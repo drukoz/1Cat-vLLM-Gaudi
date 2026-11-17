@@ -251,6 +251,26 @@ def _validate_hpu_dflash2_config(vllm_config: VllmConfig) -> None:
         raise ValueError("HPU DFlash2 requires prefix caching to be disabled")
 
 
+def _validate_flash_next_speculative_config(vllm_config: VllmConfig) -> None:
+    """Refuse the Flash-Next speculative configurations M3 cannot run correctly yet."""
+    speculative_config = vllm_config.speculative_config
+    if speculative_config is None or not is_flash_next_model(vllm_config.model_config):
+        return
+    draft_model_config = speculative_config.draft_model_config
+    draft_architectures = set(getattr(getattr(draft_model_config, "hf_config", None), "architectures", ()) or ())
+    if speculative_config.method != "mtp" or "Qwen4ExpMTP" not in draft_architectures:
+        raise ValueError("Flash-Next supports speculative decoding with its own MTP layer only: use "
+                         "--speculative-config '{\"method\": \"mtp\", \"num_speculative_tokens\": 3}'")
+    if vllm_config.cache_config.enable_prefix_caching:
+        raise ValueError("Flash-Next MTP requires prefix caching off until the align-mode state lattice lands "
+                         "(RUK-2798 T10b): add --no-enable-prefix-caching")
+    if os.environ.get("VLLM_COMPACT_GDN", "1").strip().lower() not in ("1", "true"):
+        raise ValueError("Flash-Next MTP needs compact GDN state for the per-token verification checkpoints: "
+                         "unset VLLM_COMPACT_GDN or set it to 1")
+    if not 1 <= speculative_config.num_speculative_tokens <= 4:
+        raise ValueError("Flash-Next MTP on HPU runs 1 to 4 speculative tokens (the recipe is 3)")
+
+
 class HpuPlatform(Platform):
     _enum = PlatformEnum.OOT
     device_name: str = "hpu"
@@ -552,6 +572,7 @@ class HpuPlatform(Platform):
             logger.warning("[HPU] Async scheduling disabled for Flash-Next: "
                            "PLE n-gram context needs sampled tokens on the CPU")
         _validate_hpu_dflash2_config(vllm_config)
+        _validate_flash_next_speculative_config(vllm_config)
 
     @classmethod
     def update_block_size_for_backend(cls, vllm_config: "VllmConfig") -> None:
