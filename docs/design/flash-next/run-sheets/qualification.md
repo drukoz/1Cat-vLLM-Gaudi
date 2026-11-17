@@ -228,6 +228,7 @@ docker logs <container> 2>&1 | grep -E "Usable num_blocks|HPU KV cache size|Maxi
 | Check | Expected | Observed | Pass? |
 |---|---|---|---|
 | Attention block size | 512 | | |
+| `Loading model weights took … GB` | ≈42 GB per rank | | |
 | `Usable num_blocks` | 3868 (predicted, ±5%) | | |
 | `HPU KV cache size` | ≈1.94M tokens (S4 1.98M × 0.977) | | |
 | `Maximum concurrency … 131,072 tokens` | ≈14.8x | | |
