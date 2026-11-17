@@ -203,3 +203,6 @@ csrc/moe/marlin_moe_wna16/kernel_*
 
 # Paperclip run data (agent homes, OpenCode snapshots)
 .paperclip-runtime/
+
+# Paperclip task worktrees created inside the checkout
+.paperclip/
