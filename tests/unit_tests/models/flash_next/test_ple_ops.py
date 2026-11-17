@@ -20,6 +20,7 @@ from transformers.models.qwen4_exp.modeling_qwen4_exp import Qwen4ExpTextPLELaye
 from vllm_gaudi.models.qwen4_exp.ple_ops import (
     ple_forward_torch,
     ple_gate_torch,
+    ple_short_conv_spec_torch,
     ple_short_conv_torch,
 )
 
@@ -172,3 +173,132 @@ def test_state_shape_and_carry(ple):
 
     assert new_state.shape == (9, 512)
     torch.testing.assert_close(new_state, torch.cat([state, normed], dim=0)[-9:], **TOL)
+
+
+@torch.no_grad()
+def test_spec_all_accepted_matches_straight(ple):
+    """T=4 spec steps with num_accepted = [1, 4, 4] on one row equal the straight T=1 path."""
+    total = 13  # 1 seed + 3 * 4
+    _, hidden, key, value = make_inputs(ple, total, seed=3)
+    _, normed = ple_gate_torch(**ple.gate_args(key[0], value[0], hidden[0]))
+    conv_weight = ple.layer.conv1d.weight
+    torch.manual_seed(4)
+    init_state = torch.randn(ple.state_len, ple.channels)
+    reference, reference_state = ple_short_conv_torch(normed, conv_weight, init_state, ple.dilation)
+
+    width, capacity = 4, ple.state_len + 3
+    state = torch.zeros(1, capacity, ple.channels)
+    state[0, :ple.state_len] = init_state
+    rows, token = [], 0
+    # (step width, num_accepted): the window read by a step reflects what the previous
+    # step committed, so the first T=4 step rolls back to the single seed token.
+    for step, accepted in [(1, 1), (4, 1), (4, 4), (4, 4)]:
+        out, state = ple_short_conv_spec_torch(normed[token:token + step].view(1, step, ple.channels),
+                                               conv_weight,
+                                               state,
+                                               torch.tensor([accepted]),
+                                               torch.tensor([step]),
+                                               ple.dilation)
+        rows.append(out[0])
+        token += step
+    chain = torch.cat(rows, dim=0)
+
+    assert chain.shape == reference.shape
+    torch.testing.assert_close(chain, reference, **TOL)
+    # Committed window after accepting all 4 rows of the last step starts at num_accepted - 1.
+    torch.testing.assert_close(state[0, 3:3 + ple.state_len], reference_state, **TOL)
+
+
+@torch.no_grad()
+def test_spec_rollback_matches_straight(ple):
+    """After accepting 3 of 4 candidates the next step equals the path that never saw the rejected row."""
+    total = 8  # 4 candidates + 4 next
+    _, hidden, key, value = make_inputs(ple, total, seed=5)
+    _, normed = ple_gate_torch(**ple.gate_args(key[0], value[0], hidden[0]))
+    conv_weight = ple.layer.conv1d.weight
+    torch.manual_seed(6)
+    init_state = torch.randn(ple.state_len, ple.channels)
+
+    straight = torch.cat([normed[:3], normed[4:8]], dim=0)
+    reference, reference_state = ple_short_conv_torch(straight, conv_weight, init_state, ple.dilation)
+
+    capacity = ple.state_len + 3
+    state = torch.zeros(1, capacity, ple.channels)
+    state[0, :ple.state_len] = init_state
+    accepted_rows, state = ple_short_conv_spec_torch(normed[:4].view(1, 4, ple.channels),
+                                                     conv_weight,
+                                                     state,
+                                                     torch.tensor([1]),
+                                                     torch.tensor([4]),
+                                                     ple.dilation)
+    next_rows, state = ple_short_conv_spec_torch(normed[4:8].view(1, 4, ple.channels),
+                                                 conv_weight,
+                                                 state,
+                                                 torch.tensor([3]),
+                                                 torch.tensor([4]),
+                                                 ple.dilation)
+
+    # Committed window after acceptance starts at row num_accepted - 1 (all 4 next rows committed).
+    torch.testing.assert_close(state[0, 3:3 + ple.state_len], reference_state, **TOL)
+    torch.testing.assert_close(accepted_rows[0, :3], reference[:3], **TOL)
+    torch.testing.assert_close(next_rows[0], reference[3:], **TOL)
+
+
+@torch.no_grad()
+def test_spec_ragged_rows(ple):
+    """Per-request query_lens mask padded columns; an all-zero row keeps its state and outputs zeros."""
+    rows, capacity = 3, 12
+    total = 4 + 2  # row token counts 4, 2, 0
+    _, hidden, key, value =     make_inputs(ple, total, seed=7)
+    _, normed = ple_gate_torch(**ple.gate_args(key[0], value[0], hidden[0]))
+    conv_weight = ple.layer.conv1d.weight
+    torch.manual_seed(8)
+    init = torch.randn(rows, capacity, ple.channels)
+
+    flat = torch.zeros(rows, 4, ple.channels)
+    flat[0], flat[1, :2] = normed[:4], normed[4:6]
+    query_lens = torch.tensor([4, 2, 0])
+    num_accepted = torch.tensor([1, 3, 1])
+
+    out, new_state = ple_short_conv_spec_torch(flat,
+                                               conv_weight,
+                                               init,
+                                               num_accepted,
+                                               query_lens,
+                                               ple.dilation)
+
+    for row, length, accepted in ((0, 4, 1), (1, 2, 3)):
+        history = init[row, accepted - 1:accepted - 1 + ple.state_len]
+        reference, reference_state = ple_short_conv_torch(flat[row, :length], conv_weight, history, ple.dilation)
+        # The stored window is [history[1:] ; x], so the committed rows start at length - 1.
+        torch.testing.assert_close(out[row, :length], reference, **TOL)
+        torch.testing.assert_close(new_state[row, length - 1:length - 1 + ple.state_len], reference_state, **TOL)
+
+    assert torch.equal(out[2], torch.zeros(4, ple.channels))
+    assert torch.equal(new_state[2], init[2])
+
+
+@torch.no_grad()
+def test_spec_state_shape_and_padding(ple):
+    """new_state keeps the state height, stores the T rows after the history, and zero-pads the tail."""
+    rows, width, capacity = 2, 4, 16
+    _, hidden, key, value = make_inputs(ple, rows * width, seed=9)
+    _, normed = ple_gate_torch(**ple.gate_args(key[0], value[0], hidden[0]))
+    conv_weight = ple.layer.conv1d.weight
+    torch.manual_seed(10)
+    init = torch.randn(rows, capacity, ple.channels)
+
+    _, new_state = ple_short_conv_spec_torch(normed.view(rows, width, ple.channels),
+                                             conv_weight,
+                                             init,
+                                             torch.tensor([1, 2]),
+                                             torch.tensor([4, 3]),
+                                             ple.dilation)
+
+    assert new_state.shape == (rows, capacity, ple.channels)
+    used = ple.state_len - 1 + width  # (L - 1) history rows + T candidate rows = 12
+    # Rows [L - 1, used) are the (masked) candidate rows of this step.
+    token_mask = torch.tensor([[1, 1, 1, 1], [1, 1, 1, 0]], dtype=normed.dtype).view(rows, width, 1)
+    x = normed.view(rows, width, ple.channels) * token_mask
+    torch.testing.assert_close(new_state[:, ple.state_len - 1:used], x, **TOL)
+    assert torch.equal(new_state[:, used:], torch.zeros(rows, capacity - used, ple.channels))

@@ -10,6 +10,9 @@ HPU without them:
 - short convolution: ``silu(sum_k weight[k] * history[t + k * dilation])`` over ``[state ; normed]``, added to
   ``gated``; the state carried to the next call is the last ``(kernel_size - 1) * dilation`` rows of
   ``[state ; normed]``.
+- speculative short convolution (M3): ``ple_short_conv_spec_torch`` computes the T verification rows of an MTP step
+  over the committed history window selected by ``num_accepted`` and stores ``[history[1:] ; candidates]``, the
+  rollback convention of ``_hpu_causal_conv1d_spec_update``.
 
 Every tensor is 2-D and token-major (``[T, ...]``): callers flatten the batch. The math is done in fp32 and the
 outputs are cast back to the input dtype.
@@ -136,6 +139,67 @@ def ple_short_conv_batched_torch(
     gather_index = gather_index.expand(rows, state_len, channels)
     new_state = torch.gather(history, 1, gather_index).to(state.dtype)
     return out, new_state
+
+
+def ple_short_conv_spec_torch(
+    normed: torch.Tensor,
+    conv_weight: torch.Tensor,
+    state: torch.Tensor,
+    num_accepted: torch.Tensor,
+    query_lens: torch.Tensor,
+    dilation: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Speculative (MTP verification) short conv with per-request rollback (M3, T6).
+
+    ``normed`` is ``[B, T, C]``; ``state`` is ``[B, S, C]`` with ``S >= L + T - 1`` and
+    ``L = (kernel_size - 1) * dilation``; ``num_accepted`` is int ``[B]`` (1..T_prev, the rows
+    the previous step committed) and ``query_lens`` is int ``[B]`` (0..T, the real token count
+    of every padded row). With ``a = clamp(num_accepted, 1, S - L + 1) - 1`` the committed
+    window is ``history = state[b, a : a + L]`` (gather) and ``x`` is ``normed`` masked to zero
+    at ``t >= query_lens[b]``. Over ``seq = cat(history, x)`` (``[B, L + T, C]`` the output is
+    ``out[b, t] = silu(sum_k conv_weight[:, k] * seq[b, t + k * dilation])`` for every ``t < T``
+    (padding rows computed, then masked to zero); ``new_state[b] = cat(history[b, 1:], x[b])``
+    padded with zeros to ``S`` rows, so the next step reads its window at ``num_accepted - 1``
+    and rejected candidates leave no trace. Rows with ``query_lens == 0`` keep ``state[b]``.
+    Returns ``(out [B, T, C] in normed.dtype, new_state [B, S, C] in state.dtype)``; fp32 math,
+    no Python loop over B.
+    """
+    channels = normed.shape[-1]
+    kernel = conv_weight.reshape(channels, -1)
+    kernel_size = kernel.shape[-1]
+    state_len = (kernel_size - 1) * dilation
+    rows, width = normed.shape[0], normed.shape[1]
+    capacity = state.shape[1]
+    if state.shape[0] != rows:
+        raise ValueError(f"state must be [B, S, C] = [{rows}, S, {channels}], got {tuple(state.shape)}")
+    if capacity < state_len + width - 1:
+        raise ValueError(f"state must hold at least (kernel_size - 1) * dilation + T - 1 = "
+                         f"{state_len + width - 1} rows, got {capacity}")
+
+    device = normed.device
+    accepted = num_accepted.reshape(-1).long().clamp(min=1, max=capacity - state_len + 1)
+    window = (accepted - 1).view(rows, 1) + torch.arange(state_len, device=device).view(1, state_len)
+    history = torch.gather(state.float(), 1, window.unsqueeze(-1).expand(rows, state_len, channels))
+
+    lengths = query_lens.reshape(-1).long().clamp(min=0, max=width)
+    token_mask = torch.arange(width, device=device).view(1, width) < lengths.view(rows, 1)
+    x = normed.float() * token_mask.unsqueeze(-1)
+    sequence = torch.cat([history, x], dim=1)
+
+    accumulated = torch.zeros((rows, width, channels), dtype=torch.float32, device=device)
+    for k in range(kernel_size):
+        tap = kernel[:, k].to(torch.float32).view(1, 1, channels)
+        accumulated = accumulated + sequence[:, k * dilation:k * dilation + width] * tap
+    out = F.silu(accumulated).to(normed.dtype)
+    out = out * token_mask.unsqueeze(-1).to(out.dtype)
+
+    new_state = torch.cat([history[:, 1:], x], dim=1)
+    if new_state.shape[1] < capacity:
+        new_state = F.pad(new_state, (0, 0, 0, capacity - new_state.shape[1]))
+    elif new_state.shape[1] > capacity:
+        new_state = new_state[:, :capacity]
+    new_state = torch.where((lengths > 0).view(rows, 1, 1), new_state, state.float())
+    return out, new_state.to(state.dtype)
 
 
 def ple_forward_torch(

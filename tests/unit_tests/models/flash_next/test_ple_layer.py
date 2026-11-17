@@ -12,6 +12,11 @@ the T4a torch oracle (``ple_forward_torch`` / ``ple_gate_torch``) across
 5. a decode batch whose padding row (index ``-1``) is neither read nor written,
 6. a profile run (no metadata: gated output, cache untouched),
 7. the ``Qwen4ExpPLELayer`` seam rebinding in ``apply_flash_next_patches``.
+
+M3 adds the speculative path: verification and transition steps run from the
+state lattice with ``num_accepted_tokens`` rollback and must match the
+straight single-token chain (and stop matching it when the committed-history
+update is mutated).
 """
 
 import os
@@ -34,15 +39,18 @@ from vllm.engine.arg_utils import EngineArgs  # noqa: E402
 from vllm.forward_context import set_forward_context  # noqa: E402
 from vllm.utils.torch_utils import set_default_torch_dtype  # noqa: E402
 
+import vllm_gaudi.models.qwen4_exp.ple_layer as ple_layer_module  # noqa: E402
 from vllm_gaudi.models.qwen4_exp.ple_layer import HpuQwen4ExpPLELayer  # noqa: E402
 from vllm_gaudi.models.qwen4_exp.ple_ops import (  # noqa: E402
-    ple_forward_torch, ple_gate_torch, ple_short_conv_batched_torch, ple_short_conv_torch,
+    ple_forward_torch, ple_gate_torch, ple_short_conv_batched_torch, ple_short_conv_spec_torch,
+    ple_short_conv_torch,
 )
 
 FIXTURE = Path(__file__).resolve().parent / "tiny_config.json"
 PREFIX = "model.layers.1.ple"
 SLOTS = 5
 STATE_LEN = 9
+SPEC_STATE = 12  # (kernel_size - 1) * dilation + T - 1 for a T = 4 MTP step
 CHANNELS = 512
 DILATION = 3
 TOL = dict(atol=1e-5, rtol=1e-5)
@@ -267,3 +275,163 @@ def test_seam_rebound():
     import vllm_gaudi.models.qwen4_exp as flash_next
     flash_next.apply_flash_next_patches()
     assert upstream_model.Qwen4ExpPLELayer is HpuQwen4ExpPLELayer
+
+
+def _spec_md(load, accepted, qsl_p):
+    """MTP verification/transition metadata: 1-D lattice slots plus acceptance."""
+    return types.SimpleNamespace(
+        is_prompt=False,
+        load_indices_tensor=torch.tensor(load, dtype=torch.int32),
+        store_indices_tensor=None,
+        has_initial_states_p=torch.ones(len(load), dtype=torch.int32),
+        padding_mask_flat=None,
+        num_accepted_tokens=torch.tensor(accepted, dtype=torch.int32),
+        query_start_loc_p=torch.tensor(qsl_p, dtype=torch.int32),
+    )
+
+
+def _spec_prefill_and_decode(vllm_config, layer, ids, hidden, eos, ref_state, decode_slot, spec_slot):
+    """Prefill into both slots, decode tokens 10..14 into ``decode_slot``.
+
+    Returns ``(run, decode_outs, decode_state)``.
+    """
+    def run(step_ids, step_hidden, qsl, ctx, md):
+        with torch.no_grad(), set_forward_context(md, vllm_config):
+            return layer(step_hidden, step_ids, qsl, ctx)
+
+    for slot in (decode_slot, spec_slot):
+        run(ids[:10], hidden[:10], torch.tensor([0, 10], dtype=torch.int32),
+            torch.full((1, 2), eos, dtype=torch.int32), _md(True, [slot], has_initial=[0]))
+        # The non-spec path with a taller state reads and writes rows [0, state_len).
+        assert torch.equal(layer.kv_cache[0][slot, STATE_LEN:], torch.zeros(SPEC_STATE - STATE_LEN, CHANNELS))
+
+    decode_outs = []
+    for pos in range(10, 15):
+        decode_outs.append(
+            run(ids[pos:pos + 1], hidden[pos:pos + 1], torch.tensor([0, 1], dtype=torch.int32),
+                ids[pos - 2:pos].unsqueeze(0).to(torch.int32), _md(False, [decode_slot])))
+    decode_state = layer.kv_cache[0][decode_slot, :STATE_LEN].clone()
+    torch.testing.assert_close(decode_state, ref_state, **TOL)
+    return run, decode_outs, decode_state
+
+
+def test_spec_verify_and_transition(ple_layer):
+    """An all-accepted T=4 verification plus a T=1 transition match the single-token chain."""
+    vllm_config, layer = ple_layer
+    eos = _eos(vllm_config)
+    layer.kv_cache = (torch.zeros(SLOTS, SPEC_STATE, CHANNELS),)
+    torch.manual_seed(8)
+    ids = torch.randint(0, 1000, (15,), dtype=torch.int64)
+    hidden = torch.randn(15, CHANNELS)
+    ref_out, ref_state = _oracle(layer, ids, hidden, eos=eos)
+
+    run, decode_outs, decode_state = _spec_prefill_and_decode(vllm_config, layer, ids, hidden, eos, ref_state, 1, 2)
+
+    # Verification: the seed commit of the prefill leaves num_accepted = 1.
+    spec_out = run(ids[10:14], hidden[10:14], torch.tensor([0, 4], dtype=torch.int32),
+                   ids[8:10].unsqueeze(0).to(torch.int32), _spec_md([2], [1], [0, 4]))
+    torch.testing.assert_close(spec_out, torch.cat(decode_outs[:4]), **TOL)
+    # All four rows committed: the next step reads its window at num_accepted - 1,
+    # and the window is the committed history of the 14-token straight sequence.
+    ref_state_14 = _oracle(layer, ids[:14], hidden[:14], eos=eos)[1]
+    torch.testing.assert_close(layer.kv_cache[0][2, 3:3 + STATE_LEN], ref_state_14, **TOL)
+
+    # Transition: the next single token reads the committed rows of the verify step.
+    trans = run(ids[14:15], hidden[14:15], torch.tensor([0, 1], dtype=torch.int32),
+                ids[12:14].unsqueeze(0).to(torch.int32), _spec_md([2], [4], [0, 1]))
+    torch.testing.assert_close(trans, decode_outs[4], **TOL)
+    # The transition commits one token, so the next window read is at num_accepted - 1 = 0.
+    torch.testing.assert_close(layer.kv_cache[0][2, 0:STATE_LEN], decode_state, **TOL)
+
+
+def test_spec_rollback_layer(ple_layer):
+    """Accepting 2 of 4 rows: the transitions match the chain that never saw the rejected rows."""
+    vllm_config, layer = ple_layer
+    eos = _eos(vllm_config)
+    layer.kv_cache = (torch.zeros(SLOTS, SPEC_STATE, CHANNELS),)
+    torch.manual_seed(9)
+    ids = torch.randint(0, 1000, (14,), dtype=torch.int64)
+    hidden = torch.randn(14, CHANNELS)
+    ref_out, ref_state = _oracle(layer, ids, hidden, eos=eos)
+
+    def run(step_ids, step_hidden, qsl, ctx, md):
+        with torch.no_grad(), set_forward_context(md, vllm_config):
+            return layer(step_hidden, step_ids, qsl, ctx)
+
+    for slot in (1, 2):
+        run(ids[:10], hidden[:10], torch.tensor([0, 10], dtype=torch.int32),
+            torch.full((1, 2), eos, dtype=torch.int32), _md(True, [slot], has_initial=[0]))
+
+    # Verify 4 rows, accept the first 2; the straight path continues with ids 12, 13.
+    spec_out = run(ids[10:14], hidden[10:14], torch.tensor([0, 4], dtype=torch.int32),
+                   ids[8:10].unsqueeze(0).to(torch.int32), _spec_md([2], [1], [0, 4]))
+    chain_outs = []
+    for pos in (10, 11, 12, 13):
+        chain_outs.append(
+            run(ids[pos:pos + 1], hidden[pos:pos + 1], torch.tensor([0, 1], dtype=torch.int32),
+                ids[pos - 2:pos].unsqueeze(0).to(torch.int32), _md(False, [1])))
+    torch.testing.assert_close(spec_out[:2], torch.cat(chain_outs[:2]), **TOL)
+
+    trans_a = run(ids[12:13], hidden[12:13], torch.tensor([0, 1], dtype=torch.int32),
+                  ids[10:12].unsqueeze(0).to(torch.int32), _spec_md([2], [2], [0, 1]))
+    trans_b = run(ids[13:14], hidden[13:14], torch.tensor([0, 1], dtype=torch.int32),
+                  ids[11:13].unsqueeze(0).to(torch.int32), _spec_md([2], [1], [0, 1]))
+    torch.testing.assert_close(trans_a, chain_outs[2], **TOL)
+    torch.testing.assert_close(trans_b, chain_outs[3], **TOL)
+    ref_full = _oracle(layer, ids, hidden, eos=eos)[1]
+    torch.testing.assert_close(layer.kv_cache[0][2, 0:STATE_LEN], ref_full, **TOL)
+
+
+def _mutated_spec_kernel(normed, conv_weight, state, num_accepted, query_lens, dilation):
+    """Same outputs, but keeps the full ``history`` (not ``history[1:]``) in ``new_state``."""
+    out, _ = ple_short_conv_spec_torch(normed, conv_weight, state, num_accepted, query_lens, dilation)
+    kernel = conv_weight.reshape(conv_weight.shape[0], -1)
+    length = (kernel.shape[-1] - 1) * dilation
+    offset = num_accepted.reshape(-1).long().clamp(min=1, max=state.shape[1] - length + 1) - 1
+    window = offset.view(-1, 1) + torch.arange(length).view(1, length)
+    history = state.gather(1, window.unsqueeze(-1).expand(-1, length, state.shape[-1]))
+    mask = (torch.arange(normed.shape[1]).view(1, -1) < query_lens.reshape(-1, 1).clamp(min=0, max=normed.shape[1]))
+    sequence = torch.cat([history, normed * mask.unsqueeze(-1).to(normed.dtype)], dim=1)
+    pad = state.shape[1] - sequence.shape[1]
+    if pad > 0:
+        zeros = sequence.new_zeros(sequence.shape[0], pad, sequence.shape[2])
+        sequence = torch.cat([sequence, zeros], dim=1)
+    new_state = sequence[:, :state.shape[1]]
+    new_state = torch.where((query_lens.reshape(-1, 1, 1) > 0), new_state, state)
+    return out, new_state
+
+
+def test_spec_committed_history_is_read(ple_layer, monkeypatch):
+    """Keeping the full history in new_state breaks the transition: the layer reads committed rows."""
+    vllm_config, layer = ple_layer
+    eos = _eos(vllm_config)
+    layer.kv_cache = (torch.zeros(SLOTS, SPEC_STATE, CHANNELS),)
+    torch.manual_seed(11)
+    ids = torch.randint(0, 1000, (13,), dtype=torch.int64)
+    hidden = torch.randn(13, CHANNELS)
+
+    monkeypatch.setattr(ple_layer_module, "ple_short_conv_spec_torch", _mutated_spec_kernel)
+
+    def run(step_ids, step_hidden, qsl, ctx, md):
+        with torch.no_grad(), set_forward_context(md, vllm_config):
+            return layer(step_hidden, step_ids, qsl, ctx)
+
+    run(ids[:10], hidden[:10], torch.tensor([0, 10], dtype=torch.int32),
+        torch.full((1, 2), eos, dtype=torch.int32), _md(True, [1], has_initial=[0]))
+    chain = []
+    for pos in (10, 11, 12):
+        chain.append(
+            run(ids[pos:pos + 1], hidden[pos:pos + 1], torch.tensor([0, 1], dtype=torch.int32),
+                ids[pos - 2:pos].unsqueeze(0).to(torch.int32), _md(False, [1])))
+
+    run(ids[:10], hidden[:10], torch.tensor([0, 10], dtype=torch.int32),
+        torch.full((1, 2), eos, dtype=torch.int32), _md(True, [2], has_initial=[0]))
+    run(ids[10:14], hidden[10:14], torch.tensor([0, 4], dtype=torch.int32),
+        ids[8:10].unsqueeze(0).to(torch.int32), _spec_md([2], [1], [0, 4]))
+
+    # The mutated window is one row short of the committed history, so the
+    # transition over token 12 must no longer match the straight chain.
+    with pytest.raises(AssertionError):
+        trans = run(ids[12:13], hidden[12:13], torch.tensor([0, 1], dtype=torch.int32),
+                    ids[10:12].unsqueeze(0).to(torch.int32), _spec_md([2], [2], [0, 1]))
+        torch.testing.assert_close(trans, chain[2], **TOL)
