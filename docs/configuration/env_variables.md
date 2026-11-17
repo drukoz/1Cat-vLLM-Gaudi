@@ -54,7 +54,9 @@ are in progress.
 mode as an integer. `0` (default) is dense: exact causal attention over the
 full prefix through the standard HPU Attention layer, with the indexer weights
 loaded only for checkpoint compatibility. `1` is sparse (indexer top-k
-selection); it is reserved for M2 and raises `NotImplementedError`.
+selection, added in M2): `HpuQsaIndexer.select` picks the attended
+positions per query and attention runs only over them. Sparse prefill needs a
+4-aligned context; speculative decode is not supported yet (M3).
 
 `VLLM_HPU_RECURRENT_STATE_POOL` selects the allocation mode for the recurrent
 (GDN / short-conv) state slots as an integer. `0` (default) keeps today's

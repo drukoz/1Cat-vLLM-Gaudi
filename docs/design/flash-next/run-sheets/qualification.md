@@ -570,7 +570,8 @@ done
 ```
 
 The fused decode step only runs on the direct-state GDN layout and the batch buckets {1, 2, 4, 8, 16, 32}
-(`vllm_gaudi/ops/flashinfer_gaudi_adapter.py:237-260`) — the sweep's C values are exactly the buckets. No startup line proves the
+(the buckets come from the tactic record, `_GDN_FUSED_DECODE_BATCHES` in
+`vllm_gaudi/ops/flashinfer_gaudi_adapter.py:25-26`; the gate that applies them is at `:237-260`) — the sweep's C values are exactly the buckets. No startup line proves the
 tactic engaged (R1): the proof is the TPOT difference between the two tables, plus, if you can, profiling later without
 `PT_HPU_LOG_LEVEL`. Capture for 3b: the stage greps for fn3-tactics. Results tables (3b), one per launch:
 
