@@ -221,6 +221,7 @@ def test_draft_loads_mtp_weights(tiny_checkpoint):
             "model.fc_embedding.weight",
             "model.fc_hidden.weight",
             "model.layers.0.self_attn.indexer.index_qk_proj.weight",
+            "model.layers.0.mlp.gate.weight",
             "model.layers.0.mlp.shared_expert.down_proj.weight",
             "model.layers.0.attn_hyper_connection.input_mix_weight_up.weight",
             "model.hyper_connection_mixer.input_mix_weight_up.weight",
