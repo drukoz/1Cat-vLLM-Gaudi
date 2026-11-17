@@ -85,9 +85,11 @@ def test_sparse_prefill_fp32_matches_reference(tiny_checkpoint):
             logits = sparse_prefill_last_logits(model, vllm_config, eos, prompt["prompt_ids"])
             ref = prompt["last_prefill_top5"]
             top1, delta = top1_and_delta(logits, ref)
-            assert top1 == ref["ids"][0], f"prompt {length}: sparse last-prefill top-1 {top1} != reference {ref['ids'][0]}"
+            assert top1 == ref["ids"][0], (
+                f"prompt {length}: sparse last-prefill top-1 {top1} != reference {ref['ids'][0]}")
             assert delta <= FP32_LOGIT_TOL, (
-                f"prompt {length}: sparse prefill max |Δlogit| at the reference top-5 ids {delta:.3e} > {FP32_LOGIT_TOL:.0e}")
+                f"prompt {length}: sparse prefill max |Δlogit| at the reference top-5 ids {delta:.3e} "
+                f"> {FP32_LOGIT_TOL:.0e}")
 
 
 def test_sparse_prefill_bf16_matches_reference(tiny_checkpoint):
@@ -104,6 +106,47 @@ def test_sparse_prefill_bf16_matches_reference(tiny_checkpoint):
         assert delta <= BF16_LOGIT_TOL, (
             f"prompt {LONG_PROMPT}: bf16 sparse prefill max |Δlogit| at the reference top-5 ids {delta:.3e} "
             f"> {BF16_LOGIT_TOL:.0e}")
+
+
+def test_selection_width_and_causality(tiny_checkpoint, monkeypatch):
+    """The selection contract M2-T5c depends on, captured on the 2600-token prompt.
+
+    A monkeypatched wrapper on ``HpuQsaIndexer.select`` records the ``selected`` tensor of the
+    sparse prefill: shape ``[2600, 2051]`` (``output_width = 512 * 4 + 3``), every entry ``-1``
+    (padding) or ``<=`` its row's position (causality), every row selects its own position
+    (a row with no valid entry gets an all ``-inf`` bias and FusedSDPA returns NaN for it),
+    and every row below the width selects EVERY position ``<=`` its own (count == position + 1).
+    """
+    reference = json.loads((tiny_checkpoint / "reference.json").read_text(encoding="utf-8"))
+    long_prompt = next(p for p in reference["prompts"] if len(p["prompt_ids"]) == LONG_PROMPT)
+    captured = []
+    with cpu_model(tiny_checkpoint, fp32=True, max_model_len=SPARSE_MAX_MODEL_LEN, qsa_mode=QsaMode.SPARSE) as (
+            vllm_config, model):
+        layer = next(m for m in model.modules() if isinstance(m, HpuQwen4ExpQSAAttention))
+        orig_select = layer.indexer.select
+
+        def record_select(*args, **kwargs):
+            out = orig_select(*args, **kwargs)
+            captured.append(out.detach().clone())
+            return out
+
+        monkeypatch.setattr(layer.indexer, "select", record_select)
+        eos = eos_token_id(vllm_config)
+        sparse_prefill_last_logits(model, vllm_config, eos, long_prompt["prompt_ids"])
+    assert len(captured) == 1, f"indexer.select ran {len(captured)} times, expected 1"
+    selected = captured[0]
+    positions = torch.arange(LONG_PROMPT)
+    width = layer.indexer.output_width
+    assert width == 2051, f"output_width {width} != 512 blocks * 4 + 3"
+    assert selected.shape == (LONG_PROMPT, width), f"selected shape {tuple(selected.shape)} != (2600, 2051)"
+    valid = selected >= 0
+    assert bool(((~valid) | (selected <= positions[:, None])).all()), "selected carries a future position"
+    own = (selected == positions[:, None]).any(dim=-1)
+    assert bool(own.all()), f"rows without their own position: {(~own).nonzero().flatten()[:8].tolist()}"
+    counts = valid.sum(dim=-1)
+    short = positions < width
+    assert bool((counts[short] == positions[short] + 1).all()), (
+        "a row below the width does not select every position <= its own")
 
 
 def test_dense_prefill_is_not_the_sparse_reference(tiny_checkpoint):

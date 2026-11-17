@@ -240,7 +240,7 @@ def prefill_metadata(num_tokens: int,
                      store_slot: int | None = None,
                      has_initial_state: bool = False,
                      context_len: int = 0,
-                     block_size: int = 16) -> SimpleNamespace:
+                     block_size: int = 128) -> SimpleNamespace:
     """The HPU GDN forward metadata for one prefill row in state slot ``slot`` (int64 tensors).
 
     ``load_indices_tensor``/``store_indices_tensor`` are ``(1,)`` = ``[slot]``,
@@ -274,6 +274,38 @@ def prefill_metadata(num_tokens: int,
         context_lens_tensor=torch.tensor([context_len], dtype=torch.int64),
         block_list=None,
         block_size=block_size,
+    )
+
+
+def decode_metadata(slot: int,
+                    position: int,
+                    block_size: int = 128,
+                    max_blocks: int = 32) -> SimpleNamespace:
+    """The HPU metadata for one decode step of a ``position``-token sequence in state slot ``slot``.
+
+    ``is_prompt=False`` with ``(1,)`` load/store indices ``[slot]`` and ``query_start_loc_p``
+    ``[0, 1]`` (the single-token decode the runner builds; the GDN/PLE fields match
+    ``test_decode_parity.decode_metadata``). The sparse-QSA seam fields: ``slot_mapping`` is
+    ``[position]`` (the CPU attention cache is one slot per position), ``block_table`` is the
+    identity kernel-block table ``arange(max_blocks)`` (int32 ``[1, max_blocks]``, covering
+    ``max_blocks * block_size`` positions) and ``context_lens_tensor``/``block_list`` are
+    ``None`` (a decode row has no prefill context rows).
+    """
+    return SimpleNamespace(
+        is_prompt=False,
+        load_indices_tensor=torch.tensor([slot]),
+        store_indices_tensor=torch.tensor([slot]),
+        query_start_loc_p=torch.tensor([0, 1], dtype=torch.int32),
+        has_initial_states_p=None,
+        padding_mask_flat=None,
+        direct_gdn_state=False,
+        num_accepted_tokens=None,
+        dflash_full_query=False,
+        slot_mapping=torch.tensor([position], dtype=torch.int64),
+        context_lens_tensor=None,
+        block_list=None,
+        block_size=block_size,
+        block_table=torch.arange(max_blocks, dtype=torch.int32)[None],
     )
 
 
