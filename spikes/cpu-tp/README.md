@@ -104,19 +104,26 @@ Example — checking a new sharded layer at TP8 against a plain reference:
 ```python
 # spikes/cpu-tp/test_my_layer.py
 import numpy as np
+import torch
 from harness import run_ranks
+
+def _inputs():
+    # Same full weight and input on every rank and in the test process.
+    torch.manual_seed(0)
+    return torch.randn(512, 256), torch.randn(2, 16, 256)
 
 def _rank_forward(rank):
     # runs on the rank, TP8 already initialized, current VllmConfig set
     from vllm.model_executor.layers.your_layer import YourParallelLayer
-    full_w = torch.randn(512, 256)  # same seed on every rank
+    full_w, x = _inputs()
     layer = YourParallelLayer(256, 512, params_dtype=torch.float32, prefix="l0")
     layer.weight.weight_loader(layer.weight, full_w)
     layer.quant_method.process_weights_after_loading(layer)  # CPU weight packing
-    return layer(torch.randn(2, 16, 256))[0].numpy()         # ndarray, not tensor
+    return layer(x)[0].detach().numpy()                       # ndarray, not tensor
 
 def test_your_layer_matches_unsharded_at_tp8():
-    ref = (torch.randn(2, 16, 256) @ torch.randn(512, 256).T).numpy()  # your math
+    full_w, x = _inputs()
+    ref = (x @ full_w.T).numpy()  # your math, plain PyTorch, full weights
     for out in run_ranks(8, _rank_forward, timeout_s=120):
         np.testing.assert_allclose(out, ref, atol=1e-5, rtol=1e-5)
 ```
