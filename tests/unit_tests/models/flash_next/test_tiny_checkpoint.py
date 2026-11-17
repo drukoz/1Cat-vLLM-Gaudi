@@ -129,7 +129,7 @@ def test_deterministic(checkpoint_seed0: Path, checkpoint_seed0_again: Path, che
 def test_reference_reproducible(checkpoint_seed0: Path) -> None:
     """--reference-only on the built checkpoint reproduces the committed reference.json."""
     committed = json.loads(COMMITTED_REFERENCE.read_text(encoding="utf-8"))
-    assert committed["schema"] == 1
+    assert committed["schema"] == 2
     assert [len(prompt["prompt_ids"]) for prompt in committed["prompts"]] == PROMPT_LENGTHS
     assert all(len(prompt["generated_ids"]) == committed["max_new_tokens"] for prompt in committed["prompts"])
 
