@@ -60,6 +60,9 @@ def test_prompt_chunk_lookups_hit_prepared_buckets(max_num_batched_tokens, max_m
     fallbacks = []
     for query in (128, 2048, max_num_batched_tokens):
         for ctx_blocks in (0, 64, 512, 1023, (max_model_len - query) // BLOCK_SIZE):
+            if ctx_blocks * BLOCK_SIZE + query > max_model_len:
+                # Longer than the model can hold: the scheduler never builds this chunk.
+                continue
             buckets_before = len(manager.prompt_buckets)
             bucket = manager.find_prompt_bucket(1, query, ctx_blocks)
             if len(manager.prompt_buckets) != buckets_before:
