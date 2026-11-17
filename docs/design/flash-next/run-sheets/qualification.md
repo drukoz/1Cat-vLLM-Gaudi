@@ -284,7 +284,7 @@ Each variant adds to that command:
 
 | Variant | Added flags | What it tests |
 |---|---|---|
-| A (control) | (none; the pin's defaults 2048 / 0 made explicit with `--max-num-batched-tokens 2048 --long-prefill-token-threshold 0`) | the pin's defaults, stated in the command line (R7, RUK-2728) |
+| A (control) | `--max-num-batched-tokens 2048 --long-prefill-token-threshold 0` (the pin's defaults, made explicit) | the pin's defaults, stated in the command line (R7, RUK-2728) |
 | B1 | `--max-num-batched-tokens 8192` | a bigger per-step token budget (R7) |
 | B2 | `--max-num-batched-tokens 16384` | the budget raised further (R7) |
 | C | `--max-num-batched-tokens 8192 --long-prefill-token-threshold 2048` | several prefills share a step; 2048 is a multiple of the 512-token GDN block (R7) |
@@ -296,15 +296,15 @@ Variant D (on C's server): send prompt `a` of at least 1536 tokens (three 512-to
 ```bash
 # on the node, against the running server (variant C); needs aiohttp (pip install aiohttp)
 python - <<'EOF'
-import asyncio, json, time, urllib.request
+import asyncio, time
 import aiohttp
 
 def prompt(n_words, tail):
     sysblk = ("You are a precise operations assistant. Follow the policy exactly. " * n_words).strip()
     return sysblk + tail
 
-a = prompt(300, " End of the shared system block.\n")          # >= 1536 tokens (repeats ~6 tok/word)
-b = a[:len(a) - 31] + "This agent adds its own note.\n"        # shares a's first >= 1024 tokens
+a = prompt(300, " End of the shared system block.\n")          # 3000 words, about 3900 tokens (>= 1536)
+b = prompt(100, " This agent adds its own note. " + "Agent specific detail follows here. " * 300)  # ~1300 shared tokens (2 whole blocks), then diverges; about a's length
 prompts = [("a cold", a), ("a again", a), ("b, shares a", b)]
 
 def session():
@@ -324,7 +324,7 @@ async def main():
     async with session() as sess:
         for tag, text in prompts:
             await timed(sess, tag, text)
-    print("words in shared block:", len(prompt(300, "").split()), "prompt tokens:", len(a.split()))
+    print("words: a", len(a.split()), "b", len(b.split()), "(about 1.3 tokens per word)")
 
 asyncio.run(main())
 EOF
@@ -348,7 +348,7 @@ vllm serve --help 2>&1 | grep retention   # absent on the pin's vllm -- skip F a
 | `[HPU] Recurrent state pool: 896 slots (max_num_seqs=32, recurrent groups=4, live slots per request=3, cache slots=512)` (E) | M1-T1 log format; 896 predicted by S4's slots formula | |
 | `Recurrent state pool: 896 slots x 4.76 MiB per slot = 4.18 GiB reserved; … left for attention blocks` (E) | M1-T3 log format; 4.18 GiB predicted by S4 | |
 | `Usable num_blocks: 6113` (E, within 2%: 5991–6235) | S4 pool prediction above | |
-| `Maximum concurrency for 131,072 tokens per request: 23.9x` (E) | S4 pool prediction above | |
+| `Maximum concurrency for 131,072 tokens per request: 23.9x` (E; record if it differs: vLLM's own formula may still charge GDN blocks per request) | S4 pool prediction above | |
 
 ### Capture commands
 ```bash
