@@ -63,7 +63,7 @@ def safetensors_stats(path: Path) -> tuple[int, int]:
 
 
 def make_prompts(seed: int) -> list[list[int]]:
-    """Token-id prompts of length 1/7/33/100/700: the first id is the bos token, the rest are drawn from [1000, 20000)."""
+    """Token-id prompts of length 1/7/33/100/700: the first id is the bos token, the rest drawn from [1000, 20000)."""
     generator = torch.Generator().manual_seed(seed)
     prompts = []
     for length in PROMPT_LENGTHS:
