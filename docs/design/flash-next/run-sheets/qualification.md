@@ -75,13 +75,22 @@ Prove the M0 model class serves the tiny Flash-Next checkpoint and reproduces th
 ```bash
 # in the container, CPU, about a minute
 python tools/flash_next/make_tiny_checkpoint.py --out /models/tiny-flash-next
+# TP8 needs the 8-head variant: the T1 fixture has 4 attention heads, and vLLM refuses
+# "Total number of attention heads (4) must be divisible by tensor parallel size (8)"
+# (system map §17 fact 22). Same model otherwise, with its own reference.json.
+python tools/flash_next/make_tiny_checkpoint.py --out /models/tiny-flash-next-tp8 \
+  --fixture tests/unit_tests/models/flash_next/tiny_tp8_config.json
 ```
 ```bash
 # TP1 first
 vllm serve /models/tiny-flash-next --served-model-name tiny --tensor-parallel-size 1 \
   --max-model-len 512 --max-num-seqs 4 --language-model-only --trust-remote-code --port 8010
 ```
-Stop that server, then repeat the same command with `--tensor-parallel-size 8`.
+Send the prompts (below), stop that server, then serve the 8-head checkpoint at TP8 and send the prompts again with `CKPT=/models/tiny-flash-next-tp8`:
+```bash
+vllm serve /models/tiny-flash-next-tp8 --served-model-name tiny --tensor-parallel-size 8 \
+  --max-model-len 512 --max-num-seqs 4 --language-model-only --trust-remote-code --port 8010
+```
 
 ### Expected startup lines
 | Expected line (quoted) | Source | Observed |
@@ -93,9 +102,10 @@ Stop that server, then repeat the same command with `--tensor-parallel-size 8`.
 ```bash
 # vLLM accepts a list of token ids as the prompt; return_token_ids makes the response
 # carry choices[0].token_ids, the generated ids (vllm entrypoints/openai/completion/protocol.py)
-python - <<'EOF'
-import json, urllib.request
-ref = json.load(open('/models/tiny-flash-next/reference.json'))
+# CKPT is the checkpoint being served: /models/tiny-flash-next (TP1) or /models/tiny-flash-next-tp8 (TP8)
+CKPT=${CKPT:-/models/tiny-flash-next} python - <<'EOF'
+import json, os, urllib.request
+ref = json.load(open(os.path.join(os.environ['CKPT'], 'reference.json')))
 for i, p in enumerate(ref['prompts']):
     req = {'model': 'tiny', 'prompt': p['prompt_ids'], 'max_tokens': 16,
            'temperature': 0, 'return_token_ids': True}
@@ -124,6 +134,8 @@ docker logs <container> 2>&1 | grep -i -E "recompil|graph compile|bucket|warmup 
 | 2 | 7 | /16 | /16 | |
 | 3 | 33 | /16 | /16 | |
 | 4 | 100 | /16 | /16 | |
+
+TP1 compares with `/models/tiny-flash-next/reference.json`, TP8 with `/models/tiny-flash-next-tp8/reference.json`.
 
 ### Stop rule
 The generator crashing, the server failing to start at TP1, the server crashing at TP8, any TP1 prompt not matching 16/16, or TP8 prompts 1–3 not matching 16/16 → stop, run the capture commands, post everything. bf16 on HPU may diverge from the fp32 reference after a few tokens: a single late divergence on prompt 4 (the 100-token prompt) is a warning, not a stop — record the first differing position and continue.
