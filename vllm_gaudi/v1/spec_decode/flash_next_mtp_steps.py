@@ -4,18 +4,17 @@
 ``HpuFlashNextMtpProposer`` runs the ``Qwen4ExpMTP`` draft on HPU, so it
 cannot be imported (let alone tested) on a machine without one. Every piece
 of step logic that needs no HPU lives here: the draft-model detection, the
-``(sample, multi)`` split of the draft's output, the per-step hidden state,
-the QSA ring slots (the GDN state lattice's column 0) and the per-step
-kernel ``block_table`` built from the CPU block tables.
+``(sample, multi)`` split of the draft's output, the per-step hidden state
+and the QSA ring slots (the GDN state lattice's column 0). The per-step
+kernel ``block_table`` reuses ``flash_next_inputs.build_block_table`` on the
+defragmenter-resolved rows, exactly as the target's decode does.
 
 ``hpu_flash_next_mtp.py`` stays a thin copy of ``HpuEagleProposer.propose``
-that calls these helpers. Imports stay torch + ``flash_next_inputs`` only,
+that calls these helpers. Imports stay torch only,
 so this module is unit-testable on CPU (rule from the plan's conventions).
 """
 
 import torch
-
-from vllm_gaudi.v1.worker.flash_next_inputs import build_block_table
 
 FLASH_NEXT_MTP_ARCH = "Qwen4ExpMTP"
 
@@ -62,10 +61,3 @@ def next_step_hidden(multi: torch.Tensor, last_token_indices: torch.Tensor) -> t
     rows = multi.view(-1, hidden_size)[last_token_indices]
     return rows.view(-1, 1, hidden_size)
 
-
-def draft_block_table(block_table_cpu_tensor: torch.Tensor, num_blocks: list[int], batch_size: int,
-                      max_blocks: int, pad_block_id: int) -> torch.Tensor:
-    """Per-request kernel block ids for one draft step: row i = block_table_cpu_tensor[i, :num_blocks[i]] via
-    build_block_table, padded to batch_size rows."""
-    rows = [block_table_cpu_tensor[i, :n].tolist() for i, n in enumerate(num_blocks)]
-    return build_block_table(rows, batch_size, max_blocks, pad_block_id)

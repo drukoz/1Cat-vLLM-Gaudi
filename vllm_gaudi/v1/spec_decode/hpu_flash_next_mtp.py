@@ -31,8 +31,9 @@ from vllm_gaudi.utils import async_h2d_copy
 from vllm_gaudi.v1.attention.backends.hpu_attn import HPUAttentionMetadataV1
 from vllm.model_executor.models.llama_eagle3 import Eagle3LlamaForCausalLM
 
-from vllm_gaudi.v1.spec_decode.flash_next_mtp_steps import (draft_block_table, next_step_hidden,
-                                                             ring_slots_from_lattice, split_draft_output)
+from vllm_gaudi.v1.spec_decode.flash_next_mtp_steps import (next_step_hidden, ring_slots_from_lattice,
+                                                             split_draft_output)
+from vllm_gaudi.v1.worker.flash_next_inputs import build_block_table
 from vllm_gaudi.v1.spec_decode.hpu_eagle import HpuEagleProposer
 
 
@@ -219,10 +220,12 @@ class HpuFlashNextMtpProposer(HpuEagleProposer):
         block_usage_device = async_h2d_copy(block_usage, device=self.device)
         block_groups_device = async_h2d_copy(block_groups, device=self.device)
         slot_mapping_device = async_h2d_copy(slot_mapping, device=self.device)
-        # The QSA decode attention gathers through md.block_table
-        block_table_device = async_h2d_copy(
-            draft_block_table(block_table_cpu_tensor, num_blocks, batch_size, model_runner._block_table_max_blocks,
-                              model_runner._PAD_BLOCK_ID), device=self.device)
+        # The QSA decode attention gathers through md.block_table; use the
+        # defragmenter-resolved rows, like block_list and the target's table
+        block_table_device = async_h2d_copy(build_block_table(block_tables_list, batch_size,
+                                                              model_runner._block_table_max_blocks,
+                                                              model_runner._PAD_BLOCK_ID),
+                                            device=self.device)
 
         common_attn_metadata = HPUAttentionMetadataV1.make_decode_metadata(
             block_list=block_list_device,

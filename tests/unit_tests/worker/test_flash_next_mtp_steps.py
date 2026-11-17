@@ -6,10 +6,9 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from vllm_gaudi.v1.spec_decode.flash_next_mtp_steps import (draft_block_table, is_flash_next_mtp, next_step_hidden,
+from vllm_gaudi.v1.spec_decode.flash_next_mtp_steps import (is_flash_next_mtp, next_step_hidden,
                                                              ring_slots_from_lattice, split_draft_output)
 
-PAD = 64
 PROPOSER_SRC = Path(__file__).resolve().parents[3] / "vllm_gaudi" / "v1" / "spec_decode" / "hpu_flash_next_mtp.py"
 
 
@@ -84,34 +83,13 @@ def test_next_step_hidden_accepts_the_model_shaped_output():
     assert torch.equal(out.reshape(2, 16), multi.view(-1, 16)[[0, 2]])
 
 
-def test_draft_block_table_rows_and_padding_rows():
-    table = torch.full((2, 6), PAD, dtype=torch.int32)
-    table[0, :4] = torch.tensor([7, 3, 9, 11])
-    table[1, :2] = torch.tensor([12, 5])
-
-    out = draft_block_table(table, [3, 2], batch_size=4, max_blocks=5, pad_block_id=PAD)
-
-    assert out.dtype == torch.int32
-    assert out.shape == (4, 5)
-    assert out.tolist() == [
-        [7, 3, 9, PAD, PAD],
-        [12, 5, PAD, PAD, PAD],
-        [PAD, PAD, PAD, PAD, PAD],
-        [PAD, PAD, PAD, PAD, PAD],
-    ]
-
-
-def test_draft_block_table_row_longer_than_max_blocks_raises():
-    table = torch.arange(2 * 6, dtype=torch.int32).view(2, 6)
-    with pytest.raises(ValueError):
-        draft_block_table(table, [6], batch_size=2, max_blocks=5, pad_block_id=PAD)
-
-
 def test_proposer_source_uses_the_helpers():
     src = PROPOSER_SRC.read_text()
     assert "split_draft_output(" in src
     assert "spec_step_idx=token_index + 1" in src
     assert "block_table=" in src
+    # the kernel table uses the defragmenter-resolved rows, like block_list and the target's table
+    assert "build_block_table(block_tables_list, batch_size" in src
     assert "load_indices_tensor=ring_slots" in src
     # the draft must feed its own multi' forward, never the target's hidden states
     assert "hidden_states = target_hidden_states" not in src
