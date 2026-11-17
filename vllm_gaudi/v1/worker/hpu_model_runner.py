@@ -37,6 +37,7 @@ from vllm_gaudi.extension.utils import align_and_pad, pad_list, with_default
 from vllm_gaudi.extension.debug import init_debug_logger
 from vllm_gaudi.v1.worker.hpu_dp_utils import set_hpu_dp_metadata
 from vllm_gaudi.v1.worker.gdn_state_layout import has_contiguous_dflash_checkpoints
+from vllm_gaudi.v1.worker.flash_next_inputs import (build_ple_inputs, dummy_ple_inputs, model_requires_raw_input_tokens)
 
 from vllm.v1.attention.backend import AttentionBackend, AttentionType, CommonAttentionMetadata
 from vllm.model_executor.layers.attention import Attention
@@ -766,6 +767,10 @@ class PrefillInputData:
     attn_metadata: list = empty_list()
     logits_indices: list = empty_list()
     logits_requests: list = empty_list()
+    # Per-batch (query_start_loc, ngram_context) CPU tensors for models that
+    # declare requires_raw_input_tokens, None otherwise. Kept as a list so
+    # merge_contents() can concatenate prefill batches like the other fields.
+    ple_inputs: list = empty_list()
 
 
 # TODO(kzawora): remove this
@@ -778,6 +783,7 @@ class DecodeInputData:
     logits_indices: Optional[torch.Tensor] = None
     spec_decode_metadata: Optional[SpecDecodeMetadata] = None
     draft_block_table: Optional[torch.Tensor] = None
+    ple_inputs: Optional[tuple[torch.Tensor, torch.Tensor]] = None
 
 
 def bool_helper(value):
@@ -4240,6 +4246,10 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             spec_decode_metadata=spec_decode_metadata,
         )
 
+    def _ple_eos_and_ngram(self) -> tuple[int, int]:
+        hf_text_config = self.model_config.hf_text_config
+        return int(hf_text_config.eos_token_id), int(hf_text_config.ngram_size)
+
     def _form_prefill_batch(self, contents):
         if len(contents.req_ids) == 0:
             return PrefillInputData()
@@ -4577,13 +4587,35 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                 mamba_chunks_to_block_mapping=mamba_chunks_to_block_mapping,
                 seqlens_offsets_for_blocks=seqlens_offsets_for_blocks,
                 window_block_list=window_context_blocks_t)
+        ple_inputs = None
+        if model_requires_raw_input_tokens(self.model):
+            eos_token_id, ngram_size = self._ple_eos_and_ngram()
+            # The padded rows are ordered like contents.req_ids; map them
+            # to input_batch rows the same way the mamba branch above does.
+            # DP dummy-prefill rows carry the unregistered req_id '-1'
+            # (_create_dummy_prefill_batch_contents): fall back to all-eos
+            # rows, which are discarded with the rest of the padded outputs.
+            ple_batch_indices = [self.input_batch.req_id_to_index.get(req_id) for req_id in req_ids]
+            if any(idx is None for idx in ple_batch_indices):
+                ple_inputs = dummy_ple_inputs(target_bs, target_seq, eos_token_id, ngram_size)
+            else:
+                ple_inputs = build_ple_inputs(
+                    self.input_batch.token_ids_cpu,
+                    self.input_batch.num_computed_tokens_cpu,
+                    ple_batch_indices,
+                    target_bs,
+                    target_seq,
+                    eos_token_id,
+                    ngram_size,
+                )
         return PrefillInputData(request_ids=[req_ids],
                                 prompt_lens=[query_lens],
                                 token_ids=[token_ids],
                                 position_ids=[token_positions],
                                 attn_metadata=[attn_metadata],
                                 logits_indices=[logits_indices],
-                                logits_requests=[logits_requests])
+                                logits_requests=[logits_requests],
+                                ple_inputs=[ple_inputs])
 
     def _create_dummy_prefill_batch_contents(self, num_prefills: int) -> list[PrefillInputData]:
         req_id = str(-1)
@@ -5031,13 +5063,28 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                 query_start_loc=query_start_loc_p,
             )
 
+        ple_inputs = None
+        if model_requires_raw_input_tokens(self.model):
+            eos_token_id, ngram_size = self._ple_eos_and_ngram()
+            # Decode rows are input_batch.req_ids[:num_decodes] in order.
+            ple_inputs = build_ple_inputs(
+                self.input_batch.token_ids_cpu,
+                self.input_batch.num_computed_tokens_cpu,
+                list(range(num_decodes)),
+                padded_batch_size,
+                num_tokens,
+                eos_token_id,
+                ngram_size,
+            )
+
         return DecodeInputData(num_decodes=num_decodes,
                                token_ids=token_ids_device,
                                position_ids=positions_device,
                                logits_indices=logits_indices_device,
                                attn_metadata=attn_metadata,
                                spec_decode_metadata=spec_decode_metadata,
-                               draft_block_table=draft_block_table)
+                               draft_block_table=draft_block_table,
+                               ple_inputs=ple_inputs)
 
     def _prepare_decode_inputs(self,
                                num_decodes,
@@ -5295,7 +5342,8 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                                warmup_mode=False,
                                inputs_embeds=None,
                                model_mm_kwargs=None,
-                               fuse_greedy_sampling=False):
+                               fuse_greedy_sampling=False,
+                               ple_inputs=None):
         # FORWARD.
         batch_size = token_ids.size(0)
         framework_attn_metadata = isinstance(attn_metadata, Mapping)
@@ -5325,6 +5373,10 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             use_graphs = False
         if self.model_has_chunked_attention:
             additional_kwargs.update({"model_has_chunked_attention": True})
+        if ple_inputs is not None:
+            # Flash-Next PLE layer kwargs (models with requires_raw_input_tokens).
+            additional_kwargs["query_start_loc"] = async_h2d_copy(ple_inputs[0], dtype=torch.int32, device=self.device)
+            additional_kwargs["ngram_context"] = async_h2d_copy(ple_inputs[1], dtype=torch.int32, device=self.device)
         trimmed_attn_metadata = attn_metadata if framework_attn_metadata else trim_attn_metadata(attn_metadata)
         if self.is_driver_worker:
             model_event_name = ("model_forward_"
@@ -6152,8 +6204,8 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         ######################### PREFILLS #########################
         if num_prefills > 0:
             htorch.core.mark_step()
-            for idx, (req_id, prompt_len, token_ids, position_ids, attn_metadata, logits_indices,
-                      logits_requests) in enumerate(zip(*shallow_tuple(prefill_data))):
+            for idx, (req_id, prompt_len, token_ids, position_ids, attn_metadata, logits_indices, logits_requests,
+                      ple_inputs) in enumerate(zip(*shallow_tuple(prefill_data))):
 
                 # Prepare multimodal inputs if any
                 inputs_embeds, model_mm_kwargs = self._get_model_mm_inputs(
@@ -6178,7 +6230,8 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                         lora_mask,
                         inputs_embeds=inputs_embeds,
                         model_mm_kwargs=model_mm_kwargs,
-                        warmup_mode=warmup_mode)
+                        warmup_mode=warmup_mode,
+                        ple_inputs=ple_inputs)
                 htorch.core.mark_step()
                 non_flattened_hidden_states_prefills.append(non_flattened_hidden_states)
                 # Collect prefill hidden states for prompt logprobs.
@@ -6225,7 +6278,8 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
 
         if num_pad_prefill_batch_across_dp > 0:
             for idx, (req_id, prompt_len, token_ids, position_ids, attn_metadata, logits_indices,
-                      logits_requests) in enumerate(zip(*shallow_tuple(dummy_prefill_input_data_batches_across_dp))):
+                      logits_requests, ple_inputs) in \
+                    enumerate(zip(*shallow_tuple(dummy_prefill_input_data_batches_across_dp))):
                 htorch.core.mark_step()
                 _, _, _, dummy_logits_device, _ = \
                 self._execute_model_generic(
@@ -6236,7 +6290,8 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                     self.kv_caches,
                     None,
                     None,
-                    warmup_mode=warmup_mode)
+                    warmup_mode=warmup_mode,
+                    ple_inputs=ple_inputs)
                 htorch.core.mark_step()
 
         ######################### DECODES #########################
@@ -6260,7 +6315,8 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                 lora_logits_mask,
                 lora_mask,
                 warmup_mode=warmup_mode,
-                fuse_greedy_sampling=fuse_greedy_sampling)
+                fuse_greedy_sampling=fuse_greedy_sampling,
+                ple_inputs=decode_data.ple_inputs)
             htorch.core.mark_step()
 
             if self.use_structured_output:
@@ -6383,6 +6439,12 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
 
         elif dummy_decode_input_data_across_dp is not None:
             htorch.core.mark_step()
+            dummy_ple = None
+            if model_requires_raw_input_tokens(self.model):
+                eos_token_id, ngram_size = self._ple_eos_and_ngram()
+                dummy_ple = dummy_ple_inputs(dummy_decode_input_data_across_dp.token_ids.size(0),
+                                             dummy_decode_input_data_across_dp.token_ids.size(1), eos_token_id,
+                                             ngram_size)
             _, _, _, dummy_logits_device, _ = self._execute_model_generic(
                 dummy_decode_input_data_across_dp.token_ids,
                 dummy_decode_input_data_across_dp.position_ids,
@@ -6391,7 +6453,8 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                 self.kv_caches,
                 None,
                 None,
-                warmup_mode=warmup_mode)
+                warmup_mode=warmup_mode,
+                ple_inputs=dummy_ple)
             htorch.core.mark_step()
 
         if self.use_structured_output:
@@ -7245,10 +7308,18 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                 block_size=self.block_size,
             )
 
+            ple_kwargs = {}
+            if model_requires_raw_input_tokens(self.model):
+                eos_token_id, ngram_size = self._ple_eos_and_ngram()
+                ple_query_start_loc, ple_ngram_context = dummy_ple_inputs(bs, query_len, eos_token_id, ngram_size)
+                ple_kwargs["query_start_loc"] = async_h2d_copy(ple_query_start_loc, dtype=torch.int32, device=device)
+                ple_kwargs["ngram_context"] = async_h2d_copy(ple_ngram_context, dtype=torch.int32, device=device)
+
             with set_forward_context(attn_metadata, self.vllm_config):
                 hidden_states = self.model.forward(
                     input_ids=dummy_input_ids,
                     positions=dummy_positions,
+                    **ple_kwargs,
                 )
 
             # flattened = hidden_states.view(-1, hidden_states.shape[-1])
@@ -9276,7 +9347,7 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             if prefill_data is not None:
                 assert hidden_states_prefills is not None
                 for idx, (req_ids, _prompt_lens, token_ids, _position_ids, _attn_metadata, _logits_indices,
-                          logits_requests) in enumerate(zip(*shallow_tuple(prefill_data))):
+                          logits_requests, _ple_inputs) in enumerate(zip(*shallow_tuple(prefill_data))):
                     with self.profiler.record_event('internal', "dflash2_proposer_prefill"):
                         draft_parts.append(
                             self.propose_dflash2_prefill(
@@ -9318,8 +9389,8 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                 assert hidden_states_prefills is not None
                 assert prefill_batch_start_idx is not None
 
-                for idx, (req_id, prompt_len, token_ids, position_ids, attn_metadata, logits_indices,
-                          logits_requests) in enumerate(zip(*shallow_tuple(prefill_data))):
+                for idx, (req_id, prompt_len, token_ids, position_ids, attn_metadata, logits_indices, logits_requests,
+                          _ple_inputs) in enumerate(zip(*shallow_tuple(prefill_data))):
                     if idx >= len(prefill_sampled_token_ids_tensor):
                         continue
                     _draft_token_ids = self.propose_eagle_prefill(
