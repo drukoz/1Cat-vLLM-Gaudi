@@ -108,6 +108,17 @@ def test_weights_loaded(model_bf16, tiny_checkpoint):
     assert not_finite == []
 
 
+def test_hc_padding_rows_are_zero(model_bf16):
+    """The merged down+inject weight's padding rows, which the checkpoint never fills, are exactly zero."""
+    _, model = model_bf16
+    padded = [m for m in model.modules() if isinstance(m, HpuGatedResidual) and m.pad_size]
+    assert padded, "the tiny model has no padded HyperConnection weight"
+    for module in padded:
+        pad = module.input_mix_weight_down_block_inject.weight[module.lora_rank + module.hc_count:]
+        assert pad.shape[0] == module.pad_size
+        assert bool((pad == 0).all())
+
+
 def test_kv_cache_specs(model_bf16):
     """The five cache layers of the tiny model report exactly the measured specs."""
     vllm_config, _ = model_bf16

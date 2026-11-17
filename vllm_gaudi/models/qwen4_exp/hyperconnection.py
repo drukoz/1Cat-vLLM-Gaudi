@@ -193,6 +193,10 @@ class HpuGatedResidual(nn.Module):
                 return_bias=False,
                 disable_tp=True,
             )
+            if self.pad_size:
+                # The checkpoint never fills the padding rows; zero them so they never hold garbage (or NaN).
+                with torch.no_grad():
+                    self.input_mix_weight_down_block_inject.weight[self.lora_rank + self.hc_count:].zero_()
         else:
             self.input_mix_weight_down = ReplicatedLinear(
                 self.hyper_hidden_size,
