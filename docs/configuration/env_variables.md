@@ -56,6 +56,31 @@ full prefix through the standard HPU Attention layer, with the indexer weights
 loaded only for checkpoint compatibility. `1` is sparse (indexer top-k
 selection); it is reserved for M2 and raises `NotImplementedError`.
 
+`VLLM_HPU_RECURRENT_STATE_POOL` selects the allocation mode for the recurrent
+(GDN / short-conv) state slots as an integer. `0` (default) keeps today's
+allocation, one recurrent state slot per attention block id. `1` gives the
+recurrent KV-cache groups their own pool of
+`VLLM_HPU_RECURRENT_STATE_POOL_SLOTS` slots shared by the requests. The pool
+needs prefix caching; with prefix caching off it is ignored with a warning
+(compact GDN serves the prefix-caching-off case).
+
+`VLLM_HPU_RECURRENT_STATE_POOL_SLOTS` is the resolved pool size in slots. The
+platform hook computes it at startup as `max_num_seqs x recurrent groups x 3
++ VLLM_HPU_RECURRENT_STATE_POOL_CACHE_SLOTS` and exports it to the engine-core
+and worker processes; a positive value set by the user overrides the formula.
+Default `0` (resolved, not set).
+
+`VLLM_HPU_RECURRENT_STATE_POOL_CACHE_SLOTS` is the number of retained prefix
+states the pool formula adds to the live need of `max_num_seqs` requests.
+Default `512`.
+
+`VLLM_COMPACT_GDN` selects the compact-GDN fast path with per-token state
+checkpoints for GDN hybrids. Under prefix caching the platform hook defaults
+it to `0`, and starting with `VLLM_COMPACT_GDN=1` and prefix caching enabled is
+a startup error: prefix caching uses the recurrent state pool instead, so
+unset the variable or disable prefix caching with
+`--no-enable-prefix-caching`.
+
 `VLLM_HPU_NATIVE_RECEIVE_PREPOST=1` enables the optional explicit-epoch receive
 path for a complete V4.1 native replay plan. It requires matching versioned HCL,
 Synapse and Bridge overlays, independent receive destinations, and standalone
