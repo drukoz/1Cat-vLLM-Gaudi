@@ -70,7 +70,7 @@ PLE_INDEX_TABLES = [
 ]
 
 COMMITTED_REFERENCE = Path(__file__).resolve().parent / "reference.json"
-PROMPT_LENGTHS = [1, 7, 33, 100]
+PROMPT_LENGTHS = [1, 7, 33, 100, 700]
 LOGIT_TOLERANCE = 1e-4
 
 

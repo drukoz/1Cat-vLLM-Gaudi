@@ -64,11 +64,11 @@ Stop the session and post the full traceback and the pip install logs if: the pl
 ## Stage 2a: tiny model bring-up
 
 ### Purpose
-Prove the M0 model class serves the tiny Flash-Next checkpoint and reproduces the HF CPU reference token-for-token (plan.md, Verification model: "the same tiny checkpoint on the Gaudi node at TP1 and TP8 in bf16 … greedy token agreement over 16 tokens on 4 prompts").
+Prove the M0 model class serves the tiny Flash-Next checkpoint and reproduces the HF CPU reference token-for-token (plan.md, Verification model: "the same tiny checkpoint on the Gaudi node at TP1 and TP8 in bf16 … greedy token agreement over 16 tokens on 5 prompts").
 
 ### Prerequisites
 - The stage 1 image, with the stage 1 checkout mounted (the generator script lives in the repository).
-- `tools/flash_next/make_tiny_checkpoint.py` (added by M0-T1, plan.md "Test fixture"): writes `config.json`, `model.safetensors`, the tokenizer files and `reference.json` — `{"prompts": [{"prompt_ids": [...], "generated_ids": [16 ids], "last_prefill_top5": {...}}, ...]}` over 4 prompts of 1 / 7 / 33 / 100 tokens (CPU-generated fp32 reference).
+- `tools/flash_next/make_tiny_checkpoint.py` (added by M0-T1, plan.md "Test fixture"): writes `config.json`, `model.safetensors`, the tokenizer files and `reference.json` — `{"prompts": [{"prompt_ids": [...], "generated_ids": [16 ids], "last_prefill_top5": {...}}, ...]}` over 5 prompts of 1 / 7 / 33 / 100 / 700 tokens (CPU-generated fp32 reference).
 - Output dir `/models/tiny-flash-next` (on the node, arbitrary path).
 
 ### Launch
@@ -134,6 +134,7 @@ docker logs <container> 2>&1 | grep -i -E "recompil|graph compile|bucket|warmup 
 | 2 | 7 | /16 | /16 | |
 | 3 | 33 | /16 | /16 | |
 | 4 | 100 | /16 | /16 | |
+| 5 | 700 | /16 | /16 | |
 
 TP1 compares with `/models/tiny-flash-next/reference.json`, TP8 with `/models/tiny-flash-next-tp8/reference.json`.
 
