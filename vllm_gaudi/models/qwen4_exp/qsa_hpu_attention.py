@@ -31,22 +31,27 @@ from vllm.forward_context import get_forward_context
 import vllm_gaudi.envs as envs
 
 
-def prefill_selection_bias(selected: torch.Tensor, context_lens: torch.Tensor, n_ctx_cols: int, num_queries: int,
+def prefill_selection_bias(selected: torch.Tensor, context_lens: torch.Tensor, n_ctx_cols: int, num_chunk_cols: int,
                            dtype: torch.dtype) -> torch.Tensor:
     """Bias selecting the indexer's positions inside the prompt-attention view.
 
-    ``selected`` is ``[bs, T, W]`` of absolute token positions (-1 padded),
-    ``context_lens`` is ``[bs]`` int64 and ``n_ctx_cols = n_ctx_blocks *
-    block_size`` is the context-column width that ``_include_past`` prepends.
-    Returns a ``[bs, 1, T, n_ctx_cols + T]`` bias in ``dtype``: 0 where column
-    ``c`` is selected for that query, ``-inf`` elsewhere. Column of position
-    ``p`` for row ``b`` is ``p`` when ``p < context_lens[b]`` (context block,
-    logical order) and ``n_ctx_cols + (p - context_lens[b])`` for the chunk.
-    ``-1`` entries are redirected to an extra dump column that is dropped.
-    Pure torch, no loops over tokens.
+    ``selected`` is ``[bs, T, W]`` of absolute token positions (-1 padded) for
+    one query tile of ``T`` rows, ``context_lens`` is ``[bs]`` int64,
+    ``n_ctx_cols = n_ctx_blocks * block_size`` is the context-column width that
+    ``_include_past`` prepends and ``num_chunk_cols`` is the **full chunk
+    length** (all ``seq_len`` keys the kernel sees, not this tile's height).
+    Returns a ``[bs, 1, T, n_ctx_cols + num_chunk_cols]`` bias in ``dtype``: 0
+    where column ``c`` is selected for that query, ``-inf`` elsewhere. Column
+    of position ``p`` for row ``b`` is ``p`` when ``p < context_lens[b]``
+    (context block, logical order) and ``n_ctx_cols + (p - context_lens[b])``
+    for the chunk. The query-row count is ``selected.shape[1]`` (the tile
+    height), decoupled from the column count so every tile of a long-context
+    prefill shares the same ``n_ctx_cols + seq_len`` key width. ``-1`` entries
+    are redirected to an extra dump column that is dropped. Pure torch, no
+    loops over tokens.
     """
     bs, num_queries, _ = selected.shape
-    cols = n_ctx_cols + num_queries
+    cols = n_ctx_cols + num_chunk_cols
     sel = selected.long()
     ctx = context_lens.to(torch.long).view(bs, 1, 1)
     valid = sel >= 0
@@ -173,7 +178,7 @@ class HpuQsaSparseAttention(torch.nn.Module):
             out_tiles = []
             for start in range(0, seq_len, tile):
                 end = min(start + tile, seq_len)
-                bias = prefill_selection_bias(selected_rows[:, start:end, :], context_lens, n_ctx_cols, end - start,
+                bias = prefill_selection_bias(selected_rows[:, start:end, :], context_lens, n_ctx_cols, seq_len,
                                               q.dtype)
                 out_tile = ops.prompt_attention(
                     impl=impl.prefill_impl,

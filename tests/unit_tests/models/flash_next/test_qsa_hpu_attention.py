@@ -57,6 +57,48 @@ def test_prefill_bias_layout():
             assert torch.all(others == neg_inf)
 
 
+def test_prefill_bias_tiled_columns():
+    # A long-context prefill splits the queries into tiles of height `tile`,
+    # but every tile attends to the whole chunk, so its bias width must be the
+    # full chunk (n_ctx_cols + seq_len), not n_ctx_cols + tile. The tile's
+    # selected chunk positions reach the far end of the chunk (columns beyond
+    # n_ctx_cols + tile); the old code sized the buffer by the tile height and
+    # scattered out of range.
+    torch.manual_seed(0)
+    bs, n_ctx_cols, seq_len, tile = 2, 256, 8, 4
+    context_lens = torch.tensor([256, 128], dtype=torch.int64)
+    # Second tile (query rows [tile:seq_len]); select chunk positions that
+    # span the whole chunk, i.e. columns up to n_ctx_cols + seq_len - 1.
+    selected = torch.full((bs, tile, 2), -1, dtype=torch.int32)
+    for b in range(bs):
+        base = int(context_lens[b])
+        for t in range(tile):
+            selected[b, t, 0] = base + (seq_len - 1 - t)  # far end of the chunk
+            selected[b, t, 1] = base + t  # near end of the chunk
+
+    bias = prefill_selection_bias(selected, context_lens, n_ctx_cols, seq_len, torch.float32)
+    # width is the full chunk, not the tile height
+    assert bias.shape == (bs, 1, tile, n_ctx_cols + seq_len)
+    assert bias.dtype == torch.float32
+
+    neg_inf = float("-inf")
+    for b in range(bs):
+        ctx = int(context_lens[b])
+        for t in range(tile):
+            expected = set()
+            for p in selected[b, t].tolist():
+                if p < 0:
+                    continue
+                col = p if p < ctx else n_ctx_cols + (p - ctx)
+                assert col < n_ctx_cols + seq_len  # lands inside the full-chunk buffer
+                expected.add(col)
+            row = bias[b, 0, t]
+            zeros = set(torch.nonzero(row == 0).flatten().tolist())
+            assert zeros == expected, (b, t, sorted(zeros), sorted(expected))
+            others = row[~torch.isin(torch.arange(row.shape[0]), torch.tensor(sorted(expected)))]
+            assert torch.all(others == neg_inf)
+
+
 def test_decode_selected_slots():
     block_table = torch.tensor([[5, 3, 0, 7]], dtype=torch.int32)
     selected = torch.tensor([[0, 5, 9, 14, -1]], dtype=torch.int32)
