@@ -255,8 +255,8 @@ def prefill_metadata(num_tokens: int,
     The sparse-QSA seam fields the indexer reads: ``slot_mapping`` is the attention slot of
     each token (``arange(context_len, context_len + num_tokens)``, so slot == position for a
     growing sequence), ``context_lens_tensor`` the ``context_len`` of the row, ``block_list``
-    ``None`` (no prefix-cache block table, so the visible keys are the compressed-cache
-    prefix) and ``block_size`` the KV block size.
+    the identity kernel blocks covering the context (``arange(ceil(context_len / block_size))``,
+    ``None`` without context) and ``block_size`` the KV block size.
     """
     load = slot if load_slot is None else load_slot
     store = slot if store_slot is None else store_slot
@@ -272,7 +272,7 @@ def prefill_metadata(num_tokens: int,
         dflash_full_query=False,
         slot_mapping=torch.arange(context_len, context_len + num_tokens, dtype=torch.int64),
         context_lens_tensor=torch.tensor([context_len], dtype=torch.int64),
-        block_list=None,
+        block_list=torch.arange(-(-context_len // block_size), dtype=torch.int64) if context_len else None,
         block_size=block_size,
     )
 
