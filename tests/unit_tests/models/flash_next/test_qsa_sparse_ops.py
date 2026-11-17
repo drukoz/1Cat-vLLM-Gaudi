@@ -5,7 +5,10 @@ Checks ``vllm_gaudi/models/qwen4_exp/qsa_sparse_ops.py`` against the HF
 ``Qwen4ExpTextQSAIndexer`` oracle on the tiny config:
 
 1. ``test_prefill_mask_matches_hf``: the whole-prefill selection mask for
-   300- and 2600-token sequences, two seeds, exact ``torch.equal``,
+   300- and 2600-token sequences, two seeds; exact ``torch.equal`` on every
+   row whose 512/513 block-score boundary is a strict inequality, and on
+   exact-tie rows (per CTO decision ``97c84a7b``) the selected-block sets
+   must agree outside the boundary-tie group,
 2. ``test_selection_width``: the 2051-wide selection row and ``ring_rows``,
 3. ``test_replay_matches_hf``: token-by-token decode selection through the
    raw-key ring and the compressed-key cache equals HF's rows for tokens
@@ -97,7 +100,8 @@ def _block_keys(indexer, cos_full, sin_full, raw_k, n_blocks):
 
 
 def _ours_prefill(indexer, cos_full, sin_full, hidden):
-    """Our prefill selection: (mask [L, L] bool, selected [L, 2051] int32)."""
+    """Our prefill selection: (mask [L, L] bool, selected [L, 2051] int32,
+    blocks [L, block_topk] int32, scores [L, L // ratio] fp32)."""
     ratio = indexer.compress_ratio
     L = hidden.shape[1]
     positions = torch.arange(L)
@@ -106,16 +110,43 @@ def _ours_prefill(indexer, cos_full, sin_full, hidden):
     scores = score_blocks(q, keys)
     blocks = select_blocks(scores, visible_blocks(positions, ratio), indexer.block_topk)
     selected = expand_selection(blocks, positions, ratio)
-    return selection_mask(selected, L), selected
+    return selection_mask(selected, L), selected, blocks, scores
 
 
 @pytest.mark.parametrize("seed", [0, 1])
 @pytest.mark.parametrize("L", [300, 2600])
 def test_prefill_mask_matches_hf(L, seed):
     indexer, cos_full, sin_full, hidden, ref_mask = _hf_setup(L, seed)
-    ours, selected = _ours_prefill(indexer, cos_full, sin_full, hidden)
+    ours, selected, blocks, scores = _ours_prefill(indexer, cos_full, sin_full, hidden)
+    ratio, topk = indexer.compress_ratio, indexer.block_topk
 
-    assert torch.equal(ours, ref_mask)
+    # Per CTO decision 97c84a7b: rows whose k-th/(k+1)-th visible block scores are strictly
+    # ordered must equal HF exactly; rows with an exact boundary tie may only swap blocks
+    # scored exactly at the boundary value (topk tie order is a layout artifact, not a defect).
+    tie_rows = []
+    min_gap = None
+    for t in range(L):
+        nc = (t + 1) // ratio
+        if nc > topk:  # a (k+1)-th visible column exists only on these rows
+            srt = torch.sort(scores[t, :nc].detach(), descending=True).values
+            gap = float(srt[topk - 1] - srt[topk])
+            min_gap = gap if min_gap is None else min(min_gap, gap)
+        else:  # every visible block is selected: no tie ambiguity
+            gap, srt = float("inf"), None
+        if gap == 0.0:
+            tie_rows.append(t)
+            boundary = scores[t, :nc] == srt[topk - 1]  # exact fp32 equality at the k-th score
+            ours_b = set(blocks[t][blocks[t] >= 0].tolist())
+            hf_b = set(torch.nonzero(ref_mask[t, :nc * ratio].view(nc, ratio).all(-1)).flatten().tolist())
+            boundary_b = set(torch.nonzero(boundary).flatten().tolist())
+            assert ours_b ^ hf_b <= boundary_b, f"row {t}: block sets diverge outside the boundary-tie group"
+        else:
+            assert torch.equal(ours[t], ref_mask[t]), f"row {t}: gap > 0 rows must equal HF exactly"
+
+    if not tie_rows:  # no boundary ties anywhere: the whole tensor must equal HF exactly
+        assert torch.equal(ours, ref_mask)
+    gap_txt = "N/A (no row has a 513rd visible block)" if min_gap is None else f"{min_gap}"
+    print(f"prefill L={L} seed={seed}: tie rows {len(tie_rows)}, min 512/513 boundary gap: {gap_txt}")
 
     positions = torch.arange(L)
     assert bool(torch.all((selected == -1) | (selected <= positions[:, None])))
