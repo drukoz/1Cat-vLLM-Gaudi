@@ -2,7 +2,7 @@
 """Whole-model TP2/TP4/TP8 prefill equivalence on gloo CPU ranks (M0-T7d).
 
 Builds the 8-head tiny Flash-Next checkpoint (``tiny_tp8_config.json``: the T1 fixture with
-``num_attention_heads: 8``, legal at TP8) and runs the four reference prompts through the model
+``num_attention_heads: 8``, legal at TP8) and runs the five reference prompts through the model
 built sharded on 1/2/4/8 gloo ranks (``spikes/cpu-tp/harness.py``, rank function
 ``tp_ranks.prefill_rank``), proving:
 
@@ -62,7 +62,8 @@ def test_tp1_matches_reference(tiny_tp8_checkpoint, tp1_baseline):
 def test_tp_matches_tp1(tp, tiny_tp8_checkpoint, tp1_baseline):
     """At TP2/4/8 every rank's last-token hidden states agree within 1e-6, and with TP1 within 1e-5."""
     results = _ranks(tp, tiny_tp8_checkpoint)
-    assert results[0]["hidden"].shape == (4, 128)
+    reference = json.loads((tiny_tp8_checkpoint / "reference.json").read_text(encoding="utf-8"))
+    assert results[0]["hidden"].shape == (len(reference["prompts"]), 128)
     for rank, res in enumerate(results):
         np.testing.assert_allclose(res["hidden"],
                                    results[0]["hidden"],
