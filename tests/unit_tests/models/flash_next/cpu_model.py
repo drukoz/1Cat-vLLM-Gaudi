@@ -280,7 +280,10 @@ def prefill_metadata(num_tokens: int,
 def decode_metadata(slot: int,
                     position: int,
                     block_size: int = 128,
-                    max_blocks: int = 32) -> SimpleNamespace:
+                    max_blocks: int = 32,
+                    *,
+                    load_slot: int | None = None,
+                    store_slot: int | None = None) -> SimpleNamespace:
     """The HPU metadata for one decode step of a ``position``-token sequence in state slot ``slot``.
 
     ``is_prompt=False`` with ``(1,)`` load/store indices ``[slot]`` and ``query_start_loc_p``
@@ -290,11 +293,17 @@ def decode_metadata(slot: int,
     identity kernel-block table ``arange(max_blocks)`` (int32 ``[1, max_blocks]``, covering
     ``max_blocks * block_size`` positions) and ``context_lens_tensor``/``block_list`` are
     ``None`` (a decode row has no prefill context rows).
+
+    ``load_slot``/``store_slot`` override the two state-index tensors separately (the slot
+    move of prefix caching: the step reads the state of ``load_slot`` and writes ``store_slot``);
+    ``slot`` keeps covering both when they are omitted.
     """
+    load = slot if load_slot is None else load_slot
+    store = slot if store_slot is None else store_slot
     return SimpleNamespace(
         is_prompt=False,
-        load_indices_tensor=torch.tensor([slot]),
-        store_indices_tensor=torch.tensor([slot]),
+        load_indices_tensor=torch.tensor([load]),
+        store_indices_tensor=torch.tensor([store]),
         query_start_loc_p=torch.tensor([0, 1], dtype=torch.int32),
         has_initial_states_p=None,
         padding_mask_flat=None,
