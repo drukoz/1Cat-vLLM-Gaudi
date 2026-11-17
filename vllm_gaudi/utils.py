@@ -287,6 +287,35 @@ class HPUCompileConfig:
 
 _async_sched_module.AsyncScheduler = HPUAsyncScheduler  # type: ignore[misc]
 
+# Recurrent state pool, scheduler side (M1-T2): swap the KV-cache coordinator factory when
+# VLLM_HPU_RECURRENT_STATE_POOL is on. Rebinding the module attribute works because
+# kv_cache_manager calls get_kv_cache_coordinator through its module namespace at call time.
+import vllm.v1.core.kv_cache_manager as _kv_cache_manager_module  # noqa: E402
+from vllm.logger import init_logger as _init_logger  # noqa: E402
+
+logger = _init_logger(__name__)
+
+_get_kv_cache_coordinator_orig = _kv_cache_manager_module.get_kv_cache_coordinator
+
+
+def _hpu_get_kv_cache_coordinator(**kwargs):
+    """Recurrent-state pool (M1-T2): a separate BlockPool for the MambaSpec groups when the pool is on."""
+    from vllm.v1.kv_cache_interface import MambaSpec
+    from vllm_gaudi.v1.core.recurrent_state_pool import pool_slots_from_env
+    kv_cache_config = kwargs["kv_cache_config"]
+    slots = pool_slots_from_env()
+    groups = kv_cache_config.kv_cache_groups
+    if (slots > 0 and kwargs["enable_caching"] and len(groups) > 1
+            and any(isinstance(g.kv_cache_spec, MambaSpec) for g in groups)):
+        from vllm_gaudi.v1.core.recurrent_pool_coordinator import HpuRecurrentPoolCoordinator
+        logger.info("Recurrent state pool coordinator: %d recurrent slots for %d MambaSpec groups, %d attention blocks",
+                    slots, sum(isinstance(g.kv_cache_spec, MambaSpec) for g in groups), kv_cache_config.num_blocks)
+        return HpuRecurrentPoolCoordinator(pool_slots=slots, **kwargs)
+    return _get_kv_cache_coordinator_orig(**kwargs)
+
+
+_kv_cache_manager_module.get_kv_cache_coordinator = _hpu_get_kv_cache_coordinator
+
 # Guard Prometheus counters against negative prompt-token counts that can arise
 # when KV-cache blocks are invalidated during OOM and token-count bookkeeping
 # becomes temporarily inconsistent.  Prometheus counters require non-negative
