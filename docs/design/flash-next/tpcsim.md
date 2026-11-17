@@ -1,0 +1,98 @@
+# TPC compiler and simulator on this Mac (tpcsim)
+
+`tools/flash_next/tpcsim.sh <command...>` runs a command inside an Ubuntu 22.04
+amd64 container that has the Habana TPC toolchain (`tpc-clang` 2.7.33) and the
+Gaudi2 instruction simulator, with the current directory mounted at `/work`.
+The kernel compiles natively for x86-64 under Rosetta and the simulator
+executes TPC instructions; 1CatAI's simulator test
+(`tests/standalone/deepseek_v41/test_simulation_descriptor.py`) passes in it.
+
+The VM, the image and all configuration live under
+`/Volumes/Storage/paperclip/linux-vm/` (never `$HOME`, which is temporary
+during an agent run).
+
+## One-time setup (done; recorded for rebuilds)
+
+```bash
+brew install colima docker          # colima 0.10.3, docker CLI 29.10.0
+export XDG_CONFIG_HOME=/Volumes/Storage/paperclip/linux-vm
+colima start --profile tpcsim --vm-type vz --vz-rosetta --arch aarch64 \
+    --cpu 6 --memory 12 --disk 80 --mount /Volumes/Storage:w
+docker build --platform linux/amd64 -t tpcsim:1.24.1 tools/flash_next/tpcsim
+```
+
+`tpcsim.sh` does all of this automatically: it starts the VM when
+`colima status --profile tpcsim` says it is not running and builds the image
+when `docker image inspect tpcsim:1.24.1` fails. The VM stays up afterwards.
+`tools/flash_next/tpcsim.sh --stop` stops it.
+
+## Running things
+
+```bash
+tools/flash_next/tpcsim.sh 'tpc-clang --version | head -2'
+tools/flash_next/tpcsim.sh 'python3 -m pytest -q -p no:cacheprovider --noconftest \
+    tests/standalone/deepseek_v41/test_simulation_descriptor.py'    # 2 passed
+tools/flash_next/tpcsim.sh 'tpc-clang -Wall -Werror -O2 -march=gaudi2 \
+    -I/usr/lib/habanatools/include csrc/gdn_fused/kernels/gdn_core_decode_gaudi2.c \
+    -c -o /tmp/k.o'
+tools/flash_next/tpcsim.sh 'cmake -S csrc/gdn_fused -B /tmp/b && cmake --build /tmp/b --target gdn_fused_gaudi2'
+```
+
+Pass one quoted string, or a command plus its arguments. The wrapper sets
+`COLIMA_HOME`, `DOCKER_CONFIG`, `XDG_CONFIG_HOME` and `DOCKER_HOST`
+(`unix:///Volumes/Storage/paperclip/linux-vm/colima/tpcsim/docker.sock`)
+itself and exports `PYTHONPATH=/work`, so run it from a worktree root.
+
+## Measured times (Apple Silicon, Rosetta, 6 CPU / 12 GB VM)
+
+| Step | Time |
+|------|------|
+| `colima start` (first boot, image download included) | 26 s |
+| `docker build` (full: habanalabs-tools + CPU torch download) | 151 s |
+| `docker build` (incremental, cached layers) | 52 s |
+| simulator test `test_simulation_descriptor.py` (2 passed) | 3.2 s |
+| docker container start overhead | < 1 s |
+
+## Versions in the image
+
+- Ubuntu 22.04, Python 3.10.12
+- `habanalabs-tools` 1.24.1-482 (pinned): `tpc-clang` 2.7.33,
+  `tpc-llvm-objdump`, `/usr/lib/habanatools/` (`libtpcsim_shared.so`,
+  `libtpc_tests_core_ext.so`, headers incl. `tpc_test_core_api.h`,
+  `gc_interface.h`, `tpc_kernel_lib_interface.h`)
+- torch 2.14.1+cpu (2.13.0 is not on the CPU wheel index for Python 3.10;
+  newest available recorded here), pytest 9.2.0, numpy 2.2.6
+- Docker server 29.5.2 inside the VM (CLI 29.10.0 on the Mac)
+
+## Known limits
+
+- **`half` is a reserved token of tpc-clang.** `int half = 0;` fails with
+  "cannot combine with previous 'int' declaration specifier" even in an empty
+  file. `gdn_core_decode_recurrence.h:15` uses a loop variable named `half`
+  and is the first blocker of the fused kernel compile (reported to the CTO;
+  not fixed here).
+- **colima ≥ 0.10 uses `$XDG_CONFIG_HOME/colima` and ignores `COLIMA_HOME`.**
+  The wrapper exports `XDG_CONFIG_HOME=/Volumes/Storage/paperclip/linux-vm`.
+  A pre-existing `~/.colima` on the machine takes priority over that, and
+  colima prints `found ~/.colima, ignoring $XDG_CONFIG_HOME`.
+- **`libtpc_tests_core_ext.so` carries no RPATH/RUNPATH**, so its transitive
+  deps (`libTpcElfReader.so` …) exit 127 at load time unless
+  `/usr/lib/habanatools` is in the loader cache. The image registers it via
+  `/etc/ld.so.conf.d/habanatools.conf` + `ldconfig`; no test changes needed.
+- **Rosetta works.** No SIGILL (exit 132) anywhere: `tpc-clang`, `tpc-llvm-objdump`
+  and the simulator all run under `--vm-type vz --vz-rosetta --arch aarch64`.
+  The QEMU fallback (`--vm-type qemu --arch x86_64`) was not needed.
+- **No Gaudi driver headers.** `/usr/include/habanalabs` does not exist (the
+  driver package is out of scope); `gc_interface.h` and
+  `tpc_kernel_lib_interface.h` come from `/usr/lib/habanatools/include`, so
+  point `HABANA_INCLUDE_DIR` at that folder if a build needs them.
+- **VM lifetime across agent runs is verified (2026-11-17).** The VM is
+  started by `tpcsim.sh` and stays up when a shell exits: a later run found
+  `XDG_CONFIG_HOME=/Volumes/Storage/paperclip/linux-vm colima status
+  --profile tpcsim` reporting the VM running, with the socket under
+  `/Volumes/Storage/paperclip/linux-vm/colima/tpcsim/docker.sock`. It
+  survived the end of the previous agent run.
+- **pytest 9.2.0 has no `--keep-dirs`.** For simulator-test debugging,
+  replicate the test's compile/run steps in `/tmp` inside the container.
+- Do not run pytest without `--noconftest` in the container:
+  `tests/unit_tests/conftest.py` imports vLLM, which is not installed.
