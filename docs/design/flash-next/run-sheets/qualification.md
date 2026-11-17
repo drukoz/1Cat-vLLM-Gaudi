@@ -1,6 +1,6 @@
 # Flash-Next qualification run sheet
 
-Stages are ordered fail-fast (system map §14): a stop rule ends the rental session for the day; the captures come back and the fix is made offline. Startup costs about 400 s per launch (system map §11, Reading 5), so share a launch between checks wherever possible. Sections follow [the template](README.md). Stages 1, 2a, 2b are written (M0), stage 4 is written (M1); stages 3, 5, 6 are titled placeholders filled by later milestones.
+Stages are ordered fail-fast (system map §14): a stop rule ends the rental session for the day; the captures come back and the fix is made offline. Startup costs about 400 s per launch (system map §11, Reading 5), so share a launch between checks wherever possible. Sections follow [the template](README.md). Stages 1, 2a, 2b are written (M0), stages 3 and 4 are written (M2, M1); stages 5, 6 are titled placeholders filled by later milestones.
 
 Checkpoint paths on the node are assumptions: replace `/models/Qwen3.8-Flash-Next` with the real path and say so in your post-back (system map §5 marks the Flash-Next checkpoint unverified).
 
@@ -242,6 +242,9 @@ docker logs <container> 2>&1 | grep -E "Usable num_blocks|HPU KV cache size|Maxi
 
 ### Stop rule
 Stop the session and post the captures if: startup crashes or OOMs at any rank; the attention block size is not 512; `Usable num_blocks` is more than 10% below the prediction 2862 (check `VLLM_COMPACT_GDN=0` took effect — the `GDN layers detected` line must show `VLLM_COMPACT_GDN=0`); any coherence answer is gibberish or falls into a repetition loop. A single prompt mildly off-topic is a warning: record the full text and continue. GSM8K is optional at this stage.
+Warmup failing inside `mixture_of_experts`, or crawling (far past the 400 s the 27B needed), is not a direct stop: relaunch once
+with `MAX_EXPERTS_PER_SLICE=64` — the tested slice point; the default -1 runs one `mixture_of_experts` call over all 512 experts
+(`vllm_gaudi/extension/ops.py:58-63`) — and record that in the results; stop only if the 64-slice launch fails the same way.
 
 ### What to post back
 - the three `docker logs` greps, complete;
@@ -389,8 +392,288 @@ A `ValueError` naming `VLLM_COMPACT_GDN` at startup means the environment forces
 ### Client guidance (for D and E's 16-agent run)
 A prefix-cache hit needs whole block-sized prefixes: 512 tokens at TP8 (896 at TP4), identical from token 0. GDN state is cached only at block boundaries, so pad the shared system prefix to a multiple of the block and put the per-agent text after it. `--prefix-cache-retention-interval` trades retained boundary states for pool slots.
 
-## Stages 3, 5, 6 (placeholders)
+## Stage 3: flag-by-flag A/B — sparse QSA, GDN tactics at TP8, MoE expert slices, decode batch baseline
 
-- **Stage 3: flag-by-flag A/B of each native kernel and fusion against its torch path** (system map §14) — filled by M2.
+### Purpose
+A/B every M2 flag group against the stage 2b plain launch on the real checkpoint — sparse QSA (3a), the GDN tactics at TP8 (3b), the
+MoE expert slices (3c) — and record the decode batch baseline (3d) that the M3/M5 decode work is measured against (system map §14;
+plan v0.3, M2 exit rule: sparse QSA becomes the default only after this stage passes).
+
+### Prerequisites
+- The stage 1 fork build; plugin branch `feat/flash-next-gaudi-m2` at its current head (every flag below exists only there), engine pin unchanged.
+- Checkpoint `/models/Qwen3.8-Flash-Next` (on the node; stage 2b's path). Stage 3 runs before stage 4 in the session (fail-fast order 1, 2a, 2b, 3, 4).
+- Stage 2b's S4 row in your notes (`Usable num_blocks: 2862`). 3a predicts 0.94 x that (~2690) on the sparse launch: sparse mode reserves
+  about 6% of the attention budget for the compressed keys (plan v0.3, M2 fact 2).
+- `vllm bench serve` in the container (ships with vLLM). 3a re-generates the tiny checkpoint: the M2 generator writes a `reference.json`
+  with six prompts, the sixth 2600 tokens — past the 2050-token boundary where dense equals the model's sparse attention (plan v0.3, M2 fact 1).
+
+### Launch
+Five launches, about 400 s of warmup each (system map §11, Reading 5), run in this order: launch 1 is stage 2b's command verbatim and
+serves 3d plus the "off" side of 3a-3c, every later launch adds exports to it. Launch 1:
+
+```bash
+# on the node, cards 0–7, one server; name the containers fn3-plain, fn3-sparse, fn3-tactics, fn3-slice64, fn3-slice128
+export VLLM_COMPACT_GDN=0                 # prefix caching needs it; system map §7.1
+export VLLM_HPU_FLASH_NEXT_QSA_MODE=0     # dense QSA fallback = QsaMode.DENSE; plan.md, Target architecture
+vllm serve /models/Qwen3.8-Flash-Next --served-model-name Qwen3.8-Flash-Next --port 8000 \
+  --tensor-parallel-size 8 --max-model-len 131072 --max-num-seqs 32 \
+  --enable-prefix-caching --language-model-only --trust-remote-code --gpu-memory-utilization 0.92
+```
+
+Launches 2–5 repeat that command with the extra exports (set inside each launch block, never inherited from the shell):
+
+```bash
+# launch 2, fn3-sparse (3a):
+export VLLM_HPU_FLASH_NEXT_QSA_MODE=1
+# launch 3, fn3-tactics (3b) — all four are needed; the TP8 geometry is 2 key / 6 value heads per rank,
+# packed width 1280 (plan v0.3, M2 fact 4; VLLM_HPU_FLASHINFER_GDN_TP8 is named by the plan, added by M2-T6):
+export VLLM_HPU_FLASHINFER_GDN=1 VLLM_HPU_FLASHINFER_GDN_PREFILL=1
+export VLLM_HPU_FLASHINFER_GDN_FUSED_DECODE=1 VLLM_HPU_FLASHINFER_GDN_TP8=1
+# launch 4, fn3-slice64 (3c):   export MAX_EXPERTS_PER_SLICE=64
+# launch 5, fn3-slice128 (3c):  export MAX_EXPERTS_PER_SLICE=128
+```
+
+`MAX_EXPERTS_PER_SLICE` is a plain environment variable read at `vllm_gaudi/extension/ops.py:58-63` (default -1 = one
+`mixture_of_experts` call over all 512 experts; the code comment names 64 as the tested slice). 3d benches a 32768-token input:
+launch 1 above has `--max-model-len 131072` (stage 2b), which fits 32768 + 256; if your stage 2b launch used less, launch
+fn3-plain with `--max-model-len 65536`.
+
+### Expected startup lines
+| Expected line (quoted) | Source | Observed |
+|---|---|---|
+| `Warmup finished in … secs` (about 400 s; 3c records the seconds per slice) | system map §11, Reading 5 | |
+| `Usable num_blocks: 2862` (fn3-plain, fn3-tactics, fn3-slice64, fn3-slice128; ±5%) | stage 2b's S4 prediction | |
+| `Usable num_blocks: ≈2690` (fn3-sparse: 0.94 x 2862, the compressed keys reserve ~6% of the attention budget) | plan v0.3, M2 fact 2 | |
+| `GDN layers detected (36): … VLLM_COMPACT_GDN=0` (every launch; the line names no QSA/tactic mode — 3a and 3b say what to record) | stage 2b's line | |
+
+### Capture commands
+```bash
+docker logs <name> 2>&1 | grep -E "Usable num_blocks|Warmup finished|Prefix cache hit rate|Avg generation throughput|Traceback"   # post for every launch
+docker logs <name> 2>&1 | grep -i -E "recompil|graph compile|bucket|warmup finished|max_num_batched_tokens|GDN layers detected|Compact GDN|mamba"   # R7, RUK-2728
+docker logs <name> 2>&1 | grep -i "qsa"   # 3a: no startup line names the QSA mode today (the layer logs none) — record what prints, plus the launch's VLLM_HPU_FLASH_NEXT_QSA_MODE value
+```
+
+### 3a: sparse QSA A/B (tiny 2600-token prompt, 20K needle prompt)
+Tiny side first, port 8010 (the tiny server boots in seconds; it is stage 2a's server with `--max-model-len 4096` — 2600 + 16
+tokens do not fit stage 2a's 512). Sparse side, then dense side:
+
+```bash
+# on the node, CPU, about a minute: the M2 generator adds the 2600-token sixth prompt
+python tools/flash_next/make_tiny_checkpoint.py --out /models/tiny-flash-next
+export VLLM_HPU_FLASH_NEXT_QSA_MODE=1    # sparse side (the M2 default after this stage passes)
+vllm serve /models/tiny-flash-next --served-model-name tiny --tensor-parallel-size 1 \
+  --max-model-len 4096 --max-num-seqs 4 --language-model-only --trust-remote-code --port 8010
+# run stage 2a's "Send the prompts and compare" block (CKPT=/models/tiny-flash-next), saving the printed lines:
+#   <the stage 2a block> | tee /tmp/3a-tiny-sparse.txt
+# stop that server, then the dense side: export VLLM_HPU_FLASH_NEXT_QSA_MODE=0, same serve command,
+# run the compare block again, saving to /tmp/3a-tiny-dense.txt
+```
+
+Expect: sparse mode, 6/6 prompts match 16/16 with `reference.json`. Dense mode: prompts 1–5 match 16/16 and prompt 6 (2600 tokens)
+is expected to differ — dense equals the model's sparse attention only up to 2050 tokens (plan v0.3, M2 fact 1). Record both files.
+
+Real checkpoint: the 20K-token needle prompt below, run against fn3-sparse (launch 2) and fn3-plain (launch 1). Filler sentences
+repeat, the secret sits at 30% depth, about 1.3 tokens per word (stage 4's client note); the print gives first-token seconds
+(first streamed chunk ~= first token, stage 4's convention), decode ms/token over 16 tokens, and the answer:
+
+```bash
+python - <<'EOF'
+import json, time, urllib.request
+filler = "The quarterly report describes logistics, staffing, and maintenance schedules in detail.\n"
+lines = [filler] * 14600                                     # about 20K tokens of filler
+lines[int(0.3 * len(lines))] = "The secret code is 7418.\n"  # needle at 30% depth
+prompt = "".join(lines) + "Question: What is the secret code? Answer with the digits only.\n"
+payload = {"model": "Qwen3.8-Flash-Next", "prompt": prompt, "max_tokens": 16, "temperature": 0, "stream": True}
+t0, first, text = time.perf_counter(), 0.0, ""
+with urllib.request.urlopen("http://localhost:8000/v1/completions", data=json.dumps(payload).encode(),
+                            headers={"Content-Type": "application/json"}) as r:
+    for chunk in r:
+        line = chunk.decode(errors="ignore").strip()
+        if not line.startswith("data:"):
+            continue
+        first = first or time.perf_counter() - t0
+        if line != "data: [DONE]":
+            text += json.loads(line[5:])["choices"][0].get("text", "")
+print(f"first token {first:.2f} s, decode {1000 * (time.perf_counter() - t0 - first) / 16:.0f} ms/token: {text!r}")
+EOF
+```
+
+Expect on fn3-sparse: the answer names 7418. On fn3-plain record the answer and the timings — behaviour past 2050 tokens is the
+known dense divergence, that is the A/B. Then run stage 2b's 8-prompt coherence loop against fn3-sparse, saving the answers, and,
+if stage 2b ran the GSM8K sample, run it on fn3-sparse too (same `lm_eval` command, 50 items).
+
+```bash
+# capture for 3a (the stage greps, plus):
+docker logs fn3-sparse 2>&1 | grep -E "Usable num_blocks|Warmup finished"   # ≈2690 blocks expected (0.94 x 2862)
+docker logs fn3-sparse 2>&1 | grep -i "qsa"   # record what prints: the mode-naming startup line does not exist today
+```
+
+Results table (3a):
+
+| Check | Expected | Observed | Pass? |
+|---|---|---|---|
+| Tiny prompt 6 (2600 tok), sparse mode | 16/16 | | |
+| Tiny prompt 6, dense mode | differs — record the first-differing position | | |
+| Tiny prompts 1–5, sparse mode | 16/16 | | |
+| 20K needle, fn3-sparse | answer contains 7418 | | |
+| 20K needle, fn3-plain | record (divergence past 2050 tokens expected) | | |
+| 8 short prompts, fn3-sparse | all on-topic, grammatical, no loops | | |
+| GSM8K, 50 items (only if 2b ran it) | record the score | | |
+| `Usable num_blocks`, fn3-sparse | ≈2690 (0.94 x 2862) | | |
+| 20K first token, plain / sparse | record both | | |
+| 20K decode ms/token, plain / sparse | record both | | |
+
+Stop rule (3a): fn3-sparse crashes at startup, the tiny prompt 6 does not match 16/16 in sparse mode, or the sparse 20K needle
+answer misses the code → stop the session and post the captures, both tiny files and both needle prints. Dense prompt 6 differing
+is the expected result, not a stop.
+
+Post back (3a): `/tmp/3a-tiny-sparse.txt`, `/tmp/3a-tiny-dense.txt`, the two needle prints, the sparse 8-prompt answers (and the
+GSM8K score if run), the fn3-sparse startup capture, the filled 3a table.
+
+### 3b: GDN tactics at TP8 (four flags, decode sweep)
+Correctness first: stage 2b's 8-prompt loop, greedy 64 tokens, written to a file on fn3-plain (launch 1) and fn3-tactics (launch 3):
+
+```bash
+OUT=/tmp/3b-plain.txt      # on fn3-tactics: OUT=/tmp/3b-tactics.txt
+: > "$OUT"
+for p in \
+  "Explain in two sentences why the sky is blue during the day." \
+  "Write a haiku about the sea." \
+  "List the three primary colors and one use of each." \
+  "What is the capital of France? Answer in one sentence." \
+  "Summarize in one sentence what a compiler does." \
+  "Continue this sentence: The best way to learn programming is" \
+  "Reply with a JSON object only, keys name, age, city, for a fictional person." \
+  "Write a Python function fib(n) that returns the n-th Fibonacci number." ; do
+  payload=$(python -c "import json,sys; print(json.dumps({'model':'Qwen3.8-Flash-Next','prompt':sys.argv[1],'max_tokens':64,'temperature':0}))" "$p")
+  curl -s http://localhost:8000/v1/completions -H 'Content-Type: application/json' -d "$payload" \
+    | python -c "import json,sys; print(json.load(sys.stdin)['choices'][0]['text'].strip())" >> "$OUT"
+  echo '================' >> "$OUT"
+done
+diff /tmp/3b-plain.txt /tmp/3b-tactics.txt    # expected: no output
+```
+
+The 8 greedy outputs must be identical across the two launches (both bf16; report any difference). Expected startup lines for
+fn3-tactics: stage 2b's set — the four GDN exports change no startup line (R1). Performance sweep, on both servers, N = 4 x C:
+
+```bash
+NAME=plain               # on fn3-tactics: NAME=tactics
+for C in 1 8 16 32; do
+  vllm bench serve --backend vllm --model Qwen3.8-Flash-Next --dataset-name random \
+    --random-input-len 4096 --random-output-len 256 --num-prompts $((4 * C)) --max-concurrency "$C" \
+    > "/tmp/3b-$NAME-c$C.log" 2>&1
+  grep -E "Output token throughput|Mean TPOT|P99 TPOT" "/tmp/3b-$NAME-c$C.log"
+done
+```
+
+The fused decode step only runs on the direct-state GDN layout and the batch buckets {1, 2, 4, 8, 16, 32}
+(`vllm_gaudi/ops/flashinfer_gaudi_adapter.py:237-260`) — the sweep's C values are exactly the buckets. No startup line proves the
+tactic engaged (R1): the proof is the TPOT difference between the two tables, plus, if you can, profiling later without
+`PT_HPU_LOG_LEVEL`. Capture for 3b: the stage greps for fn3-tactics. Results tables (3b), one per launch:
+
+| C | N = 4C | Output token throughput (tok/s) | Mean TPOT (ms) | P99 TPOT (ms) |
+|---|---|---|---|---|
+| 1 | 4 | | | |
+| 8 | 32 | | | |
+| 16 | 64 | | | |
+| 32 | 128 | | | |
+
+(Repeat the table for fn3-tactics; add the rows below to one of them.)
+
+| Check | Expected | Observed | Pass? |
+|---|---|---|---|
+| `diff` of the two greedy files | empty (report any difference) | | |
+| fn3-tactics Mean/P99 TPOT vs plain | record both; the delta is the gate's measurement, a loss is a finding, not a stop | | |
+
+Stop rule (3b): any difference between the two greedy files → stop the session, post both files and the capture greps of both
+launches; fn3-tactics crashes at startup → stop, post the traceback. A tactics loss in the tables is a result, not a stop.
+
+Post back (3b): the two greedy files, the two filled bench tables, the eight `/tmp/3b-*.log` files, the fn3-tactics capture greps.
+
+### 3c: MoE expert slices (unset / 64 / 128)
+Three points, one per launch: unset (fn3-plain: the -1 default, one `mixture_of_experts` call over all 512 experts), 64 (launch 4),
+128 (launch 5). Expected line per launch: `Warmup finished in … secs` — the seconds are this sub-stage's measurement:
+
+```bash
+docker logs <name> 2>&1 | grep -E "Warmup finished|Usable num_blocks|Traceback"   # per launch; the warmup seconds are the point
+```
+
+Then stage 2b's 8-prompt loop into a file (the 3b loop with `OUT=/tmp/3c-slice64.txt`, then `OUT=/tmp/3c-slice128.txt`) — slicing
+re-chunks the expert loop, so the answers must equal `/tmp/3b-plain.txt` — and the C = 16 bench row on each launch:
+
+```bash
+diff /tmp/3b-plain.txt /tmp/3c-slice64.txt     # expected: empty; same check for /tmp/3c-slice128.txt
+NAME=slice-unset       # on fn3-slice64: NAME=slice64; on fn3-slice128: NAME=slice128
+vllm bench serve --backend vllm --model Qwen3.8-Flash-Next --dataset-name random \
+  --random-input-len 4096 --random-output-len 256 --num-prompts 64 --max-concurrency 16 \
+  > "/tmp/3c-$NAME-c16.log" 2>&1
+grep -E "Output token throughput|Mean TPOT|P99 TPOT" "/tmp/3c-$NAME-c16.log"
+```
+
+Results table (3c):
+
+| Launch | `Warmup finished` (s) | 8 prompts identical to plain? | Output token throughput (C=16) | Mean TPOT (ms) | P99 TPOT (ms) |
+|---|---|---|---|---|---|
+| unset, -1 (fn3-plain) | | | | | |
+| 64 (fn3-slice64) | | | | | |
+| 128 (fn3-slice128) | | | | | |
+
+Stop rule (3c): warmup fails inside `mixture_of_experts` at any point (the traceback names it) → stop the session and post the
+traceback and the launch's capture greps; a crawl (far past the 400 s the 27B needed) is the measurement, record it. Answers not
+identical to plain → stop and post the diffs.
+
+Post back (3c): the filled 3c table, the three Warmup lines, the two diff results, the three C=16 rows and `/tmp/3c-*.log` files,
+the fn3-slice64 / fn3-slice128 capture greps.
+
+### 3d: decode batch baseline (4K and 32K input)
+On fn3-plain (dense QSA, no tactics) — the before-picture for the M3/M5 decode work. Expected startup lines: stage 2b's set
+(launch 1 is stage 2b's launch). Two sweeps, N = 4 x C, 256 tokens out:
+
+```bash
+NAME=4k; IN=4096         # then the second sweep: NAME=32k; IN=32768 (fits --max-model-len 131072; see Launch)
+for C in 1 8 16 32; do
+  vllm bench serve --backend vllm --model Qwen3.8-Flash-Next --dataset-name random \
+    --random-input-len "$IN" --random-output-len 256 --num-prompts $((4 * C)) --max-concurrency "$C" \
+    > "/tmp/3d-$NAME-c$C.log" 2>&1
+  grep -E "Output token throughput|Mean TPOT|P99 TPOT" "/tmp/3d-$NAME-c$C.log"
+done
+```
+
+During each sweep, from a second shell, sample the engine stats lines (the stage 4 capture grep):
+
+```bash
+docker logs fn3-plain 2>&1 | grep -E "Avg generation throughput|Running: " | tail -n 20
+```
+
+Results table (3d) — per-request TPOT, aggregate output throughput, and the engine stats lines:
+
+| Sweep | C | N | Output token throughput (tok/s) | Mean TPOT (ms) | P99 TPOT (ms) | `Avg generation throughput` / `Running:` during the run |
+|---|---|---|---|---|---|---|
+| 4K in / 256 out | 1 | 4 | | | | |
+| 4K in / 256 out | 8 | 32 | | | | |
+| 4K in / 256 out | 16 | 64 | | | | |
+| 4K in / 256 out | 32 | 128 | | | | |
+| 32K in / 256 out | 1 | 4 | | | | |
+| 32K in / 256 out | 8 | 32 | | | | |
+| 32K in / 256 out | 16 | 64 | | | | |
+| 32K in / 256 out | 32 | 128 | | | | |
+
+Stop rule (3d): fn3-plain crashes, OOMs, or a sweep dies mid-run → stop the session, post the captures and the log of the failing
+sweep. A low 32K throughput is data, record it.
+
+Post back (3d): the filled 3d table, the eight `/tmp/3d-*.log` files, the engine-stats lines taken during the sweeps.
+
+### What to post back
+- the results tables (3a, 3b's two bench tables, 3c, 3d), filled in;
+- the greedy-output files: `/tmp/3a-tiny-sparse.txt`, `/tmp/3a-tiny-dense.txt`, `/tmp/3b-plain.txt`, `/tmp/3b-tactics.txt`,
+  `/tmp/3c-slice64.txt`, `/tmp/3c-slice128.txt`;
+- `docker logs <name> 2>&1 | grep -E "Usable num_blocks|Warmup finished|Prefix cache hit rate|Avg generation throughput|Traceback"`
+  for each of the five launches, complete;
+- the two 20K needle prints (answer, first-token s, decode ms/token — sparse and plain) and the raw `/tmp/3b-*.log`, `/tmp/3c-*.log`,
+  `/tmp/3d-*.log` bench logs;
+- an `hl-smi` snapshot (on the node).
+
+## Stages 5, 6 (placeholders)
+
 - **Stage 5: TP1/TP2/TP4/TP8, PP2×TP4 and TP+EP throughput and latency** (system map §16, items 5b/5c) — filled by M4.
 - **Stage 6: 128K–262K contexts and the eight-agent stress run with quality checks** (system map §16, item 5d) — filled by M1/M4.
