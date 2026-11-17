@@ -58,7 +58,8 @@ float64_pair_t bf16_to_f32_linear(bfloat128 input)
 // Causal width-4 conv + SiLU, fp32, for the 128 channels starting at
 // `channel`. Reads history rows 0..2 from load_slot and the input token,
 // then writes the shifted history (h1, h2, x) to store_slot as the raw
-// bf16 vectors, after every load, so load_slot == store_slot works.
+// bf16 vectors, after every load. The stores depend on h0 through an ordering guard, so
+// load_slot == store_slot works (see the guard below).
 static inline float64_pair_t conv_silu_block(tensor conv_state, tensor mixed_qkv, tensor conv_weight_t,
                                              int channel, int request, int load_slot, int store_slot)
 {
@@ -94,13 +95,21 @@ static inline float64_pair_t conv_silu_block(tensor conv_state, tensor mixed_qkv
     conv.v1 = v_f32_mac_b(term.v1, w3.v1, conv.v1);
     conv.v2 = v_f32_mac_b(term.v2, w3.v2, conv.v2);
 
+    // Ordering guard: tpc-clang treats ld_tnsr/st_tnsr on conv_state as independent and
+    // otherwise hoists these stores above the h0 load, so with load_slot == store_slot h0
+    // reads the new history (RUK-2829). h0 > +inf is never true, so the moves keep h1/h2/x
+    // bit for bit but make every store depend on h0.
+    const bool128 never = v_bf16_cmp_grt_b(h0, (bf16)(1.0f / 0.0f));
+    const bfloat128 s1 = v_bf16_mov_vb(h0, 0, h1, never, 0);
+    const bfloat128 s2 = v_bf16_mov_vb(h0, 0, h2, never, 0);
+    const bfloat128 s3 = v_bf16_mov_vb(h0, 0, x, never, 0);
     hist_coords[2] = store_slot;
     hist_coords[1] = 0;
-    v_bf16_st_tnsr(hist_coords, conv_state, h1);
+    v_bf16_st_tnsr(hist_coords, conv_state, s1);
     hist_coords[1] = 1;
-    v_bf16_st_tnsr(hist_coords, conv_state, h2);
+    v_bf16_st_tnsr(hist_coords, conv_state, s2);
     hist_coords[1] = 2;
-    v_bf16_st_tnsr(hist_coords, conv_state, x);
+    v_bf16_st_tnsr(hist_coords, conv_state, s3);
 
     float64_pair_t act;
     act.v1 = conv.v1 * v_sigmoid_f32(conv.v1);
