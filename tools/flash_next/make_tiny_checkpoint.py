@@ -82,6 +82,22 @@ def write_config(out_dir: Path, fixture: Path) -> bytes:
     return fixture_bytes
 
 
+def perturb_constant_weights(model: torch.nn.Module, seed: int) -> None:
+    """Add seeded N(0, 0.1) noise to every constant language-model weight, in place.
+
+    HF's init leaves norm weights, ``dt_bias`` and the PLE ``conv1d.weight`` constant (the conv is
+    all zeros), so a parity test could not see a dropped short conv, its lost state, a norm
+    weight loaded into the wrong layer or a transposed one. The vision tower is never run.
+    """
+    generator = torch.Generator().manual_seed(seed + 1)
+    with torch.no_grad():
+        for name, param in model.named_parameters():
+            if name.startswith("model.visual") or param.numel() < 2 or param.float().std() != 0:
+                continue
+            noise = torch.randn(param.shape, generator=generator, dtype=torch.float32) * 0.1
+            param.add_(noise.to(param.dtype))
+
+
 def build_checkpoint(out_dir: Path, fixture: Path, seed: int) -> None:
     """Build the random bf16 model from the fixture config and save it; the config.json is restored afterwards."""
     # Not AutoConfig: vLLM's create_engine_config() replaces CONFIG_MAPPING["qwen4_exp"] with its own config
@@ -90,6 +106,7 @@ def build_checkpoint(out_dir: Path, fixture: Path, seed: int) -> None:
     config = Qwen4ExpConfig.from_pretrained(out_dir)
     torch.manual_seed(seed)
     model = Qwen4ExpForConditionalGeneration(config).to(torch.bfloat16)
+    perturb_constant_weights(model, seed)
     # save_file (not save_pretrained) keeps the model's own tensor names: transformers 5.23 splits the fused
     # experts.gate_up_proj / experts.down_proj into per-expert gate/up/down_proj on save, and the fused names
     # are the ones the vLLM loader expects. from_pretrained reads this file back exactly.
