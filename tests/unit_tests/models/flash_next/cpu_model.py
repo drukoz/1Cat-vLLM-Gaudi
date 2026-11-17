@@ -288,7 +288,10 @@ def decode_metadata(slot: int,
                     max_blocks: int = 32,
                     *,
                     load_slot: int | None = None,
-                    store_slot: int | None = None) -> SimpleNamespace:
+                    store_slot: int | None = None,
+                    num_tokens: int = 1,
+                    query_lens: list[int] | None = None,
+                    slots: list[int] | None = None) -> SimpleNamespace:
     """The HPU metadata for one decode step of a ``position``-token sequence in state slot ``slot``.
 
     ``is_prompt=False`` with ``(1,)`` load/store indices ``[slot]`` and ``query_start_loc_p``
@@ -302,24 +305,61 @@ def decode_metadata(slot: int,
     ``load_slot``/``store_slot`` override the two state-index tensors separately (the slot
     move of prefix caching: the step reads the state of ``load_slot`` and writes ``store_slot``);
     ``slot`` keeps covering both when they are omitted.
+
+    ``num_tokens = T > 1`` builds the M3 verification layout of the runner's padded
+    multi-token decode: ``bs = len(slots)`` requests of ``T`` rows each
+    (``bs * T`` query rows), ``query_start_loc_p`` the cumulative REAL lengths
+    (``query_lens``, default ``T`` for every request), ``slot_mapping`` the
+    positions ``position .. position + T`` of each request with the padding rows of a
+    ragged request on the attention's ``_PAD_SLOT_ID = -1``, the ``block_table`` with
+    ONE ROW PER QUERY ROW (``[bs * T, max_blocks]``, the identity row repeated, as the
+    runner's per-token ``block_tables_list`` gives a single-sequence test), and the
+    state-index tensors as the lattice ``[bs_groups=1, bs, T]`` with
+    ``num_accepted_tokens = [1] * bs`` (the first verification step after a prefill).
+    ``slots`` is the state slot of each request (default ``[slot]``).
     """
     load = slot if load_slot is None else load_slot
     store = slot if store_slot is None else store_slot
+    if num_tokens < 1:
+        raise ValueError(f"num_tokens must be >= 1, got {num_tokens}")
+    req_slots = [load] if slots is None else list(slots)
+    bs = len(req_slots)
+    lengths = [num_tokens] * bs if query_lens is None else list(query_lens)
+    if len(lengths) != bs or any(not 0 <= n <= num_tokens for n in lengths):
+        raise ValueError(f"query_lens {lengths} does not fit {bs} requests of {num_tokens} rows")
+    store_slots = [store] * bs if slots is None else list(slots)
+    starts = [0]
+    for n in lengths:
+        starts.append(starts[-1] + n)
+    slot_map, positions = [], []
+    for r in range(bs):
+        for j in range(num_tokens):
+            slot_map.append(position + j if j < lengths[r] else -1)
+            positions.append(position + j if j < lengths[r] else 0)
+    rows = bs * num_tokens
+    if num_tokens == 1 and bs == 1:
+        load_idx, store_idx = torch.tensor([load]), torch.tensor([store])
+        accepted = None
+    else:
+        load_idx = torch.tensor([[[s] * num_tokens for s in req_slots]], dtype=torch.int64)
+        store_idx = torch.tensor([[[s] * num_tokens for s in store_slots]], dtype=torch.int64)
+        accepted = torch.ones(bs, dtype=torch.int32)
     return SimpleNamespace(
         is_prompt=False,
-        load_indices_tensor=torch.tensor([load]),
-        store_indices_tensor=torch.tensor([store]),
-        query_start_loc_p=torch.tensor([0, 1], dtype=torch.int32),
+        load_indices_tensor=load_idx,
+        store_indices_tensor=store_idx,
+        query_start_loc_p=torch.tensor(starts, dtype=torch.int32),
         has_initial_states_p=None,
         padding_mask_flat=None,
         direct_gdn_state=False,
-        num_accepted_tokens=None,
+        num_accepted_tokens=accepted,
         dflash_full_query=False,
-        slot_mapping=torch.tensor([position], dtype=torch.int64),
+        slot_mapping=torch.tensor(slot_map, dtype=torch.int64),
         context_lens_tensor=None,
         block_list=None,
         block_size=block_size,
-        block_table=torch.arange(max_blocks, dtype=torch.int32)[None],
+        block_table=torch.arange(max_blocks, dtype=torch.int32)[None].expand(rows, max_blocks).contiguous(),
+        positions=torch.tensor(positions, dtype=torch.int64),
     )
 
 
