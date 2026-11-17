@@ -186,7 +186,7 @@ def test_spec_all_accepted_matches_straight(ple):
     init_state = torch.randn(ple.state_len, ple.channels)
     reference, reference_state = ple_short_conv_torch(normed, conv_weight, init_state, ple.dilation)
 
-    width, capacity = 4, ple.state_len + 3
+    capacity = ple.state_len + 3
     state = torch.zeros(1, capacity, ple.channels)
     state[0, :ple.state_len] = init_state
     rows, token = [], 0
@@ -249,7 +249,7 @@ def test_spec_ragged_rows(ple):
     """Per-request query_lens mask padded columns; an all-zero row keeps its state and outputs zeros."""
     rows, capacity = 3, 12
     total = 4 + 2  # row token counts 4, 2, 0
-    _, hidden, key, value =     make_inputs(ple, total, seed=7)
+    _, hidden, key, value = make_inputs(ple, total, seed=7)
     _, normed = ple_gate_torch(**ple.gate_args(key[0], value[0], hidden[0]))
     conv_weight = ple.layer.conv1d.weight
     torch.manual_seed(8)
