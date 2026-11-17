@@ -30,7 +30,7 @@ from vllm.forward_context import set_forward_context  # noqa: E402
 from vllm_gaudi.models.qwen4_exp.qsa import HpuQwen4ExpQSAAttention  # noqa: E402
 
 from tests.unit_tests.models.flash_next.cpu_model import (  # noqa: E402
-    cpu_model, eos_token_id, fp32_logits, ple_kwargs, prefill_metadata, reset_cpu_states)
+    cpu_model, dense_reference_prompts, eos_token_id, fp32_logits, ple_kwargs, prefill_metadata, reset_cpu_states)
 
 FP32_DECODE_VS_PREFILL_TOL = 1e-5
 BF16_DECODE_VS_PREFILL_TOL = 3e-2
@@ -122,7 +122,7 @@ def load_reference(tiny_checkpoint):
 
 
 def prompt_of(ref, length):
-    for p in ref["prompts"]:
+    for p in dense_reference_prompts(ref):
         if len(p["prompt_ids"]) == length:
             return p
     raise KeyError(f"no prompt of length {length}")
@@ -159,7 +159,7 @@ def test_decode_fp32_matches_reference(tiny_checkpoint):
     with cpu_model(tiny_checkpoint, fp32=True) as (vllm_config, model):
         eos = eos_token_id(vllm_config)
         atts = install_cached_attention(model)
-        for prompt in ref["prompts"]:
+        for prompt in dense_reference_prompts(ref):
             n = len(prompt["prompt_ids"])
             picks, last_decode, full = run_decode_chain(model, vllm_config, atts, prompt, 1, eos)
             for i, (picked, expected) in enumerate(zip(picks, prompt["generated_ids"])):
@@ -181,7 +181,7 @@ def test_decode_bf16_close_to_prefill(tiny_checkpoint):
     with cpu_model(tiny_checkpoint) as (vllm_config, model):
         eos = eos_token_id(vllm_config)
         atts = install_cached_attention(model)
-        for prompt in ref["prompts"]:
+        for prompt in dense_reference_prompts(ref):
             n = len(prompt["prompt_ids"])
             _, last_decode, full = run_decode_chain(model, vllm_config, atts, prompt, 1, eos)
             reset_cpu_states(model)

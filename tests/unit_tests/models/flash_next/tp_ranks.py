@@ -77,7 +77,7 @@ def prefill_rank(rank: int, ckpt_dir: str, tp: int, fp32: bool) -> dict:
         cm.use_sdpa_attention(model)
         eos = cm.eos_token_id(vc)
         with harness.record_collectives() as recorded:
-            for prompt in reference["prompts"]:
+            for prompt in cm.dense_reference_prompts(reference):
                 seq = prompt["prompt_ids"]
                 n = len(seq)
                 cm.reset_cpu_states(model)
