@@ -25,6 +25,7 @@ from pathlib import Path  # noqa: E402
 import numpy as np  # noqa: E402
 import pytest  # noqa: E402
 
+from tests.unit_tests.models.flash_next.cpu_model import dense_reference_prompts  # noqa: E402
 from tests.unit_tests.models.flash_next.tp_ranks import prefill_rank  # noqa: E402  (adds spikes/cpu-tp to sys.path)
 
 from harness import run_ranks  # noqa: E402
@@ -50,8 +51,8 @@ def tp1_baseline(tiny_tp8_checkpoint) -> list:
 def test_tp1_matches_reference(tiny_tp8_checkpoint, tp1_baseline):
     """TP1's last-prefill top-5 logits match the 8-head checkpoint's HF reference and keep its top-1."""
     reference = json.loads((tiny_tp8_checkpoint / "reference.json").read_text(encoding="utf-8"))
-    assert len(tp1_baseline[0]["top5_logits"]) == len(reference["prompts"])
-    for i, prompt in enumerate(reference["prompts"]):
+    assert len(tp1_baseline[0]["top5_logits"]) == len(dense_reference_prompts(reference))
+    for i, prompt in enumerate(dense_reference_prompts(reference)):
         expected = prompt["last_prefill_top5"]["logits"]
         got = tp1_baseline[0]["top5_logits"][i]
         np.testing.assert_allclose(got, expected, atol=1e-5, err_msg=f"prompt {i} top-5 logits")
@@ -63,7 +64,7 @@ def test_tp_matches_tp1(tp, tiny_tp8_checkpoint, tp1_baseline):
     """At TP2/4/8 every rank's last-token hidden states agree within 1e-6, and with TP1 within 1e-5."""
     results = _ranks(tp, tiny_tp8_checkpoint)
     reference = json.loads((tiny_tp8_checkpoint / "reference.json").read_text(encoding="utf-8"))
-    assert results[0]["hidden"].shape == (len(reference["prompts"]), 128)
+    assert results[0]["hidden"].shape == (len(dense_reference_prompts(reference)), 128)
     for rank, res in enumerate(results):
         np.testing.assert_allclose(res["hidden"],
                                    results[0]["hidden"],

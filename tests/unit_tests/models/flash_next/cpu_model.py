@@ -44,6 +44,15 @@ from vllm_gaudi.models.qwen4_exp.qsa import HpuQwen4ExpQSAAttention  # noqa: E40
 
 _MAKER = Path(__file__).resolve().parents[4] / "tools" / "flash_next" / "make_tiny_checkpoint.py"
 
+DENSE_EXACT_MAX_TOKENS = 2048  # dense attention equals QSA while every query sees <= 512 complete 4-token blocks
+
+
+def dense_reference_prompts(reference: dict) -> list[dict]:
+    """The reference prompts a dense-mode (QsaMode.DENSE) test may use: prompt plus the generated tokens
+    fit the exact range."""
+    limit = DENSE_EXACT_MAX_TOKENS - int(reference["max_new_tokens"])
+    return [p for p in reference["prompts"] if len(p["prompt_ids"]) <= limit]
+
 
 def build_tiny_checkpoint(out_dir: Path, fixture: Path | None = None) -> Path:
     """Write the tiny Flash-Next checkpoint into ``out_dir`` (a subdirectory is created) and return it.
