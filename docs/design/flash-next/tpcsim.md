@@ -100,3 +100,26 @@ itself and exports `PYTHONPATH=/work`, so run it from a worktree root.
   replicate the test's compile/run steps in `/tmp` inside the container.
 - Do not run pytest without `--noconftest` in the container:
   `tests/unit_tests/conftest.py` imports vLLM, which is not installed.
+
+## Known compiler hazard: in-place tensors
+
+tpc-clang treats `v_bf16_ld_tnsr_b` and `v_bf16_st_tnsr` on the same tensor as
+independent and freely reorders them, even though they touch the same
+addresses. A kernel that reads and writes a tensor in place (e.g.
+`conv_silu_block` in `gdn_core_decode_gaudi2.c` when
+`load_slot == store_slot`) must make every store data-depend on every load of
+the same addresses, otherwise the compiler hoists the stores above the loads
+and the loads read the new data. The guard pattern is to predicate each stored
+value on a comparison with the load that is never true (`h0 > +inf` is false
+for every value, NaN included), which makes the store depend on the load
+without changing the bits:
+
+```c
+const bool128 never = v_bf16_cmp_grt_b(h0, (bf16)(1.0f / 0.0f));
+const bfloat128 s1 = v_bf16_mov_vb(h0, 0, h1, never, 0);
+```
+
+`aso(1, 1)` does not fix the reorder and tpc-clang has no aliasing option. The
+aliased rows of the GDN simulator test (`tp8_mixed`, `tp4_silu` in
+`tests/standalone/gdn_core_decode/test_simulation.py`, the rows with
+`load_indices[r] == store_indices[r]`) catch a broken guard.
