@@ -78,8 +78,11 @@ def _recurrent_config(prefix_caching=True, is_hybrid=True, max_num_seqs=32):
 
 
 def _clear_pool_env(monkeypatch):
+    # setenv first so monkeypatch records the original value: the hook writes
+    # os.environ directly, and delenv on an absent variable records nothing.
     for name in POOL_ENV_VARS:
-        monkeypatch.delenv(name, raising=False)
+        monkeypatch.setenv(name, "")
+        monkeypatch.delenv(name)
 
 
 def test_compact_gdn_with_prefix_caching_raises(monkeypatch):
