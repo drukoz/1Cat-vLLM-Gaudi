@@ -79,3 +79,9 @@ def register_model():
     import vllm_gaudi.models.kimi_k25_vit  # noqa: F401
     import vllm_gaudi.models.kimi_k25  # noqa: F401
     import vllm_gaudi.models.gemma4_mm  # noqa: F401
+
+    # Flash-Next (Qwen4Exp). Registered after vllm_gaudi.models.qwen3_5 so the
+    # GDN/MoE replacements are in place before the upstream model module binds
+    # them (the package re-imports both defensively).
+    from vllm_gaudi.models.qwen4_exp import register as _register_flash_next
+    _register_flash_next()
