@@ -14,6 +14,8 @@ import vllm_gaudi.models.qwen3_5 as _qwen3_5  # noqa: F401  (must precede the up
 import vllm_gaudi.models.qwen3_next as _qwen3_next  # noqa: F401  (must precede the upstream model import)
 import vllm.models.qwen4_exp.nvidia.model as _upstream_model
 from vllm.model_executor.models.registry import ModelRegistry
+from vllm_gaudi.models.qwen4_exp.hyperconnection import HpuGatedResidual
+from vllm_gaudi.models.qwen4_exp.qsa import HpuQwen4ExpQSAAttention
 
 FLASH_NEXT_ARCHS = ("Qwen4ExpForConditionalGeneration", "Qwen4ExpForCausalLM")
 
@@ -27,13 +29,17 @@ class HpuQwen4ExpForCausalLM(_upstream_model.Qwen4ExpForCausalLM):
 
 
 def apply_flash_next_patches() -> None:
-    """Make the fork's GDN/MoE replacements effective on the Flash-Next model.
+    """Make the fork's GDN/MoE/HyperConnection/QSA replacements effective on the Flash-Next model.
 
-    The replacements are installed by importing ``vllm_gaudi.models.qwen3_5``
+    The GDN and MoE replacements are installed by importing ``vllm_gaudi.models.qwen3_5``
     and ``vllm_gaudi.models.qwen3_next`` (see module docstring); this asserts
-    the GDN binding reached the upstream model module. Later tasks add their
-    replacements (HyperConnection, PLE, QSA) here.
+    the GDN binding reached the upstream model module, and rebinds the
+    ``GatedResidual`` and ``Qwen4ExpQSAAttention`` names the upstream decoder
+    layer builds through at construction time. A later task adds its PLE
+    replacement at the end of this function.
     """
+    _upstream_model.GatedResidual = HpuGatedResidual
+    _upstream_model.Qwen4ExpQSAAttention = HpuQwen4ExpQSAAttention
     if _upstream_model.QwenGatedDeltaNetAttention is not _qwen3_5.HPUGatedDeltaNetAttention:
         raise RuntimeError("Flash-Next GDN replacement did not take: vllm_gaudi.models.qwen3_5 and "
                            "vllm_gaudi.models.qwen3_next must be imported before "
