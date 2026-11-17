@@ -1,12 +1,12 @@
 # RUK-2709 Flash-Next on Gaudi: system map
 
-Kind: **Program**. Version 0.2, 2026-11-17. Version 0.1 was written from a first reading of the repository, the model's public configuration and upstream vLLM / vllm-gaudi. Version 0.2 adds the user's answers to the question card (launch commands, versions, logs, topology, hardware access) and the first two research reports (R2 on the model runner, R4 on upstream's Flash-Next package). Facts carry a file path, a log line or a URL. Rows marked *(unverified)* wait for a research subtask or for the user.
+Kind: **Program**. Version 0.3, 2026-11-17. Version 0.3 changes the verification model (assumption 3, section 14): hardware is rented, so all code is written and checked on CPU first, and one rental session runs a single qualification run sheet. Section 16 maps the user's TP8 checklist onto the milestones. Version 0.2, 2026-11-17. Version 0.1 was written from a first reading of the repository, the model's public configuration and upstream vLLM / vllm-gaudi. Version 0.2 adds the user's answers to the question card (launch commands, versions, logs, topology, hardware access) and the first two research reports (R2 on the model runner, R4 on upstream's Flash-Next package). Facts carry a file path, a log line or a URL. Rows marked *(unverified)* wait for a research subtask or for the user.
 
 ## Assumptions
 
 1. The base of all work is this fork (`drukoz/1Cat-vLLM-Gaudi`, identical to `1CatAI/1Cat-vLLM-Gaudi` `main` at `e2266e0`), not upstream `vllm-project/vllm-gaudi`. The request asks to audit 1Cat's kernels and reuse its DFlash2 work; upstream fixes are cherry-picked, not rebased onto.
 2. The model is **Qwen3.8-Flash-Next** (`Qwen/Qwen3.8-Flash-Next`, architecture `Qwen4ExpForConditionalGeneration`); "Swift-1.5 Flash-Next" is the company's name for it. **No Flash-Next run exists yet on the Gaudi box.** Every measurement so far (section 11) used the dense Qwen3.8-27B (`Qwen3_5ForConditionalGeneration`), in BF16 or FP8, on the stock vllm-gaudi image or on this fork. The user has not quantized Flash-Next. The first Flash-Next bring-up is therefore **BF16 at TP8 on one server**, the only layout in which the 335 GiB checkpoint fits without host offload (section 2a); the production layout of two TP4 servers needs the published FP8 checkpoint or PLE host offload and comes later (M4).
-3. **No Gaudi hardware for agents** (user's answer: static work and CPU tests only). Everything is verified here with CPU unit tests (the fork's own pattern: hardware tests skip without an HPU). Every hardware step is a **run sheet**: exact commands, the log lines to capture, and a results table, executed by the user, who posts the results as a comment. The kernel audit (program item 1) is a static audit plus a profiling run sheet.
+3. **No Gaudi hardware for agents, and hardware time is rented** (user's answers, 2026-11-17: "testing cost money since we will be renting a server so lets make all the changes we need before testing"). All code for every milestone is written and passes the CPU gates in section 14 **before** the server is rented. Hardware steps are collected into **one qualification run sheet**, ordered fail-fast, that the user executes in a rental session and posts back. The kernel audit (program item 1) is a static audit; its profiling is a stage of that run sheet.
 4. The repository has no Dev branch; `main` is the base branch and the program's pull request targets it as a draft until the program is done.
 5. Existing routes (Qwen3.5 / Qwen3.8-27B GDN, DeepSeek V4 / V4.1, MiniMax M3 / H3) must not regress, but get no new work.
 6. **Engine pin.** The program builds against vLLM commit `8f816a3f665489d7f0d222115d4f72ebab01076b` (2026-09-04), the commit the user runs this fork against on the box. It already contains Flash-Next (260 commits after the 2026-08-31 merge). Later upstream Flash-Next fixes are backported into the plugin's own copy of the model (R4b lists them). Moving the fork to a newer vLLM (0.30.0 or later, where `_Fp8OnlineLinearBase` is gone and the V1 model runner was removed upstream) is a separate program, not this one.
@@ -184,7 +184,19 @@ Answered on 2026-11-17 (interaction on RUK-2709): launch commands (section 11), 
 
 ## 14. Program shape and verification model
 
-Each milestone ends in three things: CPU unit tests green on this Mac (S0's gate), a Tech-Lead-reviewed pull request into the program branch, and a **run sheet** under `docs/design/flash-next/run-sheets/` that the user executes on the node; the user's results come back as a comment and are recorded in this document. Milestones as vertical slices, in the order the reference measurements dictate:
+**Code-complete before rental (since v0.3).** Each milestone ends in a Tech-Lead-reviewed merge into the program branch and a **stage** of the qualification run sheet (`docs/design/flash-next/run-sheets/qualification.md`); no milestone waits for hardware. The CPU gates every change must pass on this Mac:
+
+1. **Import and unit tests**: the plugin and the new model package import on CPU at the pin, and the unit tests S0 records as CPU-runnable stay green.
+2. **Eight-rank CPU simulation** (spike S3, RUK-2732): eight `gloo` processes run each sharded layer (linear, embedding, GDN head split, QSA KV and indexer-head replication, MoE sharding, the HyperConnection and PLE paths) at TP1, TP2, TP4 and TP8, compared with the unsharded output, and every rank's collective sequence is recorded and compared. This covers checklist item 5's "per-kernel correctness against unsharded outputs" for every PyTorch path before rental.
+3. **Native-code compile check**: the TPC kernels and the C++ bridges (`csrc/`, `tools/build_flashinfer_gaudi.py`, the fused AllReduce bridge) need the Gaudi toolchain (`tpc-clang` from `habanalabs-tools`), which this Mac lacks (no Docker either). They compile on any x86-64 Linux machine with the Gaudi image (`vault.habana.ai/gaudi-docker/1.24.1/...`), no Gaudi card needed. Until the user provides such a machine, native code is written but marked *compile-unchecked* in the run sheet, and stage 1 of the run sheet compiles it first.
+
+What no CPU gate can check, and the run sheet must: HPU graph compilation and recompiles, TPC kernel numerics, HCCL behaviour and latency, memory fit, and every performance number.
+
+**Every new path ships behind a flag, default off**, with the CPU-verified PyTorch path as the default. A failure during the rental session is then answered by turning one flag off, not by debugging on rented time; the logs come back and the fix is made offline.
+
+**The qualification run sheet is ordered fail-fast**, cheapest and most informative first, each stage with a stop rule and the lines to capture: (1) build and native compile; (2) TP8 BF16 startup with the PyTorch paths, memory lines, greedy outputs against the CPU reference on short prompts; (3) flag-by-flag A/B of each native kernel and fusion against its PyTorch path (correctness first, then time); (4) R7's scheduler variants and prefix-cache hit rate; (5) TP1/TP2/TP4/TP8, PP2×TP4 and TP+EP throughput and latency; (6) 128K–262K contexts and the eight-agent stress run with quality checks. Startup costs about 400 s per launch (section 11), so the sheet groups variants by launch and reuses the compile cache (fork PR #62, "reuse completed startup compilation").
+
+Milestones as vertical slices, in the order the reference measurements dictate:
 
 - **M0 Foundations.** Mac CPU environment and test gate (S0); run-sheet template and a replay harness for the agent workload (needs the user's client details); Flash-Next OOT model class on HPU, copied from upstream `nvidia/model.py` + `mtp.py` at the pin with the CUDA seams replaced (torch HyperConnection, torch PLE conv/gate with the table on device, dense paged attention as the first QSA fallback, MoE through the existing HPU path, GDN through `HPUGatedDeltaNetAttention`), the runner's architecture allow-list extended, R4b's carry list applied; first bring-up run sheet at **TP8 BF16 on one server** with correctness checks (greedy outputs against a CPU reference on short prompts) and the memory lines to capture.
 - **M1 Admission, prefill and prefix reuse.** Config-only scheduling fixes from R7's run sheet first (per-step budget, long-prefill threshold), then code where the plugin caps it; long-prompt prefill at TP8/TP4 (chunking, GDN prefill for the new head shapes, attention prefill at 128K, bucket shapes, recompiles); prefix caching that hits for the hybrid model (`VLLM_COMPACT_GDN=0` qualification, cherry-picks #1831/#1853/#1828/#1890/#1895, client-side prefix alignment), measured by first-token latency and hit rate on the agent workload.
@@ -200,9 +212,36 @@ Each milestone ends in three things: CPU unit tests green on this Mac (S0's gate
 | S0 Mac CPU environment and test gate (RUK-2717) | Engineer 2, review Tech Lead 1 | in progress; pin corrected to `8f816a3f` |
 | R1 GDN flag and dispatch inventory (RUK-2718) | General Agent | todo; scope extended with the user's log lines |
 | R2 runner hybrid / prefix-caching / speculative map (RUK-2719) | Engineer 1 | done, approved; facts in section 7 |
-| R3 upstream vllm-gaudi delta (RUK-2720) | Engineer 3 | in progress |
+| R3 upstream vllm-gaudi delta (RUK-2720) | Engineer 3 | done, approved |
 | R4 upstream Qwen4Exp map at v0.34.0 (RUK-2721) | Engineer 4 | done, approved; facts in section 12 |
-| R4b upstream Flash-Next delta pin → v0.34.0 (RUK-2729) | Engineer 4 | todo |
-| R5 DeepSeek V4.1 reuse candidates (RUK-2722) | Engineer 5 | in progress |
+| R4b upstream Flash-Next delta pin → v0.34.0 (RUK-2729) | Engineer 4 | done, approved: 194 commits, 62 HPU-relevant, carry list of 21 fixes |
+| R5 DeepSeek V4.1 reuse candidates (RUK-2722) | Engineer 5 | done, approved |
 | R6 MoE / FP8 / EP inventory (RUK-2723) | Engineer 6 | todo |
-| R7 long-prompt admission and chunking, run sheet (RUK-2728) | Engineer 1 | todo |
+| R7 long-prompt admission and chunking, run sheet (RUK-2728) | Engineer 1 | done, approved; its variants become run-sheet stage 4 |
+| S3 eight-rank CPU tensor-parallel harness (RUK-2732) | Engineer 1 | todo, blocked by S0 |
+
+## 16. The user's TP8 checklist, mapped (2026-11-17)
+
+The user posted a checklist (written with ChatGPT) on RUK-2729. Each item, where it goes, and whether it can be done and checked before rental. "CPU" means checked by the section 14 gates; "rental" means a run-sheet stage.
+
+| # | Item | Milestone | Before rental? | Note |
+|---|---|---|---|---|
+| 1a | GDN prefill for 2 key / 6 value heads per rank | M0 PyTorch path, M2 native tactic | PyTorch: yes (CPU). Native: written, compile-unchecked, A/B in stage 3 | `flashinfer_gaudi_adapter.py:90` admits only (16,48) and (8,24) |
+| 1b | Fused GDN decode and state layouts for TP8 | M2 | same as 1a | State per sequence per rank 14 MB at TP8 (section 2a) |
+| 1c | Replicated attention KV heads on 8 ranks | M0 | yes (CPU) | vLLM already replicates 2 KV heads to 8 ranks; our work is the QSA indexer (4 query heads, 1 key head: must replicate at TP8) and the HPU attention backend with 1 KV head per rank |
+| 1d | Remove TP1/TP2 shape gates from kernels | M2 | gates opened only for shapes with a CPU reference; native stays behind flags | |
+| 2a | Generalize fused AllReduce + residual + RMSNorm | M4 | written and order-checked on CPU; native bridge compile-unchecked | `vllm_gaudi/distributed/tp2_fused_ar_norm.py` has TP2 and TP4 entries (`initialize_tp4_allreduce_runtime` requires 4 ranks); TP8 is new |
+| 2b | Eight-rank HCCL latency for decode-sized messages | M4 | no: a measurement | Stage 5 |
+| 2c | Overlap communication with independent compute | M5, optional | written behind a flag only after 2b shows communication matters | The change most likely to hang when untested; it is last |
+| 2d | Identical collective order on every rank | every milestone | yes (CPU) | S3 records and compares every rank's collective sequence |
+| 3a–3c | Compiled multi-region decoder, prepared buffers, native replay with fixed addresses and completion events at TP8 | M5, optional | no | Native replay exists only for DeepSeek V4.1 at TP4. Fixed addresses and completion events cannot be checked off hardware; building it blind is the costliest way to spend a rental. It starts after stage 5 shows host overhead is the bottleneck |
+| 3d | Distributed state updates, cancellation, recovery | M2, M3 | yes for state bookkeeping (CPU, 8 ranks) | |
+| 4a | Flash-Next operations in rank-local TP8 layouts | M0 | yes (CPU) | The first bring-up layout (BF16 TP8) |
+| 4b | Eight-way MoE sharding and EP comparison | M0 sharding, M4 EP | sharding yes (CPU); EP comparison is stage 5 | MoE intermediate 640 / 8 = 80 per rank: the published block-FP8 checkpoint (128-wide blocks) cannot shard at TP8, so FP8 needs TP4 or TP+EP (vLLM recipe) |
+| 4c | Distributed draft verification, recurrent-state snapshots, rollback | M3 | yes (CPU) | MTP through the EAGLE proposer; rollback-safe GDN checkpoints from DFlash2 (`gdn_state_layout.py`) |
+| 4d | FP8, long contexts, concurrent agents | M1, M4 | no | Stages 4–6 |
+| 5a | Per-kernel correctness against unsharded outputs | every milestone | PyTorch paths yes (S3); native kernels in stage 3 | |
+| 5b | Compare TP1, TP2, TP4, TP8, PP2×TP4 | M4 | no | BF16 fits only at TP8 (section 2a), so TP1–TP4 need FP8 or PLE host offload. PP needs upstream #60234 (pipeline parallel for PLE + MTP, on R4b's carry list) |
+| 5c | Per-request decode latency and aggregate throughput | M4 | no | Stage 5 |
+| 5d | Long-context and eight-agent stress with quality checks | M1–M4 | no | Stage 6 |
+
