@@ -12,11 +12,11 @@ static inline float64_pair_t gdn_core_recurrence_head(
     float64 out_lo = 0.0f;
     float64 out_hi = 0.0f;
 
-    for (int half = 0; half < 2; ++half) {
-        const float64 v_half = half == 0 ? v.v1 : v.v2;
+    for (int vh = 0; vh < 2; ++vh) {
+        const float64 v_half = vh == 0 ? v.v1 : v.v2;
         float64 out_half = 0.0f;
         for (int lane = 0; lane < 64; ++lane) {
-            const int value_row = half * 64 + lane;
+            const int value_row = vh * 64 + lane;
 
             int5 load_coords = {0, value_row, value_head, load_slot, 0};
             float64 state_lo = v_f32_ld_tnsr_b(load_coords, ssm_state);
@@ -52,7 +52,7 @@ static inline float64_pair_t gdn_core_recurrence_head(
             out_value = v_broadcast_element_f32(out_value, 0);
             out_half = v_f32_mov_vb(out_value, 0, out_half, row_lane);
         }
-        if (half == 0) {
+        if (vh == 0) {
             out_lo = out_half;
         } else {
             out_hi = out_half;
