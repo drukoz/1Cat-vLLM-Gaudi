@@ -686,6 +686,8 @@ facts 30-36).
   generator writes **163 tensors**: the 132 of the M2 checkpoint plus the 31 `mtp.*` tensors the drafter loads
   (system map §17 fact 32) — and the six-prompt `reference.json` (prompt 6 is the 2600-token one, stage 3a).
 - Checkpoint `/models/Qwen3.8-Flash-Next` (on the node; stage 2b's path).
+- Stage 3a's `/tmp/3a-tiny-sparse.txt` from this session: the MTP-off baseline the lossless check compares with (3a
+  builds the same M3 checkpoint). If 3a was skipped, run its sparse tiny side first.
 - Every 3e launch runs with prefix caching OFF and compact GDN ON. The platform refuses Flash-Next speculation with
   prefix caching until T10b (the startup error names `--no-enable-prefix-caching`; plan v0.4, M3 design: Platform;
   fact 30: the mamba cache mode is `none`), and the M3 design requires compact GDN (`VLLM_COMPACT_GDN=1` — the default
@@ -717,9 +719,10 @@ Then stage 2a's "Send the prompts and compare" block (`CKPT=/models/tiny-flash-n
 <the stage 2a compare block> | tee /tmp/3e-tiny-mtp.txt   # six prompts, from reference.json
 ```
 
-Pass: all six prompts 16/16 — the generated ids equal `reference.json`'s `generated_ids` **exactly** (greedy
-speculative decoding is lossless) — and the capture shows at least one `SpecDecoding metrics` line with `Drafted:`
-above 0 tokens (the drafter ran). Any token difference is the stage's first stop rule. Stop the server.
+Pass: every prompt's match count and first differing position equal the MTP-off lines in `/tmp/3a-tiny-sparse.txt`
+(stage 3a, same stack and QSA mode; greedy speculative decoding is lossless, so the drafter must not change the
+tokens), and the capture shows at least one `SpecDecoding metrics` line with `Drafted:` above 0 tokens (the drafter
+ran). A difference from 3a's lines is judged by the stop rule below. Stop the server.
 
 (ii) Real checkpoint, TP8 BF16, MTP on (k = 3), sparse QSA — coherence on stage 2b's 8 prompts:
 ```bash
@@ -787,7 +790,7 @@ done
 Decode tok/s per agent = 1000 / Mean TPOT (ms); total decode tok/s = Output token throughput; wall time = Benchmark
 duration (s). During each sweep, from a second shell, the stage 3d stats lines plus the acceptance line — one
 `SpecDecoding metrics` line per stats interval, each covering its own interval (the counters reset after printing,
-`vllm/v1/spec_decode/metrics.py:135`): record the last line before the sweep ends.
+`vllm/v1/spec_decode/metrics.py:137`): record the last line before the sweep ends.
 
 ```bash
 docker logs fn3e-k1 2>&1 | grep -E "SpecDecoding metrics|Avg generation throughput|Running: " | tail -n 20
@@ -814,7 +817,7 @@ docker logs <name> 2>&1 | grep -i -E "recompil|graph compile|bucket|warmup finis
 
 | Check | Expected | Observed | Pass? |
 |---|---|---|---|
-| Tiny, six prompts, MTP k = 3, greedy | 6/6 prompts 16/16, exactly equal to `reference.json` | | |
+| Tiny, six prompts, MTP k = 3, greedy | each line equal to `/tmp/3a-tiny-sparse.txt` (MTP off) | | |
 | Tiny, `SpecDecoding metrics` line | present, with Drafted above 0 tokens | | |
 | fn3e-k3, `Loading drafter model weights took … GB` | present | | |
 | fn3e-k3, `Flash-Next QSA side caches` | `13 layers` (12 target + the drafter's) | | |
@@ -843,13 +846,14 @@ wall = Benchmark duration s; acceptance columns from the last `SpecDecoding metr
 | 3 | fn3e-k3 | 32 | 128 | | | | | | |
 
 #### Stop rule
-Tiny-model tokens differ from `reference.json` on any prompt at any position → **stop the session**, post
-`/tmp/3e-tiny-mtp.txt`, the first-differing positions and the fn3e-tiny captures: greedy MTP is lossless, so a token
-difference is a correctness bug (this check has no bf16-divergence allowance — token ids are compared with the
-drafter on, and stage 2a's same-stack run is the same-token baseline).
+Tiny model with MTP on: any of prompts 1–3 below 16/16, or any prompt diverging from `reference.json` within its
+first 4 tokens where `/tmp/3a-tiny-sparse.txt` did not → **stop the session**, post `/tmp/3e-tiny-mtp.txt`,
+`/tmp/3a-tiny-sparse.txt` and the fn3e-tiny captures: greedy MTP is lossless, so that is a correctness bug. A later
+divergence on prompts 4–6 that 3a's MTP-off line does not show is a warning, not a stop (the verify pass scores k + 1
+tokens in one bf16 forward, so near-ties can flip, as in stages 2a and 3a): record both first-diff positions.
 Mean acceptance length below 1.3 at k = 3 on the real model (fn3e-k3, the `SpecDecoding metrics` lines during its
-sweep) → finish the k = 3 sweep, record its four rows, and skip the k = 1 and k = 2 launches: k = 3 is the largest
-acceptance the method can reach, and 1.3 tokens per step there is not enough payoff to time.
+sweep) → finish the k = 3 sweep, record its four rows, and skip the k = 1 and k = 2 launches: k = 3 drafts the most
+tokens per step, so k = 1 and 2 accept no more per step, and 1.3 tokens per step is not enough payoff to time.
 A crash at startup on any 3e launch → post the full traceback and that launch's capture greps, then relaunch with
 MTP off (drop the `--speculative-config` line) to confirm the rest of the sheet.
 Gibberish or repetition loops in fn3e-k3's coherence answers → stop, post `/tmp/3e-k3-coherence.txt` and the captures
