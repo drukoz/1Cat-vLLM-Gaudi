@@ -28,6 +28,8 @@ from vllm.model_executor.layers.mamba.abstract import MambaBase  # noqa: E402
 from vllm_gaudi.models.qwen4_exp import HpuQwen4ExpForConditionalGeneration  # noqa: E402
 from vllm_gaudi.models.qwen4_exp.hyperconnection import HpuGatedResidual  # noqa: E402
 from vllm_gaudi.models.qwen4_exp.qsa import HpuQwen4ExpQSAAttention  # noqa: E402
+from vllm_gaudi.v1.core.recurrent_state_pool import (  # noqa: E402
+    num_recurrent_groups, recurrent_positions)
 
 from tests.unit_tests.models.flash_next.cpu_model import (  # noqa: E402
     SdpaAttention, cpu_model, use_sdpa_attention)
@@ -135,6 +137,17 @@ def test_kv_cache_specs(model_bf16):
     assert spec.block_size == 128
     assert spec.dtype == torch.bfloat16
     assert spec.page_size_bytes == 32768
+
+
+def test_recurrent_pool_grouping(model_bf16):
+    """The pool contract groups the tiny model like the runner shares its state tensors (M1-T1)."""
+    vllm_config, _ = model_bf16
+    layers = get_layers_from_vllm_config(vllm_config, AttentionLayerBase)
+    specs = {name: layer.get_kv_cache_spec(vllm_config) for name, layer in layers.items()}
+
+    positions = recurrent_positions(specs)
+    assert {spec.mamba_type.name: pos for spec, pos in positions.items()} == {"GDN_ATTN": 1, "SHORT_CONV": 1}
+    assert num_recurrent_groups(specs) == 4
 
 
 def test_fp32_conversion(tiny_checkpoint):
