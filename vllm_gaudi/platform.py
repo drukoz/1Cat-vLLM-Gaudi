@@ -37,6 +37,9 @@ torch.accelerator.get_memory_info = _hpu_get_memory_info
 QWEN3_5_HYBRID_ARCHS = frozenset({
     "Qwen3_5ForConditionalGeneration",
     "Qwen3_5MoeForConditionalGeneration",
+    # Qwen3.8-Flash-Next shares the Qwen3.5 GDN hybrid layout
+    "Qwen4ExpForConditionalGeneration",
+    "Qwen4ExpForCausalLM",
 })
 
 _QWEN38_DFLASH2_DRAFT_FIELDS = {
