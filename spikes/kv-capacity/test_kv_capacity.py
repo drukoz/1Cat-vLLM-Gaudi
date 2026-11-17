@@ -9,9 +9,18 @@ import kv_capacity
 CONFIG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "configs")
 
 
+GIB = 1024**3
+
+
 def geom_27b():
     import json
     with open(os.path.join(CONFIG_DIR, "Qwen3.8-27B.json"), encoding="utf-8") as f:
+        return kv_capacity.geometry(json.load(f))
+
+
+def geom_fn():
+    import json
+    with open(os.path.join(CONFIG_DIR, "Qwen3.8-Flash-Next.json"), encoding="utf-8") as f:
         return kv_capacity.geometry(json.load(f))
 
 
@@ -49,3 +58,46 @@ def test_vllm_spec_cross_check():
         block_size=-1,
     )
     assert lay["gdn_real"] == mamba.page_size_bytes
+
+
+def test_flash_next_ple_geometry():
+    # Flash-Next has one PLE layer (ple_layer_ids [2]); its state per slot is
+    # hc_count * hidden_size * (ple_conv_kernel_size - 1) * ngram_size * 2 bytes, bf16,
+    # replicated on every rank. The 27B has no PLE.
+    fn = geom_fn()
+    assert fn["ple_layers"] == 1
+    assert fn["ple_state"] == 4 * 2560 * 3 * 3 * 2 == 184320
+    assert geom_27b()["ple_layers"] == 0
+    assert geom_27b()["ple_state"] == 0
+
+
+def test_flash_next_today_both_factors():
+    # Flash-Next TP8 BF16 40 GiB, today's allocation: the GDN factor page/(page+gdn_real)
+    # and the PLE standard-mamba factor page/(page+ple_state), each truncated as in
+    # hpu_worker.py:1128 and :1155. Page 524288 = 4 * 131072, gdn_real 400896, 12 layers.
+    page, gdn_real, ple_state, positions = 524288, 400896, 184320, 12
+    expected = int(int(40 * GIB * page / (page + gdn_real)) * page / (page + ple_state)) // (positions * page)
+    assert expected == 2862  # the spec's worked example
+    lay = kv_capacity.layout(geom_fn(), tp=8, kv_bytes=2, budget_gib=40)
+    assert (lay["page"], lay["gdn_real"], lay["ple_state"], lay["positions"]) == (page, gdn_real, ple_state,
+                                                                                   positions)
+    assert lay["today"]["blocks"] == expected
+
+
+def test_flash_next_pool():
+    # The recurrent state pool: slots = max_num_seqs * groups * 3 + cache_slots (32 * 4 * 3
+    # + 512 = 896 for Flash-Next: 3 GDN groups + 1 PLE group), pool bytes =
+    # (slots + 2) * (positions * gdn_real + ple_layers * ple_state); the attention blocks
+    # the budget leaves must exceed today's, and concurrency reports both terms.
+    lay = kv_capacity.layout(geom_fn(), tp=8, kv_bytes=2, budget_gib=40)
+    assert lay["groups"] == 4
+    assert lay["slots"] == 32 * 4 * 3 + 512 == 896
+    assert lay["pool"]["bytes"] == 898 * (12 * 400896 + 184320)
+    assert lay["pool"]["blocks"] > lay["today"]["blocks"]
+    assert lay["pool"]["concurrency"] == min(lay["pool"]["attn_term"], lay["pool"]["slots_term"])
+    assert lay["pool"]["attn_term"] == lay["pool"]["blocks"] / 256  # cdiv(131072 * 1024, 524288)
+    assert lay["pool"]["slots_term"] == 896 / (4 * 3)
+    # --pool-slots 896 is the default for this layout; an override changes the pool blocks.
+    override = kv_capacity.layout(geom_fn(), tp=8, kv_bytes=2, budget_gib=40, pool_slots=1024)
+    assert override["slots"] == 1024
+    assert override["pool"]["blocks"] < lay["pool"]["blocks"]
