@@ -45,23 +45,27 @@ from vllm_gaudi.models.qwen4_exp.qsa import HpuQwen4ExpQSAAttention  # noqa: E40
 _MAKER = Path(__file__).resolve().parents[4] / "tools" / "flash_next" / "make_tiny_checkpoint.py"
 
 
-def build_tiny_checkpoint(out_dir: Path) -> Path:
+def build_tiny_checkpoint(out_dir: Path, fixture: Path | None = None) -> Path:
     """Write the tiny Flash-Next checkpoint into ``out_dir`` (a subdirectory is created) and return it.
 
     Runs ``tools/flash_next/make_tiny_checkpoint.py --out <out_dir> --skip-tokenizer`` as a
     subprocess with the current environment: the builder drives transformers, whose
     ``CONFIG_MAPPING["qwen4_exp"]`` entry vLLM's ``create_engine_config()`` replaces
-    in-process, so builder and engine config must not share a process.
+    in-process, so builder and engine config must not share a process. When ``fixture`` is
+    given, passes ``--fixture <path>`` to build from that config instead of the default
+    ``tiny_config.json``.
 
     Writes ``config.json``, ``model.safetensors`` (132 tensors, 134,454,704 bytes: bf16
     weights plus the int64 PLE index tables) and ``reference.json`` (the deterministic HF
-    CPU oracle, byte-equal to the committed ``tests/unit_tests/models/flash_next/reference.json``).
+    CPU oracle, byte-equal to the committed ``tests/unit_tests/models/flash_next/reference.json``
+    only for the default fixture; a non-default fixture regenerates its own reference).
     """
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    subprocess.run([sys.executable, str(_MAKER), "--out", str(out_dir), "--skip-tokenizer"],
-                   check=True,
-                   env=os.environ.copy())
+    cmd = [sys.executable, str(_MAKER), "--out", str(out_dir), "--skip-tokenizer"]
+    if fixture is not None:
+        cmd += ["--fixture", str(fixture)]
+    subprocess.run(cmd, check=True, env=os.environ.copy())
     return out_dir
 
 
