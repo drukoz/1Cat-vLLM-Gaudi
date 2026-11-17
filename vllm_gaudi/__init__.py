@@ -101,6 +101,13 @@ def register_ops():
     from flashinfer_gaudi import load_native_extensions
 
     load_native_extensions()
+    from vllm_gaudi import envs as _gaudi_envs
+
+    if _gaudi_envs.VLLM_HPU_GDN_CORE_DECODE:
+        # Before warmup: the loader prepends libgdn_fused_gaudi2.so to GC_KERNEL_PATH.
+        from flashinfer_gaudi._native import load_gdn_fused_extension
+
+        load_gdn_fused_extension()
     import vllm_gaudi.attention.oot_mla  # noqa: F401
     """Register custom ops for the HPU platform."""
     import vllm_gaudi.v1.sample.hpu_rejection_sampler  # noqa: F401

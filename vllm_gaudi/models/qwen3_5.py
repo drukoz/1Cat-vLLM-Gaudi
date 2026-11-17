@@ -1,7 +1,14 @@
 import os
 
 import torch
+from flashinfer_gaudi.gdn_core_decode import (
+    GdnCoreDecodeMode,
+    GdnGateActivation,
+    gdn_core_decode,
+    gdn_core_decode_available,
+)
 from flashinfer_gaudi.gdn_decode import gated_delta_rule_mtp_packed
+from vllm.logger import init_logger
 from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import QwenGatedDeltaNetAttention
 from vllm.forward_context import get_forward_context
 from vllm_gaudi import envs
@@ -53,6 +60,8 @@ if _triton_gaudi_mode in ("hybrid", "strict"):
 else:
     _triton_gdn_decode_conv_packed = None
     _triton_gdn_decode_packed = None
+
+logger = init_logger(__name__)
 
 
 def _try_triton_gdn_decode_conv_packed(
@@ -235,6 +244,69 @@ class HPUGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 return result
 
             self.dt_bias.weight_loader = load_dt_bias_as_fp32
+
+        # Fused GDN core decode (track RUK-2812). GdnCoreDecodeMode(...) raises on an unknown value.
+        self.gdn_core_decode_mode = GdnCoreDecodeMode(envs.VLLM_HPU_GDN_CORE_DECODE)
+        self._gdn_core_gate = {"silu": GdnGateActivation.SILU, "sigmoid": GdnGateActivation.SIGMOID}.get(
+            getattr(self.norm, "activation", None))
+        self._gdn_core_ok = None  # None = not checked yet; then True/False, once per layer
+
+    def _gdn_core_decode_reason(self, conv_state: torch.Tensor, ssm_state: torch.Tensor) -> str | None:
+        """Why the fused core-decode op cannot serve this layer, or ``None`` when it can."""
+        if self._gdn_core_gate is None:
+            return f"output gate {self.norm.activation!r} is not silu or sigmoid"
+        if self.conv1d.bias is not None:
+            return "conv1d has a bias"
+        if self.conv_kernel_size != 4:
+            return f"conv kernel size {self.conv_kernel_size} is not 4"
+        if self.head_k_dim != self.head_v_dim:
+            return f"head dims k={self.head_k_dim} v={self.head_v_dim} differ"
+        if conv_state.dim() != 3 or conv_state.shape[1] != 3:
+            return f"conv state rows {tuple(conv_state.shape)} are not [S, 3, C]"
+        if ssm_state.dtype != torch.float32:
+            return f"ssm state dtype {ssm_state.dtype} is not fp32"
+        if _triton_gaudi_mode == "strict":
+            return "Triton strict mode runs the Triton-only decode graph"
+        if ssm_state.device.type == "hpu":
+            if self.head_v_dim != 128:
+                return f"the HPU kernel requires head_v_dim 128, got {self.head_v_dim}"
+            if not gdn_core_decode_available(ssm_state.device):
+                return "the gdn_fused_ops extension is not loaded"
+        if not gdn_core_decode_available(ssm_state.device):
+            return f"no gdn_core_decode kernel for {ssm_state.device.type}"
+        return None
+
+    def _maybe_gdn_core_decode(self, mixed_qkv, z, a, b, load_state_indices, store_state_indices, num_tokens,
+                               num_accepted_tokens):
+        """The fused core-decode op's ``[num_tokens, HV, D]`` fp32 output, or ``None`` for the torch path."""
+        if self.gdn_core_decode_mode != GdnCoreDecodeMode.FUSED:
+            return None
+        if num_accepted_tokens is not None or self._hpu_defer_ssm_writeback:
+            return None
+        if (load_state_indices is None or store_state_indices is None or load_state_indices.dim() != 1
+                or store_state_indices.dim() != 1 or load_state_indices.shape[0] != num_tokens
+                or store_state_indices.shape[0] != num_tokens):
+            return None
+        # The op indexes slots absolutely, so it always gets the full pools: a narrowed
+        # direct-state view would shift every index. The indices are absolute pool slots
+        # in every runner mode (compact pools pad with -1, which the op treats as padding).
+        conv_pool, ssm_pool = self.kv_cache[0], self.kv_cache[1]
+        if self._gdn_core_ok is None:
+            reason = self._gdn_core_decode_reason(conv_pool, ssm_pool)
+            self._gdn_core_ok = reason is None
+            if reason is not None:
+                logger.warning(
+                    "GDN core decode (VLLM_HPU_GDN_CORE_DECODE=%d) is off for %s: %s; using the torch decode path",
+                    int(self.gdn_core_decode_mode), getattr(self, "prefix", type(self).__name__), reason)
+        if not self._gdn_core_ok:
+            return None
+        weight = self.conv1d.weight
+        conv_weight_t = weight.view(weight.size(0), weight.size(2)).t().contiguous()
+        return gdn_core_decode(conv_pool, ssm_pool, mixed_qkv.contiguous(),
+                               z.reshape(num_tokens, -1).contiguous(), a.contiguous(), b.contiguous(),
+                               self.A_log.float(), self.dt_bias.float(), conv_weight_t, self.norm.weight,
+                               load_state_indices.to(torch.int32), store_state_indices.to(torch.int32),
+                               self.head_k_dim**-0.5, self.norm.eps, int(self._gdn_core_gate))
 
     def rearrange_mixed_qkv(self, mixed_qkv):
         """Pure-torch rearrange – avoids einops graph breaks on HPU."""
@@ -432,6 +504,11 @@ class HPUGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             device=hidden_states.device,
         )
 
+        gdn_core_out = None
+        if conv_state is not None and not is_prompt:
+            gdn_core_out = self._maybe_gdn_core_decode(mixed_qkv, z, a, b, load_state_indices, store_state_indices,
+                                                       num_tokens, num_accepted_tokens)
+
         if conv_state is None:
             # No attn_metadata — skip core attention (profile run)
             pass
@@ -563,6 +640,10 @@ class HPUGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
 
             non_spec_out = core_attn_out_result.squeeze(0)
             core_attn_out[:non_spec_out.shape[0]] = non_spec_out
+
+        elif gdn_core_out is not None:
+            # === Part 2c: fused core decode (conv, gates, recurrence, gated RMSNorm in one op) ===
+            core_attn_out = gdn_core_out.to(core_attn_out.dtype)
 
         else:
             # === Part 2b: Decode =====================================
@@ -744,7 +825,9 @@ class HPUGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         z_shape_og = z.shape
         core_attn_out = core_attn_out.reshape(-1, core_attn_out.shape[-1])
         z = z.reshape(-1, z.shape[-1])
-        if is_prompt and self.gdn_fused_rmsnorm_gated:
+        if gdn_core_out is not None:
+            pass  # gdn_core_decode already applied the gated RMSNorm
+        elif is_prompt and self.gdn_fused_rmsnorm_gated:
             core_attn_out = hpu_fused_rmsnorm_gated(
                 core_attn_out,
                 z,
