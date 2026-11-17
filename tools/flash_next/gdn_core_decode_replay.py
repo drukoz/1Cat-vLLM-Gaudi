@@ -85,8 +85,8 @@ def hpu_present() -> bool:
     except Exception:
         return False
     try:
-        return torch.cuda.is_available() and any(
-            "gaudi" in torch.cuda.get_device_name(i).lower() for i in range(torch.cuda.device_count()))
+        # Importing habana_frameworks.torch registers torch.hpu (Gaudi is not a CUDA device).
+        return bool(hasattr(torch, "hpu") and torch.hpu.is_available())
     except Exception:
         return False
 
