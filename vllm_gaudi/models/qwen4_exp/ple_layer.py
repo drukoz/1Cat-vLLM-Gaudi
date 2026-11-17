@@ -99,7 +99,11 @@ class HpuQwen4ExpPLELayer(Qwen4ExpPLELayer):
                 return gated
         if self.kv_cache[0].numel() == 0:
             return gated
-        if self.num_spec_tokens > 0 or getattr(md, "num_accepted_tokens", None) is not None:
+        is_prompt = bool(getattr(md, "is_prompt", False))
+        # A speculative-decode step carries the ``1 + num_spec`` token padding per sequence,
+        # which the batched short conv cannot express. Under an MTP speculative config the
+        # target prefill is not a decode step, so only the decode path is deferred to M3.
+        if (not is_prompt and self.num_spec_tokens > 0) or getattr(md, "num_accepted_tokens", None) is not None:
             raise NotImplementedError("PLE speculative decode is M3")
 
         conv_state = self.kv_cache[0]
@@ -122,7 +126,6 @@ class HpuQwen4ExpPLELayer(Qwen4ExpPLELayer):
         if tokens % rows != 0:
             raise ValueError(f"PLE token count {tokens} is not a multiple of the {rows} state rows")
         seq_len = tokens // rows
-        is_prompt = bool(getattr(md, "is_prompt", False))
 
         valid = (load >= 0) & (load < num_slots)
         init = view.index_select(0, torch.where(valid, load, torch.zeros_like(load)))
