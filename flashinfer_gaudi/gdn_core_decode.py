@@ -20,6 +20,12 @@ class GdnGateActivation(enum.IntEnum):
     SIGMOID = 1
 
 
+class GdnCoreDecodeMode(enum.IntEnum):
+    """VLLM_HPU_GDN_CORE_DECODE values (next free: 2)."""
+    OFF = 0
+    FUSED = 1
+
+
 def _require(cond: bool, msg: str) -> None:
     if not cond:
         raise ValueError(msg)
@@ -129,3 +135,74 @@ def gdn_core_decode_reference(
     new_hist = torch.cat([hist_raw[:, 1:3], raw[:, None, :]], dim=1)  # from original dtype values
     conv_state[store_valid] = new_hist.to(conv_state.dtype)
     return out
+
+
+# The torch.library op wrapper.  This module is the only place that defines the schema and the Meta
+# (fake) kernel; the HPU kernel comes from the C++ extension (K4b), which must not define them.
+
+_LIBRARY = torch.library.Library("flashinfer_gaudi", "FRAGMENT")
+
+_LIBRARY.define(
+    "gdn_core_decode("
+    "Tensor(a!) conv_state, Tensor(b!) ssm_state, Tensor mixed_qkv, Tensor z, Tensor a, Tensor b, "
+    "Tensor A_log, Tensor dt_bias, Tensor conv_weight_t, Tensor norm_weight, "
+    "Tensor load_indices, Tensor store_indices, "
+    "float scale, float eps, int gate_activation) -> Tensor")
+
+
+def _gdn_core_decode_cpu(conv_state, ssm_state, mixed_qkv, z, a, b, A_log, dt_bias, conv_weight_t, norm_weight,
+                         load_indices, store_indices, scale, eps, gate_activation):
+    return gdn_core_decode_reference(conv_state, ssm_state, mixed_qkv, z, a, b, A_log, dt_bias, conv_weight_t,
+                                     norm_weight, load_indices, store_indices, scale, eps, gate_activation)
+
+
+_LIBRARY.impl("gdn_core_decode", _gdn_core_decode_cpu, "CPU")
+
+
+@torch.library.register_fake("flashinfer_gaudi::gdn_core_decode", lib=_LIBRARY)
+def _gdn_core_decode_fake(conv_state, ssm_state, mixed_qkv, z, a, b, A_log, dt_bias, conv_weight_t, norm_weight,
+                          load_indices, store_indices, scale, eps, gate_activation):
+    # Allocation only: no mutation, no data access.
+    B = mixed_qkv.shape[0]
+    HV = ssm_state.shape[1]
+    D = ssm_state.shape[2]
+    return mixed_qkv.new_empty((B, HV, D), dtype=torch.float32)
+
+
+_DISPATCH_KEYS_BY_DEVICE_TYPE = {"cpu": "CPU", "hpu": "HPU"}
+
+
+def gdn_core_decode(
+    conv_state: torch.Tensor,
+    ssm_state: torch.Tensor,
+    mixed_qkv: torch.Tensor,
+    z: torch.Tensor,
+    a: torch.Tensor,
+    b: torch.Tensor,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    conv_weight_t: torch.Tensor,
+    norm_weight: torch.Tensor,
+    load_indices: torch.Tensor,
+    store_indices: torch.Tensor,
+    scale: float,
+    eps: float,
+    gate_activation: int,
+) -> torch.Tensor:
+    """The fused GDN core decode step as ``torch.ops.flashinfer_gaudi.gdn_core_decode``.
+
+    Mutates ``conv_state`` and ``ssm_state`` in place, returns ``[B, HV, D]`` fp32; semantics are
+    exactly ``gdn_core_decode_reference`` (contract: ``docs/design/flash-next/gdn-core-decode.md``).
+    """
+    return torch.ops.flashinfer_gaudi.gdn_core_decode(conv_state, ssm_state, mixed_qkv, z, a, b, A_log, dt_bias,
+                                                      conv_weight_t, norm_weight, load_indices, store_indices, scale,
+                                                      eps, int(gate_activation))
+
+
+def gdn_core_decode_available(device: torch.device | str) -> bool:
+    """True when ``flashinfer_gaudi::gdn_core_decode`` has a kernel for the device's type."""
+    device_type = device.type if isinstance(device, torch.device) else torch.device(device).type
+    dispatch_key = _DISPATCH_KEYS_BY_DEVICE_TYPE.get(device_type)
+    if dispatch_key is None:
+        return False
+    return torch._C._dispatch_has_kernel_for_dispatch_key("flashinfer_gaudi::gdn_core_decode", dispatch_key)
