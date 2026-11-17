@@ -526,6 +526,9 @@ if TYPE_CHECKING:
     VLLM_HPU_CGUID_DYNAMIC_QUANT_MAX_ROWS: int = 32
     VLLM_HPU_FUSED_GREEDY_LOGITS: bool = False
     VLLM_HPU_FLASH_NEXT_QSA_MODE: int = 0
+    VLLM_HPU_RECURRENT_STATE_POOL: int = 0  # RecurrentStatePoolMode: 0 off, 1 pool
+    VLLM_HPU_RECURRENT_STATE_POOL_SLOTS: int = 0  # resolved by the hook; positive overrides the formula
+    VLLM_HPU_RECURRENT_STATE_POOL_CACHE_SLOTS: int = 512  # retained prefix states added to the live need
 
 
 def _optional_bool_env(name: str) -> Optional[bool]:
@@ -1840,6 +1843,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # NotImplementedError.
     "VLLM_HPU_FLASH_NEXT_QSA_MODE":
     lambda: int(os.environ.get("VLLM_HPU_FLASH_NEXT_QSA_MODE", "0")),
+
+    # Recurrent (GDN / short-conv) state pool: 0 (default) keeps today's
+    # one-recurrent-slot-per-attention-block-id allocation, 1 gives the
+    # recurrent groups their own pool of VLLM_HPU_RECURRENT_STATE_POOL_SLOTS
+    # slots. The platform hook resolves the size at startup.
+    "VLLM_HPU_RECURRENT_STATE_POOL":
+    lambda: int(os.environ.get("VLLM_HPU_RECURRENT_STATE_POOL", "0")),
+    "VLLM_HPU_RECURRENT_STATE_POOL_SLOTS":
+    lambda: int(os.environ.get("VLLM_HPU_RECURRENT_STATE_POOL_SLOTS", "0")),
+    "VLLM_HPU_RECURRENT_STATE_POOL_CACHE_SLOTS":
+    lambda: int(os.environ.get("VLLM_HPU_RECURRENT_STATE_POOL_CACHE_SLOTS", "512")),
 }
 
 # end-env-vars-definition
