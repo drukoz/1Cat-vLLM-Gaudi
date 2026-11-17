@@ -169,14 +169,19 @@ class HpuQsaIndexer(nn.Module):
             if tail:
                 ring_write(self.key_ring, store.repeat_interleave(tail), positions2[:, n_full * ratio:].reshape(-1),
                            raw2[:, n_full * ratio:].reshape(-1, D))
-            # Visible keys per row are the compressed-cache prefix 0 .. last-block:
-            # the context blocks are already in the cache (written by the previous
-            # chunk / decode steps) and the chunk blocks were just written, both at
-            # their absolute block slot, so block i maps to tokens 4*i.
+            # Block keys per row in absolute block order (column i = tokens 4*i ..): the context
+            # rows come from the row's kernel blocks (block_list, rpb compressed rows each), the
+            # chunk's blocks go at ctx // ratio + j (overwriting a partial last context block).
+            n_ctx = 0 if md.block_list is None else md.block_list.numel() // rows
+            ctx_keys = (cache.view(-1, rpb, D)[md.block_list.long().clamp_min(0)].reshape(rows, n_ctx * rpb, D)
+                        if n_ctx else cache.new_zeros((rows, 0, D)))
+            all_rows = torch.cat((ctx_keys, cache.new_zeros((rows, n_full, D))), dim=1)
+            dst = (ctx // ratio)[:, None] + torch.arange(n_full, device=hidden.device)[None, :]
+            all_rows.scatter_(1, dst[..., None].expand(-1, -1, D), keys.view(rows, n_full, D).to(cache.dtype))
             q4 = q.view(rows, seq, H, D)
             out = cache.new_full((rows, seq, width), -1, dtype=torch.int32)
             for b in range(rows):
-                row_keys = cache[:int((positions2[b, -1] + 1) // ratio)]
+                row_keys = all_rows[b]
                 for lo in range(0, seq, self.SCORE_TILE):
                     hi = min(lo + self.SCORE_TILE, seq)
                     pos_tile = positions2[b, lo:hi]

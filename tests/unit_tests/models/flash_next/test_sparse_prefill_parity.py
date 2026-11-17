@@ -113,9 +113,10 @@ def test_selection_width_and_causality(tiny_checkpoint, monkeypatch):
 
     A monkeypatched wrapper on ``HpuQsaIndexer.select`` records the ``selected`` tensor of the
     sparse prefill: shape ``[2600, 2051]`` (``output_width = 512 * 4 + 3``), every entry ``-1``
-    (padding) or ``<=`` its row's position (causality), every row selects its own position
-    (a row with no valid entry gets an all ``-inf`` bias and FusedSDPA returns NaN for it),
-    and every row below the width selects EVERY position ``<=`` its own (count == position + 1).
+    (padding) or ``<=`` its row's position (causality), every row has at least one valid entry
+    (the M2-T5c contract: no all-invalid row, no all ``-inf`` bias, no FusedSDPA NaN), every
+    row at or above the width keeps at least ``block_topk * ratio = 2048`` valid entries, and
+    every row below the width selects EVERY position ``<=`` its own (count == position + 1).
     """
     reference = json.loads((tiny_checkpoint / "reference.json").read_text(encoding="utf-8"))
     long_prompt = next(p for p in reference["prompts"] if len(p["prompt_ids"]) == LONG_PROMPT)
@@ -141,9 +142,13 @@ def test_selection_width_and_causality(tiny_checkpoint, monkeypatch):
     assert selected.shape == (LONG_PROMPT, width), f"selected shape {tuple(selected.shape)} != (2600, 2051)"
     valid = selected >= 0
     assert bool(((~valid) | (selected <= positions[:, None])).all()), "selected carries a future position"
-    own = (selected == positions[:, None]).any(dim=-1)
-    assert bool(own.all()), f"rows without their own position: {(~own).nonzero().flatten()[:8].tolist()}"
     counts = valid.sum(dim=-1)
+    assert bool(valid.any(dim=-1).all()), (
+        f"rows with no valid entry (all -1): {(~valid).all(dim=-1).nonzero().flatten()[:8].tolist()} "
+        "- M2-T5c gives such a row an all -inf bias and FusedSDPA returns NaN")
+    wide = positions >= width
+    assert bool((counts[wide] >= width - 3).all()), (
+        f"rows >= {width} must keep >= {width - 3} valid entries, min observed {int(counts[wide].min())}")
     short = positions < width
     assert bool((counts[short] == positions[short] + 1).all()), (
         "a row below the width does not select every position <= its own")
