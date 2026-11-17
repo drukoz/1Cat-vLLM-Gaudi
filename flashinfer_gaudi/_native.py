@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import glob
+import importlib
 import os
 import threading
 from pathlib import Path
@@ -20,6 +21,7 @@ _SILU_MUL_QUANT_OP: Callable | None = None
 _BLOCK_FP8_DEQUANT_OP: Callable | None = None
 _BLOCK_FP8_LINEAR_OP: Callable | None = None
 _ADD_RMSNORM_QUANT_OP: Callable | None = None
+_GDN_FUSED_LOADED: bool | None = None  # None = not attempted
 
 
 def _library_candidates() -> list[str]:
@@ -41,17 +43,12 @@ def _library_candidates() -> list[str]:
     return unique
 
 
-def _configure_kernel_database_path() -> None:
-    package_lib = Path(__file__).resolve().parent / "lib"
-    kernel_db = package_lib / "libflashinfer_gaudi_kernels.so"
-    if not kernel_db.is_file():
-        return
+def _prepend_kernel_database(path: str) -> None:
     current = [entry for entry in os.environ.get("GC_KERNEL_PATH", "").split(os.pathsep) if entry]
-    kernel_path = str(kernel_db)
-    if kernel_path in current:
+    if path in current:
         return
 
-    configured = [kernel_path, *current]
+    configured = [path, *current]
     # Setting GC_KERNEL_PATH replaces SynapseAI's implicit default. Preserve
     # the stock kernel database when this package is the first component to
     # configure the variable.
@@ -59,6 +56,58 @@ def _configure_kernel_database_path() -> None:
     if not current and system_kernel_db.is_file():
         configured.append(str(system_kernel_db))
     os.environ["GC_KERNEL_PATH"] = os.pathsep.join(configured)
+
+
+def _configure_kernel_database_path() -> None:
+    package_lib = Path(__file__).resolve().parent / "lib"
+    kernel_db = package_lib / "libflashinfer_gaudi_kernels.so"
+    if not kernel_db.is_file():
+        return
+    _prepend_kernel_database(str(kernel_db))
+
+
+def load_gdn_fused_extension() -> bool:
+    """Load libgdn_fused_gaudi2.so (kernel database) and gdn_fused_ops*.so (HPU op) once; True when loaded."""
+    global _GDN_FUSED_LOADED
+    if _GDN_FUSED_LOADED is not None:
+        return _GDN_FUSED_LOADED
+    with _LOAD_LOCK:
+        if _GDN_FUSED_LOADED is not None:
+            return _GDN_FUSED_LOADED
+        package_lib = Path(__file__).resolve().parent / "lib"
+        kernel_db = os.environ.get("GDN_FUSED_GAUDI_KERNEL_LIBRARY", "")
+        if not kernel_db:
+            kernel_db = str(package_lib / "libgdn_fused_gaudi2.so")
+        extension = os.environ.get("GDN_FUSED_GAUDI_NATIVE_LIBRARY", "")
+        if not extension:
+            matches = sorted(glob.glob(str(package_lib / "gdn_fused_ops*.so")))
+            extension = matches[0] if matches else str(package_lib / "gdn_fused_ops*.so")
+        missing = False
+        for path in (kernel_db, extension):
+            if not os.path.isfile(path):
+                _LOAD_ERRORS.append(f"{path}: file does not exist")
+                missing = True
+        if missing:
+            _GDN_FUSED_LOADED = False
+            return False
+        _prepend_kernel_database(kernel_db)
+        # The op's Python schema (T2) must exist before the extension is loaded,
+        # because the C++ side only implements the HPU kernel of the fragment.
+        try:
+            importlib.import_module("flashinfer_gaudi.gdn_core_decode")
+        except Exception as exc:  # pragma: no cover - requires the schema module
+            _LOAD_ERRORS.append(f"flashinfer_gaudi.gdn_core_decode: {type(exc).__name__}: {exc}")
+            _GDN_FUSED_LOADED = False
+            return False
+        try:
+            torch.ops.load_library(extension)
+        except Exception as exc:  # pragma: no cover - requires an HPU runtime
+            _LOAD_ERRORS.append(f"{extension}: {type(exc).__name__}: {exc}")
+            _GDN_FUSED_LOADED = False
+            return False
+        _LOADED_PATHS.append(extension)
+        _GDN_FUSED_LOADED = True
+        return True
 
 
 def load_native_extensions() -> tuple[str, ...]:
