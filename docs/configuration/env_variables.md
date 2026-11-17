@@ -50,6 +50,12 @@ are in progress.
 
 ## Performance Tuning Parameters
 
+`VLLM_HPU_FLASH_NEXT_QSA_MODE` selects the Flash-Next Qwen4-Exp QSA attention
+mode as an integer. `0` (default) is dense: exact causal attention over the
+full prefix through the standard HPU Attention layer, with the indexer weights
+loaded only for checkpoint compatibility. `1` is sparse (indexer top-k
+selection); it is reserved for M2 and raises `NotImplementedError`.
+
 `VLLM_HPU_NATIVE_RECEIVE_PREPOST=1` enables the optional explicit-epoch receive
 path for a complete V4.1 native replay plan. It requires matching versioned HCL,
 Synapse and Bridge overlays, independent receive destinations, and standalone
