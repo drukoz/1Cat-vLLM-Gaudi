@@ -39,7 +39,7 @@ from vllm_gaudi.models.qwen4_exp.hyperconnection import (  # noqa: E402
 SHAPES = [(128, 16), (64, 20)]
 
 
-@pytest.fixture(scope="session")
+@pytest.fixture(scope="module")
 def world1():
     """World-1 gloo group with a current VllmConfig (S3 pattern)."""
     _, temp_file = tempfile.mkstemp(dir="/tmp")
