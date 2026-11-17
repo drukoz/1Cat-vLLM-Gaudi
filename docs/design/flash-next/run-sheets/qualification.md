@@ -420,7 +420,7 @@ vllm serve /models/Qwen3.8-Flash-Next --served-model-name Qwen3.8-Flash-Next --p
   --enable-prefix-caching --language-model-only --trust-remote-code --gpu-memory-utilization 0.92
 ```
 
-Launches 2–5 repeat that command with the extra exports (set inside each launch block, never inherited from the shell):
+Launches 2–5 repeat that command with the extra exports, each in a fresh container shell (an export from an earlier launch must not carry over):
 
 ```bash
 # launch 2, fn3-sparse (3a):
@@ -484,7 +484,7 @@ lines = [filler] * 1460                                      # about 20K tokens 
 lines[int(0.3 * len(lines))] = "The secret code is 7418.\n"  # needle at 30% depth
 prompt = "".join(lines) + "Question: What is the secret code? Answer with the digits only.\n"
 payload = {"model": "Qwen3.8-Flash-Next", "prompt": prompt, "max_tokens": 16, "temperature": 0, "stream": True}
-t0, first, text = time.perf_counter(), 0.0, ""
+t0, first, text, n = time.perf_counter(), 0.0, "", 0
 with urllib.request.urlopen("http://localhost:8000/v1/completions", data=json.dumps(payload).encode(),
                             headers={"Content-Type": "application/json"}) as r:
     for chunk in r:
@@ -494,7 +494,9 @@ with urllib.request.urlopen("http://localhost:8000/v1/completions", data=json.du
         first = first or time.perf_counter() - t0
         if line != "data: [DONE]":
             text += json.loads(line[5:])["choices"][0].get("text", "")
-print(f"first token {first:.2f} s, decode {1000 * (time.perf_counter() - t0 - first) / 16:.0f} ms/token: {text!r}")
+            n += 1                                           # one streamed chunk ~= one token
+dec = 1000 * (time.perf_counter() - t0 - first) / max(n - 1, 1)
+print(f"first token {first:.2f} s, decode {dec:.0f} ms/token over {n} tokens: {text!r}")
 EOF
 ```
 
@@ -523,8 +525,9 @@ Results table (3a):
 | 20K first token, plain / sparse | record both | | |
 | 20K decode ms/token, plain / sparse | record both | | |
 
-Stop rule (3a): fn3-sparse crashes at startup, the tiny prompt 6 does not match 16/16 in sparse mode, or the sparse 20K needle
-answer misses the code → stop the session and post the captures, both tiny files and both needle prints. Dense prompt 6 differing
+Stop rule (3a): fn3-sparse crashes at startup, the tiny prompt 6 diverges in sparse mode within its first 4 tokens (a later
+divergence is a warning: bf16 top-512 near-ties, plan v0.3 risks; record the position), or the sparse 20K needle answer misses
+the code → stop the session and post the captures, both tiny files and both needle prints. Dense prompt 6 differing
 is the expected result, not a stop.
 
 Post back (3a): `/tmp/3a-tiny-sparse.txt`, `/tmp/3a-tiny-dense.txt`, the two needle prints, the sparse 8-prompt answers (and the
@@ -585,8 +588,9 @@ tactic engaged (R1): the proof is the TPOT difference between the two tables, pl
 | `diff` of the two greedy files | empty (report any difference) | | |
 | fn3-tactics Mean/P99 TPOT vs plain | record both; the delta is the gate's measurement, a loss is a finding, not a stop | | |
 
-Stop rule (3b): any difference between the two greedy files → stop the session, post both files and the capture greps of both
-launches; fn3-tactics crashes at startup → stop, post the traceback. A tactics loss in the tables is a result, not a stop.
+Stop rule (3b): a tactics answer that is gibberish or loops, or differs from plain within its first sentence → stop the session, post
+both files and the capture greps of both launches; a later divergence with coherent text is a bf16 warning: record it and
+continue; fn3-tactics crashes at startup → stop, post the traceback. A tactics loss in the tables is a result, not a stop.
 
 Post back (3b): the two greedy files, the two filled bench tables, the eight `/tmp/3b-*.log` files, the fn3-tactics capture greps.
 
@@ -620,7 +624,8 @@ Results table (3c):
 
 Stop rule (3c): warmup fails inside `mixture_of_experts` at any point (the traceback names it) → stop the session and post the
 traceback and the launch's capture greps; a crawl (far past the 400 s the 27B needed) is the measurement, record it. Answers not
-identical to plain → stop and post the diffs.
+identical to plain: a late divergence with coherent text is bf16 re-chunking, record it; gibberish, loops or a difference within
+the first sentence → stop and post the diffs.
 
 Post back (3c): the filled 3c table, the three Warmup lines, the two diff results, the three C=16 rows and `/tmp/3c-*.log` files,
 the fn3-slice64 / fn3-slice128 capture greps.
