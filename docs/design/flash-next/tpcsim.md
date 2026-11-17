@@ -68,9 +68,13 @@ itself and exports `PYTHONPATH=/work`, so run it from a worktree root.
 
 - **`half` is a reserved token of tpc-clang.** `int half = 0;` fails with
   "cannot combine with previous 'int' declaration specifier" even in an empty
-  file. `gdn_core_decode_recurrence.h:15` uses a loop variable named `half`
-  and is the first blocker of the fused kernel compile (reported to the CTO;
-  not fixed here).
+  file. Never name a variable `half` in TPC code. The loop variable in
+  `gdn_core_decode_recurrence.h` was renamed to `vh` (commit `07290d4`); since
+  then both kernels compile with `-Wall -Werror` and the CMake target
+  `gdn_fused_gaudi2` links in this container.
+- **tpc-clang prints a performance warning** for both kernels: "number of
+  requested special function IDs exceeds LUT cache capacity for the Gen2+
+  architecture". It is not an error; it matters for kernel performance work.
 - **colima ≥ 0.10 uses `$XDG_CONFIG_HOME/colima` and ignores `COLIMA_HOME`.**
   The wrapper exports `XDG_CONFIG_HOME=/Volumes/Storage/paperclip/linux-vm`.
   A pre-existing `~/.colima` on the machine takes priority over that, and
