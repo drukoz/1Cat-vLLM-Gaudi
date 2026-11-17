@@ -42,6 +42,11 @@ QWEN3_5_HYBRID_ARCHS = frozenset({
     "Qwen4ExpForCausalLM",
 })
 
+FLASH_NEXT_ARCHS = frozenset({
+    "Qwen4ExpForConditionalGeneration",
+    "Qwen4ExpForCausalLM",
+})
+
 _QWEN38_DFLASH2_DRAFT_FIELDS = {
     # SpeculativeConfig wraps DFlash checkpoints in EAGLEConfig at runtime.
     # The original Hugging Face config is qwen3, but validation runs after
@@ -107,6 +112,18 @@ def is_qwen3_5_hybrid_model(model_config: Optional[ModelConfig]) -> bool:
         architectures.add(architecture)
 
     return any(arch in QWEN3_5_HYBRID_ARCHS for arch in architectures)
+
+
+def is_flash_next_model(model_config: Optional[ModelConfig]) -> bool:
+    if model_config is None:
+        return False
+
+    architectures = set(getattr(getattr(model_config, "hf_config", None), "architectures", []) or [])
+    architecture = getattr(model_config, "architecture", None)
+    if architecture is not None:
+        architectures.add(architecture)
+
+    return any(arch in FLASH_NEXT_ARCHS for arch in architectures)
 
 
 def _enable_hpu_v1_dflash2_validation() -> None:
@@ -488,6 +505,10 @@ class HpuPlatform(Platform):
         # However, for HPU, speculative decoding is not supported with async scheduling.
         vllm_config.scheduler_config.async_scheduling = \
             vllm_config.scheduler_config.async_scheduling and vllm_config.speculative_config is None
+        if vllm_config.scheduler_config.async_scheduling and is_flash_next_model(vllm_config.model_config):
+            vllm_config.scheduler_config.async_scheduling = False
+            logger.warning("[HPU] Async scheduling disabled for Flash-Next: "
+                           "PLE n-gram context needs sampled tokens on the CPU")
         _validate_hpu_dflash2_config(vllm_config)
 
     @classmethod
