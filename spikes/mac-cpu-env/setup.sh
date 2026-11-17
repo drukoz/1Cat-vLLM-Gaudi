@@ -213,7 +213,8 @@ else
     log "installing vllm from source with VLLM_TARGET_DEVICE=empty"
     VLLM_TARGET_DEVICE=empty python -m pip install --no-build-isolation -e "$VLLM_SRC"
 fi
-VLLM_VER="$(python -c 'import vllm; print(vllm.__version__)')"
+# plugin banners go to stdout; the version is the last line
+VLLM_VER="$(python -c 'import vllm; print(vllm.__version__)' | tail -1)"
 log "vllm: $VLLM_VER"
 
 # ---------------------------------------------------------------- plugin ----
