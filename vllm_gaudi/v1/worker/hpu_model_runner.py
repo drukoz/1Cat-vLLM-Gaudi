@@ -38,7 +38,8 @@ from vllm_gaudi.extension.debug import init_debug_logger
 from vllm_gaudi.v1.core.recurrent_state_pool import pool_pad_block_id, pool_slots_from_env, pool_tensor_slots
 from vllm_gaudi.v1.worker.hpu_dp_utils import set_hpu_dp_metadata
 from vllm_gaudi.v1.worker.gdn_state_layout import has_contiguous_dflash_checkpoints
-from vllm_gaudi.v1.worker.flash_next_inputs import (build_ple_inputs, dummy_ple_inputs, model_requires_raw_input_tokens)
+from vllm_gaudi.v1.worker.flash_next_inputs import (build_block_table, build_ple_inputs, dummy_ple_inputs,
+                                                    model_requires_block_table, model_requires_raw_input_tokens)
 from vllm_gaudi.platform import is_flash_next_model
 
 from vllm.v1.attention.backend import AttentionBackend, AttentionType, CommonAttentionMetadata
@@ -4845,6 +4846,11 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         positions_device = async_h2d_copy(positions, dtype=position_dtype, device=self.device)
         block_tables_list = self._resolve_all_blocks(block_tables_list)
 
+        block_table_cpu = None
+        if getattr(self, '_needs_block_table', False):
+            block_table_cpu = build_block_table(block_tables_list, padded_batch_size * num_tokens,
+                                                self._block_table_max_blocks, self._PAD_BLOCK_ID)
+
         # CONTEXT_LENS [batch_size]
         block_list, block_groups, block_usage = \
             self.get_habana_paged_attn_buffers(
@@ -4998,6 +5004,8 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         block_list_device = async_h2d_copy(block_list, device=self.device)
         block_usage_device = async_h2d_copy(block_usage, device=self.device)
         block_groups_device = async_h2d_copy(block_groups, device=self.device)
+        block_table_device = async_h2d_copy(block_table_cpu, device=self.device) \
+            if block_table_cpu is not None else None
         slot_mapping_device = async_h2d_copy(slot_mapping, device=self.device)
         window_block_list_device = async_h2d_copy(window_block_list,
                                                   device=self.device) if self.interleaved_sliding_window else None
@@ -5084,6 +5092,7 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                 dflash_full_query=dflash_full_query,
                 seq_lens_tensor=seq_lens_tensor,
                 query_start_loc=query_start_loc_p,
+                block_table=block_table_device,
             )
 
         ple_inputs = None
@@ -6885,6 +6894,12 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                         and hasattr(self.drafter, "model")):
                     self.drafter.model = self._compile(self.drafter.model)
                     logger.info("Enabled compilation for the DFlash2 drafter")
+
+        # Flash-Next sparse QSA decode (M2) addresses K/V through a per-request
+        # block_table in the attention metadata; other models never build one.
+        # max_blocks is fixed per engine so decode shapes stay bucket-stable.
+        self._needs_block_table = model_requires_block_table(self.model)
+        self._block_table_max_blocks = -(-self.max_model_len // self.attn_block_size)
 
     def _compile_methods(self):
         """
