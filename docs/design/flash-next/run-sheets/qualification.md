@@ -480,7 +480,7 @@ repeat, the secret sits at 30% depth, about 1.3 tokens per word (stage 4's clien
 python - <<'EOF'
 import json, time, urllib.request
 filler = "The quarterly report describes logistics, staffing, and maintenance schedules in detail.\n"
-lines = [filler] * 14600                                     # about 20K tokens of filler
+lines = [filler] * 1460                                      # about 20K tokens of filler
 lines[int(0.3 * len(lines))] = "The secret code is 7418.\n"  # needle at 30% depth
 prompt = "".join(lines) + "Question: What is the secret code? Answer with the digits only.\n"
 payload = {"model": "Qwen3.8-Flash-Next", "prompt": prompt, "max_tokens": 16, "temperature": 0, "stream": True}
