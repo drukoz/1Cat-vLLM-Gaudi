@@ -30,14 +30,13 @@ class HpuQwen4ExpForCausalLM(_upstream_model.Qwen4ExpForCausalLM):
 
 
 def apply_flash_next_patches() -> None:
-    """Make the fork's GDN/MoE/HyperConnection/QSA replacements effective on the Flash-Next model.
+    """Make the fork's GDN/MoE/HyperConnection/QSA/PLE replacements effective on the Flash-Next model.
 
     The GDN and MoE replacements are installed by importing ``vllm_gaudi.models.qwen3_5``
     and ``vllm_gaudi.models.qwen3_next`` (see module docstring); this asserts
     the GDN binding reached the upstream model module, and rebinds the
-    ``GatedResidual`` and ``Qwen4ExpQSAAttention`` names the upstream decoder
-    layer builds through at construction time. A later task adds its PLE
-    replacement at the end of this function.
+    ``GatedResidual``, ``Qwen4ExpQSAAttention`` and ``Qwen4ExpPLELayer`` names the
+    upstream decoder layer builds through at construction time.
     """
     _upstream_model.GatedResidual = HpuGatedResidual
     _upstream_model.Qwen4ExpQSAAttention = HpuQwen4ExpQSAAttention
