@@ -108,7 +108,22 @@ class HpuQsaIndexer(nn.Module):
         self.ring_group_idx: torch.Tensor | None = None
 
     def _state_indices(self, md: object, name: str) -> torch.Tensor | None:
-        """Resolve one state-index tensor for this layer's ring group (see ``HpuQwen4ExpPLELayer``)."""
+        """Resolve one state-index tensor for this layer's ring group (see ``HpuQwen4ExpPLELayer``).
+
+        Three shapes are accepted (the runner's tensors are ``[num_groups, ...]``
+        and the indexer's ``ring_group_idx`` picks this layer's group row):
+
+        * ``[groups, bs]``: one slot per state row (plain decode, the drafter's
+          later steps) -> ``[bs]``;
+        * ``[groups, bs, 1]``: the same with the GDN trailing 1 -> ``[bs]``;
+        * ``[groups, bs, T]``: the M3 verification lattice (``store`` is
+          identical to ``load``).  The ring and the compressed rows are
+          addressed by the request's slot, not by the lattice column (the ring
+          rows are position-addressed inside a slot and the compressed rows
+          come from ``slot_mapping``), so column 0 is the request's slot and
+          the result is ``[bs, T] -> [:, 0].repeat_interleave(T)``, i.e. the
+          ``bs * T`` per-row slots directly.
+        """
         indices = getattr(md, name, None)
         if indices is None:
             return None
@@ -117,8 +132,8 @@ class HpuQsaIndexer(nn.Module):
                 raise RuntimeError("QSA indexer ring_group_idx not set")
             indices = indices.index_select(0, self.ring_group_idx.to(device=indices.device).view(1)).squeeze(0)
         if indices.dim() == 2:
-            if indices.shape[-1] != 1:
-                raise NotImplementedError("QSA indexer state indices must carry one slot per row")
+            if indices.shape[-1] > 1:
+                return indices[:, 0].repeat_interleave(int(indices.shape[-1])).long()
             indices = indices.squeeze(-1)
         return indices.reshape(-1).long()
 
@@ -190,21 +205,86 @@ class HpuQsaIndexer(nn.Module):
                     out[b, lo:hi] = expand_selection(blocks_sel, pos_tile, ratio)
             return out.view(T, width)
 
-        # Decode: one token per row (speculative decode is M3).
-        if load.numel() != T:
-            raise NotImplementedError("speculative decode is M3")
-        complete = (positions % ratio) == ratio - 1
-        blk = ring_block_rows(self.key_ring, load, positions, raw_k, ratio)
+        return self._select_decode(q, raw_k, positions, cos_sin_at, md, load, store, slot_mapping, cache, rpb)
+
+    def _select_decode(
+        self,
+        q: torch.Tensor,
+        raw_k: torch.Tensor,
+        positions: torch.Tensor,
+        cos_sin_at: Callable[[torch.Tensor], tuple[torch.Tensor, torch.Tensor]],
+        md: object,
+        load: torch.Tensor,
+        store: torch.Tensor,
+        slot_mapping: torch.Tensor,
+        cache: torch.Tensor,
+        rpb: int,
+    ) -> torch.Tensor:
+        """Decode selection over ``T`` query rows of ``bs`` requests (M3: ``T_cols >= 1`` tokens each).
+
+        Write-then-score: the step's raw keys go into the ring and the
+        completed blocks' compressed rows into ``compressed_key_cache``
+        BEFORE any row is scored.  Both caches are position-addressed
+        (``ring[slot, pos % R]``, ``compressed_row_slots(slot_mapping)``), so a
+        token re-processed at a position overwrites the row a rejected draft
+        left there: after a verification step the caches hold the accepted
+        tokens' rows and rollback needs no extra state (no checkpoint, no
+        undo log).  Scoring a row before writing would let a query see the
+        block key of a draft that is about to be replaced.
+
+        Rows are the padded M3 layout: ``bs`` requests of ``T_cols = T // bs``
+        rows each, the real length of request ``b`` is
+        ``md.query_start_loc_p[b + 1] - md.query_start_loc_p[b]``; the padding
+        rows of a ragged request (and the rows of a step without
+        ``query_start_loc_p``: every row is valid) are parked on the ring's
+        scratch row ``key_ring.shape[0] - 1``, which is never a request's slot
+        (see ``qsa_side_caches``), and never write a compressed row.  The
+        single-token decode is the ``T_cols == 1`` case: there the ring write
+        only ever adds the current token's key (earlier keys were written by
+        earlier steps), so moving it before ``ring_block_rows`` leaves it
+        unchanged and one code path serves both.
+        """
+        D, ratio = self.index_head_dim, self.compress_ratio
+        topk = self.block_topk
+        T = int(positions.numel())
+        qsl = getattr(md, "query_start_loc_p", None)
+        if qsl is not None and int(qsl.numel()) >= 2:
+            bs = int(qsl.numel()) - 1
+            lens = (qsl[1:].long() - qsl[:bs].long()).to(device=positions.device)
+        else:
+            bs, lens = int(load.numel()), None
+        T_cols = T // bs
+        if lens is None:
+            valid = torch.ones(T, dtype=torch.bool, device=positions.device)
+        else:
+            cols = torch.arange(T, device=positions.device)
+            valid = (cols % T_cols) < lens.repeat_interleave(T_cols)
+        # ``load``/``store`` carry one slot per state row: the [groups, bs] form
+        # repeats each request's slot over its rows, the lattice form already
+        # is one slot per row (see ``_state_indices``).
+        n_slots = int(load.numel())
+        if n_slots == T:
+            load_rows, store_rows = load, store
+        elif n_slots * T_cols == T:
+            load_rows, store_rows = load.repeat_interleave(T_cols), store.repeat_interleave(T_cols)
+        else:
+            raise NotImplementedError(f"QSA decode got {n_slots} state slots for {T} rows of {bs} requests")
+        scratch = torch.full((T,), self.key_ring.shape[0] - 1, dtype=torch.long, device=positions.device)
+        ring_write(self.key_ring, torch.where(valid, store_rows, scratch), positions, raw_k)
+        blk = ring_block_rows(self.key_ring, torch.where(valid, load_rows, scratch), positions, raw_k, ratio)
+        complete = valid & ((positions % ratio) == ratio - 1)
         cs, sn = cos_sin_at(positions - (ratio - 1))
         keys = compress_block_keys(blk, self.k_layernorm.weight, self.eps, cs, sn)
+        # Only the completing rows write: the other rows of the block share that
+        # compressed row (``slot_mapping // ratio``) and a self-write of their
+        # current value through a duplicated ``index_put_`` index is undefined.
         row_slots = compressed_row_slots(slot_mapping, ratio)
-        current = cache[row_slots]
-        cache.index_put_((row_slots,), torch.where(complete[:, None], keys, current))
-        ring_write(self.key_ring, store, positions, raw_k)
+        if bool(complete.any()):
+            cache.index_put_((row_slots[complete],), keys[complete])
         MB = int(md.block_table.shape[1])
         n = MB * rpb
         bt = md.block_table.long()
-        blk_idx = torch.arange(n, device=hidden.device)
+        blk_idx = torch.arange(n, device=positions.device)
         idx = bt.gather(1, (blk_idx // rpb)[None, :].expand(T, -1)) * rpb + (blk_idx % rpb)[None, :]
         all_rows = cache[idx.reshape(-1)].view(T, n, D)
         scores = torch.relu(torch.einsum("thd,tnd->thn", q.float(), all_rows.float())).sum(1) / (D**0.5)
