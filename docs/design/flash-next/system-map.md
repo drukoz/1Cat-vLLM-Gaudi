@@ -1,24 +1,25 @@
 # RUK-2709 Flash-Next on Gaudi: system map
 
-Kind: **Program**. Version 0.1, 2026-11-17, written by the CTO from a first reading of the repository, the model's public configuration, and upstream vLLM / vllm-gaudi. Rows marked *(unverified)* wait for a research subtask or for the user's answers to the questions in section 13. Facts carry a file path or a URL.
+Kind: **Program**. Version 0.2, 2026-11-17. Version 0.1 was written from a first reading of the repository, the model's public configuration and upstream vLLM / vllm-gaudi. Version 0.2 adds the user's answers to the question card (launch commands, versions, logs, topology, hardware access) and the first two research reports (R2 on the model runner, R4 on upstream's Flash-Next package). Facts carry a file path, a log line or a URL. Rows marked *(unverified)* wait for a research subtask or for the user.
 
 ## Assumptions
 
 1. The base of all work is this fork (`drukoz/1Cat-vLLM-Gaudi`, identical to `1CatAI/1Cat-vLLM-Gaudi` `main` at `e2266e0`), not upstream `vllm-project/vllm-gaudi`. The request asks to audit 1Cat's kernels and reuse its DFlash2 work; upstream fixes are cherry-picked, not rebased onto.
-2. The model is **Qwen3.8-Flash-Next** (`Qwen/Qwen3.8-Flash-Next`, architecture `Qwen4ExpForConditionalGeneration`), served from an FP8 checkpoint with BF16 KV, two servers of four Gaudi2 cards each. "Swift-1.5 Flash-Next" is the company's name for it.
-3. No Gaudi hardware is reachable from this Mac, and no `torch` or `vllm` is installed here. Everything is verified first with CPU unit tests (the fork's own pattern: hardware tests skip without an HPU), then on the user's machines with exact commands we hand over.
+2. The model is **Qwen3.8-Flash-Next** (`Qwen/Qwen3.8-Flash-Next`, architecture `Qwen4ExpForConditionalGeneration`); "Swift-1.5 Flash-Next" is the company's name for it. **No Flash-Next run exists yet on the Gaudi box.** Every measurement so far (section 11) used the dense Qwen3.8-27B (`Qwen3_5ForConditionalGeneration`), in BF16 or FP8, on the stock vllm-gaudi image or on this fork. The user has not quantized Flash-Next. The first Flash-Next bring-up is therefore **BF16 at TP8 on one server**, the only layout in which the 335 GiB checkpoint fits without host offload (section 2a); the production layout of two TP4 servers needs the published FP8 checkpoint or PLE host offload and comes later (M4).
+3. **No Gaudi hardware for agents** (user's answer: static work and CPU tests only). Everything is verified here with CPU unit tests (the fork's own pattern: hardware tests skip without an HPU). Every hardware step is a **run sheet**: exact commands, the log lines to capture, and a results table, executed by the user, who posts the results as a comment. The kernel audit (program item 1) is a static audit plus a profiling run sheet.
 4. The repository has no Dev branch; `main` is the base branch and the program's pull request targets it as a draft until the program is done.
 5. Existing routes (Qwen3.5 / Qwen3.8-27B GDN, DeepSeek V4 / V4.1, MiniMax M3 / H3) must not regress, but get no new work.
+6. **Engine pin.** The program builds against vLLM commit `8f816a3f665489d7f0d222115d4f72ebab01076b` (2026-09-04), the commit the user runs this fork against on the box. It already contains Flash-Next (260 commits after the 2026-08-31 merge). Later upstream Flash-Next fixes are backported into the plugin's own copy of the model (R4b lists them). Moving the fork to a newer vLLM (0.30.0 or later, where `_Fp8OnlineLinearBase` is gone and the V1 model runner was removed upstream) is a separate program, not this one.
 
 ## 1. Purpose and users
 
 The repository is the Intel Gaudi hardware plugin for vLLM (`vllm_gaudi`, Apache-2.0), in 1CatAI's Gaudi2-focused fork, which adds Qwen GDN / DFlash2 paths, DeepSeek V4 / V4.1 native execution, FlashInfer-Gaudi operators and MiniMax support on top of upstream `vllm-project/vllm-gaudi` (`AGENTS.md`, `README.md`, `docs/1cat_gaudi_guide.md`).
 
-For Rukoz Ent it serves one thing: the company's agent fleet. Paperclip's engineers, tech leads and reviewers call an OpenAI-compatible endpoint with long agentic contexts (about 128K tokens each: the servers held 2.5M KV tokens for about 19 agents), many concurrent sequences, long shared prefixes (system prompts, repository guides), and tool calls. The baseline in section 11 is that workload.
+For Rukoz Ent it serves one thing: the company's agent fleet. Paperclip's engineers, tech leads and reviewers call an OpenAI-compatible endpoint with long agentic contexts (about 128K tokens each), many concurrent sequences, long shared prefixes (system prompts, repository guides) and tool calls. Today the fleet is served from other machines; the Gaudi node is the target. The reference measurements in section 11 are that workload on the 27B model.
 
 ## 2. The model: Qwen3.8-Flash-Next
 
-Sources: the Hugging Face config and model card (https://huggingface.co/Qwen/Qwen3.8-Flash-Next), the LMSYS architecture note (https://www.lmsys.org/blog/2026-08-26-qwen-flash-next/), the vLLM serving recipe (https://recipes.vllm.ai/Qwen/Qwen3.8-Flash-Next) and upstream vLLM `vllm/models/qwen4_exp/` at `v0.34.0`.
+Sources: the Hugging Face config and model card (https://huggingface.co/Qwen/Qwen3.8-Flash-Next), the LMSYS architecture note (https://www.lmsys.org/blog/2026-08-26-qwen-flash-next/), the vLLM serving recipe (https://recipes.vllm.ai/Qwen/Qwen3.8-Flash-Next) and upstream vLLM `vllm/models/qwen4_exp/` at the pin and at `v0.34.0` (R4 report on RUK-2721).
 
 | Fact | Value |
 |---|---|
@@ -38,66 +39,84 @@ Sources: the Hugging Face config and model card (https://huggingface.co/Qwen/Qwe
 
 KV cache per token (BF16, 12 attention layers, 2 KV heads, dim 256): 12 × 2 × 2 × 256 × 2 B = 24.6 KB, plus about 0.8 KB of indexer key cache. GDN state per sequence: 36 × (48 × 128 × 128 × 4 B + conv) ≈ 115 MB.
 
+### 2a. Memory budget on Gaudi2 (CTO arithmetic, to be confirmed by the first run sheet)
+
+A card has 96 GB of HBM; the stock run logged `Free device memory: 88.18 GiB, 81.13 GiB usable (gpu_memory_utilization=0.92)`, so about 83.8 GiB are usable at 0.95. vLLM replicates KV heads when the tensor-parallel size exceeds the KV head count, so every rank holds one of the two QSA KV heads at TP2, TP4 and TP8: 12 × 1 × 2 × 256 × 2 B = 12.3 KB per token per rank, plus about 0.4 KB of indexer keys.
+
+| Layout | Weights per card | Left for KV, graphs and GDN state | KV tokens per server (12.7 KB/token/rank) |
+|---|---|---|---|
+| BF16 at TP4 (two servers) | 335 / 4 = 84 GiB | none | does not fit |
+| BF16 at TP8 (one server) | 335 / 8 = 42 GiB | about 40 GiB | about 3.3M |
+| BF16 at TP4 with the PLE table on the host | (335 − 95) / 4 = 60 GiB | about 22 GiB | about 1.8M (about 14 agents at 131K) |
+| FP8 at TP4 (two servers) | 173 / 4 = 43 GiB | about 39 GiB | about 3.2M |
+
+GDN state per sequence per rank is 36 × (48 / TP) × 128 × 128 × 4 B: 28 MB at TP4, 14 MB at TP8; 32 sequences stay under 1 GiB. The indexer has 4 query heads, so TP8 must replicate indexer heads (how upstream shards them is an M0 check). TP8 splits the GDN heads to 2 key / 6 value per rank, a new shape for the fork's tactics (section 7).
+
 ## 3. Where it runs
 
-- Two servers × four Gaudi2 (HL-225, 96 GB HBM2e, about 2.45 TB/s each; `evidence/ROOFLINE.md`), TP4 per server. *(unverified)* whether both servers are one 8-card HLS-2 node or two nodes.
-- Gaudi software: the fork's baseline is Gaudi Software 1.24.1 with Gaudi PyTorch 2.11 (`docs/1cat_gaudi_guide.md`); upstream CI moved to 1.24.2 / PyTorch 2.13 on 2026-10-12. The user's version is *(unverified)*.
-- vLLM engine: the fork's last upstream sync targets vLLM commit `17da48596c98946d3e3e6896e2ebd341e809f3bd` (fork commit `71ee4e4`, 2026-08-28). Qwen3.8-Flash-Next support merged into vLLM on 2026-08-31 (`e126687a`, PR #53896), after that sync. The engine the user ran is *(unverified)*.
-- This Mac: macOS 26, Python 3.14 (Homebrew), no `torch`, no `vllm`, no HPU. The plugin requires Python 3.9–3.12 (`pyproject.toml`).
+- **One HLS-2 node**, 8 × HL-225 (Gaudi2, 98,304 MiB each), Ubuntu 22.04.4, kernel 5.15.0-118-generic, driver and NIC driver 1.24.2-52a555d, packages `habanalabs-*` 1.24.2-481, firmware `hl-1.24.0-rc-fw-…` (capture cut off). "Two servers × four cards" are two `vllm serve` processes on the same node (cards 0–3 on port 8000, cards 4–7 on port 8001).
+- **Stock stack** (the reference runs of section 11): image `vault.habana.ai/gaudi-docker/1.24.2/ubuntu22.04/habanalabs/vllm-0.30.0-ptfork-2.13.0:latest` (id 6390ce99c5d0); vLLM 0.30.0+empty; vllm_gaudi 0.30.0 (commit unknown: `vllm_gaudi_commit: Error getting commit hash`; the tag `v0.30.0` exists upstream); torch 2.13.0a0+git2469d18; habana-torch-plugin 1.24.2.481; neural_compressor_pt 3.6; transformers 5.16.1; Python 3.10.
+- **Fork stack**: base image `vault.habana.ai/gaudi-docker/1.24.1/ubuntu22.04/habanalabs/pytorch-installer-2.11.0:latest` plus `habanalabs-tools` 1.24.1 (tpc-clang); Gaudi PyTorch 2.11.0; Python 3.10; plugin `main@e2266e0e`, unmodified, built with `VLLM_TARGET_DEVICE=hpu VLLM_GAUDI_BUILD_FLASHINFER=1 pip install . --no-build-isolation` (native `libflashinfer_gaudi_kernels.so` and `flashinfer_gaudi_ops` built); vLLM `8f816a3f` (`0.28.1rc1.dev392+g8f816a3f6`) built with `VLLM_TARGET_DEVICE=empty`; transformers 5.16.1, huggingface_hub 1.33.0, tokenizers 0.23.2, safetensors 0.8.0 pinned with `--no-deps`; image `1cat-vllm-gaudi:nattuck-vllm-8f816a3f`; build files in `~/1cat-build/` (Dockerfile, Dockerfile.tf, Dockerfile.v2, Dockerfile.v3). The userspace is 1.24.1 on a 1.24.2 driver: unmatched, but it ran.
+- **Why `8f816a3f`.** The fork pins no engine version. It imports `VllmConfig._get_v1_model_runner_unsupported_features` (added to vLLM on 2026-08-27) and `_Fp8OnlineLinearBase` (removed on 2026-09-04 by vLLM PR #51392), so only commits in that window import; the user tried `17da4859` and `d2906091` and both failed at import. `8f816a3f` is the newest commit that works, and it is 260 commits after the Flash-Next merge `e126687a` (2026-08-31), so `vllm/models/qwen4_exp/` is present at the pin.
+- This Mac: macOS 26, Python 3.14 (Homebrew), no `torch`, no `vllm`, no HPU. The plugin requires Python 3.9–3.12 (`pyproject.toml`); spike S0 builds a 3.12 or 3.11 environment (the box runs 3.10).
 
 ## 4. Build, test and release
 
-- Install: a paired vLLM checkout installed with `VLLM_TARGET_DEVICE=empty pip install --no-build-isolation -e ../vllm`, then `pip install --no-build-isolation -e .` (`docs/1cat_gaudi_guide.md`, installation section). Native kernels: `tools/build_flashinfer_gaudi.py` (CMake, TPC compiler) and `tools/build_deepseek_v4*.py` (needs matching Gaudi PyTorch bridge sources).
-- Tests: `tests/unit_tests/` (pytest; many run on CPU with mocks, hardware tests skip unless an HPU is present or `FLASHINFER_GAUDI_RUN_HARDWARE_TESTS=1`), `tests/full_tests/` (model cards, HPU only), `tests/upstream_tests/`. The fork's PRs report e.g. "494 unit tests passed, 58 skipped" on CPU (`docs/benchmarks/deepseek-records.md`).
+- Install: a paired vLLM checkout installed with `VLLM_TARGET_DEVICE=empty pip install --no-build-isolation -e ../vllm`, then `pip install --no-build-isolation -e .` (`docs/1cat_gaudi_guide.md`, installation section). Native kernels: `tools/build_flashinfer_gaudi.py` (CMake, TPC compiler) and `tools/build_deepseek_v4*.py` (needs matching Gaudi PyTorch bridge sources). The user's production build is the one-line `pip install .` form in section 3.
+- Tests: `tests/unit_tests/` (pytest; many run on CPU with mocks, hardware tests skip unless an HPU is present or `FLASHINFER_GAUDI_RUN_HARDWARE_TESTS=1`), `tests/full_tests/` (model cards, HPU only), `tests/upstream_tests/`. The fork's PRs report e.g. "494 unit tests passed, 58 skipped" on CPU (`docs/benchmarks/deepseek-records.md`). Spike S0 (RUK-2717) records which files pass on this Mac at the pin.
+- Hardware gate: a run sheet per milestone, executed by the user (assumption 3).
+- FP8 through Intel Neural Compressor on a GDN model needs the conv1d layers excluded: the user's first fully-FP8 27B launch failed with `AttributeError: 'PatchedUnmeasuredModule' object has no attribute 'weight'` until `~/bench/calib-out/qwen3.8-27b/maxabs_quant_g2.json` got `blocklist.names = ["conv1d"]`.
 - Lint: `yapf` (120 columns) + `ruff`; `pre-commit`; DCO `Signed-off-by` on commits (`AGENTS.md`).
-- CI: upstream GitHub workflows need self-hosted HPU runners (`.github/workflows/pre-merge.yaml`) and will not run on this fork. Our gate is CPU unit tests plus the user's hardware runs.
-- Release and deployment: none in the repository. The user installs the plugin on the Gaudi servers by hand *(unverified)*. Nothing we merge deploys by itself.
+- CI: upstream GitHub workflows need self-hosted HPU runners (`.github/workflows/pre-merge.yaml`) and will not run on this fork. Our gate is CPU unit tests plus the user's run sheets.
+- Release and deployment: none in the repository. The user builds the image from `~/1cat-build/` and runs it by hand. Nothing we merge deploys by itself.
 - Dangerous: `tools/sync_deepseek_v41_checkpoint.py` writes into model directories; `tools/run_deepseek_v41.py` takes device locks. Not on our path.
 
 ## 5. External systems
 
 | System | How | Notes |
 |---|---|---|
-| vLLM engine | Python dependency at a pinned commit; plugin entry points `vllm_gaudi/__init__.py` (`register_ops`, `register_models`, `register_tool_parsers`) | Upstream API moves weekly; upstream vllm-gaudi carries `[FIX_FOR_VLLM_CUSTOM=<sha>]` commits for it |
-| Hugging Face checkpoints | local paths on the servers | FP8 checkpoint identity *(unverified)* |
-| Gaudi software stack | `habana_frameworks.torch`, Synapse, HCCL, TPC compiler | Versions *(unverified)* |
-| Intel Neural Compressor | FP8 calibration / quantization (`calibration/`, `docs/features/floating_point_8.md`) | Only if the FP8 weights were produced with INC *(unverified)* |
-| NIXL / KV transfer | `vllm_gaudi/distributed/kv_transfer/` | Not used by the agents' servers *(unverified)* |
+| vLLM engine | Python dependency at commit `8f816a3f`; plugin entry points `vllm_gaudi/__init__.py` (`register_ops`, `register_models`, `register_tool_parsers`) | Upstream API moves weekly; upstream vllm-gaudi carries `[FIX_FOR_VLLM_CUSTOM=<sha>]` commits for it |
+| Hugging Face checkpoints | local paths on the node: `/models/Qwen3.8-27B`, `/models/Qwen3.8-27B-FP8` | The Flash-Next checkpoint on the node (BF16 path, or none yet) is *(unverified)* |
+| Gaudi software stack | `habana_frameworks.torch`, Synapse, HCCL, TPC compiler | 1.24.1 userspace in the fork image, 1.24.2 in the stock image, 1.24.2 driver |
+| Intel Neural Compressor | FP8 calibration / quantization (`calibration/`, `docs/features/floating_point_8.md`) | Used for the 27B fully-FP8 run with the conv1d blocklist; 3.6 in the stock image |
+| NIXL / KV transfer | `vllm_gaudi/distributed/kv_transfer/` | Not used by the agents' servers |
 
 No databases, no outbound services.
 
 ## 6. Surfaces
 
-- `vllm serve` OpenAI-compatible API (chat and completions, tool-call parsers, reasoning parsers) — the agents' surface.
-- Dedicated entry points `python -m vllm_gaudi.entrypoints.deepseek_v4` / `deepseek_v41` and the multi-model API server (`vllm_gaudi/entrypoints/`) — not on our path.
-- Operator benchmarks and audits: `tools/benchmark_flashinfer_gaudi_*.py`, `tools/benchmark_gdn_*.py`, `tools/profiler/`, `tools/trace_anatomy/`, `tools/analyze_*.py` — the profiling toolkit for the kernel audit.
-- `flashinfer_gaudi.get_capabilities()` — reports which native operators are promoted (`flashinfer_gaudi/_capabilities.py`, `flashinfer_gaudi/tactics/*.json`).
+- `vllm serve` OpenAI-compatible API (chat and completions, tool-call parsers, reasoning parsers): the agents' surface.
+- Dedicated entry points `python -m vllm_gaudi.entrypoints.deepseek_v4` / `deepseek_v41` and the multi-model API server (`vllm_gaudi/entrypoints/`): not on our path.
+- Operator benchmarks and audits: `tools/benchmark_flashinfer_gaudi_*.py`, `tools/benchmark_gdn_*.py`, `tools/profiler/`, `tools/trace_anatomy/`, `tools/analyze_*.py`: the profiling toolkit the run sheets hand to the user.
+- `flashinfer_gaudi.get_capabilities()` reports which native operators are promoted (`flashinfer_gaudi/_capabilities.py`, `flashinfer_gaudi/tactics/*.json`).
 
 ## 7. Workflows this program touches
 
-1. **Startup.** `HpuPlatform.check_and_update_config` (`vllm_gaudi/platform.py`) forces block size 128, realigns `mamba_page_size_padded` for hybrid models, turns `mamba_cache_mode` "all" into "align" when prefix caching is on, disables prefix caching under contiguous PA, and validates DFlash2 (TP1 only, prefix caching off, exactly 7 draft tokens, Qwen3.5/3.8 hybrids only). Then model load with OOT overrides (`vllm_gaudi/models/__init__.py`), KV-cache sizing, warmup over buckets (`vllm_gaudi/extension/bucketing/`, `docs/features/warmup.md`), graph compilation.
-2. **Long-prompt prefill.** Scheduler chunks by `max_num_batched_tokens`; `HPUModelRunner` (`vllm_gaudi/v1/worker/hpu_model_runner.py`, 10,240 lines) pads to a prompt bucket; GDN layers run `hpu_chunk_gated_delta_rule` (`vllm_gaudi/ops/hpu_gdn_pytorch.py`) or the FlashInfer-Gaudi prefill tactic when the shape is TP1 16/48 or TP2 8/24 (`vllm_gaudi/ops/flashinfer_gaudi_adapter.py:58-94`); attention layers run FusedSDPA / paged prefill (`vllm_gaudi/attention/backends/hpu_attn.py`); MoE runs `vllm_gaudi/ops/hpu_fused_moe.py`. Prefix-cache hits reuse attention blocks; GDN state is checkpointed at mamba block boundaries (`compute_prefix_caching_block_indices`, runner line 1314).
-3. **Decode step.** Decode bucket by batch and blocks; fused GDN decode (`gdn_fused_decode_step`, promoted for TP1 16/48 batches 1–32, TP2 8/24 behind `VLLM_HPU_FLASHINFER_GDN_TP2`); paged attention; MoE; sampler (device sampling since fork PR #58); async scheduling.
-4. **Speculative decoding.** EAGLE-style proposer (`vllm_gaudi/v1/spec_decode/hpu_eagle.py`) and DFlash2 (`hpu_dflash2.py`, `flashinfer_gaudi/dflash2.py`, Qwen3.8-27B draft, TP1 only); DeepSeek DSpark is separate.
-5. **Multi-card.** HCCL collectives; TP2 fused AllReduce-norm boundaries (`vllm_gaudi/distributed/tp2_fused_ar_norm.py`); TP4 native replay only for DeepSeek V4.1.
+Line numbers are in `vllm_gaudi/v1/worker/hpu_model_runner.py` unless a file is named; the R2 report on RUK-2719 has the full tables.
+
+1. **Startup.** `HpuPlatform.check_and_update_config` (`vllm_gaudi/platform.py`) forces block size 128 and `mamba_block_size` 128 for Qwen3.5 hybrids (:362–372), realigns `mamba_page_size_padded` (:394–419), turns `mamba_cache_mode` "all" into "align" when prefix caching is on (:454–456), disables prefix caching under `VLLM_CONTIGUOUS_PA` (:447–449) and validates DFlash2 (:136–191: TP1 only, prefix caching off, exactly 7 draft tokens, Qwen3.5/3.8 hybrids only). The runner's GDN group ids are set only for architectures in the allow-list `GraniteMoeHybridForCausalLM`, `Qwen3_5MoeForConditionalGeneration`, `Qwen3_5ForConditionalGeneration`, `Qwen3NextForCausalLM`, `NemotronHForCausalLM` (:927–931): **`Qwen4ExpForConditionalGeneration` must be added** or no GDN state is managed. `VLLM_COMPACT_GDN` defaults to `1` when unset and, with prefix caching on, the runner only warns `Compact GDN mode does not support prefix caching.` (:2172–2181). Then model load with OOT overrides (`vllm_gaudi/models/__init__.py`), KV-cache sizing, warmup over buckets (`vllm_gaudi/extension/bucketing/`, `docs/features/warmup.md`; about 400 s per server in every run so far), graph compilation.
+2. **Scheduling and long-prompt prefill.** At the pin the vLLM scheduler gives each step a token budget of `max_num_batched_tokens` (default 2048, `vllm/config/scheduler.py:42`), serves running requests first and admits waiting ones only from what is left (`vllm/v1/core/sched/scheduler.py:509–1189`); `long_prefill_token_threshold` defaults to 0 and there is no `max_num_partial_prefills` at this pin. The HPU runner prefills `max_prefill_batch_size` requests per forward pass, default 1 (`VLLM_PROMPT_BS_BUCKET_MAX`, :2316–2318), and under prefix caching asserts exactly one prefill request per bucket with chunk-aligned context (:4413–4415); merged prefill is forbidden for models with mamba layers (:3633–3634). GDN layers run `hpu_chunk_gated_delta_rule` (`vllm_gaudi/ops/hpu_gdn_pytorch.py`) or the FlashInfer-Gaudi prefill tactic when the shape is TP1 16/48 or TP2 8/24 (`vllm_gaudi/ops/flashinfer_gaudi_adapter.py:58–94`); attention layers run FusedSDPA / paged prefill (`vllm_gaudi/attention/backends/hpu_attn.py`); MoE runs `vllm_gaudi/ops/hpu_fused_moe.py`. Prefix-cache hits reuse attention blocks; GDN state is checkpointed at mamba block boundaries (`compute_prefix_caching_block_indices` :1314, mapping :4417–4460). R7 (RUK-2728) maps the admission path and the knobs.
+3. **Decode step.** Decode bucket by batch and blocks; fused GDN decode (`gdn_fused_decode_step`, promoted for TP1 16/48 batches 1–32, TP2 8/24 behind `VLLM_HPU_FLASHINFER_GDN_TP2`); paged attention; MoE; sampler (device sampling since fork PR #58); async scheduling. The fast GDN state paths (`VLLM_HPU_GDN_ASYNC_STATE_DMA`, `VLLM_HPU_GDN_DIRECT_STATE_UPDATE`) require TP2 with no speculation and no prefix caching (:1390–1393), and the direct-state decode path is off whenever prefix caching is on (:2476–2479): at TP4 and TP8 none of them apply.
+4. **Speculative decoding.** EAGLE-style proposer (`vllm_gaudi/v1/spec_decode/hpu_eagle.py`, also used for `mtp`), DFlash2 (`hpu_dflash2.py`, `flashinfer_gaudi/dflash2.py`; Qwen3.8-27B draft, TP1 only, greedy only, prefix caching off); Medusa unsupported (:2258); speculation cannot combine with async scheduling (:2307). DeepSeek DSpark is separate. Only EAGLE/MTP drafting is viable for Flash-Next.
+5. **Multi-card.** HCCL collectives; TP2 fused AllReduce-norm boundaries (`vllm_gaudi/distributed/tp2_fused_ar_norm.py`); TP4 native replay only for DeepSeek V4.1. `_update_hybrid_attention_mamba_layout` (:8553) is dead code (its only call site, :9060, is commented out).
 
 ## 8. Data and configuration
 
-- Settings: 534 `VLLM_*` names in `vllm_gaudi/envs.py` (GDN: `VLLM_GDN_*`, `VLLM_HPU_GDN_*`, `VLLM_HPU_FLASHINFER_*`, `VLLM_COMPACT_GDN`), `PT_HPU_*` runtime variables, feature flags in `vllm_gaudi/extension/features.py`, bucketing in `vllm_gaudi/extension/bucketing/`, INC JSON for FP8, tactic manifests in `flashinfer_gaudi/tactics/`.
+- Settings: 534 `VLLM_*` names in `vllm_gaudi/envs.py` (GDN: `VLLM_GDN_*`, `VLLM_HPU_GDN_*`, `VLLM_HPU_FLASHINFER_*`), `VLLM_COMPACT_GDN` and `VLLM_USE_HYBRID_CACHE` read through `os.environ` in the runner, bucketing limits `VLLM_PROMPT_BS_BUCKET_MAX`, `VLLM_PROMPT_SEQ_BUCKET_*`, `VLLM_DECODE_BS_BUCKET_MAX` in `vllm_gaudi/extension/features.py`, `PT_HPU_*` runtime variables, INC JSON for FP8, tactic manifests in `flashinfer_gaudi/tactics/`. vLLM warns `Unknown vLLM environment variable detected` for any `VLLM_*` name outside its own `envs.py`; that warning says nothing about whether the plugin read the variable (R1 names the engagement log lines).
 - Runtime state: paged KV cache (block 128), GDN recurrent state (FP32 by default) and conv state per sequence, index caches (QSA, to add), the PLE table (95 GiB BF16, to place), HPU graphs / recipes.
 
 ## 9. Where the weight is
 
 | Area | Size | Nature |
 |---|---|---|
-| `vllm_gaudi/v1/worker/hpu_model_runner.py` | 10,240 lines | The engine of the plugin; heavily modified by the fork (GDN state views, async DMA, TP2 plans) |
-| GDN | `ops/hpu_gdn_pytorch.py` 2,684; `flashinfer_gaudi/gdn_*.py` 964; `csrc/flashqla_hpu/` 55 files; `csrc/flashinfer_gaudi/` 47 files | Real kernels and dispatch; audit target |
-| DeepSeek V4 / V4.1 | about 30K Python lines across `ops/deepseek_v41_*`, `models/deepseek_v41*`, `v1/worker/deepseek_v41_*`; `csrc/deepseek_v4*` 976 files | Not on our path; reuse candidates: Engram host gather, indexer kernels, DSpark MTP, TP4 replay |
-| MoE / FP8 | `ops/hpu_fused_moe.py` 983; `ops/hpu_fp8.py` 380; `ops/hpu_compressed_tensors.py` 1,321 | Generic; needs 512-expert / shared-expert / block-FP8 checks |
+| `vllm_gaudi/v1/worker/hpu_model_runner.py` | 10,240 lines | The engine of the plugin; heavily modified by the fork (GDN state views, async DMA, TP2 plans). R2 mapped its hybrid, prefix-caching and speculative paths |
+| GDN | `ops/hpu_gdn_pytorch.py` 2,684; `flashinfer_gaudi/gdn_*.py` 964; `csrc/flashqla_hpu/` 55 files; `csrc/flashinfer_gaudi/` 47 files | Real kernels and dispatch; audit target (R1) |
+| DeepSeek V4 / V4.1 | about 30K Python lines across `ops/deepseek_v41_*`, `models/deepseek_v41*`, `v1/worker/deepseek_v41_*`; `csrc/deepseek_v4*` 976 files | Not on our path; reuse candidates: Engram host gather, indexer kernels, DSpark MTP, TP4 replay (R5) |
+| MoE / FP8 | `ops/hpu_fused_moe.py` 983; `ops/hpu_fp8.py` 380; `ops/hpu_compressed_tensors.py` 1,321 | Generic; needs 512-expert / shared-expert / block-FP8 checks (R6) |
 | Attention | `attention/backends/hpu_attn.py` 969; `v1/attention/backends/hpu_attn.py` 183; `extension/ops.py` 2,602 | Dense paged attention; no sparse path |
-| Bucketing / warmup | `extension/bucketing/` 1,516 | Long-context bucket shapes live here |
+| Bucketing / warmup | `extension/bucketing/` 1,516 | Long-context bucket shapes live here (R7) |
 | Speculative | `v1/spec_decode/` 666; `ops/hpu_dflash2.py` 208; `flashinfer_gaudi/dflash2.py` 547 | DFlash2 is target-specific (Qwen3.8-27B draft) |
-| `tools/` | 96K lines | Mostly DeepSeek V4.1 audits and benchmarks; the profiling method to copy |
+| `tools/` | 96K lines | Mostly DeepSeek V4.1 audits and benchmarks; the profiling method to copy into run sheets |
 | `tests/unit_tests/` | 527 files | CPU-runnable with skips; our first gate |
 
 Dead or irrelevant for us: MiniMax H3 (`vllm_gaudi/omni/`), DeepSeek OCR, Gemma, LoRA.
@@ -109,9 +128,21 @@ Dead or irrelevant for us: MiniMax H3 (`vllm_gaudi/omni/`), DeepSeek OCR, Gemma,
 - Block size 128 and the FP8 numerics contracts in `docs/features/floating_point_8.md`.
 - `AGENTS.md` conventions: yapf/ruff, SPDX headers, no raw performance numbers in anything we may upstream (our own program documents keep the user's measurements).
 
-## 11. Baseline: Run 2 (user's measurement, 2026-11-17)
+## 11. Reference measurements: Qwen3.8-27B on the node (user's runs, 2026-11-17)
 
-FP8 weights, BF16 KV, two servers × four Gaudi2 cards, 2.5M KV tokens per server (about 19 agents each).
+These are **not Flash-Next**. They establish what the node and the two stacks do on the agent workload with a 27B dense GDN hybrid, and they expose the serving behaviour the plan attacks first.
+
+### Run 2: stock vllm-gaudi 0.30.0, FP8 weights, BF16 KV, two servers × TP4
+
+Launch (server A; server B is cards 4–7 on port 8001), no `VLLM_*` variables set:
+
+```bash
+vllm serve /models/Qwen3.8-27B-FP8 --served-model-name Qwen3.8-27B-FP8 --port 8000 \
+  --tensor-parallel-size 4 --max-model-len 131072 --max-num-seqs 16 \
+  --enable-prefix-caching --language-model-only --trust-remote-code --gpu-memory-utilization 0.95
+```
+
+FP8 came from the checkpoint's own quantization config (no `--quantization` flag). Startup: `Loading model weights took 7.0709 GB`, `HPU KV cache size: 2,500,648 tokens, Maximum concurrency for 131,072 tokens per request: 19.08x`, `Decode warmup processing: 0/87 …`, `Warmup finished in 404 secs` (B: 391 s), and `No available shared memory broadcast block found in 60 seconds` warnings (a step longer than 60 s).
 
 | Test | First token median / p90 / p99 | Decode per agent | Total output | Wall |
 |---|---|---|---|---|
@@ -119,35 +150,59 @@ FP8 weights, BF16 KV, two servers × four Gaudi2 cards, 2.5M KV tokens per serve
 | 16 agents, cold | 136 s / 237 s / 263 s | 7.1 tok/s | 51 tok/s | 321 s |
 | 16 agents, prime (also cold) | 161 s / 251 s | 6.3 tok/s | 50 tok/s | 329 s |
 
-Reading, pending the exact prompt sizes and launch flags:
+Engine stats during the warm run: A `Avg prompt throughput: 12199.2 tokens/s, Avg generation throughput: 1.5 tokens/s, Running: 3 reqs, Waiting: 5 reqs, KV cache usage: 7.0%`; B `… 12200.1 tokens/s, … 2.3 tokens/s, Running: 4 reqs, Waiting: 4 reqs, KV cache usage: 7.8%`. Prefix cache hit rate: A 13.4% → 11.9% → 11.2% → 9.6%; B 0.0% in every interval. Run 1 (same image, BF16, one server × TP8, `--max-num-seqs 32`, utilization 0.92) logged `Mamba cache mode is set to 'align' … when prefix caching is enabled`, `GDN layers detected (48): VLLM_USE_HYBRID_CACHE=1, VLLM_USE_NAIVE_MAMBA_CACHE_SHARING=0, VLLM_COMPACT_GDN=0`, `[HPU] Forcing CompilationMode.NONE`, `Model Runner V2 requires Triton; using the V1 model runner instead`, `Using LBNHC KV cache layout`, `HPU KV cache size: 2,647,954 tokens`, `kv cache group sizes [512, 512, 512, 512]`, `bucketing_strategy: exp`, `Warmup finished in 395 secs`.
 
-1. **Prefill dominates.** One agent waits 24.9 s for its first token; at 16 agents the p99 first token is 263 s of a 321 s run. If the prompts are around 100K tokens, four cards deliver roughly 4K tokens/s of prefill, about what the fork's own record shows for one card on 2K-token prompts (`docs/benchmarks/qwen38-a800-gaudi2.md`). Long-prompt prefill at TP4 is the first bottleneck: chunk size, GDN prefill tactic (none exists for the TP4 shape 4 / 12 heads), attention prefill at 128K, and recompiles.
-2. **Decode does not batch.** 28 tok/s alone, 7.1 tok/s each for 16 agents: 16× the work for 4× the aggregate. A step at batch 16 takes about 140 ms; the FP8 weight and KV traffic for that step is far below what Gaudi2's HBM moves in 140 ms, so the step is overhead-bound (host work, graph launches, per-sequence loops, prefill chunks stealing steps), not bandwidth-bound.
-3. **Prefix reuse did nothing.** Priming the cache made the cold run slower, not faster. Either prefix caching was off (DFlash2 and the GDN async-DMA path both require it off) or it never hit for a hybrid model. The startup log will say which.
+### This fork, FP8 27B, four servers × TP2 (16-agent warm run completed; numbers not yet posted)
+
+`prefix_caching: True`, `Mamba cache mode … 'align'`, `GDN layers detected (48): … VLLM_COMPACT_GDN=1`, **`Compact GDN mode does not support prefix caching.`**, `GDN compact: 3 groups, 8 base_slots, tensor_dim0=26 vs baseline=2516`, `Using Triton/FLA GDN prefill kernel (requested=auto, head_k_dim=128).`, `GDN decode kernel: cuda`, `GPU KV cache size: 2,154,549 tokens (16.44x)`, `Loading model weights took 14.0–14.9 GB`, `enable_chunked_prefill=True | enforce_eager=False | kv_cache_dtype=auto | quantization=fp8 | dtype=torch.bfloat16`, `Warmup finished in 414 secs` (others 411 / 404 / 398), `Unknown vLLM environment variable detected: VLLM_HPU_FLASHINFER_GDN` (and `_TP2`). The user's cache check on port 8001 (prompt a, a again, then b) ended at `Prefix cache hit rate: 0.0%`. Engine-stats lines did not match the user's grep on this vLLM build.
+
+### This fork, INC FP8 27B, one server × TP8 (stopped during the second priming pass)
+
+First launch failed on conv1d (section 4); with the blocklist: `GPU KV cache size: 5,194,905 tokens (39.63x)`, `Loading model weights took 0.0000 GB`, `Prompt warmup processing: 11% 12/108`, `Warmup finished in 436 secs`. `VLLM_COMPACT_GDN=0` was set but the matching `GDN layers detected` line was not captured.
+
+### Reading
+
+1. **Admission, not memory, sets first-token latency.** Three or four requests ran while four or five waited with 7–8% of the KV cache in use. At the pin the scheduler spends its per-step token budget on running prefills first (section 7.2), so a 128K prompt occupies the budget for about 64 steps at the 2048 default and waiting requests enter only as running ones finish; the stock image's defaults may differ (R7 confirms). The 263 s p99 is queueing.
+2. **Decode starves while prefills run.** Aggregate generation of 1.5–2.3 tok/s with 3–4 running requests means decode steps happened only between prefill chunks; the runner prefills one request per forward pass. The "7.1 tok/s per agent" is an average over the whole run, including this phase.
+3. **Prefix reuse never paid.** On the stock image the hit rate was 13% falling to 10% on one server and 0% on the other despite a priming pass: the shared prefix is either shorter or less aligned than assumed, or the client's prompts differ early. On the fork, `VLLM_COMPACT_GDN=1` (the default) makes the runner warn and keeps compact state, and the a/a/b check hit 0%; `VLLM_COMPACT_GDN=0` with prefix caching, which upstream vllm-gaudi #1831 qualifies, has not completed a run here.
+4. **The fork's FlashInfer-Gaudi GDN tactics may not have engaged** in the TP2 run; the unknown-variable warning is vLLM's and proves nothing either way. R1 names the log line that proves engagement and explains the `Triton/FLA` and `cuda` kernel names.
+5. **Warmup costs about 400 s per server at every start**, on both stacks.
+6. **Memory**: FP8 27B leaves 2.5M KV tokens per TP4 server on the stock image and 2.15M per TP2 server on the fork; INC FP8 at TP8 leaves 5.19M.
+
+Still needed from the user (asked in a comment, not blocking): the benchmark client (prompt and output sizes, shared-prefix length, what "prime" sends, how the rates are computed; inferred so far: prompts near 131K and about 2K output tokens per agent, from 17 tok/s × 123 s), the Flash-Next checkpoint on the node, and `docker logs` of the 16-agent containers for recompile and graph-compile messages if the containers still exist.
 
 ## 12. Upstream state that matters
 
-- **vLLM.** Qwen3.8-Flash-Next merged 2026-08-31 (PR #53896, 124 files); PLE host offload and Engram TP merged 2026-09-09 (PR #54371); block-FP8 MTP fix 2026-09-08 (PR #55513); minimum 0.30.0; latest release v0.34.0 (2026-11-16). The model is the package `vllm/models/qwen4_exp/` with `common/` (HyperConnection, n-gram embedding base classes, PLE loading, QSA metadata and index-cache ownership), `nvidia/` and `amd/`. `vllm/models/qwen4_exp/__init__.py` picks `amd` on ROCm, raises on XPU/TPU, and **falls back to `nvidia` for every other platform, including HPU**. The registry maps `Qwen4ExpForConditionalGeneration` and `Qwen4ExpMTP` there (`vllm/model_executor/models/registry.py`). An HPU implementation therefore has to be registered out-of-tree by the plugin, as the fork does for other models.
-- **vllm-gaudi upstream** (`vllm-project/vllm-gaudi`, about 216 commits since the fork's base of 2026-08-28). Relevant: Qwen3.5 GDN prefix caching with `COMPACT_GDN=0` (#1831), prefill chunk alignment to the mamba block (#1853), mamba chunk alignment fixes (#1828, #1890), non-finite initial-state masking in GDN prefill (#1895), per-request top-k in the DeepSeek sparse-attention decode indexer (#1870, `vllm_gaudi/ops/hpu_sparse_attn_indexer.py`), FP8 KV decode softmax on Gaudi2 (#1931), RoPE numerics for very long contexts (#1816), explicit MoE overloads for FP8 per-channel (#1921), MoE top-k routing options (#1922), vendored V1 model runner after upstream removal (#1970). No Qwen3.8-Flash-Next support upstream.
+- **vLLM at the pin (`8f816a3f`, 2026-09-04).** `vllm/models/qwen4_exp/` has `__init__.py` (platform dispatch: XPU/TPU raise, ROCm → `amd`, **everything else, HPU included, → `nvidia`**), `config.py`, `common/` (`hyperconnection.py`, `ple.py`, `qsa_cache.py`) and `nvidia/` (`model.py` 40 KB, `mtp.py` 18 KB, `ple_layer.py` 36 KB, `qsa.py` 18 KB, `indexer_qsa.py` 15 KB, `model_state.py`, `low_latency_gemm.py`, `hyperconnection.py`, `ops/`). The registry maps `Qwen4ExpForConditionalGeneration` and `Qwen4ExpMTP` to that package, so the plugin registers its own class out-of-tree, as the fork does for other models.
+- **vLLM after the pin.** 74 commits touched `vllm/models/qwen4_exp/` and 33 touched `vllm/model_executor/layers/mamba/gdn/` between the pin and `v0.34.0` (2026-11-16), including PLE host offload and Engram TP (#54371, 2026-09-09), block-FP8 MTP fix (#55513, 2026-09-08), FP8 indexer cache (#54890), PLE disk offload (#59958), checkpoints with quantized q/k/v and a BF16 indexer (#62318), FP8 KV scales in QSA (#65812), and the `common/` refactor that split `qsa_cache.py` into `qsa.py` + `qsa_indexer.py` and added `ngram_embedding.py` (#61454 and neighbours). R4b (RUK-2729) classifies them into a carry list. R4 (RUK-2721, mapped at `v0.34.0`) found that `nvidia/model.py` cannot be imported on HPU: `nvidia/hyperconnection.py` → `nvidia/ops/hc.py` imports Triton at module level and `low_latency_gemm.py` imports the CuTe skinny GEMM; the model skeleton itself is plain PyTorch. The HPU class is therefore a copy of `nvidia/model.py` and `nvidia/mtp.py` with those seams replaced.
+- **vllm-gaudi upstream** (`vllm-project/vllm-gaudi`, about 216 commits since the fork's base of 2026-08-28; tag `v0.30.0` is the stock image). Relevant: Qwen3.5 GDN prefix caching with `COMPACT_GDN=0` (#1831), prefill chunk alignment to the mamba block (#1853), mamba chunk alignment fixes (#1828, #1890), non-finite initial-state masking in GDN prefill (#1895), per-request top-k in the DeepSeek sparse-attention decode indexer (#1870, `vllm_gaudi/ops/hpu_sparse_attn_indexer.py`), FP8 KV decode softmax on Gaudi2 (#1931), RoPE numerics for very long contexts (#1816), explicit MoE overloads for FP8 per-channel (#1921), MoE top-k routing options (#1922), vendored V1 model runner after upstream removal (#1970). No Qwen3.8-Flash-Next support upstream. R3 (RUK-2720) catalogues the delta with conflict risk.
 - **1CatAI upstream.** No commits after 2026-10-12; no Flash-Next code. The user's fork is identical to it.
 
-## 13. Open questions for the user (asked as an interaction on RUK-2709)
+## 13. Questions and answers
 
-1. Exact launch command and environment of Run 2 (one server).
-2. Checkpoint identity and how the FP8 weights were produced.
-3. Gaudi software, vLLM, plugin, PyTorch and Python versions.
-4. Benchmark client: prompt and output lengths, shared prefix, how "prime" was done, how the rates were computed.
-5. One 8-card node or two 4-card servers.
-6. Whether an engineer or I can get access to a Gaudi2 machine for profiling, or whether the user runs the commands we write.
-7. Startup and run log excerpts (KV blocks, prefix caching, mamba cache mode, warmup buckets, recompilation warnings).
+Answered on 2026-11-17 (interaction on RUK-2709): launch commands (section 11), checkpoint (27B only was quantized; Flash-Next not yet), versions (section 3), topology (one HLS-2 node), hardware access (none for agents), logs (section 11). The benchmark client was answered as "same as Run 2, the warm run" without the script; the three open items are listed at the end of section 11.
 
-## 14. Program shape (to be confirmed by the reuse ledger and plan)
+## 14. Program shape and verification model
 
-Milestones as vertical slices, in the order the baseline dictates:
+Each milestone ends in three things: CPU unit tests green on this Mac (S0's gate), a Tech-Lead-reviewed pull request into the program branch, and a **run sheet** under `docs/design/flash-next/run-sheets/` that the user executes on the node; the user's results come back as a comment and are recorded in this document. Milestones as vertical slices, in the order the reference measurements dictate:
 
-- **M0 Foundations.** Mac CPU development environment and test gate (spike S0); exact baseline reproduction script; Flash-Next OOT model registration on HPU built from upstream `common/` pieces with the fork's GDN path, dense attention as the first QSA fallback, PLE table on device, MoE through the existing HPU path.
-- **M1 Prefill and prefix reuse.** Long-prompt prefill at TP4 (chunking, GDN TP4 prefill tactic, attention prefill at 128K, bucket shapes, recompiles) and working prefix caching for the hybrid model (cherry-picked upstream fixes), measured by first-token latency on the agent workload.
-- **M2 Decode batching.** Fused GDN decode for the TP4 shape, MoE FP8 decode for 512 experts, graph replay and host overhead at batch 16–32, QSA sparse attention proper (indexer + block gather) so long contexts stop paying dense attention.
+- **M0 Foundations.** Mac CPU environment and test gate (S0); run-sheet template and a replay harness for the agent workload (needs the user's client details); Flash-Next OOT model class on HPU, copied from upstream `nvidia/model.py` + `mtp.py` at the pin with the CUDA seams replaced (torch HyperConnection, torch PLE conv/gate with the table on device, dense paged attention as the first QSA fallback, MoE through the existing HPU path, GDN through `HPUGatedDeltaNetAttention`), the runner's architecture allow-list extended, R4b's carry list applied; first bring-up run sheet at **TP8 BF16 on one server** with correctness checks (greedy outputs against a CPU reference on short prompts) and the memory lines to capture.
+- **M1 Admission, prefill and prefix reuse.** Config-only scheduling fixes from R7's run sheet first (per-step budget, long-prefill threshold), then code where the plugin caps it; long-prompt prefill at TP8/TP4 (chunking, GDN prefill for the new head shapes, attention prefill at 128K, bucket shapes, recompiles); prefix caching that hits for the hybrid model (`VLLM_COMPACT_GDN=0` qualification, cherry-picks #1831/#1853/#1828/#1890/#1895, client-side prefix alignment), measured by first-token latency and hit rate on the agent workload.
+- **M2 Decode batching.** Fused GDN decode for the TP8 and TP4 shapes, MoE FP8 decode for 512 experts, graph replay and host overhead at batch 16–32, QSA sparse attention proper (indexer + block gather) so long contexts stop paying dense attention.
 - **M3 Speculative decoding.** Flash-Next MTP on HPU (upstream `Qwen4ExpMTP` through the fork's EAGLE proposer), IndexShare top-k reuse; DFlash2 only if a Flash-Next draft exists.
-- **M4 Eight cards.** TP4 ×2 versus TP8 versus TP + EP, HCCL topology, PLE host offload to free HBM for KV.
+- **M4 Two servers and eight cards.** 2 × TP4 with the FP8 checkpoint (block-FP8 MoE on HPU, or INC with the conv1d blocklist) or with PLE host offload (backport #54371 or the fork's Engram host gather); TP8 versus 2 × TP4 versus TP + EP; HCCL topology on the HLS-2.
 - **M5 Gaudi2 extras.** Whatever the profiles show (FP8 KV, native fusions already in FlashInfer-Gaudi, warmup time, sampler).
+
+## 15. Research and spike status (2026-11-17)
+
+| Task | Owner | Status |
+|---|---|---|
+| S0 Mac CPU environment and test gate (RUK-2717) | Engineer 2, review Tech Lead 1 | in progress; pin corrected to `8f816a3f` |
+| R1 GDN flag and dispatch inventory (RUK-2718) | General Agent | todo; scope extended with the user's log lines |
+| R2 runner hybrid / prefix-caching / speculative map (RUK-2719) | Engineer 1 | done, approved; facts in section 7 |
+| R3 upstream vllm-gaudi delta (RUK-2720) | Engineer 3 | in progress |
+| R4 upstream Qwen4Exp map at v0.34.0 (RUK-2721) | Engineer 4 | done, approved; facts in section 12 |
+| R4b upstream Flash-Next delta pin → v0.34.0 (RUK-2729) | Engineer 4 | todo |
+| R5 DeepSeek V4.1 reuse candidates (RUK-2722) | Engineer 5 | in progress |
+| R6 MoE / FP8 / EP inventory (RUK-2723) | Engineer 6 | todo |
+| R7 long-prompt admission and chunking, run sheet (RUK-2728) | Engineer 1 | todo |
