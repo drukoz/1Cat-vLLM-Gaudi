@@ -337,3 +337,33 @@ def test_chunked_prefill_bf16(tiny_checkpoint):
                                    f"max |delta logit| = {gap_b:.3e} > {BF16_TOL:.0e}")
         assert_slot_untouched(modules, LOAD_SLOT, "bf16 after chunk B")
         assert_slot_equal(modules, STORE_SLOT, stored_state, "bf16 after chunk B (chunk B read this slot)")
+
+
+def test_null_load_slot_reads_zero_state(tiny_checkpoint):
+    """A prefill with load slot 0 (the null block) and has_initial_states_p=[1] ignores whatever slot 0 holds (#1895).
+
+    Slot 0 of every GDN and PLE state tensor is filled with NaN. The logits must be finite and equal
+    to a fresh prefill of the same tokens (has_initial_states_p=[0], clean caches).
+    """
+    tokens = prompt_tokens()[:CHUNK_A_LEN]
+    with cpu_model(tiny_checkpoint, fp32=True, num_slots=NUM_SLOTS) as (vllm_config, model):
+        enable_slot_reuse(vllm_config)
+        eos = eos_token_id(vllm_config)
+        atts = install_cached_attention(model)
+        modules = state_modules(model)
+        reset(model, atts)
+        ref = prefill_logits(model, vllm_config, atts, tokens, 0,
+                             prefill_metadata(CHUNK_A_LEN, load_slot=0, store_slot=STORE_SLOT),
+                             ple_kwargs(CHUNK_A_LEN, eos))
+        reset(model, atts)
+        for tensor in slot_tensors(modules, 0):
+            tensor.fill_(float("nan"))
+        got = prefill_logits(model, vllm_config, atts, tokens, 0,
+                             prefill_metadata(CHUNK_A_LEN, load_slot=0, store_slot=STORE_SLOT, has_initial_state=True),
+                             ple_kwargs(CHUNK_A_LEN, eos))
+        assert bool(torch.isfinite(got).all()), "a layer read the NaN in null block 0 as its initial state"
+        torch.testing.assert_close(got, ref, rtol=0, atol=FP32_TOL)
+        # Zero the NaN before leaving the context: freed state blocks return to torch's CPU caching
+        # allocator, and a later cpu_model build's uninitialized (checkpoint-padding) weight rows
+        # can reuse them and read as non-finite.
+        reset(model, atts)
