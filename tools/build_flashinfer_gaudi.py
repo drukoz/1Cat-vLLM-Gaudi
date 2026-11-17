@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import shutil
 import subprocess
 import sys
@@ -60,6 +61,49 @@ def build_pytorch_extension(source_root: Path, build_root: Path, output_dir: Pat
     return matches[0]
 
 
+def build_gdn_fused(repository_root: Path, build_root: Path, output_dir: Path) -> Path:
+    source_root = repository_root / "csrc" / "gdn_fused"
+    cmake_build = build_root / "gdn_fused_kernel_db"
+    _run(
+        [
+            "cmake",
+            "-S",
+            str(source_root),
+            "-B",
+            str(cmake_build),
+            "-DCMAKE_BUILD_TYPE=Release",
+        ],
+        cwd=source_root,
+    )
+    _run(
+        ["cmake", "--build", str(cmake_build), "--target", "gdn_fused_gaudi2", "--parallel"],
+        cwd=source_root,
+    )
+    built = cmake_build / "libgdn_fused_gaudi2.so"
+    if not built.is_file():
+        raise FileNotFoundError(f"CMake did not produce {built}.")
+    shutil.copy2(built, output_dir / built.name)
+
+    pytorch_root = source_root / "pytorch"
+    extension_build = build_root / "gdn_fused_pytorch"
+    _run(
+        [
+            sys.executable,
+            "setup.py",
+            "build_ext",
+            "--build-lib",
+            str(output_dir),
+            "--build-temp",
+            str(extension_build),
+        ],
+        cwd=pytorch_root,
+    )
+    matches = sorted(output_dir.glob("gdn_fused_ops*.so"))
+    if len(matches) != 1:
+        raise FileNotFoundError(f"Expected one gdn_fused_ops extension in {output_dir}, found {matches}.")
+    return matches[0]
+
+
 def main() -> None:
     repository_root = Path(__file__).resolve().parents[1]
     parser = argparse.ArgumentParser()
@@ -75,9 +119,12 @@ def main() -> None:
     )
     parser.add_argument("--kernel-only", action="store_true")
     parser.add_argument("--extension-only", action="store_true")
+    parser.add_argument("--gdn-fused-only", action="store_true")
     args = parser.parse_args()
     if args.kernel_only and args.extension_only:
         parser.error("--kernel-only and --extension-only are mutually exclusive")
+    if args.gdn_fused_only and (args.kernel_only or args.extension_only):
+        parser.error("--gdn-fused-only is mutually exclusive with --kernel-only and --extension-only")
 
     source_root = repository_root / "csrc" / "flashinfer_gaudi"
     output_dir = args.output_dir.resolve()
@@ -85,10 +132,17 @@ def main() -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     build_root.mkdir(parents=True, exist_ok=True)
 
-    if not args.extension_only:
-        build_kernel_database(source_root, build_root, output_dir)
-    if not args.kernel_only:
-        build_pytorch_extension(source_root, build_root, output_dir)
+    if not args.gdn_fused_only:
+        if not args.extension_only:
+            build_kernel_database(source_root, build_root, output_dir)
+        if not args.kernel_only:
+            build_pytorch_extension(source_root, build_root, output_dir)
+    if args.gdn_fused_only or os.environ.get("VLLM_GAUDI_BUILD_GDN_FUSED") == "1":
+        try:
+            build_gdn_fused(repository_root, build_root, output_dir)
+        except (subprocess.CalledProcessError, FileNotFoundError) as exc:
+            print(f"GDN fused build failed (the FlashInfer-Gaudi libraries are unaffected): {exc}", file=sys.stderr)
+            sys.exit(3)
 
 
 if __name__ == "__main__":
