@@ -21,9 +21,10 @@ class GdnGateActivation(enum.IntEnum):
 
 
 class GdnCoreDecodeMode(enum.IntEnum):
-    """VLLM_HPU_GDN_CORE_DECODE values (next free: 2)."""
+    """VLLM_HPU_GDN_CORE_DECODE values (next free: 3)."""
     OFF = 0
     FUSED = 1
+    RECURRENCE = 2
 
 
 def _require(cond: bool, msg: str) -> None:
@@ -137,6 +138,81 @@ def gdn_core_decode_reference(
     return out
 
 
+def gdn_recurrent_decode_reference(
+    ssm_state: torch.Tensor,  # [S, HV, D, D] fp32, mutated in place
+    qkv: torch.Tensor,  # [B, C], the conv update's output after SiLU, in [q | k | v] order
+    a: torch.Tensor,  # [B, HV]
+    b: torch.Tensor,  # [B, HV]
+    A_log: torch.Tensor,  # [HV] fp32
+    dt_bias: torch.Tensor,  # [HV] fp32
+    load_indices: torch.Tensor,  # [B] int32
+    store_indices: torch.Tensor,  # [B] int32
+    scale: float,
+) -> torch.Tensor:  # [B, HV, D] fp32
+    """One GDN delta-rule recurrence step for every valid row: no conv, no SiLU, no norm.
+
+    ``qkv`` is the conv update's output **after** SiLU; the return is ``o``, the recurrence output
+    before the gated RMSNorm.  Rows with an out-of-range load or store slot are padding: output
+    zeros, no state write.  Every read of a state slot happens before any write, so load == store
+    on a row works.  Semantics: ``gdn_core_decode_reference`` with ``act = qkv[r].float()``.
+    """
+    _require(ssm_state.dim() == 4 and ssm_state.shape[2] == ssm_state.shape[3],
+             f"ssm_state must be [S, HV, D, D], got shape {tuple(ssm_state.shape)}")
+    S, HV, D = ssm_state.shape[0], ssm_state.shape[1], ssm_state.shape[2]
+    _require(HV > 0 and D > 0, f"ssm_state must have HV > 0 and D > 0, got shape {tuple(ssm_state.shape)}")
+    _require(qkv.dim() == 2, f"qkv must be [B, C], got shape {tuple(qkv.shape)}")
+    B, C = qkv.shape
+    H = (C - HV * D) // (2 * D)
+    _require(H > 0 and C == 2 * H * D + HV * D,
+             f"qkv channels C={C} must equal 2*H*D + HV*D with D={D}, HV={HV}")
+    _require(HV % H == 0, f"HV={HV} must be a multiple of H={H}")
+    rep = HV // H
+    _require(a.dim() == 2 and tuple(a.shape) == (B, HV), f"a must be [B, HV] = ({B}, {HV}), got {tuple(a.shape)}")
+    _require(b.dim() == 2 and tuple(b.shape) == (B, HV), f"b must be [B, HV] = ({B}, {HV}), got {tuple(b.shape)}")
+    _require(A_log.dim() == 1 and tuple(A_log.shape) == (HV,),
+             f"A_log must be [HV] = ({HV},), got {tuple(A_log.shape)}")
+    _require(dt_bias.dim() == 1 and tuple(dt_bias.shape) == (HV,),
+             f"dt_bias must be [HV] = ({HV},), got {tuple(dt_bias.shape)}")
+    _require(load_indices.dim() == 1 and tuple(load_indices.shape) == (B,),
+             f"load_indices must be [B] = ({B},), got {tuple(load_indices.shape)}")
+    _require(store_indices.dim() == 1 and tuple(store_indices.shape) == (B,),
+             f"store_indices must be [B] = ({B},), got {tuple(store_indices.shape)}")
+
+    out = torch.zeros(B, HV, D, dtype=torch.float32, device=ssm_state.device)
+    load = load_indices.long()
+    store = store_indices.long()
+    valid = (load >= 0) & (load < S) & (store >= 0) & (store < S)
+    rows = torch.nonzero(valid).reshape(-1)
+    if rows.numel() == 0:
+        return out
+    load_valid = load.index_select(0, rows)
+    store_valid = store.index_select(0, rows)
+    N = rows.shape[0]
+
+    # Read-before-write: gather every input row of the state before any write below.
+    act = qkv.index_select(0, rows).float()
+    q = act[:, 0:H * D].reshape(N, H, D)
+    k = act[:, H * D:2 * H * D].reshape(N, H, D)
+    v = act[:, 2 * H * D:2 * H * D + HV * D].reshape(N, HV, D)
+    q = q * torch.rsqrt(q.pow(2).sum(-1, keepdim=True) + 1e-6) * scale
+    k = k * torch.rsqrt(k.pow(2).sum(-1, keepdim=True) + 1e-6)
+    q = q.repeat_interleave(rep, dim=1)  # value head vh uses key head vh // rep
+    k = k.repeat_interleave(rep, dim=1)
+    xg = a.index_select(0, rows).float() + dt_bias.float()  # [N, HV]
+    sp = torch.where(xg <= 20.0, torch.log1p(torch.exp(xg)), xg)
+    decay = torch.exp(-torch.exp(A_log.float()) * sp)
+    beta = torch.sigmoid(b.index_select(0, rows).float())
+    St = ssm_state.index_select(0, load_valid).float()  # [N, HV, D, D]
+    St = St * decay[..., None, None]
+    delta = (v - torch.matmul(St, k[..., None]).squeeze(-1)) * beta[..., None]  # [N, HV, D]
+    St = St + delta[..., None] * k[..., None, :]
+    o = torch.matmul(St, q[..., None]).squeeze(-1)  # [N, HV, D]
+    out.index_copy_(0, rows, o)
+
+    ssm_state.index_copy_(0, store_valid, St.to(ssm_state.dtype))
+    return out
+
+
 # The torch.library op wrapper.  This module is the only place that defines the schema and the Meta
 # (fake) kernel; the HPU kernel comes from the C++ extension (K4b), which must not define them.
 
@@ -169,6 +245,28 @@ def _gdn_core_decode_fake(conv_state, ssm_state, mixed_qkv, z, a, b, A_log, dt_b
     return mixed_qkv.new_empty((B, HV, D), dtype=torch.float32)
 
 
+_LIBRARY.define(
+    "gdn_recurrent_decode("
+    "Tensor(a!) ssm_state, Tensor qkv, Tensor a, Tensor b, Tensor A_log, Tensor dt_bias, "
+    "Tensor load_indices, Tensor store_indices, float scale) -> Tensor")
+
+
+def _gdn_recurrent_decode_cpu(ssm_state, qkv, a, b, A_log, dt_bias, load_indices, store_indices, scale):
+    return gdn_recurrent_decode_reference(ssm_state, qkv, a, b, A_log, dt_bias, load_indices, store_indices, scale)
+
+
+_LIBRARY.impl("gdn_recurrent_decode", _gdn_recurrent_decode_cpu, "CPU")
+
+
+@torch.library.register_fake("flashinfer_gaudi::gdn_recurrent_decode", lib=_LIBRARY)
+def _gdn_recurrent_decode_fake(ssm_state, qkv, a, b, A_log, dt_bias, load_indices, store_indices, scale):
+    # Allocation only: no mutation, no data access.
+    B = qkv.shape[0]
+    HV = ssm_state.shape[1]
+    D = ssm_state.shape[2]
+    return qkv.new_empty((B, HV, D), dtype=torch.float32)
+
+
 _DISPATCH_KEYS_BY_DEVICE_TYPE = {"cpu": "CPU", "hpu": "HPU"}
 
 
@@ -197,6 +295,36 @@ def gdn_core_decode(
     return torch.ops.flashinfer_gaudi.gdn_core_decode(conv_state, ssm_state, mixed_qkv, z, a, b, A_log, dt_bias,
                                                       conv_weight_t, norm_weight, load_indices, store_indices, scale,
                                                       eps, int(gate_activation))
+
+
+def gdn_recurrent_decode(
+    ssm_state: torch.Tensor,
+    qkv: torch.Tensor,
+    a: torch.Tensor,
+    b: torch.Tensor,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    load_indices: torch.Tensor,
+    store_indices: torch.Tensor,
+    scale: float,
+) -> torch.Tensor:
+    """The GDN delta-rule recurrence alone as ``torch.ops.flashinfer_gaudi.gdn_recurrent_decode``.
+
+    Mutates ``ssm_state`` in place, returns ``o`` as ``[B, HV, D]`` fp32 (before the gated
+    RMSNorm); semantics are exactly ``gdn_recurrent_decode_reference`` (contract:
+    ``docs/design/flash-next/gdn-core-decode.md``, "Recurrence-only op").
+    """
+    return torch.ops.flashinfer_gaudi.gdn_recurrent_decode(ssm_state, qkv, a, b, A_log, dt_bias, load_indices,
+                                                           store_indices, scale)
+
+
+def gdn_recurrent_decode_available(device: torch.device | str) -> bool:
+    """True when ``flashinfer_gaudi::gdn_recurrent_decode`` has a kernel for the device's type."""
+    device_type = device.type if isinstance(device, torch.device) else torch.device(device).type
+    dispatch_key = _DISPATCH_KEYS_BY_DEVICE_TYPE.get(device_type)
+    if dispatch_key is None:
+        return False
+    return torch._C._dispatch_has_kernel_for_dispatch_key("flashinfer_gaudi::gdn_recurrent_decode", dispatch_key)
 
 
 def gdn_core_decode_available(device: torch.device | str) -> bool:
