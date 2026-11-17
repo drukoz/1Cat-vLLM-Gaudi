@@ -14,7 +14,7 @@ import types
 
 import pytest
 import torch
-from transformers import AutoConfig
+from transformers.models.qwen4_exp.configuration_qwen4_exp import Qwen4ExpConfig as HFQwen4ExpConfig
 from transformers.models.qwen4_exp.modeling_qwen4_exp import Qwen4ExpTextPLELayer
 
 from vllm_gaudi.models.qwen4_exp.ple_ops import (
@@ -44,7 +44,10 @@ def ple(tmp_path_factory):
     """A seeded fp32 ``Qwen4ExpTextPLELayer`` from the tiny fixture, plus its PLE geometry."""
     config_dir = tmp_path_factory.mktemp("flash_next_ple_config")
     shutil.copy(TINY_CONFIG, config_dir / "config.json")
-    text_config = AutoConfig.from_pretrained(str(config_dir)).text_config
+    # Build the native transformers config class directly: creating a vLLM
+    # EngineConfig for qwen4_exp (done by other test modules) re-registers the
+    # model type to vLLM's config classes, which lack the HF-only `seed`.
+    text_config = HFQwen4ExpConfig.from_json_file(str(config_dir / "config.json")).text_config
     torch.manual_seed(0)
     layer = Qwen4ExpTextPLELayer(text_config, layer_idx=1, ple_layer_index=0).to(torch.float32).eval()
     return types.SimpleNamespace(

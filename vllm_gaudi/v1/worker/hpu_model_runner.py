@@ -936,7 +936,7 @@ def maybe_set_mamba_kv_cache_groups_ids(model, kv_cache_config: KVCacheConfig):
     ]
     if not any(arch in getattr(model.config, 'architectures', []) for arch in mamba_like_arch):
         return
-    mamba_like_layer = ['.mixer', '.linear_attn']
+    mamba_like_layer = ['.mixer', '.linear_attn', '.ple']
     compact_gdn_group_ids = [
         group_idx for group_idx, group in enumerate(kv_cache_config.kv_cache_groups)
         if isinstance(group.kv_cache_spec, MambaSpec) and group.kv_cache_spec.mamba_type in _GDN_MAMBA_TYPES
@@ -987,6 +987,11 @@ def maybe_set_mamba_kv_cache_groups_ids(model, kv_cache_config: KVCacheConfig):
                     layer.linear_attn.cache_group_idx = torch.tensor(group_idx, dtype=torch.long, device="hpu")
                     layer.linear_attn.compact_state_group_offset = compact_gdn_offsets.get(group_idx)
                     layer.linear_attn.compact_state_group_count = len(compact_gdn_group_ids)
+            elif layer_name.endswith('.ple'):
+                layer_idx = int(layer_name.split('.')[-2])
+                layer = _get_decoder_layer_by_idx(model, layer_idx)
+                if layer is not None and getattr(layer, "ple", None) is not None:
+                    layer.ple.cache_group_idx = torch.tensor(group_idx, dtype=torch.long, device="hpu")
 
 
 def maybe_set_chunked_attention_layers(model_runner):

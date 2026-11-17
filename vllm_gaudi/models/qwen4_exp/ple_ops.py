@@ -95,6 +95,49 @@ def ple_short_conv_torch(
     return out, new_state
 
 
+def ple_short_conv_batched_torch(
+    normed: torch.Tensor,
+    conv_weight: torch.Tensor,
+    state: torch.Tensor,
+    dilation: int,
+    lengths: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Batched :func:`ple_short_conv_torch` over padded rows (fixed shapes, graph-safe).
+
+    ``normed`` is ``[B, S, C]``, ``conv_weight`` is ``conv1d.weight`` (``[C, 1, K]``, ``[C, K]`` is accepted
+    too), ``state`` is the carried history ``[B, L, C]`` with ``L = (K - 1) * dilation`` and ``lengths`` is
+    int64 ``[B]`` with the number of real tokens of every row (default ``S``). Returns ``(out, new_state)``,
+    ``[B, S, C]`` and ``[B, L, C]``, with ``out[b, t] = silu(sum_k conv_weight[:, k] * history[b, t +
+    k * dilation])`` over ``history[b] = [state[b] ; normed[b]]`` and ``new_state[b] = history[b, lengths[b]
+    : lengths[b] + L]``. ``out`` at ``t >= lengths[b]`` is computed over padding and must be ignored by the
+    caller. Math in fp32, outputs cast to ``normed.dtype`` / ``state.dtype``; one loop over the kernel taps,
+    ``torch.gather`` for the state window, no per-row Python loop and no boolean indexing (HPU graphs).
+    """
+    channels = normed.shape[-1]
+    kernel = conv_weight.reshape(channels, -1)
+    kernel_size = kernel.shape[-1]
+    state_len = (kernel_size - 1) * dilation
+    rows, seq_len = normed.shape[0], normed.shape[1]
+    if state.shape[0] != rows or state.shape[1] != state_len:
+        raise ValueError(f"state must be [B, (kernel_size - 1) * dilation, C] = "
+                         f"[{rows}, {state_len}, {channels}], got {tuple(state.shape)}")
+    if lengths is None:
+        lengths = torch.full((rows,), seq_len, dtype=torch.long, device=normed.device)
+    lengths = lengths.reshape(-1).long()
+
+    history = torch.cat([state.float(), normed.float()], dim=1)
+    accumulated = torch.zeros((rows, seq_len, channels), dtype=torch.float32, device=normed.device)
+    for k in range(kernel_size):
+        tap = kernel[:, k].to(torch.float32).view(1, 1, channels)
+        accumulated = accumulated + history[:, k * dilation:k * dilation + seq_len] * tap
+    out = F.silu(accumulated).to(normed.dtype)
+
+    gather_index = lengths.view(rows, 1, 1) + torch.arange(state_len, device=normed.device).view(1, state_len, 1)
+    gather_index = gather_index.expand(rows, state_len, channels)
+    new_state = torch.gather(history, 1, gather_index).to(state.dtype)
+    return out, new_state
+
+
 def ple_forward_torch(
     key: torch.Tensor,
     value: torch.Tensor,
