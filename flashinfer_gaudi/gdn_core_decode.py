@@ -206,3 +206,40 @@ def gdn_core_decode_available(device: torch.device | str) -> bool:
     if dispatch_key is None:
         return False
     return torch._C._dispatch_has_kernel_for_dispatch_key("flashinfer_gaudi::gdn_core_decode", dispatch_key)
+
+
+class GdnCoreDecodeDebug(enum.IntEnum):
+    """VLLM_HPU_GDN_CORE_DECODE_DEBUG values (next free: 2)."""
+    OFF = 0
+    CHECK = 1
+
+
+def check_gdn_core_decode_indices(load_indices: torch.Tensor, store_indices: torch.Tensor, num_slots: int,
+                                  num_rows: int) -> None:
+    """Debug check for the slot patterns the fused GDN core decode kernels cannot handle.
+
+    Over the real rows (index ``< num_rows``) whose two slots are both in ``[0, num_slots)``:
+    raises ``ValueError`` when two rows share a store slot, or when one row's store slot is
+    another row's load slot (a reordered cache).  Rows from ``num_rows`` on are padding and
+    out-of-range rows are ignored; a row loading and storing its own slot is the normal case.
+    Copies the indices to the CPU, so it costs one host sync per call: debugging only.
+    """
+    load = load_indices.reshape(-1)[:num_rows].to("cpu", torch.int64).tolist()
+    store = store_indices.reshape(-1)[:num_rows].to("cpu", torch.int64).tolist()
+    real = [r for r in range(len(load)) if 0 <= load[r] < num_slots and 0 <= store[r] < num_slots]
+
+    first_row_by_store: dict[int, int] = {}
+    rows_by_load: dict[int, list[int]] = {}
+    for r in real:
+        s = store[r]
+        r0 = first_row_by_store.get(s)
+        if r0 is not None:
+            raise ValueError(f"GDN core decode: rows {r0} and {r} both store slot {s}")
+        first_row_by_store[s] = r
+        rows_by_load.setdefault(load[r], []).append(r)
+
+    for r in real:
+        s = store[r]
+        for r2 in rows_by_load.get(s, []):
+            if r2 != r:
+                raise ValueError(f"GDN core decode: row {r} stores slot {s}, which row {r2} loads")
