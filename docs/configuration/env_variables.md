@@ -58,6 +58,15 @@ selection, added in M2): `HpuQsaIndexer.select` picks the attended
 positions per query and attention runs only over them. Sparse prefill needs a
 4-aligned context; speculative decode is not supported yet (M3).
 
+`VLLM_HPU_GDN_CORE_DECODE` selects the Flash-Next GDN decode core path as an
+integer. `0` (default) keeps the composed torch path (causal conv1d update,
+gating, fused recurrent delta rule, gated RMSNorm). `1` is fused: the
+non-speculative decode step runs through the fused core op
+`torch.ops.flashinfer_gaudi.gdn_core_decode` (conv, gates, recurrence and
+gated RMSNorm in one step, the conv and SSM states updated in place), used
+only when the device has a kernel for the op. Non-speculative decode only;
+see `docs/design/flash-next/gdn-core-decode.md`.
+
 `VLLM_HPU_RECURRENT_STATE_POOL` selects the allocation mode for the recurrent
 (GDN / short-conv) state slots as an integer. `0` (default) keeps today's
 allocation, one recurrent state slot per attention block id. `1` gives the
