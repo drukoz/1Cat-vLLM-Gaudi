@@ -84,10 +84,10 @@ class HpuQwen4ExpPLELayer(Qwen4ExpPLELayer):
 
         Profiling (no metadata) and an unbound cache leave ``gated`` untouched, as
         upstream does. Inference reads the initial state of every row from its
-        ``load_indices_tensor`` slot (padding rows read zeros, chunked prefill rows
-        only when ``has_initial_states_p`` says so) and writes the new state to the
-        ``store_indices_tensor`` slots through ``_save_ssm_state``, so invalid
-        indices are neither read nor written.
+        ``load_indices_tensor`` slot (padding rows read zeros, chunked prefill rows only
+        when ``has_initial_states_p`` says so and the load slot is not the null block 0)
+        and writes the new state to the ``store_indices_tensor`` slots through
+        ``_save_ssm_state``, so invalid indices are neither read nor written.
         """
         attn_metadata = get_forward_context().attn_metadata
         if attn_metadata is None:
@@ -133,6 +133,8 @@ class HpuQwen4ExpPLELayer(Qwen4ExpPLELayer):
                 mask = torch.zeros(rows, dtype=torch.bool, device=init.device)
             else:
                 mask = has_initial.reshape(-1).to(device=init.device, dtype=torch.bool)
+            # Block id 0 is vLLM's null block: it never holds an initial state (#1895).
+            mask = mask & (load.to(device=init.device) != 0)
             init = torch.where(mask.view(rows, 1, 1), init, torch.zeros_like(init))
 
         padding_mask = getattr(md, "padding_mask_flat", None)
