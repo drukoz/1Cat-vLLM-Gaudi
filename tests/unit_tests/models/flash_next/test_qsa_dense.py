@@ -7,7 +7,7 @@ group and a vLLM config context (no HPU required) and checks:
 1. checkpoint parameter names/shapes and ``Attention``-child registration,
 2. a dense forward that matches the HF ``Qwen4ExpTextAttention`` oracle on a
    10-token prompt (the indexer selects the full causal prefix),
-3. ``QsaMode.SPARSE`` raises ``NotImplementedError`` (M2),
+3. ``QsaMode.SPARSE`` builds the layer with the side caches unbound (M2),
 4. ``QsaMode`` is an integer enum with the documented values.
 """
 
@@ -71,8 +71,8 @@ def _engine_config(model_dir):
     return args.create_engine_config()
 
 
-@pytest.fixture()
-def qsa_layer(tmp_path):
+def _build_layer(tmp_path):
+    """Copy the fixture config, init a world-1 gloo group and build the QSA layer (yields, teardown)."""
     shutil.copy(FIXTURE, tmp_path / "config.json")
     vllm_config = _engine_config(tmp_path)
     init_file = tempfile.mkstemp(dir="/tmp")[1]
@@ -95,6 +95,18 @@ def qsa_layer(tmp_path):
         yield vllm_config, layer
     destroy_model_parallel()
     destroy_distributed_environment()
+
+
+@pytest.fixture()
+def qsa_layer(tmp_path):
+    yield from _build_layer(tmp_path)
+
+
+@pytest.fixture()
+def qsa_layer_sparse(tmp_path, monkeypatch):
+    """The same build as :func:`qsa_layer` with ``VLLM_HPU_FLASH_NEXT_QSA_MODE=1`` (sparse)."""
+    monkeypatch.setenv("VLLM_HPU_FLASH_NEXT_QSA_MODE", "1")
+    yield from _build_layer(tmp_path)
 
 
 def test_parameter_names_and_registration(qsa_layer):
@@ -197,15 +209,12 @@ def test_dense_forward_matches_hf(qsa_layer):
     torch.testing.assert_close(v_out, hf_out, atol=1e-4, rtol=1e-4)
 
 
-def test_sparse_mode_raises(monkeypatch):
-    monkeypatch.setenv("VLLM_HPU_FLASH_NEXT_QSA_MODE", "1")
-    with pytest.raises(NotImplementedError, match="M2"):
-        HpuQwen4ExpQSAAttention(
-            vllm_config=None,
-            config=None,
-            layer_id=0,
-            prefix="model.layers.0.self_attn",
-        )
+def test_sparse_mode_builds(qsa_layer_sparse):
+    """SPARSE mode builds the layer with the side caches unbound (no ``NotImplementedError``)."""
+    _, layer = qsa_layer_sparse
+    assert layer.qsa_mode is QsaMode.SPARSE
+    assert layer.indexer.compressed_key_cache is None
+    assert layer.indexer.key_ring is None
 
 
 def test_qsa_mode_is_integer_enum(monkeypatch):

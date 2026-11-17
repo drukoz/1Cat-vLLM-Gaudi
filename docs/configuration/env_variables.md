@@ -54,7 +54,9 @@ are in progress.
 mode as an integer. `0` (default) is dense: exact causal attention over the
 full prefix through the standard HPU Attention layer, with the indexer weights
 loaded only for checkpoint compatibility. `1` is sparse (indexer top-k
-selection); it is reserved for M2 and raises `NotImplementedError`.
+selection, added in M2): `HpuQsaIndexer.select` picks the attended
+positions per query and attention runs only over them. Sparse prefill needs a
+4-aligned context; speculative decode is not supported yet (M3).
 
 `VLLM_HPU_RECURRENT_STATE_POOL` selects the allocation mode for the recurrent
 (GDN / short-conv) state slots as an integer. `0` (default) keeps today's
@@ -290,6 +292,8 @@ prepared-model entrypoint and disabled in the generic entrypoint.
 | `VLLM_HPU_DFLASH2_DIRECT_CHECKPOINTS` | Experimental internal contiguous destination for the prepared native DFlash2 Target checkpoint writes. Requires full T8 verification, compact state, no prefix caching, and an exact CPU proof of group-major request/checkpoint ownership. Other layouts retain indexed writes. Does not enable or promote the native kernel itself. | `false` |
 | `VLLM_HPU_DFLASH2_DEVICE_PREPARE` | Experimental fixed-width DFlash2 target-to-draft bridge. Accepted lengths, context/query positions, KV slots, block lists, and attention bias remain on HPU so draft work can be queued before target samples are copied to the host. Unsupported or ragged decode batches retain the CPU preparation path. | `false` |
 | `VLLM_HPU_FLASHINFER_GDN_TP2` | Opt in to the experimental TP2 local-head GDN prefill and fused decode shapes. The parent GDN switch alone keeps the existing geometry. | `false` |
+| `VLLM_HPU_FLASHINFER_GDN_TP4` | Opt in to the experimental TP4 local-head GDN prefill and fused decode shapes (4 key / 12 value heads per rank). The parent GDN switch alone keeps the existing geometry. | `false` |
+| `VLLM_HPU_FLASHINFER_GDN_TP8` | Opt in to the experimental TP8 local-head GDN prefill and fused decode shapes (2 key / 6 value heads per rank). The parent GDN switch alone keeps the existing geometry. | `false` |
 | `VLLM_HPU_FLASHINFER_GDN_FUSED_DECODE` | Enables the qualified Qwen3.8 TP1 fused direct-state decode recipe for batches 1, 2, 4, 8, 16, and 32. Unsupported shapes retain the existing packed GDN path. When unset, this follows `VLLM_HPU_FLASHINFER_GDN`. | `false` (`true` with FlashInfer GDN) |
 | `VLLM_HPU_FLASHINFER_GDN_PREFILL` | Enables the offline-promoted FlashQLA graph tactic for Qwen3.8 GDN prefill. Unsupported shapes retain the general HPU path. When unset, this follows `VLLM_HPU_FLASHINFER_GDN`. | `false` (`true` with FlashInfer GDN) |
 | `VLLM_HPU_GDN_DIRECT_STATE` | Uses group-major compact recurrent-state spans when a decode bucket is full, prefix caching is disabled, and request slots are contiguous. | `true` |

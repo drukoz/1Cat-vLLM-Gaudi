@@ -21,7 +21,7 @@ import torch  # noqa: E402
 from vllm.forward_context import set_forward_context  # noqa: E402
 
 from tests.unit_tests.models.flash_next.cpu_model import (  # noqa: E402
-    cpu_model, eos_token_id, fp32_logits, ple_kwargs, prefill_metadata, reset_cpu_states)
+    cpu_model, dense_reference_prompts, eos_token_id, fp32_logits, ple_kwargs, prefill_metadata, reset_cpu_states)
 
 FP32_LOGIT_TOL = 1e-5  # CTO probe on this branch: max |Δ| 4.5e-7 .. 6.6e-7
 BF16_LOGIT_TOL = 1e-2  # CTO probe on this branch: max |Δ| 1.9e-3 .. 2.5e-3
@@ -56,7 +56,8 @@ def check_last_prefill_logits(model, vllm_config, prompts, tol: float) -> None:
 
 def test_prefill_fp32_matches_reference(tiny_checkpoint):
     """fp32 last-prefill logits: top-1 equals the HF reference and max |Δ| at its top-5 ids <= 1e-5."""
-    prompts = json.loads((tiny_checkpoint / "reference.json").read_text(encoding="utf-8"))["prompts"]
+    reference = json.loads((tiny_checkpoint / "reference.json").read_text(encoding="utf-8"))
+    prompts = dense_reference_prompts(reference)
     with cpu_model(tiny_checkpoint, fp32=True) as (vllm_config, model):
         check_last_prefill_logits(model, vllm_config, prompts, FP32_LOGIT_TOL)
 
@@ -66,7 +67,7 @@ def test_greedy_fp32_matches_reference(tiny_checkpoint):
     reference = json.loads((tiny_checkpoint / "reference.json").read_text(encoding="utf-8"))
     with cpu_model(tiny_checkpoint, fp32=True) as (vllm_config, model):
         eos = eos_token_id(vllm_config)
-        for prompt in reference["prompts"]:
+        for prompt in dense_reference_prompts(reference):
             length = len(prompt["prompt_ids"])
             seq = list(prompt["prompt_ids"])
             generated = []
@@ -83,14 +84,16 @@ def test_greedy_fp32_matches_reference(tiny_checkpoint):
 
 def test_prefill_bf16_matches_reference(tiny_checkpoint):
     """bf16 last-prefill logits: top-1 equals the HF reference and max |Δ| at its top-5 ids <= 1e-2."""
-    prompts = json.loads((tiny_checkpoint / "reference.json").read_text(encoding="utf-8"))["prompts"]
+    reference = json.loads((tiny_checkpoint / "reference.json").read_text(encoding="utf-8"))
+    prompts = dense_reference_prompts(reference)
     with cpu_model(tiny_checkpoint) as (vllm_config, model):
         check_last_prefill_logits(model, vllm_config, prompts, BF16_LOGIT_TOL)
 
 
 def test_state_slot_does_not_change_prefill(tiny_checkpoint):
     """The 33-token prompt prefilled into state slot 1 and slot 3 gives the same last-position logits."""
-    prompts = json.loads((tiny_checkpoint / "reference.json").read_text(encoding="utf-8"))["prompts"]
+    reference = json.loads((tiny_checkpoint / "reference.json").read_text(encoding="utf-8"))
+    prompts = dense_reference_prompts(reference)
     prompt = next(p for p in prompts if len(p["prompt_ids"]) == PROMPT_LENGTH_33)
     with cpu_model(tiny_checkpoint, fp32=True) as (vllm_config, model):
         eos = eos_token_id(vllm_config)

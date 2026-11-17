@@ -4,7 +4,7 @@
 The checkpoint is a 4-layer ``Qwen4ExpForConditionalGeneration`` built from the committed fixture
 ``tests/unit_tests/models/flash_next/tiny_config.json`` with seeded random bfloat16 weights (~134 MB, never
 committed). ``reference.json`` is the CPU oracle every later HPU path is compared with: greedy tokens and the
-top-5 last-prefill logits of five token-id prompts, computed by reloading the **saved** checkpoint in float32.
+top-5 last-prefill logits of six token-id prompts, computed by reloading the **saved** checkpoint in float32.
 
 Usage: ``python tools/flash_next/make_tiny_checkpoint.py --out DIR [--seed 0] [--tokenizer-from DIR |
 --skip-tokenizer] [--reference-only] [--fixture PATH]``.
@@ -36,7 +36,7 @@ TOKENIZER_PATTERNS = [
     "generation_config.json",
 ]
 
-PROMPT_LENGTHS = (1, 7, 33, 100, 700)
+PROMPT_LENGTHS = (1, 7, 33, 100, 700, 2600)
 BOS_TOKEN_ID = 248044
 MAX_NEW_TOKENS = 16
 TOP_K = 5
@@ -63,7 +63,7 @@ def safetensors_stats(path: Path) -> tuple[int, int]:
 
 
 def make_prompts(seed: int) -> list[list[int]]:
-    """Token-id prompts of length 1/7/33/100/700: the first id is the bos token, the rest drawn from [1000, 20000)."""
+    """Prompts of length 1/7/33/100/700/2600: the first id is the bos token, the rest drawn from [1000, 20000)."""
     generator = torch.Generator().manual_seed(seed)
     prompts = []
     for length in PROMPT_LENGTHS:

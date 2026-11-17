@@ -2,7 +2,7 @@
 
 Run sheets are the only way this program touches hardware: no agent has Gaudi access and the node is rented by the hour (system map, assumption 3). The user runs one sheet in one rental session, fail-fast: stages ordered cheapest and most informative first, each with a stop rule and the lines to capture. When a stop rule fires, stop the session, run the capture commands and post what they printed — never debug on rented time (system map §14).
 
-The current sheet is [qualification.md](qualification.md): stages 1–2 (build and native compile, tiny-model bring-up, real-checkpoint TP8 BF16 bring-up) are written by M0; stages 3–6 are filled by milestones M2, M1, M4 and M1/M4.
+The current sheet is [qualification.md](qualification.md): stages 1–2 (build and native compile, tiny-model bring-up, real-checkpoint TP8 BF16 bring-up) are written by M0; stage 3 (flag-by-flag A/B: sparse QSA, GDN tactics at TP8 with a decode sweep, MoE expert slices, and the decode batch baseline) is written by M2; stages 4–6 are filled by milestones M1, M4 and M1/M4.
 
 ## Rules for every sheet
 

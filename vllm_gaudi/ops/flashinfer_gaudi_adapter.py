@@ -27,8 +27,17 @@ _GDN_FUSED_DECODE_BATCHES = frozenset(
 _GDN_FUSED_DECODE_LOCAL_GEOMETRIES = frozenset({
     (10240, 48),
     (5120, 24),
+    (2560, 12),
+    (1280, 6),
 })
 _GDN_RECURRENT_COMPOUND_LOADED = load_gdn_recurrent_compound()
+
+
+def _tp_geometry_enabled(value_heads: int) -> bool:
+    """Gate each non-TP1 local geometry behind its own opt-in flag."""
+    return ((value_heads != 24 or envs.VLLM_HPU_FLASHINFER_GDN_TP2) and (value_heads != 12
+                                                                          or envs.VLLM_HPU_FLASHINFER_GDN_TP4)
+            and (value_heads != 6 or envs.VLLM_HPU_FLASHINFER_GDN_TP8))
 
 
 def flashinfer_gdn_enabled() -> bool:
@@ -52,7 +61,7 @@ def can_bind_gdn_active_state(batch: int, packed_width: int, value_heads: int) -
                                                      and not _BRIDGE_AUTO_ENABLED)
     return (flashinfer_gdn_enabled() and flashinfer_gdn_fused_decode_enabled() and use_reference
             and batch in _GDN_FUSED_DECODE_BATCHES and (packed_width, value_heads) in _GDN_FUSED_DECODE_LOCAL_GEOMETRIES
-            and (value_heads != 24 or envs.VLLM_HPU_FLASHINFER_GDN_TP2))
+            and _tp_geometry_enabled(value_heads))
 
 
 def maybe_run_gdn_prefill(
@@ -87,9 +96,9 @@ def maybe_run_gdn_prefill(
         return None
     key_heads, value_heads = q.shape[2], v.shape[2]
     if (q.shape[1] != v.shape[1] or q.shape[3] != 128 or v.shape[3] != 128
-            or (key_heads, value_heads) not in ((16, 48), (8, 24))):
+            or (key_heads, value_heads) not in ((16, 48), (8, 24), (4, 12), (2, 6))):
         return None
-    if value_heads == 24 and not envs.VLLM_HPU_FLASHINFER_GDN_TP2:
+    if not _tp_geometry_enabled(value_heads):
         return None
     if log_decay.shape != (1, q.shape[1], value_heads) or beta.shape != (1, q.shape[1], value_heads):
         return None
@@ -254,7 +263,7 @@ def maybe_run_gdn_fused_decode_step(
         return None
     packed_width = mixed_qkv.shape[1] if mixed_qkv.ndim == 2 else -1
     value_heads = A_log.numel()
-    if value_heads == 24 and not envs.VLLM_HPU_FLASHINFER_GDN_TP2:
+    if not _tp_geometry_enabled(value_heads):
         return None
     if (packed_width, value_heads) not in _GDN_FUSED_DECODE_LOCAL_GEOMETRIES:
         return None

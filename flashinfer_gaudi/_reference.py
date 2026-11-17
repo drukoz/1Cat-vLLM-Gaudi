@@ -21,6 +21,8 @@ _QWEN38_TP2_VALUE_HEADS = _QWEN38_VALUE_HEADS // 2
 _QWEN38_TP2_HEAD_REPEAT = _QWEN38_TP2_VALUE_HEADS // _QWEN38_TP2_KEY_HEADS
 _QWEN38_TP2_QK_WIDTH = 2 * _QWEN38_TP2_KEY_HEADS * _QWEN38_DIM
 _QWEN38_TP2_PACKED_WIDTH = (_QWEN38_TP2_VALUE_HEADS + 2 * _QWEN38_TP2_KEY_HEADS) * _QWEN38_DIM
+# Per-rank value-heads -> key-heads for the TP4 (12/4) and TP8 (6/2) geometries.
+_QWEN38_TP_GEOMETRIES = {12: 4, 6: 2}
 
 
 def _as_bt_heads(value: torch.Tensor, batch: int, tokens: int, heads: int, name: str) -> torch.Tensor:
@@ -352,6 +354,81 @@ def _direct_qwen38_tp2_single_token_packed_decode(
     return output, next_state
 
 
+def _direct_qwen38_tp_single_token_packed_decode(
+    packed_qkv: torch.Tensor,
+    log_decay: torch.Tensor,
+    beta: torch.Tensor,
+    state_pool: torch.Tensor,
+    scale: float,
+    use_qk_l2norm: bool,
+    inplace_state: bool = True,
+    *,
+    key_heads: int,
+    value_heads: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Static per-rank Qwen3.8 TP4/TP8 geometry for the Gaudi compiler.
+
+    The TP4 (4 key / 12 value heads) and TP8 (2 / 6) layouts share the same
+    head repeat (``value_heads // key_heads == 3``) and the same recurrent
+    math as the TP2 variant; only the head-count constants differ, so they are
+    parametrized here instead of copied per rank.
+    """
+    qk_width = 2 * key_heads * _QWEN38_DIM
+    head_repeat = value_heads // key_heads
+    batch = packed_qkv.shape[0]
+    qk_work = packed_qkv[:, :qk_width].reshape(
+        batch,
+        2 * key_heads,
+        _QWEN38_DIM,
+    ).to(torch.float32)
+    if use_qk_l2norm:
+        qk_work = _l2_normalize_rsqrt(qk_work)
+    q_work, k_work = qk_work.split(key_heads, dim=1)
+    k_grouped = k_work.unsqueeze(2)
+    value_work = packed_qkv[:, qk_width:].reshape(
+        batch,
+        key_heads,
+        head_repeat,
+        _QWEN38_DIM,
+    ).to(torch.float32)
+    state = state_pool.reshape(
+        batch,
+        key_heads,
+        head_repeat,
+        _QWEN38_DIM,
+        _QWEN38_DIM,
+    )
+    decay = torch.exp(log_decay.reshape(
+        batch,
+        key_heads,
+        head_repeat,
+    ).to(torch.float32)).reshape(
+        batch,
+        key_heads,
+        head_repeat,
+        1,
+        1,
+    )
+    beta_work = beta.reshape(
+        batch,
+        key_heads,
+        head_repeat,
+    ).to(torch.float32).unsqueeze(-1)
+
+    decayed_state = state * decay
+    projection = torch.matmul(decayed_state, k_grouped.unsqueeze(-1)).squeeze(-1)
+    delta = (value_work - projection) * beta_work
+    updated_state = torch.addcmul(decayed_state, delta.unsqueeze(-1), k_grouped.unsqueeze(-2))
+    output = torch.matmul(updated_state, (q_work.unsqueeze(2) * scale).unsqueeze(-1)).squeeze(-1)
+    next_state = updated_state.reshape_as(state_pool)
+    if inplace_state:
+        state_pool.copy_(next_state)
+        next_state = state_pool
+
+    output = output.reshape(batch, value_heads, _QWEN38_DIM).to(packed_qkv.dtype)
+    return output, next_state
+
+
 def qwen38_fused_decode_step_direct(
     packed_qkv: torch.Tensor,
     a: torch.Tensor,
@@ -389,7 +466,21 @@ def qwen38_fused_decode_step_direct(
     convolved = F.silu(convolved)
     conv_state.copy_(torch.cat((conv_state[:, 1:, :], packed_qkv.unsqueeze(1)), dim=1))
 
-    if (packed_qkv.shape[1] == _QWEN38_TP2_PACKED_WIDTH and ssm_state.shape[1] == _QWEN38_TP2_VALUE_HEADS):
+    value_heads = ssm_state.shape[1]
+    if (value_heads in _QWEN38_TP_GEOMETRIES
+            and packed_qkv.shape[1] == (value_heads + 2 * _QWEN38_TP_GEOMETRIES[value_heads]) * _QWEN38_DIM):
+        output, next_state = _direct_qwen38_tp_single_token_packed_decode(
+            convolved,
+            log_decay,
+            beta,
+            ssm_state,
+            scale,
+            True,
+            inplace_state,
+            key_heads=_QWEN38_TP_GEOMETRIES[value_heads],
+            value_heads=value_heads,
+        )
+    elif (packed_qkv.shape[1] == _QWEN38_TP2_PACKED_WIDTH and ssm_state.shape[1] == _QWEN38_TP2_VALUE_HEADS):
         output, next_state = _direct_qwen38_tp2_single_token_packed_decode(
             convolved,
             log_decay,

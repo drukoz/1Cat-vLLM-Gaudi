@@ -497,6 +497,8 @@ if TYPE_CHECKING:
     VLLM_HPU_DFLASH2_DIRECT_CHECKPOINTS: bool = False
     VLLM_HPU_DFLASH2_DEVICE_PREPARE: bool = False
     VLLM_HPU_FLASHINFER_GDN_TP2: bool = False
+    VLLM_HPU_FLASHINFER_GDN_TP4: bool = False
+    VLLM_HPU_FLASHINFER_GDN_TP8: bool = False
     VLLM_HPU_FLASHINFER_GDN_FUSED_DECODE: bool = False
     VLLM_HPU_FLASHINFER_GDN_PREFILL: bool = False
     VLLM_HPU_GDN_DIRECT_STATE: bool = True
@@ -526,6 +528,7 @@ if TYPE_CHECKING:
     VLLM_HPU_CGUID_DYNAMIC_QUANT_MAX_ROWS: int = 32
     VLLM_HPU_FUSED_GREEDY_LOGITS: bool = False
     VLLM_HPU_FLASH_NEXT_QSA_MODE: int = 0
+    VLLM_HPU_FLASH_NEXT_QSA_PREFILL_TILE: int = 2048
     VLLM_HPU_RECURRENT_STATE_POOL: int = 0  # RecurrentStatePoolMode: 0 off, 1 pool
     VLLM_HPU_RECURRENT_STATE_POOL_SLOTS: int = 0  # resolved by the hook; positive overrides the formula
     VLLM_HPU_RECURRENT_STATE_POOL_CACHE_SLOTS: int = 512  # retained prefix states added to the live need
@@ -1612,6 +1615,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # default this follows the parent FlashInfer-Gaudi GDN switch.
     "VLLM_HPU_FLASHINFER_GDN_TP2":
     lambda: os.environ.get("VLLM_HPU_FLASHINFER_GDN_TP2", "false").strip().lower() in ("1", "true"),
+
+    # Opt in the TP4 (4/12 heads per rank) geometry for the FlashInfer-Gaudi GDN
+    # tactics; measured by run sheet stage 3.
+    "VLLM_HPU_FLASHINFER_GDN_TP4":
+    lambda: os.environ.get("VLLM_HPU_FLASHINFER_GDN_TP4", "false").strip().lower() in ("1", "true"),
+
+    # Opt in the TP8 (2/6 heads per rank) geometry for the FlashInfer-Gaudi GDN
+    # tactics; measured by run sheet stage 3.
+    "VLLM_HPU_FLASHINFER_GDN_TP8":
+    lambda: os.environ.get("VLLM_HPU_FLASHINFER_GDN_TP8", "false").strip().lower() in ("1", "true"),
     "VLLM_HPU_FLASHINFER_GDN_FUSED_DECODE":
     lambda: os.environ.get(
         "VLLM_HPU_FLASHINFER_GDN_FUSED_DECODE",
@@ -1843,6 +1856,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # NotImplementedError.
     "VLLM_HPU_FLASH_NEXT_QSA_MODE":
     lambda: int(os.environ.get("VLLM_HPU_FLASH_NEXT_QSA_MODE", "0")),
+
+    # Query tile of the sparse QSA prefill attention. A tile of 2048 keeps a
+    # 262K bf16 bias plane at 1 GiB, under FusedSDPA's 2^31-byte stride limit.
+    "VLLM_HPU_FLASH_NEXT_QSA_PREFILL_TILE":
+    lambda: int(os.environ.get("VLLM_HPU_FLASH_NEXT_QSA_PREFILL_TILE", "2048")),
 
     # Recurrent (GDN / short-conv) state pool: 0 (default) keeps today's
     # one-recurrent-slot-per-attention-block-id allocation, 1 gives the

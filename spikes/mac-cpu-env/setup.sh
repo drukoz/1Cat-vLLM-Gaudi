@@ -61,6 +61,9 @@ pick_python() {
 }
 
 PLUGIN_COMMIT="$(git -C "$PLUGIN_ROOT" rev-parse HEAD)"
+# The HF CPU oracle (tests/unit_tests/models/flash_next/reference.json) records this version;
+# vLLM only asks for a lower bound, so pin it or the parity tests drift on a rebuild.
+TRANSFORMERS_PIN="5.23.0"
 
 # ------------------------------------------------------- idempotent exit ----
 venv_python_version() {
@@ -74,6 +77,7 @@ pins_match() {
     [[ -n "$py_ver" ]] || return 1
     grep -qx "vllm_commit=$VLLM_COMMIT" "$PINS" &&
         grep -qx "plugin_commit=$PLUGIN_COMMIT" "$PINS" &&
+        grep -qx "transformers=$TRANSFORMERS_PIN" "$PINS" &&
         grep -qx "python=$py_ver" "$PINS"
 }
 
@@ -224,6 +228,8 @@ python -m pip install --no-build-isolation -e "$PLUGIN_ROOT"
 # ----------------------------------------------------------- test deps ----
 log "installing test dependencies"
 python -m pip install --quiet pytest pytest-asyncio pytest-timeout pyyaml >/dev/null
+log "pinning transformers==$TRANSFORMERS_PIN"
+python -m pip install --quiet "transformers==$TRANSFORMERS_PIN" >/dev/null
 
 # -------------------------------------------------------------- PINS.txt ----
 PY_VER="$(venv_python_version)"
@@ -232,6 +238,7 @@ PY_VER="$(venv_python_version)"
     echo "torch=$TORCH_VER"
     echo "vllm_commit=$VLLM_COMMIT"
     echo "vllm_version=$VLLM_VER"
+    echo "transformers=$TRANSFORMERS_PIN"
     echo "plugin_commit=$PLUGIN_COMMIT"
     echo "setup_finished=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 } >"$PINS"

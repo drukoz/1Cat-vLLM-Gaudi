@@ -23,10 +23,14 @@ FLASH_NEXT_ARCHS = ("Qwen4ExpForConditionalGeneration", "Qwen4ExpForCausalLM")
 
 class HpuQwen4ExpForConditionalGeneration(_upstream_model.Qwen4ExpForConditionalGeneration):
     """HPU specialization of the Flash-Next multimodal model. No overrides yet."""
+    # Sparse QSA decode gathers K/V through the per-request block_table (M2).
+    requires_block_table = True
 
 
 class HpuQwen4ExpForCausalLM(_upstream_model.Qwen4ExpForCausalLM):
     """HPU specialization of the Flash-Next text-only model. No overrides yet."""
+    # Sparse QSA decode gathers K/V through the per-request block_table (M2).
+    requires_block_table = True
 
 
 def apply_flash_next_patches() -> None:
