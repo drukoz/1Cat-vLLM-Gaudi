@@ -345,7 +345,7 @@ vllm serve --help 2>&1 | grep retention   # absent on the pin's vllm -- skip F a
 | Expected line (quoted) | Source | Observed |
 |---|---|---|
 | `Usable num_blocks: 2862` (variants A–D, ±5%) | S4 prediction above (today's allocation, both worker factors) | |
-| `HPU hybrid cache: reducing available KV cache memory by … (factor=0.567)` | format: `hpu_worker.py:1129-1139`; page 524288, GDN 400896 (S4) | |
+| `HPU hybrid cache: reducing available KV cache memory by … (factor=0.567)` | format: `hpu_worker.py:1145-1153`; page 524288, GDN 400896 (S4) | |
 | `[HPU] Recurrent state pool: 896 slots (max_num_seqs=32, recurrent groups=4, live slots per request=3, cache slots=512)` (E) | M1-T1 log format; 896 predicted by S4's slots formula | |
 | `Recurrent state pool: 896 slots x 4.76 MiB per slot = 4.18 GiB reserved; … left for attention blocks` (E) | M1-T3 log format; 4.18 GiB predicted by S4 | |
 | `Usable num_blocks: 6113` (E, within 2%: 5991–6235) | S4 pool prediction above | |
