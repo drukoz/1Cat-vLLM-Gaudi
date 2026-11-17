@@ -15,6 +15,11 @@ through vLLM's real loader on world 1 (gloo), then patches what the CPU cannot r
 
 The seams (``GatedResidual``, ``Qwen4ExpQSAAttention``) are wired by
 ``vllm_gaudi.models.qwen4_exp.apply_flash_next_patches()``, which ``register()`` calls.
+
+For MTP (M3), ``cpu_model(..., speculative_config=..., load_format="dummy")`` builds the target
+under an MTP speculative config (it then returns ``(hidden, [multi])``), and ``cpu_draft_model``
+builds the ``HpuQwen4ExpMTP`` draft inside that open context the way the engine's eagle/MTP draft
+path does, binding its states and swapping in SDPA exactly as ``cpu_model`` does for the target.
 """
 
 import os
@@ -349,7 +354,9 @@ def cpu_model(ckpt_dir: Path,
               fp32: bool = False,
               num_slots: int = 4,
               qsa_mode: QsaMode | None = None,
-              max_model_len: int = 512):
+              max_model_len: int = 512,
+              speculative_config: dict | None = None,
+              load_format: str | None = None):
     """Build the tiny Flash-Next model on CPU and yield ``(vllm_config, model)``.
 
     Registers the plugin (``VLLM_PLUGINS`` is empty, so ``register()`` is called by hand),
@@ -366,6 +373,12 @@ def cpu_model(ckpt_dir: Path,
     stand-in on the ``.sparse_attn`` seam. Use ``max_model_len=4096`` for the 2600-token
     sparse-prefill prompts (the compressed cache has one row per 4 tokens).
 
+    ``speculative_config`` (a dict, e.g. ``{"method": "mtp", "num_speculative_tokens": 3}``)
+    and ``load_format`` (e.g. ``"dummy"``) are passed to ``EngineArgs`` only when not ``None``:
+    MTP whole-model tests pass both (the draft is built by :func:`cpu_draft_model`, and the
+    checkpoint has no MTP weights, so the target loads dummies). Omitting them keeps the old
+    behavior exactly.
+
     The distributed group is destroyed on exit, always. Only one ``cpu_model`` may be open
     at a time: a second ``init_distributed_environment`` asserts "already initialized".
     A build takes a few seconds.
@@ -374,15 +387,20 @@ def cpu_model(ckpt_dir: Path,
     prev_mode = os.environ.get("VLLM_HPU_FLASH_NEXT_QSA_MODE")
     if qsa_mode is not None:
         os.environ["VLLM_HPU_FLASH_NEXT_QSA_MODE"] = str(int(qsa_mode))
-    vllm_config = EngineArgs(model=str(ckpt_dir),
-                             tokenizer=str(ckpt_dir),
-                             skip_tokenizer_init=True,
-                             dtype="bfloat16",
-                             enable_prefix_caching=False,
-                             max_model_len=max_model_len,
-                             max_num_seqs=4,
-                             enforce_eager=True,
-                             language_model_only=True).create_engine_config()
+    engine_kwargs = dict(model=str(ckpt_dir),
+                         tokenizer=str(ckpt_dir),
+                         skip_tokenizer_init=True,
+                         dtype="bfloat16",
+                         enable_prefix_caching=False,
+                         max_model_len=max_model_len,
+                         max_num_seqs=4,
+                         enforce_eager=True,
+                         language_model_only=True)
+    if speculative_config is not None:
+        engine_kwargs["speculative_config"] = speculative_config
+    if load_format is not None:
+        engine_kwargs["load_format"] = load_format
+    vllm_config = EngineArgs(**engine_kwargs).create_engine_config()
     fd, init_file = tempfile.mkstemp(dir="/tmp")
     os.close(fd)
     with set_current_vllm_config(vllm_config):
@@ -409,3 +427,37 @@ def cpu_model(ckpt_dir: Path,
                 os.environ.pop("VLLM_HPU_FLASH_NEXT_QSA_MODE", None)
             else:
                 os.environ["VLLM_HPU_FLASH_NEXT_QSA_MODE"] = prev_mode
+
+
+def cpu_draft_model(vllm_config, fp32: bool = False, num_slots: int = 4, max_model_len: int = 512):
+    """Build the MTP draft model on CPU inside an open :func:`cpu_model` context, and return it.
+
+    Drives the same construction the engine's eagle/MTP draft path uses (CTO probe
+    ``spikes/flash-next-parity/mtp_probe.py``): ``replace(vllm_config, model_config=sc.draft_model_config)``,
+    then ``get_model(vllm_config=draft_vllm_config, model_config=sc.draft_model_config,
+    load_config=sc.draft_load_config)`` under ``set_model_tag("eagle_head")``, where ``sc`` is
+    ``vllm_config.speculative_config``. The draft is the registered ``HpuQwen4ExpMTP``; with
+    ``load_format="dummy"`` on the target's config it gets dummy weights (the tiny checkpoint
+    has no MTP weights until T1).
+
+    Must be called inside an open :func:`cpu_model` (it reuses that world-1 gloo group and the
+    current ``vllm_config``; a second build outside it has no distributed environment). Afterwards
+    converts with :func:`to_fp32` when ``fp32``, binds states (:func:`bind_cpu_states`) and swaps
+    in the SDPA attention (:func:`use_sdpa_attention`), exactly as :func:`cpu_model` does for the
+    target. Returns the built draft model.
+    """
+    from vllm.compilation.backends import set_model_tag
+    from vllm.config import replace
+    from vllm.model_executor.model_loader import get_model
+
+    sc = vllm_config.speculative_config
+    draft_vllm_config = replace(vllm_config, model_config=sc.draft_model_config)
+    with set_model_tag("eagle_head"):
+        draft = get_model(vllm_config=draft_vllm_config,
+                          model_config=sc.draft_model_config,
+                          load_config=sc.draft_load_config)
+    if fp32:
+        to_fp32(draft)
+    bind_cpu_states(draft, num_slots, fp32, max_model_len)
+    use_sdpa_attention(draft)
+    return draft
