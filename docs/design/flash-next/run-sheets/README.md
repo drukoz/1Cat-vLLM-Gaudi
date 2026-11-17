@@ -10,7 +10,8 @@ The current sheet is [qualification.md](qualification.md): stages 1–2 (build a
 2. Every command in a fenced `bash` block, runnable as posted. Paths that exist only on the node are marked "(on the node)".
 3. Every expected log line is quoted exactly and carries its source in a trailing comment, for example `# system map §11, Run 1`. No invented expectations.
 4. The environment is set explicitly inside the launch block; a stage never depends on shell history or on a previous stage's exports.
-5. Predictions (for example S4's `Usable num_blocks`) are pasted from the source command, labelled "predicted", and the stop rule names the tolerance.
+5. The capture commands read `docker logs`, which only shows a server started as the container's command. If you start `vllm serve` from `docker exec` or a shell inside the container, append `2>&1 | tee /tmp/serve.log` to it and grep `/tmp/serve.log` instead.
+6. Predictions (for example S4's `Usable num_blocks`) are pasted from the source command, labelled "predicted", and the stop rule names the tolerance.
 
 ## Skeleton
 

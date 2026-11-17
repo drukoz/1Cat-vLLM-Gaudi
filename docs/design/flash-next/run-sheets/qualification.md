@@ -170,7 +170,7 @@ vllm serve /models/Qwen3.8-Flash-Next --served-model-name Qwen3.8-Flash-Next --p
 |---|---|---|
 | `Loading model weights took … GB` (≈42 GB per rank) | format: system map §11; 335 GiB / 8 = 42 GiB per card, §2a | |
 | `Usable num_blocks: 3868` | S4 prediction above, predicted for today's allocation | |
-| `HPU KV cache size: … tokens` (≈1,980,416 = 3868 × 512) | S4 prediction; line format: system map §11, Run 1 | |
+| `HPU KV cache size: … tokens` (≈1.94M; the log reports about 2% below blocks × 512: Run 1 logged 2,647,954 for 5293 blocks) | S4 prediction; line format and ratio: system map §11, Run 1 and §2a | |
 | `Maximum concurrency for 131,072 tokens per request: 14.8x` | S4 prediction above | |
 | `kv cache group sizes [512, 512, 512, 512]` | block 512 at TP8, 1 attention + 3 GDN groups, system map §2a; line: §11, Run 1 | |
 | `Mamba cache mode is set to 'align' … when prefix caching is enabled` | system map §11, Run 1 | |
@@ -217,7 +217,7 @@ docker logs <container> 2>&1 | grep -E "Usable num_blocks|HPU KV cache size|Maxi
 |---|---|---|---|
 | Attention block size | 512 | | |
 | `Usable num_blocks` | 3868 (predicted, ±5%) | | |
-| `HPU KV cache size` | ≈1.98M tokens | | |
+| `HPU KV cache size` | ≈1.94M tokens (S4 1.98M × 0.977) | | |
 | `Maximum concurrency … 131,072 tokens` | ≈14.8x | | |
 | `kv cache group sizes` | `[512, 512, 512, 512]` | | |
 | `GDN layers detected` | `(36)` with `VLLM_COMPACT_GDN=0` | | |
