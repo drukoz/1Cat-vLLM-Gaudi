@@ -40,6 +40,9 @@ from vllm_gaudi.v1.worker.hpu_dp_utils import set_hpu_dp_metadata
 from vllm_gaudi.v1.worker.gdn_state_layout import has_contiguous_dflash_checkpoints
 from vllm_gaudi.v1.worker.flash_next_inputs import (build_block_table, build_ple_inputs, dummy_ple_inputs,
                                                     model_requires_block_table, model_requires_raw_input_tokens)
+from vllm_gaudi.v1.worker.recurrent_spec import (accepted_counts, load_checkpoint_offsets, qsa_modules,
+                                                 recurrent_spec_enabled, state_slots_per_request,
+                                                 verification_state_width)
 from vllm_gaudi.platform import is_flash_next_model
 
 from vllm.v1.attention.backend import AttentionBackend, AttentionType, CommonAttentionMetadata
@@ -1000,12 +1003,11 @@ def maybe_set_mamba_kv_cache_groups_ids(model, kv_cache_config: KVCacheConfig, r
 
     if runner is not None and getattr(runner, "_first_gdn_group_idx", None) is not None:
         # The Flash-Next QSA raw-key ring is addressed by the first GDN
-        # group's load/store slot; tell every QSA indexer which group that is.
-        from vllm_gaudi.models.qwen4_exp.qsa import HpuQwen4ExpQSAAttention
-        for module in model.modules():
-            if isinstance(module, HpuQwen4ExpQSAAttention):
-                module.indexer.ring_group_idx = torch.tensor(runner._first_gdn_group_idx, dtype=torch.long,
-                                                             device="hpu")
+        # group's load/store slot; tell every QSA indexer which group that
+        # is, in the target and in the drafter (MTP drafts from a QSA layer).
+        for module in qsa_modules(model, getattr(getattr(runner, "drafter", None), "model", None)):
+            module.indexer.ring_group_idx = torch.tensor(runner._first_gdn_group_idx, dtype=torch.long,
+                                                         device="hpu")
 
 
 def maybe_set_chunked_attention_layers(model_runner):
@@ -2228,11 +2230,12 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         # so each request needs num_gdn_groups distinct slot indices. Groups
         # occupy contiguous max_num_reqs-sized spans so a full decode batch can
         # update state without index_select/index_copy.
-        # DFlash2 retains one recurrent checkpoint for every token in its
-        # verification block. Other paths retain one checkpoint per request.
-        self._gdn_state_slots_per_req = (1 + self.speculative_config.num_speculative_tokens
-                                         if self.speculative_config is not None
-                                         and self.speculative_config.use_dflash() else 1)
+        # A verification-driven (recurrent-spec) decode retains one recurrent
+        # checkpoint for every token in its verification block. Other paths
+        # retain one checkpoint per request. This applies to every speculative
+        # method (MTP included), not just DFlash2.
+        self._recurrent_spec = recurrent_spec_enabled(self.speculative_config)
+        self._gdn_state_slots_per_req = state_slots_per_request(self.speculative_config)
         self._compact_gdn_enabled = os.environ.get("VLLM_COMPACT_GDN", "1").strip().lower() in ("1", "true")
         self._recurrent_pool_slots = 0
         self._first_gdn_group_idx = None
@@ -4905,28 +4908,30 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                 )
 
             req_indices = list(range(num_decodes))
-            is_dflash_decode = self.speculative_config is not None and self.speculative_config.use_dflash()
-            is_dflash_spec = is_dflash_decode and num_tokens > 1
-            state_width = num_tokens if is_dflash_spec else 1
+            is_recurrent_spec_decode = self._recurrent_spec
+            is_spec_batch = is_recurrent_spec_decode and num_tokens > 1
+            state_width = verification_state_width(num_tokens, is_recurrent_spec_decode)
             dflash_full_query = _is_full_dflash_query_block(
-                is_dflash_spec,
+                is_spec_batch and self.speculative_config.use_dflash(),
                 num_decodes,
                 padded_batch_size,
                 num_tokens_per_req,
                 state_width,
             )
-            if is_dflash_decode:
-                accepted_counts = [
-                    self._gdn_num_accepted_by_req.get(req_id, 1) for req_id in self.input_batch.req_ids[:num_decodes]
-                ]
-                load_checkpoint_offsets = None if is_dflash_spec else [count - 1 for count in accepted_counts]
+            if is_recurrent_spec_decode:
+                decode_req_ids = self.input_batch.req_ids[:num_decodes]
+                decode_accepted = accepted_counts(decode_req_ids, self._gdn_num_accepted_by_req, num_decodes)
+                load_offsets = load_checkpoint_offsets(decode_accepted, is_spec_batch)
+                decode_accepted_padded = accepted_counts(decode_req_ids, self._gdn_num_accepted_by_req,
+                                                         padded_batch_size)
             else:
-                accepted_counts = []
-                load_checkpoint_offsets = None
+                decode_accepted = []
+                load_offsets = None
+                decode_accepted_padded = []
             if self.use_prefix_caching:
                 load_state_indices_cpu = self.prepare_mamba_state_idxs(req_indices, block_idx_last_computed_token_cpu,
                                                                        padded_batch_size, state_width,
-                                                                       load_checkpoint_offsets)
+                                                                       load_offsets)
                 store_state_indices_cpu = self.prepare_mamba_state_idxs(req_indices, block_idx_last_scheduled_token_cpu,
                                                                         padded_batch_size, state_width)
             else:
@@ -4936,7 +4941,7 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                     zeros,
                     padded_batch_size,
                     state_width,
-                    load_checkpoint_offsets,
+                    load_offsets,
                 )
                 store_state_indices_cpu = self.prepare_mamba_state_idxs(
                     req_indices,
@@ -4982,10 +4987,9 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             load_indices_tensor = async_h2d_copy(load_state_indices_cpu, device=self.device)
             store_indices_tensor = async_h2d_copy(store_state_indices_cpu, device=self.device)
             query_start_loc_p = async_h2d_copy(query_start_loc_p_cpu, dtype=torch.int32)
-            if is_dflash_decode:
-                accepted_counts.extend([1] * (padded_batch_size - num_decodes))
+            if is_recurrent_spec_decode:
                 num_accepted_tokens = async_h2d_copy(
-                    torch.tensor(accepted_counts, dtype=torch.int32),
+                    torch.tensor(decode_accepted_padded, dtype=torch.int32),
                     device=self.device,
                 )
             else:
@@ -6387,7 +6391,7 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                         assert sampler_output is not None
                         decode_sampled_token_ids.append(sampler_output.sampled_token_ids.flatten())
                         logprobs_segments.append((list(pd_info.decode_req_ids), sampler_output.logprobs_tensors))
-                        if self.speculative_config is not None and self.speculative_config.use_dflash():
+                        if self._recurrent_spec:
                             # A plain target step reads the accepted checkpoint
                             # selected by the metadata builder and writes the
                             # resulting recurrent state back to checkpoint 0.
@@ -6437,7 +6441,7 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                             decode_sampled_token_ids, _ = decode_sampled_token_ids
                         # Trim output in case of dummy padding
                         decode_sampled_token_ids = decode_sampled_token_ids[:num_decodes]
-                        if self.speculative_config.use_dflash():
+                        if self._recurrent_spec:
                             for req_id, accepted_tokens in zip(
                                     self.input_batch.req_ids[:num_decodes],
                                     decode_sampled_token_ids,
@@ -9197,7 +9201,6 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         from the first GDN group's allocated state tensor rows (pool,
         compact or baseline: read from the tensor, never recomputed).
         """
-        from vllm_gaudi.models.qwen4_exp.qsa import HpuQwen4ExpQSAAttention
         from vllm_gaudi.models.qwen4_exp.qsa_side_caches import allocate_side_caches
 
         gdn_rows = None
@@ -9211,7 +9214,7 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             return
         config = getattr(self.model.model.config, "text_config", self.model.model.config)
         spec_tokens = self.speculative_config.num_speculative_tokens if self.speculative_config else 0
-        qsa_layers = [m for m in self.model.model.modules() if isinstance(m, HpuQwen4ExpQSAAttention)]
+        qsa_layers = qsa_modules(self.model.model, getattr(getattr(self, "drafter", None), "model", None))
         total_bytes = 0
         shapes = None
         for module in qsa_layers:
