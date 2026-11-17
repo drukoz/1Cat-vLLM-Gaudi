@@ -2,8 +2,10 @@
 """CPU model of the HPU hybrid (attention + GDN) KV cache capacity.
 
 Predicts the scheduler block size, bytes per block, usable blocks, KV tokens and max
-concurrent requests for a hybrid GDN model and layout, for today's HPU allocation and the
-planned GDN-state-pool fix. Validated against the Run 1 / Run 2 startup logs (see README).
+concurrent requests for a hybrid GDN model and layout, for today's HPU allocation (both
+worker shrink factors: the GDN factor and, for models with a PLE short conv, the
+standard-mamba factor) and for the M1 recurrent state pool. Validated against the
+Run 1 / Run 2 startup logs (see README).
 """
 
 import argparse
@@ -22,17 +24,30 @@ def geometry(config_json):
     """Model geometry from a HF config dict (fields read from text_config when present)."""
     tc = config_json.get("text_config", config_json)
     layer_types = tc["layer_types"]
+    ple_layers = len(tc.get("ple_layer_ids", []))  # PLE short-conv layers (standard-mamba spec)
+    ple_state = 0
+    if ple_layers:
+        # bf16, replicated on every rank: not divided by tp (hpu_worker.py:1148-1152 sums shapes).
+        ple_state = (tc["hc_count"] * tc["hidden_size"] * (tc["ple_conv_kernel_size"] - 1) * tc["ngram_size"] * 2)
     return {
         "num_hidden_layers": tc["num_hidden_layers"], "n_attn": layer_types.count("full_attention"),
         "n_gdn": layer_types.count("linear_attention"), "kv_heads": tc["num_key_value_heads"],
         "head_dim": tc["head_dim"], "linear_num_key_heads": tc["linear_num_key_heads"],
         "linear_num_value_heads": tc["linear_num_value_heads"], "linear_key_head_dim": tc["linear_key_head_dim"],
         "linear_value_head_dim": tc["linear_value_head_dim"], "linear_conv_kernel_dim": tc["linear_conv_kernel_dim"],
+        "ple_layers": ple_layers, "ple_state": ple_state,
     }
 
 
-def layout(geom, tp, kv_bytes, budget_gib, max_len=131072, checkpoints=0):
-    """Every capacity quantity for one layout; res['today'] / res['fixed'] sub-dicts."""
+def layout(geom, tp, kv_bytes, budget_gib, max_len=131072, checkpoints=0, pool_slots=None, max_num_seqs=32,
+           cache_slots=512):
+    """Every capacity quantity for one layout; res['today'] / res['pool'] sub-dicts.
+
+    today: the worker's two shrink factors (hpu_worker.py:1108-1140 GDN, :1142-1166 PLE
+    standard-mamba; ple_state = 0 for models without PLE, so the factor is 1).
+    pool: the M1 recurrent state pool (slots sized to the live + cache need, attention
+    blocks from what the budget leaves; pool_slots=None uses the slots formula).
+    """
     n_attn, n_gdn = geom["n_attn"], geom["n_gdn"]
     kv_heads_rank = max(1, geom["kv_heads"] // tp)  # vLLM replicates KV heads when tp > kv_heads
     attn_tok = 2 * kv_heads_rank * geom["head_dim"] * kv_bytes  # K+V bytes per token per layer per rank
@@ -43,6 +58,7 @@ def layout(geom, tp, kv_bytes, budget_gib, max_len=131072, checkpoints=0):
                  geom["linear_value_head_dim"] * 4)  # recurrent state, float32
     conv_bytes = (conv_dim // tp) * (geom["linear_conv_kernel_dim"] - 1) * 2  # conv state, bf16
     gdn_real = ssm_bytes + conv_bytes
+    ple_layers, ple_state = geom["ple_layers"], geom["ple_state"]
     # platform.py:394-419 pads the mamba page to a multiple of the attention page;
     # vLLM's unify_kv_cache_spec_page_size then raises the attention block size to match.
     page = cdiv(gdn_real, attn_page128) * attn_page128
@@ -50,19 +66,33 @@ def layout(geom, tp, kv_bytes, budget_gib, max_len=131072, checkpoints=0):
     positions = n_attn  # 1 attention group + (n_gdn / n_attn) GDN groups, each of n_attn layers
     gpu_bytes_per_block = positions * page  # vLLM shared-buffer accounting (kv_cache_utils)
     hpu_bytes_per_block = positions * (page + gdn_real)  # HPU: separate tensors, both num_blocks+1 deep
-    budget_bytes = budget_gib * GIB
-    blocks_today = int(budget_bytes * page / (page + gdn_real)) // gpu_bytes_per_block  # hpu_worker factor
-    blocks_fixed = int(budget_bytes) // gpu_bytes_per_block  # GDN slots sized to the real need
+    budget_bytes = int(budget_gib * GIB)
+    # hpu_worker.py:1126-1140 GDN factor page/(page+gdn_real), then :1153-1166 PLE factor
+    # page/(page+ple_state) when the model has a standard-mamba (PLE short-conv) spec.
+    blocks_today = int(int(budget_bytes * page / (page + gdn_real)) * page / (page + ple_state)) \
+        // gpu_bytes_per_block
+    groups = (n_gdn // n_attn) + (1 if ple_layers else 0)  # recurrent groups: GDN groups + the PLE layer
+    slots = pool_slots if pool_slots is not None else max_num_seqs * groups * 3 + cache_slots
+    pool_bytes = (slots + 2) * (positions * gdn_real + ple_layers * ple_state)  # M1-T3: slots + 2 slack
+    blocks_pool = (budget_bytes - pool_bytes) // gpu_bytes_per_block
     # align mode: MambaSpec.max_memory_usage_bytes = page * (2 + checkpoints) per GDN group
     per_request = cdiv(max_len * attn_tok, page) + (n_gdn // n_attn) * (2 + checkpoints)
+    attn_per_request = cdiv(max_len * attn_tok, page)  # the pool charges no per-request GDN blocks
     res = {
         "kv_heads_rank": kv_heads_rank, "attn_tok": attn_tok, "attn_page128": attn_page128,
         "conv_dim": conv_dim, "ssm_bytes": ssm_bytes, "conv_bytes": conv_bytes, "gdn_real": gdn_real,
         "page": page, "block": block, "positions": positions, "gpu_bytes_per_block": gpu_bytes_per_block,
         "hpu_bytes_per_block": hpu_bytes_per_block, "gdn_groups": n_gdn // n_attn, "per_request": per_request,
+        "ple_layers": ple_layers, "ple_state": ple_state, "groups": groups, "slots": slots,
+        "pool_bytes": pool_bytes, "attn_per_request": attn_per_request,
     }
-    for mode, blocks in (("today", blocks_today), ("fixed", blocks_fixed)):
-        res[mode] = {"blocks": blocks, "tokens": blocks * block, "concurrency": blocks / per_request}
+    res["today"] = {"blocks": blocks_today, "tokens": blocks_today * block, "concurrency": blocks_today / per_request}
+    pool = {
+        "slots": slots, "bytes": pool_bytes, "blocks": blocks_pool, "tokens": blocks_pool * block,
+        "attn_term": blocks_pool / attn_per_request, "slots_term": slots / (groups * 3),
+    }
+    pool["concurrency"] = min(pool["attn_term"], pool["slots_term"])  # report both terms
+    res["pool"] = pool
     return res
 
 
@@ -88,15 +118,15 @@ TABLE_ROWS = [
 ]
 
 TABLE_HDR = ("row", "tp", "kv", "budget GiB", "block", "blocks today", "tokens today", "agents@131K today",
-             "blocks fixed", "tokens fixed", "agents@131K fixed")
+             "slots", "pool GiB", "blocks pool", "tokens pool", "agents@131K pool")
 
 
-def table_row(name, geom, tp, kv_bytes, budget_gib, max_len=131072):
-    lay = layout(geom, tp, kv_bytes, budget_gib, max_len=max_len)
-    t, f = lay["today"], lay["fixed"]
+def table_row(name, geom, tp, kv_bytes, budget_gib, max_len=131072, pool_slots=None, max_num_seqs=32):
+    lay = layout(geom, tp, kv_bytes, budget_gib, max_len=max_len, pool_slots=pool_slots, max_num_seqs=max_num_seqs)
+    t, p = lay["today"], lay["pool"]
     return (name, tp, "bf16" if kv_bytes == 2 else "fp8", f"{budget_gib:g}", lay["block"], t["blocks"],
-            f"{t['tokens'] / 1e6:.2f}M", f"{t['concurrency']:.1f}", f["blocks"], f"{f['tokens'] / 1e6:.2f}M",
-            f"{f['concurrency']:.1f}")
+            f"{t['tokens'] / 1e6:.2f}M", f"{t['concurrency']:.1f}", p["slots"], f"{p['bytes'] / GIB:.2f}",
+            p["blocks"], f"{p['tokens'] / 1e6:.2f}M", f"{p['concurrency']:.1f}")
 
 
 def print_table(rows):
@@ -128,13 +158,19 @@ def main():
     parser.add_argument("--budget-gib", type=float)
     parser.add_argument("--max-model-len", type=int, default=131072)
     parser.add_argument("--checkpoints", type=int, default=0)  # prefill checkpoint blocks
+    parser.add_argument("--pool-slots", type=int, default=None,
+                        help="override the pool slot count (default: max_num_seqs * groups * 3 + cache_slots)")
+    parser.add_argument("--max-num-seqs", type=int, default=32, help="max_num_seqs of the launch (pool slots formula)")
     parser.add_argument("--table", action="store_true", help="Flash-Next rows plus the two 27B validation rows")
     parser.add_argument("--check", action="store_true", help="reproduce the Run 1 / Run 2 logs, exit 0 on success")
     args = parser.parse_args()
     if args.check:
         raise SystemExit(check())
     if args.table:
-        rows = [table_row(n, load_geometry(c), tp, kv, b) for n, c, tp, kv, b in TABLE_ROWS]
+        rows = [
+            table_row(n, load_geometry(c), tp, kv, b, pool_slots=args.pool_slots, max_num_seqs=args.max_num_seqs)
+            for n, c, tp, kv, b in TABLE_ROWS
+        ]
         print_table(rows)
         return
     if not all(v is not None for v in (args.config, args.tp, args.kv, args.budget_gib)):
@@ -143,7 +179,10 @@ def main():
         geom = geometry(json.load(f))
     kv_bytes = 2 if args.kv == "bf16" else 1
     name = os.path.basename(args.config)
-    print_table([table_row(name, geom, args.tp, kv_bytes, args.budget_gib, args.max_model_len)])
+    print_table([
+        table_row(name, geom, args.tp, kv_bytes, args.budget_gib, args.max_model_len, pool_slots=args.pool_slots,
+                  max_num_seqs=args.max_num_seqs)
+    ])
 
 
 if __name__ == "__main__":

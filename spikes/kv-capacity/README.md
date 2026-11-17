@@ -9,9 +9,11 @@ layout (TP size, KV dtype, HPU KV memory budget):
   131072 tokens per request (configurable via `--max-model-len`, `--checkpoints` adds
   prefill checkpoint blocks),
 
-both for **today's HPU allocation** (the worker's `page / (page + gdn_real)` factor,
-`vllm_gaudi/v1/worker/hpu_worker.py`) and for the **planned GDN-state-pool fix** (GDN slots
-sized to the real need, an M1 task). Pure CPU arithmetic; no `VllmConfig`, no weights.
+both for **today's HPU allocation** (the worker's `page / (page + gdn_real)` factor and, when
+the model has a PLE short-conv standard-mamba spec, its second factor
+`page / (page + ple_state)`, `vllm_gaudi/v1/worker/hpu_worker.py:1102-1166`) and for the
+**M1 recurrent state pool** (slots = `max_num_seqs * groups * 3 + cache_slots`, attention
+blocks from what the budget leaves). Pure CPU arithmetic; no `VllmConfig`, no weights.
 
 ## Usage
 
@@ -20,8 +22,12 @@ PY=/Volumes/Storage/paperclip/tmp/vllm-cpu-dev/venv/bin/python   # S0 env, vLLM 
 $PY spikes/kv-capacity/kv_capacity.py --check
 $PY spikes/kv-capacity/kv_capacity.py --table
 $PY spikes/kv-capacity/kv_capacity.py --config spikes/kv-capacity/configs/Qwen3.8-Flash-Next.json \
-    --tp 8 --kv fp8 --budget-gib 40 [--max-model-len L] [--checkpoints C]
+    --tp 8 --kv fp8 --budget-gib 40 [--max-model-len L] [--checkpoints C] \
+    [--pool-slots N] [--max-num-seqs S]
 ```
+
+`--pool-slots` overrides the pool slot count (default from the formula with
+`--max-num-seqs`, default 32, and `cache_slots = 512`).
 
 ## Validation (user's startup logs)
 
@@ -41,20 +47,27 @@ Run 2: block=896 concurrency=19.2 (log 19.08) OK
 `$PY spikes/kv-capacity/kv_capacity.py --table`:
 
 ```text
-row                          tp  kv    budget GiB  block  blocks today  tokens today  agents@131K today  blocks fixed  tokens fixed  agents@131K fixed
-FN TP8 BF16 weights          8   bf16  40          512    3868          1.98M         14.8               6826          3.49M         26.1
-FN TP4 FP8 weights           4   bf16  39          896    2029          1.82M         13.3               3803          3.41M         24.9
-FN TP8 + FP8 KV              8   fp8   40          896    4163          3.73M         27.2               7801          6.99M         51.0
-FN TP4 FP8 weights + FP8 KV  4   fp8   39          1664   2110          3.51M         24.8               4096          6.82M         48.2
-27B TP8 BF16 (Run 1)         8   bf16  72.98       512    5293          2.71M         20.2               9341          4.78M         35.7
-27B TP4 BF16 (Run 2)         4   bf16  75.36       896    2941          2.64M         19.2               5512          4.94M         36.0
+row                          tp  kv    budget GiB  block  blocks today  tokens today  agents@131K today  slots  pool GiB  blocks pool  tokens pool  agents@131K pool
+FN TP8 BF16 weights          8   bf16  40          512    2862          1.47M         10.9               896    4.18      6113         3.13M        23.9
+FN TP4 FP8 weights           4   bf16  39          896    1690          1.51M         11.0               896    8.20      3003         2.69M        20.4
+FN TP8 + FP8 KV              8   fp8   40          896    2970          2.66M         19.4               896    4.18      6987         6.26M        47.5
+FN TP4 FP8 weights + FP8 KV  4   fp8   39          1664   1734          2.89M         20.4               896    8.20      3234         5.38M        40.9
+27B TP8 BF16 (Run 1)         8   bf16  72.98       512    5293          2.71M         20.2               800    4.79      8728         4.47M        34.1
+27B TP4 BF16 (Run 2)         4   bf16  75.36       896    2941          2.64M         19.2               800    9.58      4811         4.31M        32.7
 ```
+
+`today` = the worker's shrink factors (the Flash-Next rows pay the PLE factor too, which is 1
+for the 27B); the pool columns use the slots formula with `max_num_seqs = 32` (the 27B has
+`groups = 3`, no PLE: 800 slots).
 
 ## Tests
 
-`$PY -m pytest spikes/kv-capacity -q` → `3 passed`: Run 1 (5293 / 512 / 20.20 ± 0.01),
-Run 2 (896 / 19.08 ± 1%), and a cross-check of the two page sizes against vLLM's own
-`FullAttentionSpec` / `MambaSpec` page-size accounting for the 27B at tp 8.
+`$PY -m pytest spikes/kv-capacity -q` → `6 passed`: Run 1 (5293 / 512 / 20.20 ± 0.01),
+Run 2 (896 / 19.08 ± 1%), a cross-check of the two page sizes against vLLM's own
+`FullAttentionSpec` / `MambaSpec` page-size accounting for the 27B at tp 8, the Flash-Next PLE
+geometry (1 layer, 184,320 B per slot), Flash-Next TP8 BF16 40 GiB `today` with both factors
+(2862 blocks), and the pool (896 slots, `(slots + 2)` bytes, more blocks than today, both
+concurrency terms).
 
 ## Model (formulas and code references)
 
@@ -76,10 +89,16 @@ From the HF config `text_config`: `layer_types` gives `n_attn` (`full_attention`
 | `positions` | `n_attn` | 1 attention group + `n_gdn / n_attn` GDN groups, each of `n_attn` layers |
 | `gpu_bytes_per_block` | `positions * page` | vLLM shared-buffer accounting (`kv_cache_utils._get_kv_cache_bytes_per_block`) |
 | `hpu_bytes_per_block` | `positions * (page + gdn_real)` | HPU allocates separate attention and GDN tensors, both `num_blocks+1` deep |
-| `blocks_today` | `int(budget * page / (page + gdn_real)) // gpu_bytes_per_block` | `hpu_worker.py` factor, then vLLM's division |
-| `blocks_fixed` | `int(budget) // gpu_bytes_per_block` | GDN slots sized to the real need (negligible memory) |
+| `ple_layers` | `len(ple_layer_ids)` (0 when the config has no PLE: the 27B) | `text_config.ple_layer_ids`, `[2]` for Flash-Next |
+| `ple_state` | `hc_count * hidden_size * (ple_conv_kernel_size - 1) * ngram_size * 2` (bf16, replicated: not `// tp`) | PLE short-conv state per slot = 184,320 B for Flash-Next |
+| `blocks_today` | `int(int(budget * page / (page + gdn_real)) * page / (page + ple_state)) // gpu_bytes_per_block` | the two `hpu_worker.py:1102-1166` factors (GDN, then standard-mamba/PLE), each int-truncated, then vLLM's division; `ple_state = 0` ⇒ factor 1 |
+| `groups` | `n_gdn // n_attn + (1 if ple_layers)` | recurrent state groups: GDN groups + the PLE layer (Flash-Next 3 + 1 = 4; 27B 3) |
+| `slots` | `max_num_seqs * groups * 3 + cache_slots` (`cache_slots = 512`; `--pool-slots` overrides) | M1-T1 pool size: live slots per request 3 + cache; Flash-Next @32: 896 |
+| `pool_bytes` | `(slots + 2) * (positions * gdn_real + ple_layers * ple_state)` | M1-T3 pool reservation (+2 slack slots); Flash-Next: 898 × 4.76 MiB = 4.18 GiB |
+| `blocks_pool` | `(budget - pool_bytes) // gpu_bytes_per_block` | attention blocks from what the budget leaves |
 | `per_request(L)` | `cdiv(L * attn_tok, page) + (n_gdn // n_attn) * (2 + checkpoints)` | align mode: `MambaSpec.max_memory_usage_bytes = page * (2 + checkpoints)` |
-| `concurrency(L)` | `blocks / per_request(L)` | vLLM's "Maximum concurrency" line |
+| `concurrency_today(L)` | `blocks_today / per_request(L)` | vLLM's "Maximum concurrency" line |
+| `concurrency_pool(L)` | `min(blocks_pool / cdiv(L * attn_tok, page), slots / (groups * 3))` | the pool charges no per-request GDN blocks; both terms reported |
 | `kv_tokens` | `blocks * block` | vLLM's "KV cache size ... tokens" line |
 
 The two page sizes equal vLLM's own classes at the pin (verified in
