@@ -188,9 +188,27 @@ while IFS= read -r line; do
 done < <(sed '/^torch/d' "$BUILD_REQ")
 
 # ------------------------------------------------------------- vllm empty ----
-if python -c "import vllm" >/dev/null 2>&1 &&
-    python -c "import vllm, pathlib, os, sys; p=pathlib.Path(vllm.__file__).resolve(); sys.exit(0 if str(p).startswith(os.path.realpath('$VLLM_SRC')) else 1)"; then
-    log "vllm (editable, from $VLLM_SRC) already importable"
+# "Fresh" means: importable, from this checkout, AND the installed version
+# metadata carries this commit's hash. Checking the hash makes a re-pin
+# (checkout of a new commit in a reused clone) reinstall vLLM, which
+# regenerates the setuptools-scm version file and refreshes dependencies.
+vllm_fresh() {
+    python - "$VLLM_SRC" "$VLLM_COMMIT" <<'PY'
+import os
+import pathlib
+import sys
+
+import vllm
+
+src = os.path.realpath(sys.argv[1])
+path = pathlib.Path(vllm.__file__).resolve()
+if not str(path).startswith(src + os.sep):
+    sys.exit(1)
+sys.exit(0 if f"g{sys.argv[2][:7]}" in vllm.__version__ else 1)
+PY
+}
+if vllm_fresh >/dev/null 2>&1; then
+    log "vllm (editable, from $VLLM_SRC at $VLLM_COMMIT) already importable"
 else
     log "installing vllm from source with VLLM_TARGET_DEVICE=empty"
     VLLM_TARGET_DEVICE=empty python -m pip install --no-build-isolation -e "$VLLM_SRC"
