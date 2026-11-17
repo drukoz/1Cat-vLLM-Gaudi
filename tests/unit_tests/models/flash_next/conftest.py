@@ -17,3 +17,10 @@ from tests.unit_tests.models.flash_next.cpu_model import build_tiny_checkpoint  
 def tiny_checkpoint(tmp_path_factory) -> Path:
     """The tiny Flash-Next checkpoint, built once per session in a subprocess (no distributed state)."""
     return build_tiny_checkpoint(tmp_path_factory.mktemp("flash_next_tiny"))
+
+
+@pytest.fixture(scope="session")
+def tiny_tp8_checkpoint(tmp_path_factory) -> Path:
+    """The 8-attention-head tiny checkpoint (legal at TP8), with its own regenerated reference.json."""
+    fixture = Path(__file__).resolve().parent / "tiny_tp8_config.json"
+    return build_tiny_checkpoint(tmp_path_factory.mktemp("flash_next_tiny_tp8"), fixture=fixture)
