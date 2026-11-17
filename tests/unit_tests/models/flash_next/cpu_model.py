@@ -221,7 +221,8 @@ def cpu_model(ckpt_dir: Path, fp32: bool = False, num_slots: int = 4):
                              max_num_seqs=4,
                              enforce_eager=True,
                              language_model_only=True).create_engine_config()
-    _, init_file = tempfile.mkstemp(dir="/tmp")
+    fd, init_file = tempfile.mkstemp(dir="/tmp")
+    os.close(fd)
     with set_current_vllm_config(vllm_config):
         try:
             init_distributed_environment(world_size=1,
@@ -240,3 +241,5 @@ def cpu_model(ckpt_dir: Path, fp32: bool = False, num_slots: int = 4):
         finally:
             destroy_model_parallel()
             destroy_distributed_environment()
+            with contextlib.suppress(FileNotFoundError):
+                os.unlink(init_file)
