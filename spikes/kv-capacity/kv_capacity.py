@@ -116,6 +116,7 @@ def check():
     good = r2["block"] == 896 and abs(r2["today"]["concurrency"] - 19.08) <= 0.01 * 19.08
     print(f"Run 2: block={r2['block']} concurrency={r2['today']['concurrency']:.1f} (log 19.08) "
           f"{'OK' if good else 'FAIL'}")
+    ok &= good
     return 0 if ok else 1
 
 
@@ -136,7 +137,7 @@ def main():
         rows = [table_row(n, load_geometry(c), tp, kv, b) for n, c, tp, kv, b in TABLE_ROWS]
         print_table(rows)
         return
-    if not (args.config and args.tp and args.kv and args.budget_gib):
+    if not all(v is not None for v in (args.config, args.tp, args.kv, args.budget_gib)):
         parser.error("--config, --tp, --kv and --budget-gib are required together")
     with open(args.config, encoding="utf-8") as f:
         geom = geometry(json.load(f))
