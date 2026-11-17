@@ -153,19 +153,31 @@ def eos_token_id(vllm_config) -> int:
     return eos[0] if isinstance(eos, list) else eos
 
 
-def prefill_metadata(num_tokens: int, slot: int = 1) -> SimpleNamespace:
+def prefill_metadata(num_tokens: int,
+                     slot: int = 1,
+                     *,
+                     load_slot: int | None = None,
+                     store_slot: int | None = None,
+                     has_initial_state: bool = False) -> SimpleNamespace:
     """The HPU GDN forward metadata for one prefill row in state slot ``slot`` (int64 tensors).
 
     ``load_indices_tensor``/``store_indices_tensor`` are ``(1,)`` = ``[slot]``,
     ``query_start_loc_p`` is ``(2,)`` int32 ``[0, num_tokens]``, ``has_initial_states_p``
     is ``(1,)`` int32 ``[0]``: the single-row prefill the runner builds for a fresh prompt.
+
+    ``load_slot``/``store_slot`` override the two indices separately (a chunked prefill under
+    prefix caching continues from the load slot and writes the store slot); ``slot`` keeps
+    covering both when they are omitted. ``has_initial_state`` sets ``has_initial_states_p``
+    to ``[1]``, which is what tells the GDN/PLE layers to read the load slot at all.
     """
+    load = slot if load_slot is None else load_slot
+    store = slot if store_slot is None else store_slot
     return SimpleNamespace(
         is_prompt=True,
-        load_indices_tensor=torch.tensor([slot]),
-        store_indices_tensor=torch.tensor([slot]),
+        load_indices_tensor=torch.tensor([load]),
+        store_indices_tensor=torch.tensor([store]),
         query_start_loc_p=torch.tensor([0, num_tokens], dtype=torch.int32),
-        has_initial_states_p=torch.tensor([0], dtype=torch.int32),
+        has_initial_states_p=torch.tensor([1 if has_initial_state else 0], dtype=torch.int32),
         padding_mask_flat=None,
         direct_gdn_state=False,
         num_accepted_tokens=None,
