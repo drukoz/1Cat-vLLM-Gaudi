@@ -200,3 +200,6 @@ shellcheck*/
 
 # Ingore moe/marlin_moe gen code
 csrc/moe/marlin_moe_wna16/kernel_*
+
+# Paperclip run data (agent homes, OpenCode snapshots)
+.paperclip-runtime/
