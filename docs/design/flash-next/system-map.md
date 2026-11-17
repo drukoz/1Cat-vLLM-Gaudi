@@ -1,6 +1,6 @@
 # RUK-2709 Flash-Next on Gaudi: system map
 
-Kind: **Program**. Version 0.4, 2026-11-17: section 2a is rederived from the HPU allocation code and reconciled with Run 1 and Run 2 (with prefix caching on, 43–47% of the KV budget is unused GDN state slots; the earlier table was per-token arithmetic and about 1.8× too optimistic); section 7.1 gains the KV-cache sizing facts; M1 gains the GDN state pool; S4 (RUK-2734) is added to section 15. Version 0.3 changes the verification model (assumption 3, section 14): hardware is rented, so all code is written and checked on CPU first, and one rental session runs a single qualification run sheet. Section 16 maps the user's TP8 checklist onto the milestones. Version 0.2, 2026-11-17. Version 0.1 was written from a first reading of the repository, the model's public configuration and upstream vLLM / vllm-gaudi. Version 0.2 adds the user's answers to the question card (launch commands, versions, logs, topology, hardware access) and the first two research reports (R2 on the model runner, R4 on upstream's Flash-Next package). Facts carry a file path, a log line or a URL. Rows marked *(unverified)* wait for a research subtask or for the user.
+Kind: **Program**. Version 0.5, 2026-11-17: research phase closed; section 15 marks every research task and spike done and section 17 records the facts checked on this Mac that the plan (`plan.md`) rests on. Version 0.4, 2026-11-17: section 2a is rederived from the HPU allocation code and reconciled with Run 1 and Run 2 (with prefix caching on, 43–47% of the KV budget is unused GDN state slots; the earlier table was per-token arithmetic and about 1.8× too optimistic); section 7.1 gains the KV-cache sizing facts; M1 gains the GDN state pool; S4 (RUK-2734) is added to section 15. Version 0.3 changes the verification model (assumption 3, section 14): hardware is rented, so all code is written and checked on CPU first, and one rental session runs a single qualification run sheet. Section 16 maps the user's TP8 checklist onto the milestones. Version 0.2, 2026-11-17. Version 0.1 was written from a first reading of the repository, the model's public configuration and upstream vLLM / vllm-gaudi. Version 0.2 adds the user's answers to the question card (launch commands, versions, logs, topology, hardware access) and the first two research reports (R2 on the model runner, R4 on upstream's Flash-Next package). Facts carry a file path, a log line or a URL. Rows marked *(unverified)* wait for a research subtask or for the user.
 
 ## Assumptions
 
@@ -221,17 +221,17 @@ Milestones as vertical slices, in the order the reference measurements dictate:
 
 | Task | Owner | Status |
 |---|---|---|
-| S0 Mac CPU environment and test gate (RUK-2717) | Engineer 2, review Tech Lead 1 | in progress; pin corrected to `8f816a3f` |
-| R1 GDN flag and dispatch inventory (RUK-2718) | General Agent | todo; scope extended with the user's log lines |
+| S0 Mac CPU environment and test gate (RUK-2717) | Engineer 2, review Tech Lead 1 | done, approved and merged (`29b857d`): venv at the pin, 66 of 175 unit-test files pass on CPU |
+| R1 GDN flag and dispatch inventory (RUK-2718) | General Agent | done, approved: 54 flags, 26 dispatch rules; no startup line proves a FlashInfer-Gaudi tactic engaged |
 | R2 runner hybrid / prefix-caching / speculative map (RUK-2719) | Engineer 1 | done, approved; facts in section 7 |
 | R3 upstream vllm-gaudi delta (RUK-2720) | Engineer 3 | done, approved |
 | R4 upstream Qwen4Exp map at v0.34.0 (RUK-2721) | Engineer 4 | done, approved; facts in section 12 |
 | R4b upstream Flash-Next delta pin → v0.34.0 (RUK-2729) | Engineer 4 | done, approved: 194 commits, 62 HPU-relevant, carry list of 21 fixes |
 | R5 DeepSeek V4.1 reuse candidates (RUK-2722) | Engineer 5 | done, approved |
-| R6 MoE / FP8 / EP inventory (RUK-2723) | Engineer 6 | todo |
+| R6 MoE / FP8 / EP inventory (RUK-2723) | Engineer 6 | done, approved with corrections: block-FP8 MoE needs EP at TP4 (640/4 = 160 is not 128-aligned) |
 | R7 long-prompt admission and chunking, run sheet (RUK-2728) | Engineer 1 | done, approved; its variants become run-sheet stage 4 |
-| S3 eight-rank CPU tensor-parallel harness (RUK-2732) | Engineer 1 | todo, blocked by S0 |
-| S4 KV cache capacity calculator, CPU (RUK-2734) | Engineer 3, review Tech Lead 3 | todo; must reproduce Run 1 (5293 blocks, 20.20×) and Run 2 (19.08×) |
+| S3 eight-rank CPU tensor-parallel harness (RUK-2732) | Engineer 1 | done, approved and merged (`368a99d`): TP1/2/4/8 equivalence and collective order on CPU |
+| S4 KV cache capacity calculator, CPU (RUK-2734) | Engineer 3, review Tech Lead 3 | done, approved and merged (`23b48d8`): Run 1 exact, Run 2 within 1% |
 
 ## 16. The user's TP8 checklist, mapped (2026-11-17)
 
@@ -258,3 +258,20 @@ The user posted a checklist (written with ChatGPT) on RUK-2729. Each item, where
 | 5c | Per-request decode latency and aggregate throughput | M4 | no | Stage 5 |
 | 5d | Long-context and eight-agent stress with quality checks | M1–M4 | no | Stage 6 |
 
+
+## 17. Facts checked on this Mac for the plan (2026-11-17)
+
+All in the S0 environment (vLLM `8f816a3f`, torch 2.13.0, Python 3.12), with `VLLM_PLUGINS=""` unless stated.
+
+1. `vllm.models.qwen4_exp.nvidia.model`, `nvidia.mtp`, `nvidia.ple_layer`, `nvidia.hyperconnection`, `nvidia.indexer_qsa`, `nvidia.low_latency_gemm` and `common.qsa_cache` all import on CPU at the pin (`nvidia.qsa` only fails when imported before `nvidia.model`: a circular import). R4's import finding is specific to `v0.34.0`.
+2. After `import vllm_gaudi.models.qwen3_5` and `vllm_gaudi.models.qwen3_next`, `nvidia.model.QwenGatedDeltaNetAttention is HPUGatedDeltaNetAttention`, `Qwen4ExpSparseMoeBlock.forward` is `_hpu_qwen3next_sparse_moe_forward` and `Qwen3NextAttention.forward` is the HPU forward: the fork's replacement mechanism covers Flash-Next's GDN, MoE and attention base classes without any copy.
+3. The registry at the pin maps `Qwen4ExpForCausalLM`, `Qwen4ExpForConditionalGeneration` and `Qwen4ExpMTP` to `vllm.models.qwen4_exp` (`registry.py:114, 587, 678`), resolved lazily to `nvidia/` for HPU.
+4. transformers 5.23.0 (the venv's version; the node pins 5.16.1) has `transformers.models.qwen4_exp.modeling_qwen4_exp`: 2,577 lines, pure PyTorch, with reference fallbacks for `causal_conv1d` and `chunk_gated_delta_rule`, torch `topk` in the QSA indexer (:754) and the MoE router. A random model from `tests/unit_tests/models/flash_next/tiny_config.json` runs a CPU forward (67.2M parameters, 256 MiB fp32; the vocab embedding and `lm_head` are 31.8M each).
+5. `tiny_config.json` validates with both `transformers.Qwen4ExpConfig` and vLLM's `Qwen4ExpConfig`; vLLM's `_validate_qsa_config` (`qwen4_exp/config.py:134-160`) requires `indexer_budget / indexer_compress_ratio` to be 512 or 2048 and `indexer_head_dim >= head_dim × partial_rotary_factor`, so the fixture keeps the real indexer budget (2048 / 4).
+6. `EngineArgs(...).create_engine_config()` on the tiny model works on the CPU platform (`is_hybrid` True). Instantiating upstream's class through `initialize_model` builds the GDN, PLE, HyperConnection and MoE layers and raises in `Qwen4ExpQSAAttention.__init__` (`nvidia/qsa.py:108`, "Qwen4Exp QSA requires FlashAttention"). The QSA class is the only constructor that must be replaced for instantiation.
+7. A GDN+PLE decoder layer declares two `MambaSpec`s: `linear_attn` with `mamba_type` `GDN_ATTN`, shapes `((3, 1280), (48, 16, 16))` bf16/fp32 for the tiny model; `ple` with `mamba_type` `SHORT_CONV`, one bf16 tensor `(9, hc_count × hidden)` = `(9, 512)` tiny, `(9, 10240)` real (180 KiB per slot). The plugin has no short-conv handling (`grep -ri short_conv vllm_gaudi` is empty); `hpu_worker.py:1105,1151` has a generic branch for `MambaSpec`s that are not GDN.
+8. No runner at the pin produces the `query_start_loc` / `ngram_context` kwargs the PLE path requires (`nvidia/model.py:297`); `nvidia/model_state.py` does it only for the GPU Model Runner V2 (`vllm/v1/worker/gpu/`), which the fork does not use. The HPU runner calls `self.model.forward(input_ids=..., positions=..., attn_metadata=..., kv_caches=..., inputs_embeds=..., model_mm_kwargs=..., **additional_kwargs)` at `hpu_model_runner.py:5352` and the warmup forward at `:7249`.
+9. `nvidia/ple_layer.py:380-437` already has a torch path for the n-gram ids (`if input_ids.is_cuda` else torch); `ple_gate` and the `qwen4_exp_ple_short_conv` custom op (`nvidia/ops/ple.py`, Triton only) are the PLE seams. `nvidia/ops/qsa.py:422,561,607` raise without CUDA and Triton; `common/hyperconnection.py:140-250` is a torch `GatedResidual` with unmerged weights (`input_mix_weight_down`, `input_mix_weight_up`, `block_inject_weight`) and a `mix` / `combine` API, while the NVIDIA class merges down+inject into `input_mix_weight_down_block_inject` (16-row padded) and adds `combine_and_mix`.
+10. `HPUMRotaryEmbedding` (`vllm_gaudi/ops/hpu_rotary_embedding.py:628`) handles interleaved mRoPE sections (`apply_interleaved_rope` at :44-47): ledger row 11's *(unverified)* is cleared.
+11. The S0 venv's editable install of `vllm_gaudi` points at the main project checkout; with `PYTHONPATH=<worktree>` (or `python -m pytest` from the worktree root) the worktree's copy is imported instead (checked with a scratch worktree). Every spec's Setup proves it.
+12. This Mac: Apple M4 Max, 16 cores, 64 GiB RAM. The real checkpoint (335 GiB) cannot be loaded here.
