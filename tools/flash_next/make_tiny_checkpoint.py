@@ -21,7 +21,7 @@ import torch
 import transformers
 from safetensors import safe_open
 from safetensors.torch import save_file
-from transformers import AutoConfig, Qwen4ExpForConditionalGeneration
+from transformers import Qwen4ExpConfig, Qwen4ExpForConditionalGeneration
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_FIXTURE = REPO_ROOT / "tests" / "unit_tests" / "models" / "flash_next" / "tiny_config.json"
@@ -84,8 +84,10 @@ def write_config(out_dir: Path, fixture: Path) -> bytes:
 
 def build_checkpoint(out_dir: Path, fixture: Path, seed: int) -> None:
     """Build the random bf16 model from the fixture config and save it; the config.json is restored afterwards."""
+    # Not AutoConfig: vLLM's create_engine_config() replaces CONFIG_MAPPING["qwen4_exp"] with its own config
+    # class (no text_config.seed), which breaks this builder when it runs in the same process after vLLM.
     fixture_bytes = write_config(out_dir, fixture)
-    config = AutoConfig.from_pretrained(out_dir)
+    config = Qwen4ExpConfig.from_pretrained(out_dir)
     torch.manual_seed(seed)
     model = Qwen4ExpForConditionalGeneration(config).to(torch.bfloat16)
     # save_file (not save_pretrained) keeps the model's own tensor names: transformers 5.23 splits the fused
