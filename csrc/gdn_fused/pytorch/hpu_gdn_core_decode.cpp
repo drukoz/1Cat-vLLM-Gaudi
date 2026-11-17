@@ -10,6 +10,7 @@ namespace {
 // The schema, CPU kernel and fake kernel are defined in Python by
 // flashinfer_gaudi/gdn_core_decode.py; this file registers only the HPU kernel.
 constexpr auto kSchema = "flashinfer_gaudi::gdn_core_decode";
+constexpr auto kRecurrentSchema = "flashinfer_gaudi::gdn_recurrent_decode";
 constexpr int64_t kHeadDim = 128;
 
 void validate(const at::Tensor& conv_state, const at::Tensor& ssm_state, const at::Tensor& mixed_qkv,
@@ -62,6 +63,41 @@ void validate(const at::Tensor& conv_state, const at::Tensor& ssm_state, const a
                 "GDN core decode load_indices and store_indices must be [B]");
 }
 
+void validate_recurrent(const at::Tensor& ssm_state, const at::Tensor& qkv, const at::Tensor& a, const at::Tensor& b,
+                        const at::Tensor& A_log, const at::Tensor& dt_bias, const at::Tensor& load_indices,
+                        const at::Tensor& store_indices, double scale) {
+    TORCH_CHECK(std::isnormal(static_cast<float>(scale)) && scale > 0,
+                "GDN recurrent decode scale must be a positive normal FP32 value");
+    TORCH_CHECK(ssm_state.scalar_type() == at::kFloat && qkv.scalar_type() == at::kBFloat16 &&
+                a.scalar_type() == at::kBFloat16 && b.scalar_type() == at::kBFloat16 &&
+                A_log.scalar_type() == at::kFloat && dt_bias.scalar_type() == at::kFloat &&
+                load_indices.scalar_type() == at::kInt && store_indices.scalar_type() == at::kInt,
+                "GDN recurrent decode requires bf16 activations, fp32 state, gates and int32 indices");
+    for (const auto* tensor : {&ssm_state, &qkv, &a, &b, &A_log, &dt_bias, &load_indices, &store_indices}) {
+        TORCH_CHECK(tensor->is_contiguous(), "GDN recurrent decode requires contiguous tensors");
+        TORCH_CHECK(tensor->device() == ssm_state.device(), "GDN recurrent decode inputs must use the same device");
+    }
+    TORCH_CHECK(qkv.dim() == 2 && qkv.size(0) > 0, "GDN recurrent decode qkv must be [B,C] with B>0");
+    TORCH_CHECK(ssm_state.dim() == 4 && ssm_state.size(2) == kHeadDim && ssm_state.size(3) == kHeadDim,
+                "GDN recurrent decode ssm_state must be [S,HV,128,128]");
+    const auto batch = qkv.size(0);
+    const auto channels = qkv.size(1);
+    const auto value_heads = ssm_state.size(1);
+    const auto key_heads = (channels - value_heads * kHeadDim) / (2 * kHeadDim);
+    TORCH_CHECK(key_heads > 0 && value_heads % key_heads == 0 &&
+                    channels == 2 * key_heads * kHeadDim + value_heads * kHeadDim,
+                "GDN recurrent decode C must be 2*H*128 + HV*128 with H>0 and HV divisible by H");
+    TORCH_CHECK(a.sizes() == at::IntArrayRef({batch, value_heads}) &&
+                    b.sizes() == at::IntArrayRef({batch, value_heads}),
+                "GDN recurrent decode a and b must be [B,HV]");
+    TORCH_CHECK(A_log.dim() == 1 && A_log.size(0) == value_heads && dt_bias.dim() == 1 &&
+                    dt_bias.size(0) == value_heads,
+                "GDN recurrent decode A_log and dt_bias must be [HV]");
+    TORCH_CHECK(load_indices.dim() == 1 && load_indices.size(0) == batch && store_indices.dim() == 1 &&
+                    store_indices.size(0) == batch,
+                "GDN recurrent decode load_indices and store_indices must be [B]");
+}
+
 const bool registered = [] {
     habana::custom_op::registerUserCustomOp(
         kSchema, kGdnCoreDecodeGuid,
@@ -83,6 +119,25 @@ const bool registered = [] {
     return true;
 }();
 
+const bool recurrent_registered = [] {
+    habana::custom_op::registerUserCustomOp(
+        kRecurrentSchema, kGdnRecurrentDecodeGuid,
+        [](const at::Stack& stack) {
+            validate_recurrent(stack.at(0).toTensor(), stack.at(1).toTensor(), stack.at(2).toTensor(),
+                               stack.at(3).toTensor(), stack.at(4).toTensor(), stack.at(5).toTensor(),
+                               stack.at(6).toTensor(), stack.at(7).toTensor(), stack.at(8).toDouble());
+            const auto batch = stack.at(1).toTensor().size(0);
+            const auto value_heads = stack.at(0).toTensor().size(1);
+            return habana::PartialOutputMetaDataVector{{at::kFloat, {batch, value_heads, kHeadDim}}};
+        },
+        [](const at::Stack& stack, size_t& size) -> std::shared_ptr<void> {
+            size = sizeof(GdnRecurrentDecodeParams);
+            return std::make_shared<GdnRecurrentDecodeParams>(
+                GdnRecurrentDecodeParams{static_cast<float>(stack.at(8).toDouble())});
+        });
+    return true;
+}();
+
 at::Tensor run(const at::Tensor& conv_state, const at::Tensor& ssm_state, const at::Tensor& mixed_qkv,
                const at::Tensor& z, const at::Tensor& a, const at::Tensor& b, const at::Tensor& A_log,
                const at::Tensor& dt_bias, const at::Tensor& conv_weight_t, const at::Tensor& norm_weight,
@@ -99,8 +154,22 @@ at::Tensor run(const at::Tensor& conv_state, const at::Tensor& ssm_state, const 
     TORCH_CHECK(outputs.size() == 1);
     return outputs.at(0);
 }
+
+at::Tensor run_recurrent(const at::Tensor& ssm_state, const at::Tensor& qkv, const at::Tensor& a, const at::Tensor& b,
+                         const at::Tensor& A_log, const at::Tensor& dt_bias, const at::Tensor& load_indices,
+                         const at::Tensor& store_indices, double scale) {
+    validate_recurrent(ssm_state, qkv, a, b, A_log, dt_bias, load_indices, store_indices, scale);
+    TORCH_CHECK(ssm_state.device().type() == c10::DeviceType::HPU, "GDN recurrent decode requires HPU inputs");
+    TORCH_CHECK(recurrent_registered);
+    auto descriptor = habana::custom_op::UserCustomOpDescriptor::getUserCustomOpDescriptor(kRecurrentSchema);
+    const auto outputs =
+        descriptor.execute({ssm_state, qkv, a, b, A_log, dt_bias, load_indices, store_indices, scale});
+    TORCH_CHECK(outputs.size() == 1);
+    return outputs.at(0);
+}
 }  // namespace
 
 TORCH_LIBRARY_IMPL(flashinfer_gaudi, HPU, m) {
     m.impl("gdn_core_decode", run);
+    m.impl("gdn_recurrent_decode", run_recurrent);
 }
