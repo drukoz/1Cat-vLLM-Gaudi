@@ -1190,6 +1190,36 @@ class HPUWorker(WorkerBase):
         # (`available_memory // page_size_bytes`) does NOT cast. A float
         # available_memory then yields a float num_blocks, which the
         # scheduler's BlockPool rejects via `isinstance(num_gpu_blocks, int)`.
+        # Flash-Next sparse QSA (M2-T5b): every QSA layer funds a compressed
+        # key cache alongside its KV bytes (a per-token fraction of the
+        # attention budget) plus a fixed raw-key ring sized from the GDN
+        # state rows.  Shrink the attention budget accordingly.
+        from vllm_gaudi import envs as gaudi_envs
+        from vllm_gaudi.platform import is_flash_next_model
+        if is_flash_next_model(self.model_config) and gaudi_envs.VLLM_HPU_FLASH_NEXT_QSA_MODE == 1:
+            from vllm_gaudi.models.qwen4_exp.qsa_side_caches import (
+                attention_budget_fraction, ring_bytes, ring_rows)
+            attn_specs = [s for s in kv_cache_spec.values() if isinstance(s, FullAttentionSpec)]
+            if attn_specs:
+                cfg = self.model_config.hf_text_config
+                ratio = int(cfg.indexer_compress_ratio)
+                dim = int(cfg.indexer_head_dim)
+                spec_tokens = self.speculative_config.num_speculative_tokens if self.speculative_config else 0
+                attn_spec = attn_specs[0]
+                fraction = attention_budget_fraction(attn_spec.num_kv_heads, attn_spec.head_size,
+                                                     attn_spec.dtype.itemsize, ratio, dim)
+                # num_blocks is not known yet: the pool row count when the
+                # recurrent pool is on, the budget upper bound otherwise
+                # (the ring is tiny, the over-reservation is noise).
+                if pool_slots > 0:
+                    gdn_rows = pool_tensor_slots(pool_slots)
+                else:
+                    gdn_rows = int(available) // attn_spec.page_size_bytes + 1
+                ring = ring_bytes(len(attn_specs), gdn_rows, ring_rows(ratio, spec_tokens), dim)
+                available = int(available * fraction) - ring
+                logger.info("Flash-Next sparse QSA side caches: attention budget x %.4f, ring %s",
+                            fraction, format_bytes(ring))
+
         # Coerce to int here so every downstream path (uniform AND
         # heterogeneous) receives an integer byte budget.
         return int(available)

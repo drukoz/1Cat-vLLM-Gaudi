@@ -39,6 +39,7 @@ from vllm_gaudi.v1.core.recurrent_state_pool import pool_pad_block_id, pool_slot
 from vllm_gaudi.v1.worker.hpu_dp_utils import set_hpu_dp_metadata
 from vllm_gaudi.v1.worker.gdn_state_layout import has_contiguous_dflash_checkpoints
 from vllm_gaudi.v1.worker.flash_next_inputs import (build_ple_inputs, dummy_ple_inputs, model_requires_raw_input_tokens)
+from vllm_gaudi.platform import is_flash_next_model
 
 from vllm.v1.attention.backend import AttentionBackend, AttentionType, CommonAttentionMetadata
 from vllm.model_executor.layers.attention import Attention
@@ -926,7 +927,7 @@ def patch_llama4_get_attn_scale(model):
         attn._get_attn_scale = types.MethodType(_get_attn_scale_for_hpu, attn)
 
 
-def maybe_set_mamba_kv_cache_groups_ids(model, kv_cache_config: KVCacheConfig):
+def maybe_set_mamba_kv_cache_groups_ids(model, kv_cache_config: KVCacheConfig, runner=None):
     model = getattr(model, "_orig_mod", model)
     if isinstance(model, HpuModelAdapter):
         model = model.model
@@ -988,11 +989,22 @@ def maybe_set_mamba_kv_cache_groups_ids(model, kv_cache_config: KVCacheConfig):
                     layer.linear_attn.cache_group_idx = torch.tensor(group_idx, dtype=torch.long, device="hpu")
                     layer.linear_attn.compact_state_group_offset = compact_gdn_offsets.get(group_idx)
                     layer.linear_attn.compact_state_group_count = len(compact_gdn_group_ids)
+                    if runner is not None and runner._first_gdn_group_idx is None:
+                        runner._first_gdn_group_idx = group_idx
             elif layer_name.endswith('.ple'):
                 layer_idx = int(layer_name.split('.')[-2])
                 layer = _get_decoder_layer_by_idx(model, layer_idx)
                 if layer is not None and getattr(layer, "ple", None) is not None:
                     layer.ple.cache_group_idx = torch.tensor(group_idx, dtype=torch.long, device="hpu")
+
+    if runner is not None and getattr(runner, "_first_gdn_group_idx", None) is not None:
+        # The Flash-Next QSA raw-key ring is addressed by the first GDN
+        # group's load/store slot; tell every QSA indexer which group that is.
+        from vllm_gaudi.models.qwen4_exp.qsa import HpuQwen4ExpQSAAttention
+        for module in model.modules():
+            if isinstance(module, HpuQwen4ExpQSAAttention):
+                module.indexer.ring_group_idx = torch.tensor(runner._first_gdn_group_idx, dtype=torch.long,
+                                                             device="hpu")
 
 
 def maybe_set_chunked_attention_layers(model_runner):
@@ -2222,6 +2234,7 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                                          and self.speculative_config.use_dflash() else 1)
         self._compact_gdn_enabled = os.environ.get("VLLM_COMPACT_GDN", "1").strip().lower() in ("1", "true")
         self._recurrent_pool_slots = 0
+        self._first_gdn_group_idx = None
         self._direct_gdn_state_enabled = (gaudi_envs.VLLM_HPU_FLASHINFER_GDN and gaudi_envs.VLLM_HPU_GDN_DIRECT_STATE)
         self._direct_dflash_checkpoints_enabled = gaudi_envs.VLLM_HPU_DFLASH2_DIRECT_CHECKPOINTS
         # The HPU runner normally consumes block tables from CPU.  The
@@ -8696,7 +8709,7 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                 self.block_size = self.vllm_config.cache_config.block_size
                 if self.enable_bucketing:
                     self.bucketing_manager.block_size = self.block_size
-            maybe_set_mamba_kv_cache_groups_ids(self.model, self.kv_cache_config)
+            maybe_set_mamba_kv_cache_groups_ids(self.model, self.kv_cache_config, runner=self)
         self.initialize_attn_backend(kv_cache_config)
         kernel_block_sizes: list[int] = []
 
@@ -9126,6 +9139,9 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         else:
             bind_kv_cache(kv_caches, self.vllm_config.compilation_config.static_forward_context, self.kv_caches)
 
+        if is_flash_next_model(self.model_config) and gaudi_envs.VLLM_HPU_FLASH_NEXT_QSA_MODE == 1:
+            self._allocate_flash_next_side_caches(kv_caches)
+
         self._set_cache_block_capacity(num_blocks, max_attention_kernel_blocks)
         if self._recurrent_pool_slots > 0:
             self._MAMBA_PAD_BLOCK_ID = pool_pad_block_id(self._recurrent_pool_slots)
@@ -9157,6 +9173,43 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         #     self._update_hybrid_attention_mamba_layout(kv_caches)
 
         htorch.hpu.synchronize()
+
+    def _allocate_flash_next_side_caches(self, kv_caches: dict[str, Any]) -> None:
+        """Allocate the per-QSA-layer sparse-mode side tensors (M2-T5b).
+
+        The compressed key cache is sized from the layer's flat K cache rows
+        (one row per ``compress_ratio`` slots); the raw-key ring is sized
+        from the first GDN group's allocated state tensor rows (pool,
+        compact or baseline: read from the tensor, never recomputed).
+        """
+        from vllm_gaudi.models.qwen4_exp.qsa import HpuQwen4ExpQSAAttention
+        from vllm_gaudi.models.qwen4_exp.qsa_side_caches import allocate_side_caches
+
+        gdn_rows = None
+        for layer_name, state in kv_caches.items():
+            if not layer_name.endswith(".linear_attn") or not isinstance(state, (tuple, list)) or len(state) < 2:
+                continue
+            gdn_rows = state[1].shape[0]
+            break
+        if gdn_rows is None:
+            logger.warning("Flash-Next QSA side caches: no GDN state tensor found; skipping allocation")
+            return
+        config = getattr(self.model.model.config, "text_config", self.model.model.config)
+        spec_tokens = self.speculative_config.num_speculative_tokens if self.speculative_config else 0
+        qsa_layers = [m for m in self.model.model.modules() if isinstance(m, HpuQwen4ExpQSAAttention)]
+        total_bytes = 0
+        shapes = None
+        for module in qsa_layers:
+            kc = kv_caches[module.attn.layer_name][0]
+            comp, ring = allocate_side_caches(kc.shape[0], gdn_rows, int(config.indexer_compress_ratio),
+                                              int(config.indexer_head_dim), spec_tokens, kc.device)
+            module.indexer.compressed_key_cache = comp
+            module.indexer.key_ring = ring
+            total_bytes += comp.numel() * comp.element_size() + ring.numel() * ring.element_size()
+            shapes = (tuple(comp.shape), tuple(ring.shape))
+        if qsa_layers:
+            logger.info("Flash-Next QSA side caches: %d layers, compressed_key_cache %s, key_ring %s, total %s",
+                        len(qsa_layers), shapes[0], shapes[1], format_bytes(total_bytes))
 
     def may_add_encoder_only_layers_to_kv_cache_config(self) -> None:
         """
