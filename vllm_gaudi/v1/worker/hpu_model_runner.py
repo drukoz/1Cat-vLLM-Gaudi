@@ -4248,7 +4248,10 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
 
     def _ple_eos_and_ngram(self) -> tuple[int, int]:
         hf_text_config = self.model_config.hf_text_config
-        return int(hf_text_config.eos_token_id), int(hf_text_config.ngram_size)
+        eos_token_id = hf_text_config.eos_token_id
+        if isinstance(eos_token_id, (list, tuple)):
+            eos_token_id = eos_token_id[0]
+        return int(eos_token_id), int(hf_text_config.ngram_size)
 
     def _form_prefill_batch(self, contents):
         if len(contents.req_ids) == 0:
