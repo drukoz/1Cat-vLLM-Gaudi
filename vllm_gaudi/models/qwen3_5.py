@@ -359,9 +359,11 @@ class HPUGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 ).long()
                 initial_state = ssm_state.index_select(0, safe_load_indices).contiguous()
             if has_initial_state is not None:
-                mask = has_initial_state.bool().view(-1, 1, 1, 1)
+                # A load index of 0 is vLLM's null block: it never holds an
+                # initial state, so reading it must yield zeros (#1895).
+                keep = has_initial_state.bool().view(-1) & (load_state_indices.reshape(-1) != 0)
                 initial_state = torch.where(
-                    mask,
+                    keep.view(-1, 1, 1, 1),
                     initial_state,
                     torch.zeros_like(initial_state),
                 )
@@ -465,10 +467,10 @@ class HPUGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                     activation=self.activation,
                     conv_states=conv_state,
                     has_initial_state=has_initial_state,
-                    cache_indices=load_state_indices,
+                    cache_indices=store_state_indices,
                     block_idx_first_scheduled_token=None,
                     block_idx_last_scheduled_token=None,
-                    initial_state_idx=None,
+                    initial_state_idx=load_state_indices,
                     query_start_loc=query_start_loc,
                     block_size_to_align=mamba_block_size,
                     num_computed_tokens=None,
@@ -644,6 +646,11 @@ class HPUGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                     full_query_valid_state=(self.dflash_full_query_conv and is_spec_decode and dflash_full_query
                                             and self.compact_state_group_offset is not None
                                             and not getattr(self.cache_config, "enable_prefix_caching", True)),
+                    store_cache_indices=(store_state_indices[:num_decodes] if (store_state_indices is not None
+                                                                               and not direct_conv_state
+                                                                               and not is_spec_decode
+                                                                               and not is_dflash_transition)
+                                         else None),
                 )
                 if _triton_gaudi_mode == "strict":
                     triton_out = _try_triton_gdn_decode_packed(
@@ -718,6 +725,8 @@ class HPUGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                         cu_seqlens=(query_start_loc[:num_decodes + 1] if query_start_loc is not None else None),
                         ssm_state_indices=load_state_indices,
                         use_qk_l2norm_in_kernel=True,
+                        ssm_store_indices=(store_state_indices[:num_decodes] if store_state_indices is not None
+                                           else None),
                     )
             if flashinfer_result is not None:
                 core_attn_out_result, next_state = flashinfer_result

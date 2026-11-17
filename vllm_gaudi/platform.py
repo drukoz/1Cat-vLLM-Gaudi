@@ -126,6 +126,46 @@ def is_flash_next_model(model_config: Optional[ModelConfig]) -> bool:
     return any(arch in FLASH_NEXT_ARCHS for arch in architectures)
 
 
+def _configure_recurrent_state(vllm_config: "VllmConfig") -> None:
+    """Compact-GDN rule and recurrent-state-pool resolution for GDN hybrids (M1-T1)."""
+    from vllm_gaudi.v1.core.recurrent_state_pool import (ENV_CACHE_SLOTS, ENV_MODE, ENV_SLOTS,
+                                                         RecurrentStatePoolMode, resolve_pool_slots)
+    model_config = vllm_config.model_config
+    if model_config is None or not getattr(model_config, "is_hybrid", False):
+        return
+    parallel_config = vllm_config.parallel_config
+    n_gdn = sum(
+        model_config.get_num_layers_by_block_type(parallel_config, bt) for bt in ("gdn_attention", "linear_attention"))
+    if n_gdn == 0:
+        return
+    prefix_caching = bool(vllm_config.cache_config.enable_prefix_caching)
+    compact = os.environ.get("VLLM_COMPACT_GDN", "").strip().lower()
+    if prefix_caching and compact in ("1", "true"):
+        raise ValueError("VLLM_COMPACT_GDN=1 does not support prefix caching: unset it (prefix caching uses the "
+                         "recurrent state pool) or disable prefix caching with --no-enable-prefix-caching")
+    if prefix_caching and compact == "":
+        os.environ["VLLM_COMPACT_GDN"] = "0"
+        logger.info("[HPU] Prefix caching with GDN layers: VLLM_COMPACT_GDN defaults to 0")
+    mode = RecurrentStatePoolMode(int(os.environ.get(ENV_MODE, "0")))
+    if mode != RecurrentStatePoolMode.POOL:
+        return
+    if not prefix_caching:
+        logger.warning("[HPU] VLLM_HPU_RECURRENT_STATE_POOL=1 ignored: the pool needs prefix caching "
+                       "(compact GDN serves the prefix-caching-off case)")
+        return
+    slots = int(os.environ.get(ENV_SLOTS, "0"))
+    n_attn = model_config.get_num_layers_by_block_type(parallel_config, "attention")
+    n_ple = len(getattr(model_config.hf_text_config, "ple_layer_ids", None) or [])
+    groups = (-(-n_gdn // n_attn) if n_attn > 0 else 1) + (1 if n_ple else 0)
+    cache_slots = int(os.environ.get(ENV_CACHE_SLOTS, "512"))
+    if slots <= 0:
+        slots = resolve_pool_slots(vllm_config.scheduler_config.max_num_seqs, groups, cache_slots)
+        os.environ[ENV_SLOTS] = str(slots)
+    logger.info(
+        "[HPU] Recurrent state pool: %d slots (max_num_seqs=%d, recurrent groups=%d, live slots per request=3, "
+        "cache slots=%d)", slots, vllm_config.scheduler_config.max_num_seqs, groups, cache_slots)
+
+
 def _enable_hpu_v1_dflash2_validation() -> None:
     """Allow only the HPU-qualified DFlash2 subset on the V1 runner.
 
@@ -475,6 +515,8 @@ class HpuPlatform(Platform):
             vllm_config.cache_config.mamba_cache_mode = "align"
             logger.info("[HPU] Overriding mamba_cache_mode from 'all' to 'align' "
                         "to ensure block-aligned chunked prefill splits.")
+
+        _configure_recurrent_state(vllm_config)
 
         if (vllm_config.model_config is not None and vllm_config.model_config.is_hybrid):
             logger.debug(

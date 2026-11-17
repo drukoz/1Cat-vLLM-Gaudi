@@ -35,6 +35,7 @@ from vllm_gaudi.extension.profiler import (HabanaHighLevelProfiler, HabanaMemory
 from vllm_gaudi.extension.runtime import clear_config, finalize_config, get_config
 from vllm_gaudi.extension.utils import align_and_pad, pad_list, with_default
 from vllm_gaudi.extension.debug import init_debug_logger
+from vllm_gaudi.v1.core.recurrent_state_pool import pool_pad_block_id, pool_slots_from_env, pool_tensor_slots
 from vllm_gaudi.v1.worker.hpu_dp_utils import set_hpu_dp_metadata
 from vllm_gaudi.v1.worker.gdn_state_layout import has_contiguous_dflash_checkpoints
 from vllm_gaudi.v1.worker.flash_next_inputs import (build_ple_inputs, dummy_ple_inputs, model_requires_raw_input_tokens)
@@ -2220,6 +2221,7 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                                          if self.speculative_config is not None
                                          and self.speculative_config.use_dflash() else 1)
         self._compact_gdn_enabled = os.environ.get("VLLM_COMPACT_GDN", "1").strip().lower() in ("1", "true")
+        self._recurrent_pool_slots = 0
         self._direct_gdn_state_enabled = (gaudi_envs.VLLM_HPU_FLASHINFER_GDN and gaudi_envs.VLLM_HPU_GDN_DIRECT_STATE)
         self._direct_dflash_checkpoints_enabled = gaudi_envs.VLLM_HPU_DFLASH2_DIRECT_CHECKPOINTS
         # The HPU runner normally consumes block tables from CPU.  The
@@ -8674,6 +8676,7 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         self.maybe_add_kv_sharing_layers_to_kv_cache_groups(kv_cache_config)
         kv_cache_config = deepcopy(kv_cache_config)
         self.kv_cache_config = kv_cache_config
+        self._recurrent_pool_slots = pool_slots_from_env() if not self._compact_gdn_enabled else 0
         self.is_encoder_only_attn = False
         self.may_add_encoder_only_layers_to_kv_cache_config()
         if self.num_mamba_like_layers > 0:
@@ -8849,6 +8852,8 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                 GDN states may be float32)."""
                 for ln in kv_cache_tensor.layers:
                     spec = _layer_spec.get(ln)
+                    if self._recurrent_pool_slots > 0 and isinstance(spec, MambaSpec):
+                        continue
                     if isinstance(spec, FullAttentionSpec):
                         continue
                     if isinstance(spec, MambaSpec) and \
@@ -8910,6 +8915,10 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                         kc = torch.zeros(kv_cache_shape, dtype=kv_cache_spec.dtype, device=self.device)
                         vc = torch.zeros(kv_cache_shape, dtype=kv_cache_spec.dtype, device=self.device)
                         kv_caches[layer_name] = (kc, vc, None, None)
+                    elif isinstance(kv_cache_spec, MambaSpec) and self._recurrent_pool_slots > 0:
+                        # Recurrent state pool (M1): pool_slots + 2 rows (ids 0..pool_slots plus the padding row).
+                        kv_caches[layer_name] = _mamba_state_tensors(kv_cache_spec, layer_pos,
+                                                                     pool_tensor_slots(self._recurrent_pool_slots))
                     elif isinstance(kv_cache_spec, MambaSpec) and \
                             kv_cache_spec.mamba_type in _GDN_MAMBA_TYPES and \
                             self._compact_gdn_enabled:
@@ -8998,6 +9007,10 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                         kc = torch.zeros(kv_cache_shape, dtype=kv_cache_spec.dtype, device=self.device)
                         vc = torch.zeros(kv_cache_shape, dtype=kv_cache_spec.dtype, device=self.device)
                         kv_caches[layer_name] = (kc, vc, None, None)
+                    elif isinstance(kv_cache_spec, MambaSpec) and self._recurrent_pool_slots > 0:
+                        # Recurrent state pool (M1): pool_slots + 2 rows (ids 0..pool_slots plus the padding row).
+                        kv_caches[layer_name] = _mamba_state_tensors(kv_cache_spec, layer_pos,
+                                                                     pool_tensor_slots(self._recurrent_pool_slots))
                     elif isinstance(kv_cache_spec, MambaSpec) and \
                             kv_cache_spec.mamba_type in _GDN_MAMBA_TYPES and \
                             self._compact_gdn_enabled:
@@ -9114,6 +9127,11 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             bind_kv_cache(kv_caches, self.vllm_config.compilation_config.static_forward_context, self.kv_caches)
 
         self._set_cache_block_capacity(num_blocks, max_attention_kernel_blocks)
+        if self._recurrent_pool_slots > 0:
+            self._MAMBA_PAD_BLOCK_ID = pool_pad_block_id(self._recurrent_pool_slots)
+            logger.info("Recurrent state pool: %d slots, recurrent state tensors have %d rows, pad id %d",
+                        self._recurrent_pool_slots, pool_tensor_slots(self._recurrent_pool_slots),
+                        self._MAMBA_PAD_BLOCK_ID)
 
         # Initialize the GDN compact slot free-list.
         # The free-list contains base-slot IDs [0..max_num_reqs-1].

@@ -56,6 +56,31 @@ full prefix through the standard HPU Attention layer, with the indexer weights
 loaded only for checkpoint compatibility. `1` is sparse (indexer top-k
 selection); it is reserved for M2 and raises `NotImplementedError`.
 
+`VLLM_HPU_RECURRENT_STATE_POOL` selects the allocation mode for the recurrent
+(GDN / short-conv) state slots as an integer. `0` (default) keeps today's
+allocation, one recurrent state slot per attention block id. `1` gives the
+recurrent KV-cache groups their own pool of
+`VLLM_HPU_RECURRENT_STATE_POOL_SLOTS` slots shared by the requests. The pool
+needs prefix caching; with prefix caching off it is ignored with a warning
+(compact GDN serves the prefix-caching-off case).
+
+`VLLM_HPU_RECURRENT_STATE_POOL_SLOTS` is the resolved pool size in slots. The
+platform hook computes it at startup as `max_num_seqs x recurrent groups x 3
++ VLLM_HPU_RECURRENT_STATE_POOL_CACHE_SLOTS` and exports it to the engine-core
+and worker processes; a positive value set by the user overrides the formula.
+Default `0` (resolved, not set).
+
+`VLLM_HPU_RECURRENT_STATE_POOL_CACHE_SLOTS` is the number of retained prefix
+states the pool formula adds to the live need of `max_num_seqs` requests.
+Default `512`.
+
+`VLLM_COMPACT_GDN` selects the compact-GDN fast path with per-token state
+checkpoints for GDN hybrids. Under prefix caching the platform hook defaults
+it to `0`, and starting with `VLLM_COMPACT_GDN=1` and prefix caching enabled is
+a startup error: prefix caching uses the recurrent state pool instead, so
+unset the variable or disable prefix caching with
+`--no-enable-prefix-caching`.
+
 `VLLM_HPU_NATIVE_RECEIVE_PREPOST=1` enables the optional explicit-epoch receive
 path for a complete V4.1 native replay plan. It requires matching versioned HCL,
 Synapse and Bridge overlays, independent receive destinations, and standalone
@@ -248,6 +273,9 @@ prepared-model entrypoint and disabled in the generic entrypoint.
 | `VLLM_GDN_QWEN38_NATIVE_COMPACT_KKT` | Uses the Gaudi2 TPC compact-KKT producer for Qwen3.8 chunk-64 prefill. Requires compact Q/K and the native Q/K extension. | `false` |
 | `VLLM_GDN_COMPACT_QK_FACTOR_GATE` | Experimental compact-Q/K phase-A dataflow that applies each value head's gate to the smaller KKT coefficient matrix before the shared physical K-head multiplication. | `false` |
 | `VLLM_GDN_NATIVE_RECURRENT_SCAN` | Lowers the fused BF16 phase-B recurrent projection and additions as one mixed MME/TPC Synapse subgraph. Requires `VLLM_GDN_FUSED_STATE_MATMUL`, BF16 state, and `VLLM_GDN_BF16_BMM_F32_EXTENSION`. | `false` |
+| `VLLM_HPU_GDN_RECURRENT_COMPOUND` | Research option: runs the Qwen3.8 recurrent-state scope as one mixed MME/TPC compound op loaded from a native extension. Requires `VLLM_HPU_GDN_RECURRENT_COMPOUND_EXTENSION`. | `false` |
+| `VLLM_HPU_GDN_RECURRENT_COMPOUND_EXTENSION` | Path to the built native GDN extension used by `VLLM_HPU_GDN_RECURRENT_COMPOUND`. | empty |
+| `VLLM_HPU_GDN_RECURRENT_COMPOUND_VARIANT` | Compound op variant: `plain`, `recompute_decay`, `recompute_decay_native`, `recompute_decay_graph`, `native_decay_graph`, `native_decay_bundled`, `decay_copy_graph` or `decay_copy_round_graph`. | `plain` |
 | `VLLM_GDN_QWEN38_NATIVE_QK_PREP_EXTENSION` | Path to the built PyTorch registration extension used by `VLLM_GDN_QWEN38_NATIVE_QK_PREP`. Its TPC perf library must also be present in `GC_KERNEL_PATH`. | empty |
 | `VLLM_HPU_DYNAMIC_QUANT_CGUID` | Uses Habana `calculate_scale_for_cast` for runtime dynamic per-token FP8 activation scales on sufficiently large prefill graphs, while preserving the ordinary path's epsilon for zero and tiny rows. Model-load block-to-channel weight conversion retains the ordinary `abs().amax()` path. | `false` |
 | `VLLM_HPU_DYNAMIC_QUANT_CGUID_MIN_TOKENS` | Minimum flattened token count for `VLLM_HPU_DYNAMIC_QUANT_CGUID`. Smaller prompt and decode graphs retain the ordinary reduction path. | `2048` |

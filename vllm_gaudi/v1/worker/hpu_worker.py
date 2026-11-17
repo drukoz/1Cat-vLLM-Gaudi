@@ -34,6 +34,7 @@ from vllm.v1.worker.utils import bind_kv_cache
 from vllm.v1.worker.workspace import init_workspace_manager
 from vllm_gaudi.extension.bucketing.common import HPUBucketingManager
 from vllm_gaudi.utils import is_fake_hpu
+from vllm_gaudi.v1.core.recurrent_state_pool import pool_slot_bytes, pool_slots_from_env, pool_tensor_slots
 from vllm_gaudi.v1.worker.hpu_model_runner import HPUModelRunner, _GDN_MAMBA_TYPES, _rebind_moe_expert_weights
 from vllm.v1.worker.worker_base import CompilationTimes, WorkerBase
 
@@ -1105,65 +1106,81 @@ class HPUWorker(WorkerBase):
             isinstance(s, MambaSpec) and s.mamba_type not in _GDN_MAMBA_TYPES for s in kv_cache_spec.values()
         )
         compact_gdn = os.environ.get("VLLM_COMPACT_GDN", "0").strip().lower() in ("1", "true")
-        if has_attn and has_gdn and not compact_gdn:
-            # When compact GDN is OFF, GDN state scales with num_blocks
-            # just like ATN.  GPU shares one raw buffer via as_strided,
-            # but HPU allocates separate tensors per spec type, so the
-            # total per-block cost is real_attn + real_mamba (not
-            # max(real_attn, real_mamba)).  Reduce reported memory so
-            # the scheduler computes fewer num_blocks that fit.
-            # When compact GDN is ON, GDN state is a small fixed
-            # allocation (max_reqs * num_groups + 2), independent of
-            # num_blocks, so no adjustment is needed.
-            padded_page = next(iter(kv_cache_spec.values())).page_size_bytes
-            real_attn = next(s.real_page_size_bytes for s in kv_cache_spec.values() if isinstance(s, FullAttentionSpec))
-            real_mamba = next(
-                sum(math.prod(sh) * get_dtype_size(dt) for sh, dt in zip(s.shapes, s.dtypes))
-                for s in kv_cache_spec.values()
-                if isinstance(s, MambaSpec) and s.mamba_type in _GDN_MAMBA_TYPES
-            )
-            total_real = real_attn + real_mamba
-            if total_real > padded_page:
-                factor = padded_page / total_real
-                adjusted = int(available * factor)
-                logger.info(
-                    "HPU hybrid cache: reducing available KV cache "
-                    "memory by %.1f%% (factor=%.3f) for separate "
-                    "per-spec allocations (padded_page=%s, "
-                    "real_attn=%s, real_mamba=%s).",
-                    (1 - factor) * 100,
-                    factor,
-                    format_bytes(padded_page),
-                    format_bytes(real_attn),
-                    format_bytes(real_mamba),
+        pool_slots = pool_slots_from_env() if not compact_gdn else 0
+        if pool_slots > 0 and has_attn and (has_gdn or has_standard_mamba):
+            # Recurrent state pool (M1): the GDN and short-conv tensors have pool_tensor_slots(pool_slots)
+            # rows each, independent of num_blocks. Reserve them here and give attention the rest.
+            slot_bytes = pool_slot_bytes(kv_cache_spec)
+            pool_bytes = pool_tensor_slots(pool_slots) * slot_bytes
+            if pool_bytes >= available:
+                raise ValueError(f"Recurrent state pool of {pool_slots} slots needs {format_bytes(pool_bytes)} "
+                                 f"but only {format_bytes(available)} is available for the KV cache; lower "
+                                 "VLLM_HPU_RECURRENT_STATE_POOL_SLOTS or VLLM_HPU_RECURRENT_STATE_POOL_CACHE_SLOTS")
+            available -= pool_bytes
+            logger.info("Recurrent state pool: %d slots x %s per slot = %s reserved; %s left for attention blocks",
+                        pool_slots, format_bytes(slot_bytes), format_bytes(pool_bytes), format_bytes(available))
+        else:
+            if has_attn and has_gdn and not compact_gdn:
+                # When compact GDN is OFF, GDN state scales with num_blocks
+                # just like ATN.  GPU shares one raw buffer via as_strided,
+                # but HPU allocates separate tensors per spec type, so the
+                # total per-block cost is real_attn + real_mamba (not
+                # max(real_attn, real_mamba)).  Reduce reported memory so
+                # the scheduler computes fewer num_blocks that fit.
+                # When compact GDN is ON, GDN state is a small fixed
+                # allocation (max_reqs * num_groups + 2), independent of
+                # num_blocks, so no adjustment is needed.
+                padded_page = next(iter(kv_cache_spec.values())).page_size_bytes
+                real_attn = next(s.real_page_size_bytes for s in kv_cache_spec.values()
+                                 if isinstance(s, FullAttentionSpec))
+                real_mamba = next(
+                    sum(math.prod(sh) * get_dtype_size(dt) for sh, dt in zip(s.shapes, s.dtypes))
+                    for s in kv_cache_spec.values()
+                    if isinstance(s, MambaSpec) and s.mamba_type in _GDN_MAMBA_TYPES
                 )
-                available = adjusted
+                total_real = real_attn + real_mamba
+                if total_real > padded_page:
+                    factor = padded_page / total_real
+                    adjusted = int(available * factor)
+                    logger.info(
+                        "HPU hybrid cache: reducing available KV cache "
+                        "memory by %.1f%% (factor=%.3f) for separate "
+                        "per-spec allocations (padded_page=%s, "
+                        "real_attn=%s, real_mamba=%s).",
+                        (1 - factor) * 100,
+                        factor,
+                        format_bytes(padded_page),
+                        format_bytes(real_attn),
+                        format_bytes(real_mamba),
+                    )
+                    available = adjusted
 
-        if has_attn and has_standard_mamba:
-            # Standard Mamba2 + ATN hybrids (e.g. Granite): the
-            # naive_mamba_cache_sharing path allocates independent
-            # tensors per layer type, so the real per-block cost is
-            # attn_page + mamba_state (not max(attn, mamba)).
-            attn_page_size = next(s.page_size_bytes for s in kv_cache_spec.values() if isinstance(s, FullAttentionSpec))
-            mamba_state_per_block = next(
-                sum(math.prod(sh) * get_dtype_size(dt) for sh, dt in zip(s.shapes, s.dtypes))
-                for s in kv_cache_spec.values()
-                if isinstance(s, MambaSpec) and s.mamba_type not in _GDN_MAMBA_TYPES
-            )
-            if attn_page_size > 0:
-                ratio = attn_page_size / (attn_page_size + mamba_state_per_block)
-                adjusted = int(available * ratio)
-                logger.info(
-                    "Hybrid model (standard Mamba2 + ATN): adjusted "
-                    "usable KV cache from %s to %s (attn_page=%d, "
-                    "mamba_state=%d, ratio=%.3f)",
-                    format_bytes(available),
-                    format_bytes(adjusted),
-                    attn_page_size,
-                    mamba_state_per_block,
-                    ratio,
+            if has_attn and has_standard_mamba:
+                # Standard Mamba2 + ATN hybrids (e.g. Granite): the
+                # naive_mamba_cache_sharing path allocates independent
+                # tensors per layer type, so the real per-block cost is
+                # attn_page + mamba_state (not max(attn, mamba)).
+                attn_page_size = next(s.page_size_bytes for s in kv_cache_spec.values()
+                                      if isinstance(s, FullAttentionSpec))
+                mamba_state_per_block = next(
+                    sum(math.prod(sh) * get_dtype_size(dt) for sh, dt in zip(s.shapes, s.dtypes))
+                    for s in kv_cache_spec.values()
+                    if isinstance(s, MambaSpec) and s.mamba_type not in _GDN_MAMBA_TYPES
                 )
-                available = adjusted
+                if attn_page_size > 0:
+                    ratio = attn_page_size / (attn_page_size + mamba_state_per_block)
+                    adjusted = int(available * ratio)
+                    logger.info(
+                        "Hybrid model (standard Mamba2 + ATN): adjusted "
+                        "usable KV cache from %s to %s (attn_page=%d, "
+                        "mamba_state=%d, ratio=%.3f)",
+                        format_bytes(available),
+                        format_bytes(adjusted),
+                        attn_page_size,
+                        mamba_state_per_block,
+                        ratio,
+                    )
+                    available = adjusted
 
         # Core vLLM's determine_available_memory contract returns an int
         # (bytes). Most models route through get_num_blocks() which casts to

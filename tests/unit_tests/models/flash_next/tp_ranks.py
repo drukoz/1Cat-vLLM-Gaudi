@@ -33,12 +33,13 @@ def prefill_rank(rank: int, ckpt_dir: str, tp: int, fp32: bool) -> dict:
     state already initialized). Registers the plugin, builds the engine config
     (``tensor_parallel_size=tp``, ``distributed_executor_backend="mp"``), loads the checkpoint with
     ``get_model``, converts to fp32 when asked, binds the CPU states and the SDPA attention, then
-    prefills the four prompts of the checkpoint's ``reference.json`` with the collective recorder on.
+    prefills every prompt of the checkpoint's ``reference.json`` with the collective recorder on.
 
-    Returns ``{"hidden": np.ndarray (4, 128) float32 (the last-token hidden state of each prompt,
-    full on every rank), "collectives": list of ``(method, input_shape, input_dtype)`` recorded on
-    the four prefills, "top5_logits": the logits at each prompt's reference top-5 ids as
-    ``list[list[float]]`` when ``tp == 1``, else ``None`` (``lm_head`` is vocab-sharded at TP>1)}``.
+    Returns ``{"hidden": np.ndarray (P, 128) float32, one row per reference prompt (the last-token
+    hidden state of each prompt, full on every rank), "collectives": list of
+    ``(method, input_shape, input_dtype)`` recorded on the prefills, "top5_logits": the logits at
+    each prompt's reference top-5 ids as ``list[list[float]]`` when ``tp == 1``, else ``None``
+    (``lm_head`` is vocab-sharded at TP>1)}``.
     """
     import json
 

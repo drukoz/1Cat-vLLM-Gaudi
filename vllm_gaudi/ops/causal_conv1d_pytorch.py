@@ -342,7 +342,6 @@ def hpu_causal_conv1d_fn(
     if any(ptr is not None for ptr in (
             block_idx_first_scheduled_token,
             block_idx_last_scheduled_token,
-            initial_state_idx,
             num_computed_tokens,
     )):
         raise NotImplementedError("Prefix caching metadata is not supported in the PyTorch reference implementation.")
@@ -385,6 +384,8 @@ def hpu_causal_conv1d_fn(
             raise ValueError("'cache_indices' must align with the batch dimension implied by 'query_start_loc'.")
         if has_initial_state is not None and has_initial_state.numel() != padded_batch:
             raise ValueError("'has_initial_state' must align with 'query_start_loc'.")
+        if initial_state_idx is not None and initial_state_idx.numel() != padded_batch:
+            raise ValueError("'initial_state_idx' must align with the batch dimension implied by 'query_start_loc'.")
 
     # Get cache indices
     if cache_indices is None:
@@ -403,6 +404,25 @@ def hpu_causal_conv1d_fn(
     safe_cache_idx_prefill = torch.remainder(batch_cache_idx, num_conv_slots_pf)
     valid_mask_prefill = batch_cache_idx >= 0
 
+    # The read slot (the state to continue from) and the write slot (cache_indices) differ under prefix caching.
+    if initial_state_idx is None:
+        read_idx_prefill = batch_cache_idx
+    else:
+        read_idx = (initial_state_idx.to(x_work.device)
+                    if initial_state_idx.device != x_work.device else initial_state_idx)
+        read_idx_prefill = read_idx.reshape(-1).to(batch_cache_idx.dtype)
+    safe_read_idx_prefill = torch.remainder(read_idx_prefill, num_conv_slots_pf)
+    keep_initial_state = None
+    if has_initial_state is not None:
+        his = has_initial_state
+        if his.numel() < padded_batch:
+            his = torch.nn.functional.pad(his, (0, padded_batch - his.numel()), value=0)
+        keep_initial_state = (his[:padded_batch].bool().reshape(-1) & valid_mask_prefill.reshape(-1)
+                              & (read_idx_prefill.reshape(-1) >= 0))
+        if cache_indices is not None or initial_state_idx is not None:
+            # Explicit indices are physical block ids: block 0 is vLLM's null block and never holds state.
+            keep_initial_state = keep_initial_state & (read_idx_prefill.reshape(-1) != 0)
+
     # Batched path — HPU bucketed prefill pads all sequences to the same
     # length, so we can reshape to (B, dim, L) and process all sequences in
     # one shot without any device-to-host syncs.
@@ -414,21 +434,9 @@ def hpu_causal_conv1d_fn(
 
         # Gather init states for all sequences at once: (B, state_len, dim) -> (B, dim, state_len)
         if has_initial_state is not None:
-            raw_states = conv_states.index_select(0, safe_cache_idx_prefill)[:, state_start:state_start + state_len, :]
-            raw_states = raw_states.transpose(-1, -2)
-            # has_initial_state may have fewer elements than padded_batch;
-            # pad with False (0) so the mask broadcasts correctly.
-            his = has_initial_state
-            if his.numel() < padded_batch:
-                his = torch.nn.functional.pad(his, (0, padded_batch - his.numel()), value=0)
-            mask = his[:padded_batch].bool().reshape(-1, 1, 1)
-            # Also mask out padding slots to avoid reading stale state.
-            mask = mask & valid_mask_prefill.reshape(-1, 1, 1)
-            init_states = torch.where(
-                mask,
-                raw_states,
-                torch.zeros_like(raw_states),
-            )
+            raw_states = conv_states.index_select(0, safe_read_idx_prefill)
+            raw_states = raw_states[:, state_start:state_start + state_len, :].transpose(-1, -2)
+            init_states = torch.where(keep_initial_state.reshape(-1, 1, 1), raw_states, torch.zeros_like(raw_states))
         else:
             init_states = torch.zeros(padded_batch, dim, state_len, device=x_work.device, dtype=work_dtype)
 
@@ -488,10 +496,10 @@ def hpu_causal_conv1d_fn(
             cache_idx_b = safe_cache_idx_prefill[b:b + 1]
 
             if has_initial_state is not None:
-                raw_state_b = conv_states[cache_idx_b, state_start:state_start + state_len, :].transpose(-1,
-                                                                                                         -2).squeeze(0)
-                mask_b = has_initial_state[b] if has_initial_state.numel() > 1 else has_initial_state[0]
-                init_state_b = torch.where(mask_b, raw_state_b,
+                read_idx_b = safe_read_idx_prefill[b:b + 1]
+                raw_state_b = conv_states[read_idx_b,
+                                          state_start:state_start + state_len, :].transpose(-1, -2).squeeze(0)
+                init_state_b = torch.where(keep_initial_state[b], raw_state_b,
                                            torch.zeros(dim, state_len, device=x_work.device, dtype=work_dtype))
             else:
                 init_state_b = torch.zeros(dim, state_len, device=x_work.device, dtype=work_dtype)
@@ -706,10 +714,13 @@ def hpu_causal_conv1d_update(
     direct_state_layout: bool = False,
     round_before_activation: bool = False,
     full_query_valid_state: bool = False,
+    store_cache_indices: torch.Tensor | None = None,
 ):
     if block_idx_last_scheduled_token is not None or initial_state_idx is not None:
         raise NotImplementedError("Prefix caching metadata is not supported in the reference implementation.")
     activation = _normalize_activation(activation)
+    if store_cache_indices is not None and num_accepted_tokens is not None:
+        raise NotImplementedError("'store_cache_indices' is not supported on the speculative update path.")
     if num_accepted_tokens is not None:
         if conv_state_indices is None or query_start_loc is None:
             raise ValueError("Speculative convolution requires state indices and query_start_loc.")
@@ -745,6 +756,7 @@ def hpu_causal_conv1d_update(
         validate_data=validate_data,
         is_prompt=False,
         direct_state_layout=direct_state_layout,
+        store_cache_indices=store_cache_indices,
     )
     return reshape_spec.reshape_fn(result)
 
@@ -767,6 +779,7 @@ def hpu_causal_conv1d_fn_update(
     validate_data: bool = False,
     is_prompt: bool = True,
     direct_state_layout: bool = False,
+    store_cache_indices: torch.Tensor | None = None,
 ):
     if any(ptr is not None for ptr in (
             block_idx_first_scheduled_token,
@@ -860,6 +873,13 @@ def hpu_causal_conv1d_fn_update(
         # integer tensors. remainder(-1, N) == N-1.
         num_conv_slots = conv_states.shape[0]
         safe_cache_idx = torch.remainder(batch_cache_idx, num_conv_slots)
+        # The read slot (conv_state_indices) and the write slot (store_cache_indices)
+        # differ under prefix caching; the state is written to the store slot.
+        if store_cache_indices is None:
+            safe_store_idx = safe_cache_idx
+        else:
+            store_idx = store_cache_indices.reshape(-1).to(device=conv_states.device, dtype=batch_cache_idx.dtype)
+            safe_store_idx = torch.remainder(store_idx, num_conv_slots)
         init_state = conv_states[safe_cache_idx, state_start:state_start + state_len, :]
     init_state = init_state.transpose(-1, -2)
 
@@ -871,6 +891,6 @@ def hpu_causal_conv1d_fn_update(
     seq_out = _apply_activation(seq_out, activation)
 
     with torch.no_grad():
-        conv_states[safe_cache_idx, state_start:state_start + state_len, :] = new_state.transpose(-1, -2)
+        conv_states[safe_store_idx, state_start:state_start + state_len, :] = new_state.transpose(-1, -2)
 
     return seq_out.to(original_dtype)
