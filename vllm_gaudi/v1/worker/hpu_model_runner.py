@@ -40,6 +40,7 @@ from vllm_gaudi.v1.worker.hpu_dp_utils import set_hpu_dp_metadata
 from vllm_gaudi.v1.worker.gdn_state_layout import has_contiguous_dflash_checkpoints
 from vllm_gaudi.v1.worker.flash_next_inputs import (build_block_table, build_ple_inputs, dummy_ple_inputs,
                                                     model_requires_block_table, model_requires_raw_input_tokens)
+from vllm_gaudi.v1.spec_decode.flash_next_mtp_steps import is_flash_next_mtp
 from vllm_gaudi.platform import is_flash_next_model
 
 from vllm.v1.attention.backend import AttentionBackend, AttentionType, CommonAttentionMetadata
@@ -2277,10 +2278,16 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                 self.drafter = HpuDFlash2Proposer(self.vllm_config, self.device, self)  # type: ignore
                 self.use_aux_hidden_state_outputs = self.drafter.use_aux_hidden_state
             elif self.speculative_config.use_eagle():
-                from vllm_gaudi.v1.spec_decode.hpu_eagle import HpuEagleProposer
-                self.drafter = HpuEagleProposer(self.vllm_config, self.device, self)  # type: ignore
-                if self.speculative_config.method == "eagle3":
+                if is_flash_next_mtp(self.speculative_config):
+                    from vllm_gaudi.v1.spec_decode.hpu_flash_next_mtp import HpuFlashNextMtpProposer
+
+                    self.drafter = HpuFlashNextMtpProposer(self.vllm_config, self.device, self)  # type: ignore
                     self.use_aux_hidden_state_outputs = True
+                else:
+                    from vllm_gaudi.v1.spec_decode.hpu_eagle import HpuEagleProposer
+                    self.drafter = HpuEagleProposer(self.vllm_config, self.device, self)  # type: ignore
+                    if self.speculative_config.method == "eagle3":
+                        self.use_aux_hidden_state_outputs = True
             elif self.speculative_config.method == "medusa":
                 raise NotImplementedError("Medusa speculative decoding is not supported on HPU.")
             else:
