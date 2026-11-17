@@ -140,3 +140,50 @@ never with `v_convert_bf16_to_f32_all_b`, whose lane order differs. The output i
 conversion is needed. `lanes` = `read_lane_id_4b_b()` (as in `gdn_mtp_prepared_f32_gaudi2.c:13`).
 
 Scalar params ABI (host -> kernel), 12 bytes: `struct GdnCoreDecodeParams { float scale; float eps; int32_t gate_activation; };`.
+
+## Recurrence-only op (version 2, 2026-11-17)
+
+Plan v0.3 adds a second op that runs only the recurrence, so the part vllm-gaudi #1834 measured at about 80% of the
+per-sequence decode cost can be qualified on its own. If the conv or norm parts of the full kernel fail on hardware,
+this mode can still be used. The layer keeps the torch conv update before it and `self.norm` after it.
+
+| What | Name |
+|---|---|
+| Op | `torch.ops.flashinfer_gaudi.gdn_recurrent_decode` (same Python module and `torch.library` fragment as `gdn_core_decode`) |
+| Torch reference | `flashinfer_gaudi.gdn_core_decode.gdn_recurrent_decode_reference` |
+| Flag value | `GdnCoreDecodeMode.RECURRENCE = 2` (`OFF = 0` and `FUSED = 1` keep their numbers) |
+| TPC kernel | `csrc/gdn_fused/kernels/gdn_recurrent_decode_gaudi2.c` (includes `gdn_core_decode_recurrence.h` and `gdn_core_decode_norm.h`), GUID `gdn_fused_recurrent_decode_f32state_gaudi2` |
+| Host glue | `csrc/gdn_fused/host/gdn_recurrent_decode_gaudi2.{hpp,cpp}`, a second GUID in the same `libgdn_fused_gaudi2.so` |
+| Scalar params ABI | `struct GdnRecurrentDecodeParams { float scale; };`, 4 bytes, in `csrc/gdn_fused/gdn_core_decode_params.h` |
+
+```
+gdn_recurrent_decode(Tensor(a!) ssm_state, Tensor qkv, Tensor a, Tensor b, Tensor A_log, Tensor dt_bias,
+                     Tensor load_indices, Tensor store_indices, float scale) -> Tensor
+```
+
+| Arg | Torch shape, dtype | TPC coords (innermost first) | Meaning |
+|---|---|---|---|
+| `ssm_state` | `[S, HV, D(v), D(k)]`, fp32 | `{k, v_row, value_head, slot}` | as in `gdn_core_decode`. Mutated |
+| `qkv` | `[B, C]`, bf16 | `{channel, request}` | the conv update's output **after** SiLU (`mixed_qkv_conv` in `qwen3_5.py`), order `[q | k | v]` |
+| `a`, `b`, `A_log`, `dt_bias`, `load_indices`, `store_indices` | as in `gdn_core_decode` | as there | as there |
+| returns | `[B, HV, D]`, fp32 | `{v_row, value_head, request}` | `o`, the recurrence output **before** the gated RMSNorm |
+
+Semantics: exactly the `gdn_core_decode` loop above with `act = qkv[r].float()` (no conv, no SiLU, no conv-state
+read or write), and `out[r, vh] = o` (no norm, no gate). Padding rows (load or store slot outside `[0, S)`) get zeros
+and no state write. Same caller invariants. Index space, vector convention and `bf16_to_f32_linear` are the same as
+the full kernel's: one point per (key head, request).
+
+Preconditions: as for `gdn_core_decode`, minus the conv-state ones. HPU only: `D == 128`, all tensors contiguous.
+
+## Debug index check (version 2)
+
+`VLLM_HPU_GDN_CORE_DECODE_DEBUG` is `GdnCoreDecodeDebug(IntEnum)`: `OFF = 0`, `CHECK = 1`, default 0. With `CHECK`,
+the layer calls `check_gdn_core_decode_indices(load_indices, store_indices, num_slots, num_rows)` (in
+`flashinfer_gaudi/gdn_core_decode.py`) before either op. `num_rows` is the layer's `num_decodes`, the rows that are
+real requests. The check copies the indices to the CPU, once per layer per step. It raises `ValueError` when either
+of these holds among the real rows (index `< num_rows`) whose two slots are both in `[0, S)`:
+1. two rows have the same store slot;
+2. one row's store slot is another row's load slot (a reordered cache).
+
+Rows from `num_rows` on are padding and are ignored: the non-compact runner points them all at one real dummy slot
+(`_MAMBA_PAD_BLOCK_ID`), which would otherwise fail check 1. With `OFF` there is no check and no host sync.

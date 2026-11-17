@@ -669,6 +669,94 @@ sweep. A low 32K throughput is data, record it.
 
 Post back (3d): the filled 3d table, the eight `/tmp/3d-*.log` files, the engine-stats lines taken during the sweeps.
 
+### 3f: fused GDN decode kernel (track RUK-2812; run after 3d)
+Purpose: qualify the two native GDN decode ops of `feat/flash-next-gaudi-gdn-fused` (contract:
+`docs/design/flash-next/gdn-core-decode.md`). `VLLM_HPU_GDN_CORE_DECODE` is `GdnCoreDecodeMode`: `0` = off (the torch
+path), `1` = FUSED (`gdn_core_decode`: conv, gates, recurrence, gated RMSNorm in one TPC kernel), `2` = RECURRENCE
+(`gdn_recurrent_decode`: recurrence only, torch conv before it and `self.norm` after it). The kernels were written
+without a compiler or a card. Run the five steps in order. Each must pass before the next one starts; a failure stops
+3f only, and the flag stays at 0 for every other stage.
+
+Prerequisites: the plugin installed from **`feat/flash-next-gaudi-gdn-fused`** with the stage 1 command (the track branch
+holds the program branch plus this track; with the flag at 0 nothing changes, so stages 2-3 run unchanged on it).
+`habanalabs-tools` 1.24.1 is in the stage 1 container (tpc-clang and the TPC simulator). Optional: a Qwen3.8-27B
+checkpoint for step 3c.
+
+**Step 3f-0: build the fused library and run the simulator** (no card needed; CPU only)
+```bash
+cd 1Cat-vLLM-Gaudi && git rev-parse HEAD                     # must be the track branch head
+LIB=$(python -c "import flashinfer_gaudi, pathlib; print(pathlib.Path(flashinfer_gaudi.__file__).parent / 'lib')")
+python tools/build_flashinfer_gaudi.py --gdn-fused-only --output-dir "$LIB" 2>&1 | tee /tmp/3f-build.log
+ls -l "$LIB"/libgdn_fused_gaudi2.so "$LIB"/gdn_fused_ops*.so
+PYTHONPATH=$PWD python -m pytest -q -rs tests/standalone/gdn_core_decode/test_simulation.py 2>&1 | tee /tmp/3f-sim.log
+```
+Expected: both libraries listed; the simulator test passes, not skipped (`-rs` prints any skip reason), and prints one
+`instructions executed` line per case. A build failure does not touch the rest of the install (exit code 3, "the
+FlashInfer-Gaudi libraries are unaffected"): post `/tmp/3f-build.log` and skip to the next stage. A simulator mismatch:
+post `/tmp/3f-sim.log` and stop 3f.
+
+**Step 3f-1: op numerics on the card**
+```bash
+PYTHONPATH=$PWD python -m pytest -q -rs tests/unit_tests/gdn_core_decode/test_hpu_op.py 2>&1 | tee /tmp/3f-hpu-op.log
+```
+Expected: every case passes, not skipped. Both ops run against their CPU references at the TP8, TP4 and TP1 head
+counts, with load == store, load != store and padded rows, and batch 1, 16 and 64. Bars: output max abs error ≤ 1e-3,
+state ≤ 1e-5, conv state exact. (#1834's bar for the recurrence alone was 2.4e-4 to 4.9e-4.) Stop 3f on a failure.
+
+**Step 3f-2: graph modes and replay**
+```bash
+PYTHONPATH=$PWD python tools/flash_next/gdn_core_decode_replay.py --steps 1000 2>&1 | tee /tmp/3f-replay.log
+```
+Expected: for each op, `lazy+hpu_graph: exact` and `torch.compile: exact` (1,000 steps against the same op run
+eagerly; an exact match rules out aliasing, stale buffers and dropped state writes on replay), and
+`recompiles after warmup: 0`. Stop 3f on any mismatch.
+
+**Step 3f-3: Qwen3.8-27B control at TP2** (skip, and say so, if no 27B checkpoint is on the node)
+vllm-gaudi #1834's ladder: 51-token prompts, 256 tokens out, prefix caching off. One server per mode, `MODE` = 0, 1, 2:
+```bash
+export VLLM_HPU_GDN_CORE_DECODE=$MODE
+vllm serve /models/Qwen3.8-27B --served-model-name q27 --port 8000 --tensor-parallel-size 2 \
+  --max-num-seqs 64 --max-model-len 4096 --no-enable-prefix-caching --gpu-memory-utilization 0.92
+# second shell:
+for C in 1 2 4 8 16 32 64; do
+  vllm bench serve --backend vllm --model q27 --dataset-name random --random-input-len 51 --random-output-len 256 \
+    --num-prompts $((4 * C)) --max-concurrency "$C" > "/tmp/3f-27b-m$MODE-c$C.log" 2>&1
+  grep -E "Mean TPOT" "/tmp/3f-27b-m$MODE-c$C.log"
+done
+```
+Run 3b's 8-prompt greedy loop on each server too (`OUT=/tmp/3f-27b-m$MODE.txt`, model `q27`), then
+`diff /tmp/3f-27b-m0.txt /tmp/3f-27b-m1.txt; diff /tmp/3f-27b-m0.txt /tmp/3f-27b-m2.txt`.
+Fit Mean TPOT = base + slope × C (least squares over the 7 points) per mode. #1834 measured a slope of 0.62-0.68 ms per
+sequence for mode 0. The target for modes 1 and 2 is a slope of at most 0.12 ms (2× the bandwidth floor).
+
+**Step 3f-4: Flash-Next at TP8**
+Launch 1 of stage 3 (fn3-plain) with `--max-num-seqs 64` and `--profiler-config '{"profiler":"torch","torch_profiler_dir":"/tmp/3f-prof-m'$MODE'"}'`
+added, once per `MODE` = 0, 1, 2, with `export VLLM_HPU_GDN_CORE_DECODE=$MODE` (containers fn3f-m0, fn3f-m1, fn3f-m2).
+On each: 3b's greedy loop (`OUT=/tmp/3f-fn-m$MODE.txt`), then 3b's sweep with `C` in 1 2 4 8 16 32 64 and logs
+`/tmp/3f-fn-m$MODE-c$C.log`, then one profiled run at batch 64:
+```bash
+vllm bench serve --backend vllm --model Qwen3.8-Flash-Next --dataset-name random --random-input-len 4096 \
+  --random-output-len 32 --num-prompts 64 --max-concurrency 64 --profile > "/tmp/3f-fn-m$MODE-prof.log" 2>&1
+```
+Expected startup line on fn3f-m1 and fn3f-m2: no `GDN core decode ... is off for` warning (that warning means the layer
+fell back to the torch path; post it). Greedy files: identical to fn3f-m0 within the first sentence (as in 3b's stop rule).
+
+**Step 3f-5: decision.** Post the tables. I record on RUK-2812 which mode, if any, becomes the default. A mode is kept
+when it is faster than mode 0 at C = 16 and C = 64 and does not regress C = 1.
+
+Results table (3f):
+
+| Step | Mode | Check | Expected | Observed | Pass? |
+|---|---|---|---|---|---|
+| 3f-0 | | build, simulator | both libraries; simulator passes | | |
+| 3f-1 | 1, 2 | `test_hpu_op.py` | all pass | | |
+| 3f-2 | 1, 2 | replay, recompiles | exact; 0 | | |
+| 3f-3 | 0 / 1 / 2 | 27B TPOT slope (ms per sequence) | ~0.65 / ≤ 0.12 / ≤ 0.12 | | |
+| 3f-4 | 0 / 1 / 2 | Flash-Next Mean TPOT at C = 1, 16, 64 | 1 and 2 faster than 0 at 16 and 64 | | |
+
+Post back (3f): `/tmp/3f-build.log`, `/tmp/3f-sim.log`, `/tmp/3f-hpu-op.log`, `/tmp/3f-replay.log`, the `/tmp/3f-27b-*` and
+`/tmp/3f-fn-*` logs and greedy files, the three `/tmp/3f-prof-m*` trace folders, the filled table.
+
 ### What to post back
 - the results tables (3a, 3b's two bench tables, 3c, 3d), filled in;
 - the greedy-output files: `/tmp/3a-tiny-sparse.txt`, `/tmp/3a-tiny-dense.txt`, `/tmp/3b-plain.txt`, `/tmp/3b-tactics.txt`,
