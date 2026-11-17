@@ -13,6 +13,7 @@ plugin modules must be imported before it.
 import vllm_gaudi.models.qwen3_5 as _qwen3_5  # noqa: F401  (must precede the upstream model import)
 import vllm_gaudi.models.qwen3_next as _qwen3_next  # noqa: F401  (must precede the upstream model import)
 import vllm.models.qwen4_exp.nvidia.model as _upstream_model
+from vllm_gaudi.models.qwen4_exp.ple_layer import HpuQwen4ExpPLELayer  # must follow the upstream model import
 from vllm.model_executor.models.registry import ModelRegistry
 
 FLASH_NEXT_ARCHS = ("Qwen4ExpForConditionalGeneration", "Qwen4ExpForCausalLM")
@@ -38,6 +39,7 @@ def apply_flash_next_patches() -> None:
         raise RuntimeError("Flash-Next GDN replacement did not take: vllm_gaudi.models.qwen3_5 and "
                            "vllm_gaudi.models.qwen3_next must be imported before "
                            "vllm.models.qwen4_exp.nvidia.model")
+    _upstream_model.Qwen4ExpPLELayer = HpuQwen4ExpPLELayer
 
 
 def register() -> None:
