@@ -100,9 +100,9 @@ def table_row(name, geom, tp, kv_bytes, budget_gib, max_len=131072):
 
 
 def print_table(rows):
-    widths = [max(len(str(r[i])) for r in rows) for i in range(len(TABLE_HDR))]
+    widths = [max(len(str(r[i])) for r in (TABLE_HDR, *rows)) for i in range(len(TABLE_HDR))]
     for row in (TABLE_HDR,) + tuple(rows):
-        print("  ".join(str(v).ljust(w) for v, w in zip(row, widths)))
+        print("  ".join(str(v).ljust(w) for v, w in zip(row, widths)).rstrip())
 
 
 def check():

@@ -42,12 +42,12 @@ Run 2: block=896 concurrency=19.2 (log 19.08) OK
 
 ```text
 row                          tp  kv    budget GiB  block  blocks today  tokens today  agents@131K today  blocks fixed  tokens fixed  agents@131K fixed
-FN TP8 BF16 weights          8  bf16  40     512   3868  1.98M  14.8  6826  3.49M  26.1
-FN TP4 FP8 weights           4  bf16  39     896   2029  1.82M  13.3  3803  3.41M  24.9
-FN TP8 + FP8 KV              8  fp8   40     896   4163  3.73M  27.2  7801  6.99M  51.0
-FN TP4 FP8 weights + FP8 KV  4  fp8   39     1664  2110  3.51M  24.8  4096  6.82M  48.2
-27B TP8 BF16 (Run 1)         8  bf16  72.98  512   5293  2.71M  20.2  9341  4.78M  35.7
-27B TP4 BF16 (Run 2)         4  bf16  75.36  896   2941  2.64M  19.2  5512  4.94M  36.0
+FN TP8 BF16 weights          8   bf16  40          512    3868          1.98M         14.8               6826          3.49M         26.1
+FN TP4 FP8 weights           4   bf16  39          896    2029          1.82M         13.3               3803          3.41M         24.9
+FN TP8 + FP8 KV              8   fp8   40          896    4163          3.73M         27.2               7801          6.99M         51.0
+FN TP4 FP8 weights + FP8 KV  4   fp8   39          1664   2110          3.51M         24.8               4096          6.82M         48.2
+27B TP8 BF16 (Run 1)         8   bf16  72.98       512    5293          2.71M         20.2               9341          4.78M         35.7
+27B TP4 BF16 (Run 2)         4   bf16  75.36       896    2941          2.64M         19.2               5512          4.94M         36.0
 ```
 
 ## Tests
