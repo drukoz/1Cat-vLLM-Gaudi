@@ -525,6 +525,7 @@ if TYPE_CHECKING:
     VLLM_HPU_CGUID_DYNAMIC_QUANT: bool = False
     VLLM_HPU_CGUID_DYNAMIC_QUANT_MAX_ROWS: int = 32
     VLLM_HPU_FUSED_GREEDY_LOGITS: bool = False
+    VLLM_HPU_FLASH_NEXT_QSA_MODE: int = 0
 
 
 def _optional_bool_env(name: str) -> Optional[bool]:
@@ -1831,6 +1832,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Keep the ordinary HPU SiLU kernel for small prompt and decode graphs.
     "VLLM_HPU_EXPLICIT_SIGMOID_SILU_MIN_TOKENS":
     lambda: int(os.environ.get("VLLM_HPU_EXPLICIT_SIGMOID_SILU_MIN_TOKENS", "2048")),
+
+    # Flash-Next Qwen4-Exp QSA attention mode. 0 (default) = dense: exact
+    # causal attention over the full prefix through the standard HPU
+    # Attention layer, indexer weights loaded for checkpoint compatibility
+    # only. 1 = sparse (indexer top-k selection): reserved for M2 and raises
+    # NotImplementedError.
+    "VLLM_HPU_FLASH_NEXT_QSA_MODE":
+    lambda: int(os.environ.get("VLLM_HPU_FLASH_NEXT_QSA_MODE", "0")),
 }
 
 # end-env-vars-definition
