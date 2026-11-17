@@ -1,6 +1,6 @@
 # RUK-2709 Flash-Next on Gaudi: plan
 
-Kind: **Program**. Version 0.1, 2026-11-17, written from the system map (v0.5) and the reuse ledger (v0.3) after all Phase 0 research (R1–R7, R4b) and spikes (S0, S3, S4) reported. The working copy is the `plan` document on RUK-2709; this file is refreshed with the pull request.
+Kind: **Program**. Version 0.2, 2026-11-17: v0.1 was written from the system map (v0.5) and the reuse ledger (v0.3) after all Phase 0 research (R1–R7, R4b) and spikes (S0, S3, S4) reported; v0.2 rewrites the M1 section after M0 merged (`383e5ab`) with the facts checked for it. The working copy is the `plan` document on RUK-2709; this file is refreshed with the pull request.
 
 ## What changed between the map and this plan
 
@@ -79,9 +79,29 @@ Delivers: the Flash-Next model class instantiates and runs on CPU through the pl
 
 Exit: T1–T8 merged into the milestone branch, the S0 regression green, the QA Engineer's verification task passed, the milestone merged into the program branch and the PR description updated.
 
-### M1 Admission, prefill, prefix reuse and the GDN state pool (`feat/flash-next-gaudi-m1`)
+### M1 Admission, prefix reuse and the recurrent state pool (`feat/flash-next-gaudi-m1`, RUK-2759)
 
-R7's config variants first (run-sheet stage 4), then code: prefill chunk alignment to the GDN block under prefix caching (re-implement upstream vllm-gaudi #1831, #1853, #1828, #1890 by hand: the fork rewrote the runner and the async scheduler); `VLLM_COMPACT_GDN=0` qualification with a loud startup error when compact mode meets prefix caching; the **GDN state pool** (system map 2a: reserved block-id range or second pool in the scheduler's `BlockPool` through `vllm_gaudi/v1/engine/core_patch.py`, worker shrink factor 1, state tensors sized to the `align` need; S4 predicts the new `num_blocks`); prompt bucket shapes for 128K–262K; the GDN PyTorch prefill path for the TP8 shape (2 key / 6 value heads per rank) checked on 8 CPU ranks; #1895 (non-finite initial-state masking). Measured by first-token latency and hit rate in run-sheet stage 4.
+Cut from the program branch at `383e5ab` (M0 merged). Four facts checked on this Mac on 2026-11-17 changed the M1 scope from v0.1:
+
+1. **The fork's GDN layer writes the conv state to the wrong slot under prefix caching.** `vllm_gaudi/models/qwen3_5.py` already resolves load and store slots and writes the SSM prefill state to the store slot, but the prefill conv (`:461-477`) reads and writes at the load slot, and the decode SSM and conv (`:629-647`, `:710-720`) write where they read. This is upstream vllm-gaudi #1831's bug (LongBench 0.23 -> 0.51 when fixed); it hits every prefill chunk after the first and every 512th decode token, so prefix reuse could never have produced correct output on the fork. M1-T4 fixes it; M1-T5 proves it with a chunked-prefill parity test on CPU (load != store), a case M0's tests did not cover.
+2. **#1828, #1853 and #1890 are not needed at the pin.** vLLM `8f816a3f`'s base `Scheduler._mamba_block_aligned_split` (`vllm/v1/core/sched/scheduler.py:394-470`) already clips every chunk end to the mamba block in `align` mode, and Flash-Next runs the base scheduler (async scheduling is off, M0-T6b). The fork's `HPUAsyncScheduler` override (the 27B with async scheduling) falls through to the base for GDN models. The runner's `context_lens % mamba_chunk_size` assert stays as a guard.
+3. **The PLE short-conv group doubles the waste.** `hpu_worker.py:1142-1166` applies a second shrink factor `page / (page + ple_state)` for the SHORT_CONV spec, so Flash-Next today gets `40 GiB x 0.567 x 0.740` for attention at TP8 BF16: 2,862 blocks, 1.47M KV tokens, about 11 agents at 131K, not the 1.98M of system map v0.5. The recurrent state pool covers the GDN and PLE groups alike.
+4. **Admission needs no plugin code.** R7 found no plugin cap beyond the zero-memory default (`platform.py:276-291`, which keeps vLLM's 2048-token step budget) and prefills that never merge for hybrids; the knobs are CLI flags, which stage 4 measures (variants A-C) before any default changes.
+
+**Design of the recurrent state pool** (contract M1-T1, scheduler M1-T2, worker/runner M1-T3): two `BlockPool`s inside an `HybridKVCacheCoordinator` subclass installed through a plugin patch of `vllm.v1.core.kv_cache_manager.get_kv_cache_coordinator`. Every `MambaSpec` group's manager allocates from a pool of `slots + 1` blocks (id 0 null); attention keeps `num_blocks`; a routing attention pool forwards deferred frees, resets and events; `get_num_blocks_to_allocate` returns the attention need or "not enough" when the recurrent pool is short. The pool size is resolved once by the platform hook into `VLLM_HPU_RECURRENT_STATE_POOL_SLOTS` (`max_num_seqs x groups x 3 + 512` cache slots: 896 for Flash-Next at 32 sequences) so the engine core and the workers agree; the worker reserves `(slots + 2) x (12 x 391.5 KiB + 180 KiB)` and gives attention the rest with no shrink factors; the runner allocates `slots + 2` rows per recurrent tensor and pads with `slots + 1`. Mode flag `VLLM_HPU_RECURRENT_STATE_POOL` (`RecurrentStatePoolMode`: 0 off, 1 pool), default off until stage 4 qualifies it. Compact GDN with prefix caching becomes a startup error, and unset defaults to 0 under prefix caching. Prediction (S4 with the pool model, M1-T8): TP8 BF16, 40 GiB, 896 slots -> 6,113 attention blocks, 3.13M KV tokens, 24 agents at 131K, against 2,862 blocks / 1.47M tokens / 11 agents today.
+
+| # | Subtask | Depends on | Owner |
+|---|---|---|---|
+| T1 | Pool contract module, env flags, platform resolution, compact-GDN rule, CPU tests | none | Engineer 2 |
+| T2 | Scheduler side: `HpuRecurrentPoolCoordinator`, routing pool, factory patch, `KVCacheManager` tests on CPU | T1 | Engineer 5 |
+| T3 | Worker memory budget and runner tensor sizing for the pool | T1 | Engineer 4 |
+| T4 | Conv read/write slot split, decode store slots, null-block masks (#1831, #1895) with op tests | none | Engineer 3 |
+| T5 | Chunked-prefill and block-crossing decode parity on CPU | T4 | Engineer 6 |
+| T6 | 700-token prompt in the HF reference (multi-chunk GDN at TP1 to TP8) | none | Engineer 6 |
+| T7 | Bucket coverage test for 128K-262K prompts, bucket counts | none | General Agent |
+| T8 | S4 pool model, run sheet stage 4 (variants A-F, hit check, pool), client prefix guidance | none | Engineer 1 |
+
+Exit: T1-T8 merged; the QA verification passed (the Flash-Next suite with the fifth prompt and the chunked test, `tests/unit_tests/core`, the S0 regression, and two mutation checks: the conv write slot reverted fails T5, the pool factory disabled fails T2's tests); the milestone merged into the program branch and the PR updated. Hardware proof is run sheet stage 4 on the user's node.
 
 ### M2 Decode batching and sparse attention (`feat/flash-next-gaudi-m2`)
 
