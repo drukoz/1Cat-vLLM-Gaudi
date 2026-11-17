@@ -10,3 +10,9 @@ struct GdnCoreDecodeParams {
     int32_t gate_activation;
 };
 static_assert(sizeof(GdnCoreDecodeParams) == 12, "GDN core-decode scalar ABI must contain two FP32 values and one I32");
+
+inline constexpr const char* kGdnRecurrentDecodeGuid = "gdn_fused_recurrent_decode_f32state_gaudi2";
+struct GdnRecurrentDecodeParams {
+    float scale;
+};
+static_assert(sizeof(GdnRecurrentDecodeParams) == 4, "GDN recurrent-decode scalar ABI must contain one FP32 value");
