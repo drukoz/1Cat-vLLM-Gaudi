@@ -17,6 +17,11 @@ model flattens ``input_ids.reshape(-1)``, so each padded row is one
 rows and padded tail tokens receive dummy values that are discarded with
 the rest of the padded outputs.
 
+The Flash-Next sparse QSA decode (M2) also needs a per-request
+``block_table`` (int32 ``[padded_batch_size, max_blocks]`` kernel block ids,
+padded with ``_PAD_BLOCK_ID``) in the attention metadata; ``build_block_table``
+is the CPU builder for it.
+
 This module imports only ``torch`` and ``numpy`` so it is unit-testable on
 machines without an HPU; ``hpu_model_runner.py`` cannot be imported there.
 """
@@ -42,6 +47,30 @@ def model_requires_raw_input_tokens(model) -> bool:
         return bool(model.requires_raw_input_tokens)
     inner = getattr(model, "model", None)
     return inner is not None and bool(getattr(inner, "requires_raw_input_tokens", False))
+
+
+def model_requires_block_table(model) -> bool:
+    """True when the model (or its .model) declares ``requires_block_table`` (Flash-Next sparse QSA, M2)."""
+    if model is None:
+        return False
+    if hasattr(model, "requires_block_table"):
+        return bool(model.requires_block_table)
+    inner = getattr(model, "model", None)
+    return inner is not None and bool(getattr(inner, "requires_block_table", False))
+
+
+def build_block_table(block_tables: list[list[int]], padded_batch_size: int, max_blocks: int,
+                      pad_block_id: int) -> torch.Tensor:
+    """int32 [padded_batch_size, max_blocks]: row r holds block_tables[r][:max_blocks] then pad_block_id;
+    rows beyond len(block_tables) are all pad_block_id. Raises ValueError if any row is longer than max_blocks."""
+    table = np.full((int(padded_batch_size), int(max_blocks)), int(pad_block_id), dtype=np.int32)
+    for row, blocks in enumerate(block_tables):
+        if row >= padded_batch_size:
+            break
+        if len(blocks) > max_blocks:
+            raise ValueError(f"block table row {row} has {len(blocks)} blocks, max_blocks={max_blocks}")
+        table[row, :len(blocks)] = blocks
+    return torch.from_numpy(table)
 
 
 def _to_numpy(tensor: TensorLike) -> np.ndarray:

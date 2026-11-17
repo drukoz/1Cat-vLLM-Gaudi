@@ -183,6 +183,7 @@ class HPUAttentionMetadata(HPUPagedAttentionMetadata, AttentionMetadata):
     # that block. Keep the default causal so existing prefill paths are
     # unchanged, while allowing the draft model to opt out explicitly.
     causal: bool = True
+    block_table: Optional[torch.Tensor] = None  # [padded_bs, max_blocks] kernel block ids; Flash-Next sparse QSA (M2)
 
 
 @dataclass
