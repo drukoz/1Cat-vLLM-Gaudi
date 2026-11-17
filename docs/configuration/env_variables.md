@@ -64,8 +64,18 @@ gating, fused recurrent delta rule, gated RMSNorm). `1` is fused: the
 non-speculative decode step runs through the fused core op
 `torch.ops.flashinfer_gaudi.gdn_core_decode` (conv, gates, recurrence and
 gated RMSNorm in one step, the conv and SSM states updated in place), used
-only when the device has a kernel for the op. Non-speculative decode only;
-see `docs/design/flash-next/gdn-core-decode.md`.
+only when the device has a kernel for the op. `2` is recurrence (the
+recurrence-only fused kernel). Non-speculative decode only; see
+`docs/design/flash-next/gdn-core-decode.md`.
+
+`VLLM_HPU_GDN_CORE_DECODE_DEBUG` adds a debug check of the GDN core decode
+slot indices as an integer. `0` (default) is off. `1` calls
+`check_gdn_core_decode_indices` before the core decode step of every GDN
+layer: over the real rows (the first `num_decodes` rows) whose load and store
+slots are both in range, it raises `ValueError` when two rows share a store
+slot, or when one row's store slot is another row's load slot (a reordered
+cache). The check copies the indices to the CPU, syncing the host once per
+GDN layer per step; for debugging only.
 
 `VLLM_HPU_RECURRENT_STATE_POOL` selects the allocation mode for the recurrent
 (GDN / short-conv) state slots as an integer. `0` (default) keeps today's
