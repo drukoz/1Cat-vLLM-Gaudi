@@ -256,7 +256,7 @@ class HPUGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         self.gdn_core_decode_mode = GdnCoreDecodeMode(envs.VLLM_HPU_GDN_CORE_DECODE)
         self.gdn_core_decode_debug = GdnCoreDecodeDebug(envs.VLLM_HPU_GDN_CORE_DECODE_DEBUG)
         self._gdn_core_gate = {"silu": GdnGateActivation.SILU, "sigmoid": GdnGateActivation.SIGMOID}.get(
-            getattr(self.norm, "activation", None))
+            getattr(getattr(self, "norm", None), "activation", None))
         self._gdn_core_ok = None  # None = not checked yet; then True/False, once per layer
 
     def _gdn_core_decode_reason(self, conv_state: torch.Tensor, ssm_state: torch.Tensor) -> str | None:
@@ -265,7 +265,8 @@ class HPUGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         if fused:
             # RECURRENCE keeps the torch conv update and self.norm, so only FUSED needs these.
             if self._gdn_core_gate is None:
-                return f"output gate {self.norm.activation!r} is not silu or sigmoid"
+                return (f"output gate {getattr(getattr(self, 'norm', None), 'activation', None)!r} "
+                        "is not silu or sigmoid")
             if self.conv1d.bias is not None:
                 return "conv1d has a bias"
             if self.conv_kernel_size != 4:
