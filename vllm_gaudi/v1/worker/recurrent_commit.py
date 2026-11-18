@@ -14,10 +14,11 @@ other token because the store lattice no longer special-cases it. The copies run
 time, once the accepted length of the step is known.
 
 Before the step, ``align_precopy_plan`` moves the running recurrent state into the request's
-running block ``curr`` when the window has moved (or, with ``normalize``, when the previous
-step left more than one accepted token in it); ``precopy_slot_pairs`` maps a plan onto one
-cache group's slots for ``commit_conv``/``commit_ssm``, and ``self_commit_requests`` finds the
-requests whose boundary commit writes the running block itself (their next accepted count is 1).
+running block ``curr`` when the window has moved (in either direction: a step that schedules
+fewer tokens moves it back), or, with ``normalize``, when the previous step left more than one
+accepted token in it; ``precopy_slot_pairs`` maps a plan onto one cache group's slots for
+``commit_conv``/``commit_ssm``, and ``self_commit_requests`` finds the requests whose boundary
+commit writes the running block itself (their next accepted count is 1).
 """
 
 from __future__ import annotations
@@ -149,7 +150,8 @@ def align_precopy_plan(prev_blocks: Sequence[int | None], context_lens: Sequence
     """Pre-step copies that move each request's running state into its running block.
     Returns (plan, new_prev_blocks, new_accepted). plan entries are (request, bias, src_block, dst_block)
     (block INDICES, not slots). new_prev_blocks[i] = curr_i; new_accepted[i] = 1 when request i is planned,
-    else accepted[i]. ValueError: unequal lengths, accepted[i] < 1, prev > curr."""
+    else accepted[i]. prev may be past curr (this step schedules fewer tokens than the previous one);
+    the copy then runs backward. ValueError: unequal lengths, accepted[i] < 1."""
     batch = len(context_lens)
     if len(prev_blocks) != batch or len(num_scheduled) != batch or len(accepted) != batch:
         raise ValueError("prev_blocks, context_lens, num_scheduled and accepted must have equal length, got "
@@ -164,9 +166,6 @@ def align_precopy_plan(prev_blocks: Sequence[int | None], context_lens: Sequence
             raise ValueError(f"accepted[{i}] must be at least 1, got {n}.")
         curr = align_running_block(ctx, int(num_scheduled[i]), block_size)
         prev = (ctx - 1) // block_size if prev_blocks[i] is None else int(prev_blocks[i])
-        if prev > curr:
-            raise ValueError(f"prev_blocks[{i}]={prev} is past the running block {curr} "
-                             f"(context_len={ctx}, block_size={block_size}).")
         new_prev_blocks.append(curr)
         if ctx > 0 and (prev != curr or (normalize and n > 1)):
             plan.append((i, n - 1, prev, curr))

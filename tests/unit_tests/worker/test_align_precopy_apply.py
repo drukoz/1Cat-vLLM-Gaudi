@@ -95,3 +95,33 @@ def test_two_requests_only_the_moving_one_changes():
     assert moved == {17}
     assert running == {"r0": 9, "r1": 9}
     assert accepted == {"r0": 1, "r1": 3}
+
+
+def test_backward_move_copies_the_running_state_into_the_lower_block():
+    # Verification step ctx 33 + 4 scheduled left the state in block 9; 1 token accepted, a plain
+    # decode (ctx 34, 1 scheduled) runs in block 8: the copy moves the state back 9 -> 8 (slots 17 -> 16).
+    ssm, conv, registry, rows = _make_state()
+    old_ssm, old_conv = ssm.clone(), conv.clone()
+    running, accepted = {"r0": 9}, {"r0": 1}
+    plan = apply_align_precopy(registry, rows, ["r0"], running, accepted, [34], [1], BS, True)
+    assert plan == [(0, 0, 9, 8)]
+    assert torch.equal(ssm[16], old_ssm[17])
+    assert torch.equal(conv[16, 0:3], old_conv[17, 0:3])
+    assert running == {"r0": 8}
+    assert accepted == {"r0": 1}
+    # The source slot is not clobbered by the backward copy.
+    assert torch.equal(ssm[17], old_ssm[17])
+
+
+def test_backward_move_reads_the_state_at_the_accepted_bias():
+    # prev = 9, 2 accepted tokens, ctx 35 + 1 scheduled: curr = cdiv(36, 4) - 1 = 8 with bias 1, so the
+    # ssm state is read from block 9 + 1 = 10 (slot 18) and the conv window from row 1 of block 9 (slot 17).
+    ssm, conv, registry, rows = _make_state()
+    old_ssm, old_conv = ssm.clone(), conv.clone()
+    running, accepted = {"r0": 9}, {"r0": 2}
+    plan = apply_align_precopy(registry, rows, ["r0"], running, accepted, [35], [1], BS, True)
+    assert plan == [(0, 1, 9, 8)]
+    assert torch.equal(ssm[16], old_ssm[18])
+    assert torch.equal(conv[16, 0:3], old_conv[17, 1:4])
+    assert running == {"r0": 8}
+    assert accepted == {"r0": 1}
