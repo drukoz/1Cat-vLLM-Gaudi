@@ -14,6 +14,11 @@ The second fixture does the same for the recurrence-only kernel
 each ``recurrent_sim_case.RECURRENT_CASES`` case is compared by
 ``recurrent_sim_case.compare_recurrent``.
 
+The third fixture does the same for the fused GDN verification kernel (phase 2, T = 1 + k)
+``csrc/gdn_fused/kernels/gdn_core_verify_gaudi2.c`` (host program ``verify_sim_host.cpp``, glue
+``csrc/gdn_fused/host/gdn_core_verify_gaudi2.cpp``), and each ``verify_sim_case.VERIFY_CASES``
+case is compared by ``verify_sim_case.compare_verify``.
+
 Skips on machines without the TPC toolchain (this Mac); runs for real in the tpcsim container
 (``tools/flash_next/tpcsim.sh``, guide ``docs/design/flash-next/tpcsim.md``) and in the rental's
 stage 1 container.  Contract: ``docs/design/flash-next/gdn-core-decode.md``.
@@ -31,6 +36,8 @@ from tests.unit_tests.gdn_core_decode.recurrent_sim_case import (RECURRENT_CASES
                                                                   make_recurrent_inputs, read_recurrent_outputs,
                                                                   write_recurrent_inputs)
 from tests.unit_tests.gdn_core_decode.sim_case import CASES, compare, make_inputs, read_outputs, write_inputs
+from tests.unit_tests.gdn_core_decode.verify_sim_case import (VERIFY_CASES, compare_verify, make_verify_inputs,
+                                                              read_verify_outputs, write_verify_inputs)
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 TOOLS_INCLUDE = Path("/usr/lib/habanatools/include")
@@ -43,6 +50,10 @@ RECURRENT_KERNEL_SOURCE = REPO_ROOT / "csrc" / "gdn_fused" / "kernels" / "gdn_re
 RECURRENT_GLUE_SOURCE = REPO_ROOT / "csrc" / "gdn_fused" / "host" / "gdn_recurrent_decode_gaudi2.cpp"
 RECURRENT_HOST_SOURCE = Path(__file__).resolve().parent / "recurrent_sim_host.cpp"
 RECURRENT_KERNEL_OBJECT = "gdn_recurrent_decode_gaudi2.o"
+VERIFY_KERNEL_SOURCE = REPO_ROOT / "csrc" / "gdn_fused" / "kernels" / "gdn_core_verify_gaudi2.c"
+VERIFY_GLUE_SOURCE = REPO_ROOT / "csrc" / "gdn_fused" / "host" / "gdn_core_verify_gaudi2.cpp"
+VERIFY_HOST_SOURCE = Path(__file__).resolve().parent / "verify_sim_host.cpp"
+VERIFY_KERNEL_OBJECT = "gdn_core_verify_gaudi2.o"
 
 
 def _missing_sdk_parts() -> list[str]:
@@ -121,6 +132,36 @@ def recurrent_sim_binary(tmp_path_factory: pytest.TempPathFactory) -> Path:
     return build
 
 
+@pytest.fixture(scope="module")
+def verify_sim_binary(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    """Build folder with the compiled verification kernel .o and the linked verify_sim_host binary (built once).
+
+    The kernel is compiled with ``-vlm 32`` exactly as the ``gdn_core_verify_gaudi2.o`` rule in
+    ``csrc/gdn_fused/CMakeLists.txt`` does (its per-node ``__local__`` arrays exceed the default VLM).
+    """
+    build = tmp_path_factory.mktemp("gdn_core_verify_sim")
+    _run([
+        "tpc-clang", "-Wall", "-Werror", "-O2", "-march=gaudi2", "-vlm", "32", f"-I{TOOLS_INCLUDE}",
+        VERIFY_KERNEL_SOURCE, "-c", "-o", build / VERIFY_KERNEL_OBJECT
+    ],
+         timeout=1800)
+    _run([
+        "objcopy", "-I", "binary", "-O", "elf64-x86-64", "-B", "i386:x86-64", VERIFY_KERNEL_OBJECT,
+        "gdn_core_verify_gaudi2_embedded.o"
+    ],
+         cwd=build,
+         timeout=600)
+    _run([
+        "g++", "-std=c++17", "-O2", "-Wall", VERIFY_HOST_SOURCE, VERIFY_GLUE_SOURCE,
+        build / "gdn_core_verify_gaudi2_embedded.o", f"-I{REPO_ROOT / 'csrc' / 'gdn_fused'}",
+        f"-I{REPO_ROOT / 'csrc' / 'gdn_fused' / 'host'}", f"-I{REPO_ROOT / 'tools'}", f"-I{TOOLS_INCLUDE}",
+        f"-I{DRIVER_INCLUDE}", "-L/usr/lib/habanatools", "-Wl,-rpath,/usr/lib/habanatools", "-ltpc_tests_core_ext",
+        "-o", build / "verify_sim_host"
+    ],
+         timeout=1800)
+    return build
+
+
 def test_kernel_disassembles_for_gaudi2(sim_binary: Path) -> None:
     listing = _run(["tpc-llvm-objdump", "--triple=tpc", "--mcpu=gaudi2", "-d", sim_binary / KERNEL_OBJECT]).stdout
     assert "TPC architecture: gaudi2" in listing
@@ -130,6 +171,12 @@ def test_recurrent_kernel_disassembles_for_gaudi2(recurrent_sim_binary: Path) ->
     listing = _run([
         "tpc-llvm-objdump", "--triple=tpc", "--mcpu=gaudi2", "-d", recurrent_sim_binary / RECURRENT_KERNEL_OBJECT
     ]).stdout
+    assert "TPC architecture: gaudi2" in listing
+
+
+def test_verify_kernel_disassembles_for_gaudi2(verify_sim_binary: Path) -> None:
+    listing = _run(
+        ["tpc-llvm-objdump", "--triple=tpc", "--mcpu=gaudi2", "-d", verify_sim_binary / VERIFY_KERNEL_OBJECT]).stdout
     assert "TPC architecture: gaudi2" in listing
 
 
@@ -153,3 +200,14 @@ def test_recurrent_simulation_matches_reference(recurrent_sim_binary: Path, case
     print(proc.stdout)
     got = read_recurrent_outputs(case, case_dir)
     assert compare_recurrent(case, inputs, got) == []
+
+
+@pytest.mark.parametrize("case", VERIFY_CASES, ids=[case.name for case in VERIFY_CASES])
+def test_verify_simulation_matches_reference(verify_sim_binary: Path, case, tmp_path: Path) -> None:
+    case_dir = tmp_path / case.name
+    inputs = make_verify_inputs(case)
+    write_verify_inputs(case, inputs, case_dir)
+    proc = _run([verify_sim_binary / "verify_sim_host", case_dir], timeout=1800)
+    print(proc.stdout)
+    got = read_verify_outputs(case, case_dir)
+    assert compare_verify(case, inputs, got) == []
