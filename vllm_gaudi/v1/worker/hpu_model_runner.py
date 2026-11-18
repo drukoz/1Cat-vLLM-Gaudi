@@ -6796,15 +6796,21 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         ################## Spec Decode ##################
         # Now, we will call drafter to propose draft token ids
         if self.speculative_config:
+            if getattr(self.drafter, "draft_rank_stats", None) is not None:
+                # Flash-Next M3b: rank of the target token in the previous step's top-4.
+                self.drafter.draft_rank_stats.observe(
+                    self.input_batch.req_ids[:len(postprocessed_sampled_token_ids)], postprocessed_sampled_token_ids)
             if device_prepared_dflash_drafts is not None:
                 self._draft_token_ids = device_prepared_dflash_drafts
             else:
-                self._draft_token_ids = self.propose_draft_token_ids(
-                    scheduler_output, postprocessed_sampled_token_ids, sampling_metadata, non_flattened_hidden_states,
-                    sample_hidden_states, aux_hidden_states, prefill_sampled_token_ids_device,
-                    decode_sampled_token_ids_device, non_flattened_hidden_states_prefills,
-                    sample_hidden_states_prefills, aux_hidden_states_prefills, num_decodes,
-                    prefill_data if num_prefills > 0 else None, decode_data if num_decodes > 0 else None)
+                with self.profiler.record_event('internal', 'propose_draft_tokens'):
+                    self._draft_token_ids = self.propose_draft_token_ids(
+                        scheduler_output, postprocessed_sampled_token_ids, sampling_metadata,
+                        non_flattened_hidden_states, sample_hidden_states, aux_hidden_states,
+                        prefill_sampled_token_ids_device, decode_sampled_token_ids_device,
+                        non_flattened_hidden_states_prefills, sample_hidden_states_prefills,
+                        aux_hidden_states_prefills, num_decodes,
+                        prefill_data if num_prefills > 0 else None, decode_data if num_decodes > 0 else None)
         ################## Spec Decode end ##################
 
         # Create output.
@@ -9661,6 +9667,11 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                     num_decodes,
                     decode_data,
                 )
+                if getattr(self.drafter, "last_draft_top_ids", None) is not None:
+                    # Remember the decode rows' top-4 before prefill reuses the drafter.
+                    self.drafter.draft_rank_stats.remember(self.input_batch.req_ids[:num_decodes],
+                                                           self.drafter.last_draft_top_ids[:num_decodes])
+                    self.drafter.last_draft_top_ids = None
             # handle prefill
             if prefill_data is not None:
                 # Currently, prefill is done one by one

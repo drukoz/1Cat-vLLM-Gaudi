@@ -31,13 +31,27 @@ from vllm_gaudi.utils import async_h2d_copy
 from vllm_gaudi.v1.attention.backends.hpu_attn import HPUAttentionMetadataV1
 from vllm.model_executor.models.llama_eagle3 import Eagle3LlamaForCausalLM
 
-from vllm_gaudi.v1.spec_decode.flash_next_mtp_steps import (next_step_hidden, ring_slots_from_lattice,
+from vllm_gaudi.v1.spec_decode.flash_next_mtp_steps import (DRAFT_RANK_TOP, DraftRankStats, draft_rank_log_enabled,
+                                                             next_step_hidden, ring_slots_from_lattice,
                                                              split_draft_output)
 from vllm_gaudi.v1.worker.flash_next_inputs import build_block_table
 from vllm_gaudi.v1.spec_decode.hpu_eagle import HpuEagleProposer
 
 
 class HpuFlashNextMtpProposer(HpuEagleProposer):
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._init_draft_rank_log()
+
+    def _init_draft_rank_log(self) -> None:
+        """Draft-rank logging (M3b, VLLM_FLASH_NEXT_DRAFT_RANK_LOG=1, default off).
+
+        Factored out of ``__init__`` so the CPU gate test can run exactly
+        these two lines on an ``object.__new__`` instance.
+        """
+        self.draft_rank_stats = DraftRankStats() if draft_rank_log_enabled() else None
+        self.last_draft_top_ids = None
 
     def propose(
         self,
@@ -57,6 +71,10 @@ class HpuFlashNextMtpProposer(HpuEagleProposer):
         # For decode, the virtual batch_size is batch size * num_tokens
         # and the seq_len is always 1
         batch_size = last_token_indices.shape[0]
+
+        # A prefill-only call must never leave stale top-4 rows for the runner.
+        self.last_draft_top_ids = None
+        draft_top_ids = [] if self.draft_rank_stats is not None else None
 
         if self.method == "eagle3":
             assert isinstance(self.model.model, Eagle3LlamaForCausalLM)
@@ -85,6 +103,8 @@ class HpuFlashNextMtpProposer(HpuEagleProposer):
         # Early exit if there is only one draft token to be generated.
         if self.num_speculative_tokens == 1:
             draft_token_ids = logits.argmax(dim=-1)
+            if self.draft_rank_stats is not None:
+                self.last_draft_top_ids = logits.topk(DRAFT_RANK_TOP, dim=-1).indices.unsqueeze(1)
             return draft_token_ids.view(-1, 1)
 
         # [num_tokens, 1]
@@ -96,6 +116,8 @@ class HpuFlashNextMtpProposer(HpuEagleProposer):
 
         # The first draft tokens
         draft_token_ids = logits.argmax(dim=-1)
+        if self.draft_rank_stats is not None:
+            draft_top_ids.append(logits.topk(DRAFT_RANK_TOP, dim=-1).indices)
         # Generate the remaining draft tokens.
         draft_token_ids_list = [draft_token_ids]
 
@@ -153,10 +175,15 @@ class HpuFlashNextMtpProposer(HpuEagleProposer):
             hidden_states = hidden_states[:batch_size]
             logits = self.model.compute_logits(last_hidden_states[:batch_size])
             draft_token_ids = logits.argmax(dim=-1)
+            if self.draft_rank_stats is not None:
+                draft_top_ids.append(logits.topk(DRAFT_RANK_TOP, dim=-1).indices)
             draft_token_ids_list.append(draft_token_ids)
 
         # [batch_size, num_speculative_tokens]
         draft_token_ids = torch.stack(draft_token_ids_list, dim=1)
+        if self.draft_rank_stats is not None:
+            # [batch_size, num_speculative_tokens, DRAFT_RANK_TOP]
+            self.last_draft_top_ids = torch.stack(draft_top_ids, dim=1)
         return draft_token_ids
 
     def prepare_attn_metadata(
