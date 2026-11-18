@@ -245,3 +245,31 @@ padding is `-1` (`_can_use_direct_gdn_state`), so absolute indexing gives the sa
 - **Debug check**: with `CHECK`, `check_gdn_core_decode_indices` runs before any state is mutated. For `FUSED` it runs
   inside `_maybe_gdn_core_decode`, before the op. For `RECURRENCE` it runs in `forward` right after the gate, before
   Part 2.
+
+## Phase 2 contract: verification over a draft chain or tree
+
+`gdn_core_verify_reference` (`flashinfer_gaudi/gdn_core_verify.py`) runs the fused GDN decode step over `T` draft
+nodes per row, where each node's input state is its **parent** node's output state (`parent_idx`), so the same
+contract covers M3's chain (`parent = t - 1`) and a future draft tree. The phase-2 TPC kernel will implement this
+contract, so tree verification later needs no kernel rework. Torch reference only for now.
+
+```python
+def gdn_core_verify_reference(conv_state, ssm_state,       # [S, 3, C], [S, HV, D, D] fp32, mutated in place (stored nodes only)
+                              mixed_qkv,                   # [B, T, C]
+                              z,                           # [B, T, HV * D]
+                              a, b,                        # [B, T, HV]
+                              A_log, dt_bias, conv_weight_t, norm_weight,  # [HV], [HV], [4, C], [D]
+                              parent_idx,                  # [B, T] int32: parent_idx[:, 0] == -1; 0 <= parent_idx[r, t] < t for t >= 1
+                              load_indices,                # [B] int32: the slot node 0 loads (conv history and SSM state)
+                              store_indices,               # [B, T] int32: where node t's state is stored; out of range = not stored
+                              scale: float, eps: float, gate_activation: int) -> torch.Tensor:  # [B, T, HV, D] fp32
+```
+
+Semantics: node 0 of row `r` loads slot `load_indices[r]`; node `t >= 1` loads the state (conv history and SSM
+state) that node `parent_idx[r, t]` produced. A row whose load slot is out of range is padding: all its outputs are
+zero and it stores nothing. Node `t`'s output does not depend on whether its state is stored. Per-node arithmetic
+is exactly the T = 1 step above (`gdn_core_decode_reference`), applied node by node in increasing `t`; the
+`parent_idx` rule is checked on non-padding rows only.
+
+M3's chain is `parent_idx[r, t] = t - 1`. A tree needs no kernel change, only a different `parent_idx` and
+per-node stores.
