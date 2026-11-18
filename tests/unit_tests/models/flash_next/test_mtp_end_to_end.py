@@ -36,6 +36,9 @@ The attention caches (``CachedSdpaAttention`` for dense, ``SparseSdpaAttention``
 sparse) are truncated to ``p_last + a + 1`` rows after each step: the bonus's K/V row is
 never written by the verification forward, so keeping it would leak the rejected rows'
 keys into the next step.
+
+Every test runs twice: on the torch GDN verification path (``VLLM_HPU_GDN_CORE_VERIFY=0``) and through
+the fused verify op (``1``), and asserts which path ran.
 """
 
 import json
@@ -44,8 +47,12 @@ import os
 os.environ.setdefault("VLLM_PLUGINS", "")
 os.environ["TMPDIR"] = "/tmp"
 
+import pytest  # noqa: E402
 import torch  # noqa: E402
 from vllm.forward_context import set_forward_context  # noqa: E402
+
+from flashinfer_gaudi.gdn_core_verify import GdnCoreVerifyMode  # noqa: E402
+import vllm_gaudi.models.qwen3_5 as qwen3_5  # noqa: E402
 
 from vllm.model_executor.layers.mamba.abstract import MambaBase  # noqa: E402
 from vllm_gaudi.models.qwen4_exp.qsa import HpuQwen4ExpQSAAttention, QsaMode  # noqa: E402
@@ -72,6 +79,26 @@ PLE_WINDOW = 9  # ngram history (8) + the token row
 LONG_PROMPT = 2600
 SPARSE_MAX_MODEL_LEN = 4096
 TAMPER = 51234  # a valid out-of-context token id used to force a rejection
+
+
+@pytest.fixture(autouse=True, params=[GdnCoreVerifyMode.OFF, GdnCoreVerifyMode.FUSED], ids=["verify_off", "verify_fused"])
+def gdn_verify_path(request, monkeypatch):
+    """Run each test on the torch GDN verification path and on gdn_core_verify, and check which one ran."""
+    mode = request.param
+    monkeypatch.setenv("VLLM_HPU_GDN_CORE_VERIFY", str(int(mode)))
+    real = qwen3_5.gdn_core_verify
+    calls = []
+
+    def counting(*args, **kwargs):
+        calls.append(1)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(qwen3_5, "gdn_core_verify", counting)
+    yield mode
+    if mode == GdnCoreVerifyMode.FUSED:
+        assert calls, "mode FUSED never called gdn_core_verify: the test did not exercise the fused path"
+    else:
+        assert not calls, f"mode OFF called gdn_core_verify {len(calls)} times"
 
 
 def _load_prompt(tiny_checkpoint, length: int) -> dict:
