@@ -24,8 +24,9 @@ stops at the first gate that trips, and you send the tarball back.
    # prints: bundle: dist/flash-next-rental-<sha>.tar.gz   (about 56 MB)
    ```
 
-   The bundle contains `run_rental.sh` (top level), `plugin/` (this repository at its commit),
-   `vllm/` (at the engine pin) and `BUNDLE.txt` (plugin sha, branch, vLLM commit, build date).
+   The bundle contains `run_rental.sh` and `prepare_host.sh` (top level), `plugin/` (this
+   repository at its commit), `vllm/` (at the engine pin) and `BUNDLE.txt` (plugin sha, branch,
+   vLLM commit, build date).
 
 2. Copy the tarball to the node (on the node, "scp" from your workstation is fine):
 
@@ -40,6 +41,46 @@ stops at the first gate that trips, and you send the tarball back.
 4. The checkpoint: if the node does not have it yet, add `--download` to the command below; the
    script downloads `Qwen/Qwen3.8-Flash-Next-FP8` (public, not gated) into the `--model` directory
    inside the container (`hf download`, about 185.5 GB — plan 1–2 h of rental time for it).
+
+5. The host: a rented node ships bare Ubuntu 22.04. The first thing to run on it is
+   `sudo bash prepare_host.sh` (from the unpacked bundle), which installs the driver, Docker, the
+   Habana runtime and the image — see [The host (bare Ubuntu 22.04)](#the-host-bare-ubuntu-2204).
+   Plan 15–30 min for it, once per node.
+
+## The host (bare Ubuntu 22.04)
+
+The rental ships bare: Ubuntu 22.04 and nothing else — no Gaudi driver, no Docker, no container
+runtime. Before the run, `prepare_host.sh` (at the top of the unpacked bundle) installs the four
+things `run_rental.sh` needs, pinned to the image's release **1.24.1, build 482**:
+
+1. the Intel Gaudi driver stack (`habanalabs-installer.sh install --type base -y`),
+2. Docker (`docker.io`),
+3. the Habana container runtime, registered with Docker as runtime `habana`, and
+4. the container image (pulled once, about 10 GB, so the run itself does not pay for it).
+
+Run it once per node, as root, from the unpacked bundle (15–30 min, including the image pull):
+
+```bash
+mkdir -p ~/rental && tar xzf ~/flash-next-rental-*.tar.gz -C ~/rental && cd ~/rental
+sudo bash prepare_host.sh
+```
+
+It is idempotent — rerun it freely. A reboot is needed only when its **step 4** (verify driver)
+reports that `hl-smi` does not see all cards; reboot and run it again. Two remedies it detects and
+prints:
+
+- **Kernel headers.** On a custom cloud kernel, `linux-headers-$(uname -r)` is absent and the driver
+  build cannot start; the script stops. Run `apt-get install -y linux-headers-generic
+  linux-image-generic`, reboot into the new kernel, and rerun.
+- **IOMMU on kernel 6.8.** On Ubuntu 22.04.5 (kernel 6.8) the driver needs `iommu=pt intel_iommu=on`
+  in `GRUB_CMDLINE_LINUX_DEFAULT` (`/etc/default/grub`), then `update-grub` and a reboot. The script
+  prints this instruction; it does not edit GRUB.
+
+Useful options: `--version V` / `--build N` (the release pin, default `1.24.1-482`), `--image IMG`,
+`--no-pull` (skip the image pull and the smoke test), `--reinstall-driver` (replace a driver whose
+version differs from the pin — it never silently downgrades), `--force` (continue on a non-22.04
+Ubuntu), and `--dry-run` (print every step's commands; needs no root, apt, docker, or network). When
+the host is not ready, `run_rental.sh` stops and points back at this script.
 
 ## The one command (on the node)
 
@@ -69,6 +110,7 @@ When the run stops at a stop rule, restart after fixing the cause with `--run-id
 
 | Phase | Expected duration |
 |---|---|
+| prepare_host.sh | 15–30 min (once per node) |
 | preflight | about 1 min |
 | install (vLLM, plugin with native kernels, model deps) | 20–40 min |
 | fused GDN gate | about 15 min |
