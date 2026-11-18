@@ -195,6 +195,9 @@ Notes:
 - The install logs are in the results folder as `install-<n>.log`; the per-phase records
   (`startup.json`, `toolchain.json`, `requests.jsonl`, `metrics.jsonl`, `status.json`,
   `summary.*`) are all in the results folder for the run id.
+- Every server runs lazy (`PT_HPU_LAZY_MODE=1`). The native extensions link only the Habana
+  backend library so one build loads in both bridge modes; the checks that prove it on the card
+  are in [native-extensions.md](../native-extensions.md#run-sheet-lines-for-the-next-rental).
 
 ## What to send back
 
