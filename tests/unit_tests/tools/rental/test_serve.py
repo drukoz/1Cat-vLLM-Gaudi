@@ -212,6 +212,29 @@ class TestProcessHandling:
         finally:
             serve.stop_server(proc)  # idempotent: must not raise
 
+    @pytest.mark.parametrize("parent_waits", [True, False])
+    def test_stop_server_kills_workers_left_in_group(self, tmp_path, parent_waits):
+        # A worker that ignores SIGINT outlives its server (which exits on SIGINT, or has already exited).
+        worker = ("import signal, time; signal.signal(signal.SIGINT, signal.SIG_IGN); "
+                  "print('worker up', flush=True); time.sleep(600)")
+        code = (f"import subprocess, sys, time; subprocess.Popen([sys.executable, '-c', {worker!r}]); "
+                f"time.sleep({600 if parent_waits else 0})")
+        log_path = tmp_path / "group.log"
+        proc = serve.start_server([sys.executable, "-c", code], os.environ.copy(), log_path, tmp_path)
+        try:
+            deadline = time.time() + 20
+            while "worker up" not in log_path.read_text() and time.time() < deadline:
+                time.sleep(0.1)
+            assert "worker up" in log_path.read_text()
+            started = time.time()
+            serve.stop_server(proc, timeout_s=2.0)
+            assert time.time() - started < 15
+            assert proc.poll() is not None
+            with pytest.raises(ProcessLookupError):  # the worker is gone too
+                os.killpg(proc.pid, 0)
+        finally:
+            serve.stop_server(proc, timeout_s=2.0)
+
     def test_stop_server_on_exited_process_never_raises(self, tmp_path):
         proc = serve.start_server([sys.executable, "-c", "pass"], os.environ.copy(), tmp_path / "x.log", tmp_path)
         assert proc.wait(timeout=30) == 0

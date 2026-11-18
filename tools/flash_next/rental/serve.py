@@ -195,27 +195,39 @@ def _killpg_safe(pgid: int, sig: int) -> None:
         os.killpg(pgid, sig)
 
 
+def _group_alive(pgid: int) -> bool:
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return False
+    except OSError:  # EPERM: macOS answers it for a member that is exiting or a zombie
+        return True
+    return True
+
+
 def stop_server(proc: subprocess.Popen, timeout_s: float = 60.0) -> None:
     """SIGINT the server's process group, SIGKILL it after `timeout_s`; never raises.
 
     The group covers the server and all of its TP workers (one session, see
-    `start_server`). An already-exited process is left as it is.
+    `start_server`, so the group id is the server's pid). It waits for the whole
+    group, not just the server: a server that exited (or crashed) can leave
+    workers behind that still hold the cards the next variant needs.
     """
-    if proc.poll() is not None:
+    pgid = proc.pid
+    proc.poll()  # reap an exited server so its zombie does not count as alive
+    if not _group_alive(pgid):
         return
-    try:
-        pgid = os.getpgid(proc.pid)
-    except (ProcessLookupError, PermissionError, OSError):
-        pgid = None
-    if pgid is not None:
-        _killpg_safe(pgid, signal.SIGINT)
-    try:
-        proc.wait(timeout=timeout_s)
-    except subprocess.TimeoutExpired:
-        if pgid is not None:
-            _killpg_safe(pgid, signal.SIGKILL)
-        with contextlib.suppress(subprocess.TimeoutExpired):
-            proc.wait(timeout=5.0)
+    _killpg_safe(pgid, signal.SIGINT)
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        proc.poll()
+        if not _group_alive(pgid):
+            return
+        time.sleep(0.2)
+    _killpg_safe(pgid, signal.SIGKILL)
+    deadline = time.monotonic() + 5.0
+    while time.monotonic() < deadline and (proc.poll() is None or _group_alive(pgid)):
+        time.sleep(0.1)
 
 
 def main(argv: list[str] | None = None) -> int:
