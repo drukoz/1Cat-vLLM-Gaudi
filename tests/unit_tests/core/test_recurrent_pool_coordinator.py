@@ -53,6 +53,7 @@ from vllm.v1.request import Request  # noqa: E402
 
 from vllm_gaudi.v1.core.recurrent_pool_coordinator import HpuRecurrentPoolCoordinator  # noqa: E402
 from vllm_gaudi.v1.core.recurrent_state_pool import ENV_MODE, ENV_SLOTS  # noqa: E402
+from vllm_gaudi.v1.worker.recurrent_lattice import align_lattice  # noqa: E402
 
 BLOCK, HASH_BLOCK = 512, 128
 NUM_ATTN_BLOCKS = 200
@@ -288,3 +289,81 @@ def test_align_spec_scratch_blocks_count_against_pool(monkeypatch):
 
     mgr.free(req1)
     assert mgr.allocate_slots(req2, BLOCK, num_new_computed_tokens=hit, new_computed_blocks=blocks) is not None
+
+
+def test_align_spec_block_rows_across_steps(monkeypatch):
+    """Spike RUK-2847: record the recurrent group's block-table row across MTP decode steps.
+
+    Drives one request through the real KVCacheManager (pool mode, 3 speculative blocks, align
+    cache mode), accepting 1..4 tokens per MTP verification step, across 3 block boundaries.
+    Prints one line per step (ctx, row length, row tail, align_lattice load/store) for the
+    report; asserts only the layout rules observed in this trace.
+    """
+    k = 3
+    sched = 1 + k
+    accepts = [4, 1, 2, 3, 4, 4, 1, 4, 3, 2] + [4] * 260
+
+    mgr = build_manager(monkeypatch, mode="1", slots="64", config=_spec3_config())
+    null_id = mgr.coordinator.recurrent_pool.null_block.block_id
+    attn_free_at_start = mgr.block_pool.get_num_free_blocks()
+    recurrent_free_at_start = mgr.coordinator.recurrent_pool.get_num_free_blocks()
+
+    req = make_request("r1", BLOCK - 2)
+    blocks, hit, _ = mgr.get_computed_blocks(req)
+    assert mgr.allocate_slots(req, BLOCK - 2, num_new_computed_tokens=hit, new_computed_blocks=blocks) is not None
+    req.num_computed_tokens += BLOCK - 2
+
+    print(f"\nprefill: row={list(mgr.get_block_ids(req.request_id)[1])}")
+    prev_ctx = req.num_computed_tokens
+    prev_window = None
+    null_load_steps = []
+    boundary_steps = []
+    for step, a in enumerate(accepts):
+        assert mgr.allocate_slots(req, sched) is not None
+        ctx = req.num_computed_tokens
+        row = list(mgr.get_block_ids(req.request_id)[1])
+        load, store = align_lattice(row, ctx, sched, BLOCK, k)
+        n_pos = -(-(ctx + sched) // BLOCK)
+        print(f"step={step:3d} ctx={ctx:5d} a={a} len(row)={len(row):2d} n_pos={n_pos:2d} "
+              f"tail={row[-6:]} load={load} store={store}")
+
+        # Row length rule observed for align mode with 3 speculative blocks.
+        assert len(row) == -(-(ctx + sched) // BLOCK) + k
+
+        # The scratch window is exactly the last k entries, row[n_pos:n_pos+k], never null.
+        window = row[n_pos:n_pos + k]
+        assert window == row[-k:]
+        assert all(b != null_id for b in window)
+        if prev_window is not None:
+            if window != prev_window:
+                # Only steps that append one position block move the window: it shifts left
+                # by one (the leftmost id becomes the new position block) and gains one id.
+                assert window == prev_window[1:] + [window[-1]]
+                assert window[-1] not in prev_window
+        prev_window = window
+
+        # store[0] (this step's running-state block) and load[0] are real blocks: the running
+        # position block (index ctx//bs, and (ctx-1)//bs == ctx//bs for ctx % bs != 0) is
+        # never freed; only strictly older blocks are nulled by remove_skipped_blocks.
+        assert store[0] != null_id
+        if load[0] == null_id:
+            null_load_steps.append(step)
+        assert load[0] != null_id
+
+        # The step right after a crossing: the previous running position block is nulled.
+        if prev_ctx // BLOCK < ctx // BLOCK:
+            boundary_steps.append(step)
+            assert row[(prev_ctx - 1) // BLOCK] == null_id
+        prev_ctx = ctx
+        req.num_computed_tokens += a
+        if ctx > 3 * BLOCK:
+            break
+
+    print(f"summary: steps_done={step + 1} final_ctx={ctx} final_row={row}")
+    print(f"summary: null_load_steps={null_load_steps} boundary_crossing_steps={boundary_steps}")
+    assert len(boundary_steps) == 3
+
+    mgr.free(req)
+    assert mgr.block_pool.get_num_free_blocks() == attn_free_at_start
+    assert mgr.coordinator.recurrent_pool.get_num_free_blocks() == recurrent_free_at_start
+
