@@ -130,33 +130,31 @@ RESULTS="${RESULTS:-$PWD/results}"
 MODEL_PARENT="$(dirname "$MODEL")"
 MODEL_NAME="$(basename "$MODEL")"
 
-if [ "$DOWNLOAD" -eq 1 ]; then
-    if [ "$NO_DISK_CHECK" -eq 1 ]; then
-        echo "warning: free-space checks skipped (--no-disk-check)" >&2
-    else
-        need=$((DOWNLOAD_NEED_GB * 1000000000))
-        if [ -d "$MODEL" ]; then
-            used_kb="$(du -sk "$MODEL" 2>/dev/null | awk 'NR==1 {print $1}' || true)"
-            case "$used_kb" in
-                '' | *[!0-9]*) ;;
-                *) need=$((need - used_kb * 1024)) ;;
-            esac
-        fi
-        if [ "$need" -lt 0 ]; then need=0; fi
-        dir="$(existing_dir "$MODEL")"
-        free="" mnt=""
-        read -r free mnt < <(disk_free "$dir") || true
-        if [ -z "$free" ]; then
-            echo "warning: cannot read the free space of $dir; continuing" >&2
-        elif [ "$free" -lt "$need" ]; then
-            echo "error: $dir (filesystem mounted at $mnt) has $((free / 1000000000)) GB free; --download needs \
+if [ "$NO_DISK_CHECK" -eq 1 ]; then
+    echo "warning: free-space checks skipped (--no-disk-check)" >&2
+elif [ "$DOWNLOAD" -eq 1 ]; then
+    need=$((DOWNLOAD_NEED_GB * 1000000000))
+    if [ -d "$MODEL" ]; then
+        used_kb="$(du -sk "$MODEL" 2>/dev/null | awk 'NR==1 {print $1}' || true)"
+        case "$used_kb" in
+            '' | *[!0-9]*) ;;
+            *) need=$((need - used_kb * 1024)) ;;
+        esac
+    fi
+    if [ "$need" -lt 0 ]; then need=0; fi
+    dir="$(existing_dir "$MODEL")"
+    free="" mnt=""
+    read -r free mnt < <(disk_free "$dir") || true
+    if [ -z "$free" ]; then
+        echo "warning: cannot read the free space of $dir; continuing" >&2
+    elif [ "$free" -lt "$need" ]; then
+        echo "error: $dir (filesystem mounted at $mnt) has $((free / 1000000000)) GB free; --download needs \
 $((need / 1000000000)) GB there (the 185.5 GB checkpoint plus room for the results). Fix: sudo bash \
 $SCRIPT_DIR/prepare_host.sh --data-disk DEV (an unused disk from lsblk, mounted at /models), or point --model \
 at a disk with room, or pass --no-disk-check." >&2
-            exit 1
-        else
-            echo "disk: $dir has $((free / 1000000000)) GB free, --download needs $((need / 1000000000)) GB: ok"
-        fi
+        exit 1
+    else
+        echo "disk: $dir has $((free / 1000000000)) GB free, --download needs $((need / 1000000000)) GB: ok"
     fi
 fi
 if [ "$DOWNLOAD" -eq 1 ]; then
