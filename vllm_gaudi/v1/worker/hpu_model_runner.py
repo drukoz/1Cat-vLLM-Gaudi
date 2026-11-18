@@ -5058,9 +5058,13 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             lattice_store_differs = False
             recurrent_boundary = None
             if self.use_prefix_caching:
-                load_state_indices_cpu = self.prepare_mamba_state_idxs(req_indices, block_idx_last_computed_token_cpu,
-                                                                       padded_batch_size, state_width,
-                                                                       load_offsets)
+                # Align mode (M3-T10c-5): a plain decode step under MTP runs in its running block
+                # row[block_idx_last_scheduled_token]; the pre-step copy has put the state there at offset 0.
+                # Loading row[(ctx-1)//bs] at a block-aligned ctx let PLE overwrite the committed checkpoint.
+                load_blocks = (block_idx_last_scheduled_token_cpu if is_recurrent_spec_decode and not is_spec_batch
+                               else block_idx_last_computed_token_cpu)
+                load_state_indices_cpu = self.prepare_mamba_state_idxs(req_indices, load_blocks, padded_batch_size,
+                                                                       state_width, load_offsets)
                 store_state_indices_cpu = self.prepare_mamba_state_idxs(req_indices, block_idx_last_scheduled_token_cpu,
                                                                         padded_batch_size, state_width)
                 if is_spec_batch:
