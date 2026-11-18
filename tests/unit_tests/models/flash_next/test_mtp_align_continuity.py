@@ -51,6 +51,9 @@ Per step the harness asserts the pre-step plan, ``a``, the boundary pairs and th
 flag equal the task trace, the committed stream equals ``gen`` over the overlapping length,
 and that the step's ``read``/``log0``/``ckpt`` gaps plus the final read gap are <= FP32_TOL.
 Plain asserts: a divergence fails the run, the harness skips and weakens nothing.
+
+Every test runs twice: on the torch GDN verification path (``VLLM_HPU_GDN_CORE_VERIFY=0``) and through
+the fused verify op (``1``), and asserts which path ran.
 """
 
 import os
@@ -58,8 +61,12 @@ import os
 os.environ.setdefault("VLLM_PLUGINS", "")
 os.environ["TMPDIR"] = "/tmp"
 
+import pytest  # noqa: E402
 import torch  # noqa: E402
 from vllm.forward_context import set_forward_context  # noqa: E402
+
+from flashinfer_gaudi.gdn_core_verify import GdnCoreVerifyMode  # noqa: E402
+import vllm_gaudi.models.qwen3_5 as qwen3_5  # noqa: E402
 
 from vllm_gaudi.v1.worker.recurrent_commit import (  # noqa: E402
     align_precopy_plan, boundary_commits, commit_conv, commit_ssm, precopy_slot_pairs, self_commit_requests)
@@ -77,6 +84,27 @@ BS = 4  # the synthetic block size: 4 positions per recurrent state slot
 PROMPT_LEN = 33
 BLOCK_SLOT0 = 8  # position block i is recurrent state slot BLOCK_SLOT0 + i
 NUM_SLOTS = 40  # block slots 8..22 + the straight/spec slots
+
+
+@pytest.fixture(autouse=True, params=[GdnCoreVerifyMode.OFF, GdnCoreVerifyMode.FUSED], ids=["verify_off", "verify_fused"])
+def gdn_verify_path(request, monkeypatch):
+    """Run each test on the torch GDN verification path and on gdn_core_verify, and check which one ran."""
+    mode = request.param
+    monkeypatch.setenv("VLLM_HPU_GDN_CORE_VERIFY", str(int(mode)))
+    real = qwen3_5.gdn_core_verify
+    calls = []
+
+    def counting(*args, **kwargs):
+        calls.append(1)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(qwen3_5, "gdn_core_verify", counting)
+    yield mode
+    if mode == GdnCoreVerifyMode.FUSED:
+        assert calls, "mode FUSED never called gdn_core_verify: the test did not exercise the fused path"
+    else:
+        assert not calls, f"mode OFF called gdn_core_verify {len(calls)} times"
+
 
 _SCENARIOS = {
     "S0": {

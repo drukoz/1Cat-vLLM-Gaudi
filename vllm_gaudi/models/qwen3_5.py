@@ -11,6 +11,11 @@ from flashinfer_gaudi.gdn_core_decode import (
     gdn_recurrent_decode,
     gdn_recurrent_decode_available,
 )
+from flashinfer_gaudi.gdn_core_verify import (
+    GdnCoreVerifyMode,
+    gdn_core_verify,
+    gdn_core_verify_available,
+)
 from flashinfer_gaudi.gdn_decode import gated_delta_rule_mtp_packed
 from vllm.logger import init_logger
 from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import QwenGatedDeltaNetAttention
@@ -259,6 +264,10 @@ class HPUGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             getattr(getattr(self, "norm", None), "activation", None))
         self._gdn_core_ok = None  # None = not checked yet; then True/False, once per layer
 
+        # Fused GDN verification (track phase 2): MTP verification steps and the plain step after one.
+        self.gdn_core_verify_mode = GdnCoreVerifyMode(envs.VLLM_HPU_GDN_CORE_VERIFY)
+        self._gdn_core_verify_ok = None  # None = not checked yet; then True/False, once per layer
+
     def _gdn_core_decode_reason(self, conv_state: torch.Tensor, ssm_state: torch.Tensor) -> str | None:
         """Why this layer's core-decode op (FUSED or RECURRENCE) cannot serve it, or ``None`` when it can."""
         fused = self.gdn_core_decode_mode == GdnCoreDecodeMode.FUSED
@@ -349,6 +358,92 @@ class HPUGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         if self.gdn_core_decode_mode != GdnCoreDecodeMode.RECURRENCE:
             return False
         return self._gdn_core_decode_ready(load_state_indices, store_state_indices, num_tokens, num_accepted_tokens)
+
+    def _gdn_core_verify_reason(self, conv_state: torch.Tensor, ssm_state: torch.Tensor) -> str | None:
+        """Why this layer's fused verification op cannot serve it, or ``None`` when it can."""
+        if self._gdn_core_gate is None:
+            return (f"output gate {getattr(getattr(self, 'norm', None), 'activation', None)!r} "
+                    "is not silu or sigmoid")
+        if self.conv1d.bias is not None:
+            return "conv1d has a bias"
+        if self.conv_kernel_size != 4:
+            return f"conv kernel size {self.conv_kernel_size} is not 4"
+        if self.head_k_dim != self.head_v_dim:
+            return f"head dims k={self.head_k_dim} v={self.head_v_dim} differ"
+        if conv_state.dim() != 3 or conv_state.shape[1] < 3:
+            return f"conv state rows {tuple(conv_state.shape)} are not [S, R >= 3, C]"
+        if ssm_state.dtype != torch.float32:
+            return f"ssm state dtype {ssm_state.dtype} is not fp32"
+        if _triton_gaudi_mode == "strict":
+            return "Triton strict mode runs the Triton-only decode graph"
+        if self.dflash_conv_round_before_activation:
+            return "VLLM_HPU_DFLASH2_CONV_ROUND_BEFORE_ACTIVATION rounds the conv output before SiLU"
+        if ssm_state.device.type == "hpu":
+            if self.head_v_dim != 128:
+                return f"the HPU kernel requires head_v_dim 128, got {self.head_v_dim}"
+            if not gdn_core_verify_available(ssm_state.device):
+                return _GDN_CORE_NO_EXTENSION
+        if not gdn_core_verify_available(ssm_state.device):
+            return f"no gdn_core_verify kernel for {ssm_state.device.type}"
+        return None
+
+    def _log_gdn_core_verify_off(self, reason: str) -> None:
+        """Log once per layer why it runs the torch verification path (debug level for a missing HPU extension)."""
+        log = logger.debug if reason == _GDN_CORE_NO_EXTENSION else logger.warning
+        log("GDN core verify (VLLM_HPU_GDN_CORE_VERIFY=%d) is off for %s: %s; using the torch verification path",
+            int(self.gdn_core_verify_mode), getattr(self, "prefix", type(self).__name__), reason)
+
+    def _maybe_gdn_core_verify(self, mixed_qkv, z, a, b, load_state_indices, store_state_indices, num_tokens,
+                               num_accepted_tokens, query_start_loc, lattice_store_differs, direct_gdn_state):
+        """The fused verification op's ``[num_tokens, HV, D]`` fp32 output, or ``None`` for the torch path."""
+        if self.gdn_core_verify_mode != GdnCoreVerifyMode.FUSED:
+            return None
+        load, store, qsl = load_state_indices, store_state_indices, query_start_loc
+        if num_accepted_tokens is None or load is None or qsl is None or self._hpu_defer_ssm_writeback:
+            return None
+        conv_pool, ssm_pool = self.kv_cache[0], self.kv_cache[1]
+        B = qsl.numel() - 1
+        R = conv_pool.shape[1] if conv_pool.dim() == 3 else 0
+        if load.dim() == 2:  # verification step: the [B, T] lattice
+            T = load.shape[1]
+            if load.shape[0] != B or num_tokens != B * T or (store is not None and store.shape != load.shape):
+                return None
+        elif load.dim() == 1:  # the plain step after a verification
+            T = 1
+            if (direct_gdn_state or load.shape[0] != B or num_tokens != B
+                    or (store is not None and store.shape != load.shape)):
+                return None  # direct state takes a narrowed conv view in mode 0, which the op does not reproduce
+        else:
+            return None
+        if not (1 <= T <= 8 and T + 2 <= R):
+            return None
+        if self._gdn_core_verify_ok is None:
+            reason = self._gdn_core_verify_reason(conv_pool, ssm_pool)
+            self._gdn_core_verify_ok = reason is None
+            if reason is not None:
+                self._log_gdn_core_verify_off(reason)
+        if not self._gdn_core_verify_ok:
+            return None
+        acc = num_accepted_tokens[:B].long()
+        query_len = (qsl[1:B + 1] - qsl[:B]).long().clamp(0, T)
+        conv_offset = acc.clamp(1, R - 2) - 1           # the conv path's clamp
+        if load.dim() == 2:
+            store_lattice = store if (lattice_store_differs and store is not None) else load
+            conv_load, conv_store = load[:, 0], store_lattice[:, 0]
+            ssm_load = load.gather(1, (acc.clamp(1, T) - 1).unsqueeze(1)).squeeze(1)   # the SSM path's clamp
+            ssm_store = store_lattice
+        else:
+            base = store if store is not None else load     # conv reads and writes the base row
+            conv_load, conv_store, ssm_load = base, base, load
+            ssm_store = base.unsqueeze(1)
+        row_indices = torch.stack([conv_load.long(), conv_offset, conv_store.long(), ssm_load.long(), query_len],
+                                  dim=1).to(torch.int32).contiguous()
+        weight = self.conv1d.weight
+        conv_weight_t = weight.view(weight.size(0), weight.size(2)).t().contiguous()
+        return gdn_core_verify(conv_pool, ssm_pool, mixed_qkv.contiguous(), z.reshape(num_tokens, -1).contiguous(),
+                               a.contiguous(), b.contiguous(), self.A_log.float(), self.dt_bias.float(), conv_weight_t,
+                               self.norm.weight, row_indices, ssm_store.to(torch.int32).contiguous(),
+                               self.head_k_dim**-0.5, self.norm.eps, int(self._gdn_core_gate))
 
     def rearrange_mixed_qkv(self, mixed_qkv):
         """Pure-torch rearrange – avoids einops graph breaks on HPU."""
@@ -554,6 +649,10 @@ class HPUGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         if conv_state is not None and not is_prompt:
             gdn_core_out = self._maybe_gdn_core_decode(mixed_qkv, z, a, b, load_state_indices, store_state_indices,
                                                        num_tokens, num_accepted_tokens, query_start_loc)
+            if gdn_core_out is None:
+                gdn_core_out = self._maybe_gdn_core_verify(mixed_qkv, z, a, b, load_state_indices, store_state_indices,
+                                                           num_tokens, num_accepted_tokens, query_start_loc,
+                                                           lattice_store_differs, direct_gdn_state)
             use_gdn_recurrent = self._use_gdn_recurrent_decode(load_state_indices, store_state_indices, num_tokens,
                                                                num_accepted_tokens)
             if use_gdn_recurrent:
@@ -693,7 +792,8 @@ class HPUGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             core_attn_out[:non_spec_out.shape[0]] = non_spec_out
 
         elif gdn_core_out is not None:
-            # === Part 2c: fused core decode (conv, gates, recurrence, gated RMSNorm in one op) ===
+            # === Part 2c: fused core decode/verify (one op: conv, gates, recurrence, gated RMSNorm; serves
+            # gdn_core_decode and gdn_core_verify) ===
             core_attn_out = gdn_core_out.to(core_attn_out.dtype)
 
         else:
