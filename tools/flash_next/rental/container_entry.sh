@@ -172,6 +172,11 @@ if [ "$SKIP_INSTALL" -eq 0 ]; then
         "$TPC_CLANG" "$(json_str "$TPC_CLANG_PATH")" "$(json_str "$TPC_CLANG_VERSION")" \
         "$(json_str "$HABANA_TOOLS_DPKG")" "$TOOLS_INSTALLED_BY_SCRIPT" "$NATIVE" \
         >"$LOG_DIR/toolchain.json"
+    # --no-build-isolation skips the build-system requires of vLLM and the plugin, and the Habana
+    # image lacks some (setuptools-rust broke step 1 on the 2026-11-18 rental): install them here,
+    # never torch (the image's Habana torch must stay).
+    install_step 0b "build tools" pip install "setuptools>=77.0.3,<81.0.0" "setuptools-scm>=8.0" \
+        "setuptools-rust>=1.9.0" "packaging>=24.2" wheel jinja2
     # The bundle's vllm/ is a git archive (no .git), so setuptools_scm cannot find a version and
     # the install fails; pin the version G1 checks (vLLM's own override hook in its setup.py).
     install_step 1 "vllm (engine pin)" env VLLM_TARGET_DEVICE=empty \
