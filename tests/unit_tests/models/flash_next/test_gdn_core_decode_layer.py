@@ -78,13 +78,17 @@ class CountingOp:
 
 
 class RecordingLogger:
-    """Stand-in for ``qwen3_5.logger`` that records the raw ``warning(*args)`` tuples."""
+    """Stand-in for ``qwen3_5.logger`` that records the raw ``warning(*args)`` and ``debug(*args)`` tuples."""
 
     def __init__(self) -> None:
         self.warnings: list[tuple] = []
+        self.debugs: list[tuple] = []
 
     def warning(self, *args) -> None:
         self.warnings.append(args)
+
+    def debug(self, *args) -> None:
+        self.debugs.append(args)
 
 
 def run(model, vllm_config, eos, atts, slot: int = SLOT) -> torch.Tensor:
@@ -130,24 +134,24 @@ def slot_state_rows(modules, slot: int) -> list[torch.Tensor]:
     return [module.kv_cache[k][slot] for module in modules for k in range(len(module.kv_cache))]
 
 
-def test_mode_defaults_off(tiny_checkpoint, monkeypatch):
-    """With the variable unset, every GDN layer starts in GdnCoreDecodeMode.OFF."""
+def test_mode_defaults_fused(tiny_checkpoint, monkeypatch):
+    """With the variable unset, every GDN layer starts in GdnCoreDecodeMode.FUSED."""
     monkeypatch.delenv("VLLM_HPU_GDN_CORE_DECODE", raising=False)
     with cpu_model(tiny_checkpoint, fp32=True) as (vllm_config, model):
         layers = gdn_layers(model)
         assert len(layers) == GDN_LAYERS
         for module in layers:
-            assert module.gdn_core_decode_mode == GdnCoreDecodeMode.OFF
+            assert module.gdn_core_decode_mode == GdnCoreDecodeMode.FUSED
 
 
 def test_flag_reaches_layers(tiny_checkpoint, monkeypatch):
-    """VLLM_HPU_GDN_CORE_DECODE=1 set before the build makes every GDN layer FUSED (envs is lazy)."""
-    monkeypatch.setenv("VLLM_HPU_GDN_CORE_DECODE", "1")
+    """VLLM_HPU_GDN_CORE_DECODE=0 set before the build makes every GDN layer OFF (envs is lazy)."""
+    monkeypatch.setenv("VLLM_HPU_GDN_CORE_DECODE", "0")
     with cpu_model(tiny_checkpoint, fp32=True) as (vllm_config, model):
         layers = gdn_layers(model)
         assert len(layers) == GDN_LAYERS
         for module in layers:
-            assert module.gdn_core_decode_mode == GdnCoreDecodeMode.FUSED
+            assert module.gdn_core_decode_mode == GdnCoreDecodeMode.OFF
 
 
 def test_fused_matches_torch_path_fp32(tiny_checkpoint, monkeypatch):
@@ -283,6 +287,20 @@ def test_fallback_when_op_unavailable(tiny_checkpoint, monkeypatch):
         off_rows = run(model, vllm_config, eos, atts)
         diff = (fused_rows - off_rows).abs().max().item()
         assert diff <= FALLBACK_TOL, f"the fallback run differs from mode OFF by {diff:.3e} > {FALLBACK_TOL:.0e}"
+
+
+def test_missing_extension_is_logged_at_debug(tiny_checkpoint, monkeypatch):
+    """A missing HPU extension (already warned once at startup) is a debug line; other reasons stay warnings."""
+    with cpu_model(tiny_checkpoint, fp32=True) as (vllm_config, model):
+        layer = gdn_layers(model)[0]
+        log = RecordingLogger()
+        monkeypatch.setattr(qwen3_5, "logger", log)
+        layer._log_gdn_core_off(qwen3_5._GDN_CORE_NO_EXTENSION)
+        assert log.warnings == [] and len(log.debugs) == 1
+        assert "is off for" in log.debugs[0][0] % log.debugs[0][1:]
+        layer._log_gdn_core_off("conv1d has a bias")
+        assert len(log.warnings) == 1 and len(log.debugs) == 1
+        assert "conv1d has a bias" in log.warnings[0][0] % log.warnings[0][1:]
 
 
 def test_fused_output_is_used(tiny_checkpoint, monkeypatch):

@@ -70,6 +70,7 @@ def test_available():
 
 def test_flag_default_and_value(monkeypatch):
     monkeypatch.delenv("VLLM_HPU_GDN_CORE_DECODE", raising=False)
-    assert vllm_gaudi.envs.VLLM_HPU_GDN_CORE_DECODE == 0
-    monkeypatch.setenv("VLLM_HPU_GDN_CORE_DECODE", "1")
+    assert vllm_gaudi.envs.VLLM_HPU_GDN_CORE_DECODE == 1
     assert GdnCoreDecodeMode(vllm_gaudi.envs.VLLM_HPU_GDN_CORE_DECODE) is GdnCoreDecodeMode.FUSED
+    monkeypatch.setenv("VLLM_HPU_GDN_CORE_DECODE", "0")
+    assert GdnCoreDecodeMode(vllm_gaudi.envs.VLLM_HPU_GDN_CORE_DECODE) is GdnCoreDecodeMode.OFF
