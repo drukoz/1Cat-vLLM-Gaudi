@@ -19,11 +19,16 @@ model ignores `mtp.*`, so `from_pretrained` on the checkpoint loads the target u
 
 `test_mtp_end_to_end.py` (M3-T8) drives the full draft-K / verify / accept loop end to end: a dense 6-step greedy
 stream on the 33-token prompt against the HF reference, GDN/PLE state parity against an interleaved single-token
-chain, a forced rejection (tampered draft) that must roll back cleanly, one step on the 2600-token prompt in
-`QsaMode.SPARSE` with indexer key-ring/compressed-cache parity, and mutation probes on the drafter hidden and on
-`num_accepted`. Slots (`num_slots=8`): the verification rows write lattice slots 1–4 (state rows / sparse ring
-slots), the speculative chain lives at lattice slot 1 and moves to `lattice[a]` after committing `a` drafts, the
-reference single-token chain runs at slot 5, the drafter at slot 2.
+chain, an accept-path parity test with a fixed `[3, 1, x, 2]` acceptance schedule, a forced rejection (tampered
+draft) that must roll back cleanly, one step on the 2600-token prompt in `QsaMode.SPARSE` with indexer
+key-ring/compressed-cache parity, and mutation probes on the drafter hidden and on `num_accepted`. The random tiny
+model's own drafts are never accepted, so the accept-path, rollback, sparse and `num_accepted`-mutation tests feed
+*oracle drafts*: the drafter still runs, but its drafts are replaced by the reference's own greedy continuation
+(`generated_ids`) before the verification, which makes greedy verification accept exactly the oracle prefix and
+drives the lattice load `idx[num_accepted - 1]` with `num_accepted > 1`. Slots (`num_slots=8`): the verification
+rows write lattice slots 1–4 (state rows / sparse ring slots), the speculative chain lives at lattice slot 1 and
+moves to `lattice[a]` after committing `a` drafts, the reference single-token chain runs at slot 5, the drafter at
+slot 2.
 
 Run tests from the worktree root with the S0 environment and `PYTHONPATH="$PWD"`, so the worktree's `vllm_gaudi`
 is the one imported (see `docs/design/flash-next/plan.md`, "Conventions").
