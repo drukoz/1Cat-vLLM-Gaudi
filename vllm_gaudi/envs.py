@@ -1853,9 +1853,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
 
     # Flash-Next Qwen4-Exp QSA attention mode. 0 (default) = dense: exact
     # causal attention over the full prefix through the standard HPU
-    # Attention layer, indexer weights loaded for checkpoint compatibility
-    # only. 1 = sparse (indexer top-k selection): reserved for M2 and raises
-    # NotImplementedError.
+    # Attention layer, exact only for prompts up to 2050 tokens. 1 = sparse
+    # (the indexer's top-512 blocks of 4 tokens plus the current tail):
+    # required for correct output on any prompt beyond 2050 tokens;
+    # production runs 1.
     "VLLM_HPU_FLASH_NEXT_QSA_MODE":
     lambda: int(os.environ.get("VLLM_HPU_FLASH_NEXT_QSA_MODE", "0")),
 
