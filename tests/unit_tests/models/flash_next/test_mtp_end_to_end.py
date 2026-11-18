@@ -10,20 +10,32 @@ GDN/PLE state parity against an interleaved single-token chain, a forced rejecti
 ``QsaMode.SPARSE`` with indexer side-cache parity, and two mutation probes that break
 the chain on purpose.
 
+Three tests feed *oracle drafts*: the drafter still runs, but its drafts are replaced by
+HF's own greedy continuation (the reference's ``generated_ids``) before the verification,
+so greedy verification accepts exactly the oracle prefix. That drives the lattice load
+``idx[num_accepted - 1]`` and the ``num_accepted - 1`` conv-window selection with
+``num_accepted > 1`` (the random tiny model's own drafts accept nothing), and fixes the
+acceptance schedule ``[3, 1, x, 2]`` of the accept-path parity test and the forced
+rejection (a tampered ``d_2`` after a 3-draft commit).
+
 Slot layout (``num_slots=8``): the verification rows write lattice slots ``[1, 2, 3, 4]``
-(state rows of the expanded GDN/PLE caches and the sparse ring slots). The speculative
-chain runs at ``lattice[0] = 1``; after committing ``a`` drafts the chain's state lives at
-``lattice[a]``. The reference single-token chain runs at slot 5, the drafter at slot 2.
-With an MTP config the harness binds the expanded states (GDN conv ``(8, 6, 1280)``, PLE
-conv ``(8, 12, 512)``); the kernels use rows ``[0:state_len)`` for prefill, single-token
-decode and the speculative window alike, so the committed spec window ``[a : a + n)``
-(window 3 for GDN conv, 9 for PLE conv) is compared with the straight chain's ``[0 : n)``.
-The SSM state of the committed step is the lattice row ``lattice[a]``, which is the state
-after the last committed *input* token - the straight chain decodes the committed stream
-up to (and excluding) the bonus. The attention caches (``CachedSdpaAttention`` for dense,
-``SparseSdpaAttention`` for sparse) are truncated to ``p_last + a + 1`` rows after each
-step: the bonus's K/V row is never written by the verification forward, so keeping it
-would leak the rejected rows' keys into the next step.
+(GDN/PLE SSM state rows and the sparse ring slots). The speculative chain runs at
+``lattice[0] = 1``; after committing ``a`` drafts the chain's state lives at
+``lattice[a]``, and the next verification loads ``idx[a]`` (its ``num_accepted = a + 1``).
+The reference single-token chain runs at slot 5, the drafter at slot 2. With an MTP config
+the harness binds the expanded states (GDN conv ``(8, 6, 1280)``, PLE conv ``(8, 12, 512)``);
+the kernels use rows ``[0:state_len)`` for prefill, single-token decode and the speculative
+window alike, so the committed spec window ``[a : a + n)`` (window 3 for GDN conv, 9 for PLE
+conv) is compared with the straight chain's ``[0 : n)``. The SSM state of the committed step
+is the lattice row ``lattice[a]``, which is the state after the last committed *input*
+token - the straight chain decodes the committed stream up to (and excluding) the bonus.
+The GDN/PLE conv and the sparse key ring live in the lattice's column-0 slot (the request's
+slot, ``lattice[0]``) and are windowed/positioned per ``num_accepted`` / position, so their
+comparisons run at slot ``lattice[0]`` over the committed rows, not at ``lattice[a]``.
+The attention caches (``CachedSdpaAttention`` for dense, ``SparseSdpaAttention`` for
+sparse) are truncated to ``p_last + a + 1`` rows after each step: the bonus's K/V row is
+never written by the verification forward, so keeping it would leak the rejected rows'
+keys into the next step.
 """
 
 import json
@@ -53,6 +65,7 @@ SPEC_SLOT = 1
 STRAIGHT_SLOT = 5
 DRAFT_SLOT = 2
 FP32_TOL = 1e-5  # the M0/M2 fp32 parity tolerance
+MUT_TOL = 1e-3  # a mutation must break parity by more than this
 GDN_WINDOW = 3  # conv history (2 taps) + the token row, per committed input row
 PLE_WINDOW = 9  # ngram history (8) + the token row
 LONG_PROMPT = 2600
@@ -161,21 +174,27 @@ def _draft_tokens(draft, vllm_config, eos, stream, pos0, atts, hidden, n_draft: 
 
 
 def _mtp_step(target, draft, vllm_config, seq, p_last, n_accepted, eos, atts, draft_atts, multi_last, tamper=None,
-              force_accepted=None):
+              oracle=None, num_accepted_override=None):
     """One draft-K / verify / accept step; returns ``(n, seq, multi_row, a, bonus, logits)``.
 
-    ``tamper=(idx, tok)`` replaces draft ``idx`` (forced rejection); ``force_accepted`` overrides
-    the acceptance count (mutation probe b).
+    ``tamper=(idx, tok)`` replaces draft ``idx`` (forced rejection). ``oracle`` (the reference's
+    greedy tokens after the last committed token) replaces the drafter's drafts *after* the
+    drafter has run, so the greedy verification accepts exactly the oracle prefix and the step
+    commits ``a > 0`` drafts; ``tamper`` is applied on top. ``num_accepted_override`` feeds a
+    wrong ``num_accepted`` into the verification metadata only (mutation probe b).
     """
     drafts = _draft_tokens(draft, vllm_config, eos, seq[max(p_last - 2, 0):p_last + 1], p_last, draft_atts,
                            multi_last, K)
+    if oracle is not None:
+        drafts = list(oracle[:K])
     if tamper is not None:
         drafts[tamper[0]] = tamper[1]
     rows = [seq[p_last]] + drafts
     for att in atts:
         att.slot = SPEC_SLOT
     ctx = (seq[p_last - 2], seq[p_last - 1])
-    with torch.no_grad(), set_forward_context(_spec_metadata(p_last, n_accepted), vllm_config):
+    n_acc = n_accepted if num_accepted_override is None else num_accepted_override
+    with torch.no_grad(), set_forward_context(_spec_metadata(p_last, n_acc), vllm_config):
         hidden, aux = target(input_ids=torch.tensor(rows),
                              positions=torch.arange(p_last, p_last + T),
                              **ple_kwargs(T, eos, context=ctx))
@@ -184,8 +203,6 @@ def _mtp_step(target, draft, vllm_config, seq, p_last, n_accepted, eos, atts, dr
     a = 0
     while a < K and argmax[a] == drafts[a]:
         a += 1
-    if force_accepted is not None:
-        a = force_accepted - 1
     bonus = argmax[a]
     seq = list(seq[:p_last + 1]) + drafts[:a] + [bonus]
     for att in atts:  # drop the verification rows beyond the last committed input (the bonus row was never written)
@@ -237,11 +254,20 @@ def _dense_context(tiny_checkpoint):
     return ctx, model, draft, vllm_config, eos, atts, _model_attns(draft), gdn, ple
 
 
-def _chain(model, draft, vllm_config, eos, atts, draft_atts, gdn, ple, ids, steps, tamper_step=None, force=None):
+def _chain(model, draft, vllm_config, eos, atts, draft_atts, gdn, ple, ids, gen, steps, oracle_steps=(),
+           tamper_steps=None, overrides=None):
     """Prefill, run ``steps`` MTP steps interleaved with straight decodes of the committed stream.
 
-    Returns ``(seq, accepts, gaps, tamper_info)``: ``gaps`` collects the per-step state gaps,
-    ``tamper_info = (straight_argmax, bonus, bonus_logits_gap)`` for the tampered step.
+    ``num_accepted`` is threaded: the first verification runs with 1 after the prefill, every
+    later one with the count the previous step committed (``a + 1``), so the verification loads
+    its state from ``idx[num_accepted - 1]``. ``oracle_steps`` lists the steps that replace the
+    drafter's drafts with the reference tokens ``gen`` (the accepted prefix is then the oracle's),
+    ``tamper_steps`` maps a step index to its tampered draft and ``overrides`` maps a step index
+    to a ``num_accepted`` override for its verification metadata (mutation probe b).
+
+    Returns ``(seq, accepts, gaps, log0_gaps, bonus_gaps)``: ``gaps`` collects the per-step state
+    gaps at ``lattice[a]``, ``log0_gaps`` the gap of the verification's row-0 logits against the
+    straight chain's logits at the same position, ``bonus_gaps`` the same for the bonus row.
     """
     out = _target_prefill(model, vllm_config, eos, ids, SPEC_SLOT, atts)
     logits = fp32_logits(model, out[0])
@@ -249,23 +275,22 @@ def _chain(model, draft, vllm_config, eos, atts, draft_atts, gdn, ple, ids, step
     p_last = len(seq) - 1
     multi = out[1][0].view(-1, out[1][0].shape[-1])[len(ids) - 1]
     _target_prefill(model, vllm_config, eos, ids, STRAIGHT_SLOT, atts, reset=False)
-    accepts, gaps, tamper_info = [], [], None
+    accepts, gaps, log0_gaps, bonus_gaps = [], [], [], []
+    n = 1
     for step in range(steps):
         old_p = p_last
-        kw = {}
-        if step == tamper_step:
-            kw["tamper"] = (2, TAMPER)  # replace the third draft
-            if force is not None:
-                kw["force_accepted"] = force
-        n, seq, multi, a, bonus, logits = _mtp_step(model, draft, vllm_config, seq, p_last, 1, eos, atts, draft_atts,
-                                                    multi, **kw)
-        last = _straight_decode(model, vllm_config, eos, seq, old_p, old_p + a + 1, atts)
+        oracle = list(gen[len(seq) - len(ids):]) if step in oracle_steps else None
+        n, seq, multi, a, bonus, logits = _mtp_step(model, draft, vllm_config, seq, p_last, n, eos, atts, draft_atts,
+                                                    multi, oracle=oracle, tamper=(tamper_steps or {}).get(step),
+                                                    num_accepted_override=(overrides or {}).get(step))
+        pick = _straight_decode(model, vllm_config, eos, seq, old_p, old_p + 1, atts)
+        rest = _straight_decode(model, vllm_config, eos, seq, old_p + 1, old_p + a + 1, atts)
         accepts.append(a)
         gaps.append(_state_gaps(model, gdn, ple, a))
-        if step == tamper_step:
-            tamper_info = (int(last.argmax()), bonus, float((logits[0] - last).abs().max()))
+        log0_gaps.append(float((logits[0] - pick).abs().max()))
+        bonus_gaps.append(float((logits[a] - (rest if rest is not None else pick)).abs().max()))
         p_last = len(seq) - 1
-    return seq, accepts, gaps, tamper_info
+    return seq, accepts, gaps, log0_gaps, bonus_gaps
 
 
 def test_dense_fp32_greedy_stream_equals_reference(tiny_checkpoint):
@@ -274,7 +299,8 @@ def test_dense_fp32_greedy_stream_equals_reference(tiny_checkpoint):
     ids, gen = list(prompt["prompt_ids"]), list(prompt["generated_ids"])
     ctx, *rest = _dense_context(tiny_checkpoint)
     try:
-        seq, accepts, _, _ = _chain(rest[0], rest[1], rest[2], rest[3], rest[4], rest[5], rest[6], rest[7], ids, 6)
+        seq, accepts, _, _, _ = _chain(rest[0], rest[1], rest[2], rest[3], rest[4], rest[5], rest[6], rest[7], ids,
+                                       gen, 6)
     finally:
         ctx.__exit__(None, None, None)
     stream = seq[len(ids):]
@@ -289,7 +315,8 @@ def test_state_parity_after_speculative_steps(tiny_checkpoint):
     ids = list(prompt["prompt_ids"])
     ctx, *rest = _dense_context(tiny_checkpoint)
     try:
-        _, accepts, gaps, _ = _chain(rest[0], rest[1], rest[2], rest[3], rest[4], rest[5], rest[6], rest[7], ids, 6)
+        _, accepts, gaps, _, _ = _chain(rest[0], rest[1], rest[2], rest[3], rest[4], rest[5], rest[6], rest[7], ids,
+                                        None, 6)
     finally:
         ctx.__exit__(None, None, None)
     worst = max(max(g) for g in gaps)
@@ -297,25 +324,65 @@ def test_state_parity_after_speculative_steps(tiny_checkpoint):
     assert worst <= FP32_TOL, f"committed spec state diverges from the straight chain: {worst:.3e}"
 
 
-def test_forced_rejection_rolls_back(tiny_checkpoint):
-    """Tampering the third draft rejects the tail; the committed stream and state stay exact."""
+def test_accept_paths_state_parity(tiny_checkpoint):
+    """Oracle drafts commit a=3, a=1 and a=2: parity with num_accepted=4 and 2 feeding the next step.
+
+    Step 0 accepts the whole 3-token oracle (num_accepted 1 -> 4), step 1's tampered ``d_2``
+    leaves ``a == 1`` (-> 2), step 2 runs the plain drafter (the random tiny model accepts
+    nothing), step 3's tampered ``d_3`` leaves ``a == 2``. Every step's committed state
+    (lattice row ``lattice[a]``, conv windows at ``[a : a + window]``) and the verification's
+    row-0 logits equal the straight chain's.
+    """
     prompt = _load_prompt(tiny_checkpoint, 33)
-    ids = list(prompt["prompt_ids"])
+    ids, gen = list(prompt["prompt_ids"]), list(prompt["generated_ids"])
     ctx, *rest = _dense_context(tiny_checkpoint)
     try:
         args = (rest[0], rest[1], rest[2], rest[3], rest[4], rest[5], rest[6], rest[7])
-        normal, _, _, _ = _chain(*args, ids, 4)
-        tampered, accepts, gaps, tamper_info = _chain(*args, ids, 4, tamper_step=2)
+        seq, accepts, gaps, log0, bonus = _chain(*args, ids, gen, 4, oracle_steps={0, 1, 3},
+                                                 tamper_steps={1: (1, TAMPER), 3: (2, TAMPER)})
     finally:
         ctx.__exit__(None, None, None)
-    straight_pick, bonus, bonus_gap = tamper_info
-    print(f"MTP forced-rejection acceptance counts: {accepts}, bonus gap {bonus_gap:.3e}")
-    assert accepts[2] == 0, f"tampered draft was accepted: {accepts}"
-    assert straight_pick == bonus, "the committed bonus is not the target's own pick at the tampered step"
-    assert bonus_gap <= FP32_TOL, f"bonus logits diverge from the straight chain: {bonus_gap:.3e}"
-    assert tampered[:len(normal)] == normal, "the tampered stream diverged from the clean chain's stream"
+    state_worst = [max(g) for g in gaps]
+    print(f"MTP accept-path acceptance counts: {accepts}, state gaps {[f'{g:.3e}' for g in state_worst]}, "
+          f"row-0 logits gaps {[f'{g:.3e}' for g in log0]}, bonus gaps {[f'{g:.3e}' for g in bonus]}")
+    assert accepts[0] == 3, f"the oracle step did not commit K drafts: {accepts}"
+    assert accepts[1] == 1, f"the tampered step did not commit exactly one draft: {accepts}"
+    assert accepts[3] == 2, f"the second tampered step did not commit two drafts: {accepts}"
+    stream = seq[len(ids):]
+    assert stream == gen[:len(stream)], f"stream {stream} is not the reference prefix"
+    for i, (g, l0) in enumerate(zip(state_worst, log0)):
+        assert g <= FP32_TOL, f"step {i} committed state diverges from the straight chain: {g:.3e}"
+        assert l0 <= FP32_TOL, f"step {i} row-0 logits diverge from the straight chain: {l0:.3e}"
+        assert bonus[i] <= FP32_TOL, f"step {i} bonus logits diverge from the straight chain: {bonus[i]:.3e}"
+
+
+def test_forced_rejection_rolls_back(tiny_checkpoint):
+    """A tampered ``d_2`` after a 3-draft commit rejects the tail; the next step rolls back exactly.
+
+    Step 0 (oracle) commits ``a == 3``, step 1 (tampered ``d_2``) commits ``a == 1``; the
+    rejection step 2 runs with ``num_accepted = 2`` (loading ``idx[1]``, the state of the last
+    accepted draft - its verification rewrites the rejected rows ``idx[2..3]``) and must match
+    the straight decode continuation.
+    """
+    prompt = _load_prompt(tiny_checkpoint, 33)
+    ids, gen = list(prompt["prompt_ids"]), list(prompt["generated_ids"])
+    ctx, *rest = _dense_context(tiny_checkpoint)
+    try:
+        args = (rest[0], rest[1], rest[2], rest[3], rest[4], rest[5], rest[6], rest[7])
+        seq, accepts, gaps, log0, bonus = _chain(*args, ids, gen, 3, oracle_steps={0, 1},
+                                                 tamper_steps={1: (1, TAMPER)})
+    finally:
+        ctx.__exit__(None, None, None)
+    print(f"MTP forced-rejection acceptance counts: {accepts}, rollback logits {log0[2]:.3e} / "
+          f"bonus {bonus[2]:.3e}, per-step state gaps {[f'{max(g):.3e}' for g in gaps]}")
+    assert accepts[0] == 3, f"the oracle step did not commit K drafts: {accepts}"
+    assert accepts[1] == 1, f"the tampered draft was not the first rejection: {accepts}"
+    assert log0[2] <= FP32_TOL, f"the rollback step's row-0 logits diverge from the straight chain: {log0[2]:.3e}"
+    assert bonus[2] <= FP32_TOL, f"the rollback step's bonus diverges from the straight chain: {bonus[2]:.3e}"
     worst = max(max(g) for g in gaps)
     assert worst <= FP32_TOL, f"state diverged from the straight chain after the rollback: {worst:.3e}"
+    stream = seq[len(ids):]
+    assert stream == gen[:len(stream)], f"the rolled-back stream diverged: {stream}"
 
 
 def test_sparse_2600_prompt_step(tiny_checkpoint):
@@ -348,32 +415,38 @@ def test_sparse_2600_prompt_step(tiny_checkpoint):
         _target_prefill(model, vllm_config, eos, ids, STRAIGHT_SLOT, atts, reset=False)
 
         n, seq, multi, a, bonus, logits = _mtp_step(model, draft, vllm_config, seq, p_last, 1, eos, atts, draft_atts,
-                                                    multi)
-        assert bonus == gen[1], f"MTP bonus {bonus} != reference pick {gen[1]}"
+                                                    multi, oracle=gen[1:1 + K])
+        assert a == K, f"the oracle drafts were not fully accepted: a={a}"
+        assert bonus == gen[K + 1], f"MTP bonus {bonus} != reference token {gen[K + 1]}"
         last = _straight_decode(model, vllm_config, eos, seq, p_last, p_last + a + 1, atts)
-        logits_gap = float((logits[0] - last).abs().max())
+        logits_gap = float((logits[a] - last).abs().max())
         ssm, conv, ple_g = _state_gaps(model, gdn, ple, a)
 
-        side = [(m.indexer.key_ring[LATTICE[a]].clone(), m.indexer.compressed_key_cache[:650].clone())
-                for m in model.modules() if getattr(getattr(m, "indexer", None), "key_ring", None) is not None]
-        ring_g = comp_g = 0.0
+        # The ssm state of the committed row lives at lattice[a]; the key ring rows of the step are
+        # position-addressed (ring[slot, pos % R]) inside the request's slot (the lattice's column
+        # 0), so the ring rows the verification wrote at p_last..p_last+a are compared, modulo the
+        # ring length R, at slot LATTICE[0].
         qsa = [m for m in model.modules() if getattr(getattr(m, "indexer", None), "key_ring", None) is not None]
+        ring_len = qsa[0].indexer.key_ring.shape[1]
+        rows = torch.tensor([(p_last + i) % ring_len for i in range(a + 1)], dtype=torch.long)
+        side = [(m.indexer.key_ring[LATTICE[0]].index_select(0, rows).clone(),
+                 m.indexer.compressed_key_cache[:650].clone()) for m in qsa]
+        ring_g = comp_g = 0.0
         for (ring_a, comp_650), m in zip(side, qsa):
-            ring_g = max(ring_g,
-                         float((ring_a[:a + 1] - m.indexer.key_ring[STRAIGHT_SLOT, :a + 1]).abs().max()))
+            ring_g = max(ring_g, float((ring_a - m.indexer.key_ring[STRAIGHT_SLOT].index_select(0, rows)).abs().max()))
             comp_g = max(comp_g, float((comp_650 - m.indexer.compressed_key_cache[:650]).abs().max()))
-        print(f"MTP sparse step: a={a}, logits {logits_gap:.3e}, ssm {ssm:.3e}, conv {conv:.3e}, "
-              f"ple {ple_g:.3e}, ring {ring_g:.3e}, compressed {comp_g:.3e}")
+        print(f"MTP sparse step: a={a} (lattice slot {LATTICE[a]}), logits {logits_gap:.3e}, ssm {ssm:.3e}, "
+              f"conv {conv:.3e}, ple {ple_g:.3e}, ring {ring_g:.3e}, compressed {comp_g:.3e}")
         assert logits_gap <= FP32_TOL
         assert max(ssm, conv, ple_g) <= FP32_TOL
-        assert ring_g <= FP32_TOL, f"key ring at the committed position diverged: {ring_g:.3e}"
+        assert ring_g <= FP32_TOL, f"key ring at the committed positions diverged: {ring_g:.3e}"
         assert comp_g == 0.0, f"compressed block rows diverged: {comp_g:.3e}"
 
 
 def test_mutations_break_the_chain(tiny_checkpoint):
     """(a) Tiling the drafter's step-1 hidden changes its drafts; (b) ``num_accepted=K+1`` breaks parity."""
     prompt = _load_prompt(tiny_checkpoint, 33)
-    ids = list(prompt["prompt_ids"])
+    ids, gen = list(prompt["prompt_ids"]), list(prompt["generated_ids"])
     ctx, *rest = _dense_context(tiny_checkpoint)
     try:
         model, draft, vllm_config, eos, atts, draft_atts, gdn, ple = rest
@@ -391,14 +464,17 @@ def test_mutations_break_the_chain(tiny_checkpoint):
         assert plain[0] == mutated[0], "the mutation must not touch the step-0 draft"
         assert plain[1:] != mutated[1:], f"drafter drafts unchanged by its hidden mutation: {plain} vs {mutated}"
 
-        # (b) tampered drafts committed with num_accepted=K+1 diverge from the straight chain
-        normal, _, _, _ = _chain(*args, ids, 4)
-        forced, accepts_f, gaps_f, _ = _chain(*args, ids, 4, tamper_step=2, force=K + 1)
-        ssm_f = max(float((m.kv_cache[1][LATTICE[K]] - m.kv_cache[1][STRAIGHT_SLOT]).abs().max()) for m in gdn)
-        print(f"MTP force-accept mutation: accepts={accepts_f}, ssm gap {ssm_f:.3e}")
-        assert accepts_f[2] == K, f"force-accepted step did not commit K drafts: {accepts_f}"
-        assert forced[:p_last + 1] == normal[:p_last + 1]
-        assert forced != normal, "the forced acceptance did not change the committed stream"
-        assert ssm_f > 1e-3, f"state parity survived the force-accept mutation: {ssm_f:.3e}"
+        # (b) after the oracle commit and the tampered rejection (true num_accepted = 2 for the
+        # rollback step), feeding num_accepted = K + 1 into that verification loads idx[K], the
+        # state of a rejected token: the step's own logits/state must diverge from the straight
+        # chain (the comparison is taken in the step that used the override).
+        _, accepts_b, gaps_b, log0_b, _ = _chain(*args, ids, gen, 3, oracle_steps={0, 1},
+                                                 tamper_steps={1: (1, TAMPER)}, overrides={2: K + 1})
+        ssm_b = gaps_b[2][0]
+        print(f"MTP num_accepted-override mutation: accepts={accepts_b}, row-0 logits gap {log0_b[2]:.3e}, "
+              f"ssm gap at lattice[a] {ssm_b:.3e}")
+        assert accepts_b[0] == 3 and accepts_b[1] == 1, f"the base chain of probe (b) is off: {accepts_b}"
+        assert log0_b[2] > MUT_TOL or ssm_b > MUT_TOL, (f"the num_accepted={K + 1} override kept parity: "
+                                                        f"logits {log0_b[2]:.3e}, ssm {ssm_b:.3e}")
     finally:
         ctx.__exit__(None, None, None)
