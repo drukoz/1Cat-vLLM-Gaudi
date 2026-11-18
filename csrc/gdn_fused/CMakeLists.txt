@@ -55,7 +55,7 @@ set_source_files_properties("${CMAKE_CURRENT_BINARY_DIR}/gdn_recurrent_decode_ga
 
 add_custom_command(
     OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/gdn_core_verify_gaudi2.o"
-    COMMAND "${TPC_COMPILER}" -Wall -Werror -O2 -march=gaudi2 -I"${TPC_INCLUDE_DIR}"
+    COMMAND "${TPC_COMPILER}" -Wall -Werror -O2 -march=gaudi2 -vlm 32 -I"${TPC_INCLUDE_DIR}"
             "${CMAKE_CURRENT_SOURCE_DIR}/kernels/gdn_core_verify_gaudi2.c"
             -c -o "${CMAKE_CURRENT_BINARY_DIR}/gdn_core_verify_gaudi2.o"
     DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/kernels/gdn_core_verify_gaudi2.c"
