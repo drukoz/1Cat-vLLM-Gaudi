@@ -15,6 +15,7 @@ from flashinfer_gaudi import _native
 def clean_loader_state(monkeypatch):
     monkeypatch.setattr(_native, "_GDN_FUSED_LOADED", None)
     monkeypatch.setattr(_native, "_LOAD_ERRORS", [])
+    monkeypatch.setattr(_native, "_GDN_FUSED_ERRORS", [])
     monkeypatch.setattr(_native, "_LOADED_PATHS", [])
     monkeypatch.setenv("GC_KERNEL_PATH", "")
     monkeypatch.delenv("GDN_FUSED_GAUDI_KERNEL_LIBRARY", raising=False)
@@ -48,6 +49,19 @@ def test_missing_files_return_false(tmp_path, monkeypatch):
     assert _native.load_gdn_fused_extension() is False
     assert any(str(kernel_db) in error and "file does not exist" in error for error in _native._LOAD_ERRORS)
     assert any(str(extension) in error and "file does not exist" in error for error in _native._LOAD_ERRORS)
+
+
+def test_gdn_fused_errors_are_gdn_only(tmp_path, monkeypatch):
+    kernel_db = tmp_path / "libgdn_fused_gaudi2.so"
+    extension = tmp_path / "gdn_fused_ops.so"
+    monkeypatch.setenv("GDN_FUSED_GAUDI_KERNEL_LIBRARY", str(kernel_db))
+    monkeypatch.setenv("GDN_FUSED_GAUDI_NATIVE_LIBRARY", str(extension))
+
+    assert _native.load_gdn_fused_extension() is False
+    errors = _native.gdn_fused_extension_errors()
+    assert len(errors) == 2
+    assert all("file does not exist" in error for error in errors)
+    assert all(error in _native._LOAD_ERRORS for error in errors)
 
 
 def test_schema_imported_before_library(tmp_path, monkeypatch):
