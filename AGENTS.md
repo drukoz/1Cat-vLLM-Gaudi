@@ -80,6 +80,9 @@ Key subsystems:
 - **Tensor-parallel checks on CPU**: `spikes/cpu-tp/harness.py` runs 1/2/4/8 `gloo` ranks through vLLM's parallel layers (`run_ranks`, `record_collectives`).
 - **No `timeout(1)` on macOS**: cap a command with `perl -e 'alarm N; exec @ARGV' <command>`.
 - **Program documents**: `docs/design/flash-next/` (system map, reuse ledger, plan, run sheets). New fast paths ship behind an env flag in `vllm_gaudi/envs.py`, default off; modes are integer enums.
+- **Rental harness**: lives in `tools/flash_next/rental/` (runs as `python -m tools.flash_next.rental.<module>` from the repository root).
+- **Rental harness tests**: `tests/unit_tests/tools/rental/` (run with the CPU environment above).
+- **Rental bundle**: `bash tools/flash_next/rental/make_rental_bundle.sh --out dist` builds `dist/flash-next-rental-<sha>.tar.gz` (plugin + vLLM at the pin + `run_rental.sh`); see `docs/design/flash-next/run-sheets/rental.md`.
 
 ## Environment Variables
 
