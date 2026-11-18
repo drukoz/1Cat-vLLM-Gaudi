@@ -7,6 +7,7 @@ at the top level, the plugin tree, vLLM at the pin and BUNDLE.txt. The bundle te
 the vLLM checkout is absent. Runs on CPU from the worktree root with ``PYTHONPATH=$PWD``.
 """
 
+import os
 import subprocess
 import sys
 import tarfile
@@ -69,6 +70,124 @@ def test_run_rental_dry_run(tmp_path):
     assert ":/models" in out
     assert ":/results" in out
     assert "container_entry.sh" in out
+
+
+def _run_rental_env(tmp_path, avail_kb, docker_root=None):
+    """PATH with a fake `df` reporting `avail_kb` free (and a fake `docker` when docker_root is set)."""
+    bin_dir = tmp_path / "fakebin"
+    bin_dir.mkdir()
+    fakes = {
+        "df": "printf 'Filesystem 1024-blocks Used Available Capacity Mounted on\\n'\n"
+              f"printf '/dev/vda1 96000000 95000000 {avail_kb} 99%% /\\n'\n",
+    }
+    if docker_root is not None:
+        fakes["docker"] = (
+            'case "$*" in\n'
+            "  *Runtimes*) echo '{\"habana\":{\"path\":\"/usr/bin/habana-container-runtime\"}}' ;;\n"
+            f"  *DockerRootDir*) echo '{docker_root}' ;;\n"
+            "  run*) echo FAKE-DOCKER-RUN ;;\n"
+            "esac\n"
+        )
+    for name, body in fakes.items():
+        path = bin_dir / name
+        path.write_text("#!/bin/sh\n" + body)
+        path.chmod(0o755)
+    env = {k: v for k, v in os.environ.items() if k != "BASH_ENV"}
+    env["PATH"] = f"{bin_dir}:/usr/bin:/bin:/usr/sbin:/sbin"
+    return env
+
+
+def test_run_rental_download_stops_on_low_disk(tmp_path):
+    env = _run_rental_env(tmp_path, 1000)
+    proc = subprocess.run(
+        [
+            "/bin/bash",
+            str(SCRIPTS_DIR / "run_rental.sh"),
+            "--dry-run",
+            "--download",
+            "--model",
+            str(tmp_path / "models" / "X"),
+        ],
+        capture_output=True,
+        text=True,
+        cwd=tmp_path,
+        env=env,
+        timeout=60,
+    )
+    assert proc.returncode == 1, proc.stdout
+    assert "GB free" in proc.stderr
+    assert "--data-disk" in proc.stderr
+    assert str(tmp_path) in proc.stderr
+    assert len(proc.stderr.strip().splitlines()) == 1
+    assert "docker run" not in proc.stdout
+    assert not (tmp_path / "models").exists()
+
+
+def test_run_rental_download_disk_ok(tmp_path):
+    env = _run_rental_env(tmp_path, 400000000)
+    proc = subprocess.run(
+        [
+            "/bin/bash",
+            str(SCRIPTS_DIR / "run_rental.sh"),
+            "--dry-run",
+            "--download",
+            "--model",
+            str(tmp_path / "models" / "X"),
+        ],
+        capture_output=True,
+        text=True,
+        cwd=tmp_path,
+        env=env,
+        timeout=60,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert "docker run" in proc.stdout
+    assert "--download needs 250 GB: ok" in proc.stdout
+
+
+def test_run_rental_no_disk_check(tmp_path):
+    env = _run_rental_env(tmp_path, 1000)
+    proc = subprocess.run(
+        [
+            "/bin/bash",
+            str(SCRIPTS_DIR / "run_rental.sh"),
+            "--dry-run",
+            "--download",
+            "--no-disk-check",
+            "--model",
+            str(tmp_path / "models" / "X"),
+        ],
+        capture_output=True,
+        text=True,
+        cwd=tmp_path,
+        env=env,
+        timeout=60,
+    )
+    assert proc.returncode == 0, proc.stdout
+    assert "docker run" in proc.stdout
+
+
+def test_run_rental_docker_root_stops_on_low_disk(tmp_path):
+    (tmp_path / "docker-root").mkdir()
+    (tmp_path / "models").mkdir()
+    env = _run_rental_env(tmp_path, 1000, docker_root=str(tmp_path / "docker-root"))
+    proc = subprocess.run(
+        [
+            "/bin/bash",
+            str(SCRIPTS_DIR / "run_rental.sh"),
+            "--model",
+            str(tmp_path / "models" / "X"),
+        ],
+        capture_output=True,
+        text=True,
+        cwd=tmp_path,
+        env=env,
+        timeout=60,
+    )
+    assert proc.returncode == 1, proc.stdout
+    assert "Docker's root" in proc.stderr
+    assert "data-root" in proc.stderr
+    assert "FAKE-DOCKER-RUN" not in proc.stdout
 
 
 @pytest.mark.skipif(not (VLLM_SRC / ".git").is_dir(), reason="vLLM checkout not present")
