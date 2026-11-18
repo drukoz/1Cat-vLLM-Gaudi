@@ -17,7 +17,10 @@ compared with an interleaved single-token chain, as in ``test_accept_paths_state
 The slot layout, tolerance and helpers are imported from ``test_mtp_end_to_end`` (see its
 module docstring for the lattice/window arithmetic); the sparse ring test additionally
 compares the QSA key ring of the request slot with the straight chain's over the whole ring
-window, which catches a pad token at position 0 overwriting ring row 0.
+window, which catches a pad token at position 0 overwriting ring row 0. The verification
+metadata carries each request's real length in ``query_start_loc_p`` (``1 + L``), as the
+runner's decode path does; with the padded length ``T`` instead, the pad rows would write
+ring row ``0 % R`` of the request slot.
 """
 
 import os
@@ -25,19 +28,29 @@ import os
 os.environ.setdefault("VLLM_PLUGINS", "")
 os.environ["TMPDIR"] = "/tmp"
 
-import pytest  # noqa: E402
 import torch  # noqa: E402
 from vllm.forward_context import set_forward_context  # noqa: E402
 
 from vllm_gaudi.models.qwen4_exp.qsa import QsaMode  # noqa: E402
 
 from tests.unit_tests.models.flash_next.cpu_model import (  # noqa: E402
-    cpu_model, eos_token_id, fp32_logits, ple_kwargs)
+    cpu_model, decode_metadata, eos_token_id, fp32_logits, ple_kwargs)
 from tests.unit_tests.models.flash_next.test_mtp_end_to_end import (  # noqa: E402
     FP32_TOL, K, LATTICE, LONG_PROMPT, MTP, SPARSE_MAX_MODEL_LEN, SPEC_SLOT, STRAIGHT_SLOT, T, TAMPER, _dense_context,
-    _load_prompt, _model_attns, _set_group_idx, _spec_metadata, _spec_state_modules, _state_gaps, _straight_decode,
-    _target_prefill)
+    _load_prompt, _model_attns, _set_group_idx, _spec_state_modules, _state_gaps, _straight_decode, _target_prefill)
 from tests.unit_tests.models.flash_next.test_mtp_parity import fp32_mtp_buffer  # noqa: E402
+
+
+def _ragged_metadata(p0, n_accepted, real_len):
+    """``_spec_metadata`` with the runner's REAL row length: ``query_start_loc_p`` is the
+    cumulative scheduled tokens per request (``1 + L``, ``hpu_model_runner.py``
+    ``_create_decode_input_data``), so QSA parks the ``K - L`` pad rows on the ring's scratch row."""
+    md = decode_metadata(LATTICE[0], p0, num_tokens=T, query_lens=[real_len])
+    lattice = torch.tensor([[LATTICE]], dtype=torch.int64)
+    md.load_indices_tensor = lattice
+    md.store_indices_tensor = lattice
+    md.num_accepted_tokens = torch.tensor([n_accepted], dtype=torch.int32)
+    return md
 
 
 def _ngram_step(target, vllm_config, seq, p_last, n_accepted, eos, atts, drafts):
@@ -56,7 +69,7 @@ def _ngram_step(target, vllm_config, seq, p_last, n_accepted, eos, atts, drafts)
     for att in atts:
         att.slot = SPEC_SLOT
     ctx = (seq[p_last - 2], seq[p_last - 1])
-    with torch.no_grad(), set_forward_context(_spec_metadata(p_last, n_accepted), vllm_config):
+    with torch.no_grad(), set_forward_context(_ragged_metadata(p_last, n_accepted, 1 + L), vllm_config):
         hidden, _aux = target(input_ids=torch.tensor(rows),
                               positions=torch.tensor(positions),
                               **ple_kwargs(T, eos, context=ctx))
@@ -147,8 +160,6 @@ def test_ngram_partial_reject_dense(tiny_checkpoint):
     _assert_chain_exact(seq, ids, gen, row0, bonus, state)
 
 
-@pytest.mark.xfail(strict=True, reason="pad tokens at position 0 write the QSA key ring: masking ring writes for pad "
-                                       "rows is a follow-up")
 def test_ngram_ragged_sparse_ring(tiny_checkpoint):
     """Two ragged steps (lengths 1, 2) on the 2600-token prompt in SPARSE mode: logits, states
     and the key ring over the straight chain's ring window stay exact.
