@@ -688,15 +688,14 @@ facts 30-36).
 - Checkpoint `/models/Qwen3.8-Flash-Next` (on the node; stage 2b's path).
 - Stage 3a's `/tmp/3a-tiny-sparse.txt` from this session: the MTP-off baseline the lossless check compares with (3a
   builds the same M3 checkpoint). If 3a was skipped, run its sparse tiny side first.
-- Every 3e launch runs with prefix caching OFF and compact GDN ON. The T10b work removed the platform's refusal of
-  Flash-Next speculation under prefix caching: with prefix caching ON the runner drives the recurrent states through
-  the scheduler's align-mode load/store lattice and commits the accepted tokens that complete a position block into
-  that block's slot (plan v0.4, M3 design: Platform; fact 30: the mamba cache mode becomes `align`). The recorded
-  sweeps stay on the prefix-caching-OFF baseline; the align path is verified by the branch's parity tests (the T8
-  align-variant in `tests/unit_tests/models/flash_next/test_mtp_end_to_end.py`) and is an optional follow-up launch
-  here: rerun (ii) without `--no-enable-prefix-caching` and with `VLLM_COMPACT_GDN=0` (compact GDN stays prohibited
-  under prefix caching, M1-T1), expecting cache mode `align` in the log and acceptance lengths on par with k3. The
-  stage 4 prefix-hit check (a/a/b, hit rate > 0% after the second request) applies to that launch with MTP on.
+- Every 3e launch runs with prefix caching OFF and compact GDN ON. The platform still refuses Flash-Next speculation
+  with prefix caching (the startup error names `--no-enable-prefix-caching`): T10b added the align-mode load/store
+  lattice and the block-boundary commits, verified for one verification step by the T8 align variants in
+  `tests/unit_tests/models/flash_next/test_mtp_end_to_end.py`, but the state does not yet carry across steps whose
+  accepted tokens cross a block boundary (RUK-2798 T10c). Once T10c lifts the refusal, rerun (ii) without
+  `--no-enable-prefix-caching` and with `VLLM_COMPACT_GDN=0` (compact GDN stays prohibited under prefix caching,
+  M1-T1), expecting cache mode `align` in the log, and run the stage 4 prefix-hit check (a/a/b, hit rate > 0% after
+  the second request) with MTP on.
   The M3 design requires compact GDN on the recorded launches (`VLLM_COMPACT_GDN=1` — the default without prefix
   caching, stated explicitly per rule 4). Sparse QSA (`VLLM_HPU_FLASH_NEXT_QSA_MODE=1`) is the mode; the
   dense fallback is noted under (ii). Each launch runs in a fresh container shell and states every flag and export
