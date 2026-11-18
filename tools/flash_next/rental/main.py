@@ -123,6 +123,12 @@ def gdn_summary_lines(run_dir, variant_ids) -> list:
         count = sum(1 for ln in path.read_text(encoding="utf-8").splitlines() if ln.strip())
         if count:
             lines.append("GDN fallback lines in %s: %d (the kernel did not run on every layer)" % (vid, count))
+    toolchain = read_json(run_dir / "toolchain.json")  # written by container_entry.sh before the build
+    if isinstance(toolchain, dict):
+        lines.append("Native kernels: %s (tpc-clang: %s; habanalabs-tools: %s)" % (
+            "compiled" if toolchain.get("native_build") == 1 else "NOT compiled, PyTorch GDN path",
+            toolchain.get("tpc_clang_version") or "absent",
+            toolchain.get("habanalabs_tools_version") or "absent"))
     return lines
 
 

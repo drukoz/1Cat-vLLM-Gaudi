@@ -127,6 +127,7 @@ DOCKER_CMD=(
     --runtime=habana
     -e HABANA_VISIBLE_DEVICES=all
     -e OMPI_MCA_btl_vader_single_copy_mechanism=none
+    -e PYTHONUNBUFFERED=1
     --cap-add=sys_nice
     --net=host
     --ipc=host
@@ -160,14 +161,18 @@ if command -v hl-smi >/dev/null 2>&1; then
     fi
 fi
 
-echo "run id: $RUN_ID"
+# Everything the run prints is also kept in the results folder (so in the tarball), to be read
+# or pasted after the fact; tee -a keeps one file across --from resumes of the same run id.
+CONSOLE_LOG="$RESULTS/$RUN_ID/console.log"
+echo "run id: $RUN_ID" | tee -a "$CONSOLE_LOG"
 set +e
-"${DOCKER_CMD[@]}"
-RC=$?
+"${DOCKER_CMD[@]}" 2>&1 | tee -a "$CONSOLE_LOG"
+RC=${PIPESTATUS[0]}
 set -e
+echo "container exit code: $RC" | tee -a "$CONSOLE_LOG"
 
 TARBALL="$RESULTS/$RUN_ID.tar.gz"
 tar czf "$TARBALL" -C "$RESULTS" "$RUN_ID"
-echo "container exit code: $RC"
+echo "PASTE THIS FILE: $RESULTS/$RUN_ID/summary.md (plus the last 40 lines of $CONSOLE_LOG if the run stopped early)"
 echo "SEND THIS FILE: $TARBALL"
 exit "$RC"

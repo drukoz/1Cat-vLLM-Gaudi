@@ -218,3 +218,23 @@ def test_gdn_summary_lines_pytorch_path(tmp_path):
         "GDN decode: PyTorch path, VLLM_HPU_GDN_CORE_DECODE=0 (no fused kernel)",
         "GDN fallback lines in A: 2 (the kernel did not run on every layer)",
     ]
+
+
+def test_summary_lines_toolchain(tmp_path):
+    run = tmp_path / "run"
+    (run / "fused_gdn").mkdir(parents=True)
+    (run / "fused_gdn" / "details.json").write_text(json.dumps({"mode": 1, "reason": None, "env": {}}), encoding="utf-8")
+    (run / "toolchain.json").write_text(json.dumps({
+        "tpc_clang": True, "tpc_clang_path": "/usr/bin/tpc-clang", "tpc_clang_version": "tpc-clang 2.7.33",
+        "habanalabs_tools_version": "1.24.1-482", "habanalabs_tools_installed_by_script": True, "native_build": 1,
+    }), encoding="utf-8")
+    assert gdn_summary_lines(run, []) == [
+        "GDN decode: fused kernel (G1b passed)",
+        "Native kernels: compiled (tpc-clang: tpc-clang 2.7.33; habanalabs-tools: 1.24.1-482)",
+    ]
+    (run / "toolchain.json").write_text(json.dumps({
+        "tpc_clang": False, "tpc_clang_path": None, "tpc_clang_version": None,
+        "habanalabs_tools_version": None, "habanalabs_tools_installed_by_script": False, "native_build": 0,
+    }), encoding="utf-8")
+    assert gdn_summary_lines(run, [])[-1] == (
+        "Native kernels: NOT compiled, PyTorch GDN path (tpc-clang: absent; habanalabs-tools: absent)")

@@ -145,6 +145,26 @@ Notes:
 
 ## What to send back
 
-`run_rental.sh`'s last line prints `SEND THIS FILE: <path>` — the one tarball
-`<results>/<run-id>.tar.gz` with every log and record of the run, made even when the run failed.
-Attach that single file to RUK-2709. Nothing else is needed from the node.
+Everything the run writes is under `<results>/<run-id>/` on the host (default `~/rental/results/`),
+and `run_rental.sh` ends with two lines:
+
+- `PASTE THIS FILE: <results>/<run-id>/summary.md` — the result, as text. It has the gates table
+  (status and reason per gate), the variants table (max concurrency, TTFT cold and warm, decode
+  tok/s per agent, aggregate tok/s, prefix-cache hit rate, preemptions, MTP acceptance length,
+  errors, wall time), one section per variant, the GDN decode line (fused kernel or PyTorch path)
+  and the native-kernel line from `toolchain.json`. Paste it whole into a comment on RUK-2709. It
+  is written at the end of every run that reached the orchestrator, passed or failed.
+- `SEND THIS FILE: <results>/<run-id>.tar.gz` — the whole run folder, made even when the run
+  failed: `console.log` (everything the run printed, kept across `--from` resumes),
+  `manifest.json`, `toolchain.json`, the `install-<n>.log` files, each gate's and variant's
+  `status.json` and `details.json`, `startup.json`, `server<k>.log`, `requests.jsonl`,
+  `metrics.jsonl`, `hlsmi.csv`, `workload.json` and `summary.json`. Copy it to the Mac at
+  `/Volumes/Storage/paperclip/tmp/rental-results/` (scp from the node to your workstation, then to
+  the Mac). The deeper readings of the plan's M5 table (the drafter-rank log, the profiler trace, a
+  failing server's log) are read from there.
+
+If the run stopped early (an install step failed, or a gate tripped), also paste the last 40 lines
+of `<results>/<run-id>/console.log`: they name the phase that stopped and the reason, and an install
+failure prints the last 30 lines of its `install-<n>.log` there. A failure before the orchestrator
+(the toolchain or install steps) leaves no `summary.md`; the console log and the tarball are then
+the whole result.
