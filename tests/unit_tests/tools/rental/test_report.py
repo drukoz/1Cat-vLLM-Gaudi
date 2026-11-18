@@ -350,15 +350,71 @@ def test_main_writes_summaries(tmp_path: Path) -> None:
 def test_main_without_manifest(tmp_path: Path) -> None:
     run = build_run(tmp_path)
     (run / "manifest.json").unlink()
-    for gate in ("preflight", "build", "tiny"):
-        (run / gate / "status.json").unlink()
 
     assert report_main([str(run)]) == 0
     data = json.loads((run / "summary.json").read_text(encoding="utf-8"))
+    # the gate folders are not listed as variants even with no manifest
     assert set(data["variants"]) == {"A", "B", "C"}
     # agents and turns fall back to the rows: A has 5 distinct agents, turns 2
     assert data["variants"]["A"]["requests"]["expected"] == 10
     assert data["variants"]["C"]["requests"]["expected"] is None
-    assert data["gates"]["preflight"]["status"] == int(GateStatus.NOT_RUN)
+    # the gate status files on disk are still read as gates
+    assert data["gates"]["preflight"]["status"] == int(GateStatus.PASSED)
+    assert data["gates"]["tiny"]["status"] == int(GateStatus.FAILED)
     md = (run / "summary.md").read_text(encoding="utf-8")
-    assert "NOT_RUN" in md
+    assert "NOT_RUN" not in md
+
+
+def test_metrics_delta_is_per_server(tmp_path: Path) -> None:
+    """A server missing from the first sample must not contribute its whole
+    cumulative counter: deltas are per server, summed over servers with two
+    values."""
+    var = tmp_path / "P"
+    write_lines(var / "metrics.jsonl", [
+        make_metrics(1000.0, 0, prefix_hits=0, prefix_queries=0),
+        make_metrics(1002.0, 0, prefix_hits=50, prefix_queries=100),
+        make_metrics(1002.0, 1, prefix_hits=5000, prefix_queries=10000),
+        make_metrics(1004.0, 0, prefix_hits=80, prefix_queries=150),
+        make_metrics(1004.0, 1, prefix_hits=5090, prefix_queries=10100),
+    ])
+    v = summarize_variant(var, 2, turns=2)
+    # server 0: 80-0 hits / 150-0 queries; server 1: 90 hits / 100 queries
+    # -> (80 + 90) / (150 + 100) = 0.68 (the summed first/last gives 0.504)
+    assert abs(v["prefix_hit_rate"] - 0.68) < 1e-12
+
+
+def test_null_status_row_counted_unknown(tmp_path: Path) -> None:
+    var = tmp_path / "N"
+    write_lines(var / "requests.jsonl", [make_row(0, 0, 1000.0, 1001.0, 1002.0, 10, status=None)])
+    v = summarize_variant(var, 1, turns=1)
+    assert v["requests"]["UNKNOWN"] == 1
+    assert v["requests"]["rows"] == 1
+
+
+def test_table_errors_column_counts_missing_rows(tmp_path: Path) -> None:
+    """A short requests.jsonl must never show 0 errors in the comparison
+    table (RUK-2923)."""
+    run = tmp_path / "run"
+    write_json(
+        run / "manifest.json", {
+            "run_id": "run-9",
+            "workload": {
+                "turns": 4
+            },
+            "variants": [{
+                "id": "D",
+                "title": "short run",
+                "servers": [{
+                    "agents": 2
+                }]
+            }],
+        })
+    write_json(run / "D" / "status.json", {"id": "D", "status": 1, "reason": None, "seconds": 10.0})
+    write_lines(run / "D" / "requests.jsonl",
+                [make_row(i % 2, 0, 1000.0 + i, 1001.0 + i, 1002.0 + i, 10, prompt=100) for i in range(5)])
+
+    assert report_main([str(run)]) == 0
+    md = (run / "summary.md").read_text(encoding="utf-8")
+    d_row = [line for line in md.splitlines() if line.startswith("| D ")][0]
+    # expected 2 agents x 4 turns = 8, rows 5, all OK -> errors 3
+    assert "| 3 |" in d_row

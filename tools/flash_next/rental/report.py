@@ -189,16 +189,28 @@ def _steady_window(samples: list, agents: int) -> tuple[Optional[float], Optiona
     span = best[-1]["t"] - best[0]["t"]
     if span <= 0:
         return None, None, "steady window has no time span"
-    delta = _sample_sum(best[-1], "generation_tokens") - _sample_sum(best[0], "generation_tokens")
+    delta = _metrics_delta(best, "generation_tokens")
+    if delta is None:
+        return None, None, "no generation_tokens in steady window"
     return delta / span, span, None
 
 
 def _metrics_delta(samples: list, key: str) -> Optional[float]:
-    """Last sample minus first sample of the summed metric, None with fewer
-    than two samples."""
-    if len(samples) < 2:
-        return None
-    return _sample_sum(samples[-1], key) - _sample_sum(samples[0], key)
+    """Sum over servers of (last - first) non-null `key` within `samples`;
+    None when no server has two values."""
+    first: dict = {}
+    last: dict = {}
+    count: dict = {}
+    for sample in samples:
+        for row in sample["rows"]:
+            if row.get(key) is None:
+                continue
+            server = row.get("server")
+            first.setdefault(server, float(row[key]))
+            last[server] = float(row[key])
+            count[server] = count.get(server, 0) + 1
+    deltas = [last[s] - first[s] for s in first if count[s] >= 2]
+    return sum(deltas) if deltas else None
 
 
 def _status_from_file(status_obj: Any) -> tuple[Optional[int], Optional[str], Optional[float]]:
@@ -289,13 +301,14 @@ def summarize_variant(variant_dir: Path, agents: int, turns: Optional[int] = Non
         status_value = row.get("status")
         try:
             counts[RequestStatus(int(status_value)).name] += 1
-        except ValueError:
+        except (TypeError, ValueError):
             counts["UNKNOWN"] = counts.get("UNKNOWN", 0) + 1
     counts["rows"] = len(rows)
     agent_count = int(agents) if agents else len({r["agent"] for r in rows if r.get("agent") is not None})
     resolved_turns = int(turns) if turns else None
     if resolved_turns is None and rows:
-        resolved_turns = max(int(r["turn"]) for r in rows if r.get("turn") is not None) + 1
+        max_turn = max((int(r["turn"]) for r in rows if r.get("turn") is not None), default=None)
+        resolved_turns = None if max_turn is None else max_turn + 1
     expected = agent_count * resolved_turns if (agent_count and resolved_turns) else None
     counts["expected"] = expected
     counts["missing"] = max(0, expected - len(rows)) if expected is not None else None
@@ -382,8 +395,8 @@ def summarize_run(run_dir: Path) -> dict:
         for entry in manifest_variants:
             if isinstance(entry, dict) and entry.get("id"):
                 entries.append(entry)
-    else:  # no manifest: every subfolder holding a variant artifact is a variant
-        for child in sorted(p for p in run_dir.iterdir() if p.is_dir()):
+    else:  # no manifest: every subfolder (except the gate folders) with an artifact is a variant
+        for child in sorted(p for p in run_dir.iterdir() if p.is_dir() and p.name not in GATE_DIRS):
             found = any((child / name).exists() for name in (STATUS_FILE, STARTUP_FILE, REQUESTS_FILE, METRICS_FILE))
             if found:
                 entries.append({"id": child.name})
@@ -463,6 +476,9 @@ def render_markdown(summary: dict) -> str:
         requests = v.get("requests", {})
         errors = sum(counts for name, counts in requests.items() if name not in ("rows", "expected", "missing"))
         errors -= requests.get("OK", 0)
+        missing = requests.get("missing")
+        if missing is not None:
+            errors += missing
         cold, warm, dec = v.get("ttft_cold_s", {}), v.get("ttft_warm_s", {}), v.get("decode_tps_per_agent", {})
         lines.append("| %s | %s | %s | %s | %s / %s | %s / %s | %s / %s | %s | %s | %s | %s | %d | %s |" % (
             variant_id,
