@@ -31,6 +31,7 @@ Standard library only, Python 3.10 compatible.
 from __future__ import annotations
 
 import argparse
+import http.client
 import json
 import math
 import shlex
@@ -138,7 +139,8 @@ def _fetch_metrics(url: str) -> Optional[str]:
     try:
         with urllib.request.urlopen(url, timeout=FETCH_TIMEOUT_S) as response:
             return response.read().decode("utf-8", errors="replace")
-    except OSError:
+    except (OSError, http.client.HTTPException, ValueError):
+        # A server dying mid-response raises HTTPException (IncompleteRead, BadStatusLine), not OSError.
         return None
 
 
