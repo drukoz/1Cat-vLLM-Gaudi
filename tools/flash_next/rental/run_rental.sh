@@ -149,6 +149,17 @@ if ! command -v docker >/dev/null 2>&1; then
     exit 1
 fi
 
+docker info --format '{{json .Runtimes}}' 2>/dev/null | grep -q '"habana"' || {
+    echo "error: the habana container runtime is not registered with Docker; run: sudo bash $SCRIPT_DIR/prepare_host.sh" >&2
+    exit 1
+}
+
+if command -v hl-smi >/dev/null 2>&1; then
+    if [ "$(hl-smi -Q index,name -f csv,noheader 2>/dev/null | grep -c . || true)" -eq 0 ]; then
+        echo "warning: hl-smi lists no cards; the run will likely fail (check the driver, or reboot and rerun prepare_host.sh)" >&2
+    fi
+fi
+
 echo "run id: $RUN_ID"
 set +e
 "${DOCKER_CMD[@]}"

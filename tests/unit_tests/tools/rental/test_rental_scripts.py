@@ -16,7 +16,7 @@ import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[4]
 SCRIPTS_DIR = REPO_ROOT / "tools" / "flash_next" / "rental"
-SCRIPTS = ["make_rental_bundle.sh", "run_rental.sh", "container_entry.sh"]
+SCRIPTS = ["make_rental_bundle.sh", "run_rental.sh", "container_entry.sh", "prepare_host.sh"]
 VLLM_SRC = Path("/Volumes/Storage/paperclip/tmp/vllm-cpu-dev/vllm-src")
 
 
@@ -67,9 +67,46 @@ def test_make_rental_bundle(tmp_path):
     with tarfile.open(tarballs[0], "r:gz") as tar:
         names = set(tar.getnames())
     assert "run_rental.sh" in names
+    assert "prepare_host.sh" in names
     assert "BUNDLE.txt" in names
     assert "vllm/setup.py" in names
     assert any(name.startswith("plugin/tools/flash_next/rental/") for name in names)
+
+
+def test_prepare_host_dry_run(tmp_path):
+    proc = subprocess.run(
+        ["bash", str(SCRIPTS_DIR / "prepare_host.sh"), "--dry-run"],
+        capture_output=True,
+        text=True,
+        cwd=tmp_path,
+        timeout=60,
+    )
+    assert proc.returncode == 0, proc.stderr
+    out = proc.stdout
+    assert "habanalabs-installer.sh install --type base -y" in out
+    assert "1.24.1" in out
+    assert "habanalabs-container-runtime=1.24.1-482" in out
+    assert "/etc/docker/daemon.json" in out
+    assert (
+        "docker pull vault.habana.ai/gaudi-docker/1.24.1/ubuntu22.04/"
+        "habanalabs/pytorch-installer-2.11.0:latest" in out
+    )
+    assert "--runtime=habana" in out
+    assert not (tmp_path / "prepare-host-logs").exists()
+
+
+def test_prepare_host_dry_run_version_override(tmp_path):
+    proc = subprocess.run(
+        ["bash", str(SCRIPTS_DIR / "prepare_host.sh"), "--dry-run", "--version", "1.24.2", "--build", "481"],
+        capture_output=True,
+        text=True,
+        cwd=tmp_path,
+        timeout=60,
+    )
+    assert proc.returncode == 0, proc.stderr
+    out = proc.stdout
+    assert "gaudi-installer/1.24.2/" in out
+    assert "habanalabs-container-runtime=1.24.2-481" in out
 
 
 if __name__ == "__main__":
