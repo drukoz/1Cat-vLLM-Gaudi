@@ -2,29 +2,38 @@
 
 Stages are ordered fail-fast (system map §14): a stop rule ends the rental session for the day; the captures come back and the fix is made offline. Startup costs about 400 s per launch (system map §11, Reading 5), so share a launch between checks wherever possible. Sections follow [the template](README.md). Stages 1, 2a, 2b are written (M0), stages 3 and 4 are written (M2, M1); stages 5, 6 are titled placeholders filled by later milestones.
 
+The fused GDN decode kernel is the default decode path (`VLLM_HPU_GDN_CORE_DECODE=1`, plan v0.4 of RUK-2812). Stage 1 builds its library, stage 1b checks it on the card before any model runs, and every later launch posts the two fallback lines of stage 1b.
+
 Checkpoint paths on the node are assumptions: replace `/models/Qwen3.8-Flash-Next` with the real path and say so in your post-back (system map §5 marks the Flash-Next checkpoint unverified).
 
 ## Stage 1: build and native compile
 
 ### Purpose
-Prove the fork stack builds at the program-branch commit: vLLM at the engine pin imports, the plugin imports, and the native FlashInfer-Gaudi kernels compile — the code the Mac gates mark *compile-unchecked* (system map §14, gate 3).
+Prove the fork stack builds at the program-branch commit: vLLM at the engine pin imports, the plugin imports, the native FlashInfer-Gaudi kernels compile — the code the Mac gates mark *compile-unchecked* (system map §14, gate 3) — and the separate fused GDN decode library builds.
 
 ### Prerequisites
 - Base image `vault.habana.ai/gaudi-docker/1.24.1/ubuntu22.04/habanalabs/pytorch-installer-2.11.0:latest` plus `habanalabs-tools` 1.24.1 (tpc-clang), Python 3.10 — the recipe in `~/1cat-build/` (on the node) (system map §3, fork stack).
-- Plugin repository `drukoz/1Cat-vLLM-Gaudi`, branch `feat/flash-next-gaudi-m0`, at its current head.
+- Plugin repository `drukoz/1Cat-vLLM-Gaudi`, branch `feat/flash-next-gaudi` (the program branch: M0–M2 merged, and the fused GDN kernel track once PR #3 merges into it; until then build `feat/flash-next-gaudi-gdn-fused`, which is the program branch plus the track), at its current head. Every later stage runs on this one build.
 - vLLM engine source at commit `8f816a3f665489d7f0d222115d4f72ebab01076b` (system map, assumption 6).
 
 ### Launch
 ```bash
 # on the node, inside a container from the base image (the ~/1cat-build/ recipe, system map §3)
 git clone https://github.com/drukoz/1Cat-vLLM-Gaudi.git && cd 1Cat-vLLM-Gaudi
-git checkout feat/flash-next-gaudi-m0 && git rev-parse HEAD   # record this in the results table
+git checkout feat/flash-next-gaudi && git rev-parse HEAD   # record this in the results table
 cd .. && git clone https://github.com/vllm-project/vllm.git && cd vllm
 git checkout 8f816a3f665489d7f0d222115d4f72ebab01076b && cd ..
 VLLM_TARGET_DEVICE=empty pip install --no-build-isolation ./vllm
 VLLM_TARGET_DEVICE=hpu VLLM_GAUDI_BUILD_FLASHINFER=1 pip install ./1Cat-vLLM-Gaudi --no-build-isolation
 pip install --no-deps transformers==5.16.1 huggingface_hub==1.33.0 tokenizers==0.23.2 safetensors==0.8.0
+# the fused GDN decode library, built on its own: a failure here exits 3 and leaves the install above intact
+LIB=$(python -c "import flashinfer_gaudi, pathlib; print(pathlib.Path(flashinfer_gaudi.__file__).parent / 'lib')")
+(cd 1Cat-vLLM-Gaudi && python tools/build_flashinfer_gaudi.py --gdn-fused-only --output-dir "$LIB") 2>&1 | tee /tmp/1-gdn-fused-build.log; echo "exit ${PIPESTATUS[0]}"
+ls -l "$LIB"/libgdn_fused_gaudi2.so "$LIB"/gdn_fused_ops*.so
+# for stage 1b in this shell: its commands put the checkout first on PYTHONPATH, whose flashinfer_gaudi/lib/ is empty
+export GDN_FUSED_GAUDI_KERNEL_LIBRARY="$LIB/libgdn_fused_gaudi2.so" GDN_FUSED_GAUDI_NATIVE_LIBRARY="$(ls "$LIB"/gdn_fused_ops*.so)"
 ```
+The fused library lands in the installed package (`$LIB`), so the servers of later stages load it with no setting; it must be part of the stage 1 image that later stages start from (if that image comes from the `~/1cat-build/` recipe, add the fused-build lines to it).
 Build sequence from system map §3 (fork stack: `VLLM_TARGET_DEVICE=hpu VLLM_GAUDI_BUILD_FLASHINFER=1 pip install . --no-build-isolation`, vLLM `8f816a3f` with `VLLM_TARGET_DEVICE=empty`, pins `--no-deps`).
 
 ### Expected startup lines
@@ -47,19 +56,79 @@ docker logs <container> 2>&1 | grep -i -E "recompil|graph compile|bucket|warmup 
 ### Results table
 | Check | Expected | Observed | Pass? |
 |---|---|---|---|
-| Plugin commit built | head of `feat/flash-next-gaudi-m0` | | |
+| Plugin commit built | head of `feat/flash-next-gaudi` (or of `feat/flash-next-gaudi-gdn-fused` before PR #3 merges) | | |
 | `vllm.__version__` | `0.28.1rc1.dev392+g8f816a3f6` | | |
 | `import vllm_gaudi` | no error | | |
 | `flashinfer_gaudi.get_capabilities()` | prints a mapping, no exception | | |
 | native build | `libflashinfer_gaudi_kernels.so` + `flashinfer_gaudi_ops*.so` present | | |
+| fused GDN build | `exit 0`; `libgdn_fused_gaudi2.so` + `gdn_fused_ops*.so` listed | | |
 
 ### Stop rule
-Stop the session and post the full traceback and the pip install logs if: the plugin `pip install` fails, the native (TPC/C++) build fails, `import vllm_gaudi` raises, or the printed vLLM version is not `0.28.1rc1.dev392+g8f816a3f6`. A `get_capabilities()` mapping with no promoted ops is *not* a stop — record it and continue.
+Stop the session and post the full traceback and the pip install logs if: the plugin `pip install` fails, the native (TPC/C++) build fails, `import vllm_gaudi` raises, or the printed vLLM version is not `0.28.1rc1.dev392+g8f816a3f6`. A `get_capabilities()` mapping with no promoted ops is *not* a stop — record it and continue. A fused GDN build failure (`exit 3`) is not a stop either: post `/tmp/1-gdn-fused-build.log`, skip stage 1b and row 3f, and add `export VLLM_HPU_GDN_CORE_DECODE=0` to every later launch.
 
 ### What to post back
 - the capture output above, complete (build logs included);
 - the results table, filled in;
 - an `hl-smi` snapshot (on the node).
+
+## Stage 1b: fused GDN decode kernel gates (before any model runs)
+
+### Purpose
+The fused GDN decode kernel is the decode path (plan v0.4 of RUK-2812): `VLLM_HPU_GDN_CORE_DECODE` defaults to `1` (FUSED), so every later stage runs it. Prove it is correct on the card before any model run. Steps 1b-1 to 1b-3 are pass/fail gates; 1b-4 measures speed and gates nothing.
+
+### Prerequisites
+Stage 1 passed, with the fused GDN build at `exit 0`. Run everything in the stage 1 container shell, from the plugin checkout (`cd 1Cat-vLLM-Gaudi`), with stage 1's two `GDN_FUSED_GAUDI_*_LIBRARY` exports still set: without them 1b-2 skips (`gdn_fused_ops extension is not built`) and 1b-3/1b-4 exit 2. About 15 minutes, no model launch.
+
+### Steps
+**1b-1: simulator** (checks the node's toolchain; the same 8 tests passed before the rental in the tpcsim container on the Mac, `docs/design/flash-next/tpcsim.md`)
+```bash
+PYTHONPATH=$PWD python -m pytest -q -rs -p no:cacheprovider --noconftest tests/standalone/gdn_core_decode/test_simulation.py 2>&1 | tee /tmp/1b-sim.log
+```
+Expected: `8 passed`, no skips (`-rs` prints any skip reason): two disassembly checks and three cases per kernel.
+
+**1b-2: op numerics on the card**
+```bash
+PYTHONPATH=$PWD python -m pytest -q -rs -p no:cacheprovider tests/unit_tests/gdn_core_decode/test_hpu_op.py 2>&1 | tee /tmp/1b-hpu-op.log
+```
+Expected: every case passes, none skipped. Both ops run against their CPU references at the TP8, TP4 and TP1 head counts, with load == store, load != store and padded rows, at batch 1, 16 and 64. Bars: output max abs error ≤ 1e-3, state ≤ 1e-5, conv state exact (vllm-gaudi #1834's bar for the recurrence alone was 2.4e-4 to 4.9e-4).
+
+**1b-3: graph modes and replay**
+```bash
+PYTHONPATH=$PWD python tools/flash_next/gdn_core_decode_replay.py --steps 1000 2>&1 | tee /tmp/1b-replay.log
+PYTHONPATH=$PWD python tools/flash_next/gdn_core_decode_replay.py --steps 1000 --case tp8_b64 2>&1 | tee -a /tmp/1b-replay.log
+```
+Expected, for each op in each run: `lazy+hpu_graph: exact`, `torch.compile: exact` and `recompiles after warmup: 0`. An exact match with eager over 1,000 steps rules out aliasing, stale graph buffers and dropped state writes on replay.
+
+**1b-4: kernel speed against the bandwidth floor** (measures; gates nothing)
+```bash
+PYTHONPATH=$PWD python tools/flash_next/gdn_core_decode_bench.py --tp 2,8 --batches 1,16,64 2>&1 | tee /tmp/1b-bench.log
+```
+Record each op's `slope` line for tp2 and tp8 and the `core tp8 B=1` line. Target: a slope of at most 2× the floor (each slope line ends `(target <= 2x)`). For comparison, #1834 measured the torch recurrence at 0.0058 ms per sequence per layer at TP2 on the 27B, 4.5× its floor. Row 3f-3 uses these numbers.
+
+### Gate rule
+- 1b-1, 1b-2 and 1b-3 all pass: leave `VLLM_HPU_GDN_CORE_DECODE` unset (the default, 1) in every later launch, except where a stage says otherwise (stage 3).
+- Any of them fails: add `export VLLM_HPU_GDN_CORE_DECODE=0` to every later launch, skip row 3f, and post the logs; the fix is a kernel fix, made offline. If 1b-2 or 1b-3 fails only for `gdn_core_decode` and passes for `gdn_recurrent_decode`, the conv or norm part of the fused kernel is at fault: say so. (Mode 2, RECURRENCE, exists only for this bisect; no stage runs a model with it.)
+- A slope above the target in 1b-4 is not a failure: it opens kernel tuning after the rental.
+
+### Every later launch: the two fallback lines
+Add this to the capture commands of every later launch and post its output (empty is the expected result once 1b passed):
+```bash
+docker logs <name> 2>&1 | grep -E "has no HPU kernel|GDN core decode .* is off for"
+```
+`has no HPU kernel` (once per process, at startup) means the fused library did not load and every GDN layer ran the torch path. `is off for <layer>` (once per layer, at its first decode step) means that layer does not fit the op and ran the torch path. Either line means the launch did not run the kernel: note it in that stage's table.
+
+### Results table (1b)
+| Step | Check | Expected | Observed | Pass? |
+|---|---|---|---|---|
+| 1b-1 | simulator | `8 passed`, no skips | | |
+| 1b-2 | `test_hpu_op.py` | all pass, none skipped | | |
+| 1b-3 | replay, 2 cases × 2 ops | `exact`, `exact`, `0` | | |
+| 1b-4 | slope, core / recurrent, tp2 (ms/seq/layer, × floor) | ≤ 2× floor (reported) | | |
+| 1b-4 | slope, core / recurrent, tp8 (ms/seq/layer, × floor) | ≤ 2× floor (reported) | | |
+| 1b-4 | `core tp8 B=1` (ms/call) | reported | | |
+
+### What to post back
+`/tmp/1b-sim.log`, `/tmp/1b-hpu-op.log`, `/tmp/1b-replay.log`, `/tmp/1b-bench.log`, the filled table, and the value of `VLLM_HPU_GDN_CORE_DECODE` the later stages ran with.
 
 ## Stage 2a: tiny model bring-up
 
@@ -258,7 +327,7 @@ with `MAX_EXPERTS_PER_SLICE=64` — the tested slice point; the default -1 runs 
 Run R7's scheduler variants A–D (the prefix-cache hit check is D) and variant E, the M1 recurrent state pool, against S4's prediction: prove admission is a scheduler-budget setting and that the pool's `Usable num_blocks` matches the model, and rule out a pool that over-reserves memory or an `align`-mode state-alignment crash (R7, RUK-2728; system map §15).
 
 ### Prerequisites
-- The stage 1 fork build; plugin branch `feat/flash-next-gaudi-m1` at its current head, with M1-T1/T3 (the recurrent state pool) merged; the engine pin unchanged.
+- The stage 1 fork build (the program branch holds M1, with M1-T1/T3, the recurrent state pool); the engine pin unchanged. The GDN decode path is the default (stage 1b's gate rule decides `VLLM_HPU_GDN_CORE_DECODE`): stage 4's prefix hits move GDN state between slots, which is the fused kernel's load != store case.
 - Checkpoint `/models/Qwen3.8-Flash-Next` (on the node; stage 2b's path).
 - S4's predictions, run on the Mac before the session (paste into your notes):
 
@@ -400,7 +469,7 @@ MoE expert slices (3c) — and record the decode batch baseline (3d) that the M3
 plan v0.3, M2 exit rule: sparse QSA becomes the default only after this stage passes).
 
 ### Prerequisites
-- The stage 1 fork build; plugin branch `feat/flash-next-gaudi-m2` at its current head (every flag below exists only there), engine pin unchanged.
+- The stage 1 fork build (the program branch holds M2; every flag below is there), engine pin unchanged.
 - Checkpoint `/models/Qwen3.8-Flash-Next` (on the node; stage 2b's path). Stage 3 runs before stage 4 in the session (fail-fast order 1, 2a, 2b, 3, 4).
 - Stage 2b's S4 row in your notes (`Usable num_blocks: 2862`). 3a predicts 0.94 x that (~2690) on the sparse launch: sparse mode reserves
   about 6% of the attention budget for the compressed keys (plan v0.3, M2 fact 2).
@@ -408,12 +477,13 @@ plan v0.3, M2 exit rule: sparse QSA becomes the default only after this stage pa
   with six prompts, the sixth 2600 tokens — past the 2050-token boundary where dense equals the model's sparse attention (plan v0.3, M2 fact 1).
 
 ### Launch
-Five launches, about 400 s of warmup each (system map §11, Reading 5), run in this order: launch 1 is stage 2b's command verbatim and
+Five launches, about 400 s of warmup each (system map §11, Reading 5), run in this order: launch 1 is stage 2b's command plus `export VLLM_HPU_GDN_CORE_DECODE=0` and
 serves 3d plus the "off" side of 3a-3c, every later launch adds exports to it. Launch 1:
 
 ```bash
 # on the node, cards 0–7, one server; name the containers fn3-plain, fn3-sparse, fn3-tactics, fn3-slice64, fn3-slice128
 export VLLM_COMPACT_GDN=0                 # prefix caching needs it; system map §7.1
+export VLLM_HPU_GDN_CORE_DECODE=0         # stage 3 A/Bs its flags on the torch GDN decode path (3b's decode tactic runs only there); row 3f measures the fused kernel
 export VLLM_HPU_FLASH_NEXT_QSA_MODE=0     # dense QSA fallback = QsaMode.DENSE; plan.md, Target architecture
 vllm serve /models/Qwen3.8-Flash-Next --served-model-name Qwen3.8-Flash-Next --port 8000 \
   --tensor-parallel-size 8 --max-model-len 131072 --max-num-seqs 32 \
@@ -872,6 +942,84 @@ Gibberish or repetition loops in fn3e-k3's coherence answers → stop, post `/tm
 - the sixteen `/tmp/3e-*.log` bench logs;
 - the three capture greps, complete, for each of fn3e-tiny, fn3e-k0, fn3e-k1, fn3e-k2, fn3e-k3;
 - an `hl-smi` snapshot (on the node).
+
+### 3f: fused GDN decode kernel performance (track RUK-2812; run after 3d)
+Purpose: measure the fused GDN decode kernel end to end, and run the torch path (mode 0) once as the baseline so the gain
+is on record. Plan v0.4 made the kernel the decode path, so this row no longer decides whether to keep it: stage 1b
+settled correctness, and a miss against the targets here opens kernel tuning, not a switch back to the torch path.
+`VLLM_HPU_GDN_CORE_DECODE` is `GdnCoreDecodeMode`: `1` = FUSED (`gdn_core_decode`: conv, gates, recurrence and gated
+RMSNorm in one TPC kernel; the default), `0` = the torch path, `2` = RECURRENCE (`gdn_recurrent_decode`, the
+recurrence only; a bisect tool for stage 1b, not run here). Contract: `docs/design/flash-next/gdn-core-decode.md`.
+
+Prerequisites: stage 1b passed (skip this row, and say so, if it did not). Stage 1b-4's bench lines in your notes.
+Optional: a Qwen3.8-27B checkpoint for 3f-1.
+
+**Step 3f-1: Qwen3.8-27B control at TP2** (skip, and say so, if no 27B checkpoint is on the node)
+vllm-gaudi #1834's ladder: 51-token prompts, 256 tokens out, prefix caching off. One server per mode, `MODE` = 0
+(the baseline), then 1:
+```bash
+export VLLM_HPU_GDN_CORE_DECODE=$MODE
+vllm serve /models/Qwen3.8-27B --served-model-name q27 --port 8000 --tensor-parallel-size 2 \
+  --max-num-seqs 64 --max-model-len 4096 --no-enable-prefix-caching --gpu-memory-utilization 0.92
+# second shell:
+for C in 1 2 4 8 16 32 64; do
+  vllm bench serve --backend vllm --model q27 --dataset-name random --random-input-len 51 --random-output-len 256 \
+    --num-prompts $((4 * C)) --max-concurrency "$C" > "/tmp/3f-27b-m$MODE-c$C.log" 2>&1
+  grep -E "Mean TPOT" "/tmp/3f-27b-m$MODE-c$C.log"
+done
+```
+Run 3b's 8-prompt greedy loop on each server too (`OUT=/tmp/3f-27b-m$MODE.txt`, model `q27`), then
+`diff /tmp/3f-27b-m0.txt /tmp/3f-27b-m1.txt`, and stage 1b's fallback grep on the mode-1 server (expected: empty).
+Fit Mean TPOT = base + slope × C (least squares over the 7 points) per mode. #1834 measured a slope of 0.62-0.68 ms
+per sequence for mode 0, of which the torch recurrence is about 0.28 ms (0.0058 ms per sequence per layer × 48 GDN
+layers, 4.5× its floor). The kernel's target is at most 2× its floor (stage 1b-4, tp2: at most about 0.0026 ms per
+sequence per layer, 0.125 ms over 48 layers), so mode 1's slope should be at least 0.15 ms per sequence below mode 0's.
+
+**Step 3f-2: Flash-Next at TP8**
+Launch 1 of stage 3 (fn3-plain) with `--max-num-seqs 64` and
+`--profiler-config '{"profiler":"torch","torch_profiler_dir":"/tmp/3f-prof-m'$MODE'"}'` added, and with
+`export VLLM_HPU_GDN_CORE_DECODE=$MODE` in place of its `=0` line, once per `MODE` = 1, then 0 (containers fn3f-m1,
+fn3f-m0). On each: 3b's greedy loop (`OUT=/tmp/3f-fn-m$MODE.txt`), then 3b's sweep with `C` in 1 2 4 8 16 32 64 and
+logs `/tmp/3f-fn-m$MODE-c$C.log`, then one profiled run at batch 64:
+```bash
+vllm bench serve --backend vllm --model Qwen3.8-Flash-Next --dataset-name random --random-input-len 4096 \
+  --random-output-len 32 --num-prompts 64 --max-concurrency 64 --profile > "/tmp/3f-fn-m$MODE-prof.log" 2>&1
+```
+Expected on fn3f-m1: stage 1b's fallback grep is empty (a line there means a layer ran the torch path; post it).
+Greedy files: identical to fn3f-m0 within the first sentence (as in 3b's stop rule).
+
+Slot check (once, on fn3f-m1 after its profiled run): relaunch it with `export VLLM_HPU_GDN_CORE_DECODE_DEBUG=1` added
+(container fn3f-m1d) and run 3b's greedy loop and the `C = 64` sweep point once (`OUT=/tmp/3f-fn-m1d.txt`, log
+`/tmp/3f-fn-m1d-c64.log`). Expected: no `ValueError: GDN core decode:` in the server log. That proves the runner never
+gives two requests one store slot, and never stores into a slot another request loads in the same step, which the
+kernels do not support. Debug mode copies the slot indices to the host in every layer, so do not use these times.
+
+Pool copies: the op mutates the whole SSM pool tensor it is given. In each profile trace, look in the GDN layers for
+a copy as large as the SSM pool (a `copy_` or memcpy of `[slots, value_heads, 128, 128]` fp32 per layer per step),
+which a graph mode can add around a mutating op. Post the traces either way; I check them.
+
+**Step 3f-3: decision.** Post the tables; I record the outcome on RUK-2812.
+- The kernel stays the default decode path: correctness was stage 1b's gate.
+- Kernel tuning opens when a stage 1b-4 slope is above 2× the floor at tp2 or tp8, when a pool copy shows up in the
+  fn3f-m1 trace, or when mode 1 is slower than mode 0 at any `C` in 3f-1 or 3f-2.
+- The small-batch index-space split (K7: spread value heads over more TPC cores when the batch is small, chosen by batch
+  size inside the glue) opens only when stage 1b-4's `core tp8 B=1` time × 36 GDN layers is more than 5% of fn3f-m1's
+  Mean TPOT at `C = 1`. At TP8 with batch 1 the kernel runs 2 points (one per key head) on Gaudi2's 24 TPC cores.
+- Mode 0's tables are the baseline on record.
+
+Results table (3f):
+
+| Step | Mode | Check | Expected | Observed | Pass? |
+|---|---|---|---|---|---|
+| 3f-1 | 0 / 1 | 27B Mean TPOT slope (ms per sequence) | ~0.65 / at least 0.15 below mode 0 | | |
+| 3f-1 | 0 vs 1 | greedy `diff` | identical within the first sentence | | |
+| 3f-2 | 0 / 1 | Flash-Next Mean TPOT at C = 1, 16, 64 | recorded; mode 1 not slower than 0 | | |
+| 3f-2 | 1 | stage 1b's fallback grep | empty | | |
+| 3f-2 | 1 + debug | slot check (fn3f-m1d) | no `ValueError` | | |
+| 3f-2 | 1 | SSM pool copies in the trace | none | | |
+
+Post back (3f): the `/tmp/3f-27b-*` and `/tmp/3f-fn-*` logs and greedy files (including `/tmp/3f-fn-m1d*` and
+fn3f-m1d's server log), the two `/tmp/3f-prof-m*` trace folders, the filled table.
 
 ### What to post back
 - the results tables (3a, 3b's two bench tables, 3c, 3d), filled in;

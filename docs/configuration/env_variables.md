@@ -58,6 +58,33 @@ selection, added in M2): `HpuQsaIndexer.select` picks the attended
 positions per query and attention runs only over them. Sparse prefill needs a
 4-aligned context. MTP verification steps (M3) score their draft rows on the sparse path too.
 
+`VLLM_HPU_GDN_CORE_DECODE` selects the GDN decode core path as an integer.
+`1` (default) is fused: every non-speculative decode step runs through the
+fused core op `torch.ops.flashinfer_gaudi.gdn_core_decode` (conv, gates,
+recurrence and gated RMSNorm in one step, the conv and SSM states updated in
+place). On Gaudi its kernel ships in a separate library,
+`libgdn_fused_gaudi2.so`, built by `tools/build_flashinfer_gaudi.py
+--gdn-fused-only` or by `VLLM_GAUDI_BUILD_GDN_FUSED=1` at install time. When
+that library is missing, the plugin logs one warning at startup
+(`GDN core decode (VLLM_HPU_GDN_CORE_DECODE=1) has no HPU kernel: ...`) and
+every GDN layer runs the torch path. A layer the op does not fit (gate, conv
+bias or width, state layout or dtype) also runs the torch path, with one
+warning per layer (`GDN core decode ... is off for <layer>: <reason>`). `0`
+keeps the composed torch path (causal conv1d update, gating, fused recurrent
+delta rule, gated RMSNorm). `2` runs only the recurrence through
+`gdn_recurrent_decode` and keeps the torch conv and norm; it exists to narrow
+down a numerics problem in the fused kernel. Speculative decode steps always
+run the torch path. See `docs/design/flash-next/gdn-core-decode.md`.
+
+`VLLM_HPU_GDN_CORE_DECODE_DEBUG` adds a debug check of the GDN core decode
+slot indices as an integer. `0` (default) is off. `1` calls
+`check_gdn_core_decode_indices` before the core decode step of every GDN
+layer: over the real rows (the first `query_start_loc[-1]` rows; the runner's
+padding rows follow them) whose load and store slots are both in range, it raises `ValueError` when two rows share a store
+slot, or when one row's store slot is another row's load slot (a reordered
+cache). The check copies the indices to the CPU, syncing the host once per
+GDN layer per step; for debugging only.
+
 `VLLM_HPU_RECURRENT_STATE_POOL` selects the allocation mode for the recurrent
 (GDN / short-conv) state slots as an integer. `0` (default) keeps today's
 allocation, one recurrent state slot per attention block id. `1` gives the

@@ -79,6 +79,8 @@ Key subsystems:
 - **Run a test file**: `PYTHONPATH="$PWD" /Volumes/Storage/paperclip/tmp/vllm-cpu-dev/venv/bin/python -m pytest -q -p no:cacheprovider tests/unit_tests/<file>`. The CPU regression over all unit tests is `spikes/mac-cpu-env/run_cpu_tests.sh <target-dir>` (`spikes/mac-cpu-env/cpu_tests.md` lists which files pass on CPU).
 - **Tensor-parallel checks on CPU**: `spikes/cpu-tp/harness.py` runs 1/2/4/8 `gloo` ranks through vLLM's parallel layers (`run_ranks`, `record_collectives`).
 - **No `timeout(1)` on macOS**: cap a command with `perl -e 'alarm N; exec @ARGV' <command>`.
+- **TPC compiler and simulator**: `tools/flash_next/tpcsim.sh <command>` (`docs/design/flash-next/tpcsim.md`).
+- **GDN decode default**: `VLLM_HPU_GDN_CORE_DECODE` defaults to `1` (FUSED), an exception to the default-off rule for new fast paths (next bullet), because the fused GDN decode kernel is the decode path (`docs/design/flash-next/gdn-core-decode.md`). On CPU, GDN decode steps therefore run the op's Python reference kernel by default; `0` selects the torch path.
 - **Program documents**: `docs/design/flash-next/` (system map, reuse ledger, plan, run sheets). New fast paths ship behind an env flag in `vllm_gaudi/envs.py`, default off; modes are integer enums.
 
 ## Environment Variables

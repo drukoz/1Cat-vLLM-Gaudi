@@ -529,6 +529,8 @@ if TYPE_CHECKING:
     VLLM_HPU_FUSED_GREEDY_LOGITS: bool = False
     VLLM_HPU_FLASH_NEXT_QSA_MODE: int = 0
     VLLM_HPU_FLASH_NEXT_QSA_PREFILL_TILE: int = 2048
+    VLLM_HPU_GDN_CORE_DECODE: int = 1  # GdnCoreDecodeMode: 1 fused (default), 0 off, 2 recurrence
+    VLLM_HPU_GDN_CORE_DECODE_DEBUG: int = 0  # GdnCoreDecodeDebug: 0 off, 1 check slot indices every step (host sync)
     VLLM_HPU_RECURRENT_STATE_POOL: int = 0  # RecurrentStatePoolMode: 0 off, 1 pool
     VLLM_HPU_RECURRENT_STATE_POOL_SLOTS: int = 0  # resolved by the hook; positive overrides the formula
     VLLM_HPU_RECURRENT_STATE_POOL_CACHE_SLOTS: int = 512  # retained prefix states added to the live need
@@ -1861,6 +1863,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # 262K bf16 bias plane at 1 GiB, under FusedSDPA's 2^31-byte stride limit.
     "VLLM_HPU_FLASH_NEXT_QSA_PREFILL_TILE":
     lambda: int(os.environ.get("VLLM_HPU_FLASH_NEXT_QSA_PREFILL_TILE", "2048")),
+
+    # Flash-Next GDN decode through the fused core op (flashinfer_gaudi.gdn_core_decode).
+    # 1 (default) = fused, 0 = off (the torch path), 2 = recurrence only (a bisect tool).
+    # Non-speculative decode only. Without the gdn_fused_ops extension on HPU the GDN layers
+    # fall back to the torch path; see docs/design/flash-next/gdn-core-decode.md.
+    "VLLM_HPU_GDN_CORE_DECODE":
+    lambda: int(os.environ.get("VLLM_HPU_GDN_CORE_DECODE", "1")),
+
+    # Debug check of the GDN core decode slot indices (check_gdn_core_decode_indices).
+    # 0 (default) = off, 1 = check the load/store indices before every core decode step.
+    "VLLM_HPU_GDN_CORE_DECODE_DEBUG":
+    lambda: int(os.environ.get("VLLM_HPU_GDN_CORE_DECODE_DEBUG", "0")),
 
     # Recurrent (GDN / short-conv) state pool: 0 (default) keeps today's
     # one-recurrent-slot-per-attention-block-id allocation, 1 gives the
