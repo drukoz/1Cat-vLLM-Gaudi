@@ -1,6 +1,6 @@
 # RUK-2709 Flash-Next on Gaudi: plan
 
-Kind: **Program**. Version 0.4, 2026-11-17: the M3 section is rewritten from seven facts checked on this Mac after M2 merged (`e4b265f`; system map §17, facts 30-36): upstream's MTP class builds on CPU through the fork's seams after one more rebinding, the target already exports the multi-stream hidden, the GDN verification lattice exists in the fork's layer but the runner builds it only for DFlash2, PLE and sparse QSA refuse speculation today, and prefix caching changes what the lattice means, so MTP ships for prefix caching off first and the align-mode lattice last. Version 0.3, 2026-11-17: the M2 section is rewritten from five facts checked on this Mac after M1 merged (`d635485`; system map §17, facts 25-29): sparse QSA is the correctness requirement for every prompt beyond 2050 tokens, the side caches become plugin-owned tensors, the GDN tactics are torch-level so the TP4/TP8 gates are a Python change. Version 0.2, 2026-11-17: v0.1 was written from the system map (v0.5) and the reuse ledger (v0.3) after all Phase 0 research (R1–R7, R4b) and spikes (S0, S3, S4) reported; v0.2 rewrites the M1 section after M0 merged (`383e5ab`) with the facts checked for it. The working copy is the `plan` document on RUK-2709; this file is refreshed with the pull request.
+Kind: **Program**. Version 0.5, 2026-11-18: the M3b section (`c58c1a6`, RUK-2909) and the M4 section (`c4dbae1`, RUK-2919; the user's direction in RUK-2733 replaced the earlier M4) are in; M4's open FP8 question is closed by RUK-2920 (the block-FP8 routed experts split into whole 128-wide blocks with expert parallelism and fail without it; every other weight of the published checkpoint is BF16 and listed in `modules_to_not_convert`; upstream #55513 is a ModelOpt-format fix and does not apply to Qwen's `fp8` format, whose ignored-layer names the pin's draft remap already matches), so there is no fix task F before the rental. Version 0.4, 2026-11-17: the M3 section is rewritten from seven facts checked on this Mac after M2 merged (`e4b265f`; system map §17, facts 30-36): upstream's MTP class builds on CPU through the fork's seams after one more rebinding, the target already exports the multi-stream hidden, the GDN verification lattice exists in the fork's layer but the runner builds it only for DFlash2, PLE and sparse QSA refuse speculation today, and prefix caching changes what the lattice means, so MTP ships for prefix caching off first and the align-mode lattice last. Version 0.3, 2026-11-17: the M2 section is rewritten from five facts checked on this Mac after M1 merged (`d635485`; system map §17, facts 25-29): sparse QSA is the correctness requirement for every prompt beyond 2050 tokens, the side caches become plugin-owned tensors, the GDN tactics are torch-level so the TP4/TP8 gates are a Python change. Version 0.2, 2026-11-17: v0.1 was written from the system map (v0.5) and the reuse ledger (v0.3) after all Phase 0 research (R1–R7, R4b) and spikes (S0, S3, S4) reported; v0.2 rewrites the M1 section after M0 merged (`383e5ab`) with the facts checked for it. The working copy is the `plan` document on RUK-2709; this file is refreshed with the pull request.
 
 ## What changed between the map and this plan
 
@@ -14,7 +14,7 @@ Instantiating upstream's class through vLLM's loader on CPU with the tiny config
 
 ## Assumptions
 
-1. The first hardware layout is BF16 at TP8 on one server (system map 2a); the two-server FP8 layout is M4.
+1. The rented layout is FP8 at TP8 + EP8 on one server, with two TP4 + EP4 servers as the comparison, at 128K context and 32 agents (user, RUK-2733, 2026-11-18; M4). BF16 at TP8 remains the CPU and tiny-model bring-up layout only.
 2. `--language-model-only` is the production setting; the vision tower is loaded as a `StageMissingLayer` and gets no work.
 3. transformers 5.16.1 on the node contains `qwen4_exp` (the checkpoint declares 5.8.0.dev0). The CPU reference is produced on this Mac, so the node's transformers version only matters for the tokenizer. *(unverified)*
 4. The real tokenizer files (`Qwen/Qwen3.8-Flash-Next`) can be downloaded on this Mac; the generator also accepts a local path. If the repository is gated, the user provides the files.
@@ -219,9 +219,92 @@ Waits for the rental numbers: tree verification (about 15 subtasks; decided by C
 (decided by E2's probe), async scheduling with speculation, host offload of cold GDN snapshots (only if stage 4
 shows evictions), n-gram under prefix caching.
 
-### M4 Two servers and eight cards (`feat/flash-next-gaudi-m4`)
+### M4 The rental test script and the FP8 layout: 128K context, 32 agents (`feat/flash-next-gaudi-m4`; replaces the earlier M4)
 
-FP8 at TP4 needs expert parallelism (R6: 640/4 = 160 per rank is not a multiple of the 128-wide FP8 blocks; `--enable-expert-parallel` gives each rank 128 whole experts), so: TP4 + EP4 block-FP8 MoE, INC FP8 with the conv1d blocklist as the alternative; PLE table on the host (backport #54371's structure with an HPU gather, or the fork's Engram host gather) to fit BF16 at TP4; TP8 fused AllReduce + residual + RMSNorm (`tp2_fused_ar_norm.py` pattern); run-sheet stage 5 comparisons (TP8, 2×TP4, TP4+EP).
+The user's direction (RUK-2733, comment `0a0bcd8e`): a complete test script is written before the rental, so the rental is "send the script over and run it", and every number comes from the same script. The rental measures one target only: **128K context, 32 concurrent agents, 8-bit (FP8) weights.** This answers the question left open in v0.5: FP8 is the layout the rental qualifies, and BF16 at TP8 leaves the rental.
+
+#### Assumptions
+1. "128K context" is `--max-model-len 131072`. Each agent's conversation starts at about 120K tokens and grows to about 128K over four turns, so every request sits near the limit.
+2. "32 agents" means 32 conversations decoding at the same time on the node. The scored layout is one server on all eight cards (TP8 + EP8, `--max-num-seqs 32`). The comparison layout is two servers on four cards each (TP4 + EP4, 16 agents each, 32 in total), using the same client and workload. The comparison decides which layout production runs.
+3. The FP8 checkpoint is the published block-FP8 one (128 × 128 weight blocks, read from the checkpoint's own `quantization_config`, no `--quantization` flag). It is downloaded to the node before the rental. The script's preflight checks its config and size, and stops if either is wrong.
+4. The KV cache stays BF16. FP8 KV needs INC calibration on the card, so it stays in M5. The capacity of TP8 + EP8 with the M1 state pool is estimated at about 5.2M KV tokens, or 40 agents at 131K (system map §2: BF16 TP8 has about 40 GiB per card for KV and 3.49M tokens with the pool; FP8 weights take 21.6 GiB per card instead of 42, which leaves about 60 GiB). 32 × 131,072 = 4.19M tokens, which is about 25% headroom. Two TP4 + EP4 servers have about 3.41M tokens each (25 agents each), which fits 16 each. **These are estimates**: the startup gate checks vLLM's own `Maximum concurrency` line.
+5. The script runs on the node. A bundle built on the Mac (`make_rental_bundle.sh`) carries the plugin at a fixed commit and the vLLM source at the engine pin. The node then needs no GitHub access, only the base image and the checkpoint.
+
+#### What leaves the rental
+The flag-by-flag A/B sweeps at BF16 (stage 3a–3d), the 4K and 32K input sweeps, the 1-, 8- and 16-agent rows, the stage 4 admission variants A–F as separate launches, the TP1/TP2 rows, PP2 × TP4, 262K contexts, and the stage 3f markdown stage (RUK-2916: its facts move into the script's variants). The markdown run sheet keeps stages 1–2a as background reading. The script is the only procedure for the rental.
+
+#### What the code already has for FP8 + EP
+`HPUFp8MoEMethod` (`vllm_gaudi/ops/hpu_fp8.py:237`) builds the block-FP8 MoE op (`VllmMixtureOfExpertsOpFP8`) over `layer.local_num_experts`, offset by `ep_rank`, so block-FP8 experts with `--enable-expert-parallel` may load as they are. With EP the routed experts are not split by TP, so each keeps its full intermediate width of 640, which is five 128-wide blocks. **Settled by RUK-2920 (M4-H0, merged `89547ef`):** in `Qwen/Qwen3.8-Flash-Next-FP8` only the routed experts are block-FP8. The shared expert, the MoE gate, attention, the GDN projections and conv, the HyperConnection weights, the embeddings, the vision tower and the MTP layer's non-expert weights are all BF16, listed in the checkpoint's `modules_to_not_convert` (943 names, 20 of them `mtp.*`), and the PLE table is in `modules_to_convert`. So the block-shape rule applies to `experts.w13` and `experts.w2` only: `check_fp8_layout.py` passes at TP8 and TP4 with `--ep` (per rank 640 = 5 blocks) and fails without it (80 and 160 per rank). The MTP draft needs nothing either: at the pin `Qwen4ExpMTP` builds its predictor under the quant prefix `mtp`, and `_remap_ignored_layers` turns the checkpoint's `mtp.layers.0.*` names into `mtp.layers.48.*`, which is exactly what `Fp8Config.get_quant_method` compares against (`is_layer_skipped`, exact match); upstream #55513 ("Fix block FP8 MTP in ModelOpt mixed checkpoints") changes `modelopt.py` and a `quantized_layers` remap that Qwen's `quant_method: fp8` checkpoint never uses. What stays unproven until the node: the fork's `HPUFp8MoEMethod` over 512 experts at EP8/EP4 and its interplay with the fused shared expert; gates G1 and G3 catch a failure there, and variant B continues on failure. The plan's earlier S1 half, a tiny block-FP8 checkpoint loaded on CPU, is dropped: this Mac cannot run the fork's HPU FP8 MoE method, so a CPU load would prove only the name mapping, which M3's 31-name loading check already covers for the draft.
+
+#### The workload `agent-128k-v1` (fixed; any change gets a new version)
+- 32 agents (16 per server in the two-server layout; agent `i` goes to server `i % servers`).
+- Each agent's first prompt is a chat conversation with:
+  - a **shared system block** of 16,384 tokens, identical for every agent. It stands in for agent instructions and a repository guide, so the prefix cache gets real cross-agent hits.
+  - its own **repository files**, the plugin's Python sources taken in a fixed order from an agent-specific starting offset, up to 120,000 tokens in total.
+  - a **coding instruction**: one of RUK-2914's three templates, asking for one file to be edited and returned whole.
+- Four turns per agent. Each turn generates exactly 1,024 tokens (`max_tokens = min_tokens = 1024`, temperature 0, thinking off) so variants compare equal work. The next turn appends the answer and a follow-up of about 40 tokens that names the next file already shown in the first prompt, with the next template (the files are not repeated).
+- Prompts are sized with the server's own `/tokenize` endpoint, so token counts are exact and no tokenizer is needed on the client.
+- Arrival: agents start staggered over 60 s. After that, each agent sends its next turn as soon as the previous one finishes (a closed loop with no think time).
+
+#### Variants (all at 131072, 32 agents, prefix caching on, recurrent state pool on, sparse QSA on, fused GDN decode where the library has it)
+| Id | Layout | Speculation | On failure | Purpose |
+|---|---|---|---|---|
+| A | TP8 + EP8, one server | none | stop the run | the baseline every number is compared with |
+| B | TP8 + EP8 | MTP, k = 3, drafter-rank log on | continue | tokens per step at 32 agents; the tree-verification ceiling |
+| C | TP4 + EP4 × 2 servers | B's setting if B passed, else none | continue | the production layout question |
+| P (optional, `--with-profile`) | A's | A's | continue | 120 s of profiler trace under full load for the step-anatomy tool (RUK-2913) |
+
+n-gram drafting is not a variant: today the platform refuses it with prefix caching on (RUK-2910), and with prefix caching off every turn would prefill 128K again, which no production setting does. Batch settings for every variant are `--max-num-batched-tokens 8192 --long-prefill-token-threshold 2048`, stage 4's variant C, because stage 4 has not run. The script records them in every result.
+
+#### Gates (fail fast; each writes its status and the logs, then the script tars the run and stops)
+| Gate | Checks | Stop when |
+|---|---|---|
+| G0 preflight | 8 cards in `hl-smi`; the checkpoint config is block-FP8 [128, 128]; the FP8 layout check (S1's tool) passes for each layout in the run; free disk; records the bundle commit, the image, `hl-smi -q` and the environment | any check fails |
+| G1 build | stage 1's install from the bundle; `vllm.__version__` is `0.28.1rc1.dev392+g8f816a3f6`; `import vllm_gaudi`; `flashinfer_gaudi.get_capabilities()`; `gdn_fused` library present (recorded, not a stop) | install or import fails, or the version is wrong |
+| G1b fused GDN kernel | op numerics of both GDN decode ops on the card against the CPU reference (`test_hpu_op.py`), 1,000-step graph replay against eager (two cases), then the verification op's numerics and two replays (only after the decode checks pass), then the speed measurement | never stops: on a failure, a skip or a missing library, every later server runs with `VLLM_HPU_GDN_CORE_DECODE=0` (the PyTorch GDN path), recorded in the manifest and the summary; a verify failure leaves `VLLM_HPU_GDN_CORE_VERIFY=0`, only a pass sets it to 1 |
+| G2 tiny TP8 | stage 2a's tiny 8-head checkpoint at TP8: greedy agreement with `reference.json` | fewer than 16/16 tokens match on any prompt, as in stage 2a |
+| G3 startup, per server | parsed `Maximum concurrency for 131,072 tokens per request` ≥ agents on that server; `Usable num_blocks`, KV tokens, weights GiB and warmup seconds recorded | the concurrency is too low, or no healthy `/v1/models` within 1,800 s |
+| G4 coherence, variant A's server only | the 8 short prompts of stage 2b; one 120K-token needle prompt (a fact placed at about 30% depth, asked at the end) | an empty answer, repetition garbage, a JSON prompt that does not parse, or a missed needle |
+| G5 load, per variant | the workload finishes in 5,400 s, with no request error and `Running` reaching the variant's agent count | any of these fails (then the variant's "on failure" rule applies) |
+
+#### What comes back
+`results/<run-id>.tar.gz`: `manifest.json`, each gate's and variant's `status.json`, `startup.json`, `requests.jsonl`, `metrics.jsonl`, `hlsmi.csv`, full server logs, and `summary.md` / `summary.json`. The user attaches the tarball to RUK-2709. The summary reports, per variant:
+- first-turn TTFT (cold) and later-turn TTFT (warm), p50 / p90 / max;
+- decode tok/s per agent, p50 and min;
+- aggregate output tok/s over the window where at least 30 agents are decoding;
+- prefix-cache hit rate, preemptions, MTP acceptance length, errors and wall time.
+
+#### Contract (pasted into every M4 harness spec)
+All files live under `tools/flash_next/rental/`. Python 3.10 standard library, plus `aiohttp` (present in vLLM images) for the client and monitor. Every status is an integer enum:
+- `GateStatus(IntEnum)`: NOT_RUN = 0, PASSED = 1, FAILED = 2, SKIPPED = 3, TIMED_OUT = 4.
+- `RequestStatus(IntEnum)`: OK = 0, HTTP_ERROR = 1, TIMEOUT = 2, SHORT_OUTPUT = 3.
+- `OnFail(IntEnum)`: STOP = 0, CONTINUE = 1.
+
+All of these live in `tools/flash_next/rental/schema.py` (written by H1 and imported by the others). Record formats (one JSON object per line in `.jsonl`; times are Unix seconds as floats):
+- `startup.json`: `{"server": int, "usable_num_blocks": int|null, "kv_cache_tokens": int|null, "max_concurrency": float|null, "max_concurrency_len": int|null, "weights_gib": float|null, "warmup_seconds": float|null, "gdn_layers_detected": str|null, "startup_seconds": float}`
+- `requests.jsonl`: `{"agent": int, "turn": int, "server": int, "prompt_tokens": int, "cached_tokens": int|null, "output_tokens": int, "t_send": float, "t_first": float|null, "t_last": float|null, "itl_p50_ms": float|null, "status": int, "error": str|null}`
+- `metrics.jsonl`: `{"t": float, "server": int, "running": float|null, "waiting": float|null, "kv_usage": float|null, "prefix_hits": float|null, "prefix_queries": float|null, "preemptions": float|null, "spec_accepted": float|null, "spec_drafts": float|null, "spec_draft_tokens": float|null, "generation_tokens": float|null, "prompt_tokens": float|null}`. The counters are raw cumulative values; the report takes the differences.
+- `workload.json`: `{"version": "agent-128k-v1", "shared_prefix_tokens": int, "target_initial_tokens": int, "turns": int, "max_tokens": int, "agents": [{"agent": int, "messages": [{"role": str, "content": str}], "followups": [str]}]}`
+- `variants.json`: `[{"id": str, "title": str, "servers": [{"cards": str, "tp": int, "ep": bool, "port": int, "agents": int}], "env": {str: str}, "serve_args": [str], "on_fail": int, "optional": bool}]`
+
+#### Tasks (milestone M4, branch `feat/flash-next-gaudi-m4`, cut from `feat/flash-next-gaudi-m3b` at `c58c1a6`)
+| Id | Task | Waits for |
+|---|---|---|
+| S1 = H0 (RUK-2920, done, merged `89547ef`) | The FP8 block-shape check for the checkpoint's block-FP8 weights at any TP, with or without EP (`check_fp8_layout.py`, CLI exit 0/1/2, 9 tests) | none |
+| H1 (RUK-2921) | `serve.py` (`schema.py` was committed with the contract, `ada3a1d`): build the `vllm serve` command from a variant, start one server per layout entry with its log teed to a file, wait for health, parse the startup lines into `startup.json`, stop cleanly | none |
+| H2 (RUK-2922) | `workload.py`: the deterministic `agent-128k-v1` builder, with `/tokenize` sizing, an offline `--estimate` counter for tests, and size options (`--agents`, `--shared-tokens`, `--initial-tokens`, `--turns`, `--max-tokens`) | none |
+| H3 (RUK-2923) | `agent_load.py` plus `stub_server.py`: the closed-loop streaming client and a stub OpenAI server for tests | none |
+| H4 (RUK-2924) | `monitor.py`: a `/metrics` poller and an `hl-smi` sampler, written as `metrics.jsonl` and `hlsmi.csv` | none |
+| H5 (RUK-2925) | `report.py`: `summary.md` and `summary.json` from a run folder | none |
+| H6 (RUK-2928) | `main.py` and `variants.json`: the orchestrator and the variant list | H0–H5, H7 |
+| H7 (RUK-2926) | `gates.py`: preflight, build, tiny TP8, capacity, coherence plus the 120K needle, load | none |
+| H8 (RUK-2927) | `run_rental.sh`, the container entry, `make_rental_bundle.sh`, `docs/design/flash-next/run-sheets/rental.md` and the guide | none |
+| V (RUK-2929) | QA: the whole script end to end on this Mac (stub mode, then CPU tiny mode), the bundle built and unpacked clean | H6, H8 |
+| F | Not needed: RUK-2920 found nothing to fix (see "What the code already has for FP8 + EP") | — |
+
+The rental starts when V passes, together with M3 and M3b.
+
+The earlier M4 (two BF16 servers with the PLE table on the host, stage 5 comparisons at TP1/2/4/8 and PP) is dropped by the user's direction; the TP8 fused AllReduce + residual + RMSNorm moves to M5.
 
 ### M5 Gaudi2 extras
 
