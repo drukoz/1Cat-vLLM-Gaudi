@@ -418,3 +418,14 @@ def test_table_errors_column_counts_missing_rows(tmp_path: Path) -> None:
     d_row = [line for line in md.splitlines() if line.startswith("| D ")][0]
     # expected 2 agents x 4 turns = 8, rows 5, all OK -> errors 3
     assert "| 3 |" in d_row
+
+
+def test_expected_rows_follow_workload_agents(tmp_path: Path) -> None:
+    """A run with fewer workload agents than variants.json (--agents 2) expects only those agents' rows."""
+    run = build_run(tmp_path)
+    manifest = json.loads((run / "manifest.json").read_text())
+    manifest["workload"]["agents"] = 2
+    write_json(run / "manifest.json", manifest)
+    summary = summarize_run(run)
+    assert summary["variants"]["A"]["requests"]["expected"] == 4  # 2 agents x 2 turns, not 4 x 2
+    assert summary["variants"]["B"]["requests"]["expected"] == 4
