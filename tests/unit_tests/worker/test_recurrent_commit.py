@@ -117,6 +117,18 @@ def test_align_precopy_plan_normalize_rewinds_a_multi_token_window():
     assert align_precopy_plan([9], [38], [1], [1], 4, normalize=True) == ([], [9], [1])
 
 
+def test_align_precopy_plan_moves_a_window_backward():
+    # Verification step ctx 33 + 4 scheduled put the state in block 9; 1 token accepted, so a plain decode
+    # (ctx 34, 1 scheduled) runs in block 8 and the state moves back 9 -> 8.
+    assert align_precopy_plan([9], [34], [1], [1], 4, normalize=True) == ([(0, 0, 9, 8)], [8], [1])
+    # Same move without normalize (a verification step with trimmed drafts): still planned.
+    assert align_precopy_plan([9], [34], [1], [1], 4) == ([(0, 0, 9, 8)], [8], [1])
+    # 2 accepted tokens: bias 1, ctx 35 -> curr cdiv(36, 4) - 1 = 8.
+    assert align_precopy_plan([9], [35], [1], [2], 4, normalize=True) == ([(0, 1, 9, 8)], [8], [1])
+    # Trimmed verification step: ctx 34 + 2 scheduled -> curr 8.
+    assert align_precopy_plan([9], [34], [2], [1], 4) == ([(0, 0, 9, 8)], [8], [1])
+
+
 def test_align_precopy_plan_keeps_requests_in_order():
     plan, prev_blocks, accepted = align_precopy_plan([None, 9], [33, 37], [4, 4], [1, 4], 4)
     assert plan == [(0, 0, 8, 9), (1, 3, 9, 10)]
@@ -130,9 +142,6 @@ def test_align_precopy_plan_rejects_bad_arguments():
         align_precopy_plan([9, 9], [33, 37], [4], [1, 4], 4)
     with pytest.raises(ValueError, match="accepted"):
         align_precopy_plan([9], [33], [4], [0], 4)
-    # prev = 11 is past the running block 10 of a ctx=37 step: the row lost its index stability.
-    with pytest.raises(ValueError, match="past the running block"):
-        align_precopy_plan([11], [37], [4], [1], 4)
 
 
 def test_precopy_slot_pairs_maps_block_indices_to_slots():
