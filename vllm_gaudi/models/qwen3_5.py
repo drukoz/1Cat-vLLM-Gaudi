@@ -265,7 +265,8 @@ class HPUGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         if fused:
             # RECURRENCE keeps the torch conv update and self.norm, so only FUSED needs these.
             if self._gdn_core_gate is None:
-                return f"output gate {getattr(getattr(self, 'norm', None), 'activation', None)!r} is not silu or sigmoid"
+                return (f"output gate {getattr(getattr(self, 'norm', None), 'activation', None)!r} "
+                        "is not silu or sigmoid")
             if self.conv1d.bias is not None:
                 return "conv1d has a bias"
             if self.conv_kernel_size != 4:
