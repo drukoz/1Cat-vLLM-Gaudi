@@ -157,6 +157,15 @@ Notes:
   (`startup.json`, `toolchain.json`, `requests.jsonl`, `metrics.jsonl`, `status.json`,
   `summary.*`) are all in the results folder for the run id.
 
+## Checks carried from rental run 1 (2026-11-18)
+
+- `PT_HPU_LAZY_MODE=1`: gate G2's tiny TP8 server reaches `/health` (run 1 failed while building
+  the model: the PLE hash multipliers were an int64 device buffer; fixed in RUK-3101).
+- On the card, in lazy mode, before G2:
+  `python -m pytest -q tests/unit_tests/models/flash_next/test_ple_ngram_hash.py` runs its `hpu`
+  case (not skipped) and passes; if it fails, the int32 hash is not exact on the card: stop and
+  send the log.
+
 ## What to send back
 
 Everything the run writes is under `<results>/<run-id>/` on the host (default `~/rental/results/`),
