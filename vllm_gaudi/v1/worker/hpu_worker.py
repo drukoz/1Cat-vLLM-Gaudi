@@ -949,7 +949,8 @@ class HPUWorker(WorkerBase):
 
             elif isinstance(layer_spec, MambaSpec):
                 dtype0 = layer_spec.dtypes[0]
-                dtype1 = layer_spec.dtypes[1]
+                # A single-state spec (the Flash-Next PLE short-conv group) has no second dtype.
+                dtype1 = layer_spec.dtypes[1] if len(layer_spec.dtypes) > 1 else dtype0
 
                 # Use an empty tensor instead of `None`` to force Dynamo to pass
                 # it by reference, rather by specializing on the value ``None``.

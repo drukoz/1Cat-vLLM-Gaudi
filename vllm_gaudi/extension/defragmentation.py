@@ -61,7 +61,8 @@ class OnlineDefragmenter:
         self.graphed = with_default(config.VLLM_DEFRAG_WITH_GRAPHS, config.bridge_mode == 'eager')
         self.debug = init_debug_logger('defrag')
         self.kv_caches = tuple(kv_caches)
-        self.is_mla = all([cache[1] is None for cache in self.kv_caches])
+        # A single-state cache (the Flash-Next PLE short-conv group) is a one-element tuple, not an MLA cache.
+        self.is_mla = all([len(cache) > 1 and cache[1] is None for cache in self.kv_caches])
         self.block_size = block_size
         self.cache_utils = CacheSwapUtils(block_size, kv_caches[0][0].device)
         if self.graphed:
