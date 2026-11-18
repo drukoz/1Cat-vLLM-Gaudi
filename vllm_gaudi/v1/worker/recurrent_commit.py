@@ -35,6 +35,7 @@ __all__ = [
     "align_precopy_plan",
     "precopy_slot_pairs",
     "self_commit_requests",
+    "apply_align_precopy",
 ]
 
 
@@ -207,3 +208,30 @@ def precopy_slot_pairs(plan: Sequence[tuple[int, int, int, int]], block_rows: Se
 def self_commit_requests(pairs: Sequence[tuple[int, int, int, int]], lattices_store: torch.Tensor) -> set[int]:
     """Requests i with a boundary-commit pair whose dst_slot == int(lattices_store[i][0])."""
     return {int(i) for (i, _t, _src, dst) in pairs if int(lattices_store[int(i)][0]) == int(dst)}
+
+
+def apply_align_precopy(registry: dict, block_rows_by_group: dict, req_ids: Sequence[str],
+                        running_blocks: dict, accepted_by_req: dict, context_lens: Sequence[int],
+                        num_scheduled: Sequence[int], block_size: int, normalize: bool
+                        ) -> list[tuple[int, int, int, int]]:
+    """Pre-step align-mode copies for the decode requests req_ids (upstream vLLM preprocess_mamba, M3-T10c).
+
+    registry is the runner's {group_id: [(tensor, "conv" | "ssm", window_rows)]}; block_rows_by_group[gid][i]
+    is request i's block-table row of that group. Reads running_blocks.get(req_id) and
+    accepted_by_req.get(req_id, 1), copies the states in place with commit_ssm/commit_conv, then writes the new
+    running block and accepted count of every request back into the two dicts. Returns the plan."""
+    prev = [running_blocks.get(req_id) for req_id in req_ids]
+    acc = [accepted_by_req.get(req_id, 1) for req_id in req_ids]
+    plan, new_prev, new_acc = align_precopy_plan(prev, context_lens, num_scheduled, acc, block_size, normalize)
+    if plan:
+        for gid, entries in registry.items():
+            conv_pairs, ssm_pairs, ts = precopy_slot_pairs(plan, block_rows_by_group[gid])
+            for tensor, kind, window_len in entries:
+                if kind == "ssm":
+                    commit_ssm(tensor, ssm_pairs)
+                else:
+                    commit_conv(tensor, conv_pairs, window_len, t_per_pair=ts)
+    for i, req_id in enumerate(req_ids):
+        running_blocks[req_id] = new_prev[i]
+        accepted_by_req[req_id] = new_acc[i]
+    return plan

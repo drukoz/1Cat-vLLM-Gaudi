@@ -40,7 +40,8 @@ from vllm_gaudi.v1.worker.hpu_dp_utils import set_hpu_dp_metadata
 from vllm_gaudi.v1.worker.gdn_state_layout import has_contiguous_dflash_checkpoints
 from vllm_gaudi.v1.worker.flash_next_inputs import (build_block_table, build_ple_inputs, dummy_ple_inputs,
                                                     model_requires_block_table, model_requires_raw_input_tokens)
-from vllm_gaudi.v1.worker.recurrent_commit import boundary_commits, commit_conv, commit_ssm
+from vllm_gaudi.v1.worker.recurrent_commit import (apply_align_precopy, boundary_commits, commit_conv, commit_ssm,
+                                                   self_commit_requests)
 from vllm_gaudi.v1.worker.recurrent_lattice import align_lattices
 from vllm_gaudi.v1.worker.recurrent_spec import (accepted_counts, load_checkpoint_offsets, qsa_modules,
                                                  recurrent_spec_enabled, state_slots_per_request,
@@ -2263,6 +2264,8 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         self._gdn_req_to_base_slot: dict[str, int] = {}
         self._compact_gdn_state_tensors: list[torch.Tensor] = []
         self._gdn_num_accepted_by_req: dict[str, int] = {}
+        # align mode (M3-T10c): each decode request's running block index from its previous step
+        self._align_running_block_by_req: dict[str, int] = {}
         self._logged_direct_gdn_state = False
         self._logged_padded_direct_gdn_state = False
 
@@ -2540,13 +2543,19 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                 registry[gid] = list(entries.values())
         return registry
 
-    def _commit_recurrent_boundaries(self, boundary, accepted_counts: list) -> None:
-        """Copy accepted block-completing states from the store lattice into position blocks (M3-T10b)."""
+    def _commit_recurrent_boundaries(self, boundary, accepted_counts: list) -> set[int]:
+        """Copy accepted block-completing states from the store lattice into position blocks (M3-T10b).
+
+        Returns the decode indices of the requests whose commit writes the running block
+        itself (the store lattice's column-0 slot, M3-T10c); the caller resets their
+        accepted counts to 1 so the next step keeps the committed state.
+        """
         load_cpu, store_cpu, context_lens, num_decodes, block_size = boundary
         registry = getattr(self, "_recurrent_commit_registry", None)
         if not registry:
-            return
+            return set()
         accepted = [int(a) for a in accepted_counts[:num_decodes]]
+        self_commits: set[int] = set()
         for gid, entries in registry.items():
             store_g = store_cpu[gid][:num_decodes]
             load_g = load_cpu[gid][:num_decodes]
@@ -2554,6 +2563,7 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             pairs = boundary_commits(context_lens, accepted, block_size, store_g, block_rows, load_g)
             if not pairs:
                 continue
+            self_commits |= self_commit_requests(pairs, store_g)
             # The spec kernels keep the convolution window in the store lattice's
             # column-0 slot; the ssm checkpoints live in the per-token columns.
             conv_pairs = [(i, t, int(store_g[i][0]), dst) for (i, t, _src, dst) in pairs]
@@ -2563,6 +2573,31 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                     commit_ssm(tensor, pairs)
                 else:
                     commit_conv(tensor, conv_pairs, window_len, t_per_pair=ts)
+        return self_commits
+
+    def _precopy_align_states(self, num_decodes: int, context_lens: list, num_scheduled: list, block_size: int,
+                              normalize: bool) -> None:
+        """Move each decode request's running recurrent state into its running block before the forward pass.
+
+        This is the runner-side call site of the upstream vLLM ``preprocess_mamba`` scheme (see the
+        ``t10c-design`` document on RUK-2798, M3-T10c): ``apply_align_precopy`` reads each request's
+        running block from the previous step and its accepted count, copies the registered conv/ssm
+        states in place into this step's running block, and writes the new running block and accepted
+        counts back into the runner's books, so ``accepted_counts`` below sees the post-copy values.
+        Requests beyond ``num_decodes`` are prefills: after a prefill the state sits in
+        ``row[(ctx - 1) // bs]``, the plan helper's default, so their entries are dropped.
+        """
+        if self.warmup_mode or not self._recurrent_commit_registry or num_decodes == 0:
+            return
+        rows = {
+            gid: self.input_batch.block_table[gid].get_cpu_tensor()[:num_decodes].tolist()
+            for gid in self._recurrent_commit_registry
+        }
+        apply_align_precopy(self._recurrent_commit_registry, rows, self.input_batch.req_ids[:num_decodes],
+                            self._align_running_block_by_req, self._gdn_num_accepted_by_req,
+                            context_lens[:num_decodes], num_scheduled[:num_decodes], block_size, normalize)
+        for r in self.input_batch.req_ids[num_decodes:]:
+            self._align_running_block_by_req.pop(r, None)
 
     def _can_use_direct_gdn_state(
         self,
@@ -2888,6 +2923,10 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         for req_id in scheduler_output.finished_req_ids:
             self.requests.pop(req_id, None)
             self._gdn_num_accepted_by_req.pop(req_id, None)
+            self._align_running_block_by_req.pop(req_id, None)
+
+        for req_id in (getattr(scheduler_output, "preempted_req_ids", None) or ()):
+            self._align_running_block_by_req.pop(req_id, None)
 
         # Remove the finished requests from the persistent batch.
         # NOTE(woosuk): There could be an edge case where finished_req_ids and
@@ -2949,6 +2988,7 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         for new_req_data in scheduler_output.scheduled_new_reqs:
             req_id = new_req_data.req_id
             self._gdn_num_accepted_by_req[req_id] = 1
+            self._align_running_block_by_req.pop(req_id, None)
             sampling_params = new_req_data.sampling_params
             pooling_params = new_req_data.pooling_params
             if sampling_params and \
@@ -2996,6 +3036,9 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             num_computed_tokens = req_data.num_computed_tokens[i]
             new_block_ids = req_data.new_block_ids[i]
             resumed_from_preemption = req_id in getattr(req_data, "resumed_req_ids", set())
+            if resumed_from_preemption:
+                self._align_running_block_by_req.pop(req_id, None)
+                self._gdn_num_accepted_by_req[req_id] = 1
             num_output_tokens = req_data.num_output_tokens[i]
             req_state.num_computed_tokens = num_computed_tokens
 
@@ -4998,6 +5041,11 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                 state_width,
             )
             if is_recurrent_spec_decode:
+                if self.use_prefix_caching:
+                    # Align mode (M3-T10c): move each request's running state into its running block first, so
+                    # num_accepted below is the post-copy count (upstream vLLM preprocess_mamba).
+                    self._precopy_align_states(num_decodes, list(context_lens), list(num_scheduled_tokens),
+                                               mamba_block_size, normalize=not is_spec_batch)
                 decode_req_ids = self.input_batch.req_ids[:num_decodes]
                 decode_accepted = accepted_counts(decode_req_ids, self._gdn_num_accepted_by_req, num_decodes)
                 load_offsets = load_checkpoint_offsets(decode_accepted, is_spec_batch)
@@ -5016,10 +5064,10 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                 store_state_indices_cpu = self.prepare_mamba_state_idxs(req_indices, block_idx_last_scheduled_token_cpu,
                                                                         padded_batch_size, state_width)
                 if is_spec_batch:
-                    # Align mode (M3-T10b): token 0 loads from the block of the last
-                    # computed token and stores into the block of its own position;
-                    # the k scratch blocks carry the remaining candidates. The scalar
-                    # lattices above are position-block constants per request.
+                    # Align mode (M3-T10b, T10c): one lattice row[curr : curr + 1 + k],
+                    # curr = the block of the last scheduled token, load == store; the
+                    # pre-step precopy has moved the running state into row[curr]. The
+                    # scalar lattices above are running-block constants per request.
                     spec_k = state_width - 1
                     load_rows = []
                     store_rows = []
@@ -6570,8 +6618,13 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                                 # Align mode (M3-T10b): accepted tokens that complete a
                                 # position block move their state from the store lattice
                                 # into that block's slot for prefix-cache reuse.
-                                self._commit_recurrent_boundaries(decode_data.recurrent_boundary,
-                                                                  [len(a) for a in decode_sampled_token_ids])
+                                self_commits = self._commit_recurrent_boundaries(
+                                    decode_data.recurrent_boundary,
+                                    [len(a) for a in decode_sampled_token_ids])
+                                # T10c: a commit into the running block itself replaced the
+                                # multi-token window, so the next step starts from one token.
+                                for i in self_commits:
+                                    self._gdn_num_accepted_by_req[self.input_batch.req_ids[i]] = 1
                         # convert decode_sampled_token_ids as list of tensor
                         spec_decode_num_tokens = [len(v) for v in decode_sampled_token_ids]
                         decode_sampled_token_ids = [
