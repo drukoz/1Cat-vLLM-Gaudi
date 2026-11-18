@@ -53,11 +53,21 @@ add_custom_command(
 set_source_files_properties("${CMAKE_CURRENT_BINARY_DIR}/gdn_recurrent_decode_gaudi2_embedded.o"
     PROPERTIES EXTERNAL_OBJECT TRUE GENERATED TRUE)
 
+# RUK-3105 diagnostic: drop the embedded LLVM bitcode from the verify kernel ELF, so the graph
+# compiler cannot recompile it (the kernel needs -vlm 32, which the bitcode does not carry).
+option(GDN_FUSED_VERIFY_STRIP_BITCODE "Remove .llvmbc from gdn_core_verify_gaudi2.o" OFF)
+set(GDN_VERIFY_STRIP_COMMAND "")
+if(GDN_FUSED_VERIFY_STRIP_BITCODE)
+    set(GDN_VERIFY_STRIP_COMMAND
+        COMMAND "${ELF_OBJCOPY}" --remove-section=.llvmbc "${CMAKE_CURRENT_BINARY_DIR}/gdn_core_verify_gaudi2.o")
+endif()
+
 add_custom_command(
     OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/gdn_core_verify_gaudi2.o"
     COMMAND "${TPC_COMPILER}" -Wall -Werror -O2 -march=gaudi2 -vlm 32 -I"${TPC_INCLUDE_DIR}"
             "${CMAKE_CURRENT_SOURCE_DIR}/kernels/gdn_core_verify_gaudi2.c"
             -c -o "${CMAKE_CURRENT_BINARY_DIR}/gdn_core_verify_gaudi2.o"
+    ${GDN_VERIFY_STRIP_COMMAND}
     DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/kernels/gdn_core_verify_gaudi2.c"
             "${CMAKE_CURRENT_SOURCE_DIR}/kernels/gdn_core_verify_recurrence.h"
             "${CMAKE_CURRENT_SOURCE_DIR}/kernels/gdn_core_decode_norm.h"
