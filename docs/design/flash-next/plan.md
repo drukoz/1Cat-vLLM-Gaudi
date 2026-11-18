@@ -238,7 +238,7 @@ The flag-by-flag A/B sweeps at BF16 (stage 3a–3d), the 4K and 32K input sweeps
   - a **shared system block** of 16,384 tokens, identical for every agent. It stands in for agent instructions and a repository guide, so the prefix cache gets real cross-agent hits.
   - its own **repository files**, the plugin's Python sources taken in a fixed order from an agent-specific starting offset, up to 120,000 tokens in total.
   - a **coding instruction**: one of RUK-2914's three templates, asking for one file to be edited and returned whole.
-- Four turns per agent. Each turn generates exactly 1,024 tokens (`max_tokens = min_tokens = 1024`, temperature 0, thinking off) so variants compare equal work. The next turn appends the answer and a follow-up of about 900 tokens: the next file in the agent's list, with the next template.
+- Four turns per agent. Each turn generates exactly 1,024 tokens (`max_tokens = min_tokens = 1024`, temperature 0, thinking off) so variants compare equal work. The next turn appends the answer and a follow-up of about 40 tokens that names the next file already shown in the first prompt, with the next template (the files are not repeated).
 - Prompts are sized with the server's own `/tokenize` endpoint, so token counts are exact and no tokenizer is needed on the client.
 - Arrival: agents start staggered over 60 s. After that, each agent sends its next turn as soon as the previous one finishes (a closed loop with no think time).
 
@@ -287,7 +287,7 @@ All of these live in `tools/flash_next/rental/schema.py` (written by H1 and impo
 |---|---|---|
 | S1 | Spike plus tool: the FP8 block-shape check for every linear layer at TP8 + EP8 and TP4 + EP4 (`check_fp8_layout.py`), and a tiny block-FP8 checkpoint loaded on CPU at TP8 + EP8 | none |
 | H1 | `schema.py` plus `serve.py`: build the `vllm serve` command from a variant, start one server per layout entry with its log teed to a file, wait for health, parse the startup lines into `startup.json`, stop cleanly | none |
-| H2 | `workload.py`: the deterministic `agent-128k-v1` builder, with `/tokenize` sizing and a `--scale` option for tests | none |
+| H2 | `workload.py`: the deterministic `agent-128k-v1` builder, with `/tokenize` sizing, an offline `--estimate` counter for tests, and size options (`--agents`, `--shared-tokens`, `--initial-tokens`, `--turns`, `--max-tokens`) | none |
 | H3 | `agent_load.py` plus `stub_server.py`: the closed-loop streaming client and a stub OpenAI server for tests | none |
 | H4 | `monitor.py`: a `/metrics` poller and an `hl-smi` sampler, written as `metrics.jsonl` and `hlsmi.csv` | none |
 | H5 | `report.py`: `summary.md` and `summary.json` from a run folder | none |
