@@ -53,6 +53,7 @@ from vllm.v1.request import Request  # noqa: E402
 
 from vllm_gaudi.v1.core.recurrent_pool_coordinator import HpuRecurrentPoolCoordinator  # noqa: E402
 from vllm_gaudi.v1.core.recurrent_state_pool import ENV_MODE, ENV_SLOTS  # noqa: E402
+from vllm_gaudi.v1.worker.recurrent_lattice import align_lattice  # noqa: E402
 
 BLOCK, HASH_BLOCK = 512, 128
 NUM_ATTN_BLOCKS = 200
@@ -94,7 +95,18 @@ def make_request(rid, n_tokens, offset=0):
                    block_hasher=get_request_block_hasher(HASH_BLOCK, hash_fn))
 
 
-def build_manager(monkeypatch, slots=None, mode=None, enable_kv_cache_events=False):
+def _spec3_config() -> KVCacheConfig:
+    """The same config with 3 speculative (align-mode scratch) blocks per recurrent group."""
+    import dataclasses
+    cfg = _build_config()
+    cfg.kv_cache_groups = [
+        dataclasses.replace(g, kv_cache_spec=dataclasses.replace(g.kv_cache_spec, num_speculative_blocks=3))
+        if isinstance(g.kv_cache_spec, MambaSpec) else g for g in cfg.kv_cache_groups
+    ]
+    return cfg
+
+
+def build_manager(monkeypatch, slots=None, mode=None, enable_kv_cache_events=False, config=None):
     """Fresh KVCacheManager with the pool env vars set as the test states them."""
     monkeypatch.delenv(ENV_MODE, raising=False)
     monkeypatch.delenv(ENV_SLOTS, raising=False)
@@ -102,7 +114,7 @@ def build_manager(monkeypatch, slots=None, mode=None, enable_kv_cache_events=Fal
         monkeypatch.setenv(ENV_MODE, mode)
     if slots is not None:
         monkeypatch.setenv(ENV_SLOTS, slots)
-    return KVCacheManager(kv_cache_config=_build_config(),
+    return KVCacheManager(kv_cache_config=config if config is not None else _build_config(),
                           max_model_len=8192,
                           scheduler_block_size=BLOCK,
                           hash_block_size=HASH_BLOCK,
@@ -235,3 +247,123 @@ def test_events_aggregated_from_both_pools(monkeypatch):
     assert events
     assert mgr.coordinator.recurrent_pool.kv_event_queue == []
     assert mgr.block_pool.kv_event_queue == []
+
+
+def test_align_spec_scratch_blocks_route_to_recurrent_pool(monkeypatch):
+    """num_speculative_blocks=3: each recurrent group carries a 1+3 align tail from the pool."""
+    mgr = build_manager(monkeypatch, mode="1", slots="24", config=_spec3_config())
+    req = make_request("r1", BLOCK)
+    blocks, hit, _ = mgr.get_computed_blocks(req)
+    assert mgr.allocate_slots(req, BLOCK, num_new_computed_tokens=hit, new_computed_blocks=blocks) is not None
+    req.num_computed_tokens += BLOCK
+
+    ids = mgr.get_block_ids(req.request_id)
+    assert len(ids[0]) == 1  # attention: only the position block
+    for group_ids in ids[1:]:
+        assert len(group_ids) == 1 + 3  # position block + 3 scratch blocks
+        for block_id in group_ids:
+            assert 0 <= block_id < 25
+
+    # Decode step with 3 drafts: the position block grows, the scratch tail is reused.
+    assert mgr.allocate_slots(req, 1 + 3) is not None
+    req.num_computed_tokens += 1
+    ids = mgr.get_block_ids(req.request_id)
+    assert len(ids[0]) == 2
+    for group_ids in ids[1:]:
+        assert len(group_ids) == 2 + 3
+        for block_id in group_ids:
+            assert 0 <= block_id < 25
+
+
+def test_align_spec_scratch_blocks_count_against_pool(monkeypatch):
+    """The 3 scratch blocks per recurrent group consume pool slots and gate admission."""
+    mgr = build_manager(monkeypatch, mode="1", slots="16", config=_spec3_config())
+    req1 = make_request("r1", BLOCK)
+    blocks, hit, _ = mgr.get_computed_blocks(req1)
+    assert mgr.allocate_slots(req1, BLOCK, num_new_computed_tokens=hit, new_computed_blocks=blocks) is not None
+    req1.num_computed_tokens += BLOCK
+
+    req2 = make_request("r2", BLOCK, offset=100000)  # distinct prompt: no prefix hit
+    blocks, hit, _ = mgr.get_computed_blocks(req2)
+    assert mgr.allocate_slots(req2, BLOCK, num_new_computed_tokens=hit, new_computed_blocks=blocks) is None
+
+    mgr.free(req1)
+    assert mgr.allocate_slots(req2, BLOCK, num_new_computed_tokens=hit, new_computed_blocks=blocks) is not None
+
+
+def test_align_spec_block_rows_across_steps(monkeypatch):
+    """Spike RUK-2847: record the recurrent group's block-table row across MTP decode steps.
+
+    Drives one request through the real KVCacheManager (pool mode, 3 speculative blocks, align
+    cache mode), accepting 1..4 tokens per MTP verification step, across 3 block boundaries.
+    Prints one line per step (ctx, row length, row tail, align_lattice load/store) for the
+    report; asserts only the layout rules observed in this trace.
+    """
+    k = 3
+    sched = 1 + k
+    accepts = [4, 1, 2, 3, 4, 4, 1, 4, 3, 2] + [4] * 260
+
+    mgr = build_manager(monkeypatch, mode="1", slots="64", config=_spec3_config())
+    null_id = mgr.coordinator.recurrent_pool.null_block.block_id
+    attn_free_at_start = mgr.block_pool.get_num_free_blocks()
+    recurrent_free_at_start = mgr.coordinator.recurrent_pool.get_num_free_blocks()
+
+    req = make_request("r1", BLOCK - 2)
+    blocks, hit, _ = mgr.get_computed_blocks(req)
+    assert mgr.allocate_slots(req, BLOCK - 2, num_new_computed_tokens=hit, new_computed_blocks=blocks) is not None
+    req.num_computed_tokens += BLOCK - 2
+
+    print(f"\nprefill: row={list(mgr.get_block_ids(req.request_id)[1])}")
+    prev_ctx = req.num_computed_tokens
+    prev_window = None
+    null_load_steps = []
+    boundary_steps = []
+    for step, a in enumerate(accepts):
+        assert mgr.allocate_slots(req, sched) is not None
+        ctx = req.num_computed_tokens
+        row = list(mgr.get_block_ids(req.request_id)[1])
+        load, store = align_lattice(row, ctx, sched, BLOCK, k)
+        n_pos = -(-(ctx + sched) // BLOCK)
+        print(f"step={step:3d} ctx={ctx:5d} a={a} len(row)={len(row):2d} n_pos={n_pos:2d} "
+              f"tail={row[-6:]} load={load} store={store}")
+
+        # Row length rule observed for align mode with 3 speculative blocks.
+        assert len(row) == -(-(ctx + sched) // BLOCK) + k
+
+        # The scratch window is exactly the last k entries, row[n_pos:n_pos+k], never null.
+        window = row[n_pos:n_pos + k]
+        assert window == row[-k:]
+        assert all(b != null_id for b in window)
+        if prev_window is not None:
+            if window != prev_window:
+                # Only steps that append one position block move the window: it shifts left
+                # by one (the leftmost id becomes the new position block) and gains one id.
+                assert window == prev_window[1:] + [window[-1]]
+                assert window[-1] not in prev_window
+        prev_window = window
+
+        # store[0] (this step's running-state block) and load[0] are real blocks: the running
+        # position block (index ctx//bs, and (ctx-1)//bs == ctx//bs for ctx % bs != 0) is
+        # never freed; only strictly older blocks are nulled by remove_skipped_blocks.
+        assert store[0] != null_id
+        if load[0] == null_id:
+            null_load_steps.append(step)
+        assert load[0] != null_id
+
+        # The step right after a crossing: the previous running position block is nulled.
+        if prev_ctx // BLOCK < ctx // BLOCK:
+            boundary_steps.append(step)
+            assert row[(prev_ctx - 1) // BLOCK] == null_id
+        prev_ctx = ctx
+        req.num_computed_tokens += a
+        if ctx > 3 * BLOCK:
+            break
+
+    print(f"summary: steps_done={step + 1} final_ctx={ctx} final_row={row}")
+    print(f"summary: null_load_steps={null_load_steps} boundary_crossing_steps={boundary_steps}")
+    assert len(boundary_steps) == 3
+
+    mgr.free(req)
+    assert mgr.block_pool.get_num_free_blocks() == attn_free_at_start
+    assert mgr.coordinator.recurrent_pool.get_num_free_blocks() == recurrent_free_at_start
+

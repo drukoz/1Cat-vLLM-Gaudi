@@ -92,6 +92,16 @@ def test_slot_arithmetic():
     assert pool_pad_block_id(896) == 897
 
 
+def test_resolve_pool_slots_with_speculation():
+    # Default and explicit 0 keep the non-speculative formula.
+    assert resolve_pool_slots(32, 4, 512) == 896
+    assert resolve_pool_slots(32, 4, 512, 0) == 896
+    # k=3: every live request owns LIVE_SLOTS_PER_REQUEST + 3 slots per group.
+    assert resolve_pool_slots(32, 4, 512, 3) == 32 * 4 * 6 + 512
+    assert resolve_pool_slots(32, 4, 512, 3) == 1280
+    assert resolve_pool_slots(1, 1, 0, 4) == LIVE_SLOTS_PER_REQUEST + 4
+
+
 def test_is_recurrent_spec():
     specs = _flash_next_specs()
     attn = next(s for s in specs.values() if isinstance(s, FullAttentionSpec))

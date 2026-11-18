@@ -9,6 +9,14 @@ raw-key ring of shape ``[gdn_state_rows, R, index_head_dim]`` sized from the
 first GDN group's state tensors, with ``R = ring_rows(compress_ratio,
 num_speculative_tokens)``.  Pure functions only (``math`` and ``torch``);
 the model runner allocates, this module only does the arithmetic.
+
+The ring's LAST row (index ``gdn_state_rows - 1``) is the scratch row: it is
+never a request's slot, because the runner's state tensors reserve their last
+row as padding (slot 0 is vLLM's null block, the last row the padding row), so
+this holds for the compact, pool and baseline GDN layouts alike.  The sparse
+decode branch of ``HpuQsaIndexer.select`` parks the padding rows of a ragged
+multi-token decode step on it (both as load and as store slot), which keeps
+those rows out of every request's ring window.
 """
 
 from __future__ import annotations

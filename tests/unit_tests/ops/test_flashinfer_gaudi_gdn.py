@@ -620,6 +620,97 @@ def test_packed_mtp_full_query_fast_path_is_exact():
     torch.testing.assert_close(fast_pool, reference_pool, rtol=0, atol=0)
 
 
+def test_packed_mtp_store_indices_split_load_and_write_slots():
+    generator = torch.Generator().manual_seed(401)
+    batch, tokens, q_heads, value_heads, dim = 2, 4, 2, 4, 8
+    q = torch.randn(batch, tokens, q_heads, dim, generator=generator)
+    k = torch.randn(batch, tokens, q_heads, dim, generator=generator)
+    v = torch.randn(batch, tokens, value_heads, dim, generator=generator)
+    packed = torch.cat((q.flatten(2), k.flatten(2), v.flatten(2)), dim=-1)
+    log_decay = -torch.rand(batch, tokens, value_heads, generator=generator)
+    beta = torch.sigmoid(torch.randn(batch, tokens, value_heads, generator=generator))
+    pool = torch.randn(16, value_heads, dim, dim, generator=generator)
+    state_indices = torch.tensor([[1, 2, 3, 4], [5, 6, 7, 8]], dtype=torch.int32)
+    store_indices = torch.tensor([[9, 2, 3, 4], [10, 6, 7, 8]], dtype=torch.int32)
+    accepted = torch.tensor([2, 1], dtype=torch.int32)
+    query_lengths = torch.tensor([3, 4], dtype=torch.int32)
+
+    reference_pool = pool.clone()
+    reference, _ = gated_delta_rule_mtp_packed(packed, log_decay, beta, reference_pool, state_indices, accepted,
+                                               query_lengths)
+    store_pool = pool.clone()
+    store_pool[9].zero_()
+    store_pool[10].zero_()
+    actual, returned = gated_delta_rule_mtp_packed(packed, log_decay, beta, store_pool, state_indices, accepted,
+                                                   query_lengths, store_indices=store_indices)
+
+    assert returned is store_pool
+    # The accepted checkpoint loads from state_indices[:, accepted - 1] (rows 3 and 5): the zeroed
+    # store-only rows 9 and 10 are never read, so the outputs match exactly.
+    torch.testing.assert_close(actual, reference, rtol=0, atol=0)
+    # Token 0's state lands in store_indices[:, 0].
+    torch.testing.assert_close(store_pool[9], reference_pool[1], rtol=0, atol=0)
+    torch.testing.assert_close(store_pool[10], reference_pool[5], rtol=0, atol=0)
+    # state_indices[:, 0]'s slots are untouched: token 0 never overwrites the checkpoint block.
+    torch.testing.assert_close(store_pool[1], pool[1], rtol=0, atol=0)
+    torch.testing.assert_close(store_pool[5], pool[5], rtol=0, atol=0)
+    # Shared t >= 1 slots (store_indices[:, t] == state_indices[:, t]) receive identical writes.
+    torch.testing.assert_close(store_pool[2:4], reference_pool[2:4], rtol=0, atol=0)
+    torch.testing.assert_close(store_pool[6:9], reference_pool[6:9], rtol=0, atol=0)
+    # Bucket padding (request 0, query length 3) writes nothing to the shared row 4.
+    torch.testing.assert_close(store_pool[4], pool[4], rtol=0, atol=0)
+    torch.testing.assert_close(reference_pool[4], pool[4], rtol=0, atol=0)
+
+    # The load lattice is authoritative: corrupting its accepted slots changes the output.
+    load_pool = pool.clone()
+    load_pool[3].zero_()
+    load_pool[5].zero_()
+    corrupted, _ = gated_delta_rule_mtp_packed(packed, log_decay, beta, load_pool, state_indices, accepted,
+                                               query_lengths, store_indices=store_indices)
+    assert not torch.allclose(corrupted, reference)
+
+
+def test_packed_mtp_public_native_route_refuses_store_indices():
+    inputs = _qwen38_mtp_native_inputs(batch=2)
+    native = mock.Mock()
+    store = torch.zeros(2, 8, dtype=torch.int32)
+    set_backend_policy("public")
+
+    with (
+            mock.patch("flashinfer_gaudi.gdn_decode._device_is_hpu", return_value=True),
+            mock.patch("flashinfer_gaudi.gdn_decode.public_mtp_gdn_op", return_value=native),
+            pytest.raises(ValueError, match="store_indices is not supported"),
+    ):
+        gated_delta_rule_mtp_packed(*inputs, store_indices=store)
+
+    native.assert_not_called()
+
+
+def test_packed_mtp_prepared_route_refuses_store_indices():
+    inputs = _qwen38_mtp_native_inputs()
+    prepared = mock.Mock()
+    store = torch.zeros(1, 8, dtype=torch.int32)
+
+    with (
+            mock.patch("flashinfer_gaudi.gdn_decode.get_backend_policy", return_value="auto"),
+            mock.patch("flashinfer_gaudi.gdn_decode.mtp_prepared_enabled", return_value=True),
+            mock.patch("flashinfer_gaudi.gdn_decode._device_is_hpu", return_value=True),
+            mock.patch("torch.compiler.is_compiling", return_value=True),
+            mock.patch("flashinfer_gaudi.gdn_decode.public_mtp_gdn_auto_promoted", return_value=False),
+            mock.patch("flashinfer_gaudi.gdn_decode._gated_delta_rule_mtp_prepared", prepared),
+            pytest.raises(ValueError, match="store_indices is not supported"),
+    ):
+        gated_delta_rule_mtp_packed(*inputs, assume_full_query=True, store_indices=store)
+
+    prepared.assert_not_called()
+
+
+def test_packed_mtp_store_indices_rejects_bad_shape():
+    inputs = _qwen38_mtp_native_inputs()
+    with pytest.raises(ValueError, match=r"store_indices must have shape \[1,8\]"):
+        gated_delta_rule_mtp_packed(*inputs, store_indices=torch.zeros(1, 7, dtype=torch.int32))
+
+
 @pytest.mark.parametrize("batch", [1, 2])
 @pytest.mark.parametrize("use_qk_l2norm", [False, True])
 @pytest.mark.parametrize("scale", [None, 0.25])

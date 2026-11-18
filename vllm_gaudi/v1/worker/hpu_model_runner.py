@@ -40,6 +40,13 @@ from vllm_gaudi.v1.worker.hpu_dp_utils import set_hpu_dp_metadata
 from vllm_gaudi.v1.worker.gdn_state_layout import has_contiguous_dflash_checkpoints
 from vllm_gaudi.v1.worker.flash_next_inputs import (build_block_table, build_ple_inputs, dummy_ple_inputs,
                                                     model_requires_block_table, model_requires_raw_input_tokens)
+from vllm_gaudi.v1.worker.recurrent_commit import (apply_align_precopy, boundary_commits, commit_conv, commit_ssm,
+                                                   self_commit_requests)
+from vllm_gaudi.v1.worker.recurrent_lattice import align_lattices
+from vllm_gaudi.v1.worker.recurrent_spec import (accepted_counts, load_checkpoint_offsets, qsa_modules,
+                                                 recurrent_spec_enabled, state_slots_per_request,
+                                                 verification_state_width)
+from vllm_gaudi.v1.spec_decode.flash_next_mtp_steps import is_flash_next_mtp
 from vllm_gaudi.platform import is_flash_next_model
 
 from vllm.v1.attention.backend import AttentionBackend, AttentionType, CommonAttentionMetadata
@@ -787,6 +794,9 @@ class DecodeInputData:
     spec_decode_metadata: Optional[SpecDecodeMetadata] = None
     draft_block_table: Optional[torch.Tensor] = None
     ple_inputs: Optional[tuple[torch.Tensor, torch.Tensor]] = None
+    # Align-mode boundary commit payload (M3-T10b): (load_cpu, store_cpu,
+    # context_lens, num_decodes, mamba_block_size) for the spec batch, or None.
+    recurrent_boundary: Optional[tuple] = None
 
 
 def bool_helper(value):
@@ -1000,12 +1010,11 @@ def maybe_set_mamba_kv_cache_groups_ids(model, kv_cache_config: KVCacheConfig, r
 
     if runner is not None and getattr(runner, "_first_gdn_group_idx", None) is not None:
         # The Flash-Next QSA raw-key ring is addressed by the first GDN
-        # group's load/store slot; tell every QSA indexer which group that is.
-        from vllm_gaudi.models.qwen4_exp.qsa import HpuQwen4ExpQSAAttention
-        for module in model.modules():
-            if isinstance(module, HpuQwen4ExpQSAAttention):
-                module.indexer.ring_group_idx = torch.tensor(runner._first_gdn_group_idx, dtype=torch.long,
-                                                             device="hpu")
+        # group's load/store slot; tell every QSA indexer which group that
+        # is, in the target and in the drafter (MTP drafts from a QSA layer).
+        for module in qsa_modules(model, getattr(getattr(runner, "drafter", None), "model", None)):
+            module.indexer.ring_group_idx = torch.tensor(runner._first_gdn_group_idx, dtype=torch.long,
+                                                         device="hpu")
 
 
 def maybe_set_chunked_attention_layers(model_runner):
@@ -2228,11 +2237,13 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         # so each request needs num_gdn_groups distinct slot indices. Groups
         # occupy contiguous max_num_reqs-sized spans so a full decode batch can
         # update state without index_select/index_copy.
-        # DFlash2 retains one recurrent checkpoint for every token in its
-        # verification block. Other paths retain one checkpoint per request.
-        self._gdn_state_slots_per_req = (1 + self.speculative_config.num_speculative_tokens
-                                         if self.speculative_config is not None
-                                         and self.speculative_config.use_dflash() else 1)
+        # A verification-driven (recurrent-spec) decode retains one recurrent
+        # checkpoint for every token in its verification block. Other paths
+        # retain one checkpoint per request. This applies to every speculative
+        # method (MTP included), not just DFlash2.
+        self._recurrent_spec = recurrent_spec_enabled(self.speculative_config)
+        self._recurrent_commit_registry: dict = {}
+        self._gdn_state_slots_per_req = state_slots_per_request(self.speculative_config)
         self._compact_gdn_enabled = os.environ.get("VLLM_COMPACT_GDN", "1").strip().lower() in ("1", "true")
         self._recurrent_pool_slots = 0
         self._first_gdn_group_idx = None
@@ -2253,6 +2264,8 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         self._gdn_req_to_base_slot: dict[str, int] = {}
         self._compact_gdn_state_tensors: list[torch.Tensor] = []
         self._gdn_num_accepted_by_req: dict[str, int] = {}
+        # align mode (M3-T10c): each decode request's running block index from its previous step
+        self._align_running_block_by_req: dict[str, int] = {}
         self._logged_direct_gdn_state = False
         self._logged_padded_direct_gdn_state = False
 
@@ -2277,10 +2290,16 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                 self.drafter = HpuDFlash2Proposer(self.vllm_config, self.device, self)  # type: ignore
                 self.use_aux_hidden_state_outputs = self.drafter.use_aux_hidden_state
             elif self.speculative_config.use_eagle():
-                from vllm_gaudi.v1.spec_decode.hpu_eagle import HpuEagleProposer
-                self.drafter = HpuEagleProposer(self.vllm_config, self.device, self)  # type: ignore
-                if self.speculative_config.method == "eagle3":
+                if is_flash_next_mtp(self.speculative_config):
+                    from vllm_gaudi.v1.spec_decode.hpu_flash_next_mtp import HpuFlashNextMtpProposer
+
+                    self.drafter = HpuFlashNextMtpProposer(self.vllm_config, self.device, self)  # type: ignore
                     self.use_aux_hidden_state_outputs = True
+                else:
+                    from vllm_gaudi.v1.spec_decode.hpu_eagle import HpuEagleProposer
+                    self.drafter = HpuEagleProposer(self.vllm_config, self.device, self)  # type: ignore
+                    if self.speculative_config.method == "eagle3":
+                        self.use_aux_hidden_state_outputs = True
             elif self.speculative_config.method == "medusa":
                 raise NotImplementedError("Medusa speculative decoding is not supported on HPU.")
             else:
@@ -2481,6 +2500,104 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
 
         state_indices = torch.stack(all_state_indices_cpu, dim=0)
         return state_indices.squeeze(-1) if state_width == 1 else state_indices
+
+    def _build_recurrent_commit_registry(self, kv_caches: dict) -> dict:
+        """Map recurrent cache groups to ``(state tensor, kind, window rows)`` for boundary commits (M3-T10b).
+
+        GDN groups contribute their convolution state (plain window = allocated rows
+        minus the ``k`` speculative rows) and their ssm state (full-row copy); PLE
+        groups contribute the short-convolution state with the module's plain
+        ``conv_state_len`` window. Layers of a group share tensors, so entries are
+        deduplicated by storage.
+        """
+        registry: dict[int, list[tuple[torch.Tensor, str, int]]] = {}
+        if not (self._recurrent_spec and self.use_prefix_caching) or self.speculative_config is None:
+            return registry
+        k = self.speculative_config.num_speculative_tokens
+        groups = [g for g in self.kv_cache_config.kv_cache_groups
+                  if not isinstance(g.kv_cache_spec, EncoderOnlyAttentionSpec)]
+        forward_context = self.vllm_config.compilation_config.static_forward_context
+        for gid, group in enumerate(groups):
+            if gid in self._compact_gdn_group_ids:
+                continue
+            entries: dict[int, tuple[torch.Tensor, str, int]] = {}
+            for layer_name in group.layer_names:
+                state = kv_caches.get(layer_name)
+                if state is None:
+                    continue
+                if layer_name.endswith(".linear_attn") and isinstance(state, (tuple, list)) and len(state) >= 2:
+                    conv, ssm = state[0], state[1]
+                    window = int(conv.shape[1]) - k
+                    if window <= 0:
+                        continue
+                    entries[conv.data_ptr()] = (conv, "conv", window)
+                    entries[ssm.data_ptr()] = (ssm, "ssm", 0)
+                else:
+                    module = forward_context.get(layer_name)
+                    conv = state[0] if isinstance(state, (tuple, list)) else state
+                    window = getattr(module, "conv_state_len", None)
+                    if window is None or not isinstance(conv, torch.Tensor) or conv.dim() != 3:
+                        continue
+                    entries[conv.data_ptr()] = (conv, "conv", int(window))
+            if entries:
+                registry[gid] = list(entries.values())
+        return registry
+
+    def _commit_recurrent_boundaries(self, boundary, accepted_counts: list) -> set[int]:
+        """Copy accepted block-completing states from the store lattice into position blocks (M3-T10b).
+
+        Returns the decode indices of the requests whose commit writes the running block
+        itself (the store lattice's column-0 slot, M3-T10c); the caller resets their
+        accepted counts to 1 so the next step keeps the committed state.
+        """
+        load_cpu, store_cpu, context_lens, num_decodes, block_size = boundary
+        registry = getattr(self, "_recurrent_commit_registry", None)
+        if not registry:
+            return set()
+        accepted = [int(a) for a in accepted_counts[:num_decodes]]
+        self_commits: set[int] = set()
+        for gid, entries in registry.items():
+            store_g = store_cpu[gid][:num_decodes]
+            load_g = load_cpu[gid][:num_decodes]
+            block_rows = self.input_batch.block_table[gid].get_cpu_tensor()[:num_decodes].tolist()
+            pairs = boundary_commits(context_lens, accepted, block_size, store_g, block_rows, load_g)
+            if not pairs:
+                continue
+            self_commits |= self_commit_requests(pairs, store_g)
+            # The spec kernels keep the convolution window in the store lattice's
+            # column-0 slot; the ssm checkpoints live in the per-token columns.
+            conv_pairs = [(i, t, int(store_g[i][0]), dst) for (i, t, _src, dst) in pairs]
+            ts = [t for (_i, t, _s, _d) in pairs]
+            for tensor, kind, window_len in entries:
+                if kind == "ssm":
+                    commit_ssm(tensor, pairs)
+                else:
+                    commit_conv(tensor, conv_pairs, window_len, t_per_pair=ts)
+        return self_commits
+
+    def _precopy_align_states(self, num_decodes: int, context_lens: list, num_scheduled: list, block_size: int,
+                              normalize: bool) -> None:
+        """Move each decode request's running recurrent state into its running block before the forward pass.
+
+        This is the runner-side call site of the upstream vLLM ``preprocess_mamba`` scheme (see the
+        ``t10c-design`` document on RUK-2798, M3-T10c): ``apply_align_precopy`` reads each request's
+        running block from the previous step and its accepted count, copies the registered conv/ssm
+        states in place into this step's running block, and writes the new running block and accepted
+        counts back into the runner's books, so ``accepted_counts`` below sees the post-copy values.
+        Requests beyond ``num_decodes`` are prefills: after a prefill the state sits in
+        ``row[(ctx - 1) // bs]``, the plan helper's default, so their entries are dropped.
+        """
+        if self.warmup_mode or not self._recurrent_commit_registry or num_decodes == 0:
+            return
+        rows = {
+            gid: self.input_batch.block_table[gid].get_cpu_tensor()[:num_decodes].tolist()
+            for gid in self._recurrent_commit_registry
+        }
+        apply_align_precopy(self._recurrent_commit_registry, rows, self.input_batch.req_ids[:num_decodes],
+                            self._align_running_block_by_req, self._gdn_num_accepted_by_req,
+                            context_lens[:num_decodes], num_scheduled[:num_decodes], block_size, normalize)
+        for r in self.input_batch.req_ids[num_decodes:]:
+            self._align_running_block_by_req.pop(r, None)
 
     def _can_use_direct_gdn_state(
         self,
@@ -2806,6 +2923,10 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         for req_id in scheduler_output.finished_req_ids:
             self.requests.pop(req_id, None)
             self._gdn_num_accepted_by_req.pop(req_id, None)
+            self._align_running_block_by_req.pop(req_id, None)
+
+        for req_id in (getattr(scheduler_output, "preempted_req_ids", None) or ()):
+            self._align_running_block_by_req.pop(req_id, None)
 
         # Remove the finished requests from the persistent batch.
         # NOTE(woosuk): There could be an edge case where finished_req_ids and
@@ -2867,6 +2988,7 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         for new_req_data in scheduler_output.scheduled_new_reqs:
             req_id = new_req_data.req_id
             self._gdn_num_accepted_by_req[req_id] = 1
+            self._align_running_block_by_req.pop(req_id, None)
             sampling_params = new_req_data.sampling_params
             pooling_params = new_req_data.pooling_params
             if sampling_params and \
@@ -2914,6 +3036,9 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             num_computed_tokens = req_data.num_computed_tokens[i]
             new_block_ids = req_data.new_block_ids[i]
             resumed_from_preemption = req_id in getattr(req_data, "resumed_req_ids", set())
+            if resumed_from_preemption:
+                self._align_running_block_by_req.pop(req_id, None)
+                self._gdn_num_accepted_by_req[req_id] = 1
             num_output_tokens = req_data.num_output_tokens[i]
             req_state.num_computed_tokens = num_computed_tokens
 
@@ -4905,30 +5030,77 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                 )
 
             req_indices = list(range(num_decodes))
-            is_dflash_decode = self.speculative_config is not None and self.speculative_config.use_dflash()
-            is_dflash_spec = is_dflash_decode and num_tokens > 1
-            state_width = num_tokens if is_dflash_spec else 1
+            is_recurrent_spec_decode = self._recurrent_spec
+            is_spec_batch = is_recurrent_spec_decode and num_tokens > 1
+            state_width = verification_state_width(num_tokens, is_recurrent_spec_decode)
             dflash_full_query = _is_full_dflash_query_block(
-                is_dflash_spec,
+                is_spec_batch and self.speculative_config.use_dflash(),
                 num_decodes,
                 padded_batch_size,
                 num_tokens_per_req,
                 state_width,
             )
-            if is_dflash_decode:
-                accepted_counts = [
-                    self._gdn_num_accepted_by_req.get(req_id, 1) for req_id in self.input_batch.req_ids[:num_decodes]
-                ]
-                load_checkpoint_offsets = None if is_dflash_spec else [count - 1 for count in accepted_counts]
+            if is_recurrent_spec_decode:
+                if self.use_prefix_caching:
+                    # Align mode (M3-T10c): move each request's running state into its running block first, so
+                    # num_accepted below is the post-copy count (upstream vLLM preprocess_mamba).
+                    self._precopy_align_states(num_decodes, list(context_lens), list(num_scheduled_tokens),
+                                               mamba_block_size, normalize=not is_spec_batch)
+                decode_req_ids = self.input_batch.req_ids[:num_decodes]
+                decode_accepted = accepted_counts(decode_req_ids, self._gdn_num_accepted_by_req, num_decodes)
+                load_offsets = load_checkpoint_offsets(decode_accepted, is_spec_batch)
+                decode_accepted_padded = accepted_counts(decode_req_ids, self._gdn_num_accepted_by_req,
+                                                         padded_batch_size)
             else:
-                accepted_counts = []
-                load_checkpoint_offsets = None
+                decode_accepted = []
+                load_offsets = None
+                decode_accepted_padded = []
+            lattice_store_differs = False
+            recurrent_boundary = None
             if self.use_prefix_caching:
-                load_state_indices_cpu = self.prepare_mamba_state_idxs(req_indices, block_idx_last_computed_token_cpu,
-                                                                       padded_batch_size, state_width,
-                                                                       load_checkpoint_offsets)
+                # Align mode (M3-T10c-5): a plain decode step under MTP runs in its running block
+                # row[block_idx_last_scheduled_token]; the pre-step copy has put the state there at offset 0.
+                # Loading row[(ctx-1)//bs] at a block-aligned ctx let PLE overwrite the committed checkpoint.
+                load_blocks = (block_idx_last_scheduled_token_cpu if is_recurrent_spec_decode and not is_spec_batch
+                               else block_idx_last_computed_token_cpu)
+                load_state_indices_cpu = self.prepare_mamba_state_idxs(req_indices, load_blocks, padded_batch_size,
+                                                                       state_width, load_offsets)
                 store_state_indices_cpu = self.prepare_mamba_state_idxs(req_indices, block_idx_last_scheduled_token_cpu,
                                                                         padded_batch_size, state_width)
+                if is_spec_batch:
+                    # Align mode (M3-T10b, T10c): one lattice row[curr : curr + 1 + k],
+                    # curr = the block of the last scheduled token, load == store; the
+                    # pre-step precopy has moved the running state into row[curr]. The
+                    # scalar lattices above are running-block constants per request.
+                    spec_k = state_width - 1
+                    load_rows = []
+                    store_rows = []
+                    for group_idx in range(len(self.input_batch.block_table.block_tables)):
+                        if group_idx in self._compact_gdn_group_ids:
+                            load_rows.append(load_state_indices_cpu[group_idx])
+                            store_rows.append(store_state_indices_cpu[group_idx])
+                            continue
+                        lat_load, lat_store = align_lattices(
+                            self.input_batch.block_table[group_idx].get_cpu_tensor(),
+                            req_indices,
+                            list(context_lens)[:num_decodes],
+                            list(num_scheduled_tokens)[:num_decodes],
+                            mamba_block_size,
+                            spec_k,
+                            padded_batch_size,
+                            self._MAMBA_PAD_BLOCK_ID,
+                        )
+                        load_rows.append(lat_load)
+                        store_rows.append(lat_store)
+                    load_state_indices_cpu = torch.stack(load_rows, dim=0)
+                    store_state_indices_cpu = torch.stack(store_rows, dim=0)
+                    lattice_store_differs = not torch.equal(load_state_indices_cpu, store_state_indices_cpu)
+                    # Boundary commits are gated on prefix caching + a completed pair,
+                    # not on a load/store lattice inequality: a t >= 1 completion lands
+                    # on a step where every context is unaligned (flag False). The pair
+                    # scan in boundary_commits is the only cost when nothing completes.
+                    recurrent_boundary = (load_state_indices_cpu, store_state_indices_cpu,
+                                          list(context_lens)[:num_decodes], num_decodes, mamba_block_size)
             else:
                 zeros = [0] * len(req_indices)
                 load_state_indices_cpu = self.prepare_mamba_state_idxs(
@@ -4936,7 +5108,7 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                     zeros,
                     padded_batch_size,
                     state_width,
-                    load_checkpoint_offsets,
+                    load_offsets,
                 )
                 store_state_indices_cpu = self.prepare_mamba_state_idxs(
                     req_indices,
@@ -4982,10 +5154,9 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             load_indices_tensor = async_h2d_copy(load_state_indices_cpu, device=self.device)
             store_indices_tensor = async_h2d_copy(store_state_indices_cpu, device=self.device)
             query_start_loc_p = async_h2d_copy(query_start_loc_p_cpu, dtype=torch.int32)
-            if is_dflash_decode:
-                accepted_counts.extend([1] * (padded_batch_size - num_decodes))
+            if is_recurrent_spec_decode:
                 num_accepted_tokens = async_h2d_copy(
-                    torch.tensor(accepted_counts, dtype=torch.int32),
+                    torch.tensor(decode_accepted_padded, dtype=torch.int32),
                     device=self.device,
                 )
             else:
@@ -4999,6 +5170,8 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             direct_gdn_state = False
             num_accepted_tokens = None
             dflash_full_query = False
+            lattice_store_differs = False
+            recurrent_boundary = None
 
         # CPU<>HPU sync *should not* happen here.
         block_list_device = async_h2d_copy(block_list, device=self.device)
@@ -5093,6 +5266,7 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                 seq_lens_tensor=seq_lens_tensor,
                 query_start_loc=query_start_loc_p,
                 block_table=block_table_device,
+                lattice_store_differs=lattice_store_differs,
             )
 
         ple_inputs = None
@@ -5116,7 +5290,8 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                                attn_metadata=attn_metadata,
                                spec_decode_metadata=spec_decode_metadata,
                                draft_block_table=draft_block_table,
-                               ple_inputs=ple_inputs)
+                               ple_inputs=ple_inputs,
+                               recurrent_boundary=recurrent_boundary)
 
     def _prepare_decode_inputs(self,
                                num_decodes,
@@ -6387,7 +6562,7 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                         assert sampler_output is not None
                         decode_sampled_token_ids.append(sampler_output.sampled_token_ids.flatten())
                         logprobs_segments.append((list(pd_info.decode_req_ids), sampler_output.logprobs_tensors))
-                        if self.speculative_config is not None and self.speculative_config.use_dflash():
+                        if self._recurrent_spec:
                             # A plain target step reads the accepted checkpoint
                             # selected by the metadata builder and writes the
                             # resulting recurrent state back to checkpoint 0.
@@ -6437,12 +6612,23 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                             decode_sampled_token_ids, _ = decode_sampled_token_ids
                         # Trim output in case of dummy padding
                         decode_sampled_token_ids = decode_sampled_token_ids[:num_decodes]
-                        if self.speculative_config.use_dflash():
+                        if self._recurrent_spec:
                             for req_id, accepted_tokens in zip(
                                     self.input_batch.req_ids[:num_decodes],
                                     decode_sampled_token_ids,
                             ):
                                 self._gdn_num_accepted_by_req[req_id] = max(1, len(accepted_tokens))
+                            if decode_data is not None and decode_data.recurrent_boundary is not None:
+                                # Align mode (M3-T10b): accepted tokens that complete a
+                                # position block move their state from the store lattice
+                                # into that block's slot for prefix-cache reuse.
+                                self_commits = self._commit_recurrent_boundaries(
+                                    decode_data.recurrent_boundary,
+                                    [len(a) for a in decode_sampled_token_ids])
+                                # T10c: a commit into the running block itself replaced the
+                                # multi-token window, so the next step starts from one token.
+                                for i in self_commits:
+                                    self._gdn_num_accepted_by_req[self.input_batch.req_ids[i]] = 1
                         # convert decode_sampled_token_ids as list of tensor
                         spec_decode_num_tokens = [len(v) for v in decode_sampled_token_ids]
                         decode_sampled_token_ids = [
@@ -9154,6 +9340,8 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         else:
             bind_kv_cache(kv_caches, self.vllm_config.compilation_config.static_forward_context, self.kv_caches)
 
+        self._recurrent_commit_registry = self._build_recurrent_commit_registry(kv_caches)
+
         if is_flash_next_model(self.model_config) and gaudi_envs.VLLM_HPU_FLASH_NEXT_QSA_MODE == 1:
             self._allocate_flash_next_side_caches(kv_caches)
 
@@ -9197,7 +9385,6 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         from the first GDN group's allocated state tensor rows (pool,
         compact or baseline: read from the tensor, never recomputed).
         """
-        from vllm_gaudi.models.qwen4_exp.qsa import HpuQwen4ExpQSAAttention
         from vllm_gaudi.models.qwen4_exp.qsa_side_caches import allocate_side_caches
 
         gdn_rows = None
@@ -9211,7 +9398,7 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             return
         config = getattr(self.model.model.config, "text_config", self.model.model.config)
         spec_tokens = self.speculative_config.num_speculative_tokens if self.speculative_config else 0
-        qsa_layers = [m for m in self.model.model.modules() if isinstance(m, HpuQwen4ExpQSAAttention)]
+        qsa_layers = qsa_modules(self.model.model, getattr(getattr(self, "drafter", None), "model", None))
         total_bytes = 0
         shapes = None
         for module in qsa_layers:

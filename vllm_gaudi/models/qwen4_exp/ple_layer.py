@@ -8,7 +8,10 @@ fills its output buffer, ``ple_gate`` is Triton-only, and ``_short_conv`` expect
 a per-layer metadata dict while the fork passes one metadata object for the whole
 model. This layer calls the pure-torch T4a ops and reads/writes its dilated
 short-conv state in the ``kv_cache[0]`` slots of its SHORT_CONV mamba group,
-exactly the way the fork's GDN layer reads its SSM state.
+exactly the way the fork's GDN layer reads its SSM state. Under MTP
+speculative decode (M3) it also runs verification and transition steps from
+the state lattice, rolling the conv history back by ``num_accepted_tokens``
+and storing ``history + candidates`` the way the fork's GDN conv update does.
 """
 
 import torch
@@ -18,7 +21,11 @@ from vllm.model_executor.layers.mamba.mamba_utils import is_conv_state_dim_first
 from vllm.models.qwen4_exp.nvidia.ple_layer import Qwen4ExpPLELayer
 
 from vllm_gaudi.models.qwen3_5 import _save_ssm_state
-from vllm_gaudi.models.qwen4_exp.ple_ops import ple_gate_torch, ple_short_conv_batched_torch
+from vllm_gaudi.models.qwen4_exp.ple_ops import (
+    ple_gate_torch,
+    ple_short_conv_batched_torch,
+    ple_short_conv_spec_torch,
+)
 
 
 class HpuQwen4ExpPLELayer(Qwen4ExpPLELayer):
@@ -79,6 +86,24 @@ class HpuQwen4ExpPLELayer(Qwen4ExpPLELayer):
             indices = indices.squeeze(-1)
         return indices.reshape(-1).long()
 
+    def _lattice_slot(self, md: object, name: str) -> torch.Tensor | None:
+        """Resolve one ``[groups, bs, T]``/``[groups, bs]`` state lattice to the ``[bs]`` column-0 slots.
+
+        The group row is picked as ``_state_indices`` picks it; the conv state of a request
+        lives in the column-0 slot of its lattice row (all T rows of a verification step
+        share the state row), so column 0 is the slot.
+        """
+        indices = getattr(md, name, None)
+        if indices is None:
+            return None
+        if indices.dim() > 1:
+            if self.cache_group_idx is None:
+                raise RuntimeError("PLE cache_group_idx not set")
+            indices = indices.index_select(0, self.cache_group_idx.to(device=indices.device).view(1)).squeeze(0)
+        if indices.dim() == 2:
+            indices = indices[:, 0]
+        return indices.reshape(-1).long()
+
     def _hpu_short_conv(self, gated: torch.Tensor, normed: torch.Tensor) -> torch.Tensor:
         """Add the dilated short convolution and persist the new state into the cache slots.
 
@@ -87,7 +112,9 @@ class HpuQwen4ExpPLELayer(Qwen4ExpPLELayer):
         ``load_indices_tensor`` slot (padding rows read zeros, chunked prefill rows only
         when ``has_initial_states_p`` says so and the load slot is not the null block 0)
         and writes the new state to the ``store_indices_tensor`` slots through
-        ``_save_ssm_state``, so invalid indices are neither read nor written.
+        ``_save_ssm_state``, so invalid indices are neither read nor written. Metadata that
+        carries ``num_accepted_tokens`` is an MTP verification or transition step and goes
+        to ``_hpu_short_conv_spec``.
         """
         attn_metadata = get_forward_context().attn_metadata
         if attn_metadata is None:
@@ -99,15 +126,22 @@ class HpuQwen4ExpPLELayer(Qwen4ExpPLELayer):
                 return gated
         if self.kv_cache[0].numel() == 0:
             return gated
-        if self.num_spec_tokens > 0 or getattr(md, "num_accepted_tokens", None) is not None:
-            raise NotImplementedError("PLE speculative decode is M3")
+        is_prompt = bool(getattr(md, "is_prompt", False))
 
         conv_state = self.kv_cache[0]
         # Canonicalize both backend cache layouts to [slot, window, channel].
         view = conv_state.transpose(-1, -2) if is_conv_state_dim_first() else conv_state
+
+        num_accepted = getattr(md, "num_accepted_tokens", None)
+        if num_accepted is not None:
+            return self._hpu_short_conv_spec(md, num_accepted, gated, normed, view)
+
         state_len = self.conv_state_len
         if view.shape[1] > state_len:
-            view = view[:, -state_len:, :]
+            # The fork's conv convention (hpu_causal_conv1d_fn): an expanded speculative
+            # state keeps its committed history in rows [0, state_len), so prefill and
+            # plain decode under a speculative config read and write the first rows.
+            view = view[:, :state_len, :]
         num_slots = view.shape[0]
 
         load = self._state_indices(md, "load_indices_tensor")
@@ -122,7 +156,6 @@ class HpuQwen4ExpPLELayer(Qwen4ExpPLELayer):
         if tokens % rows != 0:
             raise ValueError(f"PLE token count {tokens} is not a multiple of the {rows} state rows")
         seq_len = tokens // rows
-        is_prompt = bool(getattr(md, "is_prompt", False))
 
         valid = (load >= 0) & (load < num_slots)
         init = view.index_select(0, torch.where(valid, load, torch.zeros_like(load)))
@@ -153,4 +186,60 @@ class HpuQwen4ExpPLELayer(Qwen4ExpPLELayer):
         result = gated + out.reshape(tokens, self.hc_hidden_size)
         # State save in the dynamo-disabled wrapper so a compiled graph keeps the
         # in-place write (the GDN layer uses the same helper for its SSM state).
+        return _save_ssm_state(result, new_state, view, store)
+
+    def _hpu_short_conv_spec(
+        self,
+        md: object,
+        num_accepted: torch.Tensor,
+        gated: torch.Tensor,
+        normed: torch.Tensor,
+        view: torch.Tensor,
+    ) -> torch.Tensor:
+        """MTP verification (``[groups, bs, T]`` lattice) or transition (``[groups, bs]``, T = 1) step.
+
+        Each request reads the committed history window its ``num_accepted_tokens`` selects
+        from its column-0 lattice slot, computes the T outputs over ``[history ; candidates]``
+        and stores ``[history[1:] ; candidates]`` back, so the next pass rolls the rejected
+        candidate rows out of the history (the convention of ``_hpu_causal_conv1d_spec_update``).
+        Padding rows are masked to zero and rows whose load slot is invalid are neither read
+        nor written. The state is written to the ``store_indices_tensor`` column-0 slot when
+        align mode marks the lattices as differing (M3-T10b), otherwise to the load slot.
+        """
+        load = self._lattice_slot(md, "load_indices_tensor")
+        if load is None:
+            return gated
+        store = load
+        if bool(getattr(md, "lattice_store_differs", False)):
+            store = self._lattice_slot(md, "store_indices_tensor")
+            if store is None:
+                store = load
+        rows = load.numel()
+        tokens = normed.shape[0]
+        if tokens % rows != 0:
+            raise ValueError(f"PLE token count {tokens} is not a multiple of the {rows} state rows")
+        width = tokens // rows
+        num_slots = view.shape[0]
+
+        query_start_loc = getattr(md, "query_start_loc_p", None)
+        if query_start_loc is None:
+            query_lens = torch.full((rows,), width, dtype=torch.long, device=normed.device)
+        else:
+            qsl = query_start_loc.to(device=normed.device, dtype=torch.long)
+            query_lens = (qsl[1:rows + 1] - qsl[:rows]).clamp(min=0, max=width)
+
+        valid = (load >= 0) & (load < num_slots)
+        init = view.index_select(0, torch.where(valid, load, torch.zeros_like(load)))
+        init = torch.where(valid.view(rows, 1, 1), init, torch.zeros_like(init))
+
+        out, new_state = ple_short_conv_spec_torch(
+            normed.view(rows, width, self.hc_hidden_size),
+            self.conv1d.weight,
+            init,
+            num_accepted.reshape(-1)[:rows],
+            query_lens,
+            self.short_conv_dilation,
+        )
+        result = gated + out.reshape(tokens, self.hc_hidden_size)
+        # State save in the dynamo-disabled wrapper, as on the non-spec path.
         return _save_ssm_state(result, new_state, view, store)

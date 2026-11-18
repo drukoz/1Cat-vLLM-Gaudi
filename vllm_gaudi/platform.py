@@ -129,7 +129,8 @@ def is_flash_next_model(model_config: Optional[ModelConfig]) -> bool:
 def _configure_recurrent_state(vllm_config: "VllmConfig") -> None:
     """Compact-GDN rule and recurrent-state-pool resolution for GDN hybrids (M1-T1)."""
     from vllm_gaudi.v1.core.recurrent_state_pool import (ENV_CACHE_SLOTS, ENV_MODE, ENV_SLOTS,
-                                                         RecurrentStatePoolMode, resolve_pool_slots)
+                                                         LIVE_SLOTS_PER_REQUEST, RecurrentStatePoolMode,
+                                                         resolve_pool_slots)
     model_config = vllm_config.model_config
     if model_config is None or not getattr(model_config, "is_hybrid", False):
         return
@@ -158,12 +159,18 @@ def _configure_recurrent_state(vllm_config: "VllmConfig") -> None:
     n_ple = len(getattr(model_config.hf_text_config, "ple_layer_ids", None) or [])
     groups = (-(-n_gdn // n_attn) if n_attn > 0 else 1) + (1 if n_ple else 0)
     cache_slots = int(os.environ.get(ENV_CACHE_SLOTS, "512"))
+    speculative_config = getattr(vllm_config, "speculative_config", None)
+    num_speculative_tokens = getattr(speculative_config, "num_speculative_tokens", None)
+    num_speculative_tokens = int(num_speculative_tokens) if num_speculative_tokens else 0
     if slots <= 0:
-        slots = resolve_pool_slots(vllm_config.scheduler_config.max_num_seqs, groups, cache_slots)
+        slots = resolve_pool_slots(vllm_config.scheduler_config.max_num_seqs, groups, cache_slots,
+                                   num_speculative_tokens)
         os.environ[ENV_SLOTS] = str(slots)
     logger.info(
-        "[HPU] Recurrent state pool: %d slots (max_num_seqs=%d, recurrent groups=%d, live slots per request=3, "
-        "cache slots=%d)", slots, vllm_config.scheduler_config.max_num_seqs, groups, cache_slots)
+        "[HPU] Recurrent state pool: %d slots (max_num_seqs=%d, recurrent groups=%d, "
+        "live slots per request=%d, speculative tokens=%d, cache slots=%d)", slots,
+        vllm_config.scheduler_config.max_num_seqs, groups, LIVE_SLOTS_PER_REQUEST, num_speculative_tokens,
+        cache_slots)
 
 
 def _enable_hpu_v1_dflash2_validation() -> None:
@@ -249,6 +256,25 @@ def _validate_hpu_dflash2_config(vllm_config: VllmConfig) -> None:
         raise ValueError("HPU DFlash2 does not yet support LoRA")
     if vllm_config.cache_config.enable_prefix_caching:
         raise ValueError("HPU DFlash2 requires prefix caching to be disabled")
+
+
+def _validate_flash_next_speculative_config(vllm_config: VllmConfig) -> None:
+    """Refuse the Flash-Next speculative configurations M3 cannot run correctly yet."""
+    speculative_config = vllm_config.speculative_config
+    if speculative_config is None or not is_flash_next_model(vllm_config.model_config):
+        return
+    draft_model_config = speculative_config.draft_model_config
+    draft_architectures = set(getattr(getattr(draft_model_config, "hf_config", None), "architectures", ()) or ())
+    if speculative_config.method != "mtp" or "Qwen4ExpMTP" not in draft_architectures:
+        raise ValueError("Flash-Next supports speculative decoding with its own MTP layer only: use "
+                         "--speculative-config '{\"method\": \"mtp\", \"num_speculative_tokens\": 3}'")
+    # Under prefix caching the align-mode state pool replaces compact GDN (RUK-2798 T10c).
+    prefix_caching = bool(vllm_config.cache_config.enable_prefix_caching)
+    if not prefix_caching and os.environ.get("VLLM_COMPACT_GDN", "1").strip().lower() not in ("1", "true"):
+        raise ValueError("Flash-Next MTP needs compact GDN state for the per-token verification checkpoints: "
+                         "unset VLLM_COMPACT_GDN or set it to 1")
+    if not 1 <= speculative_config.num_speculative_tokens <= 4:
+        raise ValueError("Flash-Next MTP on HPU runs 1 to 4 speculative tokens (the recipe is 3)")
 
 
 class HpuPlatform(Platform):
@@ -552,6 +578,7 @@ class HpuPlatform(Platform):
             logger.warning("[HPU] Async scheduling disabled for Flash-Next: "
                            "PLE n-gram context needs sampled tokens on the CPU")
         _validate_hpu_dflash2_config(vllm_config)
+        _validate_flash_next_speculative_config(vllm_config)
 
     @classmethod
     def update_block_size_for_backend(cls, vllm_config: "VllmConfig") -> None:

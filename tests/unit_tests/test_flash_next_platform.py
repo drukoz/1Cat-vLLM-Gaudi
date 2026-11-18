@@ -39,7 +39,8 @@ class _HabanaStubFinder:
 if not importlib.util.find_spec("habana_frameworks"):
     sys.meta_path.insert(0, _HabanaStubFinder())
 
-from vllm_gaudi.platform import _configure_recurrent_state, is_flash_next_model  # noqa: E402
+from vllm_gaudi.platform import (_configure_recurrent_state, _validate_flash_next_speculative_config,  # noqa: E402
+                                 is_flash_next_model)
 from vllm_gaudi.v1.core.recurrent_state_pool import ENV_CACHE_SLOTS, ENV_MODE, ENV_SLOTS  # noqa: E402
 
 POOL_ENV_VARS = ("VLLM_COMPACT_GDN", ENV_MODE, ENV_SLOTS, ENV_CACHE_SLOTS)
@@ -107,6 +108,25 @@ def test_pool_mode_resolves_slots(monkeypatch):
     assert os.environ["VLLM_COMPACT_GDN"] == "0"
 
 
+def test_pool_mode_resolves_slots_with_speculation(monkeypatch):
+    _clear_pool_env(monkeypatch)
+    monkeypatch.setenv(ENV_MODE, "1")
+    config = _recurrent_config()
+    config.speculative_config = SimpleNamespace(num_speculative_tokens=3)
+    # groups = ceil(36 / 12) + 1 = 4; 32 * 4 * (3 + 3) + 512 = 1280
+    _configure_recurrent_state(config)
+    assert os.environ[ENV_SLOTS] == "1280"
+
+
+def test_pool_mode_speculative_config_none(monkeypatch):
+    _clear_pool_env(monkeypatch)
+    monkeypatch.setenv(ENV_MODE, "1")
+    config = _recurrent_config()
+    config.speculative_config = None
+    _configure_recurrent_state(config)
+    assert os.environ[ENV_SLOTS] == "896"
+
+
 def test_pool_mode_ignored_without_prefix_caching(monkeypatch):
     _clear_pool_env(monkeypatch)
     monkeypatch.setenv(ENV_MODE, "1")
@@ -128,3 +148,73 @@ def test_non_hybrid_config_untouched(monkeypatch):
     _configure_recurrent_state(_recurrent_config(is_hybrid=False))
     assert ENV_SLOTS not in os.environ
     assert "VLLM_COMPACT_GDN" not in os.environ
+
+
+def _spec_config(method="mtp", draft_archs=("Qwen4ExpMTP", ), prefix_caching=False, k=3,
+                 target_archs=("Qwen4ExpForCausalLM", )):
+    """A Flash-Next-shaped vllm_config with a speculative config of the given shape."""
+    return SimpleNamespace(
+        model_config=SimpleNamespace(hf_config=SimpleNamespace(architectures=list(target_archs)), architecture=None),
+        cache_config=SimpleNamespace(enable_prefix_caching=prefix_caching),
+        speculative_config=SimpleNamespace(
+            method=method,
+            num_speculative_tokens=k,
+            draft_model_config=SimpleNamespace(hf_config=SimpleNamespace(architectures=list(draft_archs))),
+        ),
+    )
+
+
+def test_spec_supported_config_passes(monkeypatch):
+    monkeypatch.setenv("VLLM_COMPACT_GDN", "1")
+    _validate_flash_next_speculative_config(_spec_config())
+
+
+def test_spec_eagle_method_raises(monkeypatch):
+    monkeypatch.setenv("VLLM_COMPACT_GDN", "1")
+    with pytest.raises(ValueError, match="its own MTP layer only"):
+        _validate_flash_next_speculative_config(_spec_config(method="eagle"))
+
+
+def test_spec_wrong_draft_arch_raises(monkeypatch):
+    monkeypatch.setenv("VLLM_COMPACT_GDN", "1")
+    with pytest.raises(ValueError, match="its own MTP layer only"):
+        _validate_flash_next_speculative_config(_spec_config(draft_archs=["Qwen3_5MoeMTP"]))
+
+
+def test_spec_prefix_caching_passes_with_compact_gdn_off(monkeypatch):
+    monkeypatch.setenv("VLLM_COMPACT_GDN", "0")
+    _validate_flash_next_speculative_config(_spec_config(prefix_caching=True))
+
+
+def test_spec_prefix_caching_passes_with_compact_gdn_unset(monkeypatch):
+    monkeypatch.delenv("VLLM_COMPACT_GDN", raising=False)
+    _validate_flash_next_speculative_config(_spec_config(prefix_caching=True))
+
+
+def test_spec_compact_gdn_off_raises(monkeypatch):
+    monkeypatch.setenv("VLLM_COMPACT_GDN", "0")
+    with pytest.raises(ValueError, match="needs compact GDN state"):
+        _validate_flash_next_speculative_config(_spec_config())
+
+
+def test_spec_too_many_tokens_raises(monkeypatch):
+    monkeypatch.setenv("VLLM_COMPACT_GDN", "1")
+    with pytest.raises(ValueError, match="1 to 4 speculative tokens"):
+        _validate_flash_next_speculative_config(_spec_config(k=7))
+
+
+def test_spec_non_flash_next_model_untouched(monkeypatch):
+    monkeypatch.setenv("VLLM_COMPACT_GDN", "0")
+    _validate_flash_next_speculative_config(
+        _spec_config(method="eagle",
+                     draft_archs=["DFlash2DraftModel"],
+                     prefix_caching=True,
+                     k=7,
+                     target_archs=["Qwen3_5MoeForConditionalGeneration"]))
+
+
+def test_spec_none_passes(monkeypatch):
+    monkeypatch.setenv("VLLM_COMPACT_GDN", "0")
+    config = _spec_config()
+    config.speculative_config = None
+    _validate_flash_next_speculative_config(config)

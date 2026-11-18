@@ -48,8 +48,10 @@ import vllm_gaudi.models.qwen3_5 as qwen3_5  # noqa: E402
 import vllm_gaudi.models.qwen3_next as qwen3_next  # noqa: E402
 import vllm_gaudi.models.qwen4_exp as flash_next  # noqa: E402
 from vllm_gaudi.models.qwen4_exp import HpuQwen4ExpForCausalLM, HpuQwen4ExpForConditionalGeneration  # noqa: E402
+from vllm_gaudi.models.qwen4_exp.mtp import HpuQwen4ExpMTP  # noqa: E402
 from vllm_gaudi.platform import is_qwen3_5_hybrid_model  # noqa: E402
 import vllm.models.qwen4_exp.nvidia.model as upstream_model  # noqa: E402
+import vllm.models.qwen4_exp.nvidia.mtp as upstream_mtp  # noqa: E402
 from vllm.engine.arg_utils import EngineArgs  # noqa: E402
 from vllm.model_executor.model_loader.utils import get_model_architecture  # noqa: E402
 from vllm.model_executor.models.registry import ModelRegistry  # noqa: E402
@@ -60,6 +62,7 @@ HPU_CLASSES = {
     "Qwen4ExpForConditionalGeneration": (HpuQwen4ExpForConditionalGeneration,
                                          upstream_model.Qwen4ExpForConditionalGeneration),
     "Qwen4ExpForCausalLM": (HpuQwen4ExpForCausalLM, upstream_model.Qwen4ExpForCausalLM),
+    "Qwen4ExpMTP": (HpuQwen4ExpMTP, upstream_mtp.Qwen4ExpMTP),
 }
 
 

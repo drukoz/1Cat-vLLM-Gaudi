@@ -54,9 +54,14 @@ def pool_slot_bytes(kv_cache_spec: dict[str, KVCacheSpec]) -> int:
     return sum(pos * spec.real_page_size_bytes for spec, pos in recurrent_positions(kv_cache_spec).items())
 
 
-def resolve_pool_slots(max_num_seqs: int, num_groups: int, cache_slots: int) -> int:
-    """Pool size: the live need of max_num_seqs requests plus cache_slots retained prefix states."""
-    return max_num_seqs * num_groups * LIVE_SLOTS_PER_REQUEST + cache_slots
+def resolve_pool_slots(max_num_seqs: int, num_groups: int, cache_slots: int, num_speculative_tokens: int = 0) -> int:
+    """Pool size: the live need of max_num_seqs requests plus cache_slots retained prefix states.
+
+    Under speculation the MambaManager allocates ``num_speculative_tokens`` scratch blocks per
+    request right after its position blocks, so each live request owns
+    ``LIVE_SLOTS_PER_REQUEST + num_speculative_tokens`` slots per recurrent group.
+    """
+    return max_num_seqs * num_groups * (LIVE_SLOTS_PER_REQUEST + num_speculative_tokens) + cache_slots
 
 
 def pool_tensor_slots(pool_slots: int) -> int:
