@@ -53,14 +53,35 @@ add_custom_command(
 set_source_files_properties("${CMAKE_CURRENT_BINARY_DIR}/gdn_recurrent_decode_gaudi2_embedded.o"
     PROPERTIES EXTERNAL_OBJECT TRUE GENERATED TRUE)
 
+add_custom_command(
+    OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/gdn_core_verify_gaudi2.o"
+    COMMAND "${TPC_COMPILER}" -Wall -Werror -O2 -march=gaudi2 -vlm 32 -I"${TPC_INCLUDE_DIR}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/kernels/gdn_core_verify_gaudi2.c"
+            -c -o "${CMAKE_CURRENT_BINARY_DIR}/gdn_core_verify_gaudi2.o"
+    DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/kernels/gdn_core_verify_gaudi2.c"
+            "${CMAKE_CURRENT_SOURCE_DIR}/kernels/gdn_core_verify_recurrence.h"
+            "${CMAKE_CURRENT_SOURCE_DIR}/kernels/gdn_core_decode_norm.h"
+    VERBATIM)
+add_custom_command(
+    OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/gdn_core_verify_gaudi2_embedded.o"
+    COMMAND "${ELF_OBJCOPY}" -I binary -O elf64-x86-64 -B i386:x86-64
+            gdn_core_verify_gaudi2.o gdn_core_verify_gaudi2_embedded.o
+    DEPENDS "${CMAKE_CURRENT_BINARY_DIR}/gdn_core_verify_gaudi2.o"
+    WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}"
+    VERBATIM)
+set_source_files_properties("${CMAKE_CURRENT_BINARY_DIR}/gdn_core_verify_gaudi2_embedded.o"
+    PROPERTIES EXTERNAL_OBJECT TRUE GENERATED TRUE)
+
 add_library(
     gdn_fused_gaudi2
     SHARED
     host/gdn_core_decode_gaudi2.cpp
     host/gdn_recurrent_decode_gaudi2.cpp
+    host/gdn_core_verify_gaudi2.cpp
     host/entry_points.cpp
     "${CMAKE_CURRENT_BINARY_DIR}/gdn_core_decode_gaudi2_embedded.o"
     "${CMAKE_CURRENT_BINARY_DIR}/gdn_recurrent_decode_gaudi2_embedded.o"
+    "${CMAKE_CURRENT_BINARY_DIR}/gdn_core_verify_gaudi2_embedded.o"
 )
 target_include_directories(
     gdn_fused_gaudi2

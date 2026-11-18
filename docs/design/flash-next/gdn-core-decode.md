@@ -246,30 +246,200 @@ padding is `-1` (`_can_use_direct_gdn_state`), so absolute indexing gives the sa
   inside `_maybe_gdn_core_decode`, before the op. For `RECURRENCE` it runs in `forward` right after the gate, before
   Part 2.
 
-## Phase 2 contract: verification over a draft chain or tree
+## Phase 2 contract, version 2: speculative verification steps (T = 1 + k), 2026-11-18
 
-`gdn_core_verify_reference` (`flashinfer_gaudi/gdn_core_verify.py`) runs the fused GDN decode step over `T` draft
-nodes per row, where each node's input state is its **parent** node's output state (`parent_idx`), so the same
-contract covers M3's chain (`parent = t - 1`) and a future draft tree. The phase-2 TPC kernel will implement this
-contract, so tree verification later needs no kernel rework. Torch reference only for now.
+Track phase 2 (RUK-2943). With MTP on, every decode step is a verification step over `T = 1 + k` tokens per
+request (Flash-Next's recipe: `k = 3`, `T = 4`), or the plain step that follows one, and phase 1's op never runs.
+`gdn_core_verify` runs the fused GDN step over those `T` nodes in one kernel and covers both step kinds.
 
-```python
-def gdn_core_verify_reference(conv_state, ssm_state,       # [S, 3, C], [S, HV, D, D] fp32, mutated in place (stored nodes only)
-                              mixed_qkv,                   # [B, T, C]
-                              z,                           # [B, T, HV * D]
-                              a, b,                        # [B, T, HV]
-                              A_log, dt_bias, conv_weight_t, norm_weight,  # [HV], [HV], [4, C], [D]
-                              parent_idx,                  # [B, T] int32: parent_idx[:, 0] == -1; 0 <= parent_idx[r, t] < t for t >= 1
-                              load_indices,                # [B] int32: the slot node 0 loads (conv history and SSM state)
-                              store_indices,               # [B, T] int32: where node t's state is stored; out of range = not stored
-                              scale: float, eps: float, gate_activation: int) -> torch.Tensor:  # [B, T, HV, D] fp32
+**Why version 2.** Version 1 (RUK-2915) gave every node its own conv checkpoint in an `[S, 3, C]` pool and a
+`parent_idx` per node. M3's runner does not keep conv state that way, and the op must follow M3's state protocol
+exactly, because the next step (on either path) reads what this one wrote:
+- **Conv state is one expanded slot per request**, `[S, R, C]` with `R = 3 + k` rows (the GDN spec's
+  `conv_kernel - 1 + num_spec`). After a T-token pass the slot holds `width - 2 = 2` history rows and then the T
+  input rows; the next pass reads its 3-row history window at row `num_accepted - 1`
+  (`_hpu_causal_conv1d_spec_update` in `vllm_gaudi/ops/causal_conv1d_pytorch.py`). The read slot is the lattice's
+  column 0; align mode writes the store lattice's column 0.
+- **SSM state is a per-node checkpoint lattice**: node 0 starts from the accepted checkpoint
+  `lattice[r, num_accepted - 1]`, and node t's state is written to `store_lattice[r, t]`
+  (`gated_delta_rule_mtp_rollback` in `flashinfer_gaudi/gdn_decode.py`).
+- **Nodes past a row's query length** (trimmed drafts) are masked: zero output, no state change, no SSM store, and
+  their conv input rows are stored as zeros.
+
+The probe `spikes/gdn-core-verify/probe.py` checks this contract against M3's composed path (`hpu_fused_gdn_gating`
+-> `hpu_causal_conv1d_update(num_accepted_tokens=...)` -> `gated_delta_rule_mtp_packed` -> `RMSNormGated`) over 4
+chained steps with the accepted counts threaded forward, align and non-align lattices, trimmed rows and a padding
+row, at all four TP head counts, and the plain step after a verification. Results under "Measured tolerances".
+
+Version 1's reference stays as `gdn_core_verify_tree_reference` (renamed, same file): the executable form of a
+future draft tree. A tree needs a different conv protocol in the runner (the accepted path is not a prefix of the
+node order) and per-node row states in the kernel; both are out of scope until the runner verifies trees.
+
+### Names
+
+| What | Name |
+|---|---|
+| Op | `torch.ops.flashinfer_gaudi.gdn_core_verify` (schema in `flashinfer_gaudi/gdn_core_verify.py`, same `torch.library` fragment as `gdn_core_decode`) |
+| Torch reference | `flashinfer_gaudi.gdn_core_verify.gdn_core_verify_reference` (version 1's function is renamed `gdn_core_verify_tree_reference`) |
+| Loop oracle and shared cases | `tests/unit_tests/gdn_core_decode/verify_sim_case.py` (`verify_oracle`, `VERIFY_CASES`, `VERIFY_HPU_CASES`, `compare_verify`, raw-file I/O) |
+| Flag | `VLLM_HPU_GDN_CORE_VERIFY`, `GdnCoreVerifyMode(IntEnum)`: `OFF = 0`, `FUSED = 1`; **default `OFF` (0)** until rental gate G1b has checked the op on a card |
+| TPC kernel | `csrc/gdn_fused/kernels/gdn_core_verify_gaudi2.c` + `gdn_core_verify_recurrence.h`; reuses `gdn_core_decode_norm.h`. GUID `gdn_fused_core_verify_f32state_gaudi2` (`kGdnCoreVerifyGuid`) |
+| Scalar params ABI | `struct GdnCoreVerifyParams { float scale; float eps; int32_t gate_activation; };`, 12 bytes, in `csrc/gdn_fused/gdn_core_decode_params.h` (with `kGdnCoreVerifyMaxNodes = 8`) |
+| Host glue | `csrc/gdn_fused/host/gdn_core_verify_gaudi2.{hpp,cpp}`, a third GUID in `libgdn_fused_gaudi2.so` |
+| HPU registration | `csrc/gdn_fused/pytorch/hpu_gdn_core_decode.cpp` (the `gdn_fused_ops` extension) |
+| Card checks | `tests/unit_tests/gdn_core_decode/test_hpu_verify_op.py`; `tools/flash_next/gdn_core_decode_replay.py --ops verify --case ver_tp8_b16` (and `ver_tp8_b64`) |
+
+### Schema
+
+```
+gdn_core_verify(Tensor(a!) conv_state, Tensor(b!) ssm_state, Tensor mixed_qkv, Tensor z, Tensor a, Tensor b,
+                Tensor A_log, Tensor dt_bias, Tensor conv_weight_t, Tensor norm_weight,
+                Tensor row_indices, Tensor ssm_store_indices,
+                float scale, float eps, int gate_activation) -> Tensor
 ```
 
-Semantics: node 0 of row `r` loads slot `load_indices[r]`; node `t >= 1` loads the state (conv history and SSM
-state) that node `parent_idx[r, t]` produced. A row whose load slot is out of range is padding: all its outputs are
-zero and it stores nothing. Node `t`'s output does not depend on whether its state is stored. Per-node arithmetic
-is exactly the T = 1 step above (`gdn_core_decode_reference`), applied node by node in increasing `t`; the
-`parent_idx` rule is checked on non-padding rows only.
+Twelve inputs, as `gdn_core_decode`, with `ssm_state` at input 1 and `mixed_qkv` at input 2, so phase 1's shape
+inference (`InferCoreDecodeShape`: output `{128, HV, mixed_qkv rows}`) serves both GUIDs. The per-row slots are
+packed into one tensor to stay within the TPC's tensor count. Activations are **token-major**, as the layer holds
+them: node `t` of row `r` is row `r * T + t` of `mixed_qkv`, `z`, `a`, `b` and the output.
 
-M3's chain is `parent_idx[r, t] = t - 1`. A tree needs no kernel change, only a different `parent_idx` and
-per-node stores.
+| Arg | Torch shape, dtype | TPC coords (innermost first) | Meaning |
+|---|---|---|---|
+| `conv_state` | `[S, R, C]`, bf16 | `{channel, row, slot}` | expanded conv slots, `R >= T + 2` (M3: `R = 3 + k`). Mutated |
+| `ssm_state` | `[S, HV, D(v), D(k)]`, fp32 | `{k, v_row, value_head, slot}` | as in `gdn_core_decode`. Mutated |
+| `mixed_qkv` | `[B*T, C]`, bf16 | `{channel, token}` | `in_proj` output, `[q | k | v]` |
+| `z` | `[B*T, HV*D]`, bf16 | `{channel, token}` | output gate input |
+| `a`, `b` | `[B*T, HV]`, bf16 | `{value_head, token}` | gate inputs |
+| `A_log`, `dt_bias`, `conv_weight_t`, `norm_weight` | as in `gdn_core_decode` | as there | as there |
+| `row_indices` | `[B, 5]`, int32 | `{field, request}` | per row: `0` conv load slot, `1` conv offset (first history row read, `num_accepted - 1`), `2` conv store slot, `3` SSM load slot (node 0's start), `4` query length (real nodes) |
+| `ssm_store_indices` | `[B, T]`, int32 | `{node, request}` | where node t's SSM state is stored; out of range = not stored |
+| returns | `[B*T, HV, D]`, **fp32** | `{v_row, value_head, token}` | gated-RMSNorm output per node; the layer casts it to the model dtype |
+
+Preconditions (the layer checks them; the HPU host code rejects anything else): `1 <= T <= 8`, `T + 2 <= R`, no conv
+bias, conv width 4, fp32 SSM state; HPU only: `D == 128`, all tensors contiguous.
+
+### Semantics (`verify_oracle` in `verify_sim_case.py` is the executable form; the reference and the kernel match it)
+
+```python
+for r in range(B):
+    cl, off, cs, sl, n = row_indices[r]
+    if not (0 <= cl < S and 0 <= cs < S and 0 <= sl < S and 0 <= off <= R - 3 and n >= 1):
+        out[r*T:(r+1)*T] = 0              # padding row: zero output, no state write at all
+        continue
+    n = min(n, T)
+    hist = conv_state[cl, off:off+3]      # [3, C], read before any write
+    xs = mixed_qkv[r*T:(r+1)*T]; xs[n:] = 0
+    seq = cat([hist, xs])                 # [3 + T, C]
+    state = ssm_state[sl]                 # [HV, D, D] fp32, read before any write
+    for t in range(n):                    # nodes t >= n: out = 0, state unchanged, nothing stored
+        conv = seq[t]*w[0] + seq[t+1]*w[1] + seq[t+2]*w[2] + seq[t+3]*w[3]      # fp32
+        # from here exactly gdn_core_decode's per-row arithmetic, with token r*T + t for z, a, b and the output,
+        # and `state` carried from node to node:  act = silu(conv); q, k L2-normalized (q * scale); per value head:
+        # decay, beta; St = state[vh] * decay; St += ((v - St @ k) * beta)[:, None] * k[None, :]; state[vh] = St;
+        # o = St @ q; out[r*T + t, vh] = rmsnorm(o) * norm_weight * gate(z)
+        if 0 <= ssm_store_indices[r, t] < S:
+            ssm_state[ssm_store_indices[r, t]] = state
+    conv_state[cs, 0:2] = hist[1:3]       # exact bf16 copies
+    conv_state[cs, 2:2+T] = xs            # zeros for nodes t >= n
+    conv_state[cs, 2+T:R] = 0
+```
+
+Caller invariants (the scheduler guarantees them): within one call no row's store slot (conv or SSM) is another
+row's load slot. Load == store for the same row is the normal case (non-align lattices: `cl == cs`, and `sl` is
+also `ssm_store_indices[r, num_accepted - 1]`) and must work: every write of a row happens after that row's reads
+of the same data.
+
+### Layer mapping (from M3's metadata to the op; checked in the probe)
+
+Verification step (`num_accepted_tokens` set, 2-D `load_indices [B, T]`; `align` = `lattice_store_differs` and a
+store lattice is present; `R = conv_pool.shape[1]`; `qsl` = `query_start_loc_p`):
+
+```python
+acc = num_accepted_tokens[:B].long()
+row_indices = stack([load[:, 0],                                   # conv load
+                     acc.clamp(1, R - 2) - 1,                      # conv offset (the conv path's clamp)
+                     store[:, 0] if align else load[:, 0],         # conv store
+                     load.gather(1, (acc.clamp(1, T) - 1)[:, None])[:, 0],   # SSM load (the SSM path's clamp)
+                     (qsl[1:B + 1] - qsl[:B]).clamp(0, T)], dim=1).int()
+ssm_store_indices = (store if align else load).int()
+```
+
+Plain step after a verification (`num_accepted_tokens` set, 1-D `load_indices [B]`, `store = store_indices`, or
+`load` when that is `None`): `T = 1`, `row_indices = [store, acc.clamp(1, R - 2) - 1, store, load, qsl diff
+clamped to [0, 1]]`, `ssm_store_indices = store[:, None]`. The conv path reads and writes the request's base row
+(`store`), the SSM path loads the accepted checkpoint (`load`) and stores to `store`.
+
+### Measured tolerances (CPU probe, 2026-11-18, seed 0, B = 3, k = 3, D = 128)
+
+| Head counts (H/HV) | fp32: out / ssm / conv vs M3's composed path, worst over 4 chained steps and 4 variants | bf16: out / ssm |
+|---|---|---|
+| 16/48 (TP1) | 4.3e-6 / 4.8e-7 / 0 | 0.042 / 0.0100 |
+| 8/24 (TP2) | 2.0e-6 / 4.8e-7 / 0 | 0.036 / 0.0100 |
+| 4/12 (TP4) | 1.4e-6 / 4.8e-7 / 0 | 0.050 / 0.0125 |
+| 2/6 (TP8) | 1.3e-6 / 3.6e-7 / 0 | 0.030 / 0.0074 |
+
+The plain step after a verification (T = 1): fp32 out 9.5e-7, ssm 3.6e-7, conv exact; bf16 out 0.019. The composed
+path rounds the conv output, `beta` and `o` to bf16 in bf16 runs; the op does not, hence the bf16 gap. Negative
+controls: a conv offset of 0 instead of `num_accepted - 1`, or an SSM load from column 0 instead of the accepted
+checkpoint, moves the outputs by 3-5.6. Test tolerances: fp32 `atol=1e-5, rtol=1e-5`; bf16 out `atol=5e-2,
+rtol=1e-2`, ssm `atol=3e-2, rtol=1e-2`; conv state exact in both. Kernel vs oracle: `sim_case.py`'s `OUT_ATOL`,
+`OUT_RTOL`, `SSM_ATOL`, `SSM_RTOL` (TPC exp/log/sigmoid/rsqrt approximations).
+
+### TPC kernel layout (two files, so two engineers can write them at once)
+
+Index space rank 2, as phase 1: `dim0 = key head` (size `H`), `dim1 = request` (size `B`). One point owns key head
+`kh` of request `r` over all `T` nodes: its Q and K channels, the V channels and `z` of value heads
+`kh*rep .. kh*rep+rep-1`, the conv channels of exactly those blocks in the conv slot (all `R` rows), and those
+value heads' SSM rows. No two points touch the same channel or state row.
+
+`gdn_core_verify_gaudi2.c` defines `bf16_to_f32_linear` (copied from `gdn_core_decode_gaudi2.c`) and declares,
+before including the two headers:
+
+```c
+#define GDN_VERIFY_MAX_NODES 8
+__local__ float64 verify_q[2 * GDN_VERIFY_MAX_NODES];   // node t: [2t] = elements 0..63, [2t+1] = 64..127
+__local__ float64 verify_k[2 * GDN_VERIFY_MAX_NODES];
+__local__ float64 verify_v[2 * GDN_VERIFY_MAX_NODES];   // the current value head
+__local__ float64 verify_decay[GDN_VERIFY_MAX_NODES];   // the current value head, all lanes equal
+__local__ float64 verify_beta[GDN_VERIFY_MAX_NODES];
+__local__ float64 verify_o[2 * GDN_VERIFY_MAX_NODES];   // written by the recurrence header
+__local__ int verify_store_slot[GDN_VERIFY_MAX_NODES];  // ssm_store_indices[r, t] if t < n and in [0, S), else -1
+#include "gdn_core_verify_recurrence.h"
+#include "gdn_core_decode_norm.h"
+```
+
+(`__local__` vector and scalar arrays with a runtime index compile with `-Wall -Werror` in tpcsim, checked with the
+contract commit; the fork's precedent is `csrc/deepseek_v41_unique/kernels/deepseek_v41_softmax_parts_gaudi2.c:4`.)
+
+```c
+// csrc/gdn_fused/kernels/gdn_core_verify_gaudi2.c   (main: row fields, conv + SiLU over the nodes, Q/K norm, gates,
+//                                                    conv-slot store, recurrence and norm per value head)
+void main(tensor conv_state, tensor ssm_state, tensor mixed_qkv, tensor z, tensor a, tensor b,
+          tensor A_log, tensor dt_bias, tensor conv_weight_t, tensor norm_weight,
+          tensor row_indices, tensor ssm_store_indices, tensor output,
+          float scale, float eps, int gate_activation);
+
+// csrc/gdn_fused/kernels/gdn_core_verify_recurrence.h   (one value head over nodes 0..nodes-1; reads the arrays above)
+static inline void gdn_core_verify_recurrence_head(
+    tensor ssm_state, int load_slot, int value_head, int nodes, uint64 lanes);
+```
+
+The output is written per node with phase 1's helpers and the token index as the request coordinate:
+`gdn_core_norm_store(z, norm_weight, output, r * T + t, vh, o_t, eps, gate_activation)` for `t < n`, and
+`gdn_core_zero_store(output, r * T + t, vh)` for `t >= n` and for every node of a padding row.
+
+**Ordering.** tpc-clang treats `ld_tnsr`/`st_tnsr` on one tensor as independent (RUK-2829). Conv: the slot's store
+rows `0..R-1` overlap the history rows `off..off+2` that the same point reads when `cl == cs`, so every conv store
+must data-depend on all three history loads `h0`, `h1`, `h2` (phase 1's guard, extended):
+
+```c
+const bool128 n0 = v_bf16_cmp_grt_b(h0, (bf16)(1.0f / 0.0f));   // never true
+const bool128 n1 = v_bf16_cmp_grt_b(h1, (bf16)(1.0f / 0.0f));
+const bool128 n2 = v_bf16_cmp_grt_b(h2, (bf16)(1.0f / 0.0f));
+// for every value s to store:  s = v_bf16_mov_vb(h0, 0, s, n0, 0); s = v_bf16_mov_vb(h1, 0, s, n1, 0);
+//                              s = v_bf16_mov_vb(h2, 0, s, n2, 0);   then v_bf16_st_tnsr(...)
+```
+
+SSM: each value row is loaded once from `load_slot` and stored only after it is updated, so every store of row
+`i` data-depends on the load of row `i`, and stores of row `i` never alias a later load (other rows). No guard is
+needed there.

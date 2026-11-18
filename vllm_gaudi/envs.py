@@ -531,6 +531,7 @@ if TYPE_CHECKING:
     VLLM_HPU_FLASH_NEXT_QSA_PREFILL_TILE: int = 2048
     VLLM_HPU_GDN_CORE_DECODE: int = 1  # GdnCoreDecodeMode: 1 fused (default), 0 off, 2 recurrence
     VLLM_HPU_GDN_CORE_DECODE_DEBUG: int = 0  # GdnCoreDecodeDebug: 0 off, 1 check slot indices every step (host sync)
+    VLLM_HPU_GDN_CORE_VERIFY: int = 0  # GdnCoreVerifyMode: 0 off (default), 1 fused verification steps
     VLLM_HPU_RECURRENT_STATE_POOL: int = 0  # RecurrentStatePoolMode: 0 off, 1 pool
     VLLM_HPU_RECURRENT_STATE_POOL_SLOTS: int = 0  # resolved by the hook; positive overrides the formula
     VLLM_HPU_RECURRENT_STATE_POOL_CACHE_SLOTS: int = 512  # retained prefix states added to the live need
@@ -1876,6 +1877,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # 0 (default) = off, 1 = check the load/store indices before every core decode step.
     "VLLM_HPU_GDN_CORE_DECODE_DEBUG":
     lambda: int(os.environ.get("VLLM_HPU_GDN_CORE_DECODE_DEBUG", "0")),
+
+    # Flash-Next GDN speculative verification steps (MTP) through the fused verify op
+    # (flashinfer_gaudi.gdn_core_verify). 0 (default) = off (the torch path), 1 = fused.
+    # Off until the rental's gate G1b has checked the op on a card; see
+    # docs/design/flash-next/gdn-core-decode.md, "Phase 2 contract, version 2".
+    "VLLM_HPU_GDN_CORE_VERIFY":
+    lambda: int(os.environ.get("VLLM_HPU_GDN_CORE_VERIFY", "0")),
 
     # Recurrent (GDN / short-conv) state pool: 0 (default) keeps today's
     # one-recurrent-slot-per-attention-block-id allocation, 1 gives the

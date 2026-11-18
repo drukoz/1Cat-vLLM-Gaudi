@@ -70,3 +70,30 @@ def test_compare_runs_identical():
 def test_eager_run_advances_state():
     result, start = _recurrent_result(3)
     assert not torch.equal(result.states["ssm_state"], start)
+
+
+def test_main_verify_small_cpu(capsys):
+    assert main(["--device", "cpu", "--steps", "3", "--ops", "verify"]) == 0
+    out = capsys.readouterr().out
+    assert "case=ver_tp8_b16" in out
+    assert "verify lazy+hpu_graph: skipped (cpu)" in out
+    assert "verify torch.compile: exact" in out
+    assert "verify recompiles after warmup: 0" in out
+
+
+def test_main_verify_t1_case():
+    assert main(["--device", "cpu", "--steps", "3", "--ops", "verify", "--case", "ver_tp4_t1"]) == 0
+
+
+def test_main_verify_arg_rules(capsys):
+    for argv in (["--device", "cpu", "--steps", "2", "--ops", "core,verify"],
+                 ["--device", "cpu", "--steps", "2", "--ops", "verify", "--case", "tp8_b16"],
+                 ["--device", "cpu", "--steps", "2", "--ops", "core", "--case", "ver_tp8_b16"]):
+        assert main(argv) == 2, argv
+    assert capsys.readouterr().err.count("\n") == 3
+
+
+def test_main_default_case_unchanged(capsys):
+    assert main(["--device", "cpu", "--steps", "2", "--ops", "core"]) == 0
+    out = capsys.readouterr().out
+    assert "case=tp8_b16" in out

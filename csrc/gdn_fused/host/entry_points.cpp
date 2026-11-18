@@ -2,6 +2,7 @@
 #include <cstdint>
 #include <cstring>
 #include "gdn_core_decode_gaudi2.hpp"
+#include "gdn_core_verify_gaudi2.hpp"
 #include "gdn_recurrent_decode_gaudi2.hpp"
 namespace tpc_lib_api { struct _TensorManipulationSuggestion; }
 
@@ -10,15 +11,14 @@ extern "C" tpc_lib_api::GlueCodeReturn GetKernelGuids(
     using namespace tpc_lib_api;
     if (!count) return GLUE_FAILED;
     const auto capacity = *count;
-    *count = device == DEVICE_ID_GAUDI2 ? 2 : 0;
+    *count = device == DEVICE_ID_GAUDI2 ? 3 : 0;
     if (!*count || !guids || !capacity) return GLUE_SUCCESS;
-    if (capacity >= 2) {
-        std::memset(guids, 0, 2 * sizeof(*guids));
-        std::strcpy(guids[0].name, GdnCoreDecodeGaudi2::name);
-        std::strcpy(guids[1].name, GdnRecurrentDecodeGaudi2::name);
-    } else {
-        std::memset(guids, 0, sizeof(*guids));
-        std::strcpy(guids[0].name, GdnCoreDecodeGaudi2::name);
+    static constexpr const char* const kGuidNames[3] = {
+        GdnCoreDecodeGaudi2::name, GdnRecurrentDecodeGaudi2::name, GdnCoreVerifyGaudi2::name};
+    const uint32_t filled = capacity < 3 ? capacity : 3;
+    std::memset(guids, 0, filled * sizeof(*guids));
+    for (uint32_t i = 0; i < filled; ++i) {
+        std::strcpy(guids[i].name, kGuidNames[i]);
     }
     return GLUE_SUCCESS;
 }
@@ -33,6 +33,9 @@ extern "C" tpc_lib_api::GlueCodeReturn InstantiateTpcKernel(
     }
     if (!std::strcmp(params->guid.name, GdnRecurrentDecodeGaudi2::name)) {
         return GdnRecurrentDecodeGaudi2{}.GetGcDefinitions(params, instance);
+    }
+    if (!std::strcmp(params->guid.name, GdnCoreVerifyGaudi2::name)) {
+        return GdnCoreVerifyGaudi2{}.GetGcDefinitions(params, instance);
     }
     return GLUE_NODE_NOT_FOUND;
 }
@@ -91,6 +94,9 @@ extern "C" tpc_lib_api::GlueCodeReturn GetShapeInference(
     using namespace tpc_lib_api;
     if (!params || !output || !params->inputTensors || !output->outputTensors) return GLUE_SIF_NULL_PTR;
     if (device != DEVICE_ID_GAUDI2) return GLUE_NODE_NOT_FOUND;
+    // The verify GUID has 12 inputs too, with ssm_state at input 1 and mixed_qkv
+    // at input 2 as here, and its output {128, HV, mixed_qkv rows} is the same,
+    // so InferCoreDecodeShape serves both GUIDs.
     if (params->inputTensorsNr == 12) return InferCoreDecodeShape(params, output);
     if (params->inputTensorsNr == 8) return InferRecurrentDecodeShape(params, output);
     return GLUE_INCOMPATIBLE_INPUT_COUNT;
