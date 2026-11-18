@@ -188,6 +188,37 @@ Exit: T1-T10b merged; the QA verification passed (the Flash-Next suite including
 
 What M3 does not build: IndexShare, a native kernel for `T = 4` (the torch recurrence runs inside the compiled graph), DFlash2 for Flash-Next (no draft checkpoint), #55513 (block-FP8 MTP scales: M4 with the FP8 checkpoint), non-greedy acceptance tuning, and draft-side bucketing or warmup changes beyond what the fork's EAGLE path already does (checked on hardware in stage 3e).
 
+### M3b Speculation and step-overhead follow-ups (`feat/flash-next-gaudi-m3b`, RUK-2909)
+
+Cut from `feat/flash-next-gaudi-m3` at `856f09c`; approved in RUK-2733 (user comment `52d3fcf4`, plan revision
+`c71cc945`). On Gaudi2 the fixed cost of a decode step dominates (27B FP8: 36 ms per step against a floor near
+3.4 ms), so tokens accepted per step and the host gap between steps matter more than bandwidth.
+
+- **A (RUK-2910)**: n-gram (prompt lookup) drafting for Flash-Next. M3's lattice already runs for any method
+  (`recurrent_spec_enabled`); only the platform validator refused it. Prefix caching off for now. The runner pads
+  ragged drafts with token 0 at position 0 and schedules `[-1]` for an empty draft: the model clamps ids at 0. The
+  pad rows never touch the QSA key ring: `query_start_loc_p` carries each request's real length (`1 + L`), so QSA
+  parks them on the scratch ring row (`test_ngram_ragged_sparse_ring` checks it). The platform refuses n-gram with
+  prefix caching on, so n-gram is not a variant of the 128K rental script (RUK-2919).
+- **B (RUK-2911)**: `build_ple_inputs` without a per-row loop, plus `advance_ple_context`, a device-side update of
+  the PLE n-gram context (groundwork for async scheduling; the runner does not call it yet).
+- **C (RUK-2912)**: `VLLM_FLASH_NEXT_DRAFT_RANK_LOG=1` logs where the target's token ranked in the drafter's top 4
+  at each first rejected position. That sets the ceiling of tree verification.
+- **D (RUK-2913)**: `tools/flash_next/step_anatomy.py` splits decode steps of the high-level profiler trace into
+  host phases; the drafter call gets a `propose_draft_tokens` event.
+- **E1 (RUK-2914)**: `tools/flash_next/make_agent_prompts.py`, a coding-agent prompt set (edit-and-return-the-file),
+  because 3e's random dataset gives n-gram nothing to match.
+- **E2 (RUK-2916)**: cancelled, superseded by the standardized rental script (RUK-2919): the rank log is its MTP
+  variant B (`VLLM_FLASH_NEXT_DRAFT_RANK_LOG=1`), the step-anatomy trace its optional variant P
+  (`VLLM_PROFILER_ENABLED=true`), and its workload comes from E1's coding-agent prompts. The suffix-decoding probe
+  waits for after the rental.
+- On the fused-kernel track, **RUK-2915**: `gdn_core_verify_reference` takes `parent_idx [B, T]` (chain: `t - 1`), so
+  the phase-2 kernel serves a draft tree without rework.
+
+Waits for the rental numbers: tree verification (about 15 subtasks; decided by C), suffix decoding in the runner
+(decided by E2's probe), async scheduling with speculation, host offload of cold GDN snapshots (only if stage 4
+shows evictions), n-gram under prefix caching.
+
 ### M4 Two servers and eight cards (`feat/flash-next-gaudi-m4`)
 
 FP8 at TP4 needs expert parallelism (R6: 640/4 = 160 per rank is not a multiple of the 128-wide FP8 blocks; `--enable-expert-parallel` gives each rank 128 whole experts), so: TP4 + EP4 block-FP8 MoE, INC FP8 with the conv1d blocklist as the alternative; PLE table on the host (backport #54371's structure with an HPU gather, or the fork's Engram host gather) to fit BF16 at TP4; TP8 fused AllReduce + residual + RMSNorm (`tp2_fused_ar_norm.py` pattern); run-sheet stage 5 comparisons (TP8, 2×TP4, TP4+EP).

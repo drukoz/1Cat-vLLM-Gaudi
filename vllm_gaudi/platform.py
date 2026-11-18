@@ -265,9 +265,15 @@ def _validate_flash_next_speculative_config(vllm_config: VllmConfig) -> None:
         return
     draft_model_config = speculative_config.draft_model_config
     draft_architectures = set(getattr(getattr(draft_model_config, "hf_config", None), "architectures", ()) or ())
-    if speculative_config.method != "mtp" or "Qwen4ExpMTP" not in draft_architectures:
-        raise ValueError("Flash-Next supports speculative decoding with its own MTP layer only: use "
-                         "--speculative-config '{\"method\": \"mtp\", \"num_speculative_tokens\": 3}'")
+    if speculative_config.method == "ngram":
+        if vllm_config.cache_config.enable_prefix_caching:
+            raise ValueError("Flash-Next n-gram speculation runs with prefix caching disabled for now: add "
+                             "--no-enable-prefix-caching")
+    elif speculative_config.method != "mtp" or "Qwen4ExpMTP" not in draft_architectures:
+        raise ValueError("Flash-Next supports speculative decoding with its own MTP layer or n-gram prompt lookup "
+                         "only: use --speculative-config '{\"method\": \"mtp\", \"num_speculative_tokens\": 3}' or "
+                         "'{\"method\": \"ngram\", \"num_speculative_tokens\": 3, \"prompt_lookup_max\": 4, "
+                         "\"prompt_lookup_min\": 2}'")
     # Under prefix caching the align-mode state pool replaces compact GDN (RUK-2798 T10c).
     prefix_caching = bool(vllm_config.cache_config.enable_prefix_caching)
     if not prefix_caching and os.environ.get("VLLM_COMPACT_GDN", "1").strip().lower() not in ("1", "true"):

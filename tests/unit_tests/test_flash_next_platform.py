@@ -171,14 +171,37 @@ def test_spec_supported_config_passes(monkeypatch):
 
 def test_spec_eagle_method_raises(monkeypatch):
     monkeypatch.setenv("VLLM_COMPACT_GDN", "1")
-    with pytest.raises(ValueError, match="its own MTP layer only"):
+    with pytest.raises(ValueError, match="its own MTP layer or n-gram"):
         _validate_flash_next_speculative_config(_spec_config(method="eagle"))
 
 
 def test_spec_wrong_draft_arch_raises(monkeypatch):
     monkeypatch.setenv("VLLM_COMPACT_GDN", "1")
-    with pytest.raises(ValueError, match="its own MTP layer only"):
+    with pytest.raises(ValueError, match="its own MTP layer or n-gram"):
         _validate_flash_next_speculative_config(_spec_config(draft_archs=["Qwen3_5MoeMTP"]))
+
+
+def test_spec_ngram_passes(monkeypatch):
+    monkeypatch.setenv("VLLM_COMPACT_GDN", "1")
+    _validate_flash_next_speculative_config(_spec_config(method="ngram", draft_archs=()))
+
+
+def test_spec_ngram_prefix_caching_raises(monkeypatch):
+    monkeypatch.setenv("VLLM_COMPACT_GDN", "1")
+    with pytest.raises(ValueError, match="prefix caching disabled"):
+        _validate_flash_next_speculative_config(_spec_config(method="ngram", draft_archs=(), prefix_caching=True))
+
+
+def test_spec_ngram_too_many_tokens_raises(monkeypatch):
+    monkeypatch.setenv("VLLM_COMPACT_GDN", "1")
+    with pytest.raises(ValueError, match="1 to 4 speculative tokens"):
+        _validate_flash_next_speculative_config(_spec_config(method="ngram", draft_archs=(), k=7))
+
+
+def test_spec_ngram_compact_gdn_off_raises(monkeypatch):
+    monkeypatch.setenv("VLLM_COMPACT_GDN", "0")
+    with pytest.raises(ValueError, match="needs compact GDN state"):
+        _validate_flash_next_speculative_config(_spec_config(method="ngram", draft_archs=()))
 
 
 def test_spec_prefix_caching_passes_with_compact_gdn_off(monkeypatch):

@@ -5,7 +5,8 @@ from types import SimpleNamespace
 import numpy as np
 import torch
 
-from vllm_gaudi.v1.worker.flash_next_inputs import (build_ple_inputs, dummy_ple_inputs, model_requires_raw_input_tokens)
+from vllm_gaudi.v1.worker.flash_next_inputs import (_to_numpy, advance_ple_context, build_ple_inputs, dummy_ple_inputs,
+                                                    model_requires_raw_input_tokens)
 
 # Values from tests/unit_tests/models/flash_next/tiny_config.json.
 EOS = 248044
@@ -147,3 +148,111 @@ def test_dummy_inputs():
     assert model_requires_raw_input_tokens(plain)
     assert not model_requires_raw_input_tokens(SimpleNamespace())
     assert not model_requires_raw_input_tokens(SimpleNamespace(model=SimpleNamespace()))
+
+
+def _build_ple_inputs_loop(token_ids_cpu, num_computed_tokens_cpu, batch_indices, padded_batch_size, num_tokens,
+                           eos_token_id, ngram_size):
+    """Verbatim copy of the original per-row loop builder, used as the oracle."""
+    context_len = max(int(ngram_size) - 1, 0)
+    query_start_loc = torch.arange(padded_batch_size + 1, dtype=torch.int32) * int(num_tokens)
+    ngram_context = torch.full((padded_batch_size, context_len), int(eos_token_id), dtype=torch.int32)
+    token_ids_np = _to_numpy(token_ids_cpu)
+    computed_np = _to_numpy(num_computed_tokens_cpu)
+    for row, b in enumerate(batch_indices):
+        if row >= padded_batch_size:
+            break
+        start = int(computed_np[b])
+        row_ids = token_ids_np[b]
+        for k in range(context_len):
+            pos = start - context_len + k
+            if pos >= 0:
+                ngram_context[row, k] = int(row_ids[pos])
+    return query_start_loc, ngram_context
+
+
+def test_build_ple_inputs_matches_loop():
+    torch.manual_seed(0)
+    rng = np.random.default_rng(0)
+    num_tokens = 64
+    for _ in range(200):
+        ngram_size = int(rng.choice([1, 2, 3, 9]))
+        padded_batch_size = int(rng.integers(1, 9))
+        n_indices = int(rng.integers(0, padded_batch_size + 2 + 1))
+        batch_indices = [int(v) for v in rng.permutation(10)[:n_indices]]
+        token_ids = rng.integers(0, 1000, size=(10, 64)).astype(np.int64)
+        computed = rng.integers(0, 41, size=(10,)).astype(np.int32)
+
+        exp_q, exp_ctx = _build_ple_inputs_loop(token_ids, computed, batch_indices, padded_batch_size, num_tokens, EOS,
+                                                ngram_size)
+        act_q, act_ctx = build_ple_inputs(token_ids, computed, batch_indices, padded_batch_size, num_tokens, EOS,
+                                          ngram_size)
+
+        assert act_q.dtype == torch.int32 and act_ctx.dtype == torch.int32
+        assert torch.equal(exp_q, act_q)
+        assert torch.equal(exp_ctx, act_ctx)
+
+
+def test_advance_matches_rebuild():
+    torch.manual_seed(0)
+    rng = np.random.default_rng(0)
+    n_reqs = 6
+    width = 64
+    for ngram_size in (1, 2, 3, 9):
+        for T in (1, 2, 4):
+            histories = rng.integers(1, 1000, size=(n_reqs, width)).astype(np.int32)
+            num_computed = np.zeros(n_reqs, dtype=np.int32)
+            indices = list(range(n_reqs))
+            ctx = build_ple_inputs(histories, num_computed, indices, n_reqs, T, EOS, ngram_size)[1]
+            for _ in range(5):
+                num_committed = rng.integers(1, T + 1, size=(n_reqs, )).astype(np.int32)
+                num_committed[n_reqs - 1] = 0  # one request is always "not run".
+                input_rows = np.stack(
+                    [histories[r, num_computed[r]:num_computed[r] + T] for r in range(n_reqs)]).astype(np.int32)
+
+                new_ctx = advance_ple_context(ctx,
+                                              torch.from_numpy(input_rows),
+                                              torch.from_numpy(num_committed.copy()))
+
+                num_computed = num_computed + num_committed
+                exp_ctx = build_ple_inputs(histories, num_computed, indices, n_reqs, T, EOS, ngram_size)[1]
+
+                assert new_ctx.dtype == torch.int32
+                assert new_ctx.shape == (n_reqs, max(ngram_size - 1, 0))
+                assert torch.equal(new_ctx, exp_ctx)
+                ctx = new_ctx
+
+
+def test_advance_left_fill():
+    ngram_size = 9
+    context_len = ngram_size - 1
+    T = 3
+    row = [100, 101, 102, 103, 104, 105, 106, 107, 108, 109]
+    histories = np.zeros((1, 16), dtype=np.int32)
+    histories[0, :len(row)] = row
+
+    num_computed = np.array([2], dtype=np.int32)
+    ctx = build_ple_inputs(histories, num_computed, [0], 1, T, EOS, ngram_size)[1]
+    assert ctx[0].tolist() == [EOS] * (context_len - 2) + [100, 101]
+
+    input_rows = np.array([row[2:2 + T]], dtype=np.int32)
+    num_committed = np.array([1], dtype=np.int32)
+    new_ctx = advance_ple_context(ctx, torch.from_numpy(input_rows), torch.from_numpy(num_committed))
+
+    exp_ctx = build_ple_inputs(histories, np.array([3], dtype=np.int32), [0], 1, T, EOS, ngram_size)[1]
+    assert torch.equal(new_ctx, exp_ctx)
+    assert new_ctx[0].tolist() == [EOS] * (context_len - 3) + [100, 101, 102]
+
+
+def test_advance_no_host_sync():
+    compiled = torch.compile(advance_ple_context, fullgraph=True, backend="eager")
+    context_len = 8
+    T = 4
+    n_reqs = 3
+    ctx = torch.full((n_reqs, context_len), 7, dtype=torch.int32)
+    input_rows = torch.arange(n_reqs * T, dtype=torch.int32).reshape(n_reqs, T)
+    num_committed = torch.tensor([1, 2, 4], dtype=torch.int32)
+
+    out = compiled(ctx, input_rows, num_committed)
+
+    assert out.shape == (n_reqs, context_len)
+    assert out.dtype == torch.int32
