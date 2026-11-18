@@ -12,8 +12,10 @@ compiler (the HPU-graph variant is reported as ``skipped (cpu)``).  The compile 
 already checks that functionalization keeps the in-place state writes through ``torch.compile``.
 
 Usage: ``PYTHONPATH=$PWD python tools/flash_next/gdn_core_decode_replay.py [--steps 1000]
-[--device auto|cpu|hpu] [--case tp8_b16] [--ops core,recurrent]``.  Exit code 0 only when every
-variant that ran is exact against eager and every recompile count after warmup is 0.
+[--device auto|cpu|hpu] [--case tp8_b16|ver_tp8_b16] [--ops core,recurrent|verify]``; ``--ops
+verify`` runs alone on a ``ver_`` case (default ``ver_tp8_b16``, others default to ``tp8_b16``).
+Exit code 0 only when every variant that ran is exact against eager and every recompile count
+after warmup is 0.
 """
 
 from __future__ import annotations
@@ -26,10 +28,15 @@ import torch
 import torch.nn as nn
 
 from flashinfer_gaudi.gdn_core_decode import gdn_core_decode, gdn_recurrent_decode
+from flashinfer_gaudi.gdn_core_verify import gdn_core_verify
 from tests.unit_tests.gdn_core_decode.sim_case import HPU_CASES, make_inputs, scalars
+from tests.unit_tests.gdn_core_decode.verify_sim_case import VERIFY_HPU_CASES, make_verify_inputs, verify_scalars
 
 CASES_BY_NAME = {case.name: case for case in HPU_CASES}
-OPS = ("core", "recurrent")
+CASES_BY_NAME.update({case.name: case for case in VERIFY_HPU_CASES})
+OPS = ("core", "recurrent", "verify")
+DEFAULT_CASE = "tp8_b16"
+DEFAULT_VERIFY_CASE = "ver_tp8_b16"
 WARMUP_STEPS = 3  # steps after which the recompile count baseline is read
 
 
@@ -76,6 +83,28 @@ class RecurrentStep(nn.Module):
     def forward(self, ssm_state, qkv, a, b):
         return gdn_recurrent_decode(ssm_state, qkv, a, b, self.A_log, self.dt_bias, self.load_indices,
                                     self.store_indices, self.scale)
+
+
+class VerifyStep(nn.Module):
+    """One fused ``gdn_core_verify`` step; constant inputs come from the constructor."""
+
+    def __init__(self, A_log, dt_bias, conv_weight_t, norm_weight, row_indices, ssm_store_indices, scale, eps,
+                 gate_activation):
+        super().__init__()
+        self.A_log = A_log
+        self.dt_bias = dt_bias
+        self.conv_weight_t = conv_weight_t
+        self.norm_weight = norm_weight
+        self.row_indices = row_indices
+        self.ssm_store_indices = ssm_store_indices
+        self.scale = float(scale)
+        self.eps = float(eps)
+        self.gate_activation = int(gate_activation)
+
+    def forward(self, conv_state, ssm_state, mixed_qkv, z, a, b):
+        return gdn_core_verify(conv_state, ssm_state, mixed_qkv, z, a, b, self.A_log, self.dt_bias,
+                               self.conv_weight_t, self.norm_weight, self.row_indices, self.ssm_store_indices,
+                               self.scale, self.eps, self.gate_activation)
 
 
 def hpu_present() -> bool:
@@ -178,17 +207,20 @@ def _make_step(op: str, base: dict[str, torch.Tensor], args: tuple[float, float,
     if op == "core":
         return CoreStep(base["A_log"], base["dt_bias"], base["conv_weight_t"], base["norm_weight"],
                         base["load_indices"], base["store_indices"], scale, eps, gate)
+    if op == "verify":
+        return VerifyStep(base["A_log"], base["dt_bias"], base["conv_weight_t"], base["norm_weight"],
+                          base["row_indices"], base["ssm_store_indices"], scale, eps, gate)
     return RecurrentStep(base["A_log"], base["dt_bias"], base["load_indices"], base["store_indices"], scale)
 
 
 def _op_states(op: str, base: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
-    if op == "core":
+    if op in ("core", "verify"):
         return {"conv_state": base["conv_state"], "ssm_state": base["ssm_state"]}
     return {"ssm_state": base["ssm_state"]}
 
 
 def _op_activations(op: str, activations: list[dict[str, torch.Tensor]]) -> list[tuple[torch.Tensor, ...]]:
-    if op == "core":
+    if op in ("core", "verify"):
         return [(d["mixed_qkv"], d["z"], d["a"], d["b"]) for d in activations]
     return [(d["qkv"], d["a"], d["b"]) for d in activations]
 
@@ -197,7 +229,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--steps", type=int, default=1000)
     parser.add_argument("--device", choices=("auto", "cpu", "hpu"), default="auto")
-    parser.add_argument("--case", default="tp8_b16", choices=sorted(CASES_BY_NAME))
+    parser.add_argument("--case", default=None, choices=sorted(CASES_BY_NAME))
     parser.add_argument("--ops", default="core,recurrent")
     ns = parser.parse_args(argv)
 
@@ -207,6 +239,20 @@ def main(argv: list[str] | None = None) -> int:
     ops = [op.strip() for op in ns.ops.split(",") if op.strip()]
     if not ops or any(op not in OPS for op in ops):
         print(f"--ops must be a comma list of {','.join(OPS)}, got {ns.ops!r}", file=sys.stderr)
+        return 2
+    if "verify" in ops and len(ops) > 1:
+        print(f"--ops verify must run alone: the verification cases run only the verify op, got {ns.ops!r}",
+              file=sys.stderr)
+        return 2
+    default_case = DEFAULT_VERIFY_CASE if ops == ["verify"] else DEFAULT_CASE
+    case = CASES_BY_NAME[ns.case if ns.case is not None else default_case]
+    if case.name.startswith("ver_") != ("verify" in ops):
+        if "verify" in ops:
+            print(f"--ops verify runs only verification cases (names starting with ver_), not --case {case.name}",
+                  file=sys.stderr)
+        else:
+            print(f"--case {case.name} is a verification case (ver_*): it runs only with --ops verify",
+                  file=sys.stderr)
         return 2
     device_str = ns.device
     if device_str == "auto":
@@ -225,9 +271,12 @@ def main(argv: list[str] | None = None) -> int:
                   "at the built files", file=sys.stderr)
             return 2
 
-    case = CASES_BY_NAME[ns.case]
-    base = {name: tensor.to(device) for name, tensor in make_inputs(case).items()}
-    args = scalars(case)
+    if case.name.startswith("ver_"):
+        base = {name: tensor.to(device) for name, tensor in make_verify_inputs(case).items()}
+        args = verify_scalars(case)
+    else:
+        base = {name: tensor.to(device) for name, tensor in make_inputs(case).items()}
+        args = scalars(case)
     activations = [{k: v.to(device) for k, v in d.items()} for d in draw_activations(base, ns.steps)]
     print(f"device={device_str} case={case.name} steps={ns.steps} ops={','.join(ops)}", flush=True)
 
