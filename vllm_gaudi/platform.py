@@ -129,7 +129,8 @@ def is_flash_next_model(model_config: Optional[ModelConfig]) -> bool:
 def _configure_recurrent_state(vllm_config: "VllmConfig") -> None:
     """Compact-GDN rule and recurrent-state-pool resolution for GDN hybrids (M1-T1)."""
     from vllm_gaudi.v1.core.recurrent_state_pool import (ENV_CACHE_SLOTS, ENV_MODE, ENV_SLOTS,
-                                                         RecurrentStatePoolMode, resolve_pool_slots)
+                                                         LIVE_SLOTS_PER_REQUEST, RecurrentStatePoolMode,
+                                                         resolve_pool_slots)
     model_config = vllm_config.model_config
     if model_config is None or not getattr(model_config, "is_hybrid", False):
         return
@@ -158,12 +159,18 @@ def _configure_recurrent_state(vllm_config: "VllmConfig") -> None:
     n_ple = len(getattr(model_config.hf_text_config, "ple_layer_ids", None) or [])
     groups = (-(-n_gdn // n_attn) if n_attn > 0 else 1) + (1 if n_ple else 0)
     cache_slots = int(os.environ.get(ENV_CACHE_SLOTS, "512"))
+    speculative_config = getattr(vllm_config, "speculative_config", None)
+    num_speculative_tokens = getattr(speculative_config, "num_speculative_tokens", None)
+    num_speculative_tokens = int(num_speculative_tokens) if num_speculative_tokens else 0
     if slots <= 0:
-        slots = resolve_pool_slots(vllm_config.scheduler_config.max_num_seqs, groups, cache_slots)
+        slots = resolve_pool_slots(vllm_config.scheduler_config.max_num_seqs, groups, cache_slots,
+                                   num_speculative_tokens)
         os.environ[ENV_SLOTS] = str(slots)
     logger.info(
-        "[HPU] Recurrent state pool: %d slots (max_num_seqs=%d, recurrent groups=%d, live slots per request=3, "
-        "cache slots=%d)", slots, vllm_config.scheduler_config.max_num_seqs, groups, cache_slots)
+        "[HPU] Recurrent state pool: %d slots (max_num_seqs=%d, recurrent groups=%d, "
+        "live slots per request=%d, speculative tokens=%d, cache slots=%d)", slots,
+        vllm_config.scheduler_config.max_num_seqs, groups, LIVE_SLOTS_PER_REQUEST, num_speculative_tokens,
+        cache_slots)
 
 
 def _enable_hpu_v1_dflash2_validation() -> None:
