@@ -691,7 +691,10 @@ ls -l "$LIB"/libgdn_fused_gaudi2.so "$LIB"/gdn_fused_ops*.so
 PYTHONPATH=$PWD python -m pytest -q -rs tests/standalone/gdn_core_decode/test_simulation.py 2>&1 | tee /tmp/3f-sim.log
 ```
 Expected: both libraries listed; the simulator test passes, not skipped (`-rs` prints any skip reason), and prints one
-`instructions executed` line per case. A build failure does not touch the rest of the install (exit code 3, "the
+`instructions executed` line per case. This step already passed before the rental for `gdn_core_decode` (3 cases and
+the disassembly check, in the tpcsim container on the Mac: `tools/flash_next/tpcsim.sh`, guide
+`docs/design/flash-next/tpcsim.md`, at track commit `9d8a0ff`). The recurrence kernel's cases join the same test
+file before the rental. Rerunning it here checks the stage 1 container's toolchain. A build failure does not touch the rest of the install (exit code 3, "the
 FlashInfer-Gaudi libraries are unaffected"): post `/tmp/3f-build.log` and skip to the next stage. A simulator mismatch:
 post `/tmp/3f-sim.log` and stop 3f.
 
@@ -741,6 +744,16 @@ vllm bench serve --backend vllm --model Qwen3.8-Flash-Next --dataset-name random
 Expected startup line on fn3f-m1 and fn3f-m2: no `GDN core decode ... is off for` warning (that warning means the layer
 fell back to the torch path; post it). Greedy files: identical to fn3f-m0 within the first sentence (as in 3b's stop rule).
 
+Slot check (once, on fn3f-m1 after its profiled run): relaunch it with `export VLLM_HPU_GDN_CORE_DECODE_DEBUG=1` added
+(container fn3f-m1d) and run 3b's greedy loop and the `C = 64` sweep point once (`OUT=/tmp/3f-fn-m1d.txt`, log
+`/tmp/3f-fn-m1d-c64.log`). Expected: no `ValueError: GDN core decode:` in the server log. That proves the runner never
+gives two requests one store slot, and never stores into a slot another request loads in the same step, which the
+kernels do not support. Debug mode copies the slot indices to the host in every layer, so do not use these times.
+
+Pool copies: each op mutates the whole SSM pool tensor it is given. In each profile trace, look in the GDN layers for
+a copy as large as the SSM pool (a `copy_` or memcpy of `[slots, value_heads, 128, 128]` fp32 per layer per step),
+which a graph mode can add around a mutating op. Post the traces either way; I check them.
+
 **Step 3f-5: decision.** Post the tables. I record on RUK-2812 which mode, if any, becomes the default. A mode is kept
 when it is faster than mode 0 at C = 16 and C = 64 and does not regress C = 1.
 
@@ -753,9 +766,11 @@ Results table (3f):
 | 3f-2 | 1, 2 | replay, recompiles | exact; 0 | | |
 | 3f-3 | 0 / 1 / 2 | 27B TPOT slope (ms per sequence) | ~0.65 / ≤ 0.12 / ≤ 0.12 | | |
 | 3f-4 | 0 / 1 / 2 | Flash-Next Mean TPOT at C = 1, 16, 64 | 1 and 2 faster than 0 at 16 and 64 | | |
+| 3f-4 | 1 + debug | slot check (fn3f-m1d) | no `ValueError` | | |
 
 Post back (3f): `/tmp/3f-build.log`, `/tmp/3f-sim.log`, `/tmp/3f-hpu-op.log`, `/tmp/3f-replay.log`, the `/tmp/3f-27b-*` and
-`/tmp/3f-fn-*` logs and greedy files, the three `/tmp/3f-prof-m*` trace folders, the filled table.
+`/tmp/3f-fn-*` logs and greedy files (including `/tmp/3f-fn-m1d*` and fn3f-m1d's server log), the three
+`/tmp/3f-prof-m*` trace folders, the filled table.
 
 ### What to post back
 - the results tables (3a, 3b's two bench tables, 3c, 3d), filled in;

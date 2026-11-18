@@ -92,6 +92,12 @@ Padding: the compact pool pads with `-1` (out of range: zeros, no writes). The n
 the dummy slot, exactly like the torch path. Tests check real rows and real slots only, plus "slots no row names are
 untouched".
 
+Measured on the CPU tiny model (CTO probe, 2026-11-17; one GDN layer, a 4-row decode step with rows `1 -> 1`, `2 -> 2`
+and two padded rows): with `-1` padding the torch path (mode 0) writes the pool's **last** row, conv and SSM state
+both, because `-1` is a valid negative index in torch; the op writes nothing for those rows and returns zeros. With
+the dummy-slot padding both paths write the dummy slot the same way. The real rows match within 6e-8 (out) and 1e-9
+(SSM), and conv state is bit-exact. So tests never compare the pool's last row, or the dummy slot, across modes.
+
 ## Measured tolerances (CPU probe, 2026-11-17, seed 0, B = 4 with one -1 padded row, load != store on two rows)
 
 | Head counts (H/HV, D = 128) | fp32 inputs: out / ssm / conv vs composed path | bf16 inputs: out / ssm vs composed path (|out| max ~6) |
@@ -179,11 +185,53 @@ Preconditions: as for `gdn_core_decode`, minus the conv-state ones. HPU only: `D
 
 `VLLM_HPU_GDN_CORE_DECODE_DEBUG` is `GdnCoreDecodeDebug(IntEnum)`: `OFF = 0`, `CHECK = 1`, default 0. With `CHECK`,
 the layer calls `check_gdn_core_decode_indices(load_indices, store_indices, num_slots, num_rows)` (in
-`flashinfer_gaudi/gdn_core_decode.py`) before either op. `num_rows` is the layer's `num_decodes`, the rows that are
-real requests. The check copies the indices to the CPU, once per layer per step. It raises `ValueError` when either
+`flashinfer_gaudi/gdn_core_decode.py`) before either op. `num_rows` is the number of real request rows:
+`int(query_start_loc[-1])` (the decode metadata's `query_start_loc_p`), or `num_tokens` when that is `None`. It is
+**not** the layer's `num_decodes`: the runner pads `query_start_loc` with zero-length rows up to the padded batch
+(`hpu_model_runner.py:4715`, `num_tokens_per_req + [0] * (padded_batch_size - num_decodes)`), so `num_decodes`
+counts the padding rows too. Every real decode row is one token, and the padding rows come last. The check copies
+the indices to the CPU, once per layer per step. It raises `ValueError` when either
 of these holds among the real rows (index `< num_rows`) whose two slots are both in `[0, S)`:
 1. two rows have the same store slot;
 2. one row's store slot is another row's load slot (a reordered cache).
 
 Rows from `num_rows` on are padding and are ignored: the non-compact runner points them all at one real dummy slot
 (`_MAMBA_PAD_BLOCK_ID`), which would otherwise fail check 1. With `OFF` there is no check and no host sync.
+
+## Layer wiring (version 3, 2026-11-17)
+
+`HPUGatedDeltaNetAttention` (`vllm_gaudi/models/qwen3_5.py`) reads `VLLM_HPU_GDN_CORE_DECODE` once, in `__init__`,
+into `self.gdn_core_decode_mode`, and `VLLM_HPU_GDN_CORE_DECODE_DEBUG` into `self.gdn_core_decode_debug`.
+
+A decode step uses an op only when all of these hold (the shared per-step gate `_gdn_core_decode_ready`):
+1. the mode is `FUSED` or `RECURRENCE`;
+2. the step is not speculative (`num_accepted_tokens is None`) and the layer does not defer its SSM write-back;
+3. the load and store indices are 1-D, with `num_tokens` rows each;
+4. the once-per-layer precondition check passed. It runs on the first step that reaches it. On a failure it logs
+   `GDN core decode (VLLM_HPU_GDN_CORE_DECODE=<n>) is off for <layer>: <reason>; using the torch decode path` once,
+   and the layer stays on the torch path.
+
+| Precondition | `FUSED` | `RECURRENCE` |
+|---|---|---|
+| output gate is `silu` or `sigmoid` | checked | not checked (`self.norm` stays) |
+| no conv bias, conv width 4, conv pool `[S, 3, C]` | checked | not checked (the torch conv stays) |
+| `head_k_dim == head_v_dim`, fp32 SSM pool, not Triton strict mode | checked | checked |
+| on HPU: `head_v_dim == 128` and the `gdn_fused_ops` extension loaded | checked | checked |
+| a kernel for the device | `gdn_core_decode_available` | `gdn_recurrent_decode_available` |
+
+Both ops get the full pools (`self.kv_cache[0]`, `self.kv_cache[1]`) and absolute slot indices as int32, in every
+runner mode. The runner turns on direct GDN state only when every row's slot already is its positional slot and the
+padding is `-1` (`_can_use_direct_gdn_state`), so absolute indexing gives the same rows.
+
+- **`FUSED`**: `_maybe_gdn_core_decode` calls `gdn_core_decode` before Part 2. Part 2c takes its output, and Part 3
+  skips `self.norm`.
+- **`RECURRENCE`**: Part 2b runs as in mode 0 up to and including the torch conv update (`hpu_causal_conv1d_update`),
+  but skips the fork's fused conv-and-recurrence step (`maybe_run_gdn_fused_decode_step`) and the torch gates
+  (`hpu_fused_gdn_gating`), because the op computes the gates itself. Then
+  `gdn_recurrent_decode(self.kv_cache[1], mixed_qkv_conv, a, b, A_log, dt_bias, load, store, scale)` replaces
+  `maybe_run_gdn_decode_packed` and `hpu_fused_recurrent_gated_delta_rule`, and Part 3 runs `self.norm` as in mode 0.
+  A step whose SSM pool is the bound active view (`state_is_active_view`) still runs the op on the full pool, as
+  `FUSED` does.
+- **Debug check**: with `CHECK`, `check_gdn_core_decode_indices` runs before any state is mutated. For `FUSED` it runs
+  inside `_maybe_gdn_core_decode`, before the op. For `RECURRENCE` it runs in `forward` right after the gate, before
+  Part 2.
