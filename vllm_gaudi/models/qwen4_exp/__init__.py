@@ -50,6 +50,9 @@ class _MtpTargetOutputs:
                 intermediate_tensors: IntermediateTensors | None = None,
                 inputs_embeds: torch.Tensor | None = None,
                 **kwargs: object) -> torch.Tensor | IntermediateTensors:
+        # The runner schedules [-1] for an empty n-gram draft (always rejected); id 0 keeps ids in embedding range.
+        if input_ids is not None:
+            input_ids = input_ids.clamp(min=0)
         hidden = super().forward(input_ids, positions, intermediate_tensors, inputs_embeds, **kwargs)
         if self._hpu_mtp_outputs and isinstance(hidden, torch.Tensor):
             return hidden, [mtp_aux_hidden(hidden, self.get_mtp_target_hidden_states())]
