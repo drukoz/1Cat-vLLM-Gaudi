@@ -5043,9 +5043,12 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                     load_state_indices_cpu = torch.stack(load_rows, dim=0)
                     store_state_indices_cpu = torch.stack(store_rows, dim=0)
                     lattice_store_differs = not torch.equal(load_state_indices_cpu, store_state_indices_cpu)
-                    if lattice_store_differs:
-                        recurrent_boundary = (load_state_indices_cpu, store_state_indices_cpu,
-                                              list(context_lens)[:num_decodes], num_decodes, mamba_block_size)
+                    # Boundary commits are gated on prefix caching + a completed pair,
+                    # not on a load/store lattice inequality: a t >= 1 completion lands
+                    # on a step where every context is unaligned (flag False). The pair
+                    # scan in boundary_commits is the only cost when nothing completes.
+                    recurrent_boundary = (load_state_indices_cpu, store_state_indices_cpu,
+                                          list(context_lens)[:num_decodes], num_decodes, mamba_block_size)
             else:
                 zeros = [0] * len(req_indices)
                 load_state_indices_cpu = self.prepare_mamba_state_idxs(

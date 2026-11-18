@@ -557,3 +557,85 @@ def test_align_lattice_step_with_boundary_commit(tiny_checkpoint):
         assert worst <= FP32_TOL, f"committed align state diverges from the straight chain: {worst:.3e}"
     finally:
         ctx.__exit__(None, None, None)
+
+
+def test_non_aligned_boundary_commit_with_equal_lattices(tiny_checkpoint):
+    """Runner-gate regression: a t >= 1 completion on a step whose load == store lattices.
+
+    Prompt 33, block_size 2, K=3: the verification runs right after the prefill with
+    context_len 33 (unaligned), and the tampered ``d_3`` leaves ``accepted = 3``, so token
+    ``t = 2`` completes a position block. The load and store lattices are equal, so the
+    runner's ``lattice_store_differs`` flag is False and the kernels write every state
+    into the shared lattice; only the boundary-commit payload (set unconditionally under
+    prefix caching, review item 1) moves token 2's checkpoint into the completed block's
+    slot. That slot must equal the interleaved straight chain's state - the case the
+    flag-gated runner dropped (the align variant above is aligned at every step).
+    """
+    prompt = _load_prompt(tiny_checkpoint, 33)
+    ids, gen = list(prompt["prompt_ids"]), list(prompt["generated_ids"])
+    ctx, model, draft, vllm_config, eos, atts, draft_atts, gdn, ple = _dense_context(tiny_checkpoint)
+    block_slot = 7
+    try:
+        out = _target_prefill(model, vllm_config, eos, ids, SPEC_SLOT, atts)
+        logits = fp32_logits(model, out[0])
+        t0 = int(logits[-1].argmax())
+        assert t0 == gen[0], f"prefill pick {t0} != reference {gen[0]}"
+        seq = list(ids) + [t0]
+        p_last = len(seq) - 1  # 33: the first sampled token, row 0 (33 tokens computed)
+        multi = out[1][0].view(-1, out[1][0].shape[-1])[len(ids) - 1]
+        _target_prefill(model, vllm_config, eos, ids, STRAIGHT_SLOT, atts, reset=False)
+
+        _draft_tokens(draft, vllm_config, eos, seq[max(p_last - 2, 0):p_last + 1], p_last, draft_atts, multi, K)
+        drafts = [gen[1], gen[2], TAMPER]  # tampered d_3: the step accepts exactly two drafts
+        rows = [seq[p_last]] + drafts
+        for att in atts:
+            att.slot = SPEC_SLOT
+        md = _spec_metadata(p_last, 1)  # load == store == [[1, 2, 3, 4]]: the flag stays False
+        assert torch.equal(md.load_indices_tensor, md.store_indices_tensor)
+        with torch.no_grad(), set_forward_context(md, vllm_config):
+            hidden, _aux = model(input_ids=torch.tensor(rows),
+                                 positions=torch.arange(p_last, p_last + T),
+                                 **ple_kwargs(T, eos, context=(seq[p_last - 2], seq[p_last - 1])))
+        verify_logits = fp32_logits(model, hidden)
+        argmax = verify_logits.argmax(dim=-1).tolist()
+        a = 0
+        while a < K and argmax[a] == drafts[a]:
+            a += 1
+        assert a == 2, f"expected exactly two accepted drafts, got a={a}"
+        bonus = argmax[a]
+        assert bonus == gen[3], f"bonus {bonus} != reference token {gen[3]}"
+        for att in atts:
+            k, v = att.cache[SPEC_SLOT]
+            att.cache[SPEC_SLOT] = (k[:p_last + a + 1], v[:p_last + a + 1])
+        seq = list(seq[:p_last + 1]) + drafts[:a] + [bonus]
+        assert seq[len(ids):] == gen[:len(seq) - len(ids)], "the non-aligned step stream is not the reference prefix"
+
+        # Straight decodes of the committed input rows (gen[0] .. gen[2]) at slot 5.
+        _straight_decode(model, vllm_config, eos, seq, p_last, p_last + a + 1, atts)
+
+        # Boundary commits, block_size 2: context_len 33 is unaligned and t = 2 completes a block.
+        ctx_len = p_last  # 33 computed tokens (the prompt); row 0 = the first sampled token
+        assert ctx_len % 2 == 1
+        block_rows = [[SPEC_SLOT] * 17 + [block_slot]]
+        pairs = boundary_commits([ctx_len], [a + 1], 2, md.store_indices_tensor[0], block_rows,
+                                 md.load_indices_tensor[0])
+        assert [(i, t, s, d) for (i, t, s, d) in pairs] == [(0, 2, LATTICE[2], block_slot)]
+        conv_pairs = [(i, t, int(md.store_indices_tensor[0][0][0]), d) for (i, t, _s, d) in pairs]
+        ts = [t for (_i, t, _s, _d) in pairs]
+        for m in gdn:
+            commit_ssm(m.kv_cache[1], pairs)
+            commit_conv(m.kv_cache[0], conv_pairs, GDN_WINDOW, t_per_pair=ts)
+        for m in ple:
+            commit_conv(m.kv_cache[0], conv_pairs, PLE_WINDOW, t_per_pair=ts)
+
+        ssm_gap = max(float((m.kv_cache[1][block_slot] - m.kv_cache[1][STRAIGHT_SLOT]).abs().max()) for m in gdn)
+        conv_gap = max(float((m.kv_cache[0][block_slot, 0:GDN_WINDOW] - m.kv_cache[0][STRAIGHT_SLOT, 0:GDN_WINDOW]
+                              ).abs().max()) for m in gdn)
+        ple_gap = max(float((m.kv_cache[0][block_slot, 0:PLE_WINDOW] - m.kv_cache[0][STRAIGHT_SLOT, 0:PLE_WINDOW]
+                             ).abs().max()) for m in ple)
+        worst = max(ssm_gap, conv_gap, ple_gap)
+        print(f"non-aligned boundary commit (flag False): a={a}, pairs {pairs}, gaps ssm={ssm_gap:.3e} "
+              f"conv={conv_gap:.3e} ple={ple_gap:.3e}")
+        assert worst <= FP32_TOL, f"flag-False boundary commit diverges from the straight chain: {worst:.3e}"
+    finally:
+        ctx.__exit__(None, None, None)
