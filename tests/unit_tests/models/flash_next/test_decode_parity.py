@@ -12,6 +12,9 @@ parity checks would catch a decode path that drops state. Based on the CTO probe
 ``spikes/flash-next-parity/decode_probe.py``.
 
 One ``cpu_model`` per test function, never nested; logits only from ``fp32_logits``.
+
+Every test runs twice: on the torch GDN decode path (``VLLM_HPU_GDN_CORE_DECODE=0``) and through
+the fused op (``1``, the default), and asserts which path ran.
 """
 
 import json
@@ -22,10 +25,14 @@ os.environ["TMPDIR"] = "/tmp"
 
 from types import SimpleNamespace  # noqa: E402
 
+import pytest  # noqa: E402
 import torch  # noqa: E402
 import torch.nn.functional as F  # noqa: E402
 
 from vllm.forward_context import set_forward_context  # noqa: E402
+
+from flashinfer_gaudi.gdn_core_decode import GdnCoreDecodeMode  # noqa: E402
+import vllm_gaudi.models.qwen3_5 as qwen3_5  # noqa: E402
 
 from vllm_gaudi.models.qwen4_exp.qsa import HpuQwen4ExpQSAAttention  # noqa: E402
 
@@ -36,6 +43,26 @@ FP32_DECODE_VS_PREFILL_TOL = 1e-5
 BF16_DECODE_VS_PREFILL_TOL = 3e-2
 LOST_STATE_MIN_GAP = 0.1
 INTERLEAVE_TOL = 1e-6
+
+
+@pytest.fixture(autouse=True, params=[GdnCoreDecodeMode.OFF, GdnCoreDecodeMode.FUSED], ids=["gdn_off", "gdn_fused"])
+def gdn_decode_path(request, monkeypatch):
+    """Run each test on the torch GDN decode path and on gdn_core_decode, and check which one ran."""
+    mode = request.param
+    monkeypatch.setenv("VLLM_HPU_GDN_CORE_DECODE", str(int(mode)))
+    real = qwen3_5.gdn_core_decode
+    calls = []
+
+    def counting(*args, **kwargs):
+        calls.append(1)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(qwen3_5, "gdn_core_decode", counting)
+    yield mode
+    if mode == GdnCoreDecodeMode.FUSED:
+        assert calls, "mode FUSED never called gdn_core_decode: the test did not exercise the fused path"
+    else:
+        assert not calls, f"mode OFF called gdn_core_decode {len(calls)} times"
 
 
 class CachedSdpaAttention(torch.nn.Module):
