@@ -30,6 +30,10 @@ NO_PULL=0
 REINSTALL_DRIVER=0
 FORCE=0
 DRY_RUN=0
+ORIG_ARGS=("$@")  # kept for the sudo re-exec; the option loop below consumes "$@"
+
+# Ubuntu 22.04 apt runs needrestart, whose dialog would hang unseen (output goes to the step logs).
+export DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a
 
 usage() {
     echo "usage: $(basename "${BASH_SOURCE[0]}") [options]"
@@ -131,7 +135,7 @@ step_failed() {
 run_logged() {
     {
         printf '\n$ %s\n' "$*"
-        bash -c "$*"
+        bash -c "$*" </dev/null  # no tty: a prompt fails instead of hanging
     } >>"$STEP_LOG" 2>&1
 }
 
@@ -202,7 +206,7 @@ dry_run() {
 step1_checks() {
     if [ "$(id -u)" -ne 0 ]; then
         if command -v sudo >/dev/null 2>&1; then
-            exec sudo bash "$0" "$@"
+            exec sudo bash "$0" ${ORIG_ARGS[@]+"${ORIG_ARGS[@]}"}
         fi
         echo "error: run as root: sudo bash $0 $*" >&2
         exit 1
@@ -466,7 +470,7 @@ main() {
         dry_run
         exit 0
     fi
-    step1_checks "$@"
+    step1_checks
     step2_apt
     step3_driver
     step4_verify_driver

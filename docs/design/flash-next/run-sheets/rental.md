@@ -61,7 +61,7 @@ things `run_rental.sh` needs, pinned to the image's release **1.24.1, build 482*
 Run it once per node, as root, from the unpacked bundle (15–30 min, including the image pull):
 
 ```bash
-tar xzf ~/flash-next-rental-*.tar.gz -C ~/rental && cd ~/rental
+mkdir -p ~/rental && tar xzf ~/flash-next-rental-*.tar.gz -C ~/rental && cd ~/rental
 sudo bash prepare_host.sh
 ```
 
