@@ -104,6 +104,13 @@ def build_gdn_fused(repository_root: Path, build_root: Path, output_dir: Path) -
     return matches[0]
 
 
+def _remove_gdn_fused_outputs(output_dir: Path) -> None:
+    """Delete both fused GDN libraries from output_dir, so a failed build leaves neither half behind."""
+    for path in [output_dir / "libgdn_fused_gaudi2.so", *sorted(output_dir.glob("gdn_fused_ops*.so"))]:
+        if path.is_file():
+            path.unlink()
+
+
 def main() -> None:
     repository_root = Path(__file__).resolve().parents[1]
     parser = argparse.ArgumentParser()
@@ -142,7 +149,10 @@ def main() -> None:
             build_gdn_fused(repository_root, build_root, output_dir)
         except (subprocess.CalledProcessError, FileNotFoundError) as exc:
             print(f"GDN fused build failed (the FlashInfer-Gaudi libraries are unaffected): {exc}", file=sys.stderr)
-            sys.exit(3)
+            _remove_gdn_fused_outputs(output_dir)
+            if args.gdn_fused_only:
+                sys.exit(3)
+            print("Continuing without libgdn_fused_gaudi2.so: GDN decode will run the torch path.", file=sys.stderr)
 
 
 if __name__ == "__main__":
