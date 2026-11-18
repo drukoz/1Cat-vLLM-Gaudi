@@ -721,7 +721,8 @@ Then stage 2a's "Send the prompts and compare" block (`CKPT=/models/tiny-flash-n
 16 tokens out), saving the printed lines:
 
 ```bash
-<the stage 2a compare block> | tee /tmp/3e-tiny-mtp.txt   # six prompts, from reference.json
+# paste stage 2a's block unchanged except its first line, which becomes:
+CKPT=/models/tiny-flash-next python - <<'EOF' | tee /tmp/3e-tiny-mtp.txt   # six prompts, from reference.json
 ```
 
 Pass: every prompt's match count and first differing position equal the MTP-off lines in `/tmp/3a-tiny-sparse.txt`
