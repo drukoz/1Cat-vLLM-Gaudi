@@ -114,7 +114,8 @@ def test_from_b_runs_only_b_and_c(tmp_path, capsys):
     assert a_status.stat().st_mtime_ns == mtime
 
     manifest = read_json(tmp_path / "results" / "rf" / "manifest.json")
-    assert [v["id"] for v in manifest["variants"]] == ["B", "C"]
+    assert [v["id"] for v in manifest["variants"]] == ["A", "B", "C"]
+    assert manifest["phases"] == ["B", "C", "report"]
     c = read_json(tmp_path / "results" / "rf" / "C" / "status.json")
     assert c["status"] == int(GateStatus.PASSED), c
     assert "--speculative-config" in json.dumps(c["servers"])
@@ -144,6 +145,58 @@ def test_dry_run_prints_commands_and_starts_nothing(tmp_path, capsys):
     assert out.count("vllm serve") == 4
     assert "--speculative-config" in out
     assert not results.exists()
+
+
+def test_run_load_raises_leaves_complete_run(tmp_path, capsys, monkeypatch):
+    model = make_model(tmp_path)
+
+    def boom(*args, **kwargs):
+        raise ConnectionResetError("stub connection reset")
+
+    monkeypatch.setattr(rental_main.agent_load, "run_load", boom)
+    rc = run_stub(tmp_path, model, "rboom", "--variants", "A")
+    out = capsys.readouterr().out
+    assert rc == 1
+    assert out.splitlines()[-1] == "RUN rboom: FAILED at A"
+    run = tmp_path / "results" / "rboom"
+    assert (run / "summary.md").is_file()
+    assert (run / "summary.json").is_file()
+    status = read_json(run / "A" / "status.json")
+    assert status["status"] == int(GateStatus.FAILED)
+    assert "ConnectionResetError" in status["reason"]
+
+
+def test_from_c_summary_keeps_all_variants(tmp_path, capsys):
+    model = make_model(tmp_path)
+    assert run_stub(tmp_path, model, "rsum", "--variants", "A,B,C") == 0
+    capsys.readouterr()
+    rc = run_stub(tmp_path, model, "rsum", "--from", "C", "--variants", "A,B,C")
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert out.splitlines()[-1] == "RUN rsum: PASSED"
+    run = tmp_path / "results" / "rsum"
+    summary = read_json(run / "summary.json")
+    assert sorted(summary["variants"]) == ["A", "B", "C"]
+    manifest = read_json(run / "manifest.json")
+    assert [v["id"] for v in manifest["variants"]] == ["A", "B", "C"]
+    assert manifest["phases"] == ["C", "report"]
+
+
+def test_from_without_run_id_is_an_error(tmp_path, capsys):
+    model = make_model(tmp_path)
+    rc = rental_main.main([
+        "--mode",
+        "stub",
+        "--model",
+        str(model),
+        "--results",
+        str(tmp_path / "results"),
+        "--from",
+        "C",
+    ] + STUB_ARGS)
+    out = capsys.readouterr().out
+    assert rc == 2
+    assert "--run-id" in out
 
 
 def test_server_env_gdn_wins():

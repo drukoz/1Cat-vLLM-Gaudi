@@ -12,6 +12,7 @@ import shlex
 import subprocess
 import sys
 import time
+import traceback
 from pathlib import Path
 
 from tools.flash_next.rental import agent_load, gates, report, schema, serve, workload
@@ -146,7 +147,7 @@ class Runner:
             raise ValueError("unknown variant ids: %s" % ", ".join(unknown))
         self.selected = [by_id[t] for t in ids]
         self.from_phase = args.from_phase
-        if self.from_phase and not self.run_id:
+        if self.from_phase and not args.run_id:
             raise ValueError("--from requires --run-id")
         self.gdn_env = {}
         self.gdn_mode = None
@@ -159,10 +160,6 @@ class Runner:
         self.hl_smi_q = ""
         self.bundle_commit = None
         self.workload_info = None
-
-    def selected_to_run(self) -> list:
-        rest = self.phases()[self.start_index:]
-        return [self.variant_by_id(n) for kind, n in rest if kind == "variant"]
 
     def variant_by_id(self, vid: str):
         for v in self.variants:
@@ -219,7 +216,7 @@ class Runner:
             print("RUN %s: FAILED at %s" % (self.run_id, self.stopped_at))
             return 1
         for v in self.selected:
-            if v.get("optional") or v["id"] not in self.ran_variant_ids:
+            if v.get("optional"):
                 continue
             if self.variant_status(v["id"]) != int(GateStatus.PASSED):
                 self.stopped_at = v["id"]
@@ -247,17 +244,21 @@ class Runner:
     def run_gate(self, name: str) -> bool:
         phase_dir = self.run_dir / name
         t0 = time.time()
-        if name == "preflight":
-            status, details = self.gate_preflight()
-        elif name == "build":
-            if self.stub:
-                status, details = GateStatus.SKIPPED, {"reason": "stub mode"}
+        try:
+            if name == "preflight":
+                status, details = self.gate_preflight()
+            elif name == "build":
+                if self.stub:
+                    status, details = GateStatus.SKIPPED, {"reason": "stub mode"}
+                else:
+                    status, details = gates.build_check()
+            elif name == "fused_gdn":
+                status, details = self.gate_fused_gdn(phase_dir)
             else:
-                status, details = gates.build_check()
-        elif name == "fused_gdn":
-            status, details = self.gate_fused_gdn(phase_dir)
-        else:
-            status, details = self.gate_tiny(phase_dir)
+                status, details = self.gate_tiny(phase_dir)
+        except Exception as exc:  # noqa: BLE001
+            status = GateStatus.FAILED
+            details = {"reason": "%s: %s" % (type(exc).__name__, exc)}
         seconds = time.time() - t0
         reason = details.get("reason") or details.get("error")
         write_status(phase_dir, name, status, reason, seconds)
@@ -283,7 +284,15 @@ class Runner:
             status = GateStatus.SKIPPED
             details = {"mode": None, "env": {}, "reason": "stub mode"}
         else:
-            status, details = gates.fused_gdn(repo_root(), phase_dir, sys.executable)
+            try:
+                status, details = gates.fused_gdn(repo_root(), phase_dir, sys.executable)
+            except Exception as exc:  # noqa: BLE001
+                status = GateStatus.FAILED
+                details = {
+                    "mode": 0,
+                    "env": {"VLLM_HPU_GDN_CORE_DECODE": "0"},
+                    "reason": "%s: %s" % (type(exc).__name__, exc),
+                }
         self.gdn_env = dict(details.get("env") or {})
         self.gdn_mode = details.get("mode")
         self.gdn_reason = details.get("reason")
@@ -363,44 +372,48 @@ class Runner:
                 proc = serve.start_server(cmd, env, vdir / ("server%d.log" % k), vdir)
                 procs.append(proc)
                 self.active.append(("server", proc))
-            for k, srv in enumerate(servers):
-                if not serve.wait_healthy(int(srv["port"]), SERVER_HEALTH_TIMEOUT_S, procs[k]):
-                    failures.append(
-                        (GateStatus.TIMED_OUT, "server %d not healthy within %d s" % (k, int(SERVER_HEALTH_TIMEOUT_S))))
-                    break
-            if not failures:
-                startup = self._startup_records(servers, vdir, time.time() - t0)
-                write_json(vdir / STARTUP_FILE, startup)
+            try:
                 for k, srv in enumerate(servers):
-                    cap, cap_det = gates.capacity(startup[k], int(srv["agents"]))
-                    if cap != GateStatus.PASSED:
-                        reason = cap_det.get("reason") or cap_det.get("error") or "capacity failed"
-                        failures.append((GateStatus.FAILED, "server %d capacity: %s" % (k, reason)))
-            w = self.ensure_workload(urls[0])
-            if vid == "A" and not failures:
-                coh_status, coh_reason = self.run_coherence(urls[0], w)
-                if coh_status == GateStatus.FAILED:
-                    failures.append((GateStatus.FAILED, "coherence: %s" % coh_reason))
-            if not failures:
-                monitor = self.start_monitor(urls, vdir)
-                try:
-                    stagger = STUB_STAGGER_S if self.stub else LOAD_STAGGER_S
-                    non_ok = asyncio.run(
-                        agent_load.run_load(w,
-                                            urls,
-                                            self.served_name,
-                                            vdir / REQUESTS_FILE,
-                                            stagger_s=stagger,
-                                            timeout_s=LOAD_TIMEOUT_S,
-                                            request_timeout_s=LOAD_REQUEST_TIMEOUT_S))
-                finally:
-                    self.stop_monitor(monitor)
-                if non_ok:
-                    failures.append((GateStatus.FAILED, "load: %d non-OK rows" % non_ok))
-                required = min(sum(int(s["agents"]) for s in servers), len(w.get("agents") or []))
-                observed = max_running_sum(vdir / METRICS_FILE)
-                if observed + 1e-9 < required:
-                    failures.append((GateStatus.FAILED, "running never reached %d (max %g)" % (required, observed)))
+                    if not serve.wait_healthy(int(srv["port"]), SERVER_HEALTH_TIMEOUT_S, procs[k]):
+                        failures.append((GateStatus.TIMED_OUT,
+                                         "server %d not healthy within %d s" % (k, int(SERVER_HEALTH_TIMEOUT_S))))
+                        break
+                if not failures:
+                    startup = self._startup_records(servers, vdir, time.time() - t0)
+                    write_json(vdir / STARTUP_FILE, startup)
+                    for k, srv in enumerate(servers):
+                        cap, cap_det = gates.capacity(startup[k], int(srv["agents"]))
+                        if cap != GateStatus.PASSED:
+                            reason = cap_det.get("reason") or cap_det.get("error") or "capacity failed"
+                            failures.append((GateStatus.FAILED, "server %d capacity: %s" % (k, reason)))
+                if not failures:
+                    w = self.ensure_workload(urls[0])
+                    if vid == "A":
+                        coh_status, coh_reason = self.run_coherence(urls[0], w)
+                        if coh_status == GateStatus.FAILED:
+                            failures.append((GateStatus.FAILED, "coherence: %s" % coh_reason))
+                if not failures:
+                    monitor = self.start_monitor(urls, vdir)
+                    try:
+                        stagger = STUB_STAGGER_S if self.stub else LOAD_STAGGER_S
+                        non_ok = asyncio.run(
+                            agent_load.run_load(w,
+                                                urls,
+                                                self.served_name,
+                                                vdir / REQUESTS_FILE,
+                                                stagger_s=stagger,
+                                                timeout_s=LOAD_TIMEOUT_S,
+                                                request_timeout_s=LOAD_REQUEST_TIMEOUT_S))
+                    finally:
+                        self.stop_monitor(monitor)
+                    if non_ok:
+                        failures.append((GateStatus.FAILED, "load: %d non-OK rows" % non_ok))
+                    required = min(sum(int(s["agents"]) for s in servers), len(w.get("agents") or []))
+                    observed = max_running_sum(vdir / METRICS_FILE)
+                    if observed + 1e-9 < required:
+                        failures.append((GateStatus.FAILED, "running never reached %d (max %g)" % (required, observed)))
+            except Exception as exc:  # noqa: BLE001
+                failures.append((GateStatus.FAILED, "%s: %s" % (type(exc).__name__, exc)))
             self.write_gdn_fallback(vdir, servers)
             status = GateStatus.PASSED if not failures else failures[0][0]
             reason = failures[0][1] if failures else None
@@ -550,7 +563,7 @@ class Runner:
 
     def run_report(self) -> None:
         report.main([str(self.run_dir)])
-        lines = gdn_summary_lines(self.run_dir, self.ran_variant_ids)
+        lines = gdn_summary_lines(self.run_dir, [v["id"] for v in self.selected])
         summary = self.run_dir / "summary.md"
         with open(summary, "a", encoding="utf-8") as fh:
             for ln in lines:
@@ -581,7 +594,7 @@ class Runner:
             "python": sys.version,
             "env": {k: v for k, v in os.environ.items() if k.startswith(ENV_PREFIXES)},
             "hl_smi_q": self.hl_smi_q,
-            "variants": self.selected_to_run(),
+            "variants": self.selected,
             "phases": [n for _, n in self.phases()[self.start_index:]],
         })
         manifest["gdn_core_decode_mode"] = self.gdn_mode
@@ -709,6 +722,13 @@ def main(argv=None) -> int:
         if runner.stopped_at is None:
             runner.stopped_at = runner.current_phase
         rc = runner.finish()
+    except Exception:  # noqa: BLE001
+        traceback.print_exc()
+        if runner.stopped_at is None:
+            runner.stopped_at = runner.current_phase
+        rc = runner.finish()
+        if rc == 0:
+            rc = 1
     finally:
         runner.teardown()
     return rc
