@@ -104,7 +104,10 @@ if [ "$SKIP_INSTALL" -eq 0 ]; then
         echo "WARNING: tpc-clang not found; building without the fused GDN kernel" \
             "(VLLM_GAUDI_BUILD_GDN_FUSED=0). The plugin runs the PyTorch GDN path." >&2
     fi
+    # The bundle's vllm/ is a git archive (no .git), so setuptools_scm cannot find a version and
+    # the install fails; pin the version G1 checks (vLLM's own override hook in its setup.py).
     install_step 1 "vllm (engine pin)" env VLLM_TARGET_DEVICE=empty \
+        VLLM_VERSION_OVERRIDE=0.28.1rc1.dev392+g8f816a3f6 \
         pip install --no-build-isolation /bundle/vllm
     install_step 2 "plugin (vllm-gaudi)" env VLLM_TARGET_DEVICE=hpu \
         VLLM_GAUDI_BUILD_FLASHINFER=1 VLLM_GAUDI_BUILD_GDN_FUSED="$GDN_FUSED" \

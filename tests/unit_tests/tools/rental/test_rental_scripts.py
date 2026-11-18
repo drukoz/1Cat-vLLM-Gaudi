@@ -28,6 +28,12 @@ def test_bash_syntax(name):
     assert proc.returncode == 0, proc.stderr
 
 
+def test_vllm_install_pins_version():
+    # vllm/ in the bundle has no .git: without the override setuptools_scm fails the install.
+    text = (SCRIPTS_DIR / "container_entry.sh").read_text()
+    assert "VLLM_VERSION_OVERRIDE=0.28.1rc1.dev392+g8f816a3f6" in text
+
+
 def test_run_rental_dry_run(tmp_path):
     proc = subprocess.run(
         ["bash", str(SCRIPTS_DIR / "run_rental.sh"), "--dry-run", "--model", "/tmp/x"],
