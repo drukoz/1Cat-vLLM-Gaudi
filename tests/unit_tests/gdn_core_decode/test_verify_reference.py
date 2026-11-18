@@ -1,17 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
-"""CPU tests for flashinfer_gaudi.gdn_core_verify.gdn_core_verify_reference.
+"""CPU tests for flashinfer_gaudi.gdn_core_verify.gdn_core_verify_tree_reference.
 
-Phase 2 contract (``docs/design/flash-next/gdn-core-decode.md``): ``T`` draft nodes per row, node ``t``'s input
-state is node ``parent_idx[r, t]``'s output state.  The chain, tree, padding and unstored-node cases compare the
-verify reference with sequential ``gdn_core_decode_reference`` paths; comparisons use ``torch.equal``, since both
-sides run the same per-node ops in the same order.
+Phase 2 contract version 1, draft trees (``docs/design/flash-next/gdn-core-decode.md``): ``T`` draft nodes per
+row, node ``t``'s input state is node ``parent_idx[r, t]``'s output state.  The chain, tree, padding and
+unstored-node cases compare the tree reference with sequential ``gdn_core_decode_reference`` paths; comparisons
+use ``torch.equal``, since both sides run the same per-node ops in the same order.
 """
 
 import pytest
 import torch
 
 from flashinfer_gaudi.gdn_core_decode import GdnGateActivation, gdn_core_decode_reference
-from flashinfer_gaudi.gdn_core_verify import gdn_core_verify_reference
+from flashinfer_gaudi.gdn_core_verify import gdn_core_verify_tree_reference
 
 HEAD_COUNTS = [(16, 48), (8, 24), (4, 12), (2, 6)]
 GATE = GdnGateActivation.SIGMOID
@@ -38,7 +38,7 @@ def _make_inputs(H, HV, D, T, S, B=3, seed=0):
         "dt_bias": torch.randn(HV).float(),
         "conv_weight_t": bf(4, C) * 0.5,
         "norm_weight": bf(D) * 0.1 + 1,
-        "scale": D ** -0.5,
+        "scale": D**-0.5,
         "eps": 1e-6,
         "parent_idx": torch.full((B, T), -1, dtype=torch.int32),
         "load_indices": torch.full((B, ), -1, dtype=torch.int32),
@@ -47,7 +47,7 @@ def _make_inputs(H, HV, D, T, S, B=3, seed=0):
 
 
 def _verify_args(inp, conv=None, ssm=None, parent=None, load=None, store=None):
-    """Positional args for gdn_core_verify_reference; conv/ssm default to the input pools (mutated)."""
+    """Positional args for gdn_core_verify_tree_reference; conv/ssm default to the input pools (mutated)."""
     return [
         inp["conv_state"] if conv is None else conv,
         inp["ssm_state"] if ssm is None else ssm,
@@ -79,9 +79,10 @@ def _path_reference_row(inp, row, nodes, stores):
         store = torch.tensor([stores[k]], dtype=torch.int32)
         outs.append(
             gdn_core_decode_reference(conv, ssm, inp["mixed_qkv"][row:row + 1, t], inp["z"][row:row + 1, t],
-                                      inp["a"][row:row + 1, t], inp["b"][row:row + 1, t], inp["A_log"],
-                                      inp["dt_bias"], inp["conv_weight_t"], inp["norm_weight"], load, store,
-                                      inp["scale"], inp["eps"], GATE))
+                                      inp["a"][row:row + 1,
+                                               t], inp["b"][row:row + 1,
+                                                            t], inp["A_log"], inp["dt_bias"], inp["conv_weight_t"],
+                                      inp["norm_weight"], load, store, inp["scale"], inp["eps"], GATE))
         load = store
     return torch.cat(outs, dim=0), conv, ssm
 
@@ -95,13 +96,14 @@ def test_t1_equals_decode_reference(H, HV):
     inp["store_indices"] = torch.tensor([[2], [6], [7]], dtype=torch.int32)
 
     conv_v, ssm_v = inp["conv_state"].clone(), inp["ssm_state"].clone()
-    out_v = gdn_core_verify_reference(*_verify_args(inp, conv=conv_v, ssm=ssm_v))
+    out_v = gdn_core_verify_tree_reference(*_verify_args(inp, conv=conv_v, ssm=ssm_v))
 
     conv_d, ssm_d = inp["conv_state"].clone(), inp["ssm_state"].clone()
-    out_d = gdn_core_decode_reference(conv_d, ssm_d, inp["mixed_qkv"][:, 0], inp["z"][:, 0], inp["a"][:, 0],
-                                      inp["b"][:, 0], inp["A_log"], inp["dt_bias"], inp["conv_weight_t"],
-                                      inp["norm_weight"], inp["load_indices"], inp["store_indices"][:, 0],
-                                      inp["scale"], inp["eps"], GATE)
+    out_d = gdn_core_decode_reference(conv_d, ssm_d, inp["mixed_qkv"][:, 0], inp["z"][:, 0], inp["a"][:,
+                                                                                                      0], inp["b"][:,
+                                                                                                                   0],
+                                      inp["A_log"], inp["dt_bias"], inp["conv_weight_t"], inp["norm_weight"],
+                                      inp["load_indices"], inp["store_indices"][:, 0], inp["scale"], inp["eps"], GATE)
 
     assert torch.equal(out_v[:, 0], out_d)
     assert torch.equal(conv_v, conv_d)
@@ -117,7 +119,7 @@ def test_chain_equals_sequential(H, HV):
     inp["store_indices"] = torch.tensor([[1 + 4 * r + t for t in range(T)] for r in range(3)], dtype=torch.int32)
 
     conv_v, ssm_v = inp["conv_state"].clone(), inp["ssm_state"].clone()
-    out_v = gdn_core_verify_reference(*_verify_args(inp, conv=conv_v, ssm=ssm_v))
+    out_v = gdn_core_verify_tree_reference(*_verify_args(inp, conv=conv_v, ssm=ssm_v))
 
     exp_out = []
     for r in range(3):
@@ -142,7 +144,7 @@ def test_tree_branches_equal_their_paths(H, HV):
     dummy = 23
 
     conv_v, ssm_v = inp["conv_state"].clone(), inp["ssm_state"].clone()
-    out_v = gdn_core_verify_reference(*_verify_args(inp, conv=conv_v, ssm=ssm_v))
+    out_v = gdn_core_verify_tree_reference(*_verify_args(inp, conv=conv_v, ssm=ssm_v))
 
     for r in range(3):
         s = inp["store_indices"][r].tolist()
@@ -177,7 +179,7 @@ def test_padding_row_and_unstored_nodes(H, HV):
     init_conv, init_ssm = inp["conv_state"].clone(), inp["ssm_state"].clone()
 
     conv_a, ssm_a = init_conv.clone(), init_ssm.clone()
-    out_a = gdn_core_verify_reference(*_verify_args(inp, conv=conv_a, ssm=ssm_a))
+    out_a = gdn_core_verify_tree_reference(*_verify_args(inp, conv=conv_a, ssm=ssm_a))
 
     # The padding row: zero outputs, and no writes to the slots its store_indices name.
     assert torch.equal(out_a[2], torch.zeros(T, HV, D, dtype=torch.float32))
@@ -190,7 +192,7 @@ def test_padding_row_and_unstored_nodes(H, HV):
     store_b = store_all.clone()
     store_b[0, 2] = -1
     conv_b, ssm_b = init_conv.clone(), init_ssm.clone()
-    out_b = gdn_core_verify_reference(*_verify_args(inp, conv=conv_b, ssm=ssm_b, store=store_b))
+    out_b = gdn_core_verify_tree_reference(*_verify_args(inp, conv=conv_b, ssm=ssm_b, store=store_b))
     assert torch.equal(out_b, out_a)
     assert torch.equal(conv_b[5], init_conv[5])
     assert torch.equal(ssm_b[5], init_ssm[5])
@@ -215,7 +217,7 @@ def test_bad_parent_raises(H, HV):
         bad = inp["parent_idx"].clone()
         bad[0, t] = value
         with pytest.raises(ValueError):
-            gdn_core_verify_reference(*_verify_args(inp, parent=bad))
+            gdn_core_verify_tree_reference(*_verify_args(inp, parent=bad))
         on_padding = inp["parent_idx"].clone()
         on_padding[2, t] = value
-        gdn_core_verify_reference(*_verify_args(inp, parent=on_padding))  # no raise: row 2 is padding
+        gdn_core_verify_tree_reference(*_verify_args(inp, parent=on_padding))  # no raise: row 2 is padding
