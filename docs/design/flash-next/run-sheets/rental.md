@@ -34,9 +34,10 @@ stops at the first gate that trips, and you send the tarball back.
    scp dist/flash-next-rental-*.tar.gz <node>:~/
    ```
 
-3. Disk on the node: the FP8 checkpoint is about 185.5 GB and the results add a few GB — allow
-   **at least 250 GB free** for a run with `--download`, at least 20 GB free otherwise. The run
-   refuses to start when the model parent folder does not exist.
+3. Disk on the node: the checkpoint is 185.5 GB and a `--download` needs **250 GB free** under
+   `--model`. Root disks of rented nodes are often smaller (92 GB on 2026-11-18).
+   `prepare_host.sh` prints the disks and the free space and prepares a data disk; `run_rental.sh`
+   refuses a download that does not fit. See [Disks and the data disk](#disks-and-the-data-disk).
 
 4. The checkpoint: if the node does not have it yet, add `--download` to the command below; the
    script downloads `Qwen/Qwen3.8-Flash-Next-FP8` (public, not gated) into the `--model` directory
@@ -81,6 +82,42 @@ Useful options: `--version V` / `--build N` (the release pin, default `1.24.1-48
 version differs from the pin — it never silently downgrades), `--force` (continue on a non-22.04
 Ubuntu), and `--dry-run` (print every step's commands; needs no root, apt, docker, or network). When
 the host is not ready, `run_rental.sh` stops and points back at this script.
+
+### Disks and the data disk
+
+On 2026-11-18 `/models` was a folder on the 92 GB root disk, and the 185.5 GB download filled it
+(97%) and stopped; the node had a second, blank 26.4 TB disk (`/dev/vdc`) that nothing used,
+because nothing showed it to us and nothing prepared it. Every `prepare_host.sh` run now prints
+`lsblk`, the free space (`df -h`) and the unused disks, so a data disk is visible before the
+download starts. To use one:
+
+```bash
+sudo bash prepare_host.sh --data-disk /dev/vdc
+```
+
+Use the device name the list printed; `--mount DIR` puts the filesystem somewhere other than
+`/models`. Try it first with `--dry-run` (it runs the checks and prints what the real run would
+do). The script formats a device only with `--data-disk`, and only when `blkid` and `wipefs` both
+see it as blank, with no partitions and not mounted: any signature, any partition, a mount point,
+an unreadable device or a non-empty mount folder is a refusal (exit 1, a `REFUSED` line). It never
+formats without the option. The `/etc/fstab` line uses the device UUID with `nofail`, so a missing
+disk does not stop the boot, and the rerun after a reboot finds the disk already prepared: the
+script's own `fn-models` ext4 is recognized and `mkfs` is skipped.
+
+### Fallback: the checkpoint in RAM (no data disk)
+
+Only for a node without a usable data disk and with plenty of memory (2026-11-18: 925 GB RAM).
+Conditions: `df -h /dev/shm` shows at least 250 GB free (tmpfs is half the RAM by default) and
+`free -g` shows at least 400 GB available.
+
+```bash
+sudo mkdir -p /dev/shm/models /models
+sudo mount --bind /dev/shm/models /models
+sudo bash run_rental.sh --model /models/Qwen3.8-Flash-Next-FP8 --download
+```
+
+It is lost on reboot: after a reboot, redo the bind mount and the download. It worked on
+2026-11-18 (gate `preflight` passed).
 
 ## The one command (on the node)
 

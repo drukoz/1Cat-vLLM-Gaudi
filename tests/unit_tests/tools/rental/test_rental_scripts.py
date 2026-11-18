@@ -7,6 +7,7 @@ at the top level, the plugin tree, vLLM at the pin and BUNDLE.txt. The bundle te
 the vLLM checkout is absent. Runs on CPU from the worktree root with ``PYTHONPATH=$PWD``.
 """
 
+import os
 import subprocess
 import sys
 import tarfile
@@ -111,6 +112,8 @@ def test_prepare_host_dry_run(tmp_path):
         "habanalabs/pytorch-installer-2.11.0:latest" in out
     )
     assert "--runtime=habana" in out
+    assert "lsblk" in out
+    assert "--data-disk" in out
     assert not (tmp_path / "prepare-host-logs").exists()
 
 
@@ -126,6 +129,115 @@ def test_prepare_host_dry_run_version_override(tmp_path):
     out = proc.stdout
     assert "gaudi-installer/1.24.2/" in out
     assert "habanalabs-container-runtime=1.24.2-481" in out
+
+
+def _disk_tool_env(tmp_path, **fake):
+    """PATH with fake lsblk/blkid/wipefs driven by FAKE_* variables (a blank, unmounted /dev/vdc by default)."""
+    bin_dir = tmp_path / "fakebin"
+    bin_dir.mkdir()
+    fakes = {
+        "lsblk": (
+            'case "$*" in\n'
+            '  *"-o TYPE"*) echo "${FAKE_LSBLK_TYPE-disk}" ;;\n'
+            '  *"-o NAME"*) echo vdc; if [ -n "${FAKE_LSBLK_PART:-}" ]; then echo "$FAKE_LSBLK_PART"; fi ;;\n'
+            '  *"-o MOUNTPOINT"*) echo "${FAKE_LSBLK_MOUNT:-}" ;;\n'
+            '  *) echo "NAME SIZE TYPE FSTYPE MOUNTPOINT"; echo "vdc 26.4T disk" ;;\n'
+            "esac\nexit 0\n"
+        ),
+        "blkid": (
+            'if [ -n "${FAKE_BLKID_OUT:-}" ]; then printf "%b\\n" "$FAKE_BLKID_OUT"; fi\n'
+            'exit "${FAKE_BLKID_RC:-2}"\n'
+        ),
+        "wipefs": 'if [ -n "${FAKE_WIPEFS_OUT:-}" ]; then printf "%b\\n" "$FAKE_WIPEFS_OUT"; fi\nexit "${FAKE_WIPEFS_RC:-0}"\n',
+    }
+    for name, body in fakes.items():
+        path = bin_dir / name
+        path.write_text("#!/bin/sh\n" + body)
+        path.chmod(0o755)
+    env = {k: v for k, v in os.environ.items() if k != "BASH_ENV"}
+    env["PATH"] = f"{bin_dir}:/usr/bin:/bin:/usr/sbin:/sbin"
+    env.update({f"FAKE_{k.upper()}": v for k, v in fake.items()})
+    return env
+
+
+def _prepare_host_data_disk(tmp_path, env, mount=None):
+    mount = mount or tmp_path / "models"
+    return subprocess.run(
+        ["/bin/bash", str(SCRIPTS_DIR / "prepare_host.sh"), "--dry-run", "--data-disk", "/dev/vdc", "--mount", str(mount)],
+        capture_output=True, text=True, cwd=tmp_path, env=env, timeout=60,
+    )
+
+
+def test_prepare_host_data_disk_dry_run(tmp_path):
+    proc = _prepare_host_data_disk(tmp_path, _disk_tool_env(tmp_path))
+    assert proc.returncode == 0, proc.stderr
+    out = proc.stdout
+    assert "mkfs.ext4 -F -L fn-models -m 0 /dev/vdc" in out
+    assert "nofail" in out
+    assert str(tmp_path / "models") in out
+    assert not (tmp_path / "models").exists()
+    assert not (tmp_path / "prepare-host-logs").exists()
+
+
+def test_prepare_host_data_disk_refuses_blkid_signature(tmp_path):
+    env = _disk_tool_env(tmp_path, blkid_rc="0", blkid_out="DEVNAME=/dev/vdc\nTYPE=xfs")
+    proc = _prepare_host_data_disk(tmp_path, env)
+    assert proc.returncode == 1
+    assert "REFUSED" in proc.stderr
+    assert "signature" in proc.stderr
+    assert "mkfs.ext4" not in proc.stdout
+
+
+def test_prepare_host_data_disk_refuses_wipefs_signature(tmp_path):
+    env = _disk_tool_env(tmp_path, wipefs_out="DEVICE OFFSET TYPE\nvdc 0x1fe dos")
+    proc = _prepare_host_data_disk(tmp_path, env)
+    assert proc.returncode == 1
+    assert "REFUSED" in proc.stderr
+    assert "mkfs.ext4" not in proc.stdout
+
+
+def test_prepare_host_data_disk_refuses_unreadable(tmp_path):
+    env = _disk_tool_env(tmp_path, blkid_rc="4")
+    proc = _prepare_host_data_disk(tmp_path, env)
+    assert proc.returncode == 1
+    assert "REFUSED" in proc.stderr
+
+
+def test_prepare_host_data_disk_refuses_mounted(tmp_path):
+    env = _disk_tool_env(tmp_path, lsblk_mount="/")
+    proc = _prepare_host_data_disk(tmp_path, env)
+    assert proc.returncode == 1
+    assert "REFUSED" in proc.stderr
+
+
+def test_prepare_host_data_disk_refuses_partitions(tmp_path):
+    env = _disk_tool_env(tmp_path, lsblk_part="vdc1")
+    proc = _prepare_host_data_disk(tmp_path, env)
+    assert proc.returncode == 1
+
+
+def test_prepare_host_data_disk_refuses_nonempty_mount(tmp_path):
+    (tmp_path / "models").mkdir()
+    (tmp_path / "models" / "old.safetensors").write_text("x")
+    proc = _prepare_host_data_disk(tmp_path, _disk_tool_env(tmp_path))
+    assert proc.returncode == 1
+    assert "not empty" in proc.stderr
+
+
+def test_prepare_host_data_disk_ours_skips_mkfs(tmp_path):
+    env = _disk_tool_env(tmp_path, blkid_rc="0", blkid_out="TYPE=ext4\nLABEL=fn-models\nUUID=1234")
+    proc = _prepare_host_data_disk(tmp_path, env)
+    assert proc.returncode == 0
+    assert "mkfs.ext4" not in proc.stdout
+    assert "nofail" in proc.stdout
+
+
+def test_prepare_host_mount_needs_data_disk(tmp_path):
+    proc = subprocess.run(
+        ["/bin/bash", str(SCRIPTS_DIR / "prepare_host.sh"), "--dry-run", "--mount", "/x"],
+        capture_output=True, text=True, cwd=tmp_path, timeout=60,
+    )
+    assert proc.returncode == 2
 
 
 if __name__ == "__main__":
