@@ -332,3 +332,64 @@ def test_general_spec_conv_keeps_ragged_and_invalid_rows_safe():
     assert torch.count_nonzero(output[2]) == 0
     torch.testing.assert_close(pool[[0, 1, 3, 5]], before[[0, 1, 3, 5]], rtol=0, atol=0)
     assert torch.count_nonzero(pool[4, 5:]) == 0
+
+
+def test_speculative_conv_store_indices_split_read_and_write_slots():
+    generator = torch.Generator().manual_seed(43)
+    batch, tokens, dim, width = 2, 4, 5, 3
+    capacity = width - 2 + tokens
+    pool = torch.randn(12, capacity, dim, generator=generator)
+    original = pool.clone()
+    read_indices = torch.tensor([1, 4], dtype=torch.int32)
+    store_indices = torch.tensor([9, 10], dtype=torch.int32)
+    accepted = torch.tensor([1, 2], dtype=torch.int32)
+    x = torch.randn(batch, tokens, dim, generator=generator)
+    weight = torch.randn(dim, width, generator=generator)
+    query_start_loc = torch.arange(0, (batch + 1) * tokens, tokens, dtype=torch.int32)
+
+    expected_output, expected_state = _spec_conv_reference(
+        x,
+        original.index_select(0, read_indices.long()),
+        weight,
+        None,
+        accepted,
+    )
+    actual = hpu_causal_conv1d_update(
+        x.reshape(batch * tokens, dim),
+        pool,
+        weight,
+        activation=None,
+        conv_state_indices=read_indices,
+        num_accepted_tokens=accepted,
+        query_start_loc=query_start_loc,
+        max_query_len=tokens,
+        store_cache_indices=store_indices,
+    )
+
+    # The history loads from conv_state_indices: outputs match the read-lattice reference.
+    torch.testing.assert_close(actual.reshape_as(expected_output), expected_output)
+    # The new state lands in the store slots.
+    torch.testing.assert_close(pool.index_select(0, store_indices.long()), expected_state)
+    # The read slots (a completed block's checkpoint) are left untouched.
+    torch.testing.assert_close(pool.index_select(0, read_indices.long()),
+                               original.index_select(0, read_indices.long()))
+    untouched = [row for row in range(12) if row not in (1, 4, 9, 10)]
+    torch.testing.assert_close(pool[untouched], original[untouched], rtol=0, atol=0)
+
+
+def test_speculative_conv_store_indices_rejects_wrong_length():
+    generator = torch.Generator().manual_seed(47)
+    batch, tokens, dim, width = 1, 4, 5, 3
+    pool = torch.randn(6, width - 2 + tokens, dim, generator=generator)
+    with pytest.raises(ValueError, match="store_indices must have shape \\[B\\]"):
+        hpu_causal_conv1d_update(
+            torch.randn(batch * tokens, dim, generator=generator),
+            pool,
+            torch.randn(dim, width, generator=generator),
+            activation=None,
+            conv_state_indices=torch.tensor([1], dtype=torch.int32),
+            num_accepted_tokens=torch.tensor([1], dtype=torch.int32),
+            query_start_loc=torch.tensor([0, tokens], dtype=torch.int32),
+            max_query_len=tokens,
+            store_cache_indices=torch.tensor([2, 3], dtype=torch.int32),
+        )

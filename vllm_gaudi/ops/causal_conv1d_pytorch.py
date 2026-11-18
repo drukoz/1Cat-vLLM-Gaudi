@@ -231,6 +231,7 @@ def _hpu_causal_conv1d_spec_update(
     max_query_len: int,
     round_before_activation: bool = False,
     full_query_valid_state: bool = False,
+    store_indices: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Rollback and advance expanded convolution state for speculative decode.
 
@@ -242,6 +243,11 @@ def _hpu_causal_conv1d_spec_update(
     ``full_query_valid_state`` is a caller-proven contract: every padded
     position is a real token and every state index is an owned, in-range row.
     It removes masking and redundant state reads, not arithmetic or rounding.
+
+    ``store_indices`` (align mode, M3-T10a) is a ``[B]`` write lattice: the
+    history is read from ``conv_state_indices`` as usual, and the new state is
+    written to ``store_indices``. This keeps token 0's state from overwriting a
+    completed block's prefix-cache checkpoint.
     """
     if x.ndim != 2 or x.shape[1] != weight.shape[0]:
         raise ValueError("Speculative convolution expects token-first x with shape [B*T, dim].")
@@ -271,6 +277,13 @@ def _hpu_causal_conv1d_spec_update(
     device = x.device
     state_indices = conv_state_indices.to(device=device, dtype=torch.long)
     safe_indices = state_indices if full_query_valid_state else torch.remainder(state_indices, state_view.shape[0])
+    if store_indices is None:
+        safe_store = safe_indices
+    else:
+        if store_indices.numel() != batch:
+            raise ValueError("store_indices must have shape [B] for speculative convolution.")
+        store_state = store_indices.to(device=device, dtype=torch.long)
+        safe_store = store_state if full_query_valid_state else torch.remainder(store_state, state_view.shape[0])
     state_rows = state_view.index_select(0, safe_indices)
     max_checkpoint = state_view.shape[1] - history_len + 1
     accepted_offset = num_accepted_tokens.to(device=device, dtype=torch.long).clamp(
@@ -317,7 +330,7 @@ def _hpu_causal_conv1d_spec_update(
         update_rows = (state_indices >= 0) & (query_lens > 0)
         new_state = torch.where(update_rows.view(-1, 1, 1), new_state, previous)
     with torch.no_grad():
-        state_view.index_copy_(0, safe_indices, new_state)
+        state_view.index_copy_(0, safe_store, new_state)
     return output.reshape_as(x).to(x.dtype)
 
 
@@ -719,8 +732,6 @@ def hpu_causal_conv1d_update(
     if block_idx_last_scheduled_token is not None or initial_state_idx is not None:
         raise NotImplementedError("Prefix caching metadata is not supported in the reference implementation.")
     activation = _normalize_activation(activation)
-    if store_cache_indices is not None and num_accepted_tokens is not None:
-        raise NotImplementedError("'store_cache_indices' is not supported on the speculative update path.")
     if num_accepted_tokens is not None:
         if conv_state_indices is None or query_start_loc is None:
             raise ValueError("Speculative convolution requires state indices and query_start_loc.")
@@ -736,6 +747,7 @@ def hpu_causal_conv1d_update(
             max_query_len,
             round_before_activation,
             full_query_valid_state,
+            store_indices=store_cache_indices,
         )
     if max_query_len not in (-1, None):  # Provided only for Triton helper parity
         raise NotImplementedError("'max_query_len' is not used in the reference implementation.")
