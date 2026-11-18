@@ -149,7 +149,8 @@ def test_decode_writes_prefill_rows(tiny_checkpoint):
 
     ``compressed_key_cache[600:654]`` (the rows the chain touches: 600..649 from the prefill,
     650..653 written at completions 2603/2607/2611/2615) equals a fresh 2616-token prefill's rows
-    within 1e-5 (fp32 reassociation: the fused GDN decode path measured 1.07e-6). ``key_ring[DECODE_SLOT]`` holds the raw keys of positions 2612..2615 in rows
+    within 1e-5 (fp32 reassociation: the fused GDN decode path measured 1.07e-6).
+    ``key_ring[DECODE_SLOT]`` holds the raw keys of positions 2612..2615 in rows
     ``pos % 4``; the fresh reference is a 2615-token prefill (tail 3 writes 2612..2614) plus the
     decode step at 2615, because a 2616-token prefill has no tail and writes NO ring rows.
     """
