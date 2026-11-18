@@ -86,10 +86,24 @@ the host is not ready, `run_rental.sh` stops and points back at this script.
 
 ```bash
 tar xzf ~/flash-next-rental-*.tar.gz -C ~/rental && cd ~/rental
-bash run_rental.sh --model /models/Qwen3.8-Flash-Next-FP8
+sudo bash run_rental.sh --model /models/Qwen3.8-Flash-Next-FP8
 ```
 
-That is all. Useful options:
+That is all. Three things about the host it runs on:
+
+- **Root.** `prepare_host.sh` does not add your user to the `docker` group, so run it with `sudo`
+  (or `sudo usermod -aG docker $USER`, then log in again). Without either, Docker refuses the socket
+  and the script stops with a message about the `habana` runtime. `--download` also creates
+  `/models`, which needs root.
+- **A terminal that survives the SSH session.** The run takes hours; run it inside `tmux`
+  (`tmux new -s rental`; detach with `Ctrl-b d`, reattach with `tmux attach -t rental`). A dropped
+  SSH session otherwise kills the run, and the tarball at the end is never written.
+- **Disk.** `--download` needs about 250 GB free under `--model`'s parent (the checkpoint is 185 GB),
+  and the image, the install and the results need about 40 GB on the root filesystem. Check `df -h`
+  first; when the large disk is mounted elsewhere, point `--model` there, for example
+  `--model /mnt/models/Qwen3.8-Flash-Next-FP8`.
+
+Useful options:
 
 | Option | Meaning |
 |---|---|
