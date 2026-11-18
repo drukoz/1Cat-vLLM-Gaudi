@@ -127,6 +127,28 @@ def _warn_gdn_core_decode_without_kernel(mode: int, loaded: bool, on_hpu: bool, 
     return message
 
 
+def _warn_gdn_core_verify_without_kernel(verify_mode: int, decode_mode: int, loaded: bool, on_hpu: bool, errors,
+                                         warn=None) -> str | None:
+    """Warn once at plugin start when a nonzero VLLM_HPU_GDN_CORE_VERIFY runs without an HPU kernel.
+
+    Returns the logged message, or ``None`` when nothing was logged: verify off, decode nonzero (its warning
+    already reported the missing extension), the extension loaded, or no HPU (the ops' CPU kernels need no
+    extension). ``warn`` defaults to the vLLM logger's ``warning``.
+    """
+    if not verify_mode or decode_mode or loaded or not on_hpu:
+        return None
+    reason = "; ".join(errors) if errors else "no error recorded"
+    message = (f"GDN core verify (VLLM_HPU_GDN_CORE_VERIFY={int(verify_mode)}) has no HPU kernel: the gdn_fused_ops "
+               f"extension did not load ({reason}); every GDN verification step runs the torch path. Build it with "
+               "tools/build_flashinfer_gaudi.py --gdn-fused-only, or set VLLM_HPU_GDN_CORE_VERIFY=0.")
+    if warn is None:
+        from vllm.logger import init_logger
+
+        warn = init_logger(__name__).warning
+    warn(message)
+    return message
+
+
 def register_ops():
     """Register custom PluggableLayers for the HPU platform"""
     from flashinfer_gaudi import load_native_extensions
@@ -134,13 +156,17 @@ def register_ops():
     load_native_extensions()
     from vllm_gaudi import envs as _gaudi_envs
 
-    if _gaudi_envs.VLLM_HPU_GDN_CORE_DECODE:
+    decode_mode = _gaudi_envs.VLLM_HPU_GDN_CORE_DECODE
+    verify_mode = _gaudi_envs.VLLM_HPU_GDN_CORE_VERIFY
+    if decode_mode or verify_mode:
         # Before warmup: the loader prepends libgdn_fused_gaudi2.so to GC_KERNEL_PATH.
         from flashinfer_gaudi._native import gdn_fused_extension_errors, load_gdn_fused_extension
 
         loaded = load_gdn_fused_extension()
-        _warn_gdn_core_decode_without_kernel(_gaudi_envs.VLLM_HPU_GDN_CORE_DECODE, loaded, _hpu_visible(),
-                                             gdn_fused_extension_errors())
+        on_hpu = _hpu_visible()
+        errors = gdn_fused_extension_errors()
+        _warn_gdn_core_decode_without_kernel(decode_mode, loaded, on_hpu, errors)
+        _warn_gdn_core_verify_without_kernel(verify_mode, decode_mode, loaded, on_hpu, errors)
     import vllm_gaudi.attention.oot_mla  # noqa: F401
     """Register custom ops for the HPU platform."""
     import vllm_gaudi.v1.sample.hpu_rejection_sampler  # noqa: F401

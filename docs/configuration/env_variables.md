@@ -73,8 +73,9 @@ warning per layer (`GDN core decode ... is off for <layer>: <reason>`). `0`
 keeps the composed torch path (causal conv1d update, gating, fused recurrent
 delta rule, gated RMSNorm). `2` runs only the recurrence through
 `gdn_recurrent_decode` and keeps the torch conv and norm; it exists to narrow
-down a numerics problem in the fused kernel. Speculative decode steps always
-run the torch path. See `docs/design/flash-next/gdn-core-decode.md`.
+down a numerics problem in the fused kernel. Speculative decode steps are
+covered by `VLLM_HPU_GDN_CORE_VERIFY`. See
+`docs/design/flash-next/gdn-core-decode.md`.
 
 `VLLM_HPU_GDN_CORE_DECODE_DEBUG` adds a debug check of the GDN core decode
 slot indices as an integer. `0` (default) is off. `1` calls
@@ -84,6 +85,15 @@ padding rows follow them) whose load and store slots are both in range, it raise
 slot, or when one row's store slot is another row's load slot (a reordered
 cache). The check copies the indices to the CPU, syncing the host once per
 GDN layer per step; for debugging only.
+
+`VLLM_HPU_GDN_CORE_VERIFY` selects the GDN path for speculative (MTP) decode
+steps as an integer. `0` (default) keeps the torch path (speculative conv
+update, gating, the MTP recurrence, gated RMSNorm). `1` runs every verification
+step, and the plain step after one, through
+`torch.ops.flashinfer_gaudi.gdn_core_verify` in the same
+`libgdn_fused_gaudi2.so`. A layer the op does not fit logs one warning
+(`GDN core verify ... is off for <layer>: <reason>`) and runs the torch path.
+It stays off until the rental's gate G1b has checked the op on a card.
 
 `VLLM_HPU_RECURRENT_STATE_POOL` selects the allocation mode for the recurrent
 (GDN / short-conv) state slots as an integer. `0` (default) keeps today's
