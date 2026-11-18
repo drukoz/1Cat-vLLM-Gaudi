@@ -405,6 +405,8 @@ def summarize_run(run_dir: Path) -> dict:
         servers = entry.get("servers")
         servers = servers if isinstance(servers, list) else []
         agents = sum(int(s.get("agents") or 0) for s in servers if isinstance(s, dict))
+        if isinstance(run["workload"]["agents"], int) and run["workload"]["agents"] > 0:
+            agents = min(agents, run["workload"]["agents"])  # --agents below variants.json runs fewer agents
         summary = summarize_variant(run_dir / variant_id, agents, turns=turns)
         summary["title"] = entry.get("title")
         variants[variant_id] = summary
