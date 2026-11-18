@@ -156,7 +156,8 @@ class HPUAttentionMetadataV1(HPUAttentionMetadata):
                              direct_gdn_state=False,
                              dflash_full_query=False,
                              causal=True,
-                             block_table=None):
+                             block_table=None,
+                             lattice_store_differs=False):
         return cls(is_prompt=False,
                    block_mapping=None,
                    alibi_blocks=None,
@@ -184,4 +185,5 @@ class HPUAttentionMetadataV1(HPUAttentionMetadata):
                    direct_gdn_state=direct_gdn_state,
                    dflash_full_query=dflash_full_query,
                    causal=causal,
-                   block_table=block_table)
+                   block_table=block_table,
+                   lattice_store_differs=lattice_store_differs)

@@ -739,6 +739,210 @@ sweep. A low 32K throughput is data, record it.
 
 Post back (3d): the filled 3d table, the eight `/tmp/3d-*.log` files, the engine-stats lines taken during the sweeps.
 
+### 3e: MTP speculative decoding A/B
+
+#### Purpose
+A/B MTP speculative decoding against the non-speculative baseline: prove the tiny model's greedy tokens are identical
+to `reference.json` with MTP on (greedy speculation is lossless), then measure mean acceptance length and decode
+throughput on the real checkpoint at 1/8/16/32 agents with k = off, 1, 2, 3. The drafter is the checkpoint's own
+`mtp.*` layer — there is no draft-model path and no draft model to download (plan v0.4, M3 T9; system map §17,
+facts 30-36).
+
+#### Prerequisites
+- Stages 2a and 2b passed. The stage 1 fork build; plugin branch `feat/flash-next-gaudi-m3` at its current head
+  (the MTP path exists only there), engine pin unchanged.
+- The tiny checkpoint with MTP weights, rebuilt on the node from the M3 branch:
+  `python tools/flash_next/make_tiny_checkpoint.py --out /models/tiny-flash-next` (stage 3a's command) — the M3
+  generator writes **163 tensors**: the 132 of the M2 checkpoint plus the 31 `mtp.*` tensors the drafter loads
+  (system map §17 fact 32) — and the six-prompt `reference.json` (prompt 6 is the 2600-token one, stage 3a).
+- Checkpoint `/models/Qwen3.8-Flash-Next` (on the node; stage 2b's path).
+- Stage 3a's `/tmp/3a-tiny-sparse.txt` from this session: the MTP-off baseline the lossless check compares with (3a
+  builds the same M3 checkpoint). If 3a was skipped, run its sparse tiny side first.
+- Every recorded 3e launch runs with prefix caching OFF and compact GDN ON. MTP with prefix caching ON runs the
+  upstream vLLM align scheme (RUK-2798 T10c: one state lattice starting at the block of the last scheduled token, a
+  pre-step copy when that block changes, block-completion commits at sample time), proven over multi-step chains
+  on CPU by `tests/unit_tests/models/flash_next/test_mtp_align_continuity.py`. As a follow-up launch, rerun (ii)
+  without `--no-enable-prefix-caching` and with `VLLM_COMPACT_GDN=0` (compact GDN stays prohibited under prefix
+  caching, M1-T1), expecting cache mode `align` in the log and acceptance lengths on par with k3, and run the
+  stage 4 prefix-hit check (a/a/b, hit rate > 0% after the second request) with MTP on.
+  The M3 design requires compact GDN on the recorded launches (`VLLM_COMPACT_GDN=1` — the default without prefix
+  caching, stated explicitly per rule 4). Sparse QSA (`VLLM_HPU_FLASH_NEXT_QSA_MODE=1`) is the mode; the
+  dense fallback is noted under (ii). Each launch runs in a fresh container shell and states every flag and export
+  (stage 3's rule: exports must not carry over).
+
+#### Launch
+The tiny server first (it boots in seconds) — the lossless check is the first step. Then four real launches, about
+400 s of warmup each (system map §11, Reading 5): fn3e-k3 from (ii) doubles as the k = 3 sweep server in (iii);
+fn3e-k0, fn3e-k1, fn3e-k2 are the sweep launches.
+
+(i) Tiny model, TP1, MTP on (k = 3), greedy — the lossless check:
+```bash
+# on the node, in the stage 1 container; name the container fn3e-tiny
+python tools/flash_next/make_tiny_checkpoint.py --out /models/tiny-flash-next   # 163 tensors (Prerequisites)
+export VLLM_LOG_STATS_INTERVAL=2        # tiny runs finish inside one default 10 s stats interval (vllm/envs.py:47)
+export VLLM_COMPACT_GDN=1               # Prerequisites: compact GDN, prefix caching off
+export VLLM_HPU_FLASH_NEXT_QSA_MODE=1   # prompt 6 is 2600 tok; dense is exact only to 2050 (plan v0.3, M2 fact 1)
+vllm serve /models/tiny-flash-next --served-model-name tiny --tensor-parallel-size 1 \
+  --max-model-len 4096 --max-num-seqs 4 --no-enable-prefix-caching \
+  --speculative-config '{"method": "mtp", "num_speculative_tokens": 3}' \
+  --language-model-only --trust-remote-code --port 8010
+```
+Then stage 2a's "Send the prompts and compare" block (`CKPT=/models/tiny-flash-next`, port 8010, model `tiny`, greedy,
+16 tokens out), saving the printed lines:
+
+```bash
+# paste stage 2a's block unchanged except its first line, which becomes:
+CKPT=/models/tiny-flash-next python - <<'EOF' | tee /tmp/3e-tiny-mtp.txt   # six prompts, from reference.json
+```
+
+Pass: every prompt's match count and first differing position equal the MTP-off lines in `/tmp/3a-tiny-sparse.txt`
+(stage 3a, same stack and QSA mode; greedy speculative decoding is lossless, so the drafter must not change the
+tokens), and the capture shows at least one `SpecDecoding metrics` line with `Drafted:` above 0 tokens (the drafter
+ran). A difference from 3a's lines is judged by the stop rule below. Stop the server.
+
+(ii) Real checkpoint, TP8 BF16, MTP on (k = 3), sparse QSA — coherence on stage 2b's 8 prompts:
+```bash
+# on the node, cards 0–7; name the container fn3e-k3
+export VLLM_COMPACT_GDN=1
+export VLLM_HPU_FLASH_NEXT_QSA_MODE=1
+vllm serve /models/Qwen3.8-Flash-Next --served-model-name Qwen3.8-Flash-Next --port 8000 \
+  --tensor-parallel-size 8 --max-model-len 131072 --max-num-seqs 32 --no-enable-prefix-caching \
+  --speculative-config '{"method": "mtp", "num_speculative_tokens": 3}' \
+  --language-model-only --trust-remote-code --gpu-memory-utilization 0.92
+```
+Stage 2b's 8-prompt coherence loop, greedy, 64 tokens out, into a file:
+
+```bash
+OUT=/tmp/3e-k3-coherence.txt
+: > "$OUT"
+for p in \
+  "Explain in two sentences why the sky is blue during the day." \
+  "Write a haiku about the sea." \
+  "List the three primary colors and one use of each." \
+  "What is the capital of France? Answer in one sentence." \
+  "Summarize in one sentence what a compiler does." \
+  "Continue this sentence: The best way to learn programming is" \
+  "Reply with a JSON object only, keys name, age, city, for a fictional person." \
+  "Write a Python function fib(n) that returns the n-th Fibonacci number." ; do
+  payload=$(python -c "import json,sys; print(json.dumps({'model':'Qwen3.8-Flash-Next','prompt':sys.argv[1],'max_tokens':64,'temperature':0}))" "$p")
+  curl -s http://localhost:8000/v1/completions -H 'Content-Type: application/json' -d "$payload" \
+    | python -c "import json,sys; print(json.load(sys.stdin)['choices'][0]['text'].strip())" >> "$OUT"
+  echo '================' >> "$OUT"
+done
+```
+
+Pass: every answer on-topic, grammatical, no repetition loops (stage 2b's rule). Dense fallback: if the sparse launch
+crashes at startup, relaunch once in the same container with `VLLM_HPU_FLASH_NEXT_QSA_MODE=0` — dense is exact only
+within 2050 tokens (plan v0.3, M2 fact 1), which covers the coherence prompts (each under 60 tokens) but not the
+sweep's 4K inputs: record the mode in every results row when falling back.
+
+(iii) Decode sweep (stage 3d's 4K shape: 4096 in, 256 out) at MTP off, k = 1, k = 2, k = 3 — one launch per k,
+containers fn3e-k0 (MTP off), fn3e-k1, fn3e-k2; fn3e-k3 is (ii)'s server. k0, in full:
+
+```bash
+# on the node, cards 0–7; name the container fn3e-k0
+export VLLM_COMPACT_GDN=1
+export VLLM_HPU_FLASH_NEXT_QSA_MODE=1
+vllm serve /models/Qwen3.8-Flash-Next --served-model-name Qwen3.8-Flash-Next --port 8000 \
+  --tensor-parallel-size 8 --max-model-len 131072 --max-num-seqs 32 --no-enable-prefix-caching \
+  --language-model-only --trust-remote-code --gpu-memory-utilization 0.92
+```
+
+fn3e-k1 adds `--speculative-config '{"method": "mtp", "num_speculative_tokens": 1}'` to that command, fn3e-k2 the
+same with `2` (one launch per k; k = 1..4 is the accepted range, plan v0.4, M3 T5b). Sweep all four servers, N = 4 x C:
+
+```bash
+NAME=k0                # on fn3e-k1: NAME=k1; on fn3e-k2: NAME=k2; on fn3e-k3: NAME=k3
+for C in 1 8 16 32; do
+  vllm bench serve --backend vllm --model Qwen3.8-Flash-Next --dataset-name random \
+    --random-input-len 4096 --random-output-len 256 --num-prompts $((4 * C)) --max-concurrency "$C" \
+    --percentile-metrics ttft,tpot --metric-percentiles 50,90 \
+    > "/tmp/3e-$NAME-c$C.log" 2>&1
+  grep -E "Output token throughput|Mean TPOT|P50 TTFT|P90 TTFT|Benchmark duration" "/tmp/3e-$NAME-c$C.log"
+done
+```
+
+`--metric-percentiles` defaults to `99`; `50,90` prints the P50/P90 TTFT lines (`vllm/benchmarks/serve.py:1807-1827`).
+Decode tok/s per agent = 1000 / Mean TPOT (ms); total decode tok/s = Output token throughput; wall time = Benchmark
+duration (s). During each sweep, from a second shell, the stage 3d stats lines plus the acceptance line — one
+`SpecDecoding metrics` line per stats interval, each covering its own interval (the counters reset after printing,
+`vllm/v1/spec_decode/metrics.py:137`): record the last line before the sweep ends.
+
+```bash
+docker logs fn3e-k1 2>&1 | grep -E "SpecDecoding metrics|Avg generation throughput|Running: " | tail -n 20
+```
+
+#### Expected startup lines
+| Expected line (quoted) | Source | Observed |
+|---|---|---|
+| `Warmup finished in … secs` (about 400 s on the real launches; record the seconds) | system map §11, Reading 5 | |
+| `Loading drafter model weights took … GB` (fn3e-tiny, fn3e-k1, fn3e-k2, fn3e-k3; absent on fn3e-k0) | the fork's runner, `hpu_model_runner.py:6820` | |
+| `Flash-Next QSA side caches: 13 layers, compressed_key_cache …, key_ring …, total …` (real MTP launches: the 12 target QSA layers + the drafter's; 12 layers on fn3e-k0; 1 + 1 = 2 on fn3e-tiny) | `hpu_model_runner.py:9226`; the drafter's caches ride the same loop from M3-T5a (system map §17 fact 36) | |
+| `GDN layers detected (36): … VLLM_COMPACT_GDN=1` (real launches; `(3)` on fn3e-tiny — 3 of the tiny model's 4 text layers are GDN) | stage 2b's line, format `hpu_model_runner.py:2208-2211`; 36 of 48: §2 | |
+| `Avg generation throughput: … tokens/s` (per stats interval during the sweeps; with `VLLM_LOG_STATS_INTERVAL=2`, also in fn3e-tiny's capture) | `vllm/v1/metrics/loggers.py:264`; the stage 3d line | |
+| `SpecDecoding metrics: Mean acceptance length: %.2f, Accepted throughput: %.2f tokens/s, Drafted throughput: %.2f tokens/s, Accepted: %d tokens, Drafted: %d tokens, Per-position acceptance rate: %s, Avg Draft acceptance rate: %.1f%%` (the format at the pin; numbers print in place of the placeholders; one line per stats interval while speculation decodes; absent on fn3e-k0) | `vllm/v1/spec_decode/metrics.py:120-135` at the engine pin | |
+
+#### Capture commands
+```bash
+docker logs <name> 2>&1 | grep -E "SpecDecoding metrics|Loading drafter|QSA side caches|Avg generation throughput"   # 3e, per launch (fn3e-k0: only the side-cache and throughput lines)
+docker logs <name> 2>&1 | grep -E "Usable num_blocks|Warmup finished|Traceback"   # stage 3's capture; no num_blocks prediction here — the prefix-caching-off layout changes the budget, record the value
+docker logs <name> 2>&1 | grep -i -E "recompil|graph compile|bucket|warmup finished|max_num_batched_tokens|GDN layers detected|Compact GDN|mamba"   # R7, RUK-2728
+```
+
+#### Results table
+
+| Check | Expected | Observed | Pass? |
+|---|---|---|---|
+| Tiny, six prompts, MTP k = 3, greedy | each line equal to `/tmp/3a-tiny-sparse.txt` (MTP off) | | |
+| Tiny, `SpecDecoding metrics` line | present, with Drafted above 0 tokens | | |
+| fn3e-k3, `Loading drafter model weights took … GB` | present | | |
+| fn3e-k3, `Flash-Next QSA side caches` | `13 layers` (12 target + the drafter's) | | |
+| fn3e-k3, 8 coherence prompts | all on-topic, grammatical, no loops | | |
+
+Sweep (decode tok/s per agent = 1000 / Mean TPOT ms; total = Output token throughput; first token = P50/P90 TTFT ms;
+wall = Benchmark duration s; acceptance columns from the last `SpecDecoding metrics` line of the sweep; em-dash is N/A):
+
+| k | Container | C | N = 4C | Mean acceptance length | Accepted / Drafted tokens | Decode tok/s per agent | Decode tok/s total | First-token p50 / p90 (ms) | Wall time (s) |
+|---|---|---|---|---|---|---|---|---|---|
+| off | fn3e-k0 | 1 | 4 | — | — | | | | |
+| off | fn3e-k0 | 8 | 32 | — | — | | | | |
+| off | fn3e-k0 | 16 | 64 | — | — | | | | |
+| off | fn3e-k0 | 32 | 128 | — | — | | | | |
+| 1 | fn3e-k1 | 1 | 4 | | | | | | |
+| 1 | fn3e-k1 | 8 | 32 | | | | | | |
+| 1 | fn3e-k1 | 16 | 64 | | | | | | |
+| 1 | fn3e-k1 | 32 | 128 | | | | | | |
+| 2 | fn3e-k2 | 1 | 4 | | | | | | |
+| 2 | fn3e-k2 | 8 | 32 | | | | | | |
+| 2 | fn3e-k2 | 16 | 64 | | | | | | |
+| 2 | fn3e-k2 | 32 | 128 | | | | | | |
+| 3 | fn3e-k3 | 1 | 4 | | | | | | |
+| 3 | fn3e-k3 | 8 | 32 | | | | | | |
+| 3 | fn3e-k3 | 16 | 64 | | | | | | |
+| 3 | fn3e-k3 | 32 | 128 | | | | | | |
+
+#### Stop rule
+Tiny model with MTP on: any of prompts 1–3 below 16/16, or any prompt diverging from `reference.json` within its
+first 4 tokens where `/tmp/3a-tiny-sparse.txt` did not → **stop the session**, post `/tmp/3e-tiny-mtp.txt`,
+`/tmp/3a-tiny-sparse.txt` and the fn3e-tiny captures: greedy MTP is lossless, so that is a correctness bug. A later
+divergence on prompts 4–6 that 3a's MTP-off line does not show is a warning, not a stop (the verify pass scores k + 1
+tokens in one bf16 forward, so near-ties can flip, as in stages 2a and 3a): record both first-diff positions.
+Mean acceptance length below 1.3 at k = 3 on the real model (fn3e-k3, the `SpecDecoding metrics` lines during its
+sweep) → finish the k = 3 sweep, record its four rows, and skip the k = 1 and k = 2 launches: k = 3 drafts the most
+tokens per step, so k = 1 and 2 accept no more per step, and 1.3 tokens per step is not enough payoff to time.
+A crash at startup on any 3e launch → post the full traceback and that launch's capture greps, then relaunch with
+MTP off (drop the `--speculative-config` line) to confirm the rest of the sheet.
+Gibberish or repetition loops in fn3e-k3's coherence answers → stop, post `/tmp/3e-k3-coherence.txt` and the captures
+(stage 2b's rule).
+
+#### What to post back
+- the filled check table and the 16-row sweep table;
+- `/tmp/3e-tiny-mtp.txt` (the six comparison lines) and `/tmp/3e-k3-coherence.txt` (the eight answers);
+- every `SpecDecoding metrics` line from fn3e-k1, fn3e-k2 and fn3e-k3;
+- the sixteen `/tmp/3e-*.log` bench logs;
+- the three capture greps, complete, for each of fn3e-tiny, fn3e-k0, fn3e-k1, fn3e-k2, fn3e-k3;
+- an `hl-smi` snapshot (on the node).
+
 ### 3f: fused GDN decode kernel performance (track RUK-2812; run after 3d)
 Purpose: measure the fused GDN decode kernel end to end, and run the torch path (mode 0) once as the baseline so the gain
 is on record. Plan v0.4 made the kernel the decode path, so this row no longer decides whether to keep it: stage 1b

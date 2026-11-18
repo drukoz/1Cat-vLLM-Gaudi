@@ -284,6 +284,7 @@ def gated_delta_rule_mtp_rollback(
     scale: float | None = None,
     use_qk_l2norm: bool = True,
     assume_full_query: bool = False,
+    store_indices: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Advance a DFlash2 GDN lattice from its accepted checkpoint.
 
@@ -292,12 +293,19 @@ def gated_delta_rule_mtp_rollback(
     request, and writes every live verification-token state back to the fixed
     checkpoint lattice. ``token_mask`` keeps bucket padding from decaying or
     overwriting recurrent state.
+
+    ``store_indices`` (align mode, M3-T10a) splits the lattice: the accepted
+    checkpoint is still loaded from ``state_indices[:, accepted - 1]``, while
+    token t's state is written to ``store_indices[b, t]``. This keeps token 0's
+    state from overwriting a completed block's prefix-cache checkpoint.
     """
     if q.ndim != 4:
         raise ValueError(f"q must have [B,T,H,K] shape, got {q.shape}.")
     batch, tokens = q.shape[:2]
     if tuple(state_indices.shape) != (batch, tokens):
         raise ValueError(f"state_indices must have shape [{batch},{tokens}], got {state_indices.shape}.")
+    if store_indices is not None and tuple(store_indices.shape) != (batch, tokens):
+        raise ValueError(f"store_indices must have shape [{batch},{tokens}], got {store_indices.shape}.")
     if num_accepted_tokens.numel() != batch:
         raise ValueError(f"num_accepted_tokens must contain {batch} entries, got {num_accepted_tokens.shape}.")
 
@@ -317,7 +325,7 @@ def gated_delta_rule_mtp_rollback(
         store_state_indices=initial_state_indices,
         scale=scale,
         use_qk_l2norm=use_qk_l2norm,
-        ssm_state_indices=state_indices,
+        ssm_state_indices=state_indices if store_indices is None else store_indices.contiguous(),
         update_final_state=False,
         token_mask=token_mask,
         reserved_padding_slot=0,
@@ -336,6 +344,7 @@ def _gated_delta_rule_mtp_packed_reference(
     scale: float | None = None,
     use_qk_l2norm: bool = True,
     assume_full_query: bool = False,
+    store_indices: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Execute the exact portable packed MTP recurrence without dispatch."""
     batch, tokens, _ = packed_qkv.shape
@@ -364,6 +373,7 @@ def _gated_delta_rule_mtp_packed_reference(
         scale,
         use_qk_l2norm,
         assume_full_query,
+        store_indices,
     )
 
 
@@ -426,6 +436,7 @@ def gated_delta_rule_mtp_packed(
     assume_full_query: bool = False,
     assume_distinct_checkpoints: bool = False,
     checkpoint_start: int | None = None,
+    store_indices: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Run packed DFlash2 GDN verification with rollback checkpoints.
 
@@ -437,6 +448,12 @@ def gated_delta_rule_mtp_packed(
     ``assume_distinct_checkpoints`` permits one coalesced checkpoint write
     in the experimental prepared route. Only set it when the caller proves
     token slots are distinct; otherwise checkpoint writes remain ordered.
+
+    ``store_indices`` (align mode, M3-T10a) is a second ``[B,T]`` lattice:
+    token t's state is written to ``store_indices[b, t]`` while the accepted
+    checkpoint keeps loading from ``state_indices[:, accepted - 1]``. Only the
+    portable reference recurrence supports it; the native and prepared routes
+    raise ``ValueError``.
     """
     if packed_qkv.ndim != 3:
         raise ValueError(f"packed_qkv must have [B,T,width] shape, got {packed_qkv.shape}.")
@@ -451,6 +468,10 @@ def gated_delta_rule_mtp_packed(
     batch, tokens, _ = packed_qkv.shape
     if tuple(state_indices.shape) != (batch, tokens):
         raise ValueError(f"state_indices must have shape [{batch},{tokens}], got {state_indices.shape}.")
+    if store_indices is not None:
+        store_indices = store_indices.contiguous()
+        if tuple(store_indices.shape) != (batch, tokens):
+            raise ValueError(f"store_indices must have shape [{batch},{tokens}], got {store_indices.shape}.")
     if num_accepted_tokens.numel() != batch or query_lengths.numel() != batch:
         raise ValueError("num_accepted_tokens and query_lengths must each contain one entry per request.")
 
@@ -471,6 +492,8 @@ def gated_delta_rule_mtp_packed(
         raise BackendUnavailableError(f"The {policy} backend does not provide complete DFlash2 MTP GDN verification.")
     if (policy != "pytorch" and mtp_prepared_enabled() and torch.compiler.is_compiling() and native_supported
             and batch == 1 and assume_full_query):
+        if store_indices is not None:
+            raise ValueError("store_indices is not supported by the prepared MTP GDN route.")
         return _gated_delta_rule_mtp_prepared(
             packed_qkv,
             log_decay,
@@ -489,6 +512,8 @@ def gated_delta_rule_mtp_packed(
     use_public = policy == "public" or (policy == "auto" and not torch.compiler.is_compiling()
                                         and batch >= _QWEN38_MTP_MIN_AUTO_BATCH and public_mtp_gdn_auto_promoted())
     if use_public and native_supported:
+        if store_indices is not None:
+            raise ValueError("store_indices is not supported by the public native MTP GDN kernel.")
         native = public_mtp_gdn_op()
         if native is not None:
             result = native(
@@ -516,4 +541,5 @@ def gated_delta_rule_mtp_packed(
         scale,
         use_qk_l2norm,
         assume_full_query,
+        store_indices,
     )

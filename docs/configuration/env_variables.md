@@ -56,7 +56,7 @@ full prefix through the standard HPU Attention layer, with the indexer weights
 loaded only for checkpoint compatibility. `1` is sparse (indexer top-k
 selection, added in M2): `HpuQsaIndexer.select` picks the attended
 positions per query and attention runs only over them. Sparse prefill needs a
-4-aligned context; speculative decode is not supported yet (M3).
+4-aligned context. MTP verification steps (M3) score their draft rows on the sparse path too.
 
 `VLLM_HPU_GDN_CORE_DECODE` selects the GDN decode core path as an integer.
 `1` (default) is fused: every non-speculative decode step runs through the

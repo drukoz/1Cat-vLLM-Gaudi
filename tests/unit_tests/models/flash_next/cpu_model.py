@@ -15,6 +15,11 @@ through vLLM's real loader on world 1 (gloo), then patches what the CPU cannot r
 
 The seams (``GatedResidual``, ``Qwen4ExpQSAAttention``) are wired by
 ``vllm_gaudi.models.qwen4_exp.apply_flash_next_patches()``, which ``register()`` calls.
+
+For MTP (M3), ``cpu_model(..., speculative_config=..., load_format="dummy")`` builds the target
+under an MTP speculative config (it then returns ``(hidden, [multi])``), and ``cpu_draft_model``
+builds the ``HpuQwen4ExpMTP`` draft inside that open context the way the engine's eagle/MTP draft
+path does, binding its states and swapping in SDPA exactly as ``cpu_model`` does for the target.
 """
 
 import os
@@ -283,7 +288,10 @@ def decode_metadata(slot: int,
                     max_blocks: int = 32,
                     *,
                     load_slot: int | None = None,
-                    store_slot: int | None = None) -> SimpleNamespace:
+                    store_slot: int | None = None,
+                    num_tokens: int = 1,
+                    query_lens: list[int] | None = None,
+                    slots: list[int] | None = None) -> SimpleNamespace:
     """The HPU metadata for one decode step of a ``position``-token sequence in state slot ``slot``.
 
     ``is_prompt=False`` with ``(1,)`` load/store indices ``[slot]`` and ``query_start_loc_p``
@@ -297,24 +305,61 @@ def decode_metadata(slot: int,
     ``load_slot``/``store_slot`` override the two state-index tensors separately (the slot
     move of prefix caching: the step reads the state of ``load_slot`` and writes ``store_slot``);
     ``slot`` keeps covering both when they are omitted.
+
+    ``num_tokens = T > 1`` builds the M3 verification layout of the runner's padded
+    multi-token decode: ``bs = len(slots)`` requests of ``T`` rows each
+    (``bs * T`` query rows), ``query_start_loc_p`` the cumulative REAL lengths
+    (``query_lens``, default ``T`` for every request), ``slot_mapping`` the
+    positions ``position .. position + T`` of each request with the padding rows of a
+    ragged request on the attention's ``_PAD_SLOT_ID = -1``, the ``block_table`` with
+    ONE ROW PER QUERY ROW (``[bs * T, max_blocks]``, the identity row repeated, as the
+    runner's per-token ``block_tables_list`` gives a single-sequence test), and the
+    state-index tensors as the lattice ``[bs_groups=1, bs, T]`` with
+    ``num_accepted_tokens = [1] * bs`` (the first verification step after a prefill).
+    ``slots`` is the state slot of each request (default ``[slot]``).
     """
     load = slot if load_slot is None else load_slot
     store = slot if store_slot is None else store_slot
+    if num_tokens < 1:
+        raise ValueError(f"num_tokens must be >= 1, got {num_tokens}")
+    req_slots = [load] if slots is None else list(slots)
+    bs = len(req_slots)
+    lengths = [num_tokens] * bs if query_lens is None else list(query_lens)
+    if len(lengths) != bs or any(not 0 <= n <= num_tokens for n in lengths):
+        raise ValueError(f"query_lens {lengths} does not fit {bs} requests of {num_tokens} rows")
+    store_slots = [store] * bs if slots is None else list(slots)
+    starts = [0]
+    for n in lengths:
+        starts.append(starts[-1] + n)
+    slot_map, positions = [], []
+    for r in range(bs):
+        for j in range(num_tokens):
+            slot_map.append(position + j if j < lengths[r] else -1)
+            positions.append(position + j if j < lengths[r] else 0)
+    rows = bs * num_tokens
+    if num_tokens == 1 and bs == 1:
+        load_idx, store_idx = torch.tensor([load]), torch.tensor([store])
+        accepted = None
+    else:
+        load_idx = torch.tensor([[[s] * num_tokens for s in req_slots]], dtype=torch.int64)
+        store_idx = torch.tensor([[[s] * num_tokens for s in store_slots]], dtype=torch.int64)
+        accepted = torch.ones(bs, dtype=torch.int32)
     return SimpleNamespace(
         is_prompt=False,
-        load_indices_tensor=torch.tensor([load]),
-        store_indices_tensor=torch.tensor([store]),
-        query_start_loc_p=torch.tensor([0, 1], dtype=torch.int32),
+        load_indices_tensor=load_idx,
+        store_indices_tensor=store_idx,
+        query_start_loc_p=torch.tensor(starts, dtype=torch.int32),
         has_initial_states_p=None,
         padding_mask_flat=None,
         direct_gdn_state=False,
-        num_accepted_tokens=None,
+        num_accepted_tokens=accepted,
         dflash_full_query=False,
-        slot_mapping=torch.tensor([position], dtype=torch.int64),
+        slot_mapping=torch.tensor(slot_map, dtype=torch.int64),
         context_lens_tensor=None,
         block_list=None,
         block_size=block_size,
-        block_table=torch.arange(max_blocks, dtype=torch.int32)[None],
+        block_table=torch.arange(max_blocks, dtype=torch.int32)[None].expand(rows, max_blocks).contiguous(),
+        positions=torch.tensor(positions, dtype=torch.int64),
     )
 
 
@@ -349,7 +394,9 @@ def cpu_model(ckpt_dir: Path,
               fp32: bool = False,
               num_slots: int = 4,
               qsa_mode: QsaMode | None = None,
-              max_model_len: int = 512):
+              max_model_len: int = 512,
+              speculative_config: dict | None = None,
+              load_format: str | None = None):
     """Build the tiny Flash-Next model on CPU and yield ``(vllm_config, model)``.
 
     Registers the plugin (``VLLM_PLUGINS`` is empty, so ``register()`` is called by hand),
@@ -366,6 +413,12 @@ def cpu_model(ckpt_dir: Path,
     stand-in on the ``.sparse_attn`` seam. Use ``max_model_len=4096`` for the 2600-token
     sparse-prefill prompts (the compressed cache has one row per 4 tokens).
 
+    ``speculative_config`` (a dict, e.g. ``{"method": "mtp", "num_speculative_tokens": 3}``)
+    and ``load_format`` (e.g. ``"dummy"``) are passed to ``EngineArgs`` only when not ``None``:
+    MTP whole-model tests pass both (the draft is built by :func:`cpu_draft_model`, and the
+    checkpoint has no MTP weights, so the target loads dummies). Omitting them keeps the old
+    behavior exactly.
+
     The distributed group is destroyed on exit, always. Only one ``cpu_model`` may be open
     at a time: a second ``init_distributed_environment`` asserts "already initialized".
     A build takes a few seconds.
@@ -374,15 +427,20 @@ def cpu_model(ckpt_dir: Path,
     prev_mode = os.environ.get("VLLM_HPU_FLASH_NEXT_QSA_MODE")
     if qsa_mode is not None:
         os.environ["VLLM_HPU_FLASH_NEXT_QSA_MODE"] = str(int(qsa_mode))
-    vllm_config = EngineArgs(model=str(ckpt_dir),
-                             tokenizer=str(ckpt_dir),
-                             skip_tokenizer_init=True,
-                             dtype="bfloat16",
-                             enable_prefix_caching=False,
-                             max_model_len=max_model_len,
-                             max_num_seqs=4,
-                             enforce_eager=True,
-                             language_model_only=True).create_engine_config()
+    engine_kwargs = dict(model=str(ckpt_dir),
+                         tokenizer=str(ckpt_dir),
+                         skip_tokenizer_init=True,
+                         dtype="bfloat16",
+                         enable_prefix_caching=False,
+                         max_model_len=max_model_len,
+                         max_num_seqs=4,
+                         enforce_eager=True,
+                         language_model_only=True)
+    if speculative_config is not None:
+        engine_kwargs["speculative_config"] = speculative_config
+    if load_format is not None:
+        engine_kwargs["load_format"] = load_format
+    vllm_config = EngineArgs(**engine_kwargs).create_engine_config()
     fd, init_file = tempfile.mkstemp(dir="/tmp")
     os.close(fd)
     with set_current_vllm_config(vllm_config):
@@ -409,3 +467,37 @@ def cpu_model(ckpt_dir: Path,
                 os.environ.pop("VLLM_HPU_FLASH_NEXT_QSA_MODE", None)
             else:
                 os.environ["VLLM_HPU_FLASH_NEXT_QSA_MODE"] = prev_mode
+
+
+def cpu_draft_model(vllm_config, fp32: bool = False, num_slots: int = 4, max_model_len: int = 512):
+    """Build the MTP draft model on CPU inside an open :func:`cpu_model` context, and return it.
+
+    Drives the same construction the engine's eagle/MTP draft path uses (CTO probe
+    ``spikes/flash-next-parity/mtp_probe.py``): ``replace(vllm_config, model_config=sc.draft_model_config)``,
+    then ``get_model(vllm_config=draft_vllm_config, model_config=sc.draft_model_config,
+    load_config=sc.draft_load_config)`` under ``set_model_tag("eagle_head")``, where ``sc`` is
+    ``vllm_config.speculative_config``. The draft is the registered ``HpuQwen4ExpMTP``; with
+    ``load_format="dummy"`` on the target's config it gets dummy weights (the tiny checkpoint
+    has no MTP weights until T1).
+
+    Must be called inside an open :func:`cpu_model` (it reuses that world-1 gloo group and the
+    current ``vllm_config``; a second build outside it has no distributed environment). Afterwards
+    converts with :func:`to_fp32` when ``fp32``, binds states (:func:`bind_cpu_states`) and swaps
+    in the SDPA attention (:func:`use_sdpa_attention`), exactly as :func:`cpu_model` does for the
+    target. Returns the built draft model.
+    """
+    from vllm.compilation.backends import set_model_tag
+    from vllm.config import replace
+    from vllm.model_executor.model_loader import get_model
+
+    sc = vllm_config.speculative_config
+    draft_vllm_config = replace(vllm_config, model_config=sc.draft_model_config)
+    with set_model_tag("eagle_head"):
+        draft = get_model(vllm_config=draft_vllm_config,
+                          model_config=sc.draft_model_config,
+                          load_config=sc.draft_load_config)
+    if fp32:
+        to_fp32(draft)
+    bind_cpu_states(draft, num_slots, fp32, max_model_len)
+    use_sdpa_attention(draft)
+    return draft

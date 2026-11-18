@@ -179,6 +179,10 @@ class HPUAttentionMetadata(HPUPagedAttentionMetadata, AttentionMetadata):
     store_indices_tensor: Optional[torch.Tensor] = None  # shape: [batch,]
     num_accepted_tokens: Optional[torch.Tensor] = None  # shape: [batch,]
     direct_gdn_state: bool = False
+    # True when the align-mode verification store lattice differs from the load
+    # lattice (a block-aligned context): the spec-path conv/PLE writes go to the
+    # store lattice's column-0 slot instead of the load slot (M3-T10b).
+    lattice_store_differs: bool = False
     # DFlash2 verifies a candidate block with bidirectional attention inside
     # that block. Keep the default causal so existing prefill paths are
     # unchanged, while allowing the draft model to opt out explicitly.

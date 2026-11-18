@@ -419,7 +419,8 @@ class HPUGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         forward_context = get_forward_context()
         attn_metadata = forward_context.attn_metadata
         if attn_metadata is None:
-            return (False, None, None, None, None, None, None, None, 0, 0, 0, 0, None, False, None, False, False)
+            return (False, None, None, None, None, None, None, None, 0, 0, 0, 0, None, False, None, False, False,
+                    False)
 
         is_prompt = bool(getattr(attn_metadata, "is_prompt", False))
         load_state_indices = self._resolve_state_indices(attn_metadata, "load_indices_tensor")
@@ -445,6 +446,7 @@ class HPUGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         padding_mask_flat = getattr(attn_metadata, "padding_mask_flat", None)
         direct_gdn_state = bool(getattr(attn_metadata, "direct_gdn_state", False))
         dflash_full_query = bool(getattr(attn_metadata, "dflash_full_query", False))
+        lattice_store_differs = bool(getattr(attn_metadata, "lattice_store_differs", False))
 
         if not is_prompt:
             num_decodes = (query_start_loc.numel() - 1 if query_start_loc is not None else
@@ -484,7 +486,8 @@ class HPUGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
 
         return (is_prompt, conv_state, ssm_state, load_state_indices, store_state_indices, query_start_loc,
                 has_initial_state, padding_mask_flat, num_decodes, mamba_block_size, prefill_num_seqs, prefill_seq_len,
-                initial_state, direct_gdn_state, num_accepted_tokens, dflash_full_query, state_is_active_view)
+                initial_state, direct_gdn_state, num_accepted_tokens, dflash_full_query, state_is_active_view,
+                lattice_store_differs)
 
     def forward(
         self,
@@ -508,7 +511,7 @@ class HPUGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         (is_prompt, conv_state, ssm_state, load_state_indices, store_state_indices, query_start_loc, has_initial_state,
          padding_mask_flat, num_decodes, mamba_block_size, prefill_num_seqs, prefill_seq_len, initial_state,
          direct_gdn_state, num_accepted_tokens, dflash_full_query,
-         state_is_active_view) = self._extract_metadata(num_tokens)
+         state_is_active_view, lattice_store_differs) = self._extract_metadata(num_tokens)
 
         # === Part 1: Input Projection ================================
         if hasattr(self, 'in_proj_qkv'):
@@ -781,7 +784,10 @@ class HPUGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                                                                                and not direct_conv_state
                                                                                and not is_spec_decode
                                                                                and not is_dflash_transition)
-                                         else None),
+                                         else (store_state_indices[:num_decodes, 0] if (
+                                             is_spec_decode
+                                             and lattice_store_differs
+                                             and store_state_indices is not None) else None)),
                 )
                 if use_gdn_recurrent:
                     # === RECURRENCE: the recurrence alone through gdn_recurrent_decode (full SSM pool, ===
@@ -832,6 +838,11 @@ class HPUGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                         assume_distinct_checkpoints=(self.compact_state_group_offset is not None
                                                      and not getattr(self.cache_config, "enable_prefix_caching", True)),
                         checkpoint_start=checkpoint_start,
+                        # Align mode (M3-T10b): token t's checkpoint lands on the
+                        # store lattice so a block-boundary token cannot overwrite
+                        # a completed prefix-cache block.
+                        store_indices=(store_state_indices[:num_decodes, :tokens_per_request]
+                                       if (lattice_store_differs and store_state_indices is not None) else None),
                     )
                     core_attn_out_result = core_attn_out_result.reshape(1, num_tokens, core_attn_out_result.size(-2),
                                                                         core_attn_out_result.size(-1))
