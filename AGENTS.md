@@ -80,7 +80,8 @@ Key subsystems:
 - **Tensor-parallel checks on CPU**: `spikes/cpu-tp/harness.py` runs 1/2/4/8 `gloo` ranks through vLLM's parallel layers (`run_ranks`, `record_collectives`).
 - **No `timeout(1)` on macOS**: cap a command with `perl -e 'alarm N; exec @ARGV' <command>`.
 - **TPC compiler and simulator**: `tools/flash_next/tpcsim.sh <command>` (`docs/design/flash-next/tpcsim.md`).
-- **Program documents**: `docs/design/flash-next/` (system map, reuse ledger, plan, run sheets). New fast paths ship behind an env flag in `vllm_gaudi/envs.py`, default off; modes are integer enums. One exception: `VLLM_HPU_GDN_CORE_DECODE` defaults to `1` (FUSED), because the fused GDN decode kernel is the decode path (`docs/design/flash-next/gdn-core-decode.md`). On CPU, GDN decode steps therefore run the op's Python reference kernel by default; `0` selects the torch path.
+- **GDN decode default**: `VLLM_HPU_GDN_CORE_DECODE` defaults to `1` (FUSED), an exception to the default-off rule for new fast paths (next bullet), because the fused GDN decode kernel is the decode path (`docs/design/flash-next/gdn-core-decode.md`). On CPU, GDN decode steps therefore run the op's Python reference kernel by default; `0` selects the torch path.
+- **Program documents**: `docs/design/flash-next/` (system map, reuse ledger, plan, run sheets). New fast paths ship behind an env flag in `vllm_gaudi/envs.py`, default off; modes are integer enums.
 
 ## Environment Variables
 
