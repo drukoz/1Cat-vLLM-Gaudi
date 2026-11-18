@@ -34,6 +34,19 @@ def test_vllm_install_pins_version():
     assert "VLLM_VERSION_OVERRIDE=0.28.1rc1.dev392+g8f816a3f6" in text
 
 
+def test_container_entry_toolchain():
+    # The base image lacks tpc-clang: the script installs habanalabs-tools so the native kernels
+    # build, drives both build flags from one NATIVE value, and records the toolchain (RUK-2709).
+    text = (SCRIPTS_DIR / "container_entry.sh").read_text()
+    assert "habanalabs-tools=1.24.1-482" in text
+    assert "habanalabs-tools_1.24.1-482_amd64.deb" in text
+    assert "/etc/ld.so.conf.d/habanatools.conf" in text
+    assert 'VLLM_GAUDI_BUILD_FLASHINFER="$NATIVE"' in text
+    assert 'VLLM_GAUDI_BUILD_GDN_FUSED="$NATIVE"' in text
+    assert "VLLM_GAUDI_BUILD_FLASHINFER=1" not in text
+    assert "toolchain.json" in text
+
+
 def test_run_rental_dry_run(tmp_path):
     proc = subprocess.run(
         ["bash", str(SCRIPTS_DIR / "run_rental.sh"), "--dry-run", "--model", "/tmp/x"],

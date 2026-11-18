@@ -91,12 +91,15 @@ A full run (three variants, no `--download`) is about 3–4 h; add the download 
 
 Notes:
 
-- When `tpc-clang` (from `habanalabs-tools` 1.24.1) is missing in the container, the plugin is
-  built without the fused GDN kernel (`VLLM_GAUDI_BUILD_GDN_FUSED=0`) and the script prints a
-  warning: the run continues on the PyTorch GDN path. This is a warning, not a stop.
+- The install adds `habanalabs-tools` 1.24.1-482 (tpc-clang) to the container when the image
+  lacks it, so the fused GDN decode and verification kernels and the flashinfer kernels are
+  compiled from the bundle (`install-0-toolchain.log`, `toolchain.json`). Only if that install
+  fails does the run continue without native kernels on the PyTorch GDN path, with
+  `native_build: 0` in `toolchain.json`, the G1b gate recording the missing library, and a
+  warning in the console.
 - The install logs are in the results folder as `install-<n>.log`; the per-phase records
-  (`startup.json`, `requests.jsonl`, `metrics.jsonl`, `status.json`, `summary.*`) are all in the
-  results folder for the run id.
+  (`startup.json`, `toolchain.json`, `requests.jsonl`, `metrics.jsonl`, `status.json`,
+  `summary.*`) are all in the results folder for the run id.
 
 ## What to send back
 
