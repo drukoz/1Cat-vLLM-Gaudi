@@ -1,6 +1,6 @@
 # RUK-2709 Flash-Next on Gaudi: plan
 
-Kind: **Program**. Version 0.4, 2026-11-17: the M3 section is rewritten from seven facts checked on this Mac after M2 merged (`e4b265f`; system map §17, facts 30-36): upstream's MTP class builds on CPU through the fork's seams after one more rebinding, the target already exports the multi-stream hidden, the GDN verification lattice exists in the fork's layer but the runner builds it only for DFlash2, PLE and sparse QSA refuse speculation today, and prefix caching changes what the lattice means, so MTP ships for prefix caching off first and the align-mode lattice last. Version 0.3, 2026-11-17: the M2 section is rewritten from five facts checked on this Mac after M1 merged (`d635485`; system map §17, facts 25-29): sparse QSA is the correctness requirement for every prompt beyond 2050 tokens, the side caches become plugin-owned tensors, the GDN tactics are torch-level so the TP4/TP8 gates are a Python change. Version 0.2, 2026-11-17: v0.1 was written from the system map (v0.5) and the reuse ledger (v0.3) after all Phase 0 research (R1–R7, R4b) and spikes (S0, S3, S4) reported; v0.2 rewrites the M1 section after M0 merged (`383e5ab`) with the facts checked for it. The working copy is the `plan` document on RUK-2709; this file is refreshed with the pull request.
+Kind: **Program**. Version 0.5, 2026-11-18: adds "Track: fused GDN decode kernel" (RUK-2812, merged through #3), which makes the fused kernel the GDN decode path. Version 0.4, 2026-11-17: the M3 section is rewritten from seven facts checked on this Mac after M2 merged (`e4b265f`; system map §17, facts 30-36): upstream's MTP class builds on CPU through the fork's seams after one more rebinding, the target already exports the multi-stream hidden, the GDN verification lattice exists in the fork's layer but the runner builds it only for DFlash2, PLE and sparse QSA refuse speculation today, and prefix caching changes what the lattice means, so MTP ships for prefix caching off first and the align-mode lattice last. Version 0.3, 2026-11-17: the M2 section is rewritten from five facts checked on this Mac after M1 merged (`d635485`; system map §17, facts 25-29): sparse QSA is the correctness requirement for every prompt beyond 2050 tokens, the side caches become plugin-owned tensors, the GDN tactics are torch-level so the TP4/TP8 gates are a Python change. Version 0.2, 2026-11-17: v0.1 was written from the system map (v0.5) and the reuse ledger (v0.3) after all Phase 0 research (R1–R7, R4b) and spikes (S0, S3, S4) reported; v0.2 rewrites the M1 section after M0 merged (`383e5ab`) with the facts checked for it. The working copy is the `plan` document on RUK-2709; this file is refreshed with the pull request.
 
 ## What changed between the map and this plan
 
@@ -196,11 +196,37 @@ FP8 at TP4 needs expert parallelism (R6: 640/4 = 160 per rank is not a multiple 
 
 Only what stages 3–6 show: FP8 KV cache (block 896 or 1664), warmup time, sampler, communication overlap, the compiled decoder (system map section 16, items 2c and 3a–3c).
 
+### Track: fused GDN decode kernel (RUK-2812, `feat/flash-next-gaudi-gdn-fused`, merged through #3)
+
+A separate track, planned on RUK-2733 and RUK-2812, wrote native Gaudi2 TPC kernels for the GDN decode step and
+merged them into the program branch on 2026-11-18. Contract and layouts: [gdn-core-decode.md](gdn-core-decode.md);
+simulator setup: [tpcsim.md](tpcsim.md).
+
+- `torch.ops.flashinfer_gaudi.gdn_core_decode` is one TPC kernel per GDN layer per decode step (T = 1), between the
+  in-projection and `out_proj`: the conv update and SiLU, the gates, the Q/K L2 norm, the delta rule, the gated
+  RMSNorm and both state writes, with separate load and store slots. It builds as its own library,
+  `libgdn_fused_gaudi2.so` (`VLLM_GAUDI_BUILD_GDN_FUSED=1`); if that build fails, the rest of the install is kept.
+- **It is the decode path.** `VLLM_HPU_GDN_CORE_DECODE` defaults to `1` (FUSED) for every model that uses this GDN
+  layer; `0` selects the torch path, and `2` (RECURRENCE, the recurrence only) is a bisect tool. Without the
+  library, the torch path runs and the process logs one warning at startup; a layer the op does not fit runs the
+  torch path with one warning for that layer. Speculative decode steps (M3) keep the torch path.
+- Checked before the rental: CPU parity at TP1/2/4/8 head counts (load != store, padded batches, slot reuse), and
+  both kernels against the torch reference on the Gaudi2 TPC simulator.
+- On the rental: stage 1 builds the library; stage 1b gates it before any model runs (simulator, op numerics on the
+  card, a 1,000-step graph replay; a failure sets `VLLM_HPU_GDN_CORE_DECODE=0` for the session); stage 3 runs on
+  mode 0, so its A/Bs keep their meaning; row 3f measures the kernel against its targets.
+- Phase 2, after M3 merges: the T = 1 + k verification kernel. Its contract and torch reference are in place
+  (`gdn_core_verify_reference`, RUK-2915): each draft node loads its `parent_idx` node's state, so a draft tree
+  needs no kernel change.
+- Merging M3 into the program branch: the run sheet conflicts once, because M3's stage 3e and this track's row 3f
+  were both added after 3d. Keep both, 3e first. A new run-sheet section takes the next free letter (3g).
+
 ## Qualification run sheet (stages, fail-fast; T8 writes stages 1–2)
 
 1. Build the image at the program branch and compile native code; record `flashinfer_gaudi.get_capabilities()`.
+   1b (fused GDN track): the simulator, op numerics on the card and a 1,000-step graph replay, as pass/fail gates before any model runs.
 2. TP8 BF16 bring-up on the **tiny checkpoint** first (greedy agreement with `reference.json`, TP1 then TP8), then the real checkpoint: startup lines (`Usable num_blocks`, `Maximum concurrency`, `kv cache group sizes`, `GDN layers detected`), compared with S4's prediction; 8 short prompts for coherence; the GSM8K sample.
-3. Flag-by-flag A/B of each native path against its torch path; 3e (M3): MTP on/off, acceptance length and the decode sweep at k = 1, 2, 3.
+3. Flag-by-flag A/B of each native path against its torch path; 3e (M3): MTP on/off, acceptance length and the decode sweep at k = 1, 2, 3; 3f (fused GDN track): the kernel against its targets, with mode 0 once as the baseline.
 4. R7's variants A–D and the prefix-cache hit rate.
 5. TP1/2/4/8, PP2×TP4 and TP+EP throughput and latency.
 6. 128K–262K contexts and the eight-agent stress run.
