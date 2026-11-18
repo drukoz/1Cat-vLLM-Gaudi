@@ -12,12 +12,15 @@
 #
 # Options:
 #     --version V (default 1.24.1)  --build N (default 482)  --image IMG
+#     --data-disk DEV  --mount DIR (default /models)
 #     --no-pull  --reinstall-driver  --force  --dry-run  -h/--help
 
 set -euo pipefail
 
 VAULT="https://vault.habana.ai/artifactory"
 DEFAULT_IMAGE="vault.habana.ai/gaudi-docker/1.24.1/ubuntu22.04/habanalabs/pytorch-installer-2.11.0:latest"
+FS_LABEL="fn-models"       # ext4 label of the data disk this script makes
+DOWNLOAD_NEED_GB=250       # free GB a run_rental.sh --download needs under --model
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LOG_DIR="$SCRIPT_DIR/prepare-host-logs"
@@ -30,6 +33,9 @@ NO_PULL=0
 REINSTALL_DRIVER=0
 FORCE=0
 DRY_RUN=0
+DATA_DISK=""
+MOUNT="/models"
+MOUNT_SET=0
 ORIG_ARGS=("$@")  # kept for the sudo re-exec; the option loop below consumes "$@"
 
 # Ubuntu 22.04 apt runs needrestart, whose dialog would hang unseen (output goes to the step logs).
@@ -40,6 +46,8 @@ usage() {
     echo "  --version V          Gaudi software release (default: $VERSION)"
     echo "  --build N            release build id (default: $BUILD); the apt pin is V-N"
     echo "  --image IMG          container image (default: $DEFAULT_IMAGE)"
+    echo "  --data-disk DEV      make ext4 (label $FS_LABEL) on a blank, unmounted DEV, mount it and add an fstab line"
+    echo "  --mount DIR          data-disk mount point (default: $MOUNT); needs --data-disk"
     echo "  --no-pull            skip the image pull and the smoke test"
     echo "  --reinstall-driver   replace a driver whose version differs from V-N"
     echo "  --force              continue on a non-22.04 Ubuntu"
@@ -59,6 +67,15 @@ while [ $# -gt 0 ]; do
             ;;
         --image)
             IMAGE="$2"
+            shift 2
+            ;;
+        --data-disk)
+            DATA_DISK="$2"
+            shift 2
+            ;;
+        --mount)
+            MOUNT="$2"
+            MOUNT_SET=1
             shift 2
             ;;
         --no-pull)
@@ -88,6 +105,20 @@ while [ $# -gt 0 ]; do
             ;;
     esac
 done
+
+if [ "$MOUNT_SET" -eq 1 ] && [ -z "$DATA_DISK" ]; then
+    echo "error: --mount needs --data-disk" >&2
+    exit 2
+fi
+if [ "$MOUNT_SET" -eq 1 ]; then
+    case "$MOUNT" in
+        /*) ;;
+        *)
+            echo "error: --mount must be an absolute path: $MOUNT" >&2
+            exit 2
+            ;;
+    esac
+fi
 
 PIN="$VERSION-$BUILD"
 INSTALLER_URL="$VAULT/gaudi-installer/$VERSION/habanalabs-installer.sh"
@@ -139,6 +170,162 @@ run_logged() {
     } >>"$STEP_LOG" 2>&1
 }
 
+# --- data disk (step 1b) --------------------------------------------------------
+
+DISK_STATE=""
+DISK_UUID=""
+
+disk_refuse() {
+    echo "host step 1b (disks): REFUSED: $1" >&2
+    echo "remedy: this script formats only a blank, unmounted, unpartitioned device; pick another device from lsblk, or pass --mount DIR" >&2
+    exit 1
+}
+
+nearest_existing_dir() {
+    local d="$1"
+    while [ ! -d "$d" ] && [ "$d" != "/" ]; do
+        d="$(dirname "$d")"
+    done
+    printf '%s\n' "$d"
+}
+
+disk_free_gb() {
+    # whole GB free on the filesystem of the closest existing folder at or above $1 (df -Pk, 1K blocks).
+    local base
+    base="$(nearest_existing_dir "$1")"
+    df -Pk "$base" 2>/dev/null | awk 'NR==2 {print int($4/1048576)}'
+}
+
+check_data_disk() {
+    # Read-only checks on $DATA_DISK: sets DISK_STATE to blank | ours | ready, or refuses (exit 1).
+    # Never writes. A check that cannot run, or answers unexpectedly, is a refusal.
+    local dev="$DATA_DISK"
+    local t="" nlines="" out="" rc=0 mps="" mp_first="" w_out="" w_rc=0 tline=""
+    t="$(lsblk -dn -o TYPE "$dev" 2>/dev/null | head -1 | tr -d '[:space:]' || true)"
+    if [ "$t" != "disk" ] && [ "$t" != "part" ]; then
+        disk_refuse "$dev is not a disk or partition (lsblk TYPE '$t')"
+    fi
+    nlines="$(lsblk -n -o NAME "$dev" 2>/dev/null | grep -c '[^[:space:]]' || true)"
+    if [ "${nlines:-0}" -gt 1 ]; then
+        disk_refuse "$dev has partitions"
+    fi
+    out="$(blkid -p -o export "$dev" 2>/dev/null)" && rc=0 || rc=$?
+    DISK_STATE=""
+    if [ "$rc" -eq 2 ]; then
+        DISK_STATE="blank"
+    elif [ "$rc" -eq 0 ]; then
+        if printf '%s\n' "$out" | grep -qx 'TYPE=ext4' && printf '%s\n' "$out" | grep -qx "LABEL=$FS_LABEL"; then
+            DISK_STATE="ours"
+            DISK_UUID="$(printf '%s\n' "$out" | sed -n 's/^UUID=//p' | head -1 || true)"
+        else
+            tline="$(printf '%s\n' "$out" | grep '^TYPE=' | head -1 || true)"
+            disk_refuse "$dev already has a signature (blkid: $tline); it may hold data"
+        fi
+    else
+        disk_refuse "blkid could not read $dev (exit $rc); run as root"
+    fi
+    mps="$(lsblk -n -o MOUNTPOINT "$dev" 2>/dev/null | grep '[^[:space:]]' || true)"
+    if [ -n "$mps" ]; then
+        mp_first="$(printf '%s\n' "$mps" | head -1)"
+        if [ "$DISK_STATE" = "ours" ] && printf '%s\n' "$mps" | grep -qxF "$MOUNT"; then
+            DISK_STATE="ready"
+            return 0
+        fi
+        disk_refuse "$dev is mounted at $mp_first"
+    fi
+    if [ "$DISK_STATE" = "blank" ]; then
+        w_out="$(wipefs -n "$dev" 2>/dev/null)" && w_rc=0 || w_rc=$?
+        if [ "$w_rc" -ne 0 ]; then
+            disk_refuse "wipefs could not read $dev"
+        fi
+        if [ -n "$w_out" ]; then
+            disk_refuse "wipefs -n sees signatures on $dev"
+        fi
+    fi
+    if [ "$DISK_STATE" != "ready" ]; then
+        if [ -d "$MOUNT" ] && [ -n "$(ls -A "$MOUNT" 2>/dev/null)" ]; then
+            disk_refuse "$MOUNT is not empty; mounting over it would hide its files: move them, or pass --mount DIR"
+        fi
+        if grep -q " $MOUNT " /proc/mounts 2>/dev/null; then
+            disk_refuse "$MOUNT is already a mount point in /proc/mounts; pass --mount DIR"
+        fi
+    fi
+    return 0
+}
+
+list_unused_disks() {
+    # Whole disks with no partitions, no filesystem and no mount point, as the operator sees them.
+    local n="" t="" parts="" fsty="" mnts="" size=""
+    lsblk -dn -o NAME,TYPE 2>/dev/null | while read -r n t; do
+        [ "$t" = "disk" ] || continue
+        parts="$(lsblk -n -o NAME "/dev/$n" 2>/dev/null | grep -c '[^[:space:]]' || true)"
+        fsty="$(lsblk -dn -o FSTYPE "/dev/$n" 2>/dev/null | tr -d '[:space:]' || true)"
+        mnts="$(lsblk -n -o MOUNTPOINT "/dev/$n" 2>/dev/null | grep -c '[^[:space:]]' || true)"
+        if [ "${parts:-1}" -le 1 ] && [ -z "$fsty" ] && [ "${mnts:-0}" -eq 0 ]; then
+            size="$(lsblk -dn -o SIZE "/dev/$n" 2>/dev/null | tr -d '[:space:]' || true)"
+            echo "unused disk: /dev/$n ($size): no filesystem, not mounted; to use it: sudo bash $0 --data-disk /dev/$n"
+        fi
+    done
+}
+
+step1b_disks() {
+    ensure_log_dir
+    step_start 1b disks
+    echo "disks:"
+    lsblk -o NAME,SIZE,TYPE,FSTYPE,MOUNTPOINT 2>/dev/null || echo "(lsblk failed)"
+    echo "free space:"
+    df -h / "$(nearest_existing_dir "$MOUNT")" 2>/dev/null || true
+    if [ -d /var/lib/docker ]; then
+        df -h /var/lib/docker 2>/dev/null || true
+    fi
+    list_unused_disks || true
+    local free_gb uuid
+    if [ -z "$DATA_DISK" ]; then
+        free_gb="$(disk_free_gb "$MOUNT" || true)"
+        if [ -n "$free_gb" ] && [ "$free_gb" -lt "$DOWNLOAD_NEED_GB" ]; then
+            echo "note: $MOUNT has $free_gb GB free; run_rental.sh --download needs $DOWNLOAD_NEED_GB GB: use --data-disk with an unused disk above, or the RAM-disk fallback in the run sheet" >&2
+        fi
+        step_ok
+        return 0
+    fi
+    check_data_disk
+    if [ "$DISK_STATE" = "ready" ]; then
+        echo "host step 1b (disks): $DATA_DISK already mounted at $MOUNT"
+        step_skipped
+        return 0
+    fi
+    if [ "$DISK_STATE" = "blank" ]; then
+        if ! run_logged "mkfs.ext4 -F -L $FS_LABEL -m 0 $DATA_DISK"; then
+            step_failed "mkfs.ext4 on $DATA_DISK failed; see $STEP_LOG"
+        fi
+    fi
+    uuid="$(blkid -p -o value -s UUID "$DATA_DISK" 2>/dev/null || true)"
+    if [ -z "$uuid" ]; then
+        step_failed "cannot read the UUID of $DATA_DISK (blkid -p -o value -s UUID) after mkfs"
+    fi
+    mkdir -p "$MOUNT" || step_failed "cannot create $MOUNT"
+    if ! grep -q "UUID=$uuid" /etc/fstab 2>/dev/null; then
+        if awk -v m="$MOUNT" '!/^[[:space:]]*(#|$)/ && $2==m {found=1} END {exit found?0:1}' /etc/fstab 2>/dev/null; then
+            step_failed "/etc/fstab already mounts something at $MOUNT"
+        fi
+        if [ ! -f /etc/fstab.fn-backup ]; then
+            cp -p /etc/fstab /etc/fstab.fn-backup || step_failed "cannot back up /etc/fstab to /etc/fstab.fn-backup"
+        fi
+        printf '%s\n' "UUID=$uuid $MOUNT ext4 defaults,nofail,x-systemd.device-timeout=30s 0 2" >>/etc/fstab ||
+            step_failed "cannot append the fstab line to /etc/fstab"
+    fi
+    systemctl daemon-reload 2>/dev/null || true
+    if ! run_logged "mount $MOUNT"; then
+        step_failed "mount $MOUNT failed; check the fstab line (UUID=$uuid) in $STEP_LOG"
+    fi
+    if ! lsblk -n -o MOUNTPOINT "$DATA_DISK" 2>/dev/null | grep -qxF "$MOUNT"; then
+        step_failed "$DATA_DISK is not mounted at $MOUNT after mount; check lsblk and /etc/fstab"
+    fi
+    free_gb="$(disk_free_gb "$MOUNT" || true)"
+    echo "data disk: $DATA_DISK mounted at $MOUNT, $free_gb GB free"
+    step_ok
+}
+
 # --- dry run ------------------------------------------------------------------
 
 dry_run() {
@@ -152,6 +339,41 @@ dry_run() {
         "uname -m  # must be x86_64" \
         "lspci -d 1da3: | wc -l  # CARDS; 0 is a stop (no Gaudi devices on the PCI bus)" \
         "curl -fsI $INSTALLER_URL  # vault reachable, version $VERSION exists"
+    echo
+    echo "host step 1b (disks):"
+    printf '%s\n' \
+        "lsblk -o NAME,SIZE,TYPE,FSTYPE,MOUNTPOINT" \
+        "df -h / $(nearest_existing_dir "$MOUNT")  # free space: /, the closest existing folder at or above $MOUNT, and /var/lib/docker" \
+        "unused disks: lsblk -dn -o NAME,TYPE  # printed as 'unused disk: /dev/<n> (<size>): ... to use it: sudo bash prepare_host.sh --data-disk /dev/<n>'"
+    if [ -n "$DATA_DISK" ]; then
+        if [ "$(id -u)" -ne 0 ]; then
+            echo "note: not root, so blkid/wipefs may not read the device; the real run repeats these checks as root"
+        fi
+        check_data_disk
+        case "$DISK_STATE" in
+            blank)
+                printf '%s\n' \
+                    "mkfs.ext4 -F -L $FS_LABEL -m 0 $DATA_DISK" \
+                    "mkdir -p $MOUNT" \
+                    "UUID=<uuid after mkfs> $MOUNT ext4 defaults,nofail,x-systemd.device-timeout=30s 0 2  # appended to /etc/fstab (backed up to /etc/fstab.fn-backup once)" \
+                    "systemctl daemon-reload" \
+                    "mount $MOUNT"
+                ;;
+            ours)
+                printf '%s\n' \
+                    "already ext4 label $FS_LABEL: no mkfs" \
+                    "mkdir -p $MOUNT" \
+                    "UUID=${DISK_UUID:-<uuid after mkfs>} $MOUNT ext4 defaults,nofail,x-systemd.device-timeout=30s 0 2  # appended to /etc/fstab when missing (backed up once)" \
+                    "systemctl daemon-reload" \
+                    "mount $MOUNT"
+                ;;
+            ready)
+                printf '%s\n' "already mounted at $MOUNT: nothing to do"
+                ;;
+        esac
+    else
+        echo "--data-disk DEV [--mount DIR]: formats a blank DEV as ext4 (label $FS_LABEL) and mounts it at $MOUNT; never without the option"
+    fi
     echo
     echo "host step 2 (apt prerequisites):"
     printf '%s\n' \
@@ -435,7 +657,7 @@ step9_smoke() {
 }
 
 summary() {
-    local drv hlv dkr rt img
+    local drv hlv dkr rt img free_gb
     drv="$(dpkg-query -W -f='${Version}' habanalabs-dkms 2>/dev/null || echo 'not installed')"
     hlv="-"
     if command -v hl-smi >/dev/null 2>&1; then
@@ -459,6 +681,9 @@ summary() {
     printf '%-20s %s\n' "runtime habana" "$rt"
     printf '%-20s %s\n' "image pulled" "$img"
     printf '%-20s %s\n' "cards" "$CARDS"
+    free_gb="$(disk_free_gb "$MOUNT" || true)"
+    printf '%-20s %s\n' "free at $MOUNT" "${free_gb:-?} GB"
+    printf '%-20s %s\n' "data disk" "${DATA_DISK:-none}"
     echo
     echo "next: bash run_rental.sh --model /models/Qwen3.8-Flash-Next-FP8"
     echo "  (add --download if the checkpoint is not on the node)"
@@ -471,6 +696,7 @@ main() {
         exit 0
     fi
     step1_checks
+    step1b_disks
     step2_apt
     step3_driver
     step4_verify_driver
