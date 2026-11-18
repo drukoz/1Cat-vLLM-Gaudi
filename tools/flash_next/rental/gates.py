@@ -2,21 +2,26 @@
 """Fail-fast gates of the Flash-Next rental (plan M4, RUK-2709).
 
 One function per gate: preflight (cards, checkpoint, FP8 layout, disk),
-build (installed vLLM / vllm_gaudi / flashinfer_gaudi), tiny TP8 token
-agreement, capacity from the startup line, and coherence with a
-120K-token needle. Every gate returns ``(GateStatus, details)`` and never
-raises for an expected failure: the exception text goes into
-``details["error"]``. Python 3.10 standard library only.
+build (installed vLLM / vllm_gaudi / flashinfer_gaudi), the fused GDN
+decode kernel on the card (G1b: the kernel's own checks, and the GDN
+decode mode every later server must use), tiny TP8 token agreement,
+capacity from the startup line, and coherence with a 120K-token needle.
+Every gate returns ``(GateStatus, details)`` and never raises for an
+expected failure: the exception text goes into ``details["error"]``.
+Python 3.10 standard library only.
 """
 
 from __future__ import annotations
 
 import json
+import os
+import re
 import shutil
 import socket
 import subprocess
 import sys
 import tempfile
+import time
 import urllib.error
 import urllib.request
 from collections import Counter
@@ -298,6 +303,154 @@ def build_check(python: str = sys.executable) -> tuple[GateStatus, dict]:
     except Exception as e:  # noqa: BLE001 - the gate never raises
         details["error"] = "%s: %s" % (type(e).__name__, e)
         return GateStatus.FAILED, details
+
+
+GDN_MODE_ENV = "VLLM_HPU_GDN_CORE_DECODE"
+GDN_FALLBACK_RE = re.compile(r"has no HPU kernel|GDN core decode .* is off for")
+GDN_OP_TIMEOUT_S = 1800.0      # test_hpu_op.py
+GDN_REPLAY_TIMEOUT_S = 1800.0  # each replay run
+GDN_BENCH_TIMEOUT_S = 1200.0
+
+GDN_LIB_LOOKUP_CODE = ("import flashinfer_gaudi, pathlib; "
+                       "print(pathlib.Path(flashinfer_gaudi.__file__).parent / 'lib')")
+GDN_KERNEL_LIB = "libgdn_fused_gaudi2.so"
+GDN_MODE_FUSED = 1
+GDN_MODE_PYTORCH = 0
+GDN_FALLBACK_ENV = {GDN_MODE_ENV: "0"}
+
+
+def _gdn_pytest_summary(output: str) -> dict:
+    """The counts of pytest's last summary line ("2 failed, 5 passed in 3.4s"); zeros when absent."""
+    counts = {"passed": 0, "skipped": 0, "failed": 0, "error": 0}
+    summary = None
+    for line in output.splitlines():
+        if re.search(r"\b\d+ (passed|failed|skipped|error)", line):
+            summary = line
+    for name in counts:
+        m = re.search(r"(\d+) %s" % name, summary) if summary else None
+        counts[name] = int(m.group(1)) if m else 0
+    return counts
+
+
+def fused_gdn(plugin_root: Path, out_dir: Path, python: str = sys.executable) -> tuple[GateStatus, dict]:
+    """G1b. details always has "mode" (1 = the fused kernel stays on, 0 = later servers run the PyTorch path)
+    and "env" ({} or {"VLLM_HPU_GDN_CORE_DECODE": "0"}; the orchestrator adds it to every later server)."""
+    started = time.monotonic()
+    details: dict = {"mode": GDN_MODE_PYTORCH, "env": dict(GDN_FALLBACK_ENV)}
+
+    def finish(status: GateStatus, reason: str = None) -> tuple[GateStatus, dict]:
+        if reason is not None:
+            details["reason"] = reason
+        details["seconds"] = time.monotonic() - started
+        return status, details
+
+    step = "the fused GDN library lookup"
+    timeout_s = BUILD_TIMEOUT_S
+    try:
+        plugin_root = Path(plugin_root)
+        out_dir = Path(out_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        # 1. the installed library folder (the bundle's source tree has an empty flashinfer_gaudi/lib/)
+        lookup = subprocess.run([str(python), "-c", GDN_LIB_LOOKUP_CODE],
+                                cwd=tempfile.gettempdir(),  # never the repository root
+                                capture_output=True,
+                                text=True,
+                                timeout=timeout_s)
+        if lookup.returncode != 0:
+            return finish(GateStatus.SKIPPED, "the fused GDN library is not installed: the interpreter exited %d: %s" %
+                          (lookup.returncode, (lookup.stderr or "").strip()[:200]))
+        lib_dir = Path(lookup.stdout.strip())
+        kernel = lib_dir / GDN_KERNEL_LIB
+        ops_files = sorted(lib_dir.glob("gdn_fused_ops*.so"))
+        if not kernel.is_file():
+            return finish(GateStatus.SKIPPED,
+                          "the fused GDN library is not installed: %s missing in %s" % (GDN_KERNEL_LIB, lib_dir))
+        if len(ops_files) != 1:
+            return finish(GateStatus.SKIPPED,
+                          "the fused GDN library is not installed: %d gdn_fused_ops*.so files in %s, expected 1" %
+                          (len(ops_files), lib_dir))
+
+        # 2. the environment of steps 3-5: the plugin tree first on PYTHONPATH, the installed library
+        #    by path, and the fused kernel ON for the checks themselves
+        env = dict(os.environ)
+        env["PYTHONPATH"] = str(plugin_root)
+        env["GDN_FUSED_GAUDI_KERNEL_LIBRARY"] = str(kernel)
+        env["GDN_FUSED_GAUDI_NATIVE_LIBRARY"] = str(ops_files[0])
+        env.pop(GDN_MODE_ENV, None)
+
+        def run(cmd: list, log_name: str, limit: float, append: bool = False):
+            nonlocal step, timeout_s
+            step = " ".join(str(arg) for arg in cmd[1:])
+            timeout_s = limit
+            proc = subprocess.run([str(arg) for arg in cmd],
+                                  cwd=str(plugin_root),
+                                  env=env,
+                                  capture_output=True,
+                                  text=True,
+                                  timeout=limit)
+            text = (proc.stdout or "") + (proc.stderr or "")
+            with open(out_dir / log_name, "a" if append else "w", encoding="utf-8") as f:
+                f.write(text)
+            return proc, text
+
+        # 3. the op numerics on the card; a module skip counts as a failure
+        proc, text = run(
+            [python, "-m", "pytest", "-q", "-rs", "-p", "no:cacheprovider",
+             "tests/unit_tests/gdn_core_decode/test_hpu_op.py"], "hpu_op.log", GDN_OP_TIMEOUT_S)
+        counts = _gdn_pytest_summary(text)
+        details["hpu_op"] = {
+            "exit": proc.returncode,
+            "passed": counts["passed"],
+            "skipped": counts["skipped"],
+            "failed": counts["failed"],
+        }
+        details["failed_tests"] = [ln for ln in text.splitlines() if ln.startswith("FAILED ")]
+        op_ok = (proc.returncode == 0 and counts["passed"] > 0 and counts["skipped"] == 0 and counts["failed"] == 0 and
+                 counts["error"] == 0)
+        if not op_ok:
+            if counts["skipped"] > 0:
+                return finish(GateStatus.FAILED, "test_hpu_op.py skipped")
+            return finish(GateStatus.FAILED, "test_hpu_op.py failed (exit %d)" % proc.returncode)
+
+        # 4. the 1,000-step graph replay against eager, two cases, in one appended log
+        details["replay"] = []
+        for case in ("tp8_b16", "tp8_b64"):
+            cmd = [python, "tools/flash_next/gdn_core_decode_replay.py", "--steps", "1000"]
+            if case != "tp8_b16":
+                cmd += ["--case", case]
+            proc, _ = run(cmd, "replay.log", GDN_REPLAY_TIMEOUT_S, append=True)
+            details["replay"].append({"case": case, "exit": proc.returncode})
+            if proc.returncode != 0:
+                return finish(GateStatus.FAILED,
+                              "gdn_core_decode_replay.py (%s) failed (exit %d)" % (case, proc.returncode))
+
+        # 5. the speed measurement: recorded only, its result never changes the status
+        try:
+            proc, text = run(
+                [python, "tools/flash_next/gdn_core_decode_bench.py", "--tp", "2,8", "--batches", "1,16,64"],
+                "bench.log", GDN_BENCH_TIMEOUT_S)
+            details["bench"] = {
+                "exit": proc.returncode,
+                "lines": [ln.strip() for ln in text.splitlines() if "slope" in ln or "B=1" in ln],
+            }
+        except subprocess.TimeoutExpired:  # a slow measurement never turns the verified kernel off
+            details["bench"] = {"exit": None, "timed_out": True, "lines": []}
+
+        # 6. the fused kernel stays on
+        details["mode"] = GDN_MODE_FUSED
+        details["env"] = {}
+        return finish(GateStatus.PASSED)
+    except subprocess.TimeoutExpired:
+        return finish(GateStatus.TIMED_OUT, "%s did not finish in %s s" % (step, timeout_s))
+    except Exception as e:  # noqa: BLE001 - the gate never raises
+        details["error"] = "%s: %s" % (type(e).__name__, e)
+        return finish(GateStatus.FAILED)
+
+
+def gdn_fallback_lines(log_text: str) -> list[str]:
+    """The lines of a server log that match GDN_FALLBACK_RE, stripped, in order."""
+    return [ln.strip() for ln in (log_text or "").splitlines() if GDN_FALLBACK_RE.search(ln)]
 
 
 def tiny_compare(base_url: str, reference_path: Path) -> tuple[GateStatus, dict]:
