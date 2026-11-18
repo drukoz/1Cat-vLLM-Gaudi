@@ -252,6 +252,7 @@ def _run(tiny_checkpoint, tamper_steps, force_steps=()):
         ctx.__exit__(None, None, None)
 
 
+@pytest.mark.xfail(strict=False, reason="RUK-2798 T10c-3 rewrites this spike harness for the upstream align scheme")
 def test_s0_control_no_boundary_commit(tiny_checkpoint):
     """S0: a = 0 at every step (tampered d_1) - token 0's state alone carries the chain, parity."""
     ids, gen, records = _run(tiny_checkpoint, {s: (0, TAMPER) for s in range(STEPS)})

@@ -613,13 +613,15 @@ def test_non_aligned_boundary_commit_with_equal_lattices(tiny_checkpoint):
         # Straight decodes of the committed input rows (gen[0] .. gen[2]) at slot 5.
         _straight_decode(model, vllm_config, eos, seq, p_last, p_last + a + 1, atts)
 
-        # Boundary commits, block_size 2: context_len 33 is unaligned and t = 2 completes a block.
+        # Boundary commits, block_size 2: context_len 33 is unaligned, so t = 0 completes the block
+        # of position 33 (row 16, SPEC_SLOT) and t = 2 completes the block of the last accepted token.
         ctx_len = p_last  # 33 computed tokens (the prompt); row 0 = the first sampled token
         assert ctx_len % 2 == 1
         block_rows = [[SPEC_SLOT] * 17 + [block_slot]]
         pairs = boundary_commits([ctx_len], [a + 1], 2, md.store_indices_tensor[0], block_rows,
                                  md.load_indices_tensor[0])
-        assert [(i, t, s, d) for (i, t, s, d) in pairs] == [(0, 2, LATTICE[2], block_slot)]
+        assert [(i, t, s, d) for (i, t, s, d) in pairs] == [(0, 0, LATTICE[0], SPEC_SLOT),
+                                                            (0, 2, LATTICE[2], block_slot)]
         conv_pairs = [(i, t, int(md.store_indices_tensor[0][0][0]), d) for (i, t, _s, d) in pairs]
         ts = [t for (_i, t, _s, _d) in pairs]
         for m in gdn:

@@ -1,17 +1,23 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Boundary commits of accepted verification tokens (M3-T10b).
+"""Boundary commits and pre-step state copies for align-mode MTP (M3-T10b, T10c).
 
 Pure torch/int helpers, importable on CPU, so they can be unit-tested without an HPU.
 
 Under align mode the verification writes the state after candidate ``t`` into the store
-lattice slot ``store[i, t]`` (``recurrent_lattice.align_lattice``), while the accepted
-checkpoint a request must expose for prefix-cache hits lives in the POSITION blocks of
-its block table. An accepted token at position ``context_len + t`` completes the block
-holding that position when ``(context_len + t + 1) % block_size == 0``; token 0 is the
-store lattice's own job (``store[0]`` is the block of token 0's position when the context
-is block-aligned), so the runner copies the states of the COMMITTED tokens ``1 <= t <
-accepted`` that complete a block from the store lattice into that block's slot. The
-copies run at sample time, once the accepted length of the step is known.
+lattice slot ``store[i, t]`` (``recurrent_lattice.align_lattice``, ``load == store``), while
+the accepted checkpoint a request must expose for prefix-cache hits lives in the POSITION
+blocks of its block table. An accepted token at position ``context_len + t`` completes the
+block holding that position when ``(context_len + t + 1) % block_size == 0``, so the runner
+copies the states of the COMMITTED tokens ``0 <= t < accepted`` that complete a block from the
+store lattice into that block's slot (``boundary_commits``); token 0 is committed like any
+other token because the store lattice no longer special-cases it. The copies run at sample
+time, once the accepted length of the step is known.
+
+Before the step, ``align_precopy_plan`` moves the running recurrent state into the request's
+running block ``curr`` when the window has moved (or, with ``normalize``, when the previous
+step left more than one accepted token in it); ``precopy_slot_pairs`` maps a plan onto one
+cache group's slots for ``commit_conv``/``commit_ssm``, and ``self_commit_requests`` finds the
+requests whose boundary commit writes the running block itself (their next accepted count is 1).
 """
 
 from __future__ import annotations
@@ -20,7 +26,16 @@ from collections.abc import Sequence
 
 import torch
 
-__all__ = ["boundary_commits", "commit_ssm", "commit_conv"]
+from vllm_gaudi.v1.worker.recurrent_lattice import align_running_block
+
+__all__ = [
+    "boundary_commits",
+    "commit_ssm",
+    "commit_conv",
+    "align_precopy_plan",
+    "precopy_slot_pairs",
+    "self_commit_requests",
+]
 
 
 def boundary_commits(context_lens: Sequence[int],
@@ -29,7 +44,7 @@ def boundary_commits(context_lens: Sequence[int],
                      lattices_store: torch.Tensor,
                      block_rows: Sequence[Sequence[int]],
                      lattices_load: torch.Tensor | None = None) -> list[tuple[int, int, int, int]]:
-    """(request, t, src_slot, dst_slot) for accepted tokens ``1 <= t < accepted[i]`` that complete a block.
+    """(request, t, src_slot, dst_slot) for accepted tokens ``0 <= t < accepted[i]`` that complete a block.
 
     ``lattices_store`` is the int32 ``[batch, 1 + k]`` store lattice of the step (row ``i``
     aligned with ``context_lens[i]``/``accepted[i]``), ``block_rows[i]`` the block-table row
@@ -56,7 +71,7 @@ def boundary_commits(context_lens: Sequence[int],
         if ctx < 0:
             raise ValueError(f"context_lens[{i}] must be non-negative, got {ctx}.")
         a = int(accepted[i])
-        for t in range(1, max(0, a)):
+        for t in range(0, max(0, a)):
             if (ctx + t + 1) % block_size != 0:
                 continue
             if t >= lattices_store.shape[1]:
@@ -125,3 +140,70 @@ def commit_conv(state: torch.Tensor,
         windows.append(state[src].narrow(row_dim - 1, t, window_len).clone())
     for (_i, _t, _src, dst), window in zip(pairs, windows):
         state[dst].narrow(row_dim - 1, 0, window_len).copy_(window)
+
+
+def align_precopy_plan(prev_blocks: Sequence[int | None], context_lens: Sequence[int], num_scheduled: Sequence[int],
+                       accepted: Sequence[int], block_size: int, normalize: bool = False
+                       ) -> tuple[list[tuple[int, int, int, int]], list[int], list[int]]:
+    """Pre-step copies that move each request's running state into its running block.
+    Returns (plan, new_prev_blocks, new_accepted). plan entries are (request, bias, src_block, dst_block)
+    (block INDICES, not slots). new_prev_blocks[i] = curr_i; new_accepted[i] = 1 when request i is planned,
+    else accepted[i]. ValueError: unequal lengths, accepted[i] < 1, prev > curr."""
+    batch = len(context_lens)
+    if len(prev_blocks) != batch or len(num_scheduled) != batch or len(accepted) != batch:
+        raise ValueError("prev_blocks, context_lens, num_scheduled and accepted must have equal length, got "
+                         f"{len(prev_blocks)}, {batch}, {len(num_scheduled)}, {len(accepted)}.")
+    plan: list[tuple[int, int, int, int]] = []
+    new_prev_blocks: list[int] = []
+    new_accepted: list[int] = []
+    for i in range(batch):
+        ctx = int(context_lens[i])
+        n = int(accepted[i])
+        if n < 1:
+            raise ValueError(f"accepted[{i}] must be at least 1, got {n}.")
+        curr = align_running_block(ctx, int(num_scheduled[i]), block_size)
+        prev = (ctx - 1) // block_size if prev_blocks[i] is None else int(prev_blocks[i])
+        if prev > curr:
+            raise ValueError(f"prev_blocks[{i}]={prev} is past the running block {curr} "
+                             f"(context_len={ctx}, block_size={block_size}).")
+        new_prev_blocks.append(curr)
+        if ctx > 0 and (prev != curr or (normalize and n > 1)):
+            plan.append((i, n - 1, prev, curr))
+            new_accepted.append(1)
+        else:
+            new_accepted.append(n)
+    return plan, new_prev_blocks, new_accepted
+
+
+def precopy_slot_pairs(plan: Sequence[tuple[int, int, int, int]], block_rows: Sequence[Sequence[int]],
+                       null_block: int = 0
+                       ) -> tuple[list[tuple[int, int, int, int]], list[tuple[int, int, int, int]], list[int]]:
+    """Map a plan to one cache group's slots: (conv_pairs, ssm_pairs, ts) with
+    conv (i, bias, row[src], row[dst]), ssm (i, bias, row[src + bias], row[dst]), ts[j] = bias.
+    ValueError: an index outside block_rows[i]; any of the three slots equal to null_block."""
+    conv_pairs: list[tuple[int, int, int, int]] = []
+    ssm_pairs: list[tuple[int, int, int, int]] = []
+    ts: list[int] = []
+    for (i, bias, src_block, dst_block) in plan:
+        if i < 0 or i >= len(block_rows):
+            raise ValueError(f"plan entry references request {i}, outside block_rows (len {len(block_rows)}).")
+        row = block_rows[i]
+        for name, idx in (("src_block", src_block), ("src_block + bias", src_block + bias),
+                          ("dst_block", dst_block)):
+            if idx < 0 or idx >= len(row):
+                raise ValueError(f"precopy {name} index {idx} of request {i} is outside block_rows[{i}] "
+                                 f"(len {len(row)}).")
+        conv_src, ssm_src, dst = int(row[src_block]), int(row[src_block + bias]), int(row[dst_block])
+        for name, slot in (("conv source", conv_src), ("ssm source", ssm_src), ("destination", dst)):
+            if slot == int(null_block):
+                raise ValueError(f"precopy {name} slot of request {i} is the null block {null_block} "
+                                 f"(block indices {src_block} + {bias} -> {dst_block}).")
+        conv_pairs.append((i, bias, conv_src, dst))
+        ssm_pairs.append((i, bias, ssm_src, dst))
+        ts.append(int(bias))
+    return conv_pairs, ssm_pairs, ts
+
+
+def self_commit_requests(pairs: Sequence[tuple[int, int, int, int]], lattices_store: torch.Tensor) -> set[int]:
+    """Requests i with a boundary-commit pair whose dst_slot == int(lattices_store[i][0])."""
+    return {int(i) for (i, _t, _src, dst) in pairs if int(lattices_store[int(i)][0]) == int(dst)}
