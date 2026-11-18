@@ -3,8 +3,9 @@
 
 One function per gate: preflight (cards, checkpoint, FP8 layout, disk),
 build (installed vLLM / vllm_gaudi / flashinfer_gaudi), the fused GDN
-decode kernel on the card (G1b: the kernel's own checks, and the GDN
-decode mode every later server must use), tiny TP8 token agreement,
+decode kernel and the GDN verify op on the card (G1b: the kernel's own
+checks, then the verify op's checks, and the GDN decode and verify
+modes every later server must use), tiny TP8 token agreement,
 capacity from the startup line, and coherence with a 120K-token needle.
 Every gate returns ``(GateStatus, details)`` and never raises for an
 expected failure: the exception text goes into ``details["error"]``.
@@ -306,8 +307,10 @@ def build_check(python: str = sys.executable) -> tuple[GateStatus, dict]:
 
 
 GDN_MODE_ENV = "VLLM_HPU_GDN_CORE_DECODE"
-GDN_FALLBACK_RE = re.compile(r"has no HPU kernel|GDN core decode .* is off for")
-GDN_OP_TIMEOUT_S = 1800.0      # test_hpu_op.py
+GDN_VERIFY_ENV = "VLLM_HPU_GDN_CORE_VERIFY"
+GDN_VERIFY_OP_TEST = "tests/unit_tests/gdn_core_decode/test_hpu_verify_op.py"
+GDN_FALLBACK_RE = re.compile(r"has no HPU kernel|GDN core (decode|verify) .* is off for")
+GDN_OP_TIMEOUT_S = 1800.0      # test_hpu_op.py and test_hpu_verify_op.py
 GDN_REPLAY_TIMEOUT_S = 1800.0  # each replay run
 GDN_BENCH_TIMEOUT_S = 1200.0
 
@@ -316,7 +319,9 @@ GDN_LIB_LOOKUP_CODE = ("import flashinfer_gaudi, pathlib; "
 GDN_KERNEL_LIB = "libgdn_fused_gaudi2.so"
 GDN_MODE_FUSED = 1
 GDN_MODE_PYTORCH = 0
-GDN_FALLBACK_ENV = {GDN_MODE_ENV: "0"}
+GDN_VERIFY_ON = 1
+GDN_VERIFY_OFF = 0
+GDN_FALLBACK_ENV = {GDN_MODE_ENV: "0", GDN_VERIFY_ENV: "0"}
 
 
 def _gdn_pytest_summary(output: str) -> dict:
@@ -332,11 +337,18 @@ def _gdn_pytest_summary(output: str) -> dict:
     return counts
 
 
+def _gdn_verify_not_run(reason: str) -> dict:
+    """The "verify" details of a run in which the verify checks did not run at all."""
+    return {"status": "not_run", "reason": reason, "hpu_op": None, "replay": []}
+
+
 def fused_gdn(plugin_root: Path, out_dir: Path, python: str = sys.executable) -> tuple[GateStatus, dict]:
-    """G1b. details always has "mode" (1 = the fused kernel stays on, 0 = later servers run the PyTorch path)
-    and "env" ({} or {"VLLM_HPU_GDN_CORE_DECODE": "0"}; the orchestrator adds it to every later server)."""
+    """G1b. details always has "mode" (1 = the fused kernel stays on, 0 = later servers run the PyTorch path),
+    "verify_mode" (1 = the GDN verify op's card checks all passed, 0 = the op stays off) and "env" (the GDN
+    flags of every later server, added by the orchestrator: the decode entry as before, and
+    "VLLM_HPU_GDN_CORE_VERIFY" = "1" only when every verify check passed, else an explicit "0")."""
     started = time.monotonic()
-    details: dict = {"mode": GDN_MODE_PYTORCH, "env": dict(GDN_FALLBACK_ENV)}
+    details: dict = {"mode": GDN_MODE_PYTORCH, "env": dict(GDN_FALLBACK_ENV), "verify_mode": GDN_VERIFY_OFF}
 
     def finish(status: GateStatus, reason: str = None) -> tuple[GateStatus, dict]:
         if reason is not None:
@@ -378,6 +390,7 @@ def fused_gdn(plugin_root: Path, out_dir: Path, python: str = sys.executable) ->
         env["GDN_FUSED_GAUDI_KERNEL_LIBRARY"] = str(kernel)
         env["GDN_FUSED_GAUDI_NATIVE_LIBRARY"] = str(ops_files[0])
         env.pop(GDN_MODE_ENV, None)
+        env.pop(GDN_VERIFY_ENV, None)
 
         def run(cmd: list, log_name: str, limit: float, append: bool = False):
             nonlocal step, timeout_s
@@ -394,36 +407,97 @@ def fused_gdn(plugin_root: Path, out_dir: Path, python: str = sys.executable) ->
                 f.write(text)
             return proc, text
 
-        # 3. the op numerics on the card; a module skip counts as a failure
-        proc, text = run(
-            [python, "-m", "pytest", "-q", "-rs", "-p", "no:cacheprovider",
-             "tests/unit_tests/gdn_core_decode/test_hpu_op.py"], "hpu_op.log", GDN_OP_TIMEOUT_S)
-        counts = _gdn_pytest_summary(text)
-        details["hpu_op"] = {
-            "exit": proc.returncode,
-            "passed": counts["passed"],
-            "skipped": counts["skipped"],
-            "failed": counts["failed"],
-        }
-        details["failed_tests"] = [ln for ln in text.splitlines() if ln.startswith("FAILED ")]
-        op_ok = (proc.returncode == 0 and counts["passed"] > 0 and counts["skipped"] == 0 and counts["failed"] == 0 and
-                 counts["error"] == 0)
-        if not op_ok:
-            if counts["skipped"] > 0:
-                return finish(GateStatus.FAILED, "test_hpu_op.py skipped")
-            return finish(GateStatus.FAILED, "test_hpu_op.py failed (exit %d)" % proc.returncode)
+        # 3-4. the decode checks: a verify run is only attempted when they all pass
+        try:
+            # 3. the op numerics on the card; a module skip counts as a failure
+            proc, text = run(
+                [python, "-m", "pytest", "-q", "-rs", "-p", "no:cacheprovider",
+                 "tests/unit_tests/gdn_core_decode/test_hpu_op.py"], "hpu_op.log", GDN_OP_TIMEOUT_S)
+            counts = _gdn_pytest_summary(text)
+            details["hpu_op"] = {
+                "exit": proc.returncode,
+                "passed": counts["passed"],
+                "skipped": counts["skipped"],
+                "failed": counts["failed"],
+            }
+            details["failed_tests"] = [ln for ln in text.splitlines() if ln.startswith("FAILED ")]
+            op_ok = (proc.returncode == 0 and counts["passed"] > 0 and counts["skipped"] == 0 and
+                     counts["failed"] == 0 and counts["error"] == 0)
+            if not op_ok:
+                details["verify"] = _gdn_verify_not_run("decode checks failed")
+                if counts["skipped"] > 0:
+                    return finish(GateStatus.FAILED, "test_hpu_op.py skipped")
+                return finish(GateStatus.FAILED, "test_hpu_op.py failed (exit %d)" % proc.returncode)
 
-        # 4. the 1,000-step graph replay against eager, two cases, in one appended log
-        details["replay"] = []
-        for case in ("tp8_b16", "tp8_b64"):
-            cmd = [python, "tools/flash_next/gdn_core_decode_replay.py", "--steps", "1000"]
-            if case != "tp8_b16":
-                cmd += ["--case", case]
-            proc, _ = run(cmd, "replay.log", GDN_REPLAY_TIMEOUT_S, append=True)
-            details["replay"].append({"case": case, "exit": proc.returncode})
-            if proc.returncode != 0:
-                return finish(GateStatus.FAILED,
-                              "gdn_core_decode_replay.py (%s) failed (exit %d)" % (case, proc.returncode))
+            # 4. the 1,000-step graph replay against eager, two cases, in one appended log
+            details["replay"] = []
+            for case in ("tp8_b16", "tp8_b64"):
+                cmd = [python, "tools/flash_next/gdn_core_decode_replay.py", "--steps", "1000"]
+                if case != "tp8_b16":
+                    cmd += ["--case", case]
+                proc, _ = run(cmd, "replay.log", GDN_REPLAY_TIMEOUT_S, append=True)
+                details["replay"].append({"case": case, "exit": proc.returncode})
+                if proc.returncode != 0:
+                    details["verify"] = _gdn_verify_not_run("decode checks failed")
+                    return finish(GateStatus.FAILED,
+                                  "gdn_core_decode_replay.py (%s) failed (exit %d)" % (case, proc.returncode))
+        except subprocess.TimeoutExpired:
+            details["verify"] = _gdn_verify_not_run("decode checks failed")
+            raise
+
+        # 4b. the GDN verify op's own card checks, only after the decode checks passed and only when its
+        #     test file is in the bundle; a verify failure never changes the gate's status
+        verify: dict = {"status": "passed", "reason": "", "hpu_op": None, "replay": []}
+        verify_ok = False
+        if not (plugin_root / GDN_VERIFY_OP_TEST).is_file():
+            verify = _gdn_verify_not_run("%s is not in the bundle" % GDN_VERIFY_OP_TEST)
+        else:
+            verify_ok = True
+            try:
+                # V1. the verify op numerics on the card; the same pass rule as step 3
+                proc, text = run(
+                    [python, "-m", "pytest", "-q", "-rs", "-p", "no:cacheprovider", GDN_VERIFY_OP_TEST],
+                    "hpu_verify_op.log", GDN_OP_TIMEOUT_S)
+                counts = _gdn_pytest_summary(text)
+                verify["hpu_op"] = {
+                    "exit": proc.returncode,
+                    "passed": counts["passed"],
+                    "skipped": counts["skipped"],
+                    "failed": counts["failed"],
+                }
+                if not (proc.returncode == 0 and counts["passed"] > 0 and counts["skipped"] == 0 and
+                        counts["failed"] == 0 and counts["error"] == 0):
+                    verify_ok = False
+                    verify["status"] = "failed"
+                    verify["reason"] = ("test_hpu_verify_op.py skipped" if counts["skipped"] > 0 else
+                                        "test_hpu_verify_op.py failed (exit %d)" % proc.returncode)
+            except subprocess.TimeoutExpired:
+                verify_ok = False
+                verify["status"] = "timed_out"
+                verify["reason"] = "test_hpu_verify_op.py did not finish in %s s" % GDN_OP_TIMEOUT_S
+            if verify_ok:
+                # V2. the 1,000-step verify replay against eager, two cases, appended to the replay log
+                for case in ("ver_tp8_b16", "ver_tp8_b64"):
+                    cmd = [python, "tools/flash_next/gdn_core_decode_replay.py", "--steps", "1000", "--ops", "verify"]
+                    if case != "ver_tp8_b16":
+                        cmd += ["--case", case]
+                    try:
+                        proc, _ = run(cmd, "replay.log", GDN_REPLAY_TIMEOUT_S, append=True)
+                    except subprocess.TimeoutExpired:
+                        verify_ok = False
+                        verify["status"] = "timed_out"
+                        verify["reason"] = ("gdn_core_decode_replay.py (verify %s) did not finish in %s s" %
+                                            (case, GDN_REPLAY_TIMEOUT_S))
+                        break
+                    verify["replay"].append({"case": case, "exit": proc.returncode})
+                    if proc.returncode != 0:
+                        verify_ok = False
+                        verify["status"] = "failed"
+                        verify["reason"] = ("gdn_core_decode_replay.py (verify %s) failed (exit %d)" %
+                                            (case, proc.returncode))
+                        break
+        details["verify"] = verify
+        details["verify_mode"] = GDN_VERIFY_ON if verify_ok else GDN_VERIFY_OFF
 
         # 5. the speed measurement: recorded only, its result never changes the status
         try:
@@ -437,9 +511,9 @@ def fused_gdn(plugin_root: Path, out_dir: Path, python: str = sys.executable) ->
         except subprocess.TimeoutExpired:  # a slow measurement never turns the verified kernel off
             details["bench"] = {"exit": None, "timed_out": True, "lines": []}
 
-        # 6. the fused kernel stays on
+        # 6. the fused kernel stays on; the verify op only when its own checks passed
         details["mode"] = GDN_MODE_FUSED
-        details["env"] = {}
+        details["env"] = {GDN_VERIFY_ENV: "1" if verify_ok else "0"}
         return finish(GateStatus.PASSED)
     except subprocess.TimeoutExpired:
         return finish(GateStatus.TIMED_OUT, "%s did not finish in %s s" % (step, timeout_s))
