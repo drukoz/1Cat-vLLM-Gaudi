@@ -116,7 +116,9 @@ install_toolchain() {
         return 0
     fi
     echo "phase: toolchain (tpc-clang absent, installing habanalabs-tools $HABANA_TOOLS_VERSION)"
-    if {
+    # errexit is off in here (the caller runs `install_toolchain || true`), so the group's status
+    # would be ldconfig's; success is judged by tpc-clang being on PATH afterwards.
+    {
         # The image configures the Habana repo for habanalabs-graph; add it only when absent.
         if ! grep -qs vault.habana.ai /etc/apt/sources.list.d/*; then
             curl -fsSL https://vault.habana.ai/artifactory/api/gpg/key/public \
@@ -126,6 +128,7 @@ install_toolchain() {
         fi
         # An unrelated stale repo of the image can fail the update; the install decides.
         apt-get update || true
+        export DEBIAN_FRONTEND=noninteractive  # no debconf prompt can wait on stdin
         apt-get install -y --no-install-recommends habanalabs-tools=1.24.1-482 \
             || (echo "apt install failed, falling back to the direct deb" \
                 && curl -fsSL -o /tmp/habanalabs-tools.deb \
@@ -135,9 +138,10 @@ install_toolchain() {
         # habanalabs-tools ships its .so files without RPATH, so the loader needs:
         echo "/usr/lib/habanatools" > /etc/ld.so.conf.d/habanatools.conf
         ldconfig
-    } >"$LOG_DIR/install-0-toolchain.log" 2>&1; then
+    } >"$LOG_DIR/install-0-toolchain.log" 2>&1
+    hash -r  # bash cached the failed tpc-clang lookup; forget it before the next command -v
+    if command -v tpc-clang >/dev/null 2>&1; then
         TOOLS_INSTALLED_BY_SCRIPT=true
-        hash -r  # bash cached the failed tpc-clang lookup; forget it before the next command -v
         return 0
     fi
     echo "WARNING: the habanalabs-tools install failed (see $LOG_DIR/install-0-toolchain.log)" >&2
