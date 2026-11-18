@@ -12,11 +12,11 @@ against the composed torch path (`spikes/gdn-core-decode/probe.py`): see "Measur
 | Op | `torch.ops.flashinfer_gaudi.gdn_core_decode` (schema defined in Python, `flashinfer_gaudi/gdn_core_decode.py`) |
 | Torch reference | `flashinfer_gaudi.gdn_core_decode.gdn_core_decode_reference` |
 | Gate enum | `GdnGateActivation(IntEnum)`: `SILU = 0`, `SIGMOID = 1` (Flash-Next's checkpoint has `output_gate_type: "sigmoid"`; the Qwen3.5/3.8 models use `silu`) |
-| Flag | `VLLM_HPU_GDN_CORE_DECODE`, `GdnCoreDecodeMode(IntEnum)`: `OFF = 0`, `FUSED = 1`, default 0 |
+| Flag | `VLLM_HPU_GDN_CORE_DECODE`, `GdnCoreDecodeMode(IntEnum)`: `OFF = 0`, `FUSED = 1`, `RECURRENCE = 2`; default `FUSED` (1) from plan v0.4, 0 before |
 | TPC kernel | `csrc/gdn_fused/kernels/gdn_core_decode_gaudi2.c` (+ two headers, below), GUID `gdn_fused_core_decode_f32state_gaudi2` |
 | Kernel database | `libgdn_fused_gaudi2.so` (CMake target `gdn_fused_gaudi2`, `csrc/gdn_fused/CMakeLists.txt`) |
 | PyTorch extension | `gdn_fused_ops*.so` (`csrc/gdn_fused/pytorch/`), registers only the `HPU` kernel of the op |
-| Build switch | `VLLM_GAUDI_BUILD_GDN_FUSED=1` in `tools/build_flashinfer_gaudi.py` |
+| Build switch | `VLLM_GAUDI_BUILD_GDN_FUSED=1` in `tools/build_flashinfer_gaudi.py` (a failed fused build removes both fused libraries and keeps the rest of the install; `--gdn-fused-only` exits 3) |
 
 Not to be confused with the existing `flashinfer_gaudi/gdn_fused_decode.py` (`gdn_fused_decode_step`: conv + gates +
 recurrence, TP1/TP2 only, no norm) or the existing flag `VLLM_HPU_FLASHINFER_GDN_FUSED_DECODE`.
@@ -150,8 +150,9 @@ Scalar params ABI (host -> kernel), 12 bytes: `struct GdnCoreDecodeParams { floa
 ## Recurrence-only op (version 2, 2026-11-17)
 
 Plan v0.3 adds a second op that runs only the recurrence, so the part vllm-gaudi #1834 measured at about 80% of the
-per-sequence decode cost can be qualified on its own. If the conv or norm parts of the full kernel fail on hardware,
-this mode can still be used. The layer keeps the torch conv update before it and `self.norm` after it.
+per-sequence decode cost can be qualified on its own. From plan v0.4 it is a bisect tool, not a candidate default: if
+the fused kernel is wrong on the card, this mode shows whether the recurrence or the conv/norm part is at fault. The
+layer keeps the torch conv update before it and `self.norm` after it.
 
 | What | Name |
 |---|---|
@@ -198,7 +199,7 @@ of these holds among the real rows (index `< num_rows`) whose two slots are both
 Rows from `num_rows` on are padding and are ignored: the non-compact runner points them all at one real dummy slot
 (`_MAMBA_PAD_BLOCK_ID`), which would otherwise fail check 1. With `OFF` there is no check and no host sync.
 
-## Layer wiring (version 3, 2026-11-17)
+## Layer wiring (version 4, 2026-11-18)
 
 `HPUGatedDeltaNetAttention` (`vllm_gaudi/models/qwen3_5.py`) reads `VLLM_HPU_GDN_CORE_DECODE` once, in `__init__`,
 into `self.gdn_core_decode_mode`, and `VLLM_HPU_GDN_CORE_DECODE_DEBUG` into `self.gdn_core_decode_debug`.
@@ -209,7 +210,16 @@ A decode step uses an op only when all of these hold (the shared per-step gate `
 3. the load and store indices are 1-D, with `num_tokens` rows each;
 4. the once-per-layer precondition check passed. It runs on the first step that reaches it. On a failure it logs
    `GDN core decode (VLLM_HPU_GDN_CORE_DECODE=<n>) is off for <layer>: <reason>; using the torch decode path` once,
-   and the layer stays on the torch path.
+   and the layer stays on the torch path. The line is a warning, except for the reason
+   `the gdn_fused_ops extension is not loaded`, which is logged at debug level because the plugin already warned once
+   at startup (below).
+
+From plan v0.4 the default mode is `FUSED`. `register_ops()` (`vllm_gaudi/__init__.py`) loads the extension whenever
+the flag is nonzero, before warmup. On a Gaudi machine where it does not load, it logs one warning per process:
+`GDN core decode (VLLM_HPU_GDN_CORE_DECODE=<n>) has no HPU kernel: the gdn_fused_ops extension did not load
+(<errors>); every GDN layer runs the torch decode path. Build it with tools/build_flashinfer_gaudi.py --gdn-fused-only,
+or set VLLM_HPU_GDN_CORE_DECODE=0.` A machine without an HPU logs nothing: the ops' CPU kernels need no extension, so
+CPU tests run `FUSED` through the Python reference kernel by default.
 
 | Precondition | `FUSED` | `RECURRENCE` |
 |---|---|---|

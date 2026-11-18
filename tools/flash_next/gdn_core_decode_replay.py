@@ -217,6 +217,13 @@ def main(argv: list[str] | None = None) -> int:
     device = torch.device(device_str)
     if device_str == "hpu":
         import habana_frameworks.torch  # noqa: F401  (registers the HPU device with torch)
+        from flashinfer_gaudi._native import load_gdn_fused_extension
+
+        if not load_gdn_fused_extension():  # nothing else loads it in a standalone script
+            print("the gdn_fused_ops extension did not load: build it with tools/build_flashinfer_gaudi.py "
+                  "--gdn-fused-only, or point GDN_FUSED_GAUDI_KERNEL_LIBRARY and GDN_FUSED_GAUDI_NATIVE_LIBRARY "
+                  "at the built files", file=sys.stderr)
+            return 2
 
     case = CASES_BY_NAME[ns.case]
     base = {name: tensor.to(device) for name, tensor in make_inputs(case).items()}
