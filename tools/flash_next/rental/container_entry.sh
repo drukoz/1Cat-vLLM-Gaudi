@@ -188,6 +188,9 @@ if [ "$SKIP_INSTALL" -eq 0 ]; then
     install_step 3 "model deps" \
         pip install --no-deps transformers==5.16.1 huggingface_hub==1.33.0 \
         tokenizers==0.23.2 safetensors==0.8.0
+    # Gate G1b runs the fused GDN card checks with "python -m pytest", and the image ships no pytest
+    # (on the 2026-11-18 rental the gate failed on that and turned the fused kernel off).
+    install_step 3b "test tools" pip install pytest
 fi
 
 if [ "$DOWNLOAD" -eq 1 ]; then

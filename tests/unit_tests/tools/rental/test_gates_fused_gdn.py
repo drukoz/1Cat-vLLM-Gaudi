@@ -31,7 +31,8 @@ FAKE_PY = r"""
   echo "GDNVERIFY: ${VLLM_HPU_GDN_CORE_VERIFY-<unset>}"
 } >> "$FAKE_PY_LOG"
 case "$1" in
-  -c) echo "$FAKE_LIB_DIR"
+  -c) if [ -n "$FAKE_LOOKUP_NOISE" ]; then echo "$FAKE_LOOKUP_NOISE"; fi
+      echo "$FAKE_LIB_DIR"
       exit ${FAKE_LOOKUP_EXIT:-0} ;;
   -m) case "$*" in
         *test_hpu_verify_op.py*)
@@ -158,6 +159,17 @@ def test_fused_gdn_all_pass(tmp_path, monkeypatch):
         assert (out / name).is_file()
     assert "5 passed" in (out / "hpu_op.log").read_text(encoding="utf-8")
     assert "3 passed" in (out / "hpu_verify_op.log").read_text(encoding="utf-8")
+
+
+def test_fused_gdn_lookup_ignores_log_lines(tmp_path, monkeypatch):
+    # On the card the lookup's import logs to stdout before it prints the folder (2026-11-18 rental, RUK-3100).
+    lib = make_lib(tmp_path)
+    noise = "INFO 11-18 22:17:11 [__init__.py:272] Platform plugin hpu is activated"
+    fake, plugin, log = setup(tmp_path, monkeypatch, lib=lib, FAKE_LOOKUP_NOISE=noise)
+    status, details = gates.fused_gdn(plugin, tmp_path / "g1b", python=fake)
+    assert status is GateStatus.PASSED
+    assert details["mode"] == 1
+    assert records(log)[1]["KERNEL"] == str(lib / "libgdn_fused_gaudi2.so")
 
 
 def test_fused_gdn_missing_library_skips(tmp_path, monkeypatch):
