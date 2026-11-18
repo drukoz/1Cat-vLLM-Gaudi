@@ -50,6 +50,7 @@ from vllm.forward_context import set_forward_context  # noqa: E402
 from vllm.model_executor.layers.mamba.abstract import MambaBase  # noqa: E402
 from vllm_gaudi.models.qwen4_exp.qsa import HpuQwen4ExpQSAAttention, QsaMode  # noqa: E402
 from vllm_gaudi.v1.spec_decode.flash_next_mtp_steps import next_step_hidden, split_draft_output  # noqa: E402
+from vllm_gaudi.v1.worker.recurrent_commit import boundary_commits, commit_conv, commit_ssm  # noqa: E402
 
 from tests.unit_tests.models.flash_next.cpu_model import (  # noqa: E402
     cpu_model, cpu_draft_model, decode_metadata, eos_token_id, fp32_logits, ple_kwargs, prefill_metadata,
@@ -476,5 +477,83 @@ def test_mutations_break_the_chain(tiny_checkpoint):
         assert accepts_b[0] == 3 and accepts_b[1] == 1, f"the base chain of probe (b) is off: {accepts_b}"
         assert log0_b[2] > MUT_TOL or ssm_b > MUT_TOL, (f"the num_accepted={K + 1} override kept parity: "
                                                         f"logits {log0_b[2]:.3e}, ssm {ssm_b:.3e}")
+    finally:
+        ctx.__exit__(None, None, None)
+
+
+def test_align_lattice_step_with_boundary_commit(tiny_checkpoint):
+    """T8 align variant: a differing load/store lattice plus boundary commits matches the straight chain.
+
+    The chain state is prefilled at slot 6 (the block of the last computed token), the
+    verification stores token 0's state at slot 7 (the block of its own position) and the
+    candidate checkpoints at scratch slots [2, 3, 4]. With block_size 2 the accepted odd
+    tokens close a position block, so their states move into the new block's slot via the
+    recurrent_commit helpers; that slot must then equal the interleaved straight chain's.
+    """
+    prompt = _load_prompt(tiny_checkpoint, 33)
+    ids, gen = list(prompt["prompt_ids"]), list(prompt["generated_ids"])
+    ctx, model, draft, vllm_config, eos, atts, draft_atts, gdn, ple = _dense_context(tiny_checkpoint)
+    chain_slot, new_slot = 6, 7
+    try:
+        out = _target_prefill(model, vllm_config, eos, ids, chain_slot, atts)
+        _target_prefill(model, vllm_config, eos, ids, SPEC_SLOT, atts, reset=False)  # attention keys
+        logits = fp32_logits(model, out[0])
+        seq = list(ids) + [int(logits[-1].argmax())]
+        p_last = len(seq) - 1
+        multi = out[1][0].view(-1, out[1][0].shape[-1])[len(ids) - 1]
+        _target_prefill(model, vllm_config, eos, ids, STRAIGHT_SLOT, atts, reset=False)
+
+        _draft_tokens(draft, vllm_config, eos, seq[max(p_last - 2, 0):p_last + 1], p_last, draft_atts, multi, K)
+        drafts = gen[len(seq) - len(ids):len(seq) - len(ids) + K]  # oracle drafts
+        rows = [seq[p_last]] + drafts
+        load = torch.tensor([[[chain_slot, 2, 3, 4]]], dtype=torch.int64)
+        store = torch.tensor([[[new_slot, 2, 3, 4]]], dtype=torch.int64)
+        assert not torch.equal(load, store)
+        for att in atts:
+            att.slot = SPEC_SLOT
+        md = _spec_metadata(p_last, 1)
+        md.load_indices_tensor = load
+        md.store_indices_tensor = store
+        md.lattice_store_differs = True
+        with torch.no_grad(), set_forward_context(md, vllm_config):
+            hidden, aux = model(input_ids=torch.tensor(rows),
+                                positions=torch.arange(p_last, p_last + T),
+                                **ple_kwargs(T, eos, context=(seq[p_last - 2], seq[p_last - 1])))
+        verify_logits = fp32_logits(model, hidden)
+        argmax = verify_logits.argmax(dim=-1).tolist()
+        a = 0
+        while a < K and argmax[a] == drafts[a]:
+            a += 1
+        assert a == K, f"the oracle verification committed only {a} of {K} drafts"
+        for att in atts:
+            k, v = att.cache[SPEC_SLOT]
+            att.cache[SPEC_SLOT] = (k[:p_last + a + 1], v[:p_last + a + 1])
+        seq = list(seq[:p_last + 1]) + drafts[:a] + [argmax[a]]
+        assert seq[len(ids):] == gen[:len(seq) - len(ids)], "the align step stream is not the reference prefix"
+
+        _straight_decode(model, vllm_config, eos, seq, p_last, p_last + a + 1, atts)
+
+        # Boundary commits, block_size 2: the accepted odd tokens complete a position block.
+        ctx_len = p_last + 1
+        block_rows = [[chain_slot] * 17 + [new_slot] * 15]
+        pairs = boundary_commits([ctx_len], [a + 1], 2, store[0], block_rows, load[0])
+        assert [(i, t, s, d) for (i, t, s, d) in pairs] == [(0, 1, 2, new_slot), (0, 3, 4, new_slot)]
+        conv_pairs = [(i, t, int(store[0][0][0]), d) for (i, t, _s, d) in pairs]
+        ts = [t for (_i, t, _s, _d) in pairs]
+        for m in gdn:
+            commit_ssm(m.kv_cache[1], pairs)
+            commit_conv(m.kv_cache[0], conv_pairs, GDN_WINDOW, t_per_pair=ts)
+        for m in ple:
+            commit_conv(m.kv_cache[0], conv_pairs, PLE_WINDOW, t_per_pair=ts)
+
+        ssm_gap = max(float((m.kv_cache[1][new_slot] - m.kv_cache[1][STRAIGHT_SLOT]).abs().max()) for m in gdn)
+        conv_gap = max(float((m.kv_cache[0][new_slot, 0:GDN_WINDOW] - m.kv_cache[0][STRAIGHT_SLOT, 0:GDN_WINDOW]
+                              ).abs().max()) for m in gdn)
+        ple_gap = max(float((m.kv_cache[0][new_slot, 0:PLE_WINDOW] - m.kv_cache[0][STRAIGHT_SLOT, 0:PLE_WINDOW]
+                             ).abs().max()) for m in ple)
+        worst = max(ssm_gap, conv_gap, ple_gap)
+        print(f"align lattice step: a={a}, pairs {pairs}, gaps ssm={ssm_gap:.3e} conv={conv_gap:.3e} "
+              f"ple={ple_gap:.3e}")
+        assert worst <= FP32_TOL, f"committed align state diverges from the straight chain: {worst:.3e}"
     finally:
         ctx.__exit__(None, None, None)

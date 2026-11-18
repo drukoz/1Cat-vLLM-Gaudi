@@ -688,10 +688,16 @@ facts 30-36).
 - Checkpoint `/models/Qwen3.8-Flash-Next` (on the node; stage 2b's path).
 - Stage 3a's `/tmp/3a-tiny-sparse.txt` from this session: the MTP-off baseline the lossless check compares with (3a
   builds the same M3 checkpoint). If 3a was skipped, run its sparse tiny side first.
-- Every 3e launch runs with prefix caching OFF and compact GDN ON. The platform refuses Flash-Next speculation with
-  prefix caching until T10b (the startup error names `--no-enable-prefix-caching`; plan v0.4, M3 design: Platform;
-  fact 30: the mamba cache mode is `none`), and the M3 design requires compact GDN (`VLLM_COMPACT_GDN=1` — the default
-  without prefix caching, stated explicitly per rule 4). Sparse QSA (`VLLM_HPU_FLASH_NEXT_QSA_MODE=1`) is the mode; the
+- Every 3e launch runs with prefix caching OFF and compact GDN ON. The T10b work removed the platform's refusal of
+  Flash-Next speculation under prefix caching: with prefix caching ON the runner drives the recurrent states through
+  the scheduler's align-mode load/store lattice and commits the accepted tokens that complete a position block into
+  that block's slot (plan v0.4, M3 design: Platform; fact 30: the mamba cache mode becomes `align`). The recorded
+  sweeps stay on the prefix-caching-OFF baseline; the align path is verified by the branch's parity tests (the T8
+  align-variant in `tests/unit_tests/models/flash_next/test_mtp_end_to_end.py`) and is an optional follow-up launch
+  here: rerun (ii) without `--no-enable-prefix-caching` and with `VLLM_COMPACT_GDN=0` (compact GDN stays prohibited
+  under prefix caching, M1-T1), expecting cache mode `align` in the log and acceptance lengths on par with k3.
+  The M3 design requires compact GDN on the recorded launches (`VLLM_COMPACT_GDN=1` — the default without prefix
+  caching, stated explicitly per rule 4). Sparse QSA (`VLLM_HPU_FLASH_NEXT_QSA_MODE=1`) is the mode; the
   dense fallback is noted under (ii). Each launch runs in a fresh container shell and states every flag and export
   (stage 3's rule: exports must not carry over).
 

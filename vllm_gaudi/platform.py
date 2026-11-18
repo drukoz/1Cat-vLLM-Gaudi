@@ -268,9 +268,6 @@ def _validate_flash_next_speculative_config(vllm_config: VllmConfig) -> None:
     if speculative_config.method != "mtp" or "Qwen4ExpMTP" not in draft_architectures:
         raise ValueError("Flash-Next supports speculative decoding with its own MTP layer only: use "
                          "--speculative-config '{\"method\": \"mtp\", \"num_speculative_tokens\": 3}'")
-    if vllm_config.cache_config.enable_prefix_caching:
-        raise ValueError("Flash-Next MTP requires prefix caching off until the align-mode state lattice lands "
-                         "(RUK-2798 T10b): add --no-enable-prefix-caching")
     if os.environ.get("VLLM_COMPACT_GDN", "1").strip().lower() not in ("1", "true"):
         raise ValueError("Flash-Next MTP needs compact GDN state for the per-token verification checkpoints: "
                          "unset VLLM_COMPACT_GDN or set it to 1")

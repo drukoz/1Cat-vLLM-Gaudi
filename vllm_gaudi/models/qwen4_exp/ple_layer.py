@@ -203,11 +203,17 @@ class HpuQwen4ExpPLELayer(Qwen4ExpPLELayer):
         and stores ``[history[1:] ; candidates]`` back, so the next pass rolls the rejected
         candidate rows out of the history (the convention of ``_hpu_causal_conv1d_spec_update``).
         Padding rows are masked to zero and rows whose load slot is invalid are neither read
-        nor written; ``store_indices_tensor`` is identical to the load lattice by contract.
+        nor written. The state is written to the ``store_indices_tensor`` column-0 slot when
+        align mode marks the lattices as differing (M3-T10b), otherwise to the load slot.
         """
         load = self._lattice_slot(md, "load_indices_tensor")
         if load is None:
             return gated
+        store = load
+        if bool(getattr(md, "lattice_store_differs", False)):
+            store = self._lattice_slot(md, "store_indices_tensor")
+            if store is None:
+                store = load
         rows = load.numel()
         tokens = normed.shape[0]
         if tokens % rows != 0:
@@ -236,4 +242,4 @@ class HpuQwen4ExpPLELayer(Qwen4ExpPLELayer):
         )
         result = gated + out.reshape(tokens, self.hc_hidden_size)
         # State save in the dynamo-disabled wrapper, as on the non-spec path.
-        return _save_ssm_state(result, new_state, view, load)
+        return _save_ssm_state(result, new_state, view, store)
