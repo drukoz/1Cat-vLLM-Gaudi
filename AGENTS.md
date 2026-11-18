@@ -82,6 +82,9 @@ Key subsystems:
 - **TPC compiler and simulator**: `tools/flash_next/tpcsim.sh <command>` (`docs/design/flash-next/tpcsim.md`).
 - **GDN decode default**: `VLLM_HPU_GDN_CORE_DECODE` defaults to `1` (FUSED), an exception to the default-off rule for new fast paths (next bullet), because the fused GDN decode kernel is the decode path (`docs/design/flash-next/gdn-core-decode.md`). On CPU, GDN decode steps therefore run the op's Python reference kernel by default; `0` selects the torch path.
 - **Program documents**: `docs/design/flash-next/` (system map, reuse ledger, plan, run sheets). New fast paths ship behind an env flag in `vllm_gaudi/envs.py`, default off; modes are integer enums.
+- **Rental harness**: lives in `tools/flash_next/rental/` (runs as `python -m tools.flash_next.rental.<module>` from the repository root).
+- **Rental harness tests**: `tests/unit_tests/tools/rental/` (run with the CPU environment above).
+- **Rental bundle**: `bash tools/flash_next/rental/make_rental_bundle.sh --out dist` builds `dist/flash-next-rental-<sha>.tar.gz` (plugin + vLLM at the pin + `run_rental.sh`); see `docs/design/flash-next/run-sheets/rental.md`.
 
 ## Environment Variables
 

@@ -1,0 +1,15 @@
+{
+  "quantization_config": {
+    "quant_method": "fp8",
+    "activation_scheme": "dynamic",
+    "weight_block_size": [128, 128],
+    "modules_to_not_convert": ["lm_head"]
+  },
+  "text_config": {
+    "hidden_size": 2560,
+    "moe_intermediate_size": 640,
+    "shared_expert_intermediate_size": 640,
+    "num_experts": 512,
+    "num_hidden_layers": 48
+  }
+}
