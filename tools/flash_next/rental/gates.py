@@ -426,12 +426,16 @@ def fused_gdn(plugin_root: Path, out_dir: Path, python: str = sys.executable) ->
                               "gdn_core_decode_replay.py (%s) failed (exit %d)" % (case, proc.returncode))
 
         # 5. the speed measurement: recorded only, its result never changes the status
-        proc, text = run([python, "tools/flash_next/gdn_core_decode_bench.py", "--tp", "2,8", "--batches", "1,16,64"],
-                         "bench.log", GDN_BENCH_TIMEOUT_S)
-        details["bench"] = {
-            "exit": proc.returncode,
-            "lines": [ln.strip() for ln in text.splitlines() if "slope" in ln or "B=1" in ln],
-        }
+        try:
+            proc, text = run(
+                [python, "tools/flash_next/gdn_core_decode_bench.py", "--tp", "2,8", "--batches", "1,16,64"],
+                "bench.log", GDN_BENCH_TIMEOUT_S)
+            details["bench"] = {
+                "exit": proc.returncode,
+                "lines": [ln.strip() for ln in text.splitlines() if "slope" in ln or "B=1" in ln],
+            }
+        except subprocess.TimeoutExpired:  # a slow measurement never turns the verified kernel off
+            details["bench"] = {"exit": None, "timed_out": True, "lines": []}
 
         # 6. the fused kernel stays on
         details["mode"] = GDN_MODE_FUSED

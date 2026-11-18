@@ -41,6 +41,7 @@ case "$1" in
       *) exit ${FAKE_REPLAY_EXIT:-0} ;;
     esac ;;
   *bench*)
+    if [ -n "$FAKE_BENCH_SLEEP" ]; then sleep "$FAKE_BENCH_SLEEP"; fi
     printf '%s\n' "core recurrent slope 0.51 ms/step" "core slope 0.42 ms/step" \
 "core tp8 B=1 0.31 ms" "plain line"
     exit ${FAKE_BENCH_EXIT:-0} ;;
@@ -201,6 +202,16 @@ FALLBACK_LOG = "\n".join([
     "  WARNING 10:00:03 [gdn] GDN core decode (FUSED) is off for model.layers.3: head_dim 256 not supported",
     "INFO 10:00:04 [api_server] Started server process",
 ])
+
+
+def test_fused_gdn_bench_timeout_keeps_kernel_on(tmp_path, monkeypatch):
+    monkeypatch.setattr(gates, "GDN_BENCH_TIMEOUT_S", 1)
+    lib = make_lib(tmp_path)
+    fake, plugin, log = setup(tmp_path, monkeypatch, lib=lib, FAKE_BENCH_SLEEP=4)
+    status, details = gates.fused_gdn(plugin, tmp_path / "out", python=fake)
+    assert status == GateStatus.PASSED
+    assert details["mode"] == 1 and details["env"] == {}
+    assert details["bench"]["timed_out"] is True
 
 
 def test_gdn_fallback_lines_finds_both_forms():
