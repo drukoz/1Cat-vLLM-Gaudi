@@ -31,7 +31,7 @@ from tests.unit_tests.models.flash_next.cpu_model import (  # noqa: E402
 from tests.unit_tests.models.flash_next.test_chunked_prefill_parity import enable_slot_reuse  # noqa: E402
 
 TOL = 1e-6
-MODES = (GdnCoreDecodeMode.FUSED,)  # RECURRENCE joins when the mode-2 layer wiring (RUK-2834) merges
+MODES = (GdnCoreDecodeMode.FUSED, GdnCoreDecodeMode.RECURRENCE)
 
 NUM_SLOTS = 6  # slots 0..5: 1 = A, 2 = B's load, 3 = B's store, 5 = the pool's last slot (-1 pad target)
 
@@ -113,10 +113,13 @@ def test_padded_batch_matches_off(tiny_checkpoint, pad):
                 for k, label in ((0, "conv"), (1, "ssm")):
                     assert not bool(after[k][slot].any()), f"{tag}: {label} slot {slot} was written"
             if pad == -1:
-                # The op writes nothing for -1 rows; OFF writes the pool's last slot, so slot 5 is
-                # checked for this mode only, never across modes.
-                for k, label in ((0, "conv"), (1, "ssm")):
-                    assert not bool(after[k][5].any()), f"{tag}: {label} slot 5 was written by the -1 padding rows"
+                # The op writes nothing for -1 rows; OFF writes the pool's last slot. RECURRENCE keeps the
+                # torch conv update, so its conv slot 5 matches OFF and only its SSM slot 5 must stay clean.
+                assert not bool(after[1][5].any()), f"{tag}: ssm slot 5 was written by the -1 padding rows"
+                if mode == GdnCoreDecodeMode.FUSED:
+                    assert not bool(after[0][5].any()), f"{tag}: conv slot 5 was written by the -1 padding rows"
+                else:
+                    assert torch.equal(after[0][5], off_after[0][5]), f"{tag}: conv slot 5 differs from OFF"
 
 
 @pytest.mark.parametrize("prompt_len", [7, 2])

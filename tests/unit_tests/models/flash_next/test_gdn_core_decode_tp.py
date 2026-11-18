@@ -37,8 +37,7 @@ from tests.unit_tests.models.flash_next.gdn_core_ranks import (  # noqa: E402  (
 
 from harness import run_ranks  # noqa: E402
 
-# RECURRENCE joins when the mode-2 layer wiring (RUK-2834) merges
-MODES = (GdnCoreDecodeMode.OFF, GdnCoreDecodeMode.FUSED)
+MODES = (GdnCoreDecodeMode.OFF, GdnCoreDecodeMode.FUSED, GdnCoreDecodeMode.RECURRENCE)
 TP_SIZES = (1, 2, 4, 8)
 ROW_TOL = 1e-6
 STATE_TOL = 1e-6
