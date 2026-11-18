@@ -103,8 +103,8 @@ def verify_rank(rank: int, ckpt_dir: str, tp: int) -> dict:
                     rows.append(layer(hidden[pos:pos + 1]).float().numpy())
             out[int(mode)] = {
                 "rows": np.concatenate(rows).astype(np.float32),
-                "ssm": layer.kv_cache[1][1:5].float().numpy(),
-                "conv": layer.kv_cache[0][1:5].float().numpy(),
+                "ssm": layer.kv_cache[1][1:5].float().numpy().copy(),  # .numpy() of an fp32 pool is a view
+                "conv": layer.kv_cache[0][1:5].float().numpy().copy(),
                 "calls": calls["n"],
                 "ts": list(calls["ts"]),
                 "ok": layer._gdn_core_verify_ok,
