@@ -196,8 +196,10 @@ Cut from `feat/flash-next-gaudi-m3` at `856f09c`; approved in RUK-2733 (user com
 
 - **A (RUK-2910)**: n-gram (prompt lookup) drafting for Flash-Next. M3's lattice already runs for any method
   (`recurrent_spec_enabled`); only the platform validator refused it. Prefix caching off for now. The runner pads
-  ragged drafts with token 0 at position 0 and schedules `[-1]` for an empty draft: the model clamps ids at 0, and a
-  CPU test checks the QSA key ring under that padding.
+  ragged drafts with token 0 at position 0 and schedules `[-1]` for an empty draft: the model clamps ids at 0. The
+  pad rows never touch the QSA key ring: `query_start_loc_p` carries each request's real length (`1 + L`), so QSA
+  parks them on the scratch ring row (`test_ngram_ragged_sparse_ring` checks it). The platform refuses n-gram with
+  prefix caching on, so n-gram is not a variant of the 128K rental script (RUK-2919).
 - **B (RUK-2911)**: `build_ple_inputs` without a per-row loop, plus `advance_ple_context`, a device-side update of
   the PLE n-gram context (groundwork for async scheduling; the runner does not call it yet).
 - **C (RUK-2912)**: `VLLM_FLASH_NEXT_DRAFT_RANK_LOG=1` logs where the target's token ranked in the drafter's top 4
@@ -206,8 +208,10 @@ Cut from `feat/flash-next-gaudi-m3` at `856f09c`; approved in RUK-2733 (user com
   host phases; the drafter call gets a `propose_draft_tokens` event.
 - **E1 (RUK-2914)**: `tools/flash_next/make_agent_prompts.py`, a coding-agent prompt set (edit-and-return-the-file),
   because 3e's random dataset gives n-gram nothing to match.
-- **E2 (RUK-2916)**: run sheet stage 3f (n-gram vs MTP on agent prompts, rank histogram, step anatomy, a probe of
-  `arctic-inference` for suffix decoding). Blocked by A, C, D, E1.
+- **E2 (RUK-2916)**: cancelled, superseded by the standardized rental script (RUK-2919): the rank log is its MTP
+  variant B (`VLLM_FLASH_NEXT_DRAFT_RANK_LOG=1`), the step-anatomy trace its optional variant P
+  (`VLLM_PROFILER_ENABLED=true`), and its workload comes from E1's coding-agent prompts. The suffix-decoding probe
+  waits for after the rental.
 - On the fused-kernel track, **RUK-2915**: `gdn_core_verify_reference` takes `parent_idx [B, T]` (chain: `t - 1`), so
   the phase-2 kernel serves a draft tree without rework.
 
