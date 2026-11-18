@@ -6799,12 +6799,14 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             if device_prepared_dflash_drafts is not None:
                 self._draft_token_ids = device_prepared_dflash_drafts
             else:
-                self._draft_token_ids = self.propose_draft_token_ids(
-                    scheduler_output, postprocessed_sampled_token_ids, sampling_metadata, non_flattened_hidden_states,
-                    sample_hidden_states, aux_hidden_states, prefill_sampled_token_ids_device,
-                    decode_sampled_token_ids_device, non_flattened_hidden_states_prefills,
-                    sample_hidden_states_prefills, aux_hidden_states_prefills, num_decodes,
-                    prefill_data if num_prefills > 0 else None, decode_data if num_decodes > 0 else None)
+                with self.profiler.record_event('internal', 'propose_draft_tokens'):
+                    self._draft_token_ids = self.propose_draft_token_ids(
+                        scheduler_output, postprocessed_sampled_token_ids, sampling_metadata,
+                        non_flattened_hidden_states, sample_hidden_states, aux_hidden_states,
+                        prefill_sampled_token_ids_device, decode_sampled_token_ids_device,
+                        non_flattened_hidden_states_prefills, sample_hidden_states_prefills,
+                        aux_hidden_states_prefills, num_decodes,
+                        prefill_data if num_prefills > 0 else None, decode_data if num_decodes > 0 else None)
         ################## Spec Decode end ##################
 
         # Create output.
