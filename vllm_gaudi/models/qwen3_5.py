@@ -67,6 +67,9 @@ else:
 
 logger = init_logger(__name__)
 
+# The one fallback reason vllm_gaudi._warn_gdn_core_decode_without_kernel already warns about at startup: debug here.
+_GDN_CORE_NO_EXTENSION = "the gdn_fused_ops extension is not loaded"
+
 
 def _try_triton_gdn_decode_conv_packed(
     conv_state: torch.Tensor,
@@ -281,10 +284,16 @@ class HPUGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             if self.head_v_dim != 128:
                 return f"the HPU kernel requires head_v_dim 128, got {self.head_v_dim}"
             if not available(ssm_state.device):
-                return "the gdn_fused_ops extension is not loaded"
+                return _GDN_CORE_NO_EXTENSION
         if not available(ssm_state.device):
             return f"no {op_name} kernel for {ssm_state.device.type}"
         return None
+
+    def _log_gdn_core_off(self, reason: str) -> None:
+        """Log once per layer why it runs the torch decode path (debug level for a missing HPU extension)."""
+        log = logger.debug if reason == _GDN_CORE_NO_EXTENSION else logger.warning
+        log("GDN core decode (VLLM_HPU_GDN_CORE_DECODE=%d) is off for %s: %s; using the torch decode path",
+            int(self.gdn_core_decode_mode), getattr(self, "prefix", type(self).__name__), reason)
 
     def _gdn_core_decode_ready(self, load_state_indices, store_state_indices, num_tokens, num_accepted_tokens) -> bool:
         """The per-step gate shared by FUSED and RECURRENCE; runs the precondition check once per layer."""
@@ -300,9 +309,7 @@ class HPUGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             reason = self._gdn_core_decode_reason(self.kv_cache[0], self.kv_cache[1])
             self._gdn_core_ok = reason is None
             if reason is not None:
-                logger.warning(
-                    "GDN core decode (VLLM_HPU_GDN_CORE_DECODE=%d) is off for %s: %s; using the torch decode path",
-                    int(self.gdn_core_decode_mode), getattr(self, "prefix", type(self).__name__), reason)
+                self._log_gdn_core_off(reason)
         return bool(self._gdn_core_ok)
 
     def _check_gdn_core_decode_indices(self, load_state_indices, store_state_indices, query_start_loc,
