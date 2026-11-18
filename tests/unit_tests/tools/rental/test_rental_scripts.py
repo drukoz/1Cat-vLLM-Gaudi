@@ -47,6 +47,12 @@ def test_container_entry_toolchain():
     assert "toolchain.json" in text
 
 
+def test_container_entry_installs_pytest():
+    # Gate G1b runs the fused GDN card checks with `python -m pytest`; the image ships no pytest (RUK-3100).
+    text = (SCRIPTS_DIR / "container_entry.sh").read_text()
+    assert 'install_step 3b "test tools" pip install pytest' in text
+
+
 def test_run_rental_dry_run(tmp_path):
     proc = subprocess.run(
         ["bash", str(SCRIPTS_DIR / "run_rental.sh"), "--dry-run", "--model", "/tmp/x"],
