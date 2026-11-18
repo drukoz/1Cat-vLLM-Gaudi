@@ -223,7 +223,10 @@ def preflight(model_dir: Path,
         else:
             layout_bad = []
             for tp, ep in layouts:
-                rows = check_layout(config, tp, ep)
+                try:
+                    rows = check_layout(config, tp, ep)
+                except (KeyError, ValueError, TypeError) as e:  # not a block-FP8 Flash-Next config
+                    rows = [{"module": "config", "dim": str(e), "size": 0, "per_rank": 0, "block": 0, "ok": False}]
                 details["layout_rows"].extend(dict(row, tp=tp, ep=ep) for row in rows)
                 layout_bad.extend(dict(row, tp=tp, ep=ep) for row in rows if not row.get("ok"))
             details["layout_failed"] = layout_bad

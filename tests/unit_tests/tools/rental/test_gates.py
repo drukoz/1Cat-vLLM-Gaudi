@@ -284,8 +284,17 @@ def test_preflight_real_check_layout_rejects_toy_config(tmp_path):
                                       expected_cards=0,
                                       min_checkpoint_bytes=1,
                                       min_free_bytes=1)
-    assert status is GateStatus.FAILED
+    assert status is GateStatus.FAILED  # the toy config has no MoE fields
     assert details["checks"]["layout"] == "failed"
+    assert details["checks"]["disk"] == "passed"  # later checks still run
+    # Flash-Next's real expert shape: TP8 without EP splits 640 into 80 (not a 128 multiple); with EP it passes
+    cfg = json.loads((model / "config.json").read_text(encoding="utf-8"))
+    cfg.update(hidden_size=2560, moe_intermediate_size=640, num_experts=512)
+    (model / "config.json").write_text(json.dumps(cfg), encoding="utf-8")
+    assert gates.preflight(model, [(8, False)], tmp_path / "results", expected_cards=0, min_checkpoint_bytes=1,
+                           min_free_bytes=1)[0] is GateStatus.FAILED
+    assert gates.preflight(model, [(8, True)], tmp_path / "results", expected_cards=0, min_checkpoint_bytes=1,
+                           min_free_bytes=1)[0] is GateStatus.PASSED
 
 
 # --------------------------------------------------------------------------- build_check
