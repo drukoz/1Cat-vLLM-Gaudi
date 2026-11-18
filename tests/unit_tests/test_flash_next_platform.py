@@ -108,6 +108,25 @@ def test_pool_mode_resolves_slots(monkeypatch):
     assert os.environ["VLLM_COMPACT_GDN"] == "0"
 
 
+def test_pool_mode_resolves_slots_with_speculation(monkeypatch):
+    _clear_pool_env(monkeypatch)
+    monkeypatch.setenv(ENV_MODE, "1")
+    config = _recurrent_config()
+    config.speculative_config = SimpleNamespace(num_speculative_tokens=3)
+    # groups = ceil(36 / 12) + 1 = 4; 32 * 4 * (3 + 3) + 512 = 1280
+    _configure_recurrent_state(config)
+    assert os.environ[ENV_SLOTS] == "1280"
+
+
+def test_pool_mode_speculative_config_none(monkeypatch):
+    _clear_pool_env(monkeypatch)
+    monkeypatch.setenv(ENV_MODE, "1")
+    config = _recurrent_config()
+    config.speculative_config = None
+    _configure_recurrent_state(config)
+    assert os.environ[ENV_SLOTS] == "896"
+
+
 def test_pool_mode_ignored_without_prefix_caching(monkeypatch):
     _clear_pool_env(monkeypatch)
     monkeypatch.setenv(ENV_MODE, "1")
