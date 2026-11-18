@@ -26,6 +26,7 @@ stage 1 container.  Contract: ``docs/design/flash-next/gdn-core-decode.md``.
 
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 from pathlib import Path
@@ -138,6 +139,9 @@ def verify_sim_binary(tmp_path_factory: pytest.TempPathFactory) -> Path:
 
     The kernel is compiled with ``-vlm 32`` exactly as the ``gdn_core_verify_gaudi2.o`` rule in
     ``csrc/gdn_fused/CMakeLists.txt`` does (its per-node ``__local__`` arrays exceed the default VLM).
+    With ``GDN_VERIFY_SIM_STRIP_BITCODE=1`` in the environment the compiled object is stripped of its
+    ``.llvmbc`` section before embedding, mirroring ``cmake -DGDN_FUSED_VERIFY_STRIP_BITCODE=ON``
+    (RUK-3105 H2 diagnostic).
     """
     build = tmp_path_factory.mktemp("gdn_core_verify_sim")
     _run([
@@ -145,6 +149,8 @@ def verify_sim_binary(tmp_path_factory: pytest.TempPathFactory) -> Path:
         VERIFY_KERNEL_SOURCE, "-c", "-o", build / VERIFY_KERNEL_OBJECT
     ],
          timeout=1800)
+    if os.environ.get("GDN_VERIFY_SIM_STRIP_BITCODE") == "1":
+        _run(["objcopy", "--remove-section=.llvmbc", VERIFY_KERNEL_OBJECT], cwd=build, timeout=600)
     _run([
         "objcopy", "-I", "binary", "-O", "elf64-x86-64", "-B", "i386:x86-64", VERIFY_KERNEL_OBJECT,
         "gdn_core_verify_gaudi2_embedded.o"

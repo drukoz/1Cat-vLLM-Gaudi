@@ -101,6 +101,24 @@ itself and exports `PYTHONPATH=/work`, so run it from a worktree root.
 - Do not run pytest without `--noconftest` in the container:
   `tests/unit_tests/conftest.py` imports vLLM, which is not installed.
 
+## Verify kernel bitcode
+
+`cmake -DGDN_FUSED_VERIFY_STRIP_BITCODE=ON` (default OFF) adds an
+`objcopy --remove-section=.llvmbc` step after the compile of
+`gdn_core_verify_gaudi2.o` in `csrc/gdn_fused/CMakeLists.txt`, so the verify
+kernel's ELF carries no embedded LLVM bitcode. This is a RUK-3105 diagnostic:
+hypothesis H2 blames the card segfault on the graph compiler recompiling that
+bitcode in-process without the kernel's `-vlm 32` flag. The verify simulator
+fixture mirrors it with `GDN_VERIFY_SIM_STRIP_BITCODE=1`; both runs must pass
+the same (5 passed):
+
+```bash
+tools/flash_next/tpcsim.sh 'python3 -m pytest -q -p no:cacheprovider --noconftest \
+    tests/standalone/gdn_core_decode/test_simulation.py -k verify'
+tools/flash_next/tpcsim.sh 'GDN_VERIFY_SIM_STRIP_BITCODE=1 python3 -m pytest -q -p no:cacheprovider \
+    --noconftest tests/standalone/gdn_core_decode/test_simulation.py -k verify'
+```
+
 ## Known compiler hazard: in-place tensors
 
 tpc-clang treats `v_bf16_ld_tnsr_b` and `v_bf16_st_tnsr` on the same tensor as
