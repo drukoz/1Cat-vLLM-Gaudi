@@ -22,6 +22,7 @@ _BLOCK_FP8_DEQUANT_OP: Callable | None = None
 _BLOCK_FP8_LINEAR_OP: Callable | None = None
 _ADD_RMSNORM_QUANT_OP: Callable | None = None
 _GDN_FUSED_LOADED: bool | None = None  # None = not attempted
+_GDN_FUSED_ERRORS: list[str] = []  # the fused GDN loader's own errors
 
 
 def _library_candidates() -> list[str]:
@@ -66,6 +67,17 @@ def _configure_kernel_database_path() -> None:
     _prepend_kernel_database(str(kernel_db))
 
 
+def _gdn_fused_error(message: str) -> None:
+    """Record one fused GDN loader failure in the shared list and in the GDN-only list."""
+    _LOAD_ERRORS.append(message)
+    _GDN_FUSED_ERRORS.append(message)
+
+
+def gdn_fused_extension_errors() -> tuple[str, ...]:
+    """Why ``load_gdn_fused_extension`` failed (empty when it loaded or was never called)."""
+    return tuple(_GDN_FUSED_ERRORS)
+
+
 def load_gdn_fused_extension() -> bool:
     """Load libgdn_fused_gaudi2.so (kernel database) and gdn_fused_ops*.so (HPU op) once; True when loaded."""
     global _GDN_FUSED_LOADED
@@ -85,7 +97,7 @@ def load_gdn_fused_extension() -> bool:
         missing = False
         for path in (kernel_db, extension):
             if not os.path.isfile(path):
-                _LOAD_ERRORS.append(f"{path}: file does not exist")
+                _gdn_fused_error(f"{path}: file does not exist")
                 missing = True
         if missing:
             _GDN_FUSED_LOADED = False
@@ -96,13 +108,13 @@ def load_gdn_fused_extension() -> bool:
         try:
             importlib.import_module("flashinfer_gaudi.gdn_core_decode")
         except Exception as exc:  # pragma: no cover - requires the schema module
-            _LOAD_ERRORS.append(f"flashinfer_gaudi.gdn_core_decode: {type(exc).__name__}: {exc}")
+            _gdn_fused_error(f"flashinfer_gaudi.gdn_core_decode: {type(exc).__name__}: {exc}")
             _GDN_FUSED_LOADED = False
             return False
         try:
             torch.ops.load_library(extension)
         except Exception as exc:  # pragma: no cover - requires an HPU runtime
-            _LOAD_ERRORS.append(f"{extension}: {type(exc).__name__}: {exc}")
+            _gdn_fused_error(f"{extension}: {type(exc).__name__}: {exc}")
             _GDN_FUSED_LOADED = False
             return False
         _LOADED_PATHS.append(extension)
