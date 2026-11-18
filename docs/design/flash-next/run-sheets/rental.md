@@ -98,10 +98,11 @@ That is all. Three things about the host it runs on:
 - **A terminal that survives the SSH session.** The run takes hours; run it inside `tmux`
   (`tmux new -s rental`; detach with `Ctrl-b d`, reattach with `tmux attach -t rental`). A dropped
   SSH session otherwise kills the run, and the tarball at the end is never written.
-- **Disk.** `--download` needs about 250 GB free under `--model`'s parent (the checkpoint is 185 GB),
-  and the image, the install and the results need about 40 GB on the root filesystem. Check `df -h`
-  first; when the large disk is mounted elsewhere, point `--model` there, for example
-  `--model /mnt/models/Qwen3.8-Flash-Next-FP8`.
+- **Disk.** `run_rental.sh` checks the disks itself. With `--download` it stops when the folder for
+  `--model` has less than 250 GB free (what is already downloaded there counts), and every run stops
+  when Docker's root (`/var/lib/docker`) has less than 30 GB free. Each stop is one line naming the
+  folder, its free space and the fix. On a node whose root disk is small, prepare the data disk
+  first: see [Disks and the data disk](#disks-and-the-data-disk).
 
 Useful options:
 
@@ -116,6 +117,7 @@ Useful options:
 | `--run-id ID` | fixed run id (default: UTC timestamp) |
 | `--image IMG` | container image (default the 1.24.1 base image) |
 | `--dry-run` | print the `docker run` command and exit |
+| `--no-disk-check` | skip both free-space checks |
 
 When the run stops at a stop rule, restart after fixing the cause with `--run-id <same id>
 --from <phase>` to keep the results in one folder.
