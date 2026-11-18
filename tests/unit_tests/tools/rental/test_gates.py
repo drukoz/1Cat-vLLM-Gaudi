@@ -350,6 +350,27 @@ def test_build_check_wrong_version(tmp_path):
     assert "9.9.9" in details["reason"]
 
 
+FAKE_PY_NOISY = """
+echo 'INFO 11-18 22:17:11 [__init__.py:272] Platform plugin hpu is activated'
+echo 'WARNING 11-18 22:17:11 [platform.py:678] Pin memory is not supported on HPU.'
+case "$2" in
+  *flashinfer_gaudi*) echo '{"device": "gaudi2"}' ;;
+  *vllm_gaudi*) : ;;
+  *) echo 0.28.1rc1.dev392+g8f816a3f6 ;;
+esac
+exit 0
+"""
+
+
+def test_build_check_ignores_log_lines_before_the_answer(tmp_path):
+    # On the card `import vllm` logs to stdout before the probe prints (2026-11-18 rental, RUK-3100).
+    fake = write_fake_python(tmp_path / "fake_python.sh", FAKE_PY_NOISY)
+    status, details = gates.build_check(python=fake)
+    assert status is GateStatus.PASSED
+    assert details["vllm_version"] == "0.28.1rc1.dev392+g8f816a3f6"
+    assert details["flashinfer_capabilities"] == '{"device": "gaudi2"}'
+
+
 def test_build_check_missing_interpreter(tmp_path):
     status, details = gates.build_check(python=str(tmp_path / "no-such-interpreter"))
     assert status is GateStatus.FAILED

@@ -263,6 +263,12 @@ def preflight(model_dir: Path,
     return GateStatus.PASSED, details
 
 
+def _last_line(text: str) -> str:
+    """The last non-empty line of a probe's stdout: importing vllm logs to stdout before the probe's own print."""
+    lines = [ln.strip() for ln in (text or "").splitlines() if ln.strip()]
+    return lines[-1] if lines else ""
+
+
 def build_check(python: str = sys.executable) -> tuple[GateStatus, dict]:
     """The G1 gate: the installed vLLM version, vllm_gaudi and flashinfer_gaudi import."""
     details: dict = {
@@ -286,7 +292,7 @@ def build_check(python: str = sys.executable) -> tuple[GateStatus, dict]:
             if proc.returncode != 0:
                 details["reason"] = "%s: exit %d: %s" % (name, proc.returncode, (proc.stderr or "").strip()[:500])
                 return GateStatus.FAILED, details
-            out = proc.stdout.strip()
+            out = _last_line(proc.stdout)
             if name == "vllm":
                 details["vllm_version"] = out
                 if out != EXPECTED_VLLM_VERSION:
@@ -372,7 +378,7 @@ def fused_gdn(plugin_root: Path, out_dir: Path, python: str = sys.executable) ->
         if lookup.returncode != 0:
             return finish(GateStatus.SKIPPED, "the fused GDN library is not installed: the interpreter exited %d: %s" %
                           (lookup.returncode, (lookup.stderr or "").strip()[:200]))
-        lib_dir = Path(lookup.stdout.strip())
+        lib_dir = Path(_last_line(lookup.stdout))
         kernel = lib_dir / GDN_KERNEL_LIB
         ops_files = sorted(lib_dir.glob("gdn_fused_ops*.so"))
         if not kernel.is_file():
