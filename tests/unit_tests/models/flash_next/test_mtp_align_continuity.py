@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Multi-step align-mode MTP continuity harness on the upstream scheme (M3-T10c-3).
 
-Six multi-step align-mode MTP chains run on the CPU model through the T10c-1 production helpers
+Eight multi-step align-mode MTP chains run on the CPU model through the T10c-1 production helpers
 (``recurrent_lattice.align_lattice``, ``recurrent_commit.align_precopy_plan`` /
 ``precopy_slot_pairs`` / ``boundary_commits`` / ``self_commit_requests`` / ``commit_ssm`` /
 ``commit_conv``) and assert parity with the straight decode chain at every step. One request,
@@ -22,6 +22,10 @@ block_size 4, k = 3, a 33-token prompt; per decode step ``ctx`` is the computed-
    (``self_commit_requests``) and resets the next step's accepted count to 1.
 4. Index-stable synthetic block row (the real KVCacheManager keeps it, RUK-2847):
    ``row = [8 + i for i in range(cdiv(ctx + 1 + k, bs) + k)]`` over ``NUM_SLOTS = 40`` slots.
+5. Plain decode step (``modes`` "p"): pre-step copy with ``sched = 1``, ``normalize=True`` (may copy
+   backward), then load and store ``row[ctx // bs]`` with ``num_accepted_tokens = [1]``; no boundary
+   commit. Prefix caching is on for the GDN layers, and every chain ends with an audit of each
+   committed checkpoint block.
 
 Scenarios (a step tampers draft j with TAMPER, forcing a = j; gen = the reference stream):
 
@@ -38,6 +42,10 @@ Scenarios (a step tampers draft j with TAMPER, forcing a = j; gen = the referenc
   blocks with a bias-3 pre-step copy and a t = 2 boundary commit at every step.
 * S5 - a = 1, 3, 2, 3: short and full acceptances interleaved, exercising bias 0, 3 and 2
   pre-step plans and a t = 0 / t = 1 boundary commit.
+* S6 - verify, plain, verify, plain, verify: a plain step's pre-step copy moves the running block
+  backward (9 -> 8), a later plain step rewinds it; plain steps commit no boundary pair.
+* S7 - verify, plain, plain, verify, verify: a bias-1 backward copy, then a plain step at
+  block-aligned ctx 36 whose own store slot is the block-completion checkpoint.
 
 Per step the harness asserts the pre-step plan, ``a``, the boundary pairs and the self-commit
 flag equal the task trace, the committed stream equals ``gen`` over the overlapping length,
@@ -58,7 +66,7 @@ from vllm_gaudi.v1.worker.recurrent_commit import (  # noqa: E402
 from vllm_gaudi.v1.worker.recurrent_lattice import align_lattice  # noqa: E402
 
 from tests.unit_tests.models.flash_next.cpu_model import (  # noqa: E402
-    cpu_draft_model, cpu_model, eos_token_id, fp32_logits, ple_kwargs)
+    cpu_draft_model, cpu_model, decode_metadata, eos_token_id, fp32_logits, ple_kwargs)
 from tests.unit_tests.models.flash_next.test_mtp_end_to_end import (  # noqa: E402
     FP32_TOL, GDN_WINDOW, K, MTP, PLE_WINDOW, SPEC_SLOT, STRAIGHT_SLOT, TAMPER, _draft_tokens,
     _install_cached_attention, _load_prompt, _model_attns, _set_group_idx, _spec_metadata, _spec_state_modules,
@@ -113,6 +121,22 @@ _SCENARIOS = {
         "pairs": [[], [(0, 0, 17, 16)], [(0, 0, 18, 17)], [(0, 1, 20, 18)]],
         "self": [False, False, False, False],
     },
+    "S6": {
+        "modes": "vpvpv",
+        "tampers": {0: (0, TAMPER)},
+        "plan": [[(0, 0, 8, 9)], [(0, 0, 9, 8)], [(0, 0, 8, 9)], [(0, 3, 9, 9)], [(0, 0, 9, 10)]],
+        "a": [0, None, 3, None, 3],
+        "pairs": [[], [], [(0, 0, 17, 16)], [], [(0, 3, 21, 18)]],
+        "self": [False, False, False, False, True],
+    },
+    "S7": {
+        "modes": "vppvv",
+        "tampers": {0: (1, TAMPER)},
+        "plan": [[(0, 0, 8, 9)], [(0, 1, 9, 8)], [(0, 0, 8, 9)], [(0, 0, 9, 10)], [(0, 3, 10, 11)]],
+        "a": [1, None, None, 3, 3],
+        "pairs": [[], [], [], [(0, 2, 20, 17)], [(0, 2, 21, 18)]],
+        "self": [False, False, False, False, False],
+    },
 }
 
 
@@ -134,14 +158,17 @@ def _gap(a, b) -> float:
     return max(float((x - y).abs().max()) for xs, ys in zip(a, b) for x, y in zip(xs, ys))
 
 
-def _chain(tiny_checkpoint, name: str, tampers, steps: int):
+def _chain(tiny_checkpoint, name: str, tampers, steps: int, modes: str | None = None):
     """``steps`` align-mode MTP steps; the per-step records, the final read gap and ``gen``.
 
-    Each record: ``step``, ``ctx``, ``plan`` (the pre-step plan, block indices), ``a``,
-    ``pairs`` (the boundary pairs), ``self_commit``, and the ``read``/``log0``/``ckpt`` gaps.
-    The final gap is what a step beyond the last would read, measured before its pre-step
-    copy; the straight decode chain at STRAIGHT_SLOT is the reference.
+    ``modes`` is one char per step: "v" = verification step, "p" = plain decode step (rule 5);
+    default all verification. Each record: ``step``, ``ctx``, ``plan`` (the pre-step plan, block
+    indices), ``a``, ``pairs`` (the boundary pairs), ``self_commit``, and the ``read``/``log0``/
+    ``ckpt`` gaps. The final gap is what a step beyond the last would read, measured before its
+    pre-step copy; the straight decode chain at STRAIGHT_SLOT is the reference.
     """
+    modes = modes or "v" * steps
+    assert len(modes) == steps
     ids = list(_load_prompt(tiny_checkpoint, PROMPT_LEN)["prompt_ids"])
     gen = list(_load_prompt(tiny_checkpoint, PROMPT_LEN)["generated_ids"])
     cm = cpu_model(tiny_checkpoint, fp32=True, num_slots=NUM_SLOTS, speculative_config=MTP)
@@ -151,6 +178,8 @@ def _chain(tiny_checkpoint, name: str, tampers, steps: int):
         fp32_mtp_buffer(model, PROMPT_LEN)
         _install_cached_attention(model)
         gdn, ple = _spec_state_modules(model)
+        for m in gdn:  # align mode is prefix caching; off, qwen3_5 folds the GDN store index into the load index
+            m.cache_config.enable_prefix_caching = True
         _set_group_idx(model)
         atts = _model_attns(model)
         draft = cpu_draft_model(vllm_config, fp32=True, num_slots=8)
@@ -168,6 +197,42 @@ def _chain(tiny_checkpoint, name: str, tampers, steps: int):
         n, ctx, prev = 1, len(seq) - 1, None
         for step in range(steps):
             row = _row(ctx)  # rules 1, 2 and 4 through the T10c-1 helpers
+            if modes[step] == "p":  # plain decode step: sched 1, normalize, load == store == row[ctx // BS]
+                plan, new_prev, acc = align_precopy_plan([prev], [ctx], [1], [n], BS, normalize=True)
+                conv_pairs, ssm_pairs, ts = precopy_slot_pairs(plan, [row])
+                for m in gdn:
+                    commit_ssm(m.kv_cache[1], ssm_pairs)
+                    commit_conv(m.kv_cache[0], conv_pairs, GDN_WINDOW, t_per_pair=ts)
+                for m in ple:
+                    commit_conv(m.kv_cache[0], conv_pairs, PLE_WINDOW, t_per_pair=ts)
+                prev, n = new_prev[0], acc[0]
+                assert n == 1, f"{name} step {step}: plain step after the pre-step copy has n = {n}"
+                slot = row[ctx // BS]
+                read = _gap(_snap(gdn, ple, slot), _snap(gdn, ple, STRAIGHT_SLOT))
+                for att in atts:
+                    att.slot = SPEC_SLOT
+                pmd = decode_metadata(slot, ctx, load_slot=slot, store_slot=slot)
+                pmd.num_accepted_tokens = torch.tensor([n], dtype=torch.int32)  # the runner's MTP plain step
+                with torch.no_grad(), set_forward_context(pmd, vllm_config):
+                    out = model(input_ids=torch.tensor([seq[ctx]]), positions=torch.tensor([ctx]),
+                                **ple_kwargs(1, eos, context=(seq[ctx - 2], seq[ctx - 1])))
+                hidden = out[0] if isinstance(out, tuple) else out
+                logits = fp32_logits(model, hidden)
+                multi = out[1][0].view(-1, out[1][0].shape[-1])[0]
+                seq = list(seq[:ctx + 1]) + [int(logits[-1].argmax())]
+                pick = _straight_decode(model, vllm_config, eos, seq, ctx, ctx + 1, atts)
+                log0 = float((logits[-1] - pick).abs().max())
+                after = _gap(_snap(gdn, ple, slot), _snap(gdn, ple, STRAIGHT_SLOT))
+                if (ctx + 1) % BS == 0:
+                    ckpt[ctx] = _snap(gdn, ple, STRAIGHT_SLOT)
+                stream = list(seq[len(ids):])
+                L = min(len(stream), len(gen))
+                print(f"{name} step {step} PLAIN ctx {ctx} plan {plan} slot {slot} read {read:.2e} "
+                      f"log0 {log0:.2e} after {after:.2e} stream_ok {stream[:L] == gen[:L]}")
+                records.append({"step": step, "ctx": ctx, "plan": plan, "a": None, "pairs": [],
+                                "self_commit": False, "read": read, "log0": log0, "ckpt": after, "stream": stream})
+                ctx += 1
+                continue
             plan, new_prev, acc = align_precopy_plan([prev], [ctx], [1 + K], [n], BS)
             conv_pairs, ssm_pairs, ts = precopy_slot_pairs(plan, [row])
             for m in gdn:
@@ -254,6 +319,9 @@ def _chain(tiny_checkpoint, name: str, tampers, steps: int):
                           [m.kv_cache[0][load[0], n - 1:n - 1 + PLE_WINDOW] for m in ple]),
                          _snap(gdn, ple, STRAIGHT_SLOT))
         print(f"{name} final read gap {final:.2e}")
+        audit = {pos: _gap(_snap(gdn, ple, BLOCK_SLOT0 + pos // BS), c) for pos, c in ckpt.items()}
+        print(f"{name} checkpoint audit {audit}")
+        final = max([final] + list(audit.values()))
         return records, final, gen
     finally:
         cm.__exit__(None, None, None)
@@ -319,3 +387,17 @@ def test_s5_mixed_acceptance_lengths(tiny_checkpoint):
     exp = _SCENARIOS["S5"]
     records, final, gen = _chain(tiny_checkpoint, "S5", exp["tampers"], len(exp["a"]))
     _check("S5", records, final, gen)
+
+
+def test_s6_plain_step_moves_the_running_block_back(tiny_checkpoint):
+    """S6: verify, plain, verify, plain, verify - a backward 9 -> 8 pre-step copy and a normalize rewind."""
+    exp = _SCENARIOS["S6"]
+    records, final, gen = _chain(tiny_checkpoint, "S6", exp["tampers"], len(exp["a"]), exp["modes"])
+    _check("S6", records, final, gen)
+
+
+def test_s7_backward_copy_with_bias_and_an_aligned_plain_step(tiny_checkpoint):
+    """S7: verify, plain, plain, verify, verify - a bias-1 backward copy, then a plain step at block-aligned ctx 36."""
+    exp = _SCENARIOS["S7"]
+    records, final, gen = _chain(tiny_checkpoint, "S7", exp["tampers"], len(exp["a"]), exp["modes"])
+    _check("S7", records, final, gen)
