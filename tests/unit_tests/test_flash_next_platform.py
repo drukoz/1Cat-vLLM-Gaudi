@@ -181,10 +181,14 @@ def test_spec_wrong_draft_arch_raises(monkeypatch):
         _validate_flash_next_speculative_config(_spec_config(draft_archs=["Qwen3_5MoeMTP"]))
 
 
-def test_spec_prefix_caching_raises(monkeypatch):
-    monkeypatch.setenv("VLLM_COMPACT_GDN", "1")
-    with pytest.raises(ValueError, match="requires prefix caching off"):
-        _validate_flash_next_speculative_config(_spec_config(prefix_caching=True))
+def test_spec_prefix_caching_passes_with_compact_gdn_off(monkeypatch):
+    monkeypatch.setenv("VLLM_COMPACT_GDN", "0")
+    _validate_flash_next_speculative_config(_spec_config(prefix_caching=True))
+
+
+def test_spec_prefix_caching_passes_with_compact_gdn_unset(monkeypatch):
+    monkeypatch.delenv("VLLM_COMPACT_GDN", raising=False)
+    _validate_flash_next_speculative_config(_spec_config(prefix_caching=True))
 
 
 def test_spec_compact_gdn_off_raises(monkeypatch):
