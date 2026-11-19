@@ -58,7 +58,9 @@ NULL_SLOT = 0  # vLLM's null block: no test row may touch it
 SELF_BLOCK = POS0 // RATIO  # block 16, the block the step at positions 64..67 completes
 SELF_ROWS = [SELF_BLOCK * RATIO + i for i in range(RATIO)]  # its positions: 64..67
 COMP_SELF = SELF_BLOCK  # compressed row of block 16 (slot_mapping == position in this harness)
-COMP_TAIL = 1023  # the last compressed row (cache row of the -1 pad slot_mapping under floor div)
+# The last compressed row: the scratch row every non-completing decode row writes (also where the
+# -1 pad slot_mapping lands under floor division).
+COMP_TAIL = 1023
 ROW_TOL = 1e-6  # side-cache rows written on the multi-token path vs the single-token chain
 HIDDEN_SEED = 20261117
 
@@ -302,8 +304,10 @@ def test_ragged_padding_rows_touch_no_state(tiny_checkpoint):
     two padding rows sit on ``slot_mapping = -1`` and position 0. The padded step's ring and
     compressed rows must equal the two requests' single-token chains on the shared caches
     (A first, then B, the cache state the padded step scores B's rows with), the ring's
-    scratch row ``key_ring[3]`` is the only row the padding may write, and the null slot 0 and the
-    compressed row the floor division of ``-1`` points at (``1023``) must stay at zero.
+    scratch row ``key_ring[3]`` is the only row the padding may write, and the null slot 0 must stay at
+    zero. The rows that complete no block write the compressed cache's scratch row (``COMP_TAIL``), the
+    row the fixed-shape decode write parks them on; that write is what ``test_decode_write_has_fixed_shape``
+    pins.
     """
     with cpu_model(tiny_checkpoint,
                    fp32=True,
@@ -348,11 +352,52 @@ def test_ragged_padding_rows_touch_no_state(tiny_checkpoint):
             "the padding rows wrote nothing at all: they must be parked on the ring's scratch row "
             f"key_ring[{SCRATCH_SLOT}], not on a request's slot")
         assert not bool(pad_ring[NULL_SLOT].any()), "a padding row wrote the null slot 0 of the ring"
-        assert not bool(pad_comp[COMP_TAIL].any()), (
-            f"compressed row {COMP_TAIL} (the floor division of the pad slot_mapping -1) was written by a "
-            "padding row")
         solo_b = chain_ring_b[SLOT_B]
         assert bool(solo_b.any()) and bool(chain_ring_a[SLOT_A].any())
+
+
+def test_decode_write_has_fixed_shape(tiny_checkpoint):
+    """The decode compressed-row write is one fixed-shape ``index_put_``: only the scratch row and the
+    completing row's row move, so HPU graph capture sees no data-dependent shape and no host sync.
+
+    A step's non-completing rows (positions 64..66 complete no block) must not write their own block's
+    row: they write the cache's LAST row, the scratch row no request's block table reaches. A chain of
+    two such steps therefore leaves every row but the last untouched; the four-step chain 64..67
+    additionally writes the row of the block position 67 completes (``COMP_SELF``) and nothing else.
+    """
+    with cpu_model(tiny_checkpoint,
+                   fp32=True,
+                   max_model_len=SPARSE_MAX_MODEL_LEN,
+                   qsa_mode=QsaMode.SPARSE) as (vllm_config, model):
+        eos = eos_token_id(vllm_config)
+        layer = qsa_layer(model)
+        layer.indexer.ring_group_idx = torch.tensor(0, dtype=torch.long)
+        prefill_layer_64(model, vllm_config, eos)
+
+        snap = snapshot_state(model)
+        before = side_caches(layer)[0].clone()
+        select_chain(layer, hidden_rows(layer, 2), SLOT_A, 2)  # positions 64, 65: no block completes
+        after = side_caches(layer)[0]
+        assert torch.equal(after[:-1], before[:-1]), (
+            "the non-completing rows of positions 64, 65 wrote a compressed row of a request: only the "
+            "scratch row (the cache's last row) may move")
+        assert not torch.equal(after[-1], before[-1]), (
+            f"the scratch row (the cache's last row, {after.shape[0] - 1}) kept the prefill's values: the "
+            "non-completing rows wrote nothing, so the write is not the fixed-shape one")
+
+        restore_state(model, snap)
+        select_chain(layer, hidden_rows(layer, 4), SLOT_A, 4)  # positions 64..67: 67 completes block 16
+        after = side_caches(layer)[0]
+        assert not torch.equal(after[COMP_SELF], before[COMP_SELF]), (
+            f"the completing row (position {POS0 + T - 1}) left the compressed row {COMP_SELF} of block "
+            f"{SELF_BLOCK} at the prefill's values")
+        assert not torch.equal(after[-1], before[-1]), (
+            "the non-completing rows of the 4-step chain wrote no scratch row")
+        mid = torch.cat((after[:COMP_SELF], after[COMP_SELF + 1:-1]))
+        mid_before = torch.cat((before[:COMP_SELF], before[COMP_SELF + 1:-1]))
+        assert torch.equal(mid, mid_before), (
+            "a compressed row of the prefill changed: the decode write must move the completing row's row "
+            f"({COMP_SELF}) and the scratch row only")
 
 
 def test_single_token_decode_metadata_is_unchanged(tiny_checkpoint):
