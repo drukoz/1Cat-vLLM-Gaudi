@@ -1,0 +1,279 @@
+# SPDX-License-Identifier: Apache-2.0
+"""Tests for the tiny smoke test (tools/flash_next/rental/tiny_smoke.py, RUK-2709).
+
+The card and vLLM are replaced by two small executables: a fake checkpoint builder that writes
+``reference.json``, and a fake server that answers ``/health``, ``/v1/models`` and ``/v1/completions``
+from that reference. Everything else is the real code: the server start, the health wait, the
+comparison, the fallback check and the stop. Runs on CPU from the worktree root with ``PYTHONPATH=$PWD``.
+"""
+
+from __future__ import annotations
+
+import json
+import socket
+import sys
+from pathlib import Path
+
+import pytest
+
+from tools.flash_next.rental import main as orchestrator
+from tools.flash_next.rental import serve, tiny_smoke
+
+FAKE_BUILDER = r"""
+import json, os, sys
+from pathlib import Path
+out = Path(sys.argv[sys.argv.index("--out") + 1])
+code = int(os.environ.get("FAKE_BUILD_EXIT", "0"))
+if code:
+    print("tiny checkpoint: no transformers", file=sys.stderr)
+    sys.exit(code)
+out.mkdir(parents=True, exist_ok=True)
+prompts = []
+for i, n in enumerate([1, 7]):
+    prompts.append({"prompt_ids": list(range(1, n + 1)),
+                    "generated_ids": list(range(100 + 16 * i, 100 + 16 * i + 16))})
+(out / "reference.json").write_text(json.dumps({"prompts": prompts}), encoding="utf-8")
+"""
+
+FAKE_SERVER = r"""
+import json, os, sys
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from pathlib import Path
+port = int(sys.argv[sys.argv.index("--port") + 1])
+reference = json.loads(Path(sys.argv[sys.argv.index("--reference") + 1]).read_text(encoding="utf-8"))
+answers = {tuple(p["prompt_ids"]): p["generated_ids"] for p in reference["prompts"]}
+keys = ("PT_HPU_LAZY_MODE", "VLLM_HPU_FLASH_NEXT_QSA_MODE", "VLLM_HPU_RECURRENT_STATE_POOL",
+        "VLLM_HPU_GDN_CORE_DECODE", "VLLM_HPU_GDN_CORE_VERIFY")
+Path("server_env.json").write_text(json.dumps({k: os.environ.get(k) for k in keys}), encoding="utf-8")
+if os.environ.get("FAKE_SERVER_LINE"):
+    print(os.environ["FAKE_SERVER_LINE"], flush=True)
+if os.environ.get("FAKE_SERVER_EXIT"):
+    print("(Worker_TP1 pid=7) ERROR 11-18 22:36:00 [multiproc_executor.py:1055] IndexError: tuple index out of range",
+          flush=True)
+    sys.exit(int(os.environ["FAKE_SERVER_EXIT"]))
+
+
+class Handler(BaseHTTPRequestHandler):
+    def log_message(self, *args):
+        pass
+
+    def _send(self, obj):
+        body = json.dumps(obj).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        self._send({"ok": True})
+
+    def do_POST(self):
+        payload = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+        ids = list(answers[tuple(payload["prompt"])])
+        if os.environ.get("FAKE_SERVER_WRONG"):
+            ids[3] = -1
+        self._send({"choices": [{"token_ids": ids}]})
+
+
+try:
+    HTTPServer(("127.0.0.1", port), Handler).serve_forever()
+except KeyboardInterrupt:
+    pass
+"""
+
+
+def free_port() -> int:
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        return sock.getsockname()[1]
+
+
+@pytest.fixture
+def fakes(tmp_path, monkeypatch):
+    """Replace the two commands the smoke test starts with the fake builder and the fake server."""
+    builder = tmp_path / "fake_builder.py"
+    builder.write_text(FAKE_BUILDER, encoding="utf-8")
+    server = tmp_path / "fake_server.py"
+    server.write_text(FAKE_SERVER, encoding="utf-8")
+    monkeypatch.setattr(tiny_smoke, "checkpoint_command",
+                        lambda ckpt: [sys.executable, str(builder), "--out", str(ckpt)])
+    monkeypatch.setattr(tiny_smoke, "serve_command",
+                        lambda ckpt, port: [sys.executable, str(server), "--port", str(port), "--reference",
+                                            str(Path(ckpt) / "reference.json")])
+    monkeypatch.setattr(serve, "_HEALTH_POLL_S", 0.1)
+    for name in ("FAKE_BUILD_EXIT", "FAKE_SERVER_EXIT", "FAKE_SERVER_LINE", "FAKE_SERVER_WRONG"):
+        monkeypatch.delenv(name, raising=False)
+    port = free_port()
+    out = tmp_path / "out"
+    return out, port
+
+
+def run(out: Path, port: int, *extra: str) -> tuple[int, dict]:
+    code = tiny_smoke.main(["--out", str(out), "--port", str(port), "--health-timeout", "20", *extra])
+    return code, json.loads((out / "summary.json").read_text(encoding="utf-8"))
+
+
+def by_mode(summary: dict) -> dict:
+    return {entry["mode"]: entry for entry in summary["modes"]}
+
+
+def test_both_modes_pass_and_the_cards_are_released(fakes, capsys):
+    out, port = fakes
+    code, summary = run(out, port)
+    assert code == 0
+    assert summary["passed"] is True
+    modes = by_mode(summary)
+    assert list(modes) == ["pytorch", "fused"]
+    assert modes["pytorch"]["status"] == "passed" and modes["fused"]["status"] == "passed"
+    assert not serve.port_in_use(port)  # each server is stopped again
+    printed = capsys.readouterr().out
+    assert "tiny smoke [pytorch]: PASSED" in printed
+    assert "tiny smoke [fused]: PASSED" in printed
+    for mode in ("pytorch", "fused"):
+        assert (out / mode / "server0.log").is_file()
+        assert json.loads((out / mode / "details.json").read_text(encoding="utf-8"))["n_prompts"] == 2
+
+
+def test_each_mode_gets_a_variant_environment_with_its_gdn_flags(fakes):
+    out, port = fakes
+    code, _ = run(out, port)
+    assert code == 0
+    pytorch = json.loads((out / "pytorch" / "server_env.json").read_text(encoding="utf-8"))
+    fused = json.loads((out / "fused" / "server_env.json").read_text(encoding="utf-8"))
+    for env in (pytorch, fused):  # what serve.server_environment gives every rental server
+        assert env["PT_HPU_LAZY_MODE"] == "1"
+        assert env["VLLM_HPU_FLASH_NEXT_QSA_MODE"] == "1"
+        assert env["VLLM_HPU_RECURRENT_STATE_POOL"] == "1"
+    assert (pytorch["VLLM_HPU_GDN_CORE_DECODE"], pytorch["VLLM_HPU_GDN_CORE_VERIFY"]) == ("0", "0")
+    assert (fused["VLLM_HPU_GDN_CORE_DECODE"], fused["VLLM_HPU_GDN_CORE_VERIFY"]) == ("1", "0")
+
+
+def test_one_mode_on_request(fakes):
+    out, port = fakes
+    code, summary = run(out, port, "--gdn", "pytorch")
+    assert code == 0
+    assert list(by_mode(summary)) == ["pytorch"]
+    assert not (out / "fused").exists()
+
+
+def test_server_that_dies_is_a_failure_with_its_error_line(fakes, monkeypatch, capsys):
+    out, port = fakes
+    monkeypatch.setenv("FAKE_SERVER_EXIT", "3")
+    code, summary = run(out, port, "--gdn", "pytorch")
+    assert code == 1
+    assert summary["passed"] is False
+    entry = by_mode(summary)["pytorch"]
+    assert entry["status"] == "failed"
+    assert "exited" in entry["reason"] and "3" in entry["reason"]
+    assert entry["errors"] == ["IndexError: tuple index out of range"]
+    printed = capsys.readouterr().out
+    assert "tiny smoke [pytorch]: FAILED" in printed
+    assert "IndexError: tuple index out of range" in printed
+    assert str(out / "pytorch" / "server0.log") in printed
+
+
+def test_wrong_tokens_are_a_failure(fakes, monkeypatch):
+    out, port = fakes
+    monkeypatch.setenv("FAKE_SERVER_WRONG", "1")
+    code, summary = run(out, port, "--gdn", "pytorch")
+    assert code == 1
+    entry = by_mode(summary)["pytorch"]
+    assert entry["status"] == "failed"
+    assert "do not match" in entry["reason"]
+
+
+def test_fused_mode_fails_when_the_server_fell_back_to_the_torch_path(fakes, monkeypatch):
+    out, port = fakes
+    line = ("WARNING 11-18 22:26:38 [__init__.py:119] GDN core decode (VLLM_HPU_GDN_CORE_DECODE=1) has no HPU "
+            "kernel: the gdn_fused_ops extension is not loaded")
+    monkeypatch.setenv("FAKE_SERVER_LINE", line)
+    code, summary = run(out, port)
+    assert code == 1
+    modes = by_mode(summary)
+    assert modes["pytorch"]["status"] == "passed"  # the torch path is what this mode asks for
+    assert modes["fused"]["status"] == "failed"
+    assert "torch" in modes["fused"]["reason"]
+    assert modes["fused"]["fallback_lines"] == [line]
+
+
+def test_a_verify_fallback_line_does_not_fail_the_fused_mode(fakes, monkeypatch):
+    out, port = fakes
+    monkeypatch.setenv("FAKE_SERVER_LINE",
+                       "GDN core verify (VLLM_HPU_GDN_CORE_VERIFY=1) has no HPU kernel: the gdn_fused_ops extension")
+    code, summary = run(out, port, "--gdn", "fused")
+    assert code == 0  # the smoke test keeps the verify op off: only the decode kernel is checked
+    assert by_mode(summary)["fused"]["status"] == "passed"
+
+
+def test_checkpoint_build_failure_starts_no_server(fakes, monkeypatch, capsys):
+    out, port = fakes
+    monkeypatch.setenv("FAKE_BUILD_EXIT", "2")
+    code, summary = run(out, port)
+    assert code == 1
+    assert summary["passed"] is False
+    assert summary["modes"] == []
+    assert "tiny checkpoint failed (exit 2)" in summary["reason"]
+    assert "no transformers" in summary["reason"]
+    assert not (out / "pytorch").exists()
+    assert "tiny smoke: FAILED" in capsys.readouterr().out
+
+
+def test_a_checkpoint_folder_is_built_once_and_reused(fakes, tmp_path, monkeypatch):
+    out, port = fakes
+    ckpt = tmp_path / "kept-ckpt"
+    code, _ = run(out, port, "--gdn", "pytorch", "--ckpt", str(ckpt))
+    assert code == 0
+    assert (ckpt / "reference.json").is_file() and not (out / "ckpt").exists()
+    monkeypatch.setenv("FAKE_BUILD_EXIT", "2")  # a second build would fail: the folder must be reused
+    code, summary = run(tmp_path / "out2", port, "--gdn", "pytorch", "--ckpt", str(ckpt))
+    assert code == 0
+    assert by_mode(summary)["pytorch"]["status"] == "passed"
+
+
+def test_port_in_use_is_a_failure_before_any_start(fakes):
+    out, port = fakes
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", port))
+        sock.listen(1)
+        code, summary = run(out, port, "--gdn", "pytorch")
+    assert code == 1
+    assert "already in use" in by_mode(summary)["pytorch"]["reason"]
+    assert not (out / "pytorch" / "server_env.json").exists()
+
+
+def test_unknown_mode_is_a_usage_error(fakes):
+    out, port = fakes
+    with pytest.raises(SystemExit) as info:
+        tiny_smoke.main(["--out", str(out), "--port", str(port), "--gdn", "pytorch,turbo"])
+    assert info.value.code == 2
+
+
+def test_the_commands_are_the_tiny_gate_commands(tmp_path):
+    # One definition for the gate and the smoke test: the smoke test must start what the run will start.
+    ckpt = tmp_path / "ckpt"
+    assert tiny_smoke.checkpoint_command(ckpt) == orchestrator.tiny_checkpoint_command(ckpt)
+    assert tiny_smoke.serve_command(ckpt, 8010) == orchestrator.tiny_serve_command(ckpt, 8010)
+    assert orchestrator.tiny_serve_command(ckpt, 8010) == [
+        "vllm", "serve", str(ckpt), "--served-model-name", "tiny", "--tensor-parallel-size", "8",
+        "--max-model-len", "512", "--max-num-seqs", "4", "--language-model-only", "--trust-remote-code",
+        "--port", "8010", "--host", "127.0.0.1",
+    ]
+    assert orchestrator.tiny_checkpoint_command(ckpt) == [
+        sys.executable, "tools/flash_next/make_tiny_checkpoint.py", "--out", str(ckpt), "--fixture",
+        orchestrator.TINY_FIXTURE,
+    ]
+
+
+def test_error_lines_keeps_the_last_distinct_errors():
+    log = "\n".join([
+        "(Worker_TP0 pid=1) INFO 11-18 22:27:10 [runtime.py:32] skip_warmup: False",
+        "(Worker_TP0 pid=1) ERROR 11-18 22:27:11 [multiproc_executor.py:944] TypeError: bad keyword 'bias_vl'",
+        "(Worker_TP1 pid=2) ERROR 11-18 22:27:11 [multiproc_executor.py:944] TypeError: bad keyword 'bias_vl'",
+        "(APIServer pid=9) RuntimeError: Engine core initialization failed. See root cause above.",
+    ])
+    assert tiny_smoke.error_lines(log) == [
+        "TypeError: bad keyword 'bias_vl'",
+        "RuntimeError: Engine core initialization failed. See root cause above.",
+    ]
+    assert tiny_smoke.error_lines("all fine\n") == []

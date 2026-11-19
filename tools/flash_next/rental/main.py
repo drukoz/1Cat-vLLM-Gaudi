@@ -31,6 +31,7 @@ ENV_PREFIXES = ("VLLM_", "HABANA_", "PT_", "HF_")
 HLSMI_Q_LIMIT = 200 * 1024
 SERVER_HEALTH_TIMEOUT_S = 1800.0
 TINY_HEALTH_TIMEOUT_S = 1200.0
+TINY_CHECKPOINT_TIMEOUT_S = 900.0
 TINY_PORT = 8010
 TINY_FIXTURE = "tests/unit_tests/models/flash_next/tiny_tp8_config.json"
 LOAD_TIMEOUT_S = 5400.0
@@ -52,6 +53,34 @@ def repo_root() -> Path:
 def load_variants(path: Path = VARIANTS_FILE) -> list:
     with open(path, encoding="utf-8") as fh:
         return json.load(fh)
+
+
+def tiny_checkpoint_command(ckpt: Path) -> list:
+    """The command that builds the tiny checkpoint and its CPU reference in `ckpt` (run from the repo root)."""
+    return [sys.executable, "tools/flash_next/make_tiny_checkpoint.py", "--out", str(ckpt), "--fixture", TINY_FIXTURE]
+
+
+def tiny_serve_command(ckpt: Path, port: int = TINY_PORT) -> list:
+    """The `vllm serve` command of the tiny gate; tiny_smoke.py starts the same one."""
+    return [
+        "vllm",
+        "serve",
+        str(ckpt),
+        "--served-model-name",
+        "tiny",
+        "--tensor-parallel-size",
+        "8",
+        "--max-model-len",
+        "512",
+        "--max-num-seqs",
+        "4",
+        "--language-model-only",
+        "--trust-remote-code",
+        "--port",
+        str(port),
+        "--host",
+        "127.0.0.1",
+    ]
 
 
 def server_env(variant_env: dict, gdn_env: dict) -> dict:
@@ -318,38 +347,12 @@ class Runner:
         if serve.port_in_use(TINY_PORT):
             return GateStatus.FAILED, {"reason": "tiny port %d already in use" % TINY_PORT}
         ckpt = phase_dir / "ckpt"
-        cmd = [
-            sys.executable,
-            "tools/flash_next/make_tiny_checkpoint.py",
-            "--out",
-            str(ckpt),
-            "--fixture",
-            TINY_FIXTURE,
-        ]
-        proc = gates.run_step(cmd, repo_root(), 900)
+        proc = gates.run_step(tiny_checkpoint_command(ckpt), repo_root(), TINY_CHECKPOINT_TIMEOUT_S)
         if proc.returncode != 0:
             tail = (proc.stderr or proc.stdout or "")[-400:]
             reason = "tiny checkpoint failed (exit %d): %s" % (proc.returncode, tail.strip())
             return GateStatus.FAILED, {"reason": reason}
-        serve_cmd = [
-            "vllm",
-            "serve",
-            str(ckpt),
-            "--served-model-name",
-            "tiny",
-            "--tensor-parallel-size",
-            "8",
-            "--max-model-len",
-            "512",
-            "--max-num-seqs",
-            "4",
-            "--language-model-only",
-            "--trust-remote-code",
-            "--port",
-            str(TINY_PORT),
-            "--host",
-            "127.0.0.1",
-        ]
+        serve_cmd = tiny_serve_command(ckpt, TINY_PORT)
         env = self.tiny_env()
         popen = serve.start_server(serve_cmd, env, phase_dir / "server0.log", phase_dir)
         self.active.append(("server", popen))
