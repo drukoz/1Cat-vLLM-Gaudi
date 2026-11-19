@@ -316,16 +316,18 @@ stop the run while the graphs compile. The health timeout (`--server-timeout`) i
 
 Bucket warmup is skipped by default, so graphs compile **on first use**, inside the first
 requests. The warm pass puts that first use before the measurement instead of inside it: after a
-variant's servers pass G3, the orchestrator runs **one turn of the measured workload** — every
-agent of the variant, its real prompt with the shared system block, `max_tokens=64` — on that
-variant's own servers, and only then runs the coherence gate (variant A) and the measured load.
+variant's servers pass G3, the orchestrator runs **a one-turn copy of the workload** — every
+agent, the same shared system block, each agent's files shifted by one (`file_offset=1`, so no
+measured prompt is pre-cached past the shared block), `max_tokens=64` — on that variant's own
+servers, and only then runs the coherence gate (variant A) and the measured load.
 
 - **What it buys:** the shapes the workload touches are compiled once (the recipe cache keeps
   them), and the shared system block is in the prefix cache before G4 and G5. Cold TTFT then
   measures the first turn of the real load, not graph compilation.
-- **Cost:** about 2–4 min per variant on a warm cache. On a cold recipe cache the variant's
-  graph compilation happens inside its warm pass — minutes, not the hours of `--full-warmup`,
-  because only the shapes the workload touches are compiled.
+- **Cost:** 5–35 min per variant (32 prompts of about 120K tokens plus the graph compiles; the
+  low end with a warm recipe cache). On a cold cache the variant's graph compilation happens
+  inside its warm pass — minutes, not the hours of `--full-warmup`, because only the shapes the
+  workload touches are compiled.
 - **Files:** `<variant>/warm-pass.json` (requests, seconds, non-OK), `<variant>/warm-requests.jsonl`
   (the rows), `warm-workload.json` at the run level, and `warm_pass: true` in the manifest.
   `summary.md` prints one `Warm pass: ... requests in ... s, ... non-OK` line per variant
@@ -344,9 +346,9 @@ variant's own servers, and only then runs the coherence gate (variant A) and the
 | install (vLLM, plugin with native kernels, model deps) | 20–40 min |
 | fused GDN gate | about 15 min |
 | tiny TP8 | about 10 min |
-| each variant | about 35–45 min; with the default skipped warmup the server startup is minutes (graphs compile on first use, the recipe cache makes this cheap from the second run — see [Warmup and the recipe cache](#warmup-and-the-recipe-cache-ruk-3200)), then the [warm pass](#warm-pass-ruk-3203) (a few min on a warm cache; it absorbs the graph compilation on a cold one), then context fill and four turns |
+| each variant | about 35–45 min; with the default skipped warmup the server startup is minutes (graphs compile on first use, the recipe cache makes this cheap from the second run — see [Warmup and the recipe cache](#warmup-and-the-recipe-cache-ruk-3200)), then the [warm pass](#warm-pass-ruk-3203) (5–35 min; it absorbs the graph compilation), then context fill and four turns |
 
-A full run (three variants, no `--download`) is about 3–4 h; add the download on top.
+A full run (three variants, no `--download`) is about 3.5–5.5 h with the warm pass; add the download on top.
 
 ## What each gate checks and its stop rule
 
@@ -358,7 +360,7 @@ A full run (three variants, no `--download`) is about 3–4 h; add the download 
 | G2 tiny TP8 | stage 2a's tiny 8-head checkpoint at TP8: greedy agreement with `reference.json` | fewer than 16/16 tokens match on any prompt |
 | card_tests (after the gates) | the two HPU-only unit-test files on the card, in lazy mode (`PT_HPU_LAZY_MODE=1`), 600 s each: `tests/unit_tests/test_defragmentation.py` and `tests/unit_tests/ops/test_hpu_fused_moe.py`; each file's output is kept as `<stem>.log` and the pytest counts are recorded in `details.json` | never stops the run: a failure, a timeout or a skip is recorded only |
 | G3 startup, per server | `Maximum concurrency for 131,072 tokens per request` ≥ agents on that server; `Usable num_blocks`, KV tokens, weights and warmup recorded | the concurrency is too low, or no healthy `/v1/models` within the health timeout (default 1,800 s, `--server-timeout`; warmup is skipped by default, so startup is usually minutes) |
-| G4w warm pass, per variant (RUK-3203) | one turn of the measured workload on the variant's own servers (`max_tokens=64`): compiles the workload's graphs on first use and caches the shared system block; `warm-pass.json` records requests, seconds and non-OK rows; `--no-warm-pass` switches it off | any non-OK row fails the variant with `warm pass: <n> non-OK rows` (the variant's "on failure" rule applies: A stops the run, B and C continue) — see [Warm pass](#warm-pass-ruk-3203) |
+| G4w warm pass, per variant (RUK-3203) | a one-turn copy of the workload, files shifted by one, on the variant's own servers (`max_tokens=64`): compiles the workload's graphs on first use and caches the shared system block; `warm-pass.json` records requests, seconds and non-OK rows; `--no-warm-pass` switches it off | any non-OK row fails the variant with `warm pass: <n> non-OK rows` (the variant's "on failure" rule applies: A stops the run, B and C continue) — see [Warm pass](#warm-pass-ruk-3203) |
 | G4 coherence (variant A's server, after A's warm pass) | the 8 short prompts of stage 2b; one 120K-token needle prompt | an empty answer, repetition, a JSON prompt that does not parse, or a missed needle |
 | G5 load, per variant | the workload finishes in 5,400 s with no request error and `Running` reaching the agent count | any of these (then the variant's "on failure" rule applies: A stops the run, B and C continue) |
 

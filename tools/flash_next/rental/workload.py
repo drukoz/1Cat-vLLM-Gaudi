@@ -319,10 +319,10 @@ def main(argv: list[str] | None = None) -> int:
                                   args.shared_tokens,
                                   args.initial_tokens,
                                   args.turns,
-                                   args.max_tokens,
-                                   counter,
-                                   on_agent=on_agent,
-                                   file_offset=args.file_offset)
+                                  args.max_tokens,
+                                  counter,
+                                  on_agent=on_agent,
+                                  file_offset=args.file_offset)
     except ValueError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
