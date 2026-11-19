@@ -11,8 +11,9 @@ from __future__ import annotations
 import torch
 
 from tests.unit_tests.gdn_core_decode.sim_case import HPU_CASES, make_inputs, scalars
-from tools.flash_next.gdn_core_decode_replay import (RunResult, RecurrentStep, compare_runs, draw_activations, main,
-                                                     run)
+from tools.flash_next import gdn_core_decode_replay as replay
+from tools.flash_next.gdn_core_decode_replay import (RunResult, RecurrentStep, compare_runs, draw_activations,
+                                                     main, run)
 
 CASE_BY_NAME = {case.name: case for case in HPU_CASES}
 
@@ -97,3 +98,56 @@ def test_main_default_case_unchanged(capsys):
     assert main(["--device", "cpu", "--steps", "2", "--ops", "core"]) == 0
     out = capsys.readouterr().out
     assert "case=tp8_b16" in out
+
+
+class _OffsetStep(torch.nn.Module):
+    """Wraps a step module and shifts every step output by +1 (a graph variant that must MISMATCH)."""
+
+    def __init__(self, inner: torch.nn.Module):
+        super().__init__()
+        self.inner = inner
+
+    def forward(self, *args):
+        return self.inner(*args) + 1
+
+
+def test_lazy_mode_runs_graph_and_skips_compile(monkeypatch, capsys):
+    monkeypatch.setattr(replay, "bridge_mode", lambda device: replay.BridgeMode.LAZY)
+    monkeypatch.setattr(replay, "wrap_in_hpu_graph", lambda module: module)
+    assert main(["--device", "cpu", "--steps", "3"]) == 0
+    out = capsys.readouterr().out
+    assert "bridge=lazy" in out
+    for op in ("core", "recurrent"):
+        assert f"{op} lazy+hpu_graph: exact" in out
+        assert f"{op} torch.compile: skipped (lazy mode)" in out
+        assert f"{op} recompiles after warmup: skipped (lazy mode)" in out
+
+
+def test_eager_mode_runs_compile_and_skips_graph(monkeypatch, capsys):
+    monkeypatch.setattr(replay, "bridge_mode", lambda device: replay.BridgeMode.EAGER)
+    assert main(["--device", "cpu", "--steps", "3"]) == 0
+    out = capsys.readouterr().out
+    assert "core lazy+hpu_graph: skipped (eager mode)" in out
+    assert "core torch.compile: exact" in out
+    assert "core recompiles after warmup: 0" in out
+
+
+def test_graph_mismatch_fails_in_lazy_mode(monkeypatch, capsys):
+    monkeypatch.setattr(replay, "bridge_mode", lambda device: replay.BridgeMode.LAZY)
+    monkeypatch.setattr(replay, "wrap_in_hpu_graph", lambda module: _OffsetStep(module))
+    assert main(["--device", "cpu", "--steps", "3"]) == 1
+    out = capsys.readouterr().out
+    assert "lazy+hpu_graph: MISMATCH" in out
+
+
+def test_no_variant_ran_is_a_failure(monkeypatch, capsys):
+    monkeypatch.setattr(replay, "graph_skip_reason", lambda mode: "(test)")
+    monkeypatch.setattr(replay, "compile_skip_reason", lambda mode: "(test)")
+    assert main(["--device", "cpu", "--steps", "3"]) == 1
+    err = capsys.readouterr().err
+    assert "no replay variant runs in bridge mode cpu" in err
+
+
+def test_bridge_mode_cpu():
+    assert replay.bridge_mode(torch.device("cpu")) is replay.BridgeMode.CPU
+    assert (int(replay.BridgeMode.CPU), int(replay.BridgeMode.EAGER), int(replay.BridgeMode.LAZY)) == (0, 1, 2)

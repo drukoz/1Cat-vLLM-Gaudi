@@ -100,3 +100,46 @@ def test_load_failure_recorded(tmp_path, monkeypatch):
 
     assert _native.load_gdn_fused_extension() is False
     assert any(str(extension) in error and "bad elf" in error for error in _native._LOAD_ERRORS)
+
+
+_DLOPEN = "libhabana_pytorch2_plugin.so: cannot open shared object file: No such file or directory"
+
+
+def _raise_wrapped(path):
+    try:
+        raise OSError(_DLOPEN)
+    except OSError as exc:
+        raise OSError(f"Could not load this library: {path}") from exc
+
+
+def test_gdn_load_error_keeps_dlopen_cause(tmp_path, monkeypatch):
+    _, extension = _make_libraries(tmp_path, monkeypatch)
+    _record_imports(monkeypatch, [])
+    monkeypatch.setattr(torch.ops, "load_library", _raise_wrapped)
+
+    assert _native.load_gdn_fused_extension() is False
+    assert _native.gdn_fused_extension_errors() == (
+        f"{extension}: OSError: Could not load this library: {extension}; caused by OSError: {_DLOPEN}", )
+
+
+def test_gdn_real_load_library_error_names_cause(tmp_path, monkeypatch):
+    _, extension = _make_libraries(tmp_path, monkeypatch)  # an empty file is not a loadable library
+    _record_imports(monkeypatch, [])
+
+    assert _native.load_gdn_fused_extension() is False
+    (error, ) = _native.gdn_fused_extension_errors()
+    assert error.startswith(f"{extension}: OSError: Could not load this library: {extension}; caused by OSError: ")
+
+
+def test_native_extensions_error_keeps_dlopen_cause(tmp_path, monkeypatch):
+    library = tmp_path / "flashinfer_gaudi_ops.so"
+    library.write_bytes(b"")
+    monkeypatch.setenv("FLASHINFER_GAUDI_NATIVE_LIBRARY", str(library))
+    monkeypatch.setattr(_native, "_LOAD_ATTEMPTED", False)
+    monkeypatch.setattr(_native, "_SILU_AND_MUL_OP", None)
+    monkeypatch.setattr(_native, "_ADD_RMSNORM_QUANT_OP", None)
+    monkeypatch.setattr(torch.ops, "load_library", _raise_wrapped)
+
+    _native.load_native_extensions()
+    expected = f"{library}: OSError: Could not load this library: {library}; caused by OSError: {_DLOPEN}"
+    assert expected in _native._LOAD_ERRORS

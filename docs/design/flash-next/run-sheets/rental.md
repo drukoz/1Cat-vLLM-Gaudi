@@ -34,9 +34,10 @@ stops at the first gate that trips, and you send the tarball back.
    scp dist/flash-next-rental-*.tar.gz <node>:~/
    ```
 
-3. Disk on the node: the FP8 checkpoint is about 185.5 GB and the results add a few GB — allow
-   **at least 250 GB free** for a run with `--download`, at least 20 GB free otherwise. The run
-   refuses to start when the model parent folder does not exist.
+3. Disk on the node: the checkpoint is 185.5 GB and a `--download` needs **250 GB free** under
+   `--model`. Root disks of rented nodes are often smaller (92 GB on 2026-11-18).
+   `prepare_host.sh` prints the disks and the free space and prepares a data disk; `run_rental.sh`
+   refuses a download that does not fit. See [Disks and the data disk](#disks-and-the-data-disk).
 
 4. The checkpoint: if the node does not have it yet, add `--download` to the command below; the
    script downloads `Qwen/Qwen3.8-Flash-Next-FP8` (public, not gated) into the `--model` directory
@@ -82,6 +83,42 @@ version differs from the pin — it never silently downgrades), `--force` (conti
 Ubuntu), and `--dry-run` (print every step's commands; needs no root, apt, docker, or network). When
 the host is not ready, `run_rental.sh` stops and points back at this script.
 
+### Disks and the data disk
+
+On 2026-11-18 `/models` was a folder on the 92 GB root disk, and the 185.5 GB download filled it
+(97%) and stopped; the node had a second, blank 26.4 TB disk (`/dev/vdc`) that nothing used,
+because nothing showed it to us and nothing prepared it. Every `prepare_host.sh` run now prints
+`lsblk`, the free space (`df -h`) and the unused disks, so a data disk is visible before the
+download starts. To use one:
+
+```bash
+sudo bash prepare_host.sh --data-disk /dev/vdc
+```
+
+Use the device name the list printed; `--mount DIR` puts the filesystem somewhere other than
+`/models`. Try it first with `--dry-run` (it runs the checks and prints what the real run would
+do). The script formats a device only with `--data-disk`, and only when `blkid` and `wipefs` both
+see it as blank, with no partitions and not mounted: any signature, any partition, a mount point,
+an unreadable device or a non-empty mount folder is a refusal (exit 1, a `REFUSED` line). It never
+formats without the option. The `/etc/fstab` line uses the device UUID with `nofail`, so a missing
+disk does not stop the boot, and the rerun after a reboot finds the disk already prepared: the
+script's own `fn-models` ext4 is recognized and `mkfs` is skipped.
+
+### Fallback: the checkpoint in RAM (no data disk)
+
+Only for a node without a usable data disk and with plenty of memory (2026-11-18: 925 GB RAM).
+Conditions: `df -h /dev/shm` shows at least 250 GB free (tmpfs is half the RAM by default) and
+`free -g` shows at least 400 GB available.
+
+```bash
+sudo mkdir -p /dev/shm/models /models
+sudo mount --bind /dev/shm/models /models
+sudo bash run_rental.sh --model /models/Qwen3.8-Flash-Next-FP8 --download
+```
+
+It is lost on reboot: after a reboot, redo the bind mount and the download. It worked on
+2026-11-18 (gate `preflight` passed).
+
 ## The one command (on the node)
 
 ```bash
@@ -98,10 +135,11 @@ That is all. Three things about the host it runs on:
 - **A terminal that survives the SSH session.** The run takes hours; run it inside `tmux`
   (`tmux new -s rental`; detach with `Ctrl-b d`, reattach with `tmux attach -t rental`). A dropped
   SSH session otherwise kills the run, and the tarball at the end is never written.
-- **Disk.** `--download` needs about 250 GB free under `--model`'s parent (the checkpoint is 185 GB),
-  and the image, the install and the results need about 40 GB on the root filesystem. Check `df -h`
-  first; when the large disk is mounted elsewhere, point `--model` there, for example
-  `--model /mnt/models/Qwen3.8-Flash-Next-FP8`.
+- **Disk.** `run_rental.sh` checks the disks itself. With `--download` it stops when the folder for
+  `--model` has less than 250 GB free (what is already downloaded there counts), and every run stops
+  when Docker's root (`/var/lib/docker`) has less than 30 GB free. Each stop is one line naming the
+  folder, its free space and the fix. On a node whose root disk is small, prepare the data disk
+  first: see [Disks and the data disk](#disks-and-the-data-disk).
 
 Useful options:
 
@@ -116,6 +154,7 @@ Useful options:
 | `--run-id ID` | fixed run id (default: UTC timestamp) |
 | `--image IMG` | container image (default the 1.24.1 base image) |
 | `--dry-run` | print the `docker run` command and exit |
+| `--no-disk-check` | skip both free-space checks |
 
 When the run stops at a stop rule, restart after fixing the cause with `--run-id <same id>
 --from <phase>` to keep the results in one folder.
@@ -139,7 +178,7 @@ A full run (three variants, no `--download`) is about 3–4 h; add the download 
 |---|---|---|
 | G0 preflight | 8 cards in `hl-smi`; the checkpoint config is block-FP8 [128, 128]; the FP8 layout check passes for each layout in the run; free disk; records the bundle commit, the image, `hl-smi -q` and the environment | any check fails |
 | G1 build | stage 1's install from the bundle; `vllm.__version__` is `0.28.1rc1.dev392+g8f816a3f6`; `import vllm_gaudi`; `flashinfer_gaudi.get_capabilities()` | install or import fails, or the version is wrong |
-| G1b fused GDN kernel | op numerics of both GDN decode ops on the card against the CPU reference (`test_hpu_op.py`), 1,000-step graph replay against eager (two cases), then the verification op's numerics and two replays (only after the decode checks pass), then the speed measurement | never stops: on a failure, a skip or a missing library, every later server runs with `VLLM_HPU_GDN_CORE_DECODE=0` (the PyTorch GDN path), recorded in the manifest and the summary; a verify failure leaves `VLLM_HPU_GDN_CORE_VERIFY=0`, only a pass sets it to 1 |
+| G1b fused GDN kernel | op numerics of both GDN decode ops on the card against the CPU reference (`test_hpu_op.py`), 1,000-step graph replay against eager (two cases), then the verification op's numerics and two replays (only after the decode checks pass), then the speed measurement; all of these run with `PT_HPU_LAZY_MODE=1`, the servers' bridge mode, and only they decide the kernel. The two decode replays then run once more with `PT_HPU_LAZY_MODE=0` for `torch.compile` and are recorded only (`replay_eager`, `eager_compile_ok`): an eager failure never turns the kernel off. Every step runs in its own process group and is killed with its whole group at its timeout (op tests 600 s, each replay 900 s, bench 1200 s) | never stops: on a failure, a skip or a missing library, every later server runs with `VLLM_HPU_GDN_CORE_DECODE=0` (the PyTorch GDN path), recorded in the manifest and the summary; a verify failure leaves `VLLM_HPU_GDN_CORE_VERIFY=0`, only a pass sets it to 1 |
 | G2 tiny TP8 | stage 2a's tiny 8-head checkpoint at TP8: greedy agreement with `reference.json` | fewer than 16/16 tokens match on any prompt |
 | G3 startup, per server | `Maximum concurrency for 131,072 tokens per request` ≥ agents on that server; `Usable num_blocks`, KV tokens, weights and warmup recorded | the concurrency is too low, or no healthy `/v1/models` within 1,800 s |
 | G4 coherence (variant A's server) | the 8 short prompts of stage 2b; one 120K-token needle prompt | an empty answer, repetition, a JSON prompt that does not parse, or a missed needle |
@@ -156,6 +195,9 @@ Notes:
 - The install logs are in the results folder as `install-<n>.log`; the per-phase records
   (`startup.json`, `toolchain.json`, `requests.jsonl`, `metrics.jsonl`, `status.json`,
   `summary.*`) are all in the results folder for the run id.
+- Every server runs lazy (`PT_HPU_LAZY_MODE=1`). The native extensions link only the Habana
+  backend library so one build loads in both bridge modes; the checks that prove it on the card
+  are in [native-extensions.md](../native-extensions.md#run-sheet-lines-for-the-next-rental).
 
 ## Checks carried from rental run 1 (2026-11-18)
 

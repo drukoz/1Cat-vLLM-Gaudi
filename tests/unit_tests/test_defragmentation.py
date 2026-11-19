@@ -308,6 +308,32 @@ class TestOnlineDefragmenter:
             # Should only be called once for keys (no values)
             assert mock_forward.call_count == 1
 
+    def test_recurrent_caches_disable_defragmenter(self, mock_config, mock_debug_logger):
+        """Test that a model with recurrent-state caches gets a disabled defragmenter"""
+        kv_caches = ((torch.empty(0, device='meta'), torch.empty(0, device='meta')), )
+        defrag = OnlineDefragmenter(kv_caches, block_size=0, recurrent=True)
+
+        assert defrag.enabled is False
+
+        defrag.update_state({"r": [5, 9]}, [])
+        defrag.defragment()
+
+        assert defrag.used_blocks == {}
+        assert defrag.resolve(9) == 9
+
+    def test_recurrent_false_keeps_config_value(self, mock_config, mock_debug_logger):
+        """Test that the default (no recurrent flag) keeps the config's defrag value"""
+        kv_caches = ((torch.empty(0, device='meta'), torch.empty(0, device='meta')), )
+        defrag = OnlineDefragmenter(kv_caches, block_size=0)
+
+        assert defrag.enabled is True
+
+    def test_single_state_cache_is_not_mla(self, mock_config, mock_debug_logger):
+        """Test that a one-element (single-state) cache tuple is not treated as MLA"""
+        defrag = OnlineDefragmenter(((torch.empty(0, device='meta'),),), block_size=0)
+
+        assert defrag.is_mla is False
+
 
 class TestCacheSwapUtils:
     """Test suite for CacheSwapUtils"""

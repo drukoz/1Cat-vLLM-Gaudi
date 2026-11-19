@@ -40,6 +40,27 @@ _WEIGHTS_RE = re.compile(r"Loading model weights took ([\d.]+) GB")
 _WARMUP_RE = re.compile(r"Warmup finished in ([\d,]+) secs")
 _GDN_RE = re.compile(r"GDN layers detected (.*)$", re.MULTILINE)
 
+RENTAL_ENV_DEFAULTS = {
+    "VLLM_HPU_FLASH_NEXT_QSA_MODE": "1",
+    "VLLM_HPU_RECURRENT_STATE_POOL": "1",
+    "PT_HPU_LAZY_MODE": "1",
+}
+
+
+def server_environment(overrides: dict, cards: str = None) -> dict[str, str]:
+    """os.environ with the rental defaults, VLLM_COMPACT_GDN removed, then `overrides` on top.
+
+    `cards` sets HABANA_VISIBLE_MODULES when given (a variant's server); the tiny gate uses every card
+    and passes None. Every `vllm serve` the rental starts gets its environment from here.
+    """
+    env = dict(os.environ)
+    if cards is not None:
+        env["HABANA_VISIBLE_MODULES"] = str(cards)
+    env.update(RENTAL_ENV_DEFAULTS)
+    env.pop("VLLM_COMPACT_GDN", None)
+    env.update(overrides or {})
+    return env
+
 
 def _to_int(text: str) -> int:
     return int(text.replace(",", ""))
@@ -48,8 +69,8 @@ def _to_int(text: str) -> int:
 def build_command(variant: dict, server: dict, model: str, served_name: str) -> tuple[list[str], dict[str, str]]:
     """The exact `vllm serve` command for one server of one variant, and its environment.
 
-    The environment is `os.environ` with the rental defaults set, `VLLM_COMPACT_GDN`
-    removed and `variant["env"]` applied on top (it may override any default).
+    The environment is `server_environment` with `variant["env"]` as the overrides
+    (they may override any default) and the server's `cards` in HABANA_VISIBLE_MODULES.
     """
     cmd = [
         "vllm",
@@ -84,14 +105,7 @@ def build_command(variant: dict, server: dict, model: str, served_name: str) -> 
     ]
     cmd += list(variant.get("serve_args") or [])
 
-    env = dict(os.environ)
-    env["HABANA_VISIBLE_MODULES"] = str(server["cards"])
-    env["VLLM_HPU_FLASH_NEXT_QSA_MODE"] = "1"
-    env["VLLM_HPU_RECURRENT_STATE_POOL"] = "1"
-    env["PT_HPU_LAZY_MODE"] = "1"
-    env.pop("VLLM_COMPACT_GDN", None)
-    for key, value in (variant.get("env") or {}).items():
-        env[key] = value
+    env = server_environment(variant.get("env") or {}, server["cards"])
     return cmd, env
 
 

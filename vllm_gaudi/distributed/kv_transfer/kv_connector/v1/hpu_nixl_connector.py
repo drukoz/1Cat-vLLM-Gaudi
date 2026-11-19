@@ -294,18 +294,18 @@ def _hpu_transfer_cache_regions(transfer_topo, cache, layer_spec):
 
     Args:
         transfer_topo: The active :class:`TransferTopology` for this worker.
-        cache: The per-layer KV cache tensor (``(conv, ssm)`` for Mamba, a
-            K/V-split ``TensorTuple`` for regular attention, or a single
-            tensor for MLA / already-blocks-first layouts).
+        cache: The per-layer KV cache tensor (``(conv, ssm)`` or ``(conv,)``
+            for Mamba, a K/V-split ``TensorTuple`` for regular attention, or a
+            single tensor for MLA / already-blocks-first layouts).
         layer_spec: The ``KVCacheSpec`` for this layer.
 
     Returns:
         The list of tensor(s) to register as NIXL memory regions.
     """
     if isinstance(layer_spec, MambaSpec):
-        # Register the whole shared conv/ssm tensor (mirror upstream).
-        conv, _ssm = cache
-        return [conv]
+        # Register the first state tensor (conv) as upstream does; a single-state
+        # spec (the Flash-Next PLE short-conv) has only that one.
+        return [cache[0]]
 
     # Mirror upstream's hybrid-SSM blocks-first transpose.
     if transfer_topo.is_mamba and cache.shape[0] == 2:
