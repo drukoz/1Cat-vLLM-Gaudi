@@ -263,9 +263,10 @@ def print_table(entries):
     print()
     print("| component | module | tokens | compile_s | replay_s | note |")
     print("| --- | --- | ---: | ---: | ---: | --- |")
-    for entry in sorted(entries, key=lambda e: -e["compile_s"]):
+    for entry in sorted(entries, key=lambda e: -(e["compile_s"] or 0.0)):
         replay = "skipped" if entry["replay_s"] is None else f"{entry['replay_s']:.3f}"
-        print(f"| {entry['component']} | {entry['module']} | {entry['tokens']} | {entry['compile_s']:.3f} | "
+        compile_text = "error" if entry["compile_s"] is None else f"{entry['compile_s']:.3f}"
+        print(f"| {entry['component']} | {entry['module']} | {entry['tokens']} | {compile_text} | "
               f"{replay} | {entry['note'] or ''} |")
 
 
@@ -331,7 +332,9 @@ def run(args, token_counts):
                     print(f"compile_probe: WARNING {key} captured no inputs at {tokens} tokens, skipped", flush=True)
                     continue
                 cap = captured[key]
-                component = target["module"]
+                # Always graph-wrap a fresh thin module: wrap_in_hpu_graph patches its argument's forward in
+                # place, so wrapping the real module would leave the next shape's eager capture running graphs.
+                component = MethodModule(target["module"], "__call__")
                 if target["kind"] == "select":
                     component = SelectModule(target["module"])
                 elif target["kind"] == "method":
@@ -340,12 +343,23 @@ def run(args, token_counts):
                     component = htorch.hpu.wrap_in_hpu_graph(component, disable_tensor_cache=True)
                 run_callable = functools.partial(component, *cap["args"], **cap["kwargs"])
                 note = cap["method"] + "()" if target["kind"] == "method" else None
-                compile_s = timed_call(run_callable, md, vllm_config, torch, set_forward_context, htorch)
+                try:
+                    for att in sparse_attns:  # the stand-in appends K/V per call: keep the captured length
+                        att.reset()
+                    compile_s = timed_call(run_callable, md, vllm_config, torch, set_forward_context, htorch)
+                except Exception as exc:  # one component failing to capture must not lose the rest of the table
+                    print(f"compile_probe: ERROR {key} at {tokens} tokens: {exc!r}", flush=True)
+                    entries.append({"component": target["component"], "module": target["module_name"],
+                                    "tokens": tokens, "compile_s": None, "replay_s": None,
+                                    "note": f"error: {exc!r}"[:300]})
+                    continue
                 replay_s = None
                 if compile_s > FIRST_CALL_BUDGET_S:
                     note = f"first call took {compile_s:.1f} s (> {FIRST_CALL_BUDGET_S:.0f} s); replay skipped" + (
                         f" [{cap['method']}()]" if target["kind"] == "method" else "")
                 else:
+                    for att in sparse_attns:
+                        att.reset()
                     replay_s = timed_call(run_callable, md, vllm_config, torch, set_forward_context, htorch)
                 entries.append({
                     "component": target["component"],
