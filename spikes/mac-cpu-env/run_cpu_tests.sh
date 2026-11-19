@@ -13,6 +13,7 @@
 #
 # Resumable: a second run skips files already present in the TSV.
 # Use FRESH=1 run_cpu_tests.sh <target-dir> to start over.
+# MAX_SECONDS=N stops starting new files after N seconds (exit 0); the same command resumes.
 
 set -uo pipefail
 
@@ -31,6 +32,7 @@ VENV="$TARGET_DIR/venv"
 OUT="$TARGET_DIR/cpu_tests.tsv"
 LOG_DIR="$TARGET_DIR/test_logs"
 PER_FILE_TIMEOUT="${PER_FILE_TIMEOUT:-600}"
+MAX_SECONDS="${MAX_SECONDS:-0}"
 
 [[ -x "$VENV/bin/python" ]] || {
     echo "no venv at $VENV; run setup.sh first" >&2
@@ -97,6 +99,10 @@ for f in "${FILES[@]}"; do
     if printf '%s\n' "$SKIP_LIST" | grep -qxF "$f"; then
         echo "[cpu-tests] $DONE/$TOTAL $f (already recorded, skipped)"
         continue
+    fi
+    if [[ "$MAX_SECONDS" -gt 0 && $(($(date +%s) - STARTED)) -ge "$MAX_SECONDS" ]]; then
+        echo "[cpu-tests] MAX_SECONDS=$MAX_SECONDS reached before file $DONE/$TOTAL; run the same command to resume"
+        exit 0
     fi
     log="$LOG_DIR/$(printf '%s' "${f#tests/unit_tests/}" | tr '/' '_' | sed 's/\.py$/.log/')"
     if [[ -n "$TIMEOUT_BIN" ]]; then
