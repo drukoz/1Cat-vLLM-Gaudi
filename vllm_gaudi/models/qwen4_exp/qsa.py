@@ -168,8 +168,8 @@ class HpuQsaIndexer(nn.Module):
             seq = T // rows
             ctx = md.context_lens_tensor
             ctx = torch.zeros(rows, dtype=torch.long, device=hidden.device) if ctx is None else ctx.long()
-            if bool((ctx % ratio).any()):
-                raise NotImplementedError("sparse QSA prefill needs 4-aligned context")
+            # ctx is 4-aligned by construction (the base scheduler's mamba-block-aligned chunking,
+            # the runner's assert); no device check here: a host sync breaks HPU graph capture.
             positions2 = positions.view(rows, seq)
             raw2 = raw_k.view(rows, seq, D)
             n_full = seq // ratio  # complete blocks inside the chunk (ctx 4-aligned => blocks start at t = 0, 4, ...)
@@ -275,12 +275,13 @@ class HpuQsaIndexer(nn.Module):
         complete = valid & ((positions % ratio) == ratio - 1)
         cs, sn = cos_sin_at(positions - (ratio - 1))
         keys = compress_block_keys(blk, self.k_layernorm.weight, self.eps, cs, sn)
-        # Only the completing rows write: the other rows of the block share that
-        # compressed row (``slot_mapping // ratio``) and a self-write of their
-        # current value through a duplicated ``index_put_`` index is undefined.
+        # One fixed-shape write (HPU graphs replay the captured shapes): a row that completes a
+        # block writes its compressed row; every other row writes the scratch row, the cache's
+        # last row, which no request's block table reaches (qsa_side_caches). Writing a block's
+        # row from a row that does not complete it would race the completing row's write.
         row_slots = compressed_row_slots(slot_mapping, ratio)
-        if bool(complete.any()):
-            cache.index_put_((row_slots[complete],), keys[complete])
+        scratch_row = torch.full_like(row_slots, cache.shape[0] - 1)
+        cache.index_put_((torch.where(complete, row_slots, scratch_row),), keys)
         MB = int(md.block_table.shape[1])
         n = MB * rpb
         bt = md.block_table.long()

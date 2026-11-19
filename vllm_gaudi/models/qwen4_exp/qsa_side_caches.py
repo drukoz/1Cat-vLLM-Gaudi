@@ -17,6 +17,13 @@ this holds for the compact, pool and baseline GDN layouts alike.  The sparse
 decode branch of ``HpuQsaIndexer.select`` parks the padding rows of a ragged
 multi-token decode step on it (both as load and as store slot), which keeps
 those rows out of every request's ring window.
+
+The compressed key cache's LAST row (one less than its row count) is its
+scratch row: the decode rows that complete no compression block write it (the
+decode branch keeps exactly one fixed-shape ``index_put_`` per step, so HPU
+graph capture sees no data-dependent shape and no host sync), and only padded
+block-table entries, masked by the visible blocks before the top-k, ever
+gather it.
 """
 
 from __future__ import annotations
