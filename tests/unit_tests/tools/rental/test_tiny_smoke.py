@@ -112,6 +112,12 @@ def fakes(tmp_path, monkeypatch):
     return out, port
 
 
+@pytest.fixture(autouse=True)
+def no_combined_kernel_db(monkeypatch):
+    """The combined kernel database is not installed on the test machine; a test that wants it overrides this."""
+    monkeypatch.setattr(orchestrator, "combined_kernel_db_installed", lambda *args, **kwargs: False)
+
+
 def run(out: Path, port: int, *extra: str) -> tuple[int, dict]:
     code = tiny_smoke.main(["--out", str(out), "--port", str(port), "--health-timeout", "20", *extra])
     return code, json.loads((out / "summary.json").read_text(encoding="utf-8"))
@@ -187,6 +193,60 @@ def test_env_pairs_are_applied_last(fakes):
     assert code == 0
     env = json.loads((out / "fused" / "server_env.json").read_text(encoding="utf-8"))
     assert env["VLLM_HPU_GDN_CORE_DECODE"] == "0"
+
+
+def test_the_pytorch_mode_gets_the_recipe_cache_and_the_fused_mode_does_not(fakes, monkeypatch, capsys):
+    out, port = fakes
+    monkeypatch.setenv("FAKE_SERVER_ENV_KEYS", serve.RECIPE_CACHE_ENV)
+    code, summary = run(out, port, "--recipe-cache", "/rc")
+    assert code == 0
+    pytorch = json.loads((out / "pytorch" / "server_env.json").read_text(encoding="utf-8"))
+    fused = json.loads((out / "fused" / "server_env.json").read_text(encoding="utf-8"))
+    assert pytorch[serve.RECIPE_CACHE_ENV] == "/rc,false,8192"
+    assert fused[serve.RECIPE_CACHE_ENV] is None
+    modes = by_mode(summary)
+    assert modes["pytorch"]["recipe_cache"] == "/rc"
+    assert modes["fused"]["recipe_cache"] == serve.RECIPE_CACHE_OFF_REASON
+    printed = capsys.readouterr().out
+    assert "starting the server (recipe cache on" in printed
+    assert "starting the server (recipe cache off" in printed
+    assert "PASSED (server up in" in printed
+    assert "recipe cache on)" in printed and "recipe cache off)" in printed
+
+
+def test_without_recipe_cache_no_server_gets_the_variable(fakes, monkeypatch):
+    out, port = fakes
+    monkeypatch.setenv("FAKE_SERVER_ENV_KEYS", serve.RECIPE_CACHE_ENV)
+    code, summary = run(out, port)
+    assert code == 0
+    modes = by_mode(summary)
+    for mode in ("pytorch", "fused"):
+        env = json.loads((out / mode / "server_env.json").read_text(encoding="utf-8"))
+        assert env[serve.RECIPE_CACHE_ENV] is None
+        assert modes[mode]["recipe_cache"] == serve.RECIPE_CACHE_NONE
+
+
+def test_env_pairs_override_the_recipe_cache(fakes, monkeypatch):
+    out, port = fakes
+    monkeypatch.setenv("FAKE_SERVER_ENV_KEYS", serve.RECIPE_CACHE_ENV)
+    code, _ = run(out, port, "--gdn", "pytorch", "--recipe-cache", "/rc",
+                  "--env", "PT_HPU_RECIPE_CACHE_CONFIG=/x,false,1")
+    assert code == 0
+    env = json.loads((out / "pytorch" / "server_env.json").read_text(encoding="utf-8"))
+    assert env[serve.RECIPE_CACHE_ENV] == "/x,false,1"
+
+
+def test_with_the_combined_kernel_database_both_modes_get_the_cache(fakes, monkeypatch):
+    out, port = fakes
+    monkeypatch.setattr(orchestrator, "combined_kernel_db_installed", lambda *args, **kwargs: True)
+    monkeypatch.setenv("FAKE_SERVER_ENV_KEYS", serve.RECIPE_CACHE_ENV)
+    code, summary = run(out, port, "--recipe-cache", "/rc")
+    assert code == 0
+    modes = by_mode(summary)
+    for mode in ("pytorch", "fused"):
+        env = json.loads((out / mode / "server_env.json").read_text(encoding="utf-8"))
+        assert env[serve.RECIPE_CACHE_ENV] == "/rc,false,8192"
+        assert modes[mode]["recipe_cache"] == "/rc"
 
 
 def test_env_without_equals_is_a_usage_error(fakes):
