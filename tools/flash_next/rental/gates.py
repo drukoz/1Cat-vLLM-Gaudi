@@ -695,3 +695,57 @@ def coherence(base_url: str, model: str, needle_messages: list) -> tuple[GateSta
     except Exception as e:  # noqa: BLE001 - the gate never raises
         details["error"] = "%s: %s" % (type(e).__name__, e)
         return GateStatus.FAILED, details
+
+
+CARD_TEST_FILES = ("tests/unit_tests/test_defragmentation.py", "tests/unit_tests/ops/test_hpu_fused_moe.py")
+CARD_TESTS_TIMEOUT_S = 600.0
+
+
+def card_tests(plugin_root: Path, out_dir: Path, python: str = sys.executable) -> tuple[GateStatus, dict]:
+    """The HPU-only unit tests (RUK-3106): the files of CARD_TEST_FILES run with pytest on the card in
+    lazy mode (PT_HPU_LAZY_MODE=1), CARD_TESTS_TIMEOUT_S each, through run_step.
+
+    Recorded only: the orchestrator keeps the run going whatever this returns. Each file's output goes
+    to out_dir/<file stem>.log (on a timeout, the partial output if the interpreter left one) and one
+    entry {"file", "exit", "timed_out", "passed", "failed", "skipped", "error"} per file lands in
+    details["files"]. PASSED when every file exited 0 with failed == error == 0, FAILED otherwise.
+    The gate never raises."""
+    details: dict = {"files": []}
+    try:
+        plugin_root = Path(plugin_root)
+        out_dir = Path(out_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        env = dict(os.environ, PYTHONPATH=str(plugin_root), PT_HPU_LAZY_MODE="1")
+        all_ok = True
+        for file in CARD_TEST_FILES:
+            entry = {
+                "file": file,
+                "exit": None,
+                "timed_out": False,
+                "passed": 0,
+                "failed": 0,
+                "skipped": 0,
+                "error": 0,
+            }
+            text = ""
+            try:
+                proc = run_step([python, "-m", "pytest", "-q", "-rs", "-p", "no:cacheprovider", file], plugin_root,
+                                CARD_TESTS_TIMEOUT_S, env)
+                entry["exit"] = proc.returncode
+                text = (proc.stdout or "") + (proc.stderr or "")
+            except subprocess.TimeoutExpired as e:
+                entry["timed_out"] = True
+                text = (e.output or "") + (e.stderr or "")
+            with open(out_dir / (Path(file).stem + ".log"), "w", encoding="utf-8") as f:
+                f.write(text)
+            entry.update(_gdn_pytest_summary(text))
+            details["files"].append(entry)
+            if not (entry["exit"] == 0 and entry["failed"] == 0 and entry["error"] == 0):
+                all_ok = False
+        if all_ok:
+            return GateStatus.PASSED, details
+        details["reason"] = "a card test file failed or timed out"
+        return GateStatus.FAILED, details
+    except Exception as e:  # noqa: BLE001 - the gate never raises
+        details["error"] = "%s: %s" % (type(e).__name__, e)
+        return GateStatus.FAILED, details

@@ -26,7 +26,7 @@ from tools.flash_next.rental.schema import (
 )
 
 VARIANTS_FILE = Path(__file__).resolve().parent / "variants.json"
-GATE_PHASES = ("preflight", "build", "fused_gdn", "tiny")
+GATE_PHASES = ("preflight", "build", "fused_gdn", "tiny", "card_tests")
 ENV_PREFIXES = ("VLLM_", "HABANA_", "PT_", "HF_")
 HLSMI_Q_LIMIT = 200 * 1024
 SERVER_HEALTH_TIMEOUT_S = 1800.0
@@ -261,8 +261,10 @@ class Runner:
                     status, details = gates.build_check()
             elif name == "fused_gdn":
                 status, details = self.gate_fused_gdn(phase_dir)
-            else:
+            elif name == "tiny":
                 status, details = self.gate_tiny(phase_dir)
+            else:
+                status, details = self.gate_card_tests(phase_dir)
         except Exception as exc:  # noqa: BLE001
             status = GateStatus.FAILED
             details = {"reason": "%s: %s" % (type(exc).__name__, exc)}
@@ -270,9 +272,14 @@ class Runner:
         reason = details.get("reason") or details.get("error")
         write_status(phase_dir, name, status, reason, seconds)
         write_json(phase_dir / "details.json", details)
-        if name == "fused_gdn":
-            return True
+        if name in ("fused_gdn", "card_tests"):
+            return True  # recorded-only phases: their result never stops the run
         return status in (GateStatus.PASSED, GateStatus.SKIPPED)
+
+    def gate_card_tests(self, phase_dir: Path):
+        if self.stub:
+            return GateStatus.SKIPPED, {"reason": "stub mode"}
+        return gates.card_tests(repo_root(), phase_dir, sys.executable)
 
     def gate_preflight(self):
         layouts = sorted({(int(s["tp"]), bool(s.get("ep"))) for v in self.selected for s in v["servers"]})
