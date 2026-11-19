@@ -128,6 +128,7 @@ REPO_LIST="/etc/apt/sources.list.d/habanalabs.list"
 SYNAPSEAI_LIST="/etc/apt/sources.list.d/habanalabs_synapseai.list"
 DAEMON_JSON="/etc/docker/daemon.json"
 CARDS=0
+APT_UPDATED=0
 
 # --- step logging -------------------------------------------------------------
 
@@ -168,6 +169,24 @@ run_logged() {
         printf '\n$ %s\n' "$*"
         bash -c "$*" </dev/null  # no tty: a prompt fails instead of hanging
     } >>"$STEP_LOG" 2>&1
+}
+
+# apt_update_once — `apt-get update` at most once per run (it is slow on the rental node). Steps call
+# it only right before they install something.
+apt_update_once() {
+    [ "$APT_UPDATED" -eq 1 ] && return 0
+    run_logged "apt-get update" || return 1
+    APT_UPDATED=1
+}
+
+# apt_update_list FILE — refresh only the repo in FILE (one this run just added), not every repo.
+apt_update_list() {
+    run_logged "apt-get update -o Dir::Etc::sourcelist=$1 -o Dir::Etc::sourceparts=- -o APT::Get::List-Cleanup=0"
+}
+
+# pkg_installed NAME — true when dpkg has NAME fully installed.
+pkg_installed() {
+    dpkg-query -W -f='${Status}' "$1" 2>/dev/null | grep -q 'install ok installed'
 }
 
 # --- data disk (step 1b) --------------------------------------------------------
@@ -377,7 +396,7 @@ dry_run() {
     echo
     echo "host step 2 (apt prerequisites):"
     printf '%s\n' \
-        "apt-get update" \
+        "apt-get update  # only when a prerequisite below is missing; at most once per run" \
         "apt-get install -y linux-headers-$(uname -r)  # remedy if absent: apt-get install -y linux-headers-generic linux-image-generic, reboot, rerun" \
         "apt-get install -y curl wget gnupg ca-certificates pciutils sudo python3"
     echo
@@ -395,6 +414,7 @@ dry_run() {
     echo
     echo "host step 5 (docker): skipped when 'docker info' succeeds"
     printf '%s\n' \
+        "apt-get update  # only when no earlier step ran it" \
         "apt-get install -y docker.io" \
         "systemctl enable --now docker"
     echo
@@ -402,7 +422,7 @@ dry_run() {
     printf '%s\n' \
         "curl -fsSL $VAULT/api/gpg/key/public | gpg --dearmor -o $KEYRING  # only when $SYNAPSEAI_LIST is absent" \
         "echo 'deb [signed-by=$KEYRING] $VAULT/debian jammy main' > $REPO_LIST" \
-        "apt-get update" \
+        "apt-get update -o Dir::Etc::sourcelist=$REPO_LIST -o Dir::Etc::sourceparts=- -o APT::Get::List-Cleanup=0  # only the Habana list, when this step added it; otherwise the once-per-run update" \
         "apt-get install -y --no-install-recommends habanalabs-container-runtime=$PIN" \
         "curl -fsSL -o /tmp/hcr.deb $HCR_DEB_URL && apt-get install -y --no-install-recommends /tmp/hcr.deb  # direct-deb fallback"
     echo
@@ -488,14 +508,28 @@ ensure_habana_key() {
 step2_apt() {
     step_start 2 "apt prerequisites"
     command -v gpg >/dev/null 2>&1 && ensure_habana_key
-    if ! run_logged "apt-get update"; then
-        step_failed "apt-get update failed; check the network and /etc/apt/sources.list.d"
-    fi
-    if ! run_logged "apt-get install -y linux-headers-$(uname -r)"; then
-        step_failed "cannot install linux-headers-$(uname -r) (custom cloud kernel?). Remedy: apt-get install -y linux-headers-generic linux-image-generic, reboot into the new kernel, then rerun this script"
-    fi
-    if ! run_logged "apt-get install -y curl wget gnupg ca-certificates pciutils sudo python3"; then
-        step_failed "apt-get install of the prerequisites (curl wget gnupg ca-certificates pciutils sudo python3) failed"
+    local headers="linux-headers-$(uname -r)"
+    local missing=()
+    local pkg
+    for pkg in curl wget gnupg ca-certificates pciutils sudo python3; do
+        pkg_installed "$pkg" || missing+=("$pkg")
+    done
+    if pkg_installed "$headers" && [ "${#missing[@]}" -eq 0 ]; then
+        echo "all prerequisites installed; no apt-get update" >>"$STEP_LOG"
+    else
+        if ! apt_update_once; then
+            step_failed "apt-get update failed; check the network and /etc/apt/sources.list.d"
+        fi
+        if ! pkg_installed "$headers"; then
+            if ! run_logged "apt-get install -y $headers"; then
+                step_failed "cannot install linux-headers-$(uname -r) (custom cloud kernel?). Remedy: apt-get install -y linux-headers-generic linux-image-generic, reboot into the new kernel, then rerun this script"
+            fi
+        fi
+        if [ "${#missing[@]}" -gt 0 ]; then
+            if ! run_logged "apt-get install -y ${missing[*]}"; then
+                step_failed "apt-get install of the prerequisites (curl wget gnupg ca-certificates pciutils sudo python3) failed"
+            fi
+        fi
     fi
     local kver
     kver="$(uname -r)"
@@ -533,6 +567,7 @@ step3_driver() {
     if ! run_logged "cd $LOG_DIR && ./habanalabs-installer.sh install --type base -y"; then
         step_failed "habanalabs-installer.sh install --type base -y failed; see $STEP_LOG"
     fi
+    APT_UPDATED=1  # the installer ran apt-get update itself
     step_ok
 }
 
@@ -561,6 +596,7 @@ step5_docker() {
         step_skipped
         return 0
     fi
+    apt_update_once || step_failed "apt-get update failed before installing docker.io"
     if ! run_logged "apt-get install -y docker.io"; then
         step_failed "apt-get install -y docker.io failed"
     fi
@@ -579,6 +615,7 @@ step6_runtime() {
         step_skipped
         return 0
     fi
+    local added_list=0
     if [ ! -f "$SYNAPSEAI_LIST" ]; then
         if ! run_logged "curl -fsSL $VAULT/api/gpg/key/public | gpg --dearmor -o $KEYRING"; then
             step_failed "cannot fetch and dearmor the Habana GPG key from $VAULT/api/gpg/key/public"
@@ -586,9 +623,16 @@ step6_runtime() {
         if ! run_logged "echo 'deb [signed-by=$KEYRING] $VAULT/debian jammy main' > $REPO_LIST"; then
             step_failed "cannot write $REPO_LIST"
         fi
+        added_list=1
     fi
-    if ! run_logged "apt-get update"; then
-        step_failed "apt-get update failed before installing the container runtime"
+    if [ "$added_list" -eq 1 ]; then
+        if ! apt_update_list "$REPO_LIST"; then
+            step_failed "apt-get update of $REPO_LIST failed before installing the container runtime"
+        fi
+    else
+        if ! apt_update_once; then
+            step_failed "apt-get update failed before installing the container runtime"
+        fi
     fi
     if ! run_logged "apt-get install -y --no-install-recommends habanalabs-container-runtime=$PIN"; then
         echo "apt install of habanalabs-container-runtime=$PIN failed; trying the direct deb" >>"$STEP_LOG"
