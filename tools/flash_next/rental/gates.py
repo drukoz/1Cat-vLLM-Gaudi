@@ -288,10 +288,10 @@ def run_step(cmd: list, cwd, timeout_s: float, env: dict = None) -> subprocess.C
     except subprocess.TimeoutExpired:
         _kill_group(proc.pid)
         try:
-            proc.communicate(timeout=STEP_KILL_WAIT_S)
+            out, err = proc.communicate(timeout=STEP_KILL_WAIT_S)
         except subprocess.TimeoutExpired:
-            pass
-        raise subprocess.TimeoutExpired(args, timeout_s) from None
+            out, err = "", ""  # the pipes did not close after the SIGKILL: no partial output to keep
+        raise subprocess.TimeoutExpired(args, timeout_s, output=out, stderr=err) from None
     _kill_group(proc.pid)
     return subprocess.CompletedProcess(args, proc.returncode, out, err)
 
@@ -349,6 +349,8 @@ GDN_LAZY_ENV = "PT_HPU_LAZY_MODE"  # the Habana bridge mode: "1" lazy (the serve
 GDN_VERIFY_OP_TEST = "tests/unit_tests/gdn_core_decode/test_hpu_verify_op.py"
 GDN_FALLBACK_RE = re.compile(r"has no HPU kernel|GDN core (decode|verify) .* is off for")
 GDN_OP_TIMEOUT_S = 600.0       # test_hpu_op.py and test_hpu_verify_op.py (about 16x the card's 37 s)
+GDN_CRASH_PROBE = "tools/flash_next/gdn_verify_crash_probe.sh"
+GDN_CRASH_PROBE_TIMEOUT_S = 4500.0  # the probe's worst case: apt 600 s + cmake 1800 s + six runs of 310 s = 4260 s
 GDN_REPLAY_TIMEOUT_S = 900.0   # each replay run
 GDN_BENCH_TIMEOUT_S = 1200.0
 
@@ -378,6 +380,37 @@ def _gdn_pytest_summary(output: str) -> dict:
 def _gdn_verify_not_run(reason: str) -> dict:
     """The "verify" details of a run in which the verify checks did not run at all."""
     return {"status": "not_run", "reason": reason, "hpu_op": None, "replay": []}
+
+
+def _gdn_crash_probe(plugin_root: Path, out_dir: Path, env: dict, python: str) -> dict:
+    """Run gdn_verify_crash_probe.sh after V1 ended by a signal or a timeout; recorded only.
+
+    The probe reads PYTHON, PLUGIN_ROOT and PROBE_TIMEOUT_S from its environment and writes
+    OUT_DIR/summary.txt. Its stdout+stderr go to out_dir/verify_crash_probe.log and the summary lines
+    are returned; the function never raises and its result never changes a status or a mode.
+    """
+    probe = Path(plugin_root) / GDN_CRASH_PROBE
+    if not probe.is_file():
+        return {"exit": None, "reason": "not in the bundle", "summary": []}
+    crash_dir = Path(out_dir) / "verify_crash"
+    try:
+        try:
+            proc = run_step(["bash", GDN_CRASH_PROBE, str(crash_dir)], Path(plugin_root), GDN_CRASH_PROBE_TIMEOUT_S,
+                            dict(env, PYTHON=str(python), PLUGIN_ROOT=str(plugin_root)))
+            text, exit_code, timed_out = (proc.stdout or "") + (proc.stderr or ""), proc.returncode, False
+        except subprocess.TimeoutExpired as e:
+            text, exit_code, timed_out = (e.output or "") + (e.stderr or ""), None, True
+        with open(Path(out_dir) / "verify_crash_probe.log", "w", encoding="utf-8") as f:
+            f.write(text)
+        try:
+            summary = (crash_dir / "summary.txt").read_text(encoding="utf-8").splitlines()
+        except FileNotFoundError:
+            summary = []
+        if timed_out:
+            return {"exit": None, "timed_out": True, "summary": summary}
+        return {"exit": exit_code, "summary": summary}
+    except Exception as e:  # noqa: BLE001 - the probe is recorded only, it never changes a status
+        return {"exit": None, "reason": "%s: %s" % (type(e).__name__, e), "summary": []}
 
 
 def fused_gdn(plugin_root: Path, out_dir: Path, python: str = sys.executable) -> tuple[GateStatus, dict]:
@@ -440,7 +473,12 @@ def fused_gdn(plugin_root: Path, out_dir: Path, python: str = sys.executable) ->
             nonlocal step, timeout_s
             step = " ".join(str(arg) for arg in cmd[1:])
             timeout_s = limit
-            proc = run_step(cmd, plugin_root, limit, dict(env, **{GDN_LAZY_ENV: str(lazy_mode)}))
+            try:
+                proc = run_step(cmd, plugin_root, limit, dict(env, **{GDN_LAZY_ENV: str(lazy_mode)}))
+            except subprocess.TimeoutExpired as e:  # the step's partial output reaches its log before the raise
+                with open(out_dir / log_name, "a" if append else "w", encoding="utf-8") as f:
+                    f.write((e.output or "") + (e.stderr or ""))
+                raise
             text = (proc.stdout or "") + (proc.stderr or "")
             with open(out_dir / log_name, "a" if append else "w", encoding="utf-8") as f:
                 f.write(text)
@@ -525,10 +563,13 @@ def fused_gdn(plugin_root: Path, out_dir: Path, python: str = sys.executable) ->
                     verify["status"] = "failed"
                     verify["reason"] = ("test_hpu_verify_op.py skipped" if counts["skipped"] > 0 else
                                         "test_hpu_verify_op.py failed (exit %d)" % proc.returncode)
+                if proc.returncode < 0 or proc.returncode in (134, 139):  # SIGSEGV/SIGABRT: ask the probe why
+                    verify["crash_probe"] = _gdn_crash_probe(plugin_root, out_dir, env, python)
             except subprocess.TimeoutExpired:
                 verify_ok = False
                 verify["status"] = "timed_out"
                 verify["reason"] = "test_hpu_verify_op.py did not finish in %s s" % GDN_OP_TIMEOUT_S
+                verify["crash_probe"] = _gdn_crash_probe(plugin_root, out_dir, env, python)
             if verify_ok:
                 # V2. the 1,000-step verify replay against eager, two cases, appended to the replay log
                 for case in ("ver_tp8_b16", "ver_tp8_b64"):

@@ -37,7 +37,11 @@ case "$1" in
       echo "$FAKE_LIB_DIR"
       exit ${FAKE_LOOKUP_EXIT:-0} ;;
   -m) case "$*" in
-        *test_hpu_op.py*) if [ -n "$FAKE_HANG_PIDFILE" ]; then
+        *test_hpu_op.py*) if [ -n "$FAKE_OP_PRINT" ]; then
+                            echo "$FAKE_OP_PRINT"
+                            sleep 60
+                          fi
+                          if [ -n "$FAKE_HANG_PIDFILE" ]; then
                             sleep 60 &
                             echo "$!" > "$FAKE_HANG_PIDFILE"
                             sleep 60
@@ -45,6 +49,10 @@ case "$1" in
       esac
       case "$*" in
         *test_hpu_verify_op.py*)
+          if [ -n "$FAKE_VERIFY_CRASH" ]; then
+            echo "Fatal Python error: Segmentation fault"
+            kill -s SEGV $$
+          fi
           if [ -n "$FAKE_VERIFY_PYTEST_SLEEP" ]; then sleep "$FAKE_VERIFY_PYTEST_SLEEP"; fi
           printf '%s\n' "$FAKE_VERIFY_PYTEST_OUT"
           exit ${FAKE_VERIFY_PYTEST_EXIT:-0} ;;
@@ -328,6 +336,54 @@ def test_fused_gdn_verify_pytest_failure_is_verify_failure(tmp_path, monkeypatch
     args = [rec["args"] for rec in records(log)]
     assert not any("--ops verify" in a for a in args)
     assert any("bench.py" in a for a in args)
+
+
+def test_fused_gdn_verify_crash_runs_probe(tmp_path, monkeypatch):
+    lib = make_lib(tmp_path)
+    calls = []
+
+    def fake_probe(plugin_root, out_dir, env, python):
+        calls.append({"plugin_root": plugin_root, "out_dir": out_dir, "env": env, "python": python})
+        return {"exit": 0, "summary": ["x"]}
+
+    monkeypatch.setattr(gates, "_gdn_crash_probe", fake_probe)
+    fake, plugin, log = setup(tmp_path, monkeypatch, lib=lib, FAKE_VERIFY_CRASH=1)
+    out = tmp_path / "g1b"
+    status, details = gates.fused_gdn(plugin, out, python=fake)
+    assert status is GateStatus.PASSED  # the gate's status is the decode kernel's
+    assert details["mode"] == 1
+    assert details["verify_mode"] == 0
+    assert details["verify"]["status"] == "failed"
+    assert details["env"]["VLLM_HPU_GDN_CORE_VERIFY"] == "0"
+    assert len(calls) == 1  # the probe ran exactly once
+    assert details["verify"]["crash_probe"] == {"exit": 0, "summary": ["x"]}
+    assert calls[0]["plugin_root"] == plugin and calls[0]["out_dir"] == out
+    assert calls[0]["python"] == fake and calls[0]["env"]["PT_HPU_LAZY_MODE"] == "1"
+    assert "Fatal Python error: Segmentation fault" in (out / "hpu_verify_op.log").read_text(encoding="utf-8")
+
+
+def test_fused_gdn_verify_plain_failure_no_probe(tmp_path, monkeypatch):
+    lib = make_lib(tmp_path)
+    calls = []
+    monkeypatch.setattr(gates, "_gdn_crash_probe", lambda *args: calls.append(args))
+    fake, plugin, log = setup(tmp_path, monkeypatch, lib=lib,
+                              verify_pytest_out="F\n1 failed, 2 passed in 0.20s", FAKE_VERIFY_PYTEST_EXIT=1)
+    status, details = gates.fused_gdn(plugin, tmp_path / "g1b", python=fake)
+    assert status is GateStatus.PASSED
+    assert details["verify"]["status"] == "failed"
+    assert calls == []  # exit 1 is not a crash: the probe did not run
+    assert "crash_probe" not in details["verify"]
+
+
+def test_fused_gdn_timeout_keeps_partial_output(tmp_path, monkeypatch):
+    monkeypatch.setattr(gates, "GDN_OP_TIMEOUT_S", 1)
+    lib = make_lib(tmp_path)
+    fake, plugin, log = setup(tmp_path, monkeypatch, lib=lib, FAKE_OP_PRINT="partial-marker")
+    out = tmp_path / "out"
+    status, details = gates.fused_gdn(plugin, out, python=fake)
+    assert status is GateStatus.TIMED_OUT
+    assert details["mode"] == 0
+    assert "partial-marker" in (out / "hpu_op.log").read_text(encoding="utf-8")
 
 
 def test_fused_gdn_verify_second_replay_fails(tmp_path, monkeypatch):
