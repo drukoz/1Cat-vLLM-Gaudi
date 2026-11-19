@@ -157,6 +157,32 @@ Notes:
   (`startup.json`, `toolchain.json`, `requests.jsonl`, `metrics.jsonl`, `status.json`,
   `summary.*`) are all in the results folder for the run id.
 
+## If the GDN verify op crashes (RUK-3105)
+
+Run the crash probe when G1b's verify step ends by a signal (a segfault) or a timeout.
+R1-d (RUK-3104) will make G1b run the probe on its own, into
+`<results>/<run-id>/fused_gdn/verify_crash/`; until then, run it by hand while a run is going:
+
+```bash
+docker exec fn-rental bash /bundle/plugin/tools/flash_next/gdn_verify_crash_probe.sh /results/verify-crash
+```
+
+(`fn-rental` is the container `run_rental.sh` starts.) The probe runs six short checks, each in
+its own process under `gdb -batch`, bounded by `PROBE_TIMEOUT_S` (default 300 s): the decode
+control, the verify op at T = 1 and T = 4 (the crashing `ver_tp8_chain` case) in lazy mode,
+T = 4 in eager mode, and the T = 1 / T = 4 checks again against a verify kernel rebuilt with its
+`.llvmbc` section stripped (`-DGDN_FUSED_VERIFY_STRIP_BITCODE=ON`).
+
+Send `summary.txt`, the six logs and the `*.habana_logs` folders back with the results.
+
+How to read `summary.txt`:
+
+| Result | Points to |
+|---|---|
+| `verify_t1_lazy` crashes too | not the T = 4 geometry: the kernel ELF (H1 or H2) |
+| the strip runs pass where the shipped ones crash | H2: ship the stripped ELF |
+| the backtrace names libSynapse or the graph compiler, and the strip runs crash | H1 or H3: the kernel must fit the default 16 KB VLM |
+
 ## What to send back
 
 Everything the run writes is under `<results>/<run-id>/` on the host (default `~/rental/results/`),
