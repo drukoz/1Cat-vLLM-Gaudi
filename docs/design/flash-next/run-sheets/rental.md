@@ -269,8 +269,8 @@ Useful options:
 | `--image IMG` | container image (default the 1.24.1 base image) |
 | `--full-warmup` | run the full bucket warmup at server start (default: skipped — see [Warmup and the recipe cache](#warmup-and-the-recipe-cache-ruk-3200)) |
 | `--server-timeout S` | seconds to wait for a server to become healthy (default 1800, enough with the default skipped warmup; raise it with `--full-warmup`, see below) |
-| `--recipe-cache DIR` | host folder for the HPU recipe cache, mounted at `/recipe-cache` (default: a `recipe-cache` folder next to `--model`) |
-| `--no-recipe-cache` | start the containers without an HPU recipe cache |
+| `--recipe-cache DIR` | host folder for the HPU recipe cache, mounted at `/recipe-cache` and handed to the orchestrator with `--recipe-cache` (default: a `recipe-cache` folder next to `--model`) |
+| `--no-recipe-cache` | no recipe cache: no `/recipe-cache` mount and no `--recipe-cache` for the orchestrator |
 | `--dry-run` | print the `docker run` command and exit |
 | `--no-disk-check` | skip both free-space checks |
 | `--no-warm-pass` | skip the warm pass (a one-turn pass that compiles the variant's graphs and caches the shared block before the coherence gate; on by default — see [Warm pass](#warm-pass-ruk-3203)) |
@@ -293,13 +293,20 @@ use**, inside the first requests. Two consequences:
   wait holds; `--server-timeout` matters with `--full-warmup` (below). The coherence gate allows
   3,600 s per request when the warmup is skipped, so a first request that triggers compilation
   is not cut off.
-- **The recipe cache keeps the compiled graphs.** `run_rental.sh` mounts a recipe cache at
-  `/recipe-cache` with `PT_HPU_RECIPE_CACHE_CONFIG=/recipe-cache,false,16384`. The default
-  folder is `recipe-cache` **next to the checkpoint**, so it lives on the checkpoint's disk: on
-  the prepared data disk it survives reboots and container rebuilds, and the second run on the
-  same checkpoint and node starts with the graphs already compiled. Keep it on the data disk,
-  never under Docker's root (which has its own 30 GB free-space check). `--recipe-cache DIR`
-  picks another folder; `--no-recipe-cache` drops the mount and the variable.
+- **The recipe cache keeps the compiled graphs.** `run_rental.sh` mounts the cache at
+  `/recipe-cache` and hands it to the orchestrator with `--recipe-cache /recipe-cache`; the
+  orchestrator then sets `PT_HPU_RECIPE_CACHE_CONFIG` **per server** (RUK-3242). Only servers
+  that run the PyTorch GDN path get the variable: a server that runs the fused GDN kernel
+  registers its native kernel database in `GC_KERNEL_PATH`, which the Habana 1.24.1 bridge
+  accepts only when no recipe cache is set. Once the combined kernel database is installed and
+  gate G1b passes, every server gets the cache. The folder gets a per-bundle subfolder
+  `<dir>/<plugin sha, 12 chars>`, and `summary.md` records the policy on its `Recipe cache:`
+  line. The default folder is `recipe-cache` **next to the checkpoint**, so it lives on the
+  checkpoint's disk: on the prepared data disk it survives reboots and container rebuilds, and
+  the second run on the same checkpoint and node starts with the graphs already compiled. Keep
+  it on the data disk, never under Docker's root (which has its own 30 GB free-space check).
+  `--recipe-cache DIR` picks another folder; `--no-recipe-cache` drops the mount and the
+  orchestrator option.
 
 The TPC toolchain is cached on the data disk the same way (RUK-3239): the first run on a node
 installs `habanalabs-tools` with `apt-get update` (slow on the rental node) and keeps the
