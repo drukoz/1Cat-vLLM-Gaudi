@@ -144,6 +144,8 @@ def test_bounds_rejected():
 def test_matches_on_device(device):
     pytest.importorskip("habana_frameworks.torch")
     import habana_frameworks.torch  # noqa: F401,E402  registers the hpu device with torch
+    if not (hasattr(torch, "hpu") and torch.hpu.is_available()):  # test_registration.py stubs habana_frameworks on CPU
+        pytest.skip("no HPU device: habana_frameworks is a CPU stub")
     mult, sizes, offsets = _tables(REAL_BASE)
     tokens = _tokens()
     args = _int32_inputs(tokens, mult, sizes, offsets)
