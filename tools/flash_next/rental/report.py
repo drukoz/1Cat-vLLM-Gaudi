@@ -13,8 +13,9 @@ names. Python 3.10 standard library only.
 ``manifest.json`` (written by main.py, M4-H6) is read for these keys; unknown
 keys are ignored and missing ones become null: ``run_id``, ``bundle_commit``,
 ``workload_sha``, ``mode``, ``created``, ``skip_warmup``, ``server_timeout_s``,
-``workload`` (the workload.json header, for ``turns``) and ``variants`` (the
-variants.json entries that ran).
+``recipe_cache`` (the RUK-3242 cache folder, size, combined-kernel-database flag
+and per-variant notes), ``workload`` (the workload.json header, for ``turns``)
+and ``variants`` (the variants.json entries that ran).
 """
 
 from __future__ import annotations
@@ -25,6 +26,7 @@ import math
 from pathlib import Path
 from typing import Any, Optional
 
+from tools.flash_next.rental import serve
 from tools.flash_next.rental.schema import (
     METRICS_FILE,
     REQUESTS_FILE,
@@ -380,6 +382,7 @@ def summarize_run(run_dir: Path) -> dict:
         "created": manifest.get("created"),
         "skip_warmup": manifest.get("skip_warmup"),
         "server_timeout_s": manifest.get("server_timeout_s"),
+        "recipe_cache": manifest.get("recipe_cache"),
         "workload": {
             "version": workload.get("version"),
             "shared_prefix_tokens": workload.get("shared_prefix_tokens"),
@@ -455,6 +458,24 @@ def _max_concurrency(summary: dict) -> Optional[float]:
     return min(values) if values else None
 
 
+def _recipe_cache_text(recipe: Any) -> str:
+    """The `Recipe cache:` line body (RUK-3242): `none`, the folder for every
+    variant, the ids that got the folder and the ids that did not with the reason."""
+    if not isinstance(recipe, dict) or not recipe.get("dir"):
+        return "none"
+    rc_dir = recipe["dir"]
+    notes = recipe.get("variants")
+    notes = notes if isinstance(notes, dict) else {}
+    on_ids = [vid for vid, note in notes.items() if note == rc_dir]
+    off_ids = [vid for vid, note in notes.items() if note != rc_dir]
+    reason = serve.RECIPE_CACHE_OFF_REASON.removeprefix("off: ")
+    if not off_ids:
+        return "%s (all variants)" % rc_dir
+    if on_ids:
+        return "%s for %s; off for %s: %s" % (rc_dir, ", ".join(on_ids), ", ".join(off_ids), reason)
+    return "off for all variants: %s" % reason
+
+
 def render_markdown(summary: dict) -> str:
     """The human-readable report: header, gate table, one comparison table,
     then one section per variant. Statuses appear as names here, never ints."""
@@ -466,6 +487,7 @@ def render_markdown(summary: dict) -> str:
     lines.append("- Bundle commit: %s" % (run.get("bundle_commit") or "n/a"))
     lines.append("- Workload sha: %s" % (run.get("workload_sha") or "n/a"))
     lines.append("- Warmup: %s" % ("skipped (graphs compiled on first use)" if run.get("skip_warmup") else "full"))
+    lines.append("- Recipe cache: %s" % _recipe_cache_text(run.get("recipe_cache")))
     server_timeout = run.get("server_timeout_s")
     lines.append("- Server health timeout: %s" % ("%s s" % server_timeout if server_timeout is not None else "n/a"))
     lines.append("")

@@ -49,6 +49,31 @@ RENTAL_ENV_DEFAULTS = {
     "PT_HPU_LAZY_MODE": "1",
 }
 
+RECIPE_CACHE_ENV = "PT_HPU_RECIPE_CACHE_CONFIG"
+COMBINED_KERNEL_DB = "libflashinfer_gaudi_combined_gaudi2.so"
+COMBINED_KERNEL_DB_ENV = "FLASHINFER_GAUDI_COMBINED_KERNEL_DB"
+RECIPE_CACHE_NONE = "none"
+RECIPE_CACHE_OFF_REASON = ("off: this server registers the fused GDN kernel's database in GC_KERNEL_PATH, and the "
+                           "Habana bridge accepts only one kernel library next to a recipe cache")
+
+
+def recipe_cache_env(cache_dir: str | None, size_mb: int, server_env: dict,
+                     combined_db: bool = False) -> tuple[dict, str]:
+    """The recipe-cache variable for one server and a note for the manifest.
+
+    Returns ({RECIPE_CACHE_ENV: f"{cache_dir},false,{size_mb}"}, cache_dir) when `cache_dir` is set and
+    either `combined_db` is True or `server_env` has VLLM_HPU_GDN_CORE_DECODE and VLLM_HPU_GDN_CORE_VERIFY
+    both equal to "0" (a missing key counts as "1", the plugin default). Returns ({}, RECIPE_CACHE_NONE)
+    when `cache_dir` is None or empty, and ({}, RECIPE_CACHE_OFF_REASON) otherwise.
+    """
+    if not cache_dir:
+        return {}, RECIPE_CACHE_NONE
+    if not combined_db:
+        if server_env.get("VLLM_HPU_GDN_CORE_DECODE", "1") != "0" or \
+                server_env.get("VLLM_HPU_GDN_CORE_VERIFY", "1") != "0":
+            return {}, RECIPE_CACHE_OFF_REASON
+    return {RECIPE_CACHE_ENV: "%s,false,%s" % (cache_dir, size_mb)}, cache_dir
+
 
 def server_environment(overrides: dict, cards: str = None) -> dict[str, str]:
     """os.environ with the rental defaults, VLLM_COMPACT_GDN removed, then `overrides` on top.

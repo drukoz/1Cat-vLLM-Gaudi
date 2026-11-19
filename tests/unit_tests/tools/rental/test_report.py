@@ -7,6 +7,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from tools.flash_next.rental import serve
 from tools.flash_next.rental.report import main as report_main
 from tools.flash_next.rental.report import percentile, summarize_run, summarize_variant
 from tools.flash_next.rental.schema import WORKLOAD_VERSION, GateStatus, RequestStatus
@@ -469,4 +470,41 @@ def test_warm_pass_line_and_absent_falls_back_to_none(tmp_path: Path) -> None:
     md = (run / "summary.md").read_text(encoding="utf-8")
     assert "- Warm pass: 4 requests in 250.0 s, 0 non-OK (graphs compiled on first use; shared block cached)" in md
     assert "- Warm pass: none" in md  # variant B, which has no warm-pass.json
+
+
+def test_recipe_cache_line_shapes(tmp_path: Path) -> None:
+    """The `Recipe cache:` line (RUK-3242): none, the folder for all variants,
+    the ids that got it with the reason for the rest, and off for all."""
+    run = build_run(tmp_path)
+    manifest = json.loads((run / "manifest.json").read_text(encoding="utf-8"))
+    reason = serve.RECIPE_CACHE_OFF_REASON.removeprefix("off: ")
+
+    assert report_main([str(run)]) == 0  # a run from before RUK-3242: no recipe_cache key at all
+    md = (run / "summary.md").read_text(encoding="utf-8")
+    assert "- Recipe cache: none" in md
+
+    rc_dir = "/recipe-cache/abc123456789"
+    manifest["recipe_cache"] = {
+        "dir": rc_dir,
+        "size_mb": 16384,
+        "combined_kernel_db": True,
+        "variants": {"A": rc_dir, "B": rc_dir, "C": rc_dir},
+    }
+    write_json(run / "manifest.json", manifest)
+    assert report_main([str(run)]) == 0
+    assert summarize_run(run)["run"]["recipe_cache"] == manifest["recipe_cache"]
+    md = (run / "summary.md").read_text(encoding="utf-8")
+    assert "- Recipe cache: %s (all variants)" % rc_dir in md
+
+    manifest["recipe_cache"]["variants"] = {"A": rc_dir, "B": serve.RECIPE_CACHE_OFF_REASON, "C": "none"}
+    write_json(run / "manifest.json", manifest)
+    assert report_main([str(run)]) == 0
+    md = (run / "summary.md").read_text(encoding="utf-8")
+    assert "- Recipe cache: %s for A; off for B, C: %s" % (rc_dir, reason) in md
+
+    manifest["recipe_cache"]["variants"] = {"A": serve.RECIPE_CACHE_OFF_REASON, "B": "none", "C": "none"}
+    write_json(run / "manifest.json", manifest)
+    assert report_main([str(run)]) == 0
+    md = (run / "summary.md").read_text(encoding="utf-8")
+    assert "- Recipe cache: off for all variants: %s" % reason in md
     assert "TTFT cold is turn 1 of the measured load, which runs after the warm pass." in md
