@@ -190,6 +190,25 @@ the server start worked as designed, and it caught two prompt-warmup failures th
 (the MoE fast path's engine drift, `ca676dd`; `torch.cummax` without an HPU kernel, `b89bdd7`). Both were
 applied to the running container one file at a time, as below, and rerun in minutes.
 
+### Where the compile time goes (compile_probe.py)
+
+The tiny model's prompt graphs take 13–35 s to compile on the card, and nothing on the Mac can time
+the graph compiler. The probe times each Flash-Next component in isolation on the card: it captures
+one eager prefill's inputs per component (the whole model, every decoder layer, the GDN layer, the
+QSA layer and its indexer `select`, the PLE layer and its n-gram embedding, a HyperConnection, the
+MoE block) and times the first (compiling) and second (replaying) call of each, wrapped in an HPU
+graph, at 128, 512 and 2048 tokens. With the `fn-smoke` container prepared by `tiny_smoke.sh`:
+
+```bash
+sudo docker exec -w /bundle/plugin -e PT_HPU_LAZY_MODE=1 fn-smoke python -m tools.flash_next.compile_probe \
+    --ckpt /tmp/fn-smoke-ckpt --device hpu --out /results/probe-$(date -u +%Y%m%dT%H%M%SZ)
+```
+
+The run takes about 15 minutes; the probe refuses to start without `-e PT_HPU_LAZY_MODE=1`. Paste
+back the printed markdown table (one row per component and shape: compile and replay seconds,
+sorted by compile time); `probe.json` in the `--out` folder carries the same data if the table is
+cut off.
+
 ### Updating the bundle on a prepared node
 
 When the branch changes after the node was prepared, copy the new tarball and extract it over the same
