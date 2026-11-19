@@ -13,6 +13,10 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import os
+import socket
+import sys
+from pathlib import Path
 from typing import Optional
 
 from aiohttp import web
@@ -202,18 +206,46 @@ async def handle_metrics(request: web.Request) -> web.Response:
     return web.Response(text="\n".join(lines) + "\n", content_type="text/plain")
 
 
+def bind_socket(port: int) -> socket.socket:
+    """A listening TCP socket on 127.0.0.1:`port` (0 = any free port); raises OSError."""
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        sock.bind(("127.0.0.1", port))
+        sock.listen(128)
+    except OSError:
+        sock.close()
+        raise
+    return sock
+
+
+def write_port_file(path: Path, port: int) -> None:
+    """Write `port` as one decimal line; atomic, so a reader never sees a partial file."""
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text("%d\n" % port, encoding="utf-8")
+    os.replace(tmp, path)
+
+
 def main(argv: Optional[list[str]] = None) -> int:
     parser = argparse.ArgumentParser(description="Stub OpenAI server for the rental harness")
-    parser.add_argument("--port", type=int, required=True)
+    parser.add_argument("--port", type=int, default=0, help="TCP port on 127.0.0.1; 0 picks a free port")
+    parser.add_argument("--port-file", default=None, help="write the bound port to this file once listening")
     parser.add_argument("--tokens-per-second", type=float, default=400.0)
     parser.add_argument("--model", default="flash-next")
     parser.add_argument("--fail-after", type=int, default=None)
     args = parser.parse_args(argv)
 
+    try:
+        sock = bind_socket(args.port)
+    except OSError as exc:
+        print("stub_server: cannot listen on 127.0.0.1:%d: %s" % (args.port, exc), file=sys.stderr, flush=True)
+        return 2
+    port = int(sock.getsockname()[1])
     app = make_app(args.model, args.tokens_per_second, args.fail_after)
-    print("stub_server listening on port %d (model=%s, %.1f tok/s)" % (args.port, args.model, args.tokens_per_second),
+    print("stub_server listening on port %d (model=%s, %.1f tok/s)" % (port, args.model, args.tokens_per_second),
           flush=True)
-    web.run_app(app, host="127.0.0.1", port=args.port, print=None)
+    if args.port_file:
+        write_port_file(Path(args.port_file), port)
+    web.run_app(app, sock=sock, print=None)
     return 0
 
 
