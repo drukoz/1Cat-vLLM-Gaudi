@@ -119,6 +119,58 @@ sudo bash run_rental.sh --model /models/Qwen3.8-Flash-Next-FP8 --download
 It is lost on reboot: after a reboot, redo the bind mount and the download. It worked on
 2026-11-18 (gate `preflight` passed).
 
+## First on the node: the tiny smoke test
+
+Before the checkpoint download and before `run_rental.sh`, check that a Flash-Next server starts and
+decodes on this node at all. It needs no checkpoint:
+
+```bash
+tar xzf ~/flash-next-rental-*.tar.gz -C ~/rental && cd ~/rental
+sudo bash tiny_smoke.sh
+```
+
+What it does: starts the container `fn-smoke`, installs the stack from the bundle in it
+(`container_entry.sh --install-only`), builds the tiny checkpoint and its CPU reference, then serves
+it twice with the environment of a rental variant (lazy mode, sparse QSA, the recurrent state pool)
+and compares the served tokens with the reference each time:
+
+| Mode | GDN flags | A pass means |
+|---|---|---|
+| `pytorch` | `VLLM_HPU_GDN_CORE_DECODE=0`, `VLLM_HPU_GDN_CORE_VERIFY=0` | the server builds, warms up and decodes on the torch GDN path |
+| `fused` | `VLLM_HPU_GDN_CORE_DECODE=1`, `VLLM_HPU_GDN_CORE_VERIFY=0` | the same with the fused decode kernel, and no layer fell back to the torch path |
+
+It prints one line per mode (`tiny smoke [pytorch]: PASSED ...`) and, on a failure, the error lines of
+the server log and the path of that log. Results are in `results/smoke-<UTC>/` (`summary.json`,
+`<mode>/server0.log`, `console.log`). The exit code is 0 only when every mode passed.
+
+Reading the result:
+
+- Both pass: go on to the one command below.
+- `pytorch` fails: no variant can start. Fix it here first; `run_rental.sh` would stop at gate `tiny`
+  for the same reason, an hour of download later.
+- `pytorch` passes and `fused` fails: the run would work with the kernel off. Gate G1b decides that
+  for the run; read the `fused` log before spending the run on it.
+
+The container stays, with the stack installed, every server stopped and the cards free. A second call
+reuses it and skips the install and the checkpoint build, so the loop "change, check" takes a few
+minutes instead of a full run:
+
+| Option | Meaning |
+|---|---|
+| `--reinstall` | install the stack again in the same container; needed after any change under `plugin/` (the servers run the installed plugin, not the source tree) |
+| `--fresh` | remove the container first: new install, new tiny checkpoint |
+| `--gdn LIST` | the modes to serve, in order (default `pytorch,fused`) |
+| `--results DIR`, `--run-id ID`, `--image IMG`, `--dry-run` | as for `run_rental.sh`; `--results` is fixed once the container exists |
+
+It refuses to start while the rental run's container (`fn-rental`) is running, because that run holds
+the cards. `Ctrl-C` stops the check inside the container too, so the tiny server does not keep them.
+`sudo docker exec -it fn-smoke bash` opens a shell in the container; `sudo docker rm -f fn-smoke`
+removes it when you are done.
+
+`tiny_smoke.sh` has not run on a card yet (it was written after rental run 1). The steps it runs are
+the ones done by hand on 2026-11-18: about 2 minutes for the install, several minutes for the first
+checkpoint build, about 2 minutes for a tiny server to start.
+
 ## The one command (on the node)
 
 ```bash

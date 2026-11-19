@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 # Make the Flash-Next rental bundle (RUK-2709 M4): one tarball holding the plugin at its commit,
-# vLLM at the engine pin, and run_rental.sh and prepare_host.sh at the top level. Copy it to the
+# vLLM at the engine pin, and run_rental.sh, prepare_host.sh and tiny_smoke.sh at the top level. Copy it to the
 # rented node, unpack, prepare a bare host with `sudo bash prepare_host.sh`, then run
 # `bash run_rental.sh --model <checkpoint dir>`.
 #
@@ -79,6 +79,7 @@ git -C "$REPO_ROOT" archive HEAD | tar -x -C "$STAGE/plugin"
 git -C "$VLLM_SRC" archive --prefix=vllm/ "$VLLM_PIN" | tar -x -C "$STAGE"
 cp "$SCRIPT_DIR/run_rental.sh" "$STAGE/run_rental.sh"
 cp "$SCRIPT_DIR/prepare_host.sh" "$STAGE/prepare_host.sh"
+cp "$SCRIPT_DIR/tiny_smoke.sh" "$STAGE/tiny_smoke.sh"
 
 {
     echo "plugin sha: $PLUGIN_SHA"
@@ -89,7 +90,7 @@ cp "$SCRIPT_DIR/prepare_host.sh" "$STAGE/prepare_host.sh"
 
 mkdir -p "$OUT_DIR"
 TARBALL="$(cd "$OUT_DIR" && pwd)/flash-next-rental-$PLUGIN_SHA12.tar.gz"
-tar czf "$TARBALL" -C "$STAGE" BUNDLE.txt run_rental.sh prepare_host.sh plugin vllm
+tar czf "$TARBALL" -C "$STAGE" BUNDLE.txt run_rental.sh prepare_host.sh tiny_smoke.sh plugin vllm
 
 echo "bundle: $TARBALL"
 echo "size: $(du -h "$TARBALL" | cut -f1)"

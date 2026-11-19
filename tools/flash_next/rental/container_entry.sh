@@ -14,6 +14,7 @@ HABANA_TOOLS_VERSION="1.24.1-482"
 usage() {
     echo "usage: $(basename "${BASH_SOURCE[0]}") --model DIR [--results DIR] [--run-id ID]"
     echo "       [--variants LIST] [--with-profile] [--from PHASE] [--download] [--skip-install]"
+    echo "       $(basename "${BASH_SOURCE[0]}") --install-only [--results DIR] [--run-id ID]"
 }
 
 MODEL=""
@@ -24,6 +25,7 @@ WITH_PROFILE=0
 FROM_PHASE=""
 DOWNLOAD=0
 SKIP_INSTALL=0
+INSTALL_ONLY=0
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -59,6 +61,10 @@ while [ $# -gt 0 ]; do
             SKIP_INSTALL=1
             shift
             ;;
+        --install-only)
+            INSTALL_ONLY=1
+            shift
+            ;;
         -h | --help)
             usage
             exit 0
@@ -71,7 +77,7 @@ while [ $# -gt 0 ]; do
     esac
 done
 
-if [ -z "$MODEL" ]; then
+if [ -z "$MODEL" ] && [ "$INSTALL_ONLY" -eq 0 ]; then
     echo "error: --model is required" >&2
     usage >&2
     exit 2
@@ -205,6 +211,12 @@ if [ "$DOWNLOAD" -eq 1 ]; then
         exit 1
     fi
     echo "checkpoint download: ok"
+fi
+
+if [ "$INSTALL_ONLY" -eq 1 ]; then
+    # tiny_smoke.sh stops here: the stack is installed, and it starts its own check in this container.
+    echo "install only: done"
+    exit 0
 fi
 
 MAIN_ARGS=(--model "$MODEL" --results "$RESULTS" --run-id "$RUN_ID")
