@@ -106,3 +106,33 @@ In the container, from the plugin checkout (`cd /bundle/plugin`), after the inst
    ```
 
    prints nothing (the pattern is `GDN_FALLBACK_RE` in `tools/flash_next/rental/gates.py`).
+
+## The recipe cache and GC_KERNEL_PATH (RUK-3241)
+
+**Rule.** With a recipe cache configured (`PT_HPU_RECIPE_CACHE_CONFIG` set to a non-empty value) the Habana
+PyTorch bridge (Gaudi 1.24.1) validates `GC_KERNEL_PATH` as **one regular file** and aborts on a colon-separated
+list. Without the recipe cache the bridge accepts the colon list (Intel's TPC guide, "Multiple Kernel Libraries").
+
+**Evidence.** On the Gaudi node (2026-11-19, 17:15Z) every vLLM worker aborted in `init_device` with
+`RuntimeError: [Rank:0] FATAL ERROR :: MODULE:PT_SYNHELPER Flag GC_KERNEL_PATH: Path is not a regular file:
+<...>/flashinfer_gaudi/lib/libflashinfer_gaudi_kernels.so:/usr/lib/habanalabs/libtpc_kernels.so`; the bridge
+printout of that run shows `PT_HPU_RECIPE_CACHE_CONFIG = /results/recipe-cache,false,8192`. The same
+colon-separated `GC_KERNEL_PATH` was accepted earlier the same day without the recipe cache (the servers started
+and compiled graphs).
+
+**What the loader does now.** When `PT_HPU_RECIPE_CACHE_CONFIG` is set to a non-empty value, `flashinfer_gaudi._native`
+prepends no kernel database and leaves `GC_KERNEL_PATH` untouched. The op extensions that depend on a database
+(`flashinfer_gaudi_ops*.so`, `gdn_fused_ops*.so`) are not loaded either, because their ops name TPC GUIDs the graph
+compiler could not find and the first graph compile would fail instead of start-up. The reason is recorded once in
+`_LOAD_ERRORS` (and, for the fused path, in `gdn_fused_extension_errors()`). With the variable unset or empty,
+registration proceeds exactly as before.
+
+**What the operator sees.** `register_ops()` logs one warning naming `PT_HPU_RECIPE_CACHE_CONFIG`,
+`GC_KERNEL_PATH` and `libflashinfer_gaudi_kernels.so`; and when a fused GDN mode is on, the existing startup line
+prints `GDN core decode ... has no HPU kernel: ... PT_HPU_RECIPE_CACHE_CONFIG is set ...`. The callers fall back:
+`silu_and_mul_op()` and friends return `None` and the Python paths run; the GDN layers run the torch decode path.
+
+**Remedies.** (1) Unset `PT_HPU_RECIPE_CACHE_CONFIG` to use the native TPC kernels, or (2) install the combined
+kernel database. The combined kernel database (`libflashinfer_gaudi_combined_gaudi2.so`, a later task) bundles the
+FlashInfer, stock and fused-GDN kernels into the single regular file the bridge accepts, which lifts the
+restriction so a recipe-cache server can keep the native kernels.

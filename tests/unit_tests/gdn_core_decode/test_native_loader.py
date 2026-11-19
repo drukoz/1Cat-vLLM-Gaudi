@@ -20,6 +20,7 @@ def clean_loader_state(monkeypatch):
     monkeypatch.setenv("GC_KERNEL_PATH", "")
     monkeypatch.delenv("GDN_FUSED_GAUDI_KERNEL_LIBRARY", raising=False)
     monkeypatch.delenv("GDN_FUSED_GAUDI_NATIVE_LIBRARY", raising=False)
+    monkeypatch.delenv("PT_HPU_RECIPE_CACHE_CONFIG", raising=False)
 
 
 def _make_libraries(tmp_path, monkeypatch):
@@ -129,6 +130,44 @@ def test_gdn_real_load_library_error_names_cause(tmp_path, monkeypatch):
     assert _native.load_gdn_fused_extension() is False
     (error, ) = _native.gdn_fused_extension_errors()
     assert error.startswith(f"{extension}: OSError: Could not load this library: {extension}; caused by OSError: ")
+
+
+def test_recipe_cache_blocks_the_fused_kernel_database(tmp_path, monkeypatch):
+    kernel_db, _ = _make_libraries(tmp_path, monkeypatch)
+    _record_imports(monkeypatch, [])
+    monkeypatch.setenv("PT_HPU_RECIPE_CACHE_CONFIG", "/tmp/rc,false,1024")
+    calls: list[str] = []
+    monkeypatch.setattr(torch.ops, "load_library", lambda path: calls.append(path))
+
+    assert _native.load_gdn_fused_extension() is False
+    assert os.environ["GC_KERNEL_PATH"] == ""
+    assert calls == []
+    (error, ) = _native.gdn_fused_extension_errors()
+    assert "PT_HPU_RECIPE_CACHE_CONFIG" in error
+    assert "GC_KERNEL_PATH" in error
+    assert "libgdn_fused_gaudi2.so" in error
+    assert error in _native._LOAD_ERRORS
+    assert kernel_db.is_file()
+
+
+def test_recipe_cache_empty_value_does_not_block(tmp_path, monkeypatch):
+    kernel_db, _ = _make_libraries(tmp_path, monkeypatch)
+    _record_imports(monkeypatch, [])
+    monkeypatch.setenv("PT_HPU_RECIPE_CACHE_CONFIG", "")
+    monkeypatch.setattr(torch.ops, "load_library", lambda path: None)
+
+    assert _native.load_gdn_fused_extension() is True
+    assert os.environ["GC_KERNEL_PATH"].startswith(str(kernel_db))
+
+
+def test_blocked_reason_names_the_remedy(monkeypatch):
+    monkeypatch.setenv("PT_HPU_RECIPE_CACHE_CONFIG", "/tmp/rc,false,1024")
+    reason = _native.kernel_database_blocked_reason("x.so")
+    assert reason is not None
+    assert "Unset PT_HPU_RECIPE_CACHE_CONFIG" in reason
+    assert "libflashinfer_gaudi_combined_gaudi2.so" in reason
+    monkeypatch.delenv("PT_HPU_RECIPE_CACHE_CONFIG")
+    assert _native.kernel_database_blocked_reason("x.so") is None
 
 
 def test_native_extensions_error_keeps_dlopen_cause(tmp_path, monkeypatch):
