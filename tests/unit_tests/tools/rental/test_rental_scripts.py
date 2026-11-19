@@ -86,6 +86,7 @@ def test_run_rental_dry_run(tmp_path):
     # The env is not set on the container; the orchestrator gets the folder (RUK-3244).
     assert "PT_HPU_RECIPE_CACHE_CONFIG" not in flat
     assert "--recipe-cache /recipe-cache" in flat
+    assert "FLASHINFER_GAUDI_COMBINED_KERNEL_DB" not in flat  # the combined kernel database stays in by default
     assert "--full-warmup" not in out  # warmup is skipped by default
     assert "--no-warm-pass" not in out  # the warm pass runs by default
 
@@ -188,6 +189,27 @@ def test_run_rental_dry_run_no_recipe_cache(tmp_path):
     assert proc.returncode == 0, proc.stderr
     assert "recipe-cache" not in proc.stdout
     assert "PT_HPU_RECIPE_CACHE_CONFIG" not in proc.stdout
+
+
+def test_run_rental_dry_run_no_combined_kernel_db(tmp_path):
+    proc = subprocess.run(
+        [
+            "bash",
+            str(SCRIPTS_DIR / "run_rental.sh"),
+            "--dry-run",
+            "--model",
+            "/tmp/x",
+            "--no-combined-kernel-db",
+        ],
+        capture_output=True,
+        text=True,
+        cwd=tmp_path,
+        timeout=60,
+    )
+    assert proc.returncode == 0, proc.stderr
+    flat = proc.stdout.replace("\\", "")
+    assert "-e FLASHINFER_GAUDI_COMBINED_KERNEL_DB=0" in flat
+    assert flat.index("-e FLASHINFER_GAUDI_COMBINED_KERNEL_DB=0") < flat.index("container_entry.sh")
 
 
 def test_run_rental_dry_run_writes_nothing(tmp_path):
@@ -571,6 +593,31 @@ def test_tiny_smoke_dry_run_options(tmp_path):
                      "--env", "Y=2"]
     assert "--recipe-cache" not in smoke  # --no-recipe-cache drops the option
     assert not any("PT_HPU_" in word for word in smoke)
+    assert not results.exists()  # a dry run writes nothing
+
+
+def test_tiny_smoke_dry_run_no_combined_kernel_db(tmp_path):
+    results = tmp_path / "results"
+
+    def dry_run(*extra):
+        proc = subprocess.run(
+            ["bash", str(SCRIPTS_DIR / "tiny_smoke.sh"), "--dry-run", "--results", str(results), "--run-id", "t1",
+             *extra],
+            capture_output=True,
+            text=True,
+            cwd=tmp_path,
+            timeout=60,
+        )
+        assert proc.returncode == 0, proc.stderr
+        return proc.stdout.replace("\\", "")
+
+    off = dry_run()
+    assert "FLASHINFER_GAUDI_COMBINED_KERNEL_DB" not in off
+    on = dry_run("--no-combined-kernel-db")
+    assert "-e FLASHINFER_GAUDI_COMBINED_KERNEL_DB=0" in on
+    smoke = [ln for ln in on.splitlines() if "tools.flash_next.rental.tiny_smoke" in ln]
+    assert len(smoke) == 1, on
+    assert "-e FLASHINFER_GAUDI_COMBINED_KERNEL_DB=0" in smoke[0]
     assert not results.exists()  # a dry run writes nothing
 
 

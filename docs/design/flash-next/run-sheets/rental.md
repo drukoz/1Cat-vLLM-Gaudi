@@ -180,6 +180,7 @@ minutes instead of a full run:
 | `--health-timeout S` | seconds to wait for a server to get healthy, passed to the check (default 1800) |
 | `--env KEY=VALUE` | extra server environment variable, repeatable; applied after the mode's own flags, so it can override them (a `KEY` without `=` is a usage error) |
 | `--no-recipe-cache` | do not give the `pytorch` mode's server the compiled-recipe cache under `results/recipe-cache` (the `fused` mode never gets it, see above) |
+| `--no-combined-kernel-db` | keep the combined kernel database out of the smoke servers (`FLASHINFER_GAUDI_COMBINED_KERNEL_DB=0` in the container; the servers then use the colon-list `GC_KERNEL_PATH`) |
 | `--results DIR`, `--run-id ID`, `--image IMG`, `--dry-run` | as for `run_rental.sh`; `--results` is fixed once the container exists |
 
 It refuses to start while the rental run's container (`fn-rental`) is running, because that run holds
@@ -273,6 +274,7 @@ Useful options:
 | `--server-timeout S` | seconds to wait for a server to become healthy (default 1800, enough with the default skipped warmup; raise it with `--full-warmup`, see below) |
 | `--recipe-cache DIR` | host folder for the HPU recipe cache, mounted at `/recipe-cache` and handed to the orchestrator with `--recipe-cache` (default: a `recipe-cache` folder next to `--model`) |
 | `--no-recipe-cache` | no recipe cache: no `/recipe-cache` mount and no `--recipe-cache` for the orchestrator |
+| `--no-combined-kernel-db` | keep the combined kernel database out of the servers (`FLASHINFER_GAUDI_COMBINED_KERNEL_DB=0` in the container); the run then uses the colon-list `GC_KERNEL_PATH` and gives the recipe cache only to servers on the PyTorch GDN path |
 | `--dry-run` | print the `docker run` command and exit |
 | `--no-disk-check` | skip both free-space checks |
 | `--no-warm-pass` | skip the warm pass (a one-turn pass that compiles the variant's graphs and caches the shared block before the coherence gate; on by default — see [Warm pass](#warm-pass-ruk-3203)) |
