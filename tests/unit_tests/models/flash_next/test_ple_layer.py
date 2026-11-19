@@ -11,7 +11,10 @@ the T4a torch oracle (``ple_forward_torch`` / ``ple_gate_torch``) across
 4. a chunked prefill followed by decode (state carried in the slot),
 5. a decode batch whose padding row (index ``-1``) is neither read nor written,
 6. a profile run (no metadata: gated output, cache untouched),
-7. the ``Qwen4ExpPLELayer`` seam rebinding in ``apply_flash_next_patches``.
+7. the ``Qwen4ExpPLELayer`` and ``Qwen4ExpNGramEmbedding`` seam rebinding in
+   ``apply_flash_next_patches``, and the host-multiplier n-gram embedding
+   (``HpuQwen4ExpNGramEmbedding``): its int32 ids equal the engine's int64 ids
+   before and after a checkpoint multipliers load.
 
 M3 adds the speculative path: verification and transition steps run from the
 state lattice with ``num_accepted_tokens`` rollback and must match the
@@ -39,8 +42,12 @@ from vllm.engine.arg_utils import EngineArgs  # noqa: E402
 from vllm.forward_context import set_forward_context  # noqa: E402
 from vllm.utils.torch_utils import set_default_torch_dtype  # noqa: E402
 
+import vllm_gaudi.models.qwen4_exp as flash_next  # noqa: E402
 import vllm_gaudi.models.qwen4_exp.ple_layer as ple_layer_module  # noqa: E402
-from vllm_gaudi.models.qwen4_exp.ple_layer import HpuQwen4ExpPLELayer  # noqa: E402
+from vllm_gaudi.models.qwen4_exp.ple_layer import (  # noqa: E402
+    HpuQwen4ExpNGramEmbedding,
+    HpuQwen4ExpPLELayer,
+)
 from vllm_gaudi.models.qwen4_exp.ple_ops import (  # noqa: E402
     ple_forward_torch, ple_gate_torch, ple_short_conv_batched_torch, ple_short_conv_spec_torch,
     ple_short_conv_torch,
@@ -77,6 +84,9 @@ def _engine_config(model_dir):
 def ple_layer(tmp_path):
     shutil.copy(FIXTURE, tmp_path / "config.json")
     vllm_config = _engine_config(tmp_path)
+    # The n-gram replacement is built through the ple_layer module seam, so the
+    # PLE layer built below must see the patched engine name.
+    flash_next.apply_flash_next_patches()
     init_file = tempfile.mkstemp(dir="/tmp")[1]
     with set_current_vllm_config(vllm_config):
         init_distributed_environment(
@@ -95,6 +105,7 @@ def ple_layer(tmp_path):
                 ple_dense_layer_id=0,
                 prefix=PREFIX,
             )
+        assert type(layer.ple_embedding) is HpuQwen4ExpNGramEmbedding
         layer.float()
         torch.manual_seed(0)
         for param in layer.parameters():
@@ -271,10 +282,68 @@ def test_profile_metadata_none(ple_layer):
 
 def test_seam_rebound():
     import vllm.models.qwen4_exp.nvidia.model as upstream_model
+    import vllm.models.qwen4_exp.nvidia.ple_layer as upstream_ple
 
     import vllm_gaudi.models.qwen4_exp as flash_next
     flash_next.apply_flash_next_patches()
     assert upstream_model.Qwen4ExpPLELayer is HpuQwen4ExpPLELayer
+    assert upstream_ple.Qwen4ExpNGramEmbedding is HpuQwen4ExpNGramEmbedding
+
+
+def _engine_embedding(vllm_config):
+    """The engine's embedding built with the fixture's config, in the fixture's context."""
+    config = vllm_config.model_config.hf_text_config
+    engine_cls = HpuQwen4ExpNGramEmbedding.__bases__[0]
+    with set_default_torch_dtype(torch.bfloat16), torch.device("cpu"):
+        return engine_cls(
+            vllm_config.model_config.hf_text_config,
+            int(config.ple_embed_dim),
+            ple_dense_layer_id=0,
+            prefix=PREFIX + ".ple_embedding",
+            layer_name=PREFIX,
+        )
+
+
+def _ngram_inputs(vllm_config):
+    """Three requests of lengths 1, 5 and 40 plus a [3, 2] n-gram context."""
+    vocab_size = int(vllm_config.model_config.hf_text_config.vocab_size)
+    gen = torch.Generator().manual_seed(0)
+    ids = torch.randint(0, vocab_size, (46,), generator=gen, dtype=torch.int32)
+    ids[0], ids[1], ids[6] = 0, vocab_size - 1, _eos(vllm_config)
+    qsl = torch.tensor([0, 1, 6, 46], dtype=torch.int32)
+    ctx = torch.randint(0, vocab_size, (3, 2), generator=gen, dtype=torch.int32)
+    return ids, qsl, ctx
+
+
+def test_ngram_ids_match_engine(ple_layer):
+    vllm_config, layer = ple_layer
+    engine = _engine_embedding(vllm_config)
+    ids, qsl, ctx = _ngram_inputs(vllm_config)
+    ours = layer.ple_embedding.compute_ngram_ids(ids, qsl, ctx)
+    assert torch.equal(ours, engine.compute_ngram_ids(ids, qsl, ctx))
+
+
+def test_ngram_ids_after_load(ple_layer):
+    vllm_config, layer = ple_layer
+    engine = _engine_embedding(vllm_config)
+    ids, qsl, ctx = _ngram_inputs(vllm_config)
+    before = layer.ple_embedding.compute_ngram_ids(ids, qsl, ctx)
+
+    # The tiny checkpoint's multipliers: above int32, and not the seed-1234 ones.
+    table = torch.tensor([8052911324071, 23703573157769, 20109073645365])
+    assert layer.ple_embedding.load_weights([("layer_multipliers", table)]) == {"layer_multipliers"}
+    assert engine.load_weights([("layer_multipliers", table)]) == {"layer_multipliers"}
+
+    ours = layer.ple_embedding.compute_ngram_ids(ids, qsl, ctx)
+    assert torch.equal(ours, engine.compute_ngram_ids(ids, qsl, ctx))
+    assert not torch.equal(ours, before)
+    assert torch.equal(layer.ple_embedding.layer_multipliers, torch.zeros(3, dtype=torch.long))
+
+
+def test_bad_multiplier_rejected(ple_layer):
+    _, layer = ple_layer
+    with pytest.raises(ValueError):
+        layer.ple_embedding.load_weights([("layer_multipliers", torch.tensor([1, 2 ** 62, 3]))])
 
 
 def _spec_md(load, accepted, qsl_p):

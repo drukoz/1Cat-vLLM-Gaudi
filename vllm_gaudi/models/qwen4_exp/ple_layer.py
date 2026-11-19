@@ -1,6 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 """HPU PLE layer for the Qwen4Exp (Flash-Next) model (M0, T4b).
 
+``HpuQwen4ExpNGramEmbedding`` replaces the upstream ``Qwen4ExpNGramEmbedding``
+through the ``vllm.models.qwen4_exp.nvidia.ple_layer.Qwen4ExpNGramEmbedding``
+seam. The engine registers its int64 ``layer_multipliers`` buffer on the model
+device, and the Gaudi lazy bridge cannot hold values above int32, so this class
+keeps the hash multipliers on the host, registers the hash tables as int32
+buffers and computes the ids with the int32-only ``ple_ngram_ids_int32``.
+
 ``HpuQwen4ExpPLELayer`` replaces the upstream ``Qwen4ExpPLELayer`` through the
 ``vllm.models.qwen4_exp.nvidia.model.Qwen4ExpPLELayer`` seam. The upstream
 ``forward`` cannot run in this fork: the n-gram id custom op's torch branch never
@@ -18,14 +25,181 @@ import torch
 
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.mamba.mamba_utils import is_conv_state_dim_first
-from vllm.models.qwen4_exp.nvidia.ple_layer import Qwen4ExpPLELayer
+from vllm.models.qwen4_exp.nvidia.ple_layer import Qwen4ExpNGramEmbedding, Qwen4ExpPLELayer
 
 from vllm_gaudi.models.qwen3_5 import _save_ssm_state
 from vllm_gaudi.models.qwen4_exp.ple_ops import (
+    NGRAM_HASH_LIMBS,
+    check_ngram_hash_bounds,
+    ngram_hash_limbs,
+    ngram_mod_weights,
     ple_gate_torch,
+    ple_ngram_ids_int32,
     ple_short_conv_batched_torch,
     ple_short_conv_spec_torch,
 )
+
+
+class HpuQwen4ExpNGramEmbedding(Qwen4ExpNGramEmbedding):
+    """N-gram embedding with the hash multipliers on the host and int32-only ids.
+
+    The engine builds ``layer_multipliers`` as an int64 buffer on the model device,
+    copies the checkpoint's multipliers onto the card in ``load_weights`` and
+    multiplies them in the forward hash; the Gaudi lazy bridge narrows int64 device
+    tensors to int32, so every one of those values (up to 2**62) fails to build.
+    This subclass keeps the buffer as zeros, keeps the real hash tables on the host
+    and mirrors them into int32 limb buffers, and computes the ids with
+    ``ple_ngram_ids_int32``, which reproduces the engine's int64 hash exactly.
+    """
+
+    @classmethod
+    def _make_layer_multipliers(cls, **kwargs: object) -> list[int]:
+        # The engine registers this result as an int64 buffer on the model device;
+        # zeros keep that buffer inside int32 on the HPU lazy bridge. The real
+        # multipliers are computed on the host in __init__ and live in the
+        # int32 ``hash_multiplier_limbs`` buffer, never in ``layer_multipliers``.
+        return [0] * int(kwargs["ngram_size"])  # type: ignore[arg-type]
+
+    def __init__(
+        self,
+        config,
+        embedding_dim: int,
+        ple_dense_layer_id: int,
+        prefix: str,
+        layer_name: str,
+        quant_config=None,
+        params_dtype: torch.dtype | None = None,
+    ) -> None:
+        super().__init__(
+            config,
+            embedding_dim,
+            ple_dense_layer_id,
+            prefix,
+            layer_name,
+            quant_config=quant_config,
+            params_dtype=params_dtype,
+        )
+        # The real tables, as plain Python ints on the host. The engine class, not
+        # self, so the zero override above is skipped.
+        multipliers = Qwen4ExpNGramEmbedding._make_layer_multipliers(
+            ngram_size=self.ngram_size,
+            unigram_vocab_size=self.unigram_vocab_size,
+            seed=int(getattr(config, "seed", 1234)),
+            ple_dense_layer_id=ple_dense_layer_id,
+        )
+        sizes, offsets, _ = self._make_vocab_layout(
+            ngram_vocab_size_base=int(config.ngram_vocab_size_base),
+            ngram_heads=self.ngram_heads,
+            ple_dense_layer_id=ple_dense_layer_id,
+        )
+        self.register_buffer(
+            "hash_multiplier_limbs",
+            torch.zeros(self.ngram_size, NGRAM_HASH_LIMBS, dtype=torch.int32),
+            persistent=False,
+        )
+        self.register_buffer(
+            "hash_mod_weights",
+            torch.zeros(self.ngram_heads, NGRAM_HASH_LIMBS, dtype=torch.int32),
+            persistent=False,
+        )
+        self.register_buffer("hash_sizes", torch.zeros(self.ngram_heads, dtype=torch.int32), persistent=False)
+        self.register_buffer("hash_offsets", torch.zeros(self.ngram_heads, dtype=torch.int32), persistent=False)
+        self._set_hash_tables(multipliers, sizes, offsets)
+
+    def _set_hash_tables(self, multipliers, sizes, offsets) -> None:
+        """Validate the host tables and refill the int32 limb buffers in place."""
+        multipliers = [int(value) for value in multipliers]
+        sizes = [int(value) for value in sizes]
+        offsets = [int(value) for value in offsets]
+        check_ngram_hash_bounds(multipliers, sizes, offsets, self.unigram_vocab_size)
+        self.hash_multipliers = tuple(multipliers)
+        self.hash_head_sizes = tuple(sizes)
+        self.hash_head_offsets = tuple(offsets)
+        # In place, so the buffers stay on the device they were built on.
+        limbs = torch.tensor([ngram_hash_limbs(m) for m in multipliers], dtype=torch.int32)
+        weights = torch.tensor(ngram_mod_weights(sizes), dtype=torch.int32)
+        self.hash_multiplier_limbs.copy_(limbs.to(self.hash_multiplier_limbs.device))
+        self.hash_mod_weights.copy_(weights.to(self.hash_mod_weights.device))
+        self.hash_sizes.copy_(torch.tensor(sizes, dtype=torch.int32).to(self.hash_sizes.device))
+        self.hash_offsets.copy_(torch.tensor(offsets, dtype=torch.int32).to(self.hash_offsets.device))
+
+    def load_weights(self, weights):
+        """Load the checkpoint, keeping ``layer_multipliers`` off the device."""
+        recorded: dict[str, list[int]] = {}
+        table_names = ("layer_multipliers", "ngram_heads_vocab_sizes", "ngram_heads_offsets")
+
+        def watch():
+            for name, loaded_weight in weights:
+                if name == "layer_multipliers":
+                    # Must never be copied to the card: check the shape with the
+                    # engine's message, record the values, skip the buffer copy.
+                    if tuple(loaded_weight.shape) != (self.ngram_size,):
+                        raise ValueError(f"Shape mismatch for {name}: expected "
+                                         f"{(self.ngram_size,)}, got {tuple(loaded_weight.shape)}")
+                    recorded[name] = loaded_weight.reshape(-1).tolist()
+                    continue
+                if name in table_names:
+                    recorded[name] = loaded_weight.reshape(-1).tolist()
+                yield name, loaded_weight
+
+        loaded = super().load_weights(watch())
+        if recorded:
+            self._set_hash_tables(
+                recorded.get("layer_multipliers", self.hash_multipliers),
+                recorded.get("ngram_heads_vocab_sizes", self.hash_head_sizes),
+                recorded.get("ngram_heads_offsets", self.hash_head_offsets),
+            )
+        if "layer_multipliers" in recorded:
+            loaded.add("layer_multipliers")
+        return loaded
+
+    def compute_ngram_ids(
+        self,
+        input_ids: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        ngram_context: torch.Tensor,
+        output: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """The engine's torch branch up to the hash, then the int32-only hash.
+
+        Gathering the tokens before the hash is equal to the engine's order (the
+        hash is elementwise) and hashes ``[num_tokens]`` rows instead of the whole
+        ``[num_reqs, context + num_tokens]`` context.
+        """
+        input_ids = input_ids.reshape(-1)
+        num_reqs = query_start_loc.numel() - 1
+        num_tokens = input_ids.shape[0]
+
+        input_ids = input_ids.long()
+        query_start_loc = query_start_loc.long()
+        positions = torch.arange(num_tokens, device=input_ids.device, dtype=torch.int64)
+        packed = torch.full(
+            (num_reqs, num_tokens),
+            self.eos_token_id,
+            device=input_ids.device,
+            dtype=torch.int64,
+        )
+        request_indices = torch.searchsorted(query_start_loc, positions, right=True) - 1
+        request_indices.clamp_(max=num_reqs - 1)
+        columns = (positions - query_start_loc[request_indices]).clamp(0, packed.shape[1] - 1)
+        packed[request_indices, columns] = input_ids
+        ngram_context = ngram_context[:num_reqs].to(device=input_ids.device, dtype=torch.long)
+
+        context = torch.cat([ngram_context, packed], dim=-1)
+        positions_2d, position_in_segment = self._shift_precompute(context, self.eos_token_id)
+        shifted = [context]
+        for shift in range(1, self.ngram_size):
+            shifted.append(
+                self._shift_apply(context, positions_2d, position_in_segment, shift, self.eos_token_id))
+        adjusted_columns = columns + self.ngram_size - 1
+
+        tokens = [shifted[i][request_indices, adjusted_columns].to(torch.int32) for i in range(self.ngram_size)]
+        ids = ple_ngram_ids_int32(tokens, self.hash_multiplier_limbs, self.hash_mod_weights, self.hash_sizes,
+                                  self.hash_offsets, self.heads_per_ngram).long()
+        if output is not None:
+            output.copy_(ids)
+            return output
+        return ids
 
 
 class HpuQwen4ExpPLELayer(Qwen4ExpPLELayer):
