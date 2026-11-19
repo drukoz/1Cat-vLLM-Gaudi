@@ -316,7 +316,7 @@ class Runner:
             "--fixture",
             TINY_FIXTURE,
         ]
-        proc = subprocess.run(cmd, cwd=str(repo_root()), capture_output=True, text=True, timeout=900)
+        proc = gates.run_step(cmd, repo_root(), 900)
         if proc.returncode != 0:
             tail = (proc.stderr or proc.stdout or "")[-400:]
             reason = "tiny checkpoint failed (exit %d): %s" % (proc.returncode, tail.strip())

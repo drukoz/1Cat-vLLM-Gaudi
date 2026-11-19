@@ -6,6 +6,7 @@ from __future__ import annotations
 import os
 import stat
 import tempfile
+import time
 from pathlib import Path
 
 from tools.flash_next.rental import gates
@@ -29,12 +30,20 @@ FAKE_PY = r"""
   echo "PYTHONPATH: ${PYTHONPATH-<unset>}"
   echo "GDNMODE: ${VLLM_HPU_GDN_CORE_DECODE-<unset>}"
   echo "GDNVERIFY: ${VLLM_HPU_GDN_CORE_VERIFY-<unset>}"
+  echo "LAZY: ${PT_HPU_LAZY_MODE-<unset>}"
 } >> "$FAKE_PY_LOG"
 case "$1" in
   -c) if [ -n "$FAKE_LOOKUP_NOISE" ]; then echo "$FAKE_LOOKUP_NOISE"; fi
       echo "$FAKE_LIB_DIR"
       exit ${FAKE_LOOKUP_EXIT:-0} ;;
   -m) case "$*" in
+        *test_hpu_op.py*) if [ -n "$FAKE_HANG_PIDFILE" ]; then
+                            sleep 60 &
+                            echo "$!" > "$FAKE_HANG_PIDFILE"
+                            sleep 60
+                          fi ;;
+      esac
+      case "$*" in
         *test_hpu_verify_op.py*)
           if [ -n "$FAKE_VERIFY_PYTEST_SLEEP" ]; then sleep "$FAKE_VERIFY_PYTEST_SLEEP"; fi
           printf '%s\n' "$FAKE_VERIFY_PYTEST_OUT"
@@ -50,7 +59,11 @@ case "$1" in
           *ver_tp8_b64*) exit ${FAKE_VERIFY_REPLAY2_EXIT:-0} ;;
           *) exit ${FAKE_VERIFY_REPLAY_EXIT:-0} ;;
         esac ;;
-      *) if [ -n "$FAKE_REPLAY_SLEEP" ]; then sleep "$FAKE_REPLAY_SLEEP"; fi
+      *) if [ "$PT_HPU_LAZY_MODE" = "0" ]; then
+           if [ -n "$FAKE_EAGER_REPLAY_SLEEP" ]; then sleep "$FAKE_EAGER_REPLAY_SLEEP"; fi
+           exit ${FAKE_EAGER_REPLAY_EXIT:-0}
+         fi
+         if [ -n "$FAKE_REPLAY_SLEEP" ]; then sleep "$FAKE_REPLAY_SLEEP"; fi
          case "$*" in
            *--case*) exit ${FAKE_REPLAY2_EXIT:-0} ;;
            *) exit ${FAKE_REPLAY_EXIT:-0} ;;
@@ -99,7 +112,7 @@ def setup(tmp_path: Path, monkeypatch, *, lib: Path, pytest_out: str = "..... [1
 
 def records(log: Path) -> list:
     """The fake interpreter's invocations, in order, as {args, PWD, KERNEL, NATIVE, PYTHONPATH, GDNMODE,
-    GDNVERIFY}."""
+    GDNVERIFY, LAZY}."""
     text = log.read_text(encoding="utf-8") if log.exists() else ""
     out = []
     for block in text.split("ARGS: ")[1:]:
@@ -110,6 +123,19 @@ def records(log: Path) -> list:
             rec[key] = value
         out.append(rec)
     return out
+
+
+def assert_pid_gone(pid: int, within_s: float = 5.0) -> None:
+    """Poll os.kill(pid, 0) until it raises ProcessLookupError; fail when the pid survives within_s."""
+    deadline = time.monotonic() + within_s
+    while True:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return
+        if time.monotonic() >= deadline:
+            raise AssertionError("pid %d is still alive %s s after the step ended" % (pid, within_s))
+        time.sleep(0.05)
 
 
 def test_fused_gdn_all_pass(tmp_path, monkeypatch):
@@ -126,10 +152,15 @@ def test_fused_gdn_all_pass(tmp_path, monkeypatch):
     assert details["seconds"] >= 0
     assert details["hpu_op"] == {"exit": 0, "passed": 5, "skipped": 0, "failed": 0}
     assert details["failed_tests"] == []
-    assert details["replay"] == [{"case": "tp8_b16", "exit": 0}, {"case": "tp8_b64", "exit": 0}]
+    assert details["replay"] == [{"case": "tp8_b16", "lazy_mode": 1, "exit": 0},
+                                 {"case": "tp8_b64", "lazy_mode": 1, "exit": 0}]
+    assert details["replay_eager"] == [{"case": "tp8_b16", "lazy_mode": 0, "exit": 0},
+                                       {"case": "tp8_b64", "lazy_mode": 0, "exit": 0}]
+    assert details["eager_compile_ok"] is True
     assert details["verify"]["status"] == "passed"
     assert details["verify"]["hpu_op"] == {"exit": 0, "passed": 3, "skipped": 0, "failed": 0}
-    assert details["verify"]["replay"] == [{"case": "ver_tp8_b16", "exit": 0}, {"case": "ver_tp8_b64", "exit": 0}]
+    assert details["verify"]["replay"] == [{"case": "ver_tp8_b16", "lazy_mode": 1, "exit": 0},
+                                           {"case": "ver_tp8_b64", "lazy_mode": 1, "exit": 0}]
     assert details["bench"]["exit"] == 0
     assert details["bench"]["lines"] == [
         "core recurrent slope 0.51 ms/step",
@@ -137,17 +168,19 @@ def test_fused_gdn_all_pass(tmp_path, monkeypatch):
         "core tp8 B=1 0.31 ms",
     ]
     recs = records(log)
-    assert len(recs) == 8  # the library lookup, then the seven steps, in order
+    assert len(recs) == 10  # the library lookup, then the nine steps, in order
     assert recs[0]["args"].startswith("-c import flashinfer_gaudi")
     assert os.path.realpath(recs[0]["PWD"]) == os.path.realpath(tempfile.gettempdir())
     steps = recs[1:]
     assert "pytest" in steps[0]["args"] and "test_hpu_op.py" in steps[0]["args"]
     assert "gdn_core_decode_replay.py" in steps[1]["args"] and "--case" not in steps[1]["args"]
     assert "gdn_core_decode_replay.py" in steps[2]["args"] and "--case tp8_b64" in steps[2]["args"]
-    assert "pytest" in steps[3]["args"] and "test_hpu_verify_op.py" in steps[3]["args"]
-    assert "--ops verify" in steps[4]["args"] and "--case" not in steps[4]["args"]
-    assert "--ops verify" in steps[5]["args"] and "--case ver_tp8_b64" in steps[5]["args"]
-    assert "gdn_core_decode_bench.py" in steps[6]["args"]
+    assert "gdn_core_decode_replay.py" in steps[3]["args"] and "--case" not in steps[3]["args"]
+    assert "gdn_core_decode_replay.py" in steps[4]["args"] and "--case tp8_b64" in steps[4]["args"]
+    assert "pytest" in steps[5]["args"] and "test_hpu_verify_op.py" in steps[5]["args"]
+    assert "--ops verify" in steps[6]["args"] and "--case" not in steps[6]["args"]
+    assert "--ops verify" in steps[7]["args"] and "--case ver_tp8_b64" in steps[7]["args"]
+    assert "gdn_core_decode_bench.py" in steps[8]["args"]
     for rec in steps:
         assert os.path.realpath(rec["PWD"]) == os.path.realpath(plugin)
         assert rec["KERNEL"] == str(lib / "libgdn_fused_gaudi2.so")
@@ -225,7 +258,8 @@ def test_fused_gdn_second_replay_fails(tmp_path, monkeypatch):
     assert details["mode"] == 0
     assert details["env"] == {"VLLM_HPU_GDN_CORE_DECODE": "0", "VLLM_HPU_GDN_CORE_VERIFY": "0"}
     assert details["verify"]["status"] == "not_run" and details["verify"]["reason"] == "decode checks failed"
-    assert details["replay"] == [{"case": "tp8_b16", "exit": 0}, {"case": "tp8_b64", "exit": 1}]
+    assert details["replay"] == [{"case": "tp8_b16", "lazy_mode": 1, "exit": 0},
+                                 {"case": "tp8_b64", "lazy_mode": 1, "exit": 1}]
     assert "bench" not in details
     assert not any("bench.py" in rec["args"] for rec in records(log))
     assert "tp8_b64" in details["reason"] and "exit 1" in details["reason"]
@@ -305,7 +339,8 @@ def test_fused_gdn_verify_second_replay_fails(tmp_path, monkeypatch):
     assert details["verify_mode"] == 0
     assert details["env"] == {"VLLM_HPU_GDN_CORE_VERIFY": "0"}
     assert details["verify"]["status"] == "failed"
-    assert details["verify"]["replay"] == [{"case": "ver_tp8_b16", "exit": 0}, {"case": "ver_tp8_b64", "exit": 1}]
+    assert details["verify"]["replay"] == [{"case": "ver_tp8_b16", "lazy_mode": 1, "exit": 0},
+                                           {"case": "ver_tp8_b64", "lazy_mode": 1, "exit": 1}]
     assert "ver_tp8_b64" in details["verify"]["reason"] and "exit 1" in details["verify"]["reason"]
     assert any("bench.py" in rec["args"] for rec in records(log))
 
@@ -347,6 +382,73 @@ def test_fused_gdn_bench_timeout_keeps_kernel_on(tmp_path, monkeypatch):
     assert details["mode"] == 1 and details["verify_mode"] == 1
     assert details["env"] == {"VLLM_HPU_GDN_CORE_VERIFY": "1"}
     assert details["bench"]["timed_out"] is True
+
+
+def test_fused_gdn_modes_per_step(tmp_path, monkeypatch):
+    monkeypatch.delenv("PT_HPU_LAZY_MODE", raising=False)
+    lib = make_lib(tmp_path)
+    fake, plugin, log = setup(tmp_path, monkeypatch, lib=lib)
+    status, details = gates.fused_gdn(plugin, tmp_path / "g1b", python=fake)
+    assert status is GateStatus.PASSED
+    recs = records(log)
+    assert len(recs) == 10
+    for idx in (4, 5):  # the two eager replays: replay args, no verify, eager mode
+        assert "replay" in recs[idx]["args"] and "--ops verify" not in recs[idx]["args"]
+        assert recs[idx]["LAZY"] == "0"
+    for idx in (1, 2, 3, 6, 7, 8, 9):  # every other step runs in the servers' lazy mode
+        assert recs[idx]["LAZY"] == "1"
+
+
+def test_fused_gdn_eager_replay_failure_keeps_kernel_on(tmp_path, monkeypatch):
+    lib = make_lib(tmp_path)
+    fake, plugin, log = setup(tmp_path, monkeypatch, lib=lib, FAKE_EAGER_REPLAY_EXIT=1)
+    status, details = gates.fused_gdn(plugin, tmp_path / "g1b", python=fake)
+    assert status is GateStatus.PASSED  # an eager failure never changes the gate's status
+    assert details["mode"] == 1
+    assert details["verify_mode"] == 1
+    assert details["env"] == {"VLLM_HPU_GDN_CORE_VERIFY": "1"}
+    assert details["replay_eager"][0]["exit"] == 1
+    assert details["eager_compile_ok"] is False
+    assert details["verify"]["status"] == "passed"  # the verify checks still ran
+    assert any("test_hpu_verify_op.py" in rec["args"] for rec in records(log))
+    assert any("bench.py" in rec["args"] for rec in records(log))
+
+
+def test_fused_gdn_eager_replay_timeout_keeps_kernel_on(tmp_path, monkeypatch):
+    monkeypatch.setattr(gates, "GDN_REPLAY_TIMEOUT_S", 1)
+    lib = make_lib(tmp_path)
+    fake, plugin, log = setup(tmp_path, monkeypatch, lib=lib, FAKE_EAGER_REPLAY_SLEEP=4)
+    status, details = gates.fused_gdn(plugin, tmp_path / "out", python=fake)
+    assert status is GateStatus.PASSED  # an eager timeout never changes the gate's status
+    assert details["mode"] == 1
+    assert details["env"] == {"VLLM_HPU_GDN_CORE_VERIFY": "1"}
+    assert [entry["timed_out"] for entry in details["replay_eager"]] == [True, True]
+    assert all(entry["exit"] is None for entry in details["replay_eager"])
+    assert details["eager_compile_ok"] is False
+    assert any("bench.py" in rec["args"] for rec in records(log))  # the gate went on to the verify checks
+
+
+def test_fused_gdn_hung_step_group_is_killed(tmp_path, monkeypatch):
+    monkeypatch.setattr(gates, "GDN_OP_TIMEOUT_S", 1)
+    monkeypatch.setattr(gates, "STEP_KILL_WAIT_S", 5)
+    lib = make_lib(tmp_path)
+    pidfile = tmp_path / "hung.pid"
+    fake, plugin, _ = setup(tmp_path, monkeypatch, lib=lib, FAKE_HANG_PIDFILE=str(pidfile))
+    t0 = time.monotonic()
+    status, details = gates.fused_gdn(plugin, tmp_path / "out", python=fake)
+    elapsed = time.monotonic() - t0
+    assert status is GateStatus.TIMED_OUT
+    assert details["mode"] == 0
+    assert elapsed < 15  # the grandchild holding the pipe cannot make the gate wait for its sleep 60
+    assert_pid_gone(int(pidfile.read_text(encoding="utf-8").strip()))
+
+
+def test_run_step_kills_leftovers_after_exit(tmp_path):
+    t0 = time.monotonic()
+    proc = gates.run_step(["/bin/sh", "-c", "sleep 60 >/dev/null 2>&1 & echo $!"], tmp_path, 10)
+    assert time.monotonic() - t0 < 15  # the sleeper redirects the pipes away, so the exit is not a timeout
+    assert proc.returncode == 0
+    assert_pid_gone(int(proc.stdout.strip()))
 
 
 def test_gdn_fallback_lines_finds_all_forms():
