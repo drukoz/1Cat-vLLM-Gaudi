@@ -163,11 +163,14 @@ def compressed_row_slots(slot_mapping: torch.Tensor, compress_ratio: int) -> tor
 
 
 def ring_write(ring: torch.Tensor, slot: torch.Tensor, positions: torch.Tensor, raw_k: torch.Tensor) -> None:
-    """Write raw keys into the ring (in place): ``ring`` ``[S, R, D]``, ``slot``
-    ``[bs]`` int64, ``positions`` ``[bs]`` int64, ``raw_k`` ``[bs, D]``: ``ring
-    [slot, positions % R] = raw_k`` (``index_put_``).
+    """Write raw keys into the ring (in place): ``ring`` ``[S, R, D]`` (contiguous),
+    ``slot`` ``[bs]`` int64, ``positions`` ``[bs]`` int64, ``raw_k`` ``[bs, D]``:
+    ``ring.view(-1, D).index_copy_(0, slot * R + positions % R, raw_k)``, the
+    flat-index form of writing the two-axis row ``(slot, positions % R)`` (the
+    HPU-compilable gather/write form; no multi-index write).
     """
-    ring.index_put_((slot, positions % ring.shape[1]), raw_k)
+    ring.view(-1, ring.shape[2]).index_copy_(0, slot * ring.shape[1] + positions % ring.shape[1],
+                                             raw_k.to(ring.dtype))
 
 
 def ring_block_rows(ring: torch.Tensor, slot: torch.Tensor, positions: torch.Tensor, raw_k: torch.Tensor,
@@ -175,13 +178,18 @@ def ring_block_rows(ring: torch.Tensor, slot: torch.Tensor, positions: torch.Ten
     """The ``ratio`` raw keys of the blocks that the tokens at ``positions``
     (``positions % ratio == ratio - 1``) complete.
 
-    ``ring`` ``[S, R, D]``, ``slot`` ``[bs]`` int64, ``positions`` ``[bs]``
-    int64, ``raw_k`` ``[bs, D]``: rows ``j = 0 .. ratio-2`` are ``ring[slot,
-    (positions - (ratio - 1) + j) % R]``, the last row is ``raw_k`` -> ``[bs,
-    ratio, D]`` in ``ring``'s dtype. Rows whose position does not complete a
-    block are garbage and the caller ignores them.
+    ``ring`` ``[S, R, D]`` (contiguous), ``slot`` ``[bs]`` int64, ``positions``
+    ``[bs]`` int64, ``raw_k`` ``[bs, D]``: rows ``j = 0 .. ratio-2`` come from
+    ``ring.view(-1, D).index_select(0, slot * R + (positions - (ratio - 1) + j) % R)``,
+    the flat-index form of the two-axis row ``(slot, (positions - (ratio - 1) +
+    j) % R)``, the last row is ``raw_k`` -> ``[bs, ratio, D]`` in ``ring``'s
+    dtype. Rows whose position does not complete a block are garbage and the
+    caller ignores them.
     """
     r = ring.shape[1]
-    rows = [ring[slot, (positions - (compress_ratio - 1) + j) % r] for j in range(compress_ratio - 1)]
+    rows = [
+        ring.view(-1, ring.shape[2]).index_select(0, slot * r + (positions - (compress_ratio - 1) + j) % r)
+        for j in range(compress_ratio - 1)
+    ]
     rows.append(raw_k)
     return torch.stack(rows, dim=1)

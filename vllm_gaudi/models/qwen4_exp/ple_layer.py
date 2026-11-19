@@ -230,8 +230,8 @@ class HpuQwen4ExpNGramEmbedding(Qwen4ExpNGramEmbedding):
         )
         request_indices = torch.searchsorted(query_start_loc, positions, right=True) - 1
         request_indices.clamp_(max=num_reqs - 1)
-        columns = (positions - query_start_loc[request_indices]).clamp(0, packed.shape[1] - 1)
-        packed[request_indices, columns] = input_ids
+        columns = (positions - query_start_loc.index_select(0, request_indices)).clamp(0, packed.shape[1] - 1)
+        packed.view(-1).index_copy_(0, request_indices * packed.shape[1] + columns, input_ids.to(packed.dtype))
         ngram_context = ngram_context[:num_reqs].to(device=input_ids.device, dtype=torch.long)
 
         context = torch.cat([ngram_context, packed], dim=-1)
@@ -242,7 +242,10 @@ class HpuQwen4ExpNGramEmbedding(Qwen4ExpNGramEmbedding):
                 self._shift_apply(context, positions_2d, position_in_segment, shift, self.eos_token_id))
         adjusted_columns = columns + self.ngram_size - 1
 
-        tokens = [shifted[i][request_indices, adjusted_columns].to(torch.int32) for i in range(self.ngram_size)]
+        tokens = [
+            shifted[i].reshape(-1).index_select(0, request_indices * shifted[i].shape[1] + adjusted_columns).to(
+                torch.int32) for i in range(self.ngram_size)
+        ]
         ids = ple_ngram_ids_int32(tokens, self.hash_multiplier_limbs, self.hash_mod_weights, self.hash_sizes,
                                   self.hash_offsets, self.heads_per_ngram).long()
         if output is not None:
