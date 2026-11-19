@@ -7,6 +7,7 @@ import glob
 import importlib
 import os
 import threading
+from enum import IntEnum
 from pathlib import Path
 from typing import Callable
 
@@ -23,6 +24,34 @@ _BLOCK_FP8_LINEAR_OP: Callable | None = None
 _ADD_RMSNORM_QUANT_OP: Callable | None = None
 _GDN_FUSED_LOADED: bool | None = None  # None = not attempted
 _GDN_FUSED_ERRORS: list[str] = []  # the fused GDN loader's own errors
+
+RECIPE_CACHE_ENV = "PT_HPU_RECIPE_CACHE_CONFIG"
+COMBINED_KERNEL_DB = "libflashinfer_gaudi_combined_gaudi2.so"  # built by a later task; named only in the reason
+
+
+class KernelDbState(IntEnum):
+    MISSING = 0  # the database file is not installed
+    REGISTERED = 1  # prepended to GC_KERNEL_PATH, or already in it
+    BLOCKED = 2  # left out because PT_HPU_RECIPE_CACHE_CONFIG is set
+
+
+def kernel_database_blocked_reason(name: str) -> str | None:
+    """Why the kernel database `name` must not be prepended to GC_KERNEL_PATH in this process, or None."""
+    if os.environ.get(RECIPE_CACHE_ENV, "").strip():
+        return (f"{RECIPE_CACHE_ENV} is set: with a recipe cache the Habana PyTorch bridge accepts only one regular "
+                f"file in GC_KERNEL_PATH (Gaudi 1.24.1 aborts at init_device with 'PT_SYNHELPER Flag GC_KERNEL_PATH: "
+                f"Path is not a regular file'), so {name} was not registered and its native TPC kernels are "
+                f"unavailable in this process. Unset {RECIPE_CACHE_ENV} to use them, or install the combined kernel "
+                f"database ({COMBINED_KERNEL_DB}).")
+    return None
+
+
+_FLASHINFER_DB_STATE = KernelDbState.MISSING
+
+
+def flashinfer_kernel_database_state() -> KernelDbState:
+    """The registration state of the packaged FlashInfer kernel database in this process."""
+    return _FLASHINFER_DB_STATE
 
 
 def _library_candidates() -> list[str]:
@@ -44,10 +73,14 @@ def _library_candidates() -> list[str]:
     return unique
 
 
-def _prepend_kernel_database(path: str) -> None:
+def _prepend_kernel_database(path: str) -> str | None:
+    reason = kernel_database_blocked_reason(Path(path).name)
+    if reason:
+        return reason
+
     current = [entry for entry in os.environ.get("GC_KERNEL_PATH", "").split(os.pathsep) if entry]
     if path in current:
-        return
+        return None
 
     configured = [path, *current]
     # Setting GC_KERNEL_PATH replaces SynapseAI's implicit default. Preserve
@@ -57,14 +90,24 @@ def _prepend_kernel_database(path: str) -> None:
     if not current and system_kernel_db.is_file():
         configured.append(str(system_kernel_db))
     os.environ["GC_KERNEL_PATH"] = os.pathsep.join(configured)
+    return None
 
 
-def _configure_kernel_database_path() -> None:
+def _configure_kernel_database_path() -> KernelDbState:
+    global _FLASHINFER_DB_STATE
     package_lib = Path(__file__).resolve().parent / "lib"
     kernel_db = package_lib / "libflashinfer_gaudi_kernels.so"
     if not kernel_db.is_file():
-        return
-    _prepend_kernel_database(str(kernel_db))
+        _FLASHINFER_DB_STATE = KernelDbState.MISSING
+        return KernelDbState.MISSING
+    reason = _prepend_kernel_database(str(kernel_db))
+    if reason is not None:
+        if reason not in _LOAD_ERRORS:
+            _LOAD_ERRORS.append(reason)
+        _FLASHINFER_DB_STATE = KernelDbState.BLOCKED
+        return KernelDbState.BLOCKED
+    _FLASHINFER_DB_STATE = KernelDbState.REGISTERED
+    return KernelDbState.REGISTERED
 
 
 def _exception_text(exc: BaseException) -> str:
@@ -118,7 +161,11 @@ def load_gdn_fused_extension() -> bool:
         if missing:
             _GDN_FUSED_LOADED = False
             return False
-        _prepend_kernel_database(kernel_db)
+        reason = _prepend_kernel_database(kernel_db)
+        if reason:
+            _gdn_fused_error(reason)
+            _GDN_FUSED_LOADED = False
+            return False
         # The op's Python schema (T2) must exist before the extension is loaded,
         # because the C++ side only implements the HPU kernel of the fragment.
         try:
@@ -150,7 +197,13 @@ def load_native_extensions() -> tuple[str, ...]:
     with _LOAD_LOCK:
         if _LOAD_ATTEMPTED:
             return tuple(_LOADED_PATHS)
-        _configure_kernel_database_path()
+        state = _configure_kernel_database_path()
+        if state is KernelDbState.BLOCKED:
+            # The op extensions' TPC GUIDs have no discoverable kernel database,
+            # so loading them would only move the failure to the first graph
+            # compile. Leave the handles unset; the callers run the Python paths.
+            _LOAD_ATTEMPTED = True
+            return tuple(_LOADED_PATHS)
         for candidate in _library_candidates():
             if not os.path.isfile(candidate):
                 _LOAD_ERRORS.append(f"{candidate}: file does not exist")
@@ -251,7 +304,7 @@ def native_diagnostics() -> dict[str, object]:
 def _reset_native_state_for_tests() -> None:
     global _LOAD_ATTEMPTED, _SILU_AND_MUL_OP, _SILU_MUL_QUANT_OP
     global _BLOCK_FP8_DEQUANT_OP, _BLOCK_FP8_LINEAR_OP
-    global _ADD_RMSNORM_QUANT_OP
+    global _ADD_RMSNORM_QUANT_OP, _FLASHINFER_DB_STATE
     with _LOAD_LOCK:
         _LOAD_ATTEMPTED = False
         _SILU_AND_MUL_OP = None
@@ -259,6 +312,7 @@ def _reset_native_state_for_tests() -> None:
         _BLOCK_FP8_DEQUANT_OP = None
         _BLOCK_FP8_LINEAR_OP = None
         _ADD_RMSNORM_QUANT_OP = None
+        _FLASHINFER_DB_STATE = KernelDbState.MISSING
         _LOADED_PATHS.clear()
         _LOAD_ERRORS.clear()
 

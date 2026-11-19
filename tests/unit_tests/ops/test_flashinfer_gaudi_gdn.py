@@ -1121,22 +1121,56 @@ def test_auto_policy_uses_reference_on_cpu():
     assert output.shape == (1, 4, 8)
 
 
-def test_native_loader_adds_kernel_database_file_to_gc_path(tmp_path, monkeypatch):
+def _fake_flashinfer_package_with_kernel_db(tmp_path, monkeypatch):
     package_dir = tmp_path / "flashinfer_gaudi"
     library_dir = package_dir / "lib"
     library_dir.mkdir(parents=True)
     kernel_database = library_dir / "libflashinfer_gaudi_kernels.so"
     kernel_database.touch()
-
     monkeypatch.setattr(_native, "__file__", str(package_dir / "_native.py"))
     monkeypatch.delenv("GC_KERNEL_PATH", raising=False)
-    _native._configure_kernel_database_path()
+    _native._reset_native_state_for_tests()
+    return package_dir, library_dir, kernel_database
+
+
+def test_native_loader_adds_kernel_database_file_to_gc_path(tmp_path, monkeypatch):
+    _, _, kernel_database = _fake_flashinfer_package_with_kernel_db(tmp_path, monkeypatch)
+    monkeypatch.delenv("PT_HPU_RECIPE_CACHE_CONFIG", raising=False)
+
+    assert _native._configure_kernel_database_path() is _native.KernelDbState.REGISTERED
 
     configured = os.environ["GC_KERNEL_PATH"].split(os.pathsep)
     assert configured[0] == str(kernel_database)
     system_kernel_database = Path("/usr/lib/habanalabs/libtpc_kernels.so")
     if system_kernel_database.is_file():
         assert configured[-1] == str(system_kernel_database)
+
+
+def test_native_loader_skips_the_kernel_database_next_to_a_recipe_cache(tmp_path, monkeypatch):
+    _fake_flashinfer_package_with_kernel_db(tmp_path, monkeypatch)
+    monkeypatch.setenv("PT_HPU_RECIPE_CACHE_CONFIG", "/tmp/rc,false,1024")
+
+    assert _native._configure_kernel_database_path() is _native.KernelDbState.BLOCKED
+    assert "GC_KERNEL_PATH" not in os.environ
+    (error, ) = _native._LOAD_ERRORS
+    assert "libflashinfer_gaudi_kernels.so" in error
+
+    assert _native._configure_kernel_database_path() is _native.KernelDbState.BLOCKED
+    assert len(_native._LOAD_ERRORS) == 1
+    assert "GC_KERNEL_PATH" not in os.environ
+
+
+def test_native_loader_loads_no_extension_next_to_a_recipe_cache(tmp_path, monkeypatch):
+    _, library_dir, _ = _fake_flashinfer_package_with_kernel_db(tmp_path, monkeypatch)
+    (library_dir / "flashinfer_gaudi_ops.so").touch()
+    monkeypatch.setenv("PT_HPU_RECIPE_CACHE_CONFIG", "/tmp/rc,false,1024")
+    calls: list[str] = []
+    monkeypatch.setattr(torch.ops, "load_library", lambda path: calls.append(path))
+    _native._LOAD_ATTEMPTED = False
+
+    assert _native.load_native_extensions() == ()
+    assert calls == []
+    assert _native.silu_and_mul_op() is None
 
 
 def test_recurrent_state_is_continuous_across_many_steps():

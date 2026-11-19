@@ -154,6 +154,12 @@ def register_ops():
     from flashinfer_gaudi import load_native_extensions
 
     load_native_extensions()
+    from flashinfer_gaudi._native import KernelDbState, flashinfer_kernel_database_state, kernel_database_blocked_reason
+
+    if flashinfer_kernel_database_state() is KernelDbState.BLOCKED:
+        from vllm.logger import init_logger
+
+        init_logger(__name__).warning(kernel_database_blocked_reason("libflashinfer_gaudi_kernels.so"))
     from vllm_gaudi import envs as _gaudi_envs
 
     decode_mode = _gaudi_envs.VLLM_HPU_GDN_CORE_DECODE
