@@ -268,7 +268,7 @@ Useful options:
 | `--run-id ID` | fixed run id (default: UTC timestamp) |
 | `--image IMG` | container image (default the 1.24.1 base image) |
 | `--full-warmup` | run the full bucket warmup at server start (default: skipped — see [Warmup and the recipe cache](#warmup-and-the-recipe-cache-ruk-3200)) |
-| `--server-timeout S` | seconds to wait for a server to become healthy (default 1800; use 3600 with the default skipped warmup) |
+| `--server-timeout S` | seconds to wait for a server to become healthy (default 1800, enough with the default skipped warmup; raise it with `--full-warmup`, see below) |
 | `--recipe-cache DIR` | host folder for the HPU recipe cache, mounted at `/recipe-cache` (default: a `recipe-cache` folder next to `--model`) |
 | `--no-recipe-cache` | start the containers without an HPU recipe cache |
 | `--dry-run` | print the `docker run` command and exit |
@@ -288,10 +288,11 @@ it; the manifest records both).
 Skipping warmup means the graphs are not compiled at server start — they compile **on first
 use**, inside the first requests. Two consequences:
 
-- **Startup is minutes, not tens of minutes.** The `/v1/models` health check does not wait for
-  graph compilation. When a cold-cache run's compile-only startup is expected to exceed 30 min,
-  give it room: `--server-timeout 3600` (the coherence gate already allows 3,600 s per request
-  when the warmup is skipped, so a first request that triggers compilation is not cut off).
+- **Startup is minutes, not tens of minutes.** With the warmup skipped a start is weight loading,
+  the cache setup and the sampler warmup, with no graph compiled, so the default 1800 s health
+  wait holds; `--server-timeout` matters with `--full-warmup` (below). The coherence gate allows
+  3,600 s per request when the warmup is skipped, so a first request that triggers compilation
+  is not cut off.
 - **The recipe cache keeps the compiled graphs.** `run_rental.sh` mounts a recipe cache at
   `/recipe-cache` with `PT_HPU_RECIPE_CACHE_CONFIG=/recipe-cache,false,16384`. The default
   folder is `recipe-cache` **next to the checkpoint**, so it lives on the checkpoint's disk: on
