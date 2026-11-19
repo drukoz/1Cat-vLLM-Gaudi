@@ -1173,6 +1173,26 @@ def test_native_loader_loads_no_extension_next_to_a_recipe_cache(tmp_path, monke
     assert _native.silu_and_mul_op() is None
 
 
+def test_native_loader_uses_the_combined_database_next_to_a_recipe_cache(tmp_path, monkeypatch):
+    _, library_dir, _ = _fake_flashinfer_package_with_kernel_db(tmp_path, monkeypatch)
+    combined = library_dir / _native.COMBINED_KERNEL_DB
+    combined.touch()
+    monkeypatch.delenv("FLASHINFER_GAUDI_COMBINED_KERNEL_DB", raising=False)
+    monkeypatch.setenv("PT_HPU_RECIPE_CACHE_CONFIG", "/tmp/rc,false,1024")
+
+    assert _native._configure_kernel_database_path() is _native.KernelDbState.COMBINED
+    assert os.environ["GC_KERNEL_PATH"] == str(combined)
+    assert _native._LOAD_ERRORS == []
+
+    (library_dir / "flashinfer_gaudi_ops.so").touch()
+    calls: list[str] = []
+    monkeypatch.setattr(torch.ops, "load_library", lambda path: calls.append(path))
+    _native._LOAD_ATTEMPTED = False
+
+    _native.load_native_extensions()
+    assert calls == [str(library_dir / "flashinfer_gaudi_ops.so")]
+
+
 def test_recurrent_state_is_continuous_across_many_steps():
     q, k, v, pool, log_decay, beta = _inputs(batch=1)
     reference_pool = pool.clone()

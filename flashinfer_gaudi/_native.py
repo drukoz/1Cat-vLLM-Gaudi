@@ -24,15 +24,18 @@ _BLOCK_FP8_LINEAR_OP: Callable | None = None
 _ADD_RMSNORM_QUANT_OP: Callable | None = None
 _GDN_FUSED_LOADED: bool | None = None  # None = not attempted
 _GDN_FUSED_ERRORS: list[str] = []  # the fused GDN loader's own errors
+_COMBINED_DB_ACTIVE: str | None = None  # the combined kernel database this process activated (its path)
 
 RECIPE_CACHE_ENV = "PT_HPU_RECIPE_CACHE_CONFIG"
-COMBINED_KERNEL_DB = "libflashinfer_gaudi_combined_gaudi2.so"  # built by a later task; named only in the reason
+COMBINED_KERNEL_DB = "libflashinfer_gaudi_combined_gaudi2.so"  # built by RUK-3243; one file carrying every GUID
+COMBINED_KERNEL_DB_ENV = "FLASHINFER_GAUDI_COMBINED_KERNEL_DB"  # kill switch: "0" ignores the combined database
 
 
 class KernelDbState(IntEnum):
     MISSING = 0  # the database file is not installed
     REGISTERED = 1  # prepended to GC_KERNEL_PATH, or already in it
     BLOCKED = 2  # left out because PT_HPU_RECIPE_CACHE_CONFIG is set
+    COMBINED = 3  # registered through the combined kernel database (the single GC_KERNEL_PATH file)
 
 
 def kernel_database_blocked_reason(name: str) -> str | None:
@@ -93,8 +96,42 @@ def _prepend_kernel_database(path: str) -> str | None:
     return None
 
 
+def _combined_kernel_db_path() -> Path | None:
+    """The combined kernel database next to this module, or None when absent or switched off."""
+    path = Path(__file__).resolve().parent / "lib" / COMBINED_KERNEL_DB
+    if not path.is_file():
+        return None
+    if os.environ.get(COMBINED_KERNEL_DB_ENV, "1").strip() != "0":
+        return path
+    return None
+
+
+def _activate_combined_kernel_db() -> bool:
+    """Make the combined kernel database the only GC_KERNEL_PATH entry; True when activated."""
+    global _COMBINED_DB_ACTIVE
+    path = _combined_kernel_db_path()
+    if path is None:
+        return False
+
+    current = os.environ.get("GC_KERNEL_PATH", "")
+    if current in ("", str(path), "/usr/lib/habanalabs/libtpc_kernels.so"):
+        os.environ["GC_KERNEL_PATH"] = str(path)
+        _COMBINED_DB_ACTIVE = str(path)
+        return True
+
+    error = (f"GC_KERNEL_PATH is already set to {current}: the combined kernel database {path} was not "
+             f"activated; unset it or set {COMBINED_KERNEL_DB_ENV}=0")
+    if error not in _LOAD_ERRORS:
+        _LOAD_ERRORS.append(error)
+    return False
+
+
 def _configure_kernel_database_path() -> KernelDbState:
     global _FLASHINFER_DB_STATE
+    if _activate_combined_kernel_db():
+        # The FlashInfer TPC GUIDs are inside the combined file, so the database is registered.
+        _FLASHINFER_DB_STATE = KernelDbState.COMBINED
+        return KernelDbState.COMBINED
     package_lib = Path(__file__).resolve().parent / "lib"
     kernel_db = package_lib / "libflashinfer_gaudi_kernels.so"
     if not kernel_db.is_file():
@@ -161,11 +198,15 @@ def load_gdn_fused_extension() -> bool:
         if missing:
             _GDN_FUSED_LOADED = False
             return False
-        reason = _prepend_kernel_database(kernel_db)
-        if reason:
-            _gdn_fused_error(reason)
-            _GDN_FUSED_LOADED = False
-            return False
+        # The combined database serves the fused GDN GUIDs, so its member only
+        # needs to exist (checked above); with it active GC_KERNEL_PATH is left
+        # as the single file and the recipe-cache block does not apply.
+        if not _activate_combined_kernel_db():
+            reason = _prepend_kernel_database(kernel_db)
+            if reason:
+                _gdn_fused_error(reason)
+                _GDN_FUSED_LOADED = False
+                return False
         # The op's Python schema (T2) must exist before the extension is loaded,
         # because the C++ side only implements the HPU kernel of the fragment.
         try:
@@ -285,6 +326,7 @@ def native_diagnostics() -> dict[str, object]:
     return {
         "loaded_libraries": tuple(_LOADED_PATHS),
         "load_errors": tuple(_LOAD_ERRORS),
+        "combined_kernel_db": _COMBINED_DB_ACTIVE,
         "public_packed_gdn": public_packed_gdn_op() is not None,
         "bridge_packed_gdn": bridge_packed_gdn_op() is not None,
         "silu_and_mul": silu_and_mul_op() is not None,
@@ -304,7 +346,7 @@ def native_diagnostics() -> dict[str, object]:
 def _reset_native_state_for_tests() -> None:
     global _LOAD_ATTEMPTED, _SILU_AND_MUL_OP, _SILU_MUL_QUANT_OP
     global _BLOCK_FP8_DEQUANT_OP, _BLOCK_FP8_LINEAR_OP
-    global _ADD_RMSNORM_QUANT_OP, _FLASHINFER_DB_STATE
+    global _ADD_RMSNORM_QUANT_OP, _FLASHINFER_DB_STATE, _COMBINED_DB_ACTIVE
     with _LOAD_LOCK:
         _LOAD_ATTEMPTED = False
         _SILU_AND_MUL_OP = None
@@ -313,6 +355,7 @@ def _reset_native_state_for_tests() -> None:
         _BLOCK_FP8_LINEAR_OP = None
         _ADD_RMSNORM_QUANT_OP = None
         _FLASHINFER_DB_STATE = KernelDbState.MISSING
+        _COMBINED_DB_ACTIVE = None
         _LOADED_PATHS.clear()
         _LOAD_ERRORS.clear()
 

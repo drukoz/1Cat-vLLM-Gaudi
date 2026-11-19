@@ -137,6 +137,18 @@ kernel database. The combined kernel database (`libflashinfer_gaudi_combined_gau
 FlashInfer, stock and fused-GDN kernels into the single regular file the bridge accepts, which lifts the
 restriction so a recipe-cache server can keep the native kernels.
 
+**With the combined database.** When `flashinfer_gaudi/lib/libflashinfer_gaudi_combined_gaudi2.so` exists and
+`FLASHINFER_GAUDI_COMBINED_KERNEL_DB` is not `0`, `flashinfer_gaudi._native` sets `GC_KERNEL_PATH` to **exactly that
+one file** (it obeys the bridge's single-regular-file rule above) and treats the FlashInfer database as registered,
+so both loaders load their op extensions and the recipe-cache block of this section does not apply. It replaces the
+variable only when that is safe: when it is unset, empty, already the combined file, or the stock
+`/usr/lib/habanalabs/libtpc_kernels.so` default. A foreign `GC_KERNEL_PATH` is never overwritten; the loader records
+one error naming the existing value and the remedy (`unset it or set FLASHINFER_GAUDI_COMBINED_KERNEL_DB=0`) and falls
+back to the per-library behaviour, the recipe-cache block included. `FLASHINFER_GAUDI_COMBINED_KERNEL_DB=0` is the
+kill switch: with it the loader behaves exactly as if the combined file were absent (this is what the rental sets when
+gate **G1b** has not passed). Gate G1b of the rental runs a lazy server through the single combined file before any
+real server is started on it.
+
 ## The combined kernel database (RUK-3243)
 
 With `PT_HPU_RECIPE_CACHE_CONFIG` set, the Habana PyTorch bridge (1.24.1) accepts only **one regular
