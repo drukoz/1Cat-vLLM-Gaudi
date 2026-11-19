@@ -158,9 +158,13 @@ def test_multi_token_step_equals_single_token_chain(tiny_checkpoint):
         ring_gap = (step_ring - chain_ring).abs().max().item()
         assert ring_gap <= ROW_TOL, (f"key_ring after the 4-token step vs the 1-token chain: "
                                      f"max |delta| = {ring_gap:.3e} > {ROW_TOL:.0e}")
-        comp_gap = (step_comp - chain_comp).abs().max().item()
+        # Parity is on the request rows only: the cache's last row is the scratch row, and the step's
+        # three non-completing rows write it in one fixed-shape ``index_put_`` with a duplicated index,
+        # whose winning write is undefined (the chain writes it once per step). Which rows move is
+        # pinned by ``test_decode_write_has_fixed_shape``.
+        comp_gap = (step_comp[:-1] - chain_comp[:-1]).abs().max().item()
         assert comp_gap <= ROW_TOL, (f"compressed_key_cache after the 4-token step vs the 1-token chain: "
-                                     f"max |delta| = {comp_gap:.3e} > {ROW_TOL:.0e}")
+                                      f"max |delta| = {comp_gap:.3e} > {ROW_TOL:.0e}")
         assert bool(step_ring[SLOT_A].any()), "the multi-token step wrote no raw key into the request's ring slot"
         assert bool(step_comp[COMP_SELF].any()), "the step left the compressed row of block 16 at zero"
         picked = {int(p) for p in sel_step[-1] if int(p) >= 0}
