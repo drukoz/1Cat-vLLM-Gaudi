@@ -106,3 +106,67 @@ In the container, from the plugin checkout (`cd /bundle/plugin`), after the inst
    ```
 
    prints nothing (the pattern is `GDN_FALLBACK_RE` in `tools/flash_next/rental/gates.py`).
+
+## The combined kernel database (RUK-3243)
+
+With `PT_HPU_RECIPE_CACHE_CONFIG` set, the Habana PyTorch bridge (1.24.1) accepts only **one regular
+file** in `GC_KERNEL_PATH`, while SynapseAI itself accepts a colon list. On the Gaudi node every vLLM
+server aborted at `init_device` with `PT_SYNHELPER Flag GC_KERNEL_PATH: Path is not a regular file`.
+`csrc/kernel_db_adapter/adapter.cpp` is a TPC kernel library (`libflashinfer_gaudi_combined_gaudi2.so`)
+that forwards every entry point to an ordered list of member libraries, so `GC_KERNEL_PATH` can name
+that one file. It generalizes the DeepSeek V4 glue (`csrc/deepseek_v4/memory_ready/glue.cpp`) from one
+base library to a list of members. The host test `csrc/kernel_db_adapter/test/` proves the GUID merging
+and routing with two fake members.
+
+**Members and order (= GUID precedence, the same order the Python loader prepends today; first member
+wins on a duplicate name):**
+
+1. `libgdn_fused_gaudi2.so` (optional, a missing sibling is skipped silently)
+2. `libflashinfer_gaudi_kernels.so` (optional)
+3. the stock library (required): `FLASHINFER_GAUDI_STOCK_KERNEL_DB` if set, else
+   `/usr/lib/habanalabs/libtpc_kernels.so`
+
+Siblings are found next to the adapter with `dladdr`. Members are opened once (`std::call_once`,
+`dlopen(RTLD_NOW | RTLD_LOCAL)`); a member that fails to open is skipped, and if none opened every
+entry point returns `GLUE_FAILED` and `GetKernelGuids` reports 0.
+
+**The six exported entry points** (the graph compiler calls these; see `tpc_kernel_lib_interface.h`):
+
+| Entry point | Routing rule |
+|---|---|
+| `GetKernelGuids` | merged list of all members for `DEVICE_ID_GAUDI2` (first wins on a duplicate); two-call size protocol; capacity smaller than the total is `GLUE_FAILED`; a non-Gaudi2 device forwards to the stock member only |
+| `InstantiateTpcKernel` | by `p->guid.name` to the owning member; unknown name `GLUE_NODE_NOT_FOUND` |
+| `GetShapeInference` | by `(p->pGuid ? p->pGuid : &p->guid)->name` |
+| `GetSuggestedManipulation` | by `p->guid.name`; a member without the symbol is `GLUE_FAILED` |
+| `GetSupportedDataLayouts` | by `p->guid.name` |
+| `GetLibVersion` | the stock member's (the last member's) value |
+
+**Environment variables:**
+
+- `FLASHINFER_GAUDI_STOCK_KERNEL_DB` — replaces `/usr/lib/habanalabs/libtpc_kernels.so` as the stock
+  member.
+- `FLASHINFER_GAUDI_COMBINED_MEMBERS=<colon-separated paths>` — **test-only**; replaces the whole
+  member list (used by the host test to point the adapter at the fake members).
+
+**Build and test.** The library is host C++ only (no `tpc-clang`, no `objcopy`); it links
+`${CMAKE_DL_LIBS}` and needs the header folder (in tpcsim that is `/usr/lib/habanatools/include`, the
+default for `TPC_INCLUDE_DIR`/`HABANA_INCLUDE_DIR`):
+
+```bash
+tools/flash_next/tpcsim.sh 'cmake -S csrc/kernel_db_adapter -B /tmp/kda -DKERNEL_DB_ADAPTER_TESTS=ON \
+    && cmake --build /tmp/kda --parallel && ctest --test-dir /tmp/kda --output-on-failure'   # 100% tests passed
+tools/flash_next/tpcsim.sh 'nm -D /tmp/kda/libflashinfer_gaudi_combined_gaudi2.so | grep " T "'  # the six entry points
+```
+
+`tools/build_flashinfer_gaudi.py` builds it after the other libraries (as
+`flashinfer_gaudi/lib/libflashinfer_gaudi_combined_gaudi2.so`), only when at least one member database
+was built; a failure removes the file and prints `Continuing without the combined kernel database:
+GC_KERNEL_PATH stays a colon list.` so the install never fails. `--combined-only` forces the build and
+exits 3 on failure.
+
+**Unverified until a card runs it.** The host test uses fake members, so on-card proof is still needed
+that the graph compiler drives the adapter for the **stock** kernels under real graphs, not just for the
+fused GDN / FlashInfer GUIDs: that the merged GUID list is accepted, that a stock kernel the adapter
+forwards to `libtpc_kernels.so` instantiates and runs, and that `GetLibVersion` matches the installed
+SynapseAI. Gate **G1b** of the rental is exactly that check (a lazy server starts and generates with
+`GC_KERNEL_PATH` set to the single combined file).
