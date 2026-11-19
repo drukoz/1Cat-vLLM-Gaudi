@@ -13,12 +13,16 @@ HPU without them:
 - speculative short convolution (M3): ``ple_short_conv_spec_torch`` computes the T verification rows of an MTP step
   over the committed history window selected by ``num_accepted`` and stores ``[history[1:] ; candidates]``, the
   rollback convention of ``_hpu_causal_conv1d_spec_update``.
+- int32-only n-gram hash (RUK-3116): ``ple_ngram_ids_int32`` reproduces the engine's int64 n-gram hash
+  (``vllm/models/qwen4_exp/nvidia/ple_layer.py:426-440``) with 5-bit limb arithmetic on int32 tensors only, so it runs
+  on the Gaudi lazy bridge, which narrows every int64 device tensor to int32.
 
 Every tensor is 2-D and token-major (``[T, ...]``): callers flatten the batch. The math is done in fp32 and the
 outputs are cast back to the input dtype.
 """
 
 import math
+from collections.abc import Sequence
 
 import torch
 import torch.nn.functional as F
@@ -223,3 +227,88 @@ def ple_forward_torch(
     gated, normed = ple_gate_torch(key, value, hidden, norm_key_w, norm_query_w, norm_conv_w, eps)
     conv_out, new_state = ple_short_conv_torch(normed, conv_weight, state, dilation)
     return gated + conv_out, new_state
+
+
+NGRAM_HASH_LIMB_BITS = 5
+NGRAM_HASH_LIMBS = 13  # 13 * 5 = 65 bits cover every product below 2**63
+NGRAM_HASH_MAX_VOCAB = 1 << 25
+NGRAM_HASH_MAX_SIZE = 1 << 25
+
+_NGRAM_HASH_LIMB_MASK = (1 << NGRAM_HASH_LIMB_BITS) - 1
+_NGRAM_HASH_MAX_VALUE = 1 << (NGRAM_HASH_LIMB_BITS * NGRAM_HASH_LIMBS)
+
+
+def ngram_hash_limbs(value: int) -> list[int]:
+    """The 13 five-bit limbs of a non-negative int below 2**65, least significant first."""
+    if value < 0 or value >= _NGRAM_HASH_MAX_VALUE:
+        raise ValueError(f"value {value} does not fit in {NGRAM_HASH_LIMBS} limbs of {NGRAM_HASH_LIMB_BITS} bits")
+    return [(value >> (NGRAM_HASH_LIMB_BITS * j)) & _NGRAM_HASH_LIMB_MASK for j in range(NGRAM_HASH_LIMBS)]
+
+
+def ngram_mod_weights(sizes: Sequence[int]) -> list[list[int]]:
+    """``[[pow(2, 5 * j, p) for j in range(13)] for p in sizes]``."""
+    return [[pow(2, NGRAM_HASH_LIMB_BITS * j, p) for j in range(NGRAM_HASH_LIMBS)] for p in sizes]
+
+
+def check_ngram_hash_bounds(multipliers: Sequence[int], sizes: Sequence[int], offsets: Sequence[int],
+                            vocab_size: int) -> None:
+    """Raise ValueError unless the int32 hash is exact for these tables."""
+    if len(sizes) != len(offsets):
+        raise ValueError(f"sizes has {len(sizes)} entries, offsets has {len(offsets)}")
+    if vocab_size > NGRAM_HASH_MAX_VOCAB:
+        raise ValueError(f"vocab_size {vocab_size} exceeds NGRAM_HASH_MAX_VOCAB {NGRAM_HASH_MAX_VOCAB}")
+    for index, size in enumerate(sizes):
+        if size < 1 or size > NGRAM_HASH_MAX_SIZE:
+            raise ValueError(f"sizes[{index}] = {size} is outside [1, {NGRAM_HASH_MAX_SIZE}]")
+    for index, offset in enumerate(offsets):
+        if offset < 0:
+            raise ValueError(f"offsets[{index}] = {offset} is negative")
+        if offset + sizes[index] > (1 << 31) - 1:
+            raise ValueError(f"offsets[{index}] = {offset} plus sizes[{index}] = {sizes[index]} exceeds 2**31 - 1")
+    for index, multiplier in enumerate(multipliers):
+        if multiplier < 1:
+            raise ValueError(f"multipliers[{index}] = {multiplier} is below 1")
+        if multiplier >= _NGRAM_HASH_MAX_VALUE:
+            raise ValueError(f"multipliers[{index}] = {multiplier} does not fit in {NGRAM_HASH_LIMBS} limbs")
+        if multiplier * (vocab_size - 1) >= 1 << 63:
+            raise ValueError(f"multipliers[{index}] = {multiplier} times vocab_size - 1 = {vocab_size - 1} "
+                             f"reaches 2**63")
+
+
+def ple_ngram_ids_int32(tokens: Sequence[torch.Tensor], multiplier_limbs: torch.Tensor, mod_weights: torch.Tensor,
+                        sizes: torch.Tensor, offsets: torch.Tensor, heads_per_ngram: int) -> torch.Tensor:
+    """N-gram ids ``[N, (len(tokens) - 1) * heads_per_ngram]`` int32, equal to the engine's int64 hash.
+
+    ``tokens[i]`` is the int32 ``[N]`` tensor of the token ``i`` positions back (``len(tokens) == ngram_size``);
+    ``multiplier_limbs`` is int32 ``[ngram_size, 13]`` with row ``i`` = ``ngram_hash_limbs(multiplier[i])``,
+    ``mod_weights`` int32 ``[H, 13]`` (``ngram_mod_weights(sizes)``), ``sizes`` and ``offsets`` int32 ``[H]`` with
+    ``H = (ngram_size - 1) * heads_per_ngram``, the heads ordered as in the engine (bigram heads first). The product
+    limbs of ``tokens[i]`` with row ``i`` are computed once and XORed cumulatively; every intermediate is int32, so
+    the whole op runs on the Gaudi lazy bridge. Callers check the tables with :func:`check_ngram_hash_bounds`.
+    """
+    mult = multiplier_limbs.to(torch.int32)
+    weights = mod_weights.to(torch.int32)
+    head_sizes = sizes.to(torch.int32)
+    head_offsets = offsets.to(torch.int32)
+
+    blocks: list[torch.Tensor] = []
+    mixed: torch.Tensor | None = None
+    for index, token in enumerate(tokens):
+        tok = token.to(torch.int32)
+        carry = torch.zeros_like(tok)
+        limb_rows: list[torch.Tensor] = []
+        for limb in range(NGRAM_HASH_LIMBS):
+            acc = tok * mult[index, limb] + carry
+            limb_rows.append(torch.bitwise_and(acc, _NGRAM_HASH_LIMB_MASK))
+            carry = torch.bitwise_right_shift(acc, NGRAM_HASH_LIMB_BITS)
+        product = torch.stack(limb_rows, dim=-1)
+        mixed = product if mixed is None else torch.bitwise_xor(mixed, product)
+        if index == 0:
+            continue
+        start = (index - 1) * heads_per_ngram
+        end = start + heads_per_ngram
+        size = head_sizes[start:end]
+        terms = torch.remainder(mixed[:, None, :] * weights[None, start:end, :], size[None, :, None])
+        ids = torch.remainder(terms.sum(-1, dtype=torch.int32), size[None, :])
+        blocks.append(ids + head_offsets[start:end][None, :])
+    return torch.cat(blocks, dim=-1)
