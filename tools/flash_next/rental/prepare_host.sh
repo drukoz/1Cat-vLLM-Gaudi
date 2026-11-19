@@ -384,6 +384,7 @@ dry_run() {
     echo "host step 3 (driver): skipped when hl-smi exists and habanalabs-dkms == $PIN (and not --reinstall-driver)"
     printf '%s\n' \
         "dpkg-query -W -f='\${Version}' habanalabs-dkms" \
+        "curl -fsSL $VAULT/api/gpg/key/public | gpg --dearmor -o $TRUSTED_KEY  # before the installer: its own apt update fails on the unsigned repo otherwise" \
         "curl -fsSL -o $LOG_DIR/habanalabs-installer.sh $INSTALLER_URL" \
         "chmod +x $LOG_DIR/habanalabs-installer.sh" \
         "cd $LOG_DIR && ./habanalabs-installer.sh install --type base -y  # 5-15 min"
@@ -474,8 +475,19 @@ step1_checks() {
     step_ok
 }
 
+# The Habana installer writes its apt repo and runs `apt update` before importing the signing key, so the
+# update fails on its own unsigned repo (NO_PUBKEY 1E676CE836A2DE65; seen on 2026-11-19) and the key import
+# never runs. Importing the key first, into the installer's own location, makes both steps 2 and 3 succeed.
+TRUSTED_KEY="/etc/apt/trusted.gpg.d/habanalabs.gpg"
+ensure_habana_key() {
+    [ -s "$TRUSTED_KEY" ] && return 0
+    run_logged "curl -fsSL $VAULT/api/gpg/key/public | gpg --dearmor -o $TRUSTED_KEY" \
+        || step_failed "cannot fetch and dearmor the Habana GPG key from $VAULT/api/gpg/key/public into $TRUSTED_KEY"
+}
+
 step2_apt() {
     step_start 2 "apt prerequisites"
+    command -v gpg >/dev/null 2>&1 && ensure_habana_key
     if ! run_logged "apt-get update"; then
         step_failed "apt-get update failed; check the network and /etc/apt/sources.list.d"
     fi
@@ -516,6 +528,7 @@ step3_driver() {
         step_failed "cannot download $INSTALLER_URL (no network, or version $VERSION is wrong)"
     fi
     run_logged "chmod +x $LOG_DIR/habanalabs-installer.sh" || true
+    ensure_habana_key
     echo "installing the driver with habanalabs-installer.sh (this takes 5-15 min)..." >&2
     if ! run_logged "cd $LOG_DIR && ./habanalabs-installer.sh install --type base -y"; then
         step_failed "habanalabs-installer.sh install --type base -y failed; see $STEP_LOG"

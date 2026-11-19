@@ -48,6 +48,14 @@ stops at the first gate that trips, and you send the tarball back.
    Habana runtime and the image — see [The host (bare Ubuntu 22.04)](#the-host-bare-ubuntu-2204).
    Plan 15–30 min for it, once per node.
 
+**Known failure, fixed in the script on 2026-11-19 (apt repository "is not signed", `NO_PUBKEY 1E676CE836A2DE65` in `step-3.log`).** Intel's installer writes its apt repository and runs `apt update` before it imports the signing key, so the update fails on the installer's own repository and the key is never imported. `prepare_host.sh` now imports the key into `/etc/apt/trusted.gpg.d/habanalabs.gpg` before step 2's `apt-get update` and before the installer. On a node that already hit the failure with an older bundle, import the key by hand and rerun:
+
+```bash
+curl -fsSL https://vault.habana.ai/artifactory/api/gpg/key/public | gpg --dearmor | sudo tee /etc/apt/trusted.gpg.d/habanalabs.gpg >/dev/null
+sudo apt-get update
+cd ~/rental && sudo bash prepare_host.sh
+```
+
 ## The host (bare Ubuntu 22.04)
 
 The rental ships bare: Ubuntu 22.04 and nothing else — no Gaudi driver, no Docker, no container
