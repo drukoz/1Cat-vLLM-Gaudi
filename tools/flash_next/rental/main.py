@@ -308,6 +308,8 @@ class Runner:
     def gate_tiny(self, phase_dir: Path):
         if self.stub:
             return GateStatus.SKIPPED, {"reason": "stub mode"}
+        if serve.port_in_use(TINY_PORT):
+            return GateStatus.FAILED, {"reason": "tiny port %d already in use" % TINY_PORT}
         ckpt = phase_dir / "ckpt"
         cmd = [
             sys.executable,
@@ -372,28 +374,35 @@ class Runner:
             envs.append(env)
         procs = []
         try:
-            for k, srv in enumerate(servers):
-                port_file = vdir / ("server%d.port" % k)
-                if self.stub:
-                    port_file.unlink(missing_ok=True)
-                cmd = self._stub_command(port_file) if self.stub else planned[k]
-                env = self._child_env() if self.stub else envs[k]
-                proc = serve.start_server(cmd, env, vdir / ("server%d.log" % k), vdir)
-                procs.append(proc)
-                self.active.append(("server", proc))
-            try:
+            if not self.stub:
                 for k, srv in enumerate(servers):
-                    port = int(srv["port"])
+                    if serve.port_in_use(int(srv["port"])):
+                        failures.append((GateStatus.FAILED,
+                                         "server %d port %d already in use" % (k, int(srv["port"]))))
+            if not failures:
+                for k, srv in enumerate(servers):
+                    port_file = vdir / ("server%d.port" % k)
                     if self.stub:
-                        port = serve.wait_port_file(vdir / ("server%d.port" % k), STUB_PORT_TIMEOUT_S, procs[k])
-                        if port is None:
-                            failures.append((GateStatus.FAILED, "server %d (stub) did not report its port" % k))
+                        port_file.unlink(missing_ok=True)
+                    cmd = self._stub_command(port_file) if self.stub else planned[k]
+                    env = self._child_env() if self.stub else envs[k]
+                    proc = serve.start_server(cmd, env, vdir / ("server%d.log" % k), vdir)
+                    procs.append(proc)
+                    self.active.append(("server", proc))
+            try:
+                if not failures:
+                    for k, srv in enumerate(servers):
+                        port = int(srv["port"])
+                        if self.stub:
+                            port = serve.wait_port_file(vdir / ("server%d.port" % k), STUB_PORT_TIMEOUT_S, procs[k])
+                            if port is None:
+                                failures.append((GateStatus.FAILED, "server %d (stub) did not report its port" % k))
+                                break
+                            urls[k] = "http://127.0.0.1:%d" % port
+                        if not serve.wait_healthy(port, SERVER_HEALTH_TIMEOUT_S, procs[k]):
+                            failures.append((GateStatus.TIMED_OUT,
+                                             "server %d not healthy within %d s" % (k, int(SERVER_HEALTH_TIMEOUT_S))))
                             break
-                        urls[k] = "http://127.0.0.1:%d" % port
-                    if not serve.wait_healthy(port, SERVER_HEALTH_TIMEOUT_S, procs[k]):
-                        failures.append((GateStatus.TIMED_OUT,
-                                         "server %d not healthy within %d s" % (k, int(SERVER_HEALTH_TIMEOUT_S))))
-                        break
                 if not failures:
                     startup = self._startup_records(servers, vdir, time.time() - t0)
                     write_json(vdir / STARTUP_FILE, startup)

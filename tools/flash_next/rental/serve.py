@@ -5,7 +5,8 @@
 the exact `vllm serve` command and environment; `start_server` launches it with
 its log in a file in its own process group; `wait_healthy` polls `/health` and
 `/v1/models`; `wait_port_file` reads the port a server wrote to a file once
-listening; `parse_startup` reads the startup lines into the `startup.json`
+listening; `port_in_use` reports whether something already accepts TCP
+connections on a port; `parse_startup` reads the startup lines into the `startup.json`
 record of `schema.STARTUP_KEYS`; `stop_server` ends the whole process group.
 
 Runs on Python 3.10 with the standard library only (the node's container).
@@ -21,6 +22,7 @@ import json
 import os
 import re
 import signal
+import socket
 import subprocess
 import sys
 import time
@@ -184,6 +186,15 @@ def wait_port_file(path: Path, timeout_s: float, proc: subprocess.Popen) -> int 
         if proc.poll() is not None or time.monotonic() >= deadline:
             return None
         time.sleep(_LIVENESS_STEP_S)
+
+
+def port_in_use(port: int) -> bool:
+    """True when something accepts TCP connections on 127.0.0.1:`port`."""
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=1.0):
+            return True
+    except OSError:
+        return False
 
 
 def parse_startup(log_text: str, server: int, startup_seconds: float) -> dict:
