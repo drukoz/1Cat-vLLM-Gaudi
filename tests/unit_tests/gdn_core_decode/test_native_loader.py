@@ -21,6 +21,7 @@ def clean_loader_state(monkeypatch):
     monkeypatch.delenv("GDN_FUSED_GAUDI_KERNEL_LIBRARY", raising=False)
     monkeypatch.delenv("GDN_FUSED_GAUDI_NATIVE_LIBRARY", raising=False)
     monkeypatch.delenv("PT_HPU_RECIPE_CACHE_CONFIG", raising=False)
+    monkeypatch.delenv("FLASHINFER_GAUDI_COMBINED_KERNEL_DB", raising=False)
 
 
 def _make_libraries(tmp_path, monkeypatch):
@@ -31,6 +32,16 @@ def _make_libraries(tmp_path, monkeypatch):
     monkeypatch.setenv("GDN_FUSED_GAUDI_KERNEL_LIBRARY", str(kernel_db))
     monkeypatch.setenv("GDN_FUSED_GAUDI_NATIVE_LIBRARY", str(extension))
     return kernel_db, extension
+
+
+def _make_combined(monkeypatch, tmp_path):
+    """Point the loader at a fake package whose lib/ holds the combined database and the fused members."""
+    package_dir = tmp_path / "flashinfer_gaudi"
+    lib = package_dir / "lib"
+    lib.mkdir(parents=True)
+    monkeypatch.setattr(_native, "__file__", str(package_dir / "_native.py"))
+    (lib / _native.COMBINED_KERNEL_DB).touch()
+    return _make_libraries(lib, monkeypatch)
 
 
 def _record_imports(monkeypatch, events):
@@ -158,6 +169,63 @@ def test_recipe_cache_empty_value_does_not_block(tmp_path, monkeypatch):
 
     assert _native.load_gdn_fused_extension() is True
     assert os.environ["GC_KERNEL_PATH"].startswith(str(kernel_db))
+
+
+def test_combined_database_is_the_only_kernel_path(tmp_path, monkeypatch):
+    kernel_db, extension = _make_combined(monkeypatch, tmp_path)
+    combined = tmp_path / "flashinfer_gaudi" / "lib" / _native.COMBINED_KERNEL_DB
+    _record_imports(monkeypatch, [])
+    monkeypatch.setenv("PT_HPU_RECIPE_CACHE_CONFIG", "/tmp/rc,false,1024")
+    calls: list[str] = []
+    monkeypatch.setattr(torch.ops, "load_library", lambda path: calls.append(path))
+
+    assert _native.load_gdn_fused_extension() is True
+    assert os.environ["GC_KERNEL_PATH"] == str(combined)
+    assert os.pathsep not in os.environ["GC_KERNEL_PATH"]
+    assert calls == [str(extension)]
+    assert _native.gdn_fused_extension_errors() == ()
+    assert kernel_db.is_file()
+
+
+def test_combined_database_disabled_by_the_switch(tmp_path, monkeypatch):
+    _make_combined(monkeypatch, tmp_path)
+    _record_imports(monkeypatch, [])
+    monkeypatch.setenv("FLASHINFER_GAUDI_COMBINED_KERNEL_DB", "0")
+    monkeypatch.setenv("PT_HPU_RECIPE_CACHE_CONFIG", "/tmp/rc,false,1024")
+    calls: list[str] = []
+    monkeypatch.setattr(torch.ops, "load_library", lambda path: calls.append(path))
+
+    assert _native.load_gdn_fused_extension() is False
+    assert os.environ["GC_KERNEL_PATH"] == ""
+    assert calls == []
+    (error, ) = _native.gdn_fused_extension_errors()
+    assert "PT_HPU_RECIPE_CACHE_CONFIG" in error
+    assert "libgdn_fused_gaudi2.so" in error
+
+
+def test_combined_database_yields_to_a_foreign_gc_kernel_path(tmp_path, monkeypatch):
+    kernel_db, _ = _make_combined(monkeypatch, tmp_path)
+    _record_imports(monkeypatch, [])
+    monkeypatch.setattr(torch.ops, "load_library", lambda path: None)
+    monkeypatch.setenv("GC_KERNEL_PATH", "/opt/other.so")
+
+    assert _native.load_gdn_fused_extension() is True
+    (error, ) = _native._LOAD_ERRORS
+    assert "/opt/other.so" in error
+    assert "FLASHINFER_GAUDI_COMBINED_KERNEL_DB=0" in error
+    assert os.environ["GC_KERNEL_PATH"].startswith(str(kernel_db))
+
+
+def test_combined_database_replaces_the_stock_default(tmp_path, monkeypatch):
+    _make_combined(monkeypatch, tmp_path)
+    combined = tmp_path / "flashinfer_gaudi" / "lib" / _native.COMBINED_KERNEL_DB
+    _record_imports(monkeypatch, [])
+    monkeypatch.setattr(torch.ops, "load_library", lambda path: None)
+    monkeypatch.setenv("GC_KERNEL_PATH", "/usr/lib/habanalabs/libtpc_kernels.so")
+
+    assert _native.load_gdn_fused_extension() is True
+    assert os.environ["GC_KERNEL_PATH"] == str(combined)
+    assert _native._LOAD_ERRORS == []
 
 
 def test_blocked_reason_names_the_remedy(monkeypatch):
