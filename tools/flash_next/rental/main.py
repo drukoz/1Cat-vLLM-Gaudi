@@ -39,6 +39,12 @@ LOAD_TIMEOUT_S = 5400.0
 LOAD_REQUEST_TIMEOUT_S = 1800.0
 LOAD_STAGGER_S = 60.0
 WORKLOAD_TURNS = 4
+WARM_PASS_MAX_TOKENS = 64
+WARM_PASS_FILE_OFFSET = 1
+WARM_PASS_REQUEST_TIMEOUT_S = 3600.0
+WARM_WORKLOAD_FILE = "warm-workload.json"
+WARM_REQUESTS_FILE = "warm-requests.jsonl"
+WARM_PASS_FILE = "warm-pass.json"
 MONITOR_TERM_WAIT_S = 15.0
 CARD_FREE_WAIT_S = 20.0
 STUB_STAGGER_S = 0.0
@@ -190,6 +196,7 @@ class Runner:
         self.gdn_mode = None
         self.gdn_reason = None
         self.skip_warmup = not args.full_warmup
+        self.warm_pass = not args.no_warm_pass
         self.server_timeout_s = float(args.server_timeout)
         self.request_timeout_s = (COHERENCE_REQUEST_TIMEOUT_SKIP_WARMUP_S if self.skip_warmup else
                                   gates.HTTP_TIMEOUT_S)
@@ -428,10 +435,14 @@ class Runner:
                             failures.append((GateStatus.FAILED, "server %d capacity: %s" % (k, reason)))
                 if not failures:
                     w = self.ensure_workload(urls[0])
-                    if vid == "A":
-                        coh_status, coh_reason = self.run_coherence(urls[0], w)
-                        if coh_status == GateStatus.FAILED:
-                            failures.append((GateStatus.FAILED, "coherence: %s" % coh_reason))
+                if not failures and self.warm_pass:
+                    non_ok = self.run_warm_pass(urls, vdir)
+                    if non_ok:
+                        failures.append((GateStatus.FAILED, "warm pass: %d non-OK rows" % non_ok))
+                if not failures and vid == "A":
+                    coh_status, coh_reason = self.run_coherence(urls[0], w)
+                    if coh_status == GateStatus.FAILED:
+                        failures.append((GateStatus.FAILED, "coherence: %s" % coh_reason))
                 if not failures:
                     monitor = self.start_monitor(urls, vdir)
                     try:
@@ -522,6 +533,61 @@ class Runner:
             json.dump(w, fh, ensure_ascii=False, sort_keys=True)
         self.set_workload_info(path, w)
         return w
+
+    def ensure_warm_workload(self, first_url: str) -> dict:
+        """The warm pass's one-turn, 64-token copy of the measured workload (file offset 1).
+
+        Same agents, same shared system block, each agent's file window shifted by one, so the
+        prompts differ from the measured ones right after the shared prefix. Built once per run.
+        """
+        path = self.run_dir / WARM_WORKLOAD_FILE
+        if path.is_file():
+            w = read_json(path)
+            if isinstance(w, dict):
+                return w
+        if self.stub:
+            counter = workload.estimate_counter
+        else:
+            counter = workload.tokenize_counter(first_url, self.served_name)
+        w = workload.build_workload(repo_root(),
+                                    int(self.args.agents),
+                                    int(self.args.shared_tokens),
+                                    int(self.args.initial_tokens),
+                                    1,
+                                    WARM_PASS_MAX_TOKENS,
+                                    counter,
+                                    file_offset=WARM_PASS_FILE_OFFSET)
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(w, fh, ensure_ascii=False, sort_keys=True)
+        return w
+
+    def run_warm_pass(self, urls: list, vdir: Path) -> int:
+        """One turn of 64 tokens per agent over the warm workload before the gates measure anything.
+
+        The first server start after a (recipe-cached) graph compile takes the prompt shapes of the
+        run; this pass pays that compile cost on purpose, with prompts that share the measured
+        workload's system block, so the coherence gate and the measured load meet warm graphs and a
+        cached shared block. Returns the number of non-OK rows.
+        """
+        warm = self.ensure_warm_workload(urls[0])
+        stagger = STUB_STAGGER_S if self.stub else LOAD_STAGGER_S
+        t0 = time.time()
+        non_ok = asyncio.run(
+            agent_load.run_load(warm,
+                                urls,
+                                self.served_name,
+                                vdir / WARM_REQUESTS_FILE,
+                                stagger_s=stagger,
+                                timeout_s=LOAD_TIMEOUT_S,
+                                request_timeout_s=WARM_PASS_REQUEST_TIMEOUT_S))
+        write_json(vdir / WARM_PASS_FILE, {
+            "requests": len(warm.get("agents") or []),
+            "non_ok": int(non_ok),
+            "seconds": round(time.time() - t0, 3),
+            "max_tokens": WARM_PASS_MAX_TOKENS,
+            "file_offset": WARM_PASS_FILE_OFFSET,
+        })
+        return int(non_ok)
 
     def set_workload_info(self, path: Path, w: dict) -> None:
         self.workload_info = {
@@ -641,6 +707,7 @@ class Runner:
         manifest["gdn_core_decode_mode"] = self.gdn_mode
         manifest["gdn_core_decode_reason"] = self.gdn_reason
         manifest["skip_warmup"] = self.skip_warmup
+        manifest["warm_pass"] = self.warm_pass
         manifest["server_timeout_s"] = self.server_timeout_s
         if self.workload_info is not None:
             manifest["workload"] = self.workload_info
@@ -756,6 +823,8 @@ def _parse_args(argv):
     parser.add_argument("--full-warmup", action="store_true", help="run the bucket warmup (default: skipped)")
     parser.add_argument("--server-timeout", type=float, default=SERVER_HEALTH_TIMEOUT_S,
                         help="seconds to wait for a server to become healthy")
+    parser.add_argument("--no-warm-pass", action="store_true",
+                        help="skip the one-turn warm pass that compiles the graphs before the gates")
     parser.add_argument("--agents", type=int, default=32)
     parser.add_argument("--shared-tokens", type=int, default=16384)
     parser.add_argument("--initial-tokens", type=int, default=124000)

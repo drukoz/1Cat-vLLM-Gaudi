@@ -35,6 +35,8 @@ usage() {
     echo "  --no-recipe-cache   do not mount an HPU recipe cache"
     echo "  --dry-run         print the docker command and exit 0"
     echo "  --no-disk-check   skip the free-space checks (download folder and Docker root)"
+    echo "  --no-warm-pass    skip the warm pass that compiles the workload's graphs and caches the"
+    echo "                    shared block before the coherence gate (on by default)"
 }
 
 # The nearest existing folder at or above $1 (a folder that does not exist yet lives on its parent's disk).
@@ -64,6 +66,7 @@ FROM_PHASE=""
 RUN_ID=""
 DRY_RUN=0
 NO_DISK_CHECK=0
+NO_WARM_PASS=0
 FULL_WARMUP=0
 SERVER_TIMEOUT=""
 RECIPE_CACHE=""
@@ -109,6 +112,10 @@ while [ $# -gt 0 ]; do
             ;;
         --no-disk-check)
             NO_DISK_CHECK=1
+            shift
+            ;;
+        --no-warm-pass)
+            NO_WARM_PASS=1
             shift
             ;;
         --full-warmup)
@@ -219,6 +226,8 @@ if [ -n "$VARIANTS" ]; then ENTRY_ARGS+=(--variants "$VARIANTS"); fi
 if [ "$WITH_PROFILE" -eq 1 ]; then ENTRY_ARGS+=(--with-profile); fi
 if [ -n "$FROM_PHASE" ]; then ENTRY_ARGS+=(--from "$FROM_PHASE"); fi
 if [ "$DOWNLOAD" -eq 1 ]; then ENTRY_ARGS+=(--download); fi
+# Appended last so the --dry-run line ends with --no-warm-pass.
+if [ "$NO_WARM_PASS" -eq 1 ]; then ENTRY_ARGS+=(--no-warm-pass); fi
 
 # The recipe-cache mount and its env are optional, so they are collected separately and spliced
 # into the command with the `${arr[@]+"${arr[@]}"}` guard (bash 3.2 keeps `set -u` quiet for the

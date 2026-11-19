@@ -14,7 +14,7 @@ HABANA_TOOLS_VERSION="1.24.1-482"
 usage() {
     echo "usage: $(basename "${BASH_SOURCE[0]}") --model DIR [--results DIR] [--run-id ID]"
     echo "       [--variants LIST] [--with-profile] [--from PHASE] [--download] [--skip-install]"
-    echo "       [--full-warmup] [--server-timeout S]"
+    echo "       [--full-warmup] [--server-timeout S] [--no-warm-pass]"
     echo "       $(basename "${BASH_SOURCE[0]}") --install-only [--results DIR] [--run-id ID]"
 }
 
@@ -29,6 +29,7 @@ SKIP_INSTALL=0
 INSTALL_ONLY=0
 FULL_WARMUP=0
 SERVER_TIMEOUT=""
+NO_WARM_PASS=0
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -75,6 +76,10 @@ while [ $# -gt 0 ]; do
         --server-timeout)
             SERVER_TIMEOUT="$2"
             shift 2
+            ;;
+        --no-warm-pass)
+            NO_WARM_PASS=1
+            shift
             ;;
         -h | --help)
             usage
@@ -236,6 +241,7 @@ if [ -n "$SERVER_TIMEOUT" ]; then MAIN_ARGS+=(--server-timeout "$SERVER_TIMEOUT"
 if [ -n "$VARIANTS" ]; then MAIN_ARGS+=(--variants "$VARIANTS"); fi
 if [ "$WITH_PROFILE" -eq 1 ]; then MAIN_ARGS+=(--with-profile); fi
 if [ -n "$FROM_PHASE" ]; then MAIN_ARGS+=(--from "$FROM_PHASE"); fi
+if [ "$NO_WARM_PASS" -eq 1 ]; then MAIN_ARGS+=(--no-warm-pass); fi
 
 echo "phase: orchestrator (python -m tools.flash_next.rental.main)"
 cd /bundle/plugin

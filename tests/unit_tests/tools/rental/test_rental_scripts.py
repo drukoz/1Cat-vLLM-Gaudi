@@ -76,6 +76,7 @@ def test_run_rental_dry_run(tmp_path):
     assert "/tmp/recipe-cache:/recipe-cache" in flat  # the default sits next to the model
     assert "-e PT_HPU_RECIPE_CACHE_CONFIG=/recipe-cache,false,16384" in flat
     assert "--full-warmup" not in out  # warmup is skipped by default
+    assert "--no-warm-pass" not in out  # the warm pass runs by default
 
 
 def test_run_rental_dry_run_warmup_options(tmp_path):
@@ -104,6 +105,30 @@ def test_run_rental_dry_run_warmup_options(tmp_path):
     assert "PT_HPU_RECIPE_CACHE_CONFIG=/recipe-cache,false,16384" in flat
     assert "--full-warmup" in proc.stdout
     assert "--server-timeout 7200" in flat
+
+
+def test_run_rental_dry_run_no_warm_pass(tmp_path):
+    """--no-warm-pass must reach the container entry as the last argument, so the
+    dry-run line ends with it (RUK-3203)."""
+    proc = subprocess.run(
+        [
+            "bash",
+            str(SCRIPTS_DIR / "run_rental.sh"),
+            "--dry-run",
+            "--model",
+            "/tmp/x",
+            "--no-disk-check",
+            "--no-warm-pass",
+        ],
+        capture_output=True,
+        text=True,
+        cwd=tmp_path,
+        timeout=60,
+    )
+    assert proc.returncode == 0, proc.stderr
+    line = proc.stdout.strip()
+    assert line.endswith("--no-warm-pass")
+    assert line.count("--no-warm-pass") == 1
 
 
 def test_run_rental_dry_run_no_recipe_cache(tmp_path):
