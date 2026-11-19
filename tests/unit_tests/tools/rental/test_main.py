@@ -75,6 +75,8 @@ def test_full_stub_run(tmp_path, capsys):
 
     fused = read_json(run / "fused_gdn" / "status.json")
     assert fused["status"] == int(GateStatus.SKIPPED)
+    card = read_json(run / "card_tests" / "status.json")
+    assert card["status"] == int(GateStatus.SKIPPED)
     coherence = read_json(run / "coherence" / "status.json")
     assert coherence["status"] == int(GateStatus.SKIPPED)
 
@@ -173,7 +175,7 @@ def test_dry_run_prints_commands_and_starts_nothing(tmp_path, capsys):
     rc = rental_main.main(["--model", str(model), "--results", str(results), "--dry-run"])
     out = capsys.readouterr().out
     assert rc == 0
-    for phase in ("preflight", "build", "fused_gdn", "tiny", "A", "B", "C", "report"):
+    for phase in ("preflight", "build", "fused_gdn", "tiny", "card_tests", "A", "B", "C", "report"):
         assert "phase: %s" % phase in out
     assert out.count("vllm serve") == 4
     assert "--speculative-config" in out
@@ -291,3 +293,34 @@ def test_tiny_env_matches_variant_env(tmp_path, monkeypatch):
         assert tiny.get(key) == venv.get(key)
     assert tiny["PT_HPU_LAZY_MODE"] == "1"
     assert "VLLM_COMPACT_GDN" not in tiny
+
+
+def make_node_runner(tmp_path, monkeypatch):
+    monkeypatch.delenv("PT_HPU_LAZY_MODE", raising=False)
+    args = rental_main._parse_args([
+        "--mode", "node", "--model", str(tmp_path / "m"), "--results", str(tmp_path / "r"), "--run-id", "ct"
+    ])
+    return rental_main.Runner(args, rental_main.load_variants())
+
+
+def test_card_tests_failure_is_recorded_and_run_continues(tmp_path, monkeypatch):
+    def fake_card_tests(plugin_root, out_dir, python):
+        return GateStatus.FAILED, {"files": [], "reason": "test_hpu_fused_moe.py failed (exit 1)"}
+
+    monkeypatch.setattr(rental_main.gates, "card_tests", fake_card_tests)
+    runner = make_node_runner(tmp_path, monkeypatch)
+    assert runner.run_gate("card_tests") is True
+    status = read_json(runner.run_dir / "card_tests" / "status.json")
+    assert status["status"] == int(GateStatus.FAILED)
+    assert status["reason"] == "test_hpu_fused_moe.py failed (exit 1)"
+
+
+def test_card_tests_stub_mode_skips(tmp_path, monkeypatch):
+    args = rental_main._parse_args([
+        "--mode", "stub", "--model", str(tmp_path / "m"), "--results", str(tmp_path / "r"), "--run-id", "ct2"
+    ] + STUB_ARGS)
+    runner = rental_main.Runner(args, rental_main.load_variants())
+    assert runner.run_gate("card_tests") is True
+    status = read_json(runner.run_dir / "card_tests" / "status.json")
+    assert status["status"] == int(GateStatus.SKIPPED)
+    assert status["reason"] == "stub mode"

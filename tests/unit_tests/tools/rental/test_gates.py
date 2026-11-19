@@ -523,3 +523,99 @@ def test_coherence_server_down():
     status, details = gates.coherence("http://127.0.0.1:1", "Qwen3.8-Flash-Next", NEEDLE_MESSAGES)
     assert status is GateStatus.FAILED
     assert "error" in details
+
+
+# --------------------------------------------------------------------------- card_tests
+
+CARD_TESTS_FAKE_PY = """
+{
+  echo "ARGS: $*"
+  echo "PWD: $(pwd)"
+  echo "PYTHONPATH: ${PYTHONPATH-<unset>}"
+  echo "LAZY: ${PT_HPU_LAZY_MODE-<unset>}"
+} >> "$CARD_TESTS_LOG"
+if [ -n "$CARD_TESTS_SLEEP" ]; then sleep "$CARD_TESTS_SLEEP"; fi
+printf '%s\\n' "$CARD_TESTS_PYTEST_OUT"
+exit ${CARD_TESTS_PYTEST_EXIT:-0}
+"""
+
+
+def card_tests_setup(tmp_path, monkeypatch, *,
+                     pytest_out: str = "3 passed in 1.0s", pytest_exit: int = 0, sleep: int = None):
+    log = tmp_path / "card_tests.log"
+    monkeypatch.setenv("CARD_TESTS_LOG", str(log))
+    monkeypatch.setenv("CARD_TESTS_PYTEST_OUT", pytest_out)
+    monkeypatch.setenv("CARD_TESTS_PYTEST_EXIT", str(pytest_exit))
+    if sleep is not None:
+        monkeypatch.setenv("CARD_TESTS_SLEEP", str(sleep))
+    fake = write_fake_python(tmp_path / "fake_python.sh", CARD_TESTS_FAKE_PY)
+    plugin = tmp_path / "plugin"
+    plugin.mkdir()
+    return fake, plugin, log
+
+
+def card_tests_records(log: Path) -> list:
+    text = log.read_text(encoding="utf-8") if log.exists() else ""
+    out = []
+    for block in text.split("ARGS: ")[1:]:
+        lines = block.splitlines()
+        rec = {"args": lines[0]}
+        for ln in lines[1:]:
+            key, _, value = ln.partition(": ")
+            rec[key] = value
+        out.append(rec)
+    return out
+
+
+def test_card_tests_pass(tmp_path, monkeypatch):
+    monkeypatch.delenv("PT_HPU_LAZY_MODE", raising=False)
+    fake, plugin, log = card_tests_setup(tmp_path, monkeypatch)
+    out = tmp_path / "card"
+    status, details = gates.card_tests(plugin, out, python=fake)
+    assert status is GateStatus.PASSED
+    assert [entry["file"] for entry in details["files"]] == list(gates.CARD_TEST_FILES)
+    for entry in details["files"]:
+        assert entry["exit"] == 0 and entry["timed_out"] is False
+        assert (entry["passed"], entry["failed"], entry["skipped"], entry["error"]) == (3, 0, 0, 0)
+    for stem in ("test_defragmentation", "test_hpu_fused_moe"):
+        assert "3 passed" in (out / (stem + ".log")).read_text(encoding="utf-8")
+    recs = card_tests_records(log)
+    assert len(recs) == 2
+    for rec, file in zip(recs, gates.CARD_TEST_FILES):
+        assert rec["args"] == "-m pytest -q -rs -p no:cacheprovider %s" % file
+        assert os.path.realpath(rec["PWD"]) == os.path.realpath(plugin)
+        assert rec["PYTHONPATH"] == str(plugin)
+        assert rec["LAZY"] == "1"
+
+
+def test_card_tests_failure_is_recorded(tmp_path, monkeypatch):
+    fake, plugin, log = card_tests_setup(tmp_path, monkeypatch, pytest_out="1 failed, 2 passed in 0.5s",
+                                         pytest_exit=1)
+    status, details = gates.card_tests(plugin, tmp_path / "card", python=fake)
+    assert status is GateStatus.FAILED
+    assert len(details["files"]) == 2
+    for entry in details["files"]:
+        assert entry["exit"] == 1 and entry["timed_out"] is False
+        assert (entry["passed"], entry["failed"], entry["skipped"], entry["error"]) == (2, 1, 0, 0)
+    assert len(card_tests_records(log)) == 2  # the second file ran after the first failed
+
+
+def test_card_tests_timeout_is_recorded(tmp_path, monkeypatch):
+    monkeypatch.setattr(gates, "CARD_TESTS_TIMEOUT_S", 1)
+    fake, plugin, log = card_tests_setup(tmp_path, monkeypatch, sleep=30)
+    status, details = gates.card_tests(plugin, tmp_path / "card", python=fake)
+    assert status is GateStatus.FAILED
+    assert len(details["files"]) == 2
+    for entry in details["files"]:
+        assert entry["exit"] is None and entry["timed_out"] is True
+        assert (entry["passed"], entry["failed"], entry["skipped"], entry["error"]) == (0, 0, 0, 0)
+    for stem in ("test_defragmentation", "test_hpu_fused_moe"):
+        assert (tmp_path / "card" / (stem + ".log")).is_file()
+    assert len(card_tests_records(log)) == 2  # the timeout did not stop the second file
+
+
+def test_card_tests_missing_interpreter_never_raises(tmp_path, monkeypatch):
+    monkeypatch.delenv("PT_HPU_LAZY_MODE", raising=False)
+    status, details = gates.card_tests(tmp_path, tmp_path / "card", python=str(tmp_path / "no-such-interpreter"))
+    assert status is GateStatus.FAILED
+    assert "FileNotFoundError" in details["error"]
