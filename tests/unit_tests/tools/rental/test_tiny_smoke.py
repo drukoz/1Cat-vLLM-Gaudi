@@ -42,8 +42,10 @@ from pathlib import Path
 port = int(sys.argv[sys.argv.index("--port") + 1])
 reference = json.loads(Path(sys.argv[sys.argv.index("--reference") + 1]).read_text(encoding="utf-8"))
 answers = {tuple(p["prompt_ids"]): p["generated_ids"] for p in reference["prompts"]}
-keys = ("PT_HPU_LAZY_MODE", "VLLM_HPU_FLASH_NEXT_QSA_MODE", "VLLM_HPU_RECURRENT_STATE_POOL",
-        "VLLM_HPU_GDN_CORE_DECODE", "VLLM_HPU_GDN_CORE_VERIFY")
+keys = ["PT_HPU_LAZY_MODE", "VLLM_HPU_FLASH_NEXT_QSA_MODE", "VLLM_HPU_RECURRENT_STATE_POOL",
+        "VLLM_HPU_GDN_CORE_DECODE", "VLLM_HPU_GDN_CORE_VERIFY", "VLLM_SKIP_WARMUP"]
+if os.environ.get("FAKE_SERVER_ENV_KEYS"):
+    keys += os.environ["FAKE_SERVER_ENV_KEYS"].split(",")
 Path("server_env.json").write_text(json.dumps({k: os.environ.get(k) for k in keys}), encoding="utf-8")
 if os.environ.get("FAKE_SERVER_LINE"):
     print(os.environ["FAKE_SERVER_LINE"], flush=True)
@@ -102,7 +104,8 @@ def fakes(tmp_path, monkeypatch):
                         lambda ckpt, port: [sys.executable, str(server), "--port", str(port), "--reference",
                                             str(Path(ckpt) / "reference.json")])
     monkeypatch.setattr(serve, "_HEALTH_POLL_S", 0.1)
-    for name in ("FAKE_BUILD_EXIT", "FAKE_SERVER_EXIT", "FAKE_SERVER_LINE", "FAKE_SERVER_WRONG"):
+    for name in ("FAKE_BUILD_EXIT", "FAKE_SERVER_EXIT", "FAKE_SERVER_LINE", "FAKE_SERVER_WRONG",
+                 "FAKE_SERVER_ENV_KEYS"):
         monkeypatch.delenv(name, raising=False)
     port = free_port()
     out = tmp_path / "out"
@@ -147,6 +150,50 @@ def test_each_mode_gets_a_variant_environment_with_its_gdn_flags(fakes):
         assert env["VLLM_HPU_RECURRENT_STATE_POOL"] == "1"
     assert (pytorch["VLLM_HPU_GDN_CORE_DECODE"], pytorch["VLLM_HPU_GDN_CORE_VERIFY"]) == ("0", "0")
     assert (fused["VLLM_HPU_GDN_CORE_DECODE"], fused["VLLM_HPU_GDN_CORE_VERIFY"]) == ("1", "0")
+
+
+def test_the_servers_skip_the_warmup_by_default(fakes, capsys):
+    out, port = fakes
+    code, _ = run(out, port)
+    assert code == 0
+    for mode in ("pytorch", "fused"):
+        env = json.loads((out / mode / "server_env.json").read_text(encoding="utf-8"))
+        assert env["VLLM_SKIP_WARMUP"] == "true"
+    printed = capsys.readouterr().out
+    assert "warmup skipped" in printed
+
+
+def test_full_warmup_leaves_skip_warmup_unset(fakes, capsys):
+    out, port = fakes
+    code, _ = run(out, port, "--gdn", "pytorch", "--full-warmup")
+    assert code == 0
+    env = json.loads((out / "pytorch" / "server_env.json").read_text(encoding="utf-8"))
+    assert env["VLLM_SKIP_WARMUP"] is None
+    assert "full warmup" in capsys.readouterr().out
+
+
+def test_env_pairs_reach_the_server_environment(fakes, monkeypatch):
+    out, port = fakes
+    monkeypatch.setenv("FAKE_SERVER_ENV_KEYS", "A,B")
+    code, _ = run(out, port, "--gdn", "pytorch", "--env", "A=1", "--env", "B=2")
+    assert code == 0
+    env = json.loads((out / "pytorch" / "server_env.json").read_text(encoding="utf-8"))
+    assert (env["A"], env["B"]) == ("1", "2")
+
+
+def test_env_pairs_are_applied_last(fakes):
+    out, port = fakes
+    code, _ = run(out, port, "--gdn", "fused", "--env", "VLLM_HPU_GDN_CORE_DECODE=0")
+    assert code == 0
+    env = json.loads((out / "fused" / "server_env.json").read_text(encoding="utf-8"))
+    assert env["VLLM_HPU_GDN_CORE_DECODE"] == "0"
+
+
+def test_env_without_equals_is_a_usage_error(fakes):
+    out, port = fakes
+    with pytest.raises(SystemExit) as info:
+        tiny_smoke.main(["--out", str(out), "--port", str(port), "--env", "NOEQUALS"])
+    assert info.value.code == 2
 
 
 def test_one_mode_on_request(fakes):

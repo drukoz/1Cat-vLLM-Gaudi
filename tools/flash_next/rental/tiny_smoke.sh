@@ -13,6 +13,12 @@
 # and once with the fused GDN kernel. Every server is stopped again, so the cards are free when the
 # script returns.
 #
+# By default the servers skip the bucket warmup (VLLM_SKIP_WARMUP=true): the graphs compile on first
+# use and a run takes about 5 minutes per mode. --full-warmup keeps the real warmup, about 15 minutes
+# per mode on the tiny model. The servers share a compiled-recipe cache under /results/recipe-cache,
+# so the second run is faster; --no-recipe-cache drops it. --health-timeout S and --env KEY=VALUE
+# (repeatable) are passed through to the check.
+#
 # The container stays. A second call reuses it, skips the install and the checkpoint build, and takes
 # a few minutes. After a change under plugin/ pass --reinstall: the servers run the installed plugin,
 # not the source tree.
@@ -36,6 +42,10 @@ usage() {
     echo "  --image IMG     container image (default: $DEFAULT_IMAGE)"
     echo "  --reinstall     install the stack again in the existing container (after a change under plugin/)"
     echo "  --fresh         remove the container first: new install, new tiny checkpoint"
+    echo "  --full-warmup   run the real bucket warmup (about 15 minutes per mode); the default skips it"
+    echo "  --health-timeout S  seconds to wait for the server to get healthy (default in the check: 1800)"
+    echo "  --env KEY=VALUE extra server environment variable, repeatable; applied after the mode's own flags"
+    echo "  --no-recipe-cache   do not share the compiled-recipe cache under /results/recipe-cache"
     echo "  --dry-run       print the docker commands and exit 0"
 }
 
@@ -46,6 +56,10 @@ GDN="pytorch,fused"
 REINSTALL=0
 FRESH=0
 DRY_RUN=0
+FULL_WARMUP=0
+HEALTH_TIMEOUT=""
+NO_RECIPE_CACHE=0
+EXTRA_ENV=()
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -71,6 +85,22 @@ while [ $# -gt 0 ]; do
             ;;
         --fresh)
             FRESH=1
+            shift
+            ;;
+        --full-warmup)
+            FULL_WARMUP=1
+            shift
+            ;;
+        --health-timeout)
+            HEALTH_TIMEOUT="$2"
+            shift 2
+            ;;
+        --env)
+            EXTRA_ENV+=("$2")
+            shift 2
+            ;;
+        --no-recipe-cache)
+            NO_RECIPE_CACHE=1
             shift
             ;;
         --dry-run)
@@ -122,11 +152,28 @@ build_commands() {
         sleep infinity
     )
     INSTALL_CMD=(docker exec "$NAME" bash "/bundle/$ENTRY" --install-only --results /results --run-id "$RUN_ID")
-    SMOKE_CMD=(
-        docker exec -w /bundle/plugin "$NAME"
+    SMOKE_CMD=(docker exec -w /bundle/plugin)
+    if [ "$NO_RECIPE_CACHE" -eq 0 ]; then
+        # The compiled recipes live under the mounted results directory and are reused on the next start.
+        SMOKE_CMD+=(-e "PT_HPU_RECIPE_CACHE_CONFIG=/results/recipe-cache,false,8192")
+    fi
+    SMOKE_CMD+=(
+        "$NAME"
         python -m tools.flash_next.rental.tiny_smoke
         --out "/results/$RUN_ID" --ckpt "$CKPT" --gdn "$GDN"
     )
+    if [ "$FULL_WARMUP" -eq 1 ]; then
+        SMOKE_CMD+=(--full-warmup)
+    fi
+    if [ -n "$HEALTH_TIMEOUT" ]; then
+        SMOKE_CMD+=(--health-timeout "$HEALTH_TIMEOUT")
+    fi
+    if [ "${#EXTRA_ENV[@]}" -gt 0 ]; then
+        local kv
+        for kv in "${EXTRA_ENV[@]}"; do
+            SMOKE_CMD+=(--env "$kv")
+        done
+    fi
 }
 build_commands
 
