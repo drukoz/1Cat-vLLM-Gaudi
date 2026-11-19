@@ -151,8 +151,13 @@ if command -v gdb >/dev/null 2>&1; then
     printf 'gdb: present\n' >> "$SUMMARY"
     GDB_OK=1
 else
-    if DEBIAN_FRONTEND=noninteractive timeout 300 apt-get update -qq >/dev/null 2>&1; then
-        timeout 300 apt-get install -y -qq gdb >/dev/null 2>&1 || true
+    # The rental container's apt lists are usually warm (the toolchain step refreshed them):
+    # try the install first and pay for a list refresh only when the bare install fails.
+    DEBIAN_FRONTEND=noninteractive timeout 300 apt-get install -y -qq gdb >/dev/null 2>&1 || true
+    if ! command -v gdb >/dev/null 2>&1; then
+        if DEBIAN_FRONTEND=noninteractive timeout 300 apt-get update -qq >/dev/null 2>&1; then
+            timeout 300 apt-get install -y -qq gdb >/dev/null 2>&1 || true
+        fi
     fi
     if command -v gdb >/dev/null 2>&1; then
         printf 'gdb: installed\n' >> "$SUMMARY"

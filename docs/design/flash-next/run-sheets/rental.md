@@ -301,6 +301,11 @@ use**, inside the first requests. Two consequences:
   never under Docker's root (which has its own 30 GB free-space check). `--recipe-cache DIR`
   picks another folder; `--no-recipe-cache` drops the mount and the variable.
 
+The TPC toolchain is cached on the data disk the same way (RUK-3239): the first run on a node
+installs `habanalabs-tools` with `apt-get update` (slow on the rental node) and keeps the
+downloaded debs in an `apt-cache` folder next to the checkpoint; later runs install from there
+with no `apt-get update` at all. Delete that folder to force a fresh download.
+
 Graph-count guidance for the report-back: the first server start on a cold cache compiles every
 shape the run touches, and the console shows the graph builders working through the buckets;
 the same server with a warm cache reports far fewer compiled graphs. With `--full-warmup` the
