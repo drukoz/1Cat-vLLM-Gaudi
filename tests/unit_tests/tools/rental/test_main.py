@@ -7,7 +7,7 @@ import shutil
 import socket
 from pathlib import Path
 
-from tools.flash_next.rental import main as rental_main, serve
+from tools.flash_next.rental import gates, main as rental_main, serve
 from tools.flash_next.rental.main import gdn_summary_lines, server_env
 from tools.flash_next.rental.schema import GateStatus
 
@@ -62,6 +62,8 @@ def test_full_stub_run(tmp_path, capsys):
     assert manifest["skip_warmup"] is True
     assert manifest["warm_pass"] is True
     assert manifest["server_timeout_s"] == rental_main.SERVER_HEALTH_TIMEOUT_S
+    assert manifest["recipe_cache"]["dir"] is None
+    assert manifest["recipe_cache"]["variants"] == {"A": "none", "B": "none"}
     for key in manifest["env"]:
         assert key.startswith(("VLLM_", "HABANA_", "PT_", "HF_"))
 
@@ -383,6 +385,56 @@ def node_runner(tmp_path):
                                     "--results", str(tmp_path / "results"), "--run-id", "r",
                                     "--variants", "A"])
     return rental_main.Runner(args, rental_main.load_variants())
+
+
+def recipe_runner(tmp_path):
+    args = rental_main._parse_args([
+        "--mode", "stub", "--model", str(tmp_path / "model"), "--results", str(tmp_path / "results"),
+        "--run-id", "r", "--variants", "A", "--recipe-cache", "/rc", "--recipe-cache-mb", "123"
+    ] + STUB_ARGS)
+    return rental_main.Runner(args, rental_main.load_variants())
+
+
+def test_variant_server_env_recipe_cache_pytorch_gdn(tmp_path):
+    runner = recipe_runner(tmp_path)
+    runner.gdn_env = dict(gates.GDN_FALLBACK_ENV)
+    runner.gdn_mode = gates.GDN_MODE_PYTORCH
+    env = runner.variant_server_env({})
+    key = (runner.bundle_commit or "unknown")[:12]
+    assert env["PT_HPU_RECIPE_CACHE_CONFIG"] == "/rc/%s,false,123" % key
+    assert runner.recipe_cache_note == runner.recipe_cache_dir
+
+
+def test_variant_server_env_recipe_cache_off_for_fused_gdn(tmp_path):
+    runner = recipe_runner(tmp_path)
+    runner.gdn_env = {"VLLM_HPU_GDN_CORE_DECODE": "1", "VLLM_HPU_GDN_CORE_VERIFY": "0"}
+    runner.gdn_mode = gates.GDN_MODE_FUSED
+    env = runner.variant_server_env({})
+    assert "PT_HPU_RECIPE_CACHE_CONFIG" not in env
+    assert "FLASHINFER_GAUDI_COMBINED_KERNEL_DB" not in env
+    assert runner.recipe_cache_note == serve.RECIPE_CACHE_OFF_REASON
+
+
+def test_variant_server_env_recipe_cache_combined_db(tmp_path):
+    runner = recipe_runner(tmp_path)
+    runner.combined_db_installed = True
+    runner.gdn_env = {"VLLM_HPU_GDN_CORE_DECODE": "1", "VLLM_HPU_GDN_CORE_VERIFY": "1"}
+    runner.gdn_mode = gates.GDN_MODE_FUSED
+    env = runner.variant_server_env({})
+    assert "PT_HPU_RECIPE_CACHE_CONFIG" in env  # the combined database is safe next to a recipe cache
+    assert "FLASHINFER_GAUDI_COMBINED_KERNEL_DB" not in env
+    runner.gdn_mode = gates.GDN_MODE_PYTORCH  # installed, but G1b did not pass fused: the database stays out
+    env = runner.variant_server_env({})
+    assert "PT_HPU_RECIPE_CACHE_CONFIG" not in env
+    assert env["FLASHINFER_GAUDI_COMBINED_KERNEL_DB"] == "0"
+
+
+def test_variant_server_env_no_recipe_cache_flag(tmp_path):
+    runner = node_runner(tmp_path)
+    runner.gdn_env = dict(gates.GDN_FALLBACK_ENV)
+    env = runner.variant_server_env({})
+    assert "PT_HPU_RECIPE_CACHE_CONFIG" not in env
+    assert runner.recipe_cache_note == "none"
 
 
 def test_tiny_gate_refuses_held_port(tmp_path, monkeypatch):

@@ -11,6 +11,7 @@ import os
 import shlex
 import subprocess
 import sys
+import tempfile
 import time
 import traceback
 from pathlib import Path
@@ -94,6 +95,20 @@ def server_env(variant_env: dict, gdn_env: dict) -> dict:
     env = dict(variant_env)
     env.update(gdn_env)
     return env
+
+
+def combined_kernel_db_installed(python: str = sys.executable) -> bool:
+    """True when the installed flashinfer_gaudi `lib` folder holds the combined kernel database (RUK-3242):
+    one file with Intel's kernels and ours, the only kernel library the bridge accepts next to a recipe cache.
+    Never import it here: the lookup is a subprocess, as in the G1b gate."""
+    try:
+        lookup = gates.run_step([python, "-c", gates.GDN_LIB_LOOKUP_CODE], tempfile.gettempdir(), 120)
+        if lookup.returncode != 0:
+            return False
+        lib_dir = Path(gates._last_line(lookup.stdout))
+        return (lib_dir / serve.COMBINED_KERNEL_DB).is_file()
+    except Exception:  # noqa: BLE001 - no lookup, no combined database: the plan of record is the fallback
+        return False
 
 
 def write_json(path: Path, obj) -> None:
@@ -208,6 +223,19 @@ class Runner:
         self.hl_smi_q = ""
         self.bundle_commit = None
         self.workload_info = None
+        self.recipe_cache_mb = int(args.recipe_cache_mb)
+        self.recipe_cache_dir = self._keyed_recipe_cache_dir()
+        self.recipe_cache_notes = {}
+        self.recipe_cache_note = serve.RECIPE_CACHE_NONE
+        self.combined_db_installed = False if self.stub else combined_kernel_db_installed()
+
+    def _keyed_recipe_cache_dir(self):
+        """--recipe-cache with the bundle commit key (first 12 chars, `unknown` while the commit is not
+        known yet) so a new bundle gets a fresh cache folder: the bridge keys cached recipes by the
+        GC_KERNEL_PATH file, not by the kernels that file forwards to (RUK-3242)."""
+        if not self.args.recipe_cache:
+            return None
+        return "%s/%s" % (self.args.recipe_cache.rstrip("/"), (self.bundle_commit or "unknown")[:12])
 
     def variant_by_id(self, vid: str):
         for v in self.variants:
@@ -237,6 +265,7 @@ class Runner:
             self.run_dir.mkdir(parents=True, exist_ok=True)
             self.bundle_commit = self._git_commit()
             self.hl_smi_q = self._hl_smi_q()
+        self.recipe_cache_dir = self._keyed_recipe_cache_dir()
         self.write_manifest()
         for kind, name in self.phases()[self.start_index:]:
             self.current_phase = name
@@ -386,6 +415,7 @@ class Runner:
         failures = []
         eff, note = self.effective_variant(variant)
         eff["env"] = self.variant_server_env(eff["env"])
+        self.recipe_cache_notes[vid] = self.recipe_cache_note
         servers = variant["servers"]
         urls = ["http://127.0.0.1:%d" % int(s["port"]) for s in servers]
         planned = []
@@ -709,6 +739,12 @@ class Runner:
         manifest["skip_warmup"] = self.skip_warmup
         manifest["warm_pass"] = self.warm_pass
         manifest["server_timeout_s"] = self.server_timeout_s
+        manifest["recipe_cache"] = {
+            "dir": self.recipe_cache_dir,
+            "size_mb": self.recipe_cache_mb,
+            "combined_kernel_db": self.combined_db_installed,
+            "variants": dict(self.recipe_cache_notes),
+        }
         if self.workload_info is not None:
             manifest["workload"] = self.workload_info
             manifest["workload_sha"] = self.workload_info.get("sha256")
@@ -756,11 +792,20 @@ class Runner:
         ]
 
     def variant_server_env(self, variant_env: dict) -> dict:
-        """The environment of a variant's servers: the variant's flags, the GDN flags and, by default,
+        """The environment of a variant's servers: the variant's flags, the GDN flags, the recipe cache
+        for the servers that run without the fused GDN kernel (`serve.recipe_cache_env`) and, by default,
         the skipped bucket warmup (the compiled graphs land in the recipe cache)."""
         env = server_env(variant_env, self.gdn_env)
         if self.skip_warmup:
             env["VLLM_SKIP_WARMUP"] = "true"
+        combined = self.combined_db_installed and self.gdn_mode == gates.GDN_MODE_FUSED
+        if self.combined_db_installed and not combined:
+            env[serve.COMBINED_KERNEL_DB_ENV] = "0"  # a database G1b did not pass stays out of every server
+        cache_env, note = serve.recipe_cache_env(self.recipe_cache_dir, self.recipe_cache_mb, env, combined)
+        if cache_env and not self.stub:
+            Path(self.recipe_cache_dir).mkdir(parents=True, exist_ok=True)
+        env.update(cache_env)
+        self.recipe_cache_note = note
         return env
 
     def tiny_env(self) -> dict:
@@ -825,6 +870,11 @@ def _parse_args(argv):
                         help="seconds to wait for a server to become healthy")
     parser.add_argument("--no-warm-pass", action="store_true",
                         help="skip the one-turn warm pass that compiles the graphs before the gates")
+    parser.add_argument("--recipe-cache", metavar="DIR", default=None,
+                        help="folder for the HPU recipe cache; a server gets it only when it runs without the "
+                        "fused GDN kernel, or when the combined kernel database is installed and G1b passed")
+    parser.add_argument("--recipe-cache-mb", type=int, default=16384,
+                        help="recipe cache size in MB (default 16384)")
     parser.add_argument("--agents", type=int, default=32)
     parser.add_argument("--shared-tokens", type=int, default=16384)
     parser.add_argument("--initial-tokens", type=int, default=124000)

@@ -287,3 +287,29 @@ def test_port_in_use():
         assert serve.port_in_use(port) is True
     assert serve.port_in_use(port) is False
     assert serve.port_in_use(free_port()) is False
+
+
+class TestRecipeCacheEnv:
+
+    PYTORCH_GDN = {"VLLM_HPU_GDN_CORE_DECODE": "0", "VLLM_HPU_GDN_CORE_VERIFY": "0"}
+
+    def test_no_dir_is_none(self):
+        assert serve.recipe_cache_env(None, 16384, dict(self.PYTORCH_GDN)) == ({}, "none")
+        assert serve.recipe_cache_env("", 16384, dict(self.PYTORCH_GDN)) == ({}, "none")
+
+    def test_pytorch_flags_get_the_cache(self):
+        env = dict(self.PYTORCH_GDN)
+        assert serve.recipe_cache_env("/rc/abc123456789", 16384, env) == (
+            {"PT_HPU_RECIPE_CACHE_CONFIG": "/rc/abc123456789,false,16384"}, "/rc/abc123456789")
+
+    def test_fused_decode_flag_is_off_with_the_reason(self):
+        env = {"VLLM_HPU_GDN_CORE_DECODE": "1", "VLLM_HPU_GDN_CORE_VERIFY": "0"}
+        assert serve.recipe_cache_env("/rc/abc123456789", 16384, env) == ({}, serve.RECIPE_CACHE_OFF_REASON)
+
+    def test_missing_flags_count_as_fused(self):
+        assert serve.recipe_cache_env("/rc/abc123456789", 16384, {}) == ({}, serve.RECIPE_CACHE_OFF_REASON)
+
+    def test_combined_db_allows_the_cache_with_fused(self):
+        env = {"VLLM_HPU_GDN_CORE_DECODE": "1", "VLLM_HPU_GDN_CORE_VERIFY": "1"}
+        assert serve.recipe_cache_env("/rc/abc123456789", 4096, env, combined_db=True) == (
+            {"PT_HPU_RECIPE_CACHE_CONFIG": "/rc/abc123456789,false,4096"}, "/rc/abc123456789")
