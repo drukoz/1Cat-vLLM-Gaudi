@@ -108,6 +108,7 @@ if [ ! -d "$PLUGIN_ROOT/csrc/gdn_fused" ]; then
 fi
 mkdir -p "$OUT_DIR" || exit 2
 OUT_DIR=$(cd "$OUT_DIR" && pwd)
+STRIP_LIB="$OUT_DIR/build_strip/libgdn_fused_gaudi2.so"  # absolute: the runs cd to $PLUGIN_ROOT
 SUMMARY="$OUT_DIR/summary.txt"
 : > "$SUMMARY"
 
