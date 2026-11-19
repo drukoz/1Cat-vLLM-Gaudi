@@ -16,7 +16,11 @@ import vllm_gaudi.models.qwen3_5 as _qwen3_5  # noqa: F401  (must precede the up
 import vllm_gaudi.models.qwen3_next as _qwen3_next  # noqa: F401  (must precede the upstream model import)
 import vllm.models.qwen4_exp.nvidia.model as _upstream_model
 import vllm.models.qwen4_exp.nvidia.mtp as _upstream_mtp  # must follow the upstream model import
-from vllm_gaudi.models.qwen4_exp.ple_layer import HpuQwen4ExpPLELayer  # must follow the upstream model import
+import vllm.models.qwen4_exp.nvidia.ple_layer as _upstream_ple
+from vllm_gaudi.models.qwen4_exp.ple_layer import (  # must follow the upstream model import
+    HpuQwen4ExpNGramEmbedding,
+    HpuQwen4ExpPLELayer,
+)
 from vllm.config import VllmConfig
 from vllm.model_executor.models.registry import ModelRegistry
 from vllm.sequence import IntermediateTensors
@@ -77,8 +81,9 @@ def apply_flash_next_patches() -> None:
     The GDN and MoE replacements are installed by importing ``vllm_gaudi.models.qwen3_5``
     and ``vllm_gaudi.models.qwen3_next`` (see module docstring); this asserts
     the GDN binding reached the upstream model module, and rebinds the
-    ``GatedResidual``, ``Qwen4ExpQSAAttention`` and ``Qwen4ExpPLELayer`` names the
-    upstream decoder layer builds through at construction time.
+    ``GatedResidual``, ``Qwen4ExpQSAAttention``, ``Qwen4ExpPLELayer`` and
+    ``Qwen4ExpNGramEmbedding`` names the upstream decoder layer builds through at
+    construction time.
     """
     _upstream_model.GatedResidual = HpuGatedResidual
     _upstream_model.Qwen4ExpQSAAttention = HpuQwen4ExpQSAAttention
@@ -87,6 +92,8 @@ def apply_flash_next_patches() -> None:
                            "vllm_gaudi.models.qwen3_next must be imported before "
                            "vllm.models.qwen4_exp.nvidia.model")
     _upstream_model.Qwen4ExpPLELayer = HpuQwen4ExpPLELayer
+    # The upstream Qwen4ExpPLELayer.__init__ looks this name up when it builds the embedding.
+    _upstream_ple.Qwen4ExpNGramEmbedding = HpuQwen4ExpNGramEmbedding
     # The MTP draft's final mixer is built in nvidia/mtp.py through its own GatedResidual import.
     _upstream_mtp.GatedResidual = HpuGatedResidual
 
