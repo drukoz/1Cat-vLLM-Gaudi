@@ -34,6 +34,9 @@ usage() {
     echo "                    without the fused GDN kernel (the bridge accepts one kernel library next"
     echo "                    to a recipe cache); default: a recipe-cache folder next to --model"
     echo "  --no-recipe-cache   do not mount an HPU recipe cache"
+    echo "  --no-combined-kernel-db  keep the combined kernel database out of this run"
+    echo "                    (FLASHINFER_GAUDI_COMBINED_KERNEL_DB=0 in the container): GC_KERNEL_PATH stays"
+    echo "                    a colon list and only servers on the PyTorch GDN path get the recipe cache"
     echo "  --dry-run         print the docker command and exit 0"
     echo "  --no-disk-check   skip the free-space checks (download folder and Docker root)"
     echo "  --no-warm-pass    skip the warm pass that compiles the workload's graphs and caches the"
@@ -72,6 +75,7 @@ FULL_WARMUP=0
 SERVER_TIMEOUT=""
 RECIPE_CACHE=""
 NO_RECIPE_CACHE=0
+NO_COMBINED_DB=0
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -134,6 +138,10 @@ while [ $# -gt 0 ]; do
             ;;
         --no-recipe-cache)
             NO_RECIPE_CACHE=1
+            shift
+            ;;
+        --no-combined-kernel-db)
+            NO_COMBINED_DB=1
             shift
             ;;
         -h | --help)
@@ -243,6 +251,16 @@ if [ "$NO_RECIPE_CACHE" -eq 0 ]; then
     )
 fi
 
+# --no-combined-kernel-db puts FLASHINFER_GAUDI_COMBINED_KERNEL_DB=0 into the container, where the
+# loader treats the combined kernel database as absent (GC_KERNEL_PATH stays a colon list). The
+# install builds the combined database regardless; the variable only stops its use (RUK-3249).
+COMBINED_DB_ARGS=()
+if [ "$NO_COMBINED_DB" -eq 1 ]; then
+    COMBINED_DB_ARGS=(
+        -e FLASHINFER_GAUDI_COMBINED_KERNEL_DB=0
+    )
+fi
+
 DOCKER_CMD=(
     docker run --rm --name fn-rental
     --runtime=habana
@@ -256,6 +274,7 @@ DOCKER_CMD=(
     -v "$MODEL_PARENT:/models"
     -v "$RESULTS:/results"
     ${RECIPE_CACHE_ARGS[@]+"${RECIPE_CACHE_ARGS[@]}"}
+    ${COMBINED_DB_ARGS[@]+"${COMBINED_DB_ARGS[@]}"}
     "$IMAGE"
     bash /bundle/plugin/tools/flash_next/rental/container_entry.sh
     "${ENTRY_ARGS[@]}"

@@ -48,6 +48,7 @@ usage() {
     echo "  --health-timeout S  seconds to wait for the server to get healthy (default in the check: 1800)"
     echo "  --env KEY=VALUE extra server environment variable, repeatable; applied after the mode's own flags"
     echo "  --no-recipe-cache   do not give the pytorch mode's server the compiled-recipe cache under /results/recipe-cache (the fused mode never gets it)"
+    echo "  --no-combined-kernel-db  keep the combined kernel database out of the smoke servers (FLASHINFER_GAUDI_COMBINED_KERNEL_DB=0 in the container)"
     echo "  --dry-run       print the docker commands and exit 0"
 }
 
@@ -61,6 +62,7 @@ DRY_RUN=0
 FULL_WARMUP=0
 HEALTH_TIMEOUT=""
 NO_RECIPE_CACHE=0
+NO_COMBINED_DB=0
 EXTRA_ENV=()
 
 while [ $# -gt 0 ]; do
@@ -103,6 +105,10 @@ while [ $# -gt 0 ]; do
             ;;
         --no-recipe-cache)
             NO_RECIPE_CACHE=1
+            shift
+            ;;
+        --no-combined-kernel-db)
+            NO_COMBINED_DB=1
             shift
             ;;
         --dry-run)
@@ -154,8 +160,13 @@ build_commands() {
         sleep infinity
     )
     INSTALL_CMD=(docker exec "$NAME" bash "/bundle/$ENTRY" --install-only --results /results --run-id "$RUN_ID")
-    SMOKE_CMD=(
-        docker exec -w /bundle/plugin
+    SMOKE_CMD=(docker exec -w /bundle/plugin)
+    if [ "$NO_COMBINED_DB" -eq 1 ]; then
+        # docker exec -e reaches the check and the servers it starts: they then treat the
+        # combined kernel database as absent and use the colon-list GC_KERNEL_PATH (RUK-3249).
+        SMOKE_CMD+=(-e FLASHINFER_GAUDI_COMBINED_KERNEL_DB=0)
+    fi
+    SMOKE_CMD+=(
         "$NAME"
         python -m tools.flash_next.rental.tiny_smoke
         --out "/results/$RUN_ID" --ckpt "$CKPT" --gdn "$GDN"
