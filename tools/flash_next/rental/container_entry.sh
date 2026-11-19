@@ -14,6 +14,7 @@ HABANA_TOOLS_VERSION="1.24.1-482"
 usage() {
     echo "usage: $(basename "${BASH_SOURCE[0]}") --model DIR [--results DIR] [--run-id ID]"
     echo "       [--variants LIST] [--with-profile] [--from PHASE] [--download] [--skip-install]"
+    echo "       [--full-warmup] [--server-timeout S]"
     echo "       $(basename "${BASH_SOURCE[0]}") --install-only [--results DIR] [--run-id ID]"
 }
 
@@ -26,6 +27,8 @@ FROM_PHASE=""
 DOWNLOAD=0
 SKIP_INSTALL=0
 INSTALL_ONLY=0
+FULL_WARMUP=0
+SERVER_TIMEOUT=""
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -64,6 +67,14 @@ while [ $# -gt 0 ]; do
         --install-only)
             INSTALL_ONLY=1
             shift
+            ;;
+        --full-warmup)
+            FULL_WARMUP=1
+            shift
+            ;;
+        --server-timeout)
+            SERVER_TIMEOUT="$2"
+            shift 2
             ;;
         -h | --help)
             usage
@@ -220,6 +231,8 @@ if [ "$INSTALL_ONLY" -eq 1 ]; then
 fi
 
 MAIN_ARGS=(--model "$MODEL" --results "$RESULTS" --run-id "$RUN_ID")
+if [ "$FULL_WARMUP" -eq 1 ]; then MAIN_ARGS+=(--full-warmup); fi
+if [ -n "$SERVER_TIMEOUT" ]; then MAIN_ARGS+=(--server-timeout "$SERVER_TIMEOUT"); fi
 if [ -n "$VARIANTS" ]; then MAIN_ARGS+=(--variants "$VARIANTS"); fi
 if [ "$WITH_PROFILE" -eq 1 ]; then MAIN_ARGS+=(--with-profile); fi
 if [ -n "$FROM_PHASE" ]; then MAIN_ARGS+=(--from "$FROM_PHASE"); fi

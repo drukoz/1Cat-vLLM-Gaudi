@@ -71,6 +71,81 @@ def test_run_rental_dry_run(tmp_path):
     assert ":/models" in out
     assert ":/results" in out
     assert "container_entry.sh" in out
+    # printf %q escapes `:` and `,` on bash 3.2; compare on the unescaped line (RUK-3200).
+    flat = out.replace("\\", "")
+    assert "/tmp/recipe-cache:/recipe-cache" in flat  # the default sits next to the model
+    assert "-e PT_HPU_RECIPE_CACHE_CONFIG=/recipe-cache,false,16384" in flat
+    assert "--full-warmup" not in out  # warmup is skipped by default
+
+
+def test_run_rental_dry_run_warmup_options(tmp_path):
+    (tmp_path / "models").mkdir()
+    proc = subprocess.run(
+        [
+            "bash",
+            str(SCRIPTS_DIR / "run_rental.sh"),
+            "--dry-run",
+            "--model",
+            str(tmp_path / "models" / "X"),
+            "--recipe-cache",
+            "/x",
+            "--full-warmup",
+            "--server-timeout",
+            "7200",
+        ],
+        capture_output=True,
+        text=True,
+        cwd=tmp_path,
+        timeout=60,
+    )
+    assert proc.returncode == 0, proc.stderr
+    flat = proc.stdout.replace("\\", "")
+    assert "/x:/recipe-cache" in flat
+    assert "PT_HPU_RECIPE_CACHE_CONFIG=/recipe-cache,false,16384" in flat
+    assert "--full-warmup" in proc.stdout
+    assert "--server-timeout 7200" in flat
+
+
+def test_run_rental_dry_run_no_recipe_cache(tmp_path):
+    (tmp_path / "models").mkdir()
+    proc = subprocess.run(
+        [
+            "bash",
+            str(SCRIPTS_DIR / "run_rental.sh"),
+            "--dry-run",
+            "--model",
+            str(tmp_path / "models" / "X"),
+            "--no-recipe-cache",
+        ],
+        capture_output=True,
+        text=True,
+        cwd=tmp_path,
+        timeout=60,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert "recipe-cache" not in proc.stdout
+    assert "PT_HPU_RECIPE_CACHE_CONFIG" not in proc.stdout
+
+
+def test_run_rental_dry_run_writes_nothing(tmp_path):
+    (tmp_path / "models").mkdir()
+    proc = subprocess.run(
+        [
+            "bash",
+            str(SCRIPTS_DIR / "run_rental.sh"),
+            "--dry-run",
+            "--model",
+            str(tmp_path / "models" / "X"),
+            "--recipe-cache",
+            str(tmp_path / "cache"),
+        ],
+        capture_output=True,
+        text=True,
+        cwd=tmp_path,
+        timeout=60,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert not (tmp_path / "cache").exists()  # the cache folder appears only for a real run
 
 
 def _run_rental_env(tmp_path, avail_kb, docker_root=None):

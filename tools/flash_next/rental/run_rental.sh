@@ -5,7 +5,9 @@
 # rental bundle: bash run_rental.sh --model /models/Qwen3.8-Flash-Next-FP8
 #
 # Starts the Habana container, runs container_entry.sh inside it (install + orchestrator), and
-# leaves <results>/<run-id>.tar.gz on the host to send back.
+# leaves <results>/<run-id>.tar.gz on the host to send back. Bucket warmup is skipped by default
+# (--full-warmup to force it) and the HPU recipe cache lives next to the checkpoint (the data
+# disk) so compiled graphs survive between runs (--recipe-cache DIR / --no-recipe-cache).
 
 set -euo pipefail
 
@@ -23,6 +25,14 @@ usage() {
     echo "  --download        download the checkpoint into --model inside the container first"
     echo "  --from PHASE      resume the orchestrator from PHASE"
     echo "  --run-id ID       run id (default: UTC timestamp)"
+    echo "  --full-warmup     run the full bucket warmup at server start (default: skipped, graphs"
+    echo "                    compile on first use)"
+    echo "  --server-timeout S  seconds to wait for a server to become healthy (default: 1800; use"
+    echo "                    3600 with the default skipped warmup)"
+    echo "  --recipe-cache DIR  host folder for the HPU recipe cache, mounted at /recipe-cache"
+    echo "                    (default: a recipe-cache folder next to --model, i.e. on the data disk;"
+    echo "                    an empty DIR disables the mount)"
+    echo "  --no-recipe-cache   do not mount an HPU recipe cache"
     echo "  --dry-run         print the docker command and exit 0"
     echo "  --no-disk-check   skip the free-space checks (download folder and Docker root)"
 }
@@ -54,6 +64,10 @@ FROM_PHASE=""
 RUN_ID=""
 DRY_RUN=0
 NO_DISK_CHECK=0
+FULL_WARMUP=0
+SERVER_TIMEOUT=""
+RECIPE_CACHE=""
+NO_RECIPE_CACHE=0
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -97,6 +111,23 @@ while [ $# -gt 0 ]; do
             NO_DISK_CHECK=1
             shift
             ;;
+        --full-warmup)
+            FULL_WARMUP=1
+            shift
+            ;;
+        --server-timeout)
+            SERVER_TIMEOUT="$2"
+            shift 2
+            ;;
+        --recipe-cache)
+            RECIPE_CACHE="$2"
+            if [ -z "$RECIPE_CACHE" ]; then NO_RECIPE_CACHE=1; fi
+            shift 2
+            ;;
+        --no-recipe-cache)
+            NO_RECIPE_CACHE=1
+            shift
+            ;;
         -h | --help)
             usage
             exit 0
@@ -129,6 +160,18 @@ RUN_ID="${RUN_ID:-$(date -u +%Y%m%dT%H%M%SZ)}"
 RESULTS="${RESULTS:-$PWD/results}"
 MODEL_PARENT="$(dirname "$MODEL")"
 MODEL_NAME="$(basename "$MODEL")"
+
+# The recipe cache defaults to a folder next to the checkpoint, so it sits on the checkpoint's
+# (data) disk and survives between runs. Relative paths are taken against $PWD.
+if [ "$NO_RECIPE_CACHE" -eq 0 ] && [ -z "$RECIPE_CACHE" ]; then
+    RECIPE_CACHE="$MODEL_PARENT/recipe-cache"
+fi
+if [ "$NO_RECIPE_CACHE" -eq 0 ]; then
+    case "$RECIPE_CACHE" in
+        /*) ;;
+        *) RECIPE_CACHE="$PWD/$RECIPE_CACHE" ;;
+    esac
+fi
 
 if [ "$NO_DISK_CHECK" -eq 1 ]; then
     echo "warning: free-space checks skipped (--no-disk-check)" >&2
@@ -170,10 +213,23 @@ RESULTS="$(cd "$RESULTS" && pwd)"
 mkdir -p "$RESULTS/$RUN_ID"
 
 ENTRY_ARGS=(--model "/models/$MODEL_NAME" --results /results --run-id "$RUN_ID")
+if [ "$FULL_WARMUP" -eq 1 ]; then ENTRY_ARGS+=(--full-warmup); fi
+if [ -n "$SERVER_TIMEOUT" ]; then ENTRY_ARGS+=(--server-timeout "$SERVER_TIMEOUT"); fi
 if [ -n "$VARIANTS" ]; then ENTRY_ARGS+=(--variants "$VARIANTS"); fi
 if [ "$WITH_PROFILE" -eq 1 ]; then ENTRY_ARGS+=(--with-profile); fi
 if [ -n "$FROM_PHASE" ]; then ENTRY_ARGS+=(--from "$FROM_PHASE"); fi
 if [ "$DOWNLOAD" -eq 1 ]; then ENTRY_ARGS+=(--download); fi
+
+# The recipe-cache mount and its env are optional, so they are collected separately and spliced
+# into the command with the `${arr[@]+"${arr[@]}"}` guard (bash 3.2 keeps `set -u` quiet for the
+# empty array of --no-recipe-cache).
+RECIPE_CACHE_ARGS=()
+if [ "$NO_RECIPE_CACHE" -eq 0 ]; then
+    RECIPE_CACHE_ARGS=(
+        -v "$RECIPE_CACHE:/recipe-cache"
+        -e PT_HPU_RECIPE_CACHE_CONFIG=/recipe-cache,false,16384
+    )
+fi
 
 DOCKER_CMD=(
     docker run --rm --name fn-rental
@@ -187,6 +243,7 @@ DOCKER_CMD=(
     -v "$SCRIPT_DIR:/bundle"
     -v "$MODEL_PARENT:/models"
     -v "$RESULTS:/results"
+    ${RECIPE_CACHE_ARGS[@]+"${RECIPE_CACHE_ARGS[@]}"}
     "$IMAGE"
     bash /bundle/plugin/tools/flash_next/rental/container_entry.sh
     "${ENTRY_ARGS[@]}"
@@ -196,6 +253,11 @@ if [ "$DRY_RUN" -eq 1 ]; then
     printf '%q ' "${DOCKER_CMD[@]}"
     printf '\n'
     exit 0
+fi
+
+# Only a real run populates the cache: a dry run writes nothing.
+if [ "$NO_RECIPE_CACHE" -eq 0 ]; then
+    mkdir -p "$RECIPE_CACHE"
 fi
 
 if ! command -v docker >/dev/null 2>&1; then

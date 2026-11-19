@@ -59,6 +59,8 @@ def test_full_stub_run(tmp_path, capsys):
     assert manifest["workload_sha"]
     assert [v["id"] for v in manifest["variants"]] == ["A", "B"]
     assert manifest["gdn_core_decode_mode"] is None
+    assert manifest["skip_warmup"] is True
+    assert manifest["server_timeout_s"] == rental_main.SERVER_HEALTH_TIMEOUT_S
     for key in manifest["env"]:
         assert key.startswith(("VLLM_", "HABANA_", "PT_", "HF_"))
 
@@ -294,6 +296,30 @@ def test_tiny_env_matches_variant_env(tmp_path, monkeypatch):
         assert tiny.get(key) == venv.get(key)
     assert tiny["PT_HPU_LAZY_MODE"] == "1"
     assert "VLLM_COMPACT_GDN" not in tiny
+
+
+def test_variant_server_env_skips_warmup_by_default(tmp_path):
+    runner = node_runner(tmp_path)
+    runner.gdn_env = {"VLLM_HPU_GDN_CORE_DECODE": "0", "VLLM_HPU_GDN_CORE_VERIFY": "0"}
+    env = runner.variant_server_env({"VLLM_X": "1"})
+    assert env["VLLM_SKIP_WARMUP"] == "true"
+    assert env["VLLM_X"] == "1"
+    assert env["VLLM_HPU_GDN_CORE_DECODE"] == "0"
+    assert runner.request_timeout_s == 3600.0
+    assert runner.server_timeout_s == rental_main.SERVER_HEALTH_TIMEOUT_S
+
+
+def test_variant_server_env_full_warmup(tmp_path):
+    args = rental_main._parse_args([
+        "--mode", "node", "--model", str(tmp_path / "model"), "--results", str(tmp_path / "results"),
+        "--run-id", "r", "--variants", "A", "--full-warmup", "--server-timeout", "7200"
+    ])
+    runner = rental_main.Runner(args, rental_main.load_variants())
+    env = runner.variant_server_env({"VLLM_X": "1"})
+    assert "VLLM_SKIP_WARMUP" not in env
+    assert env["VLLM_X"] == "1"
+    assert runner.server_timeout_s == 7200.0
+    assert runner.request_timeout_s == rental_main.gates.HTTP_TIMEOUT_S
 
 
 def node_runner(tmp_path):

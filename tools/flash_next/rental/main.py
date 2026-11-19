@@ -30,6 +30,7 @@ GATE_PHASES = ("preflight", "build", "fused_gdn", "tiny", "card_tests")
 ENV_PREFIXES = ("VLLM_", "HABANA_", "PT_", "HF_")
 HLSMI_Q_LIMIT = 200 * 1024
 SERVER_HEALTH_TIMEOUT_S = 1800.0
+COHERENCE_REQUEST_TIMEOUT_SKIP_WARMUP_S = 3600.0
 TINY_HEALTH_TIMEOUT_S = 1200.0
 TINY_CHECKPOINT_TIMEOUT_S = 900.0
 TINY_PORT = 8010
@@ -188,6 +189,10 @@ class Runner:
         self.gdn_env = {}
         self.gdn_mode = None
         self.gdn_reason = None
+        self.skip_warmup = not args.full_warmup
+        self.server_timeout_s = float(args.server_timeout)
+        self.request_timeout_s = (COHERENCE_REQUEST_TIMEOUT_SKIP_WARMUP_S if self.skip_warmup else
+                                  gates.HTTP_TIMEOUT_S)
         self.active = []
         self.stopped_at = None
         self.current_phase = GATE_PHASES[0]
@@ -373,7 +378,7 @@ class Runner:
         t0 = time.time()
         failures = []
         eff, note = self.effective_variant(variant)
-        eff["env"] = server_env(eff["env"], self.gdn_env)
+        eff["env"] = self.variant_server_env(eff["env"])
         servers = variant["servers"]
         urls = ["http://127.0.0.1:%d" % int(s["port"]) for s in servers]
         planned = []
@@ -409,9 +414,9 @@ class Runner:
                                 failures.append((GateStatus.FAILED, "server %d (stub) did not report its port" % k))
                                 break
                             urls[k] = "http://127.0.0.1:%d" % port
-                        if not serve.wait_healthy(port, SERVER_HEALTH_TIMEOUT_S, procs[k]):
+                        if not serve.wait_healthy(port, self.server_timeout_s, procs[k]):
                             failures.append((GateStatus.TIMED_OUT,
-                                             "server %d not healthy within %d s" % (k, int(SERVER_HEALTH_TIMEOUT_S))))
+                                             "server %d not healthy within %d s" % (k, int(self.server_timeout_s))))
                             break
                 if not failures:
                     startup = self._startup_records(servers, vdir, time.time() - t0)
@@ -487,7 +492,7 @@ class Runner:
             return GateStatus.SKIPPED, "stub mode"
         agents = w.get("agents") or []
         messages = agents[0].get("messages") if agents else []
-        status, details = gates.coherence(url, self.served_name, messages or [])
+        status, details = gates.coherence(url, self.served_name, messages or [], request_timeout_s=self.request_timeout_s)
         reason = details.get("reason") or details.get("error")
         write_status(cdir, "coherence", status, reason, time.time() - t0)
         write_json(cdir / "details.json", details)
@@ -634,6 +639,8 @@ class Runner:
         })
         manifest["gdn_core_decode_mode"] = self.gdn_mode
         manifest["gdn_core_decode_reason"] = self.gdn_reason
+        manifest["skip_warmup"] = self.skip_warmup
+        manifest["server_timeout_s"] = self.server_timeout_s
         if self.workload_info is not None:
             manifest["workload"] = self.workload_info
             manifest["workload_sha"] = self.workload_info.get("sha256")
@@ -680,9 +687,17 @@ class Runner:
             STUB_TOKENS_PER_SECOND,
         ]
 
+    def variant_server_env(self, variant_env: dict) -> dict:
+        """The environment of a variant's servers: the variant's flags, the GDN flags and, by default,
+        the skipped bucket warmup (the compiled graphs land in the recipe cache)."""
+        env = server_env(variant_env, self.gdn_env)
+        if self.skip_warmup:
+            env["VLLM_SKIP_WARMUP"] = "true"
+        return env
+
     def tiny_env(self) -> dict:
         """The tiny gate's server environment: a variant's environment without a variant's own flags."""
-        return serve.server_environment(server_env({}, self.gdn_env))
+        return serve.server_environment(self.variant_server_env({}))
 
     def _child_env(self) -> dict:
         env = dict(os.environ)
@@ -737,6 +752,9 @@ def _parse_args(argv):
     parser.add_argument("--mode", choices=("node", "stub"), default="node")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--download", action="store_true", help="accepted for entry-script compatibility")
+    parser.add_argument("--full-warmup", action="store_true", help="run the bucket warmup (default: skipped)")
+    parser.add_argument("--server-timeout", type=float, default=SERVER_HEALTH_TIMEOUT_S,
+                        help="seconds to wait for a server to become healthy")
     parser.add_argument("--agents", type=int, default=32)
     parser.add_argument("--shared-tokens", type=int, default=16384)
     parser.add_argument("--initial-tokens", type=int, default=124000)

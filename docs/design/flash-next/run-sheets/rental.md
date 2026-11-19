@@ -238,11 +238,45 @@ Useful options:
 | `--from PHASE` | resume from a phase (`preflight`, `build`, `tiny`, a variant id, `report`) |
 | `--run-id ID` | fixed run id (default: UTC timestamp) |
 | `--image IMG` | container image (default the 1.24.1 base image) |
+| `--full-warmup` | run the full bucket warmup at server start (default: skipped — see [Warmup and the recipe cache](#warmup-and-the-recipe-cache-ruk-3200)) |
+| `--server-timeout S` | seconds to wait for a server to become healthy (default 1800; use 3600 with the default skipped warmup) |
+| `--recipe-cache DIR` | host folder for the HPU recipe cache, mounted at `/recipe-cache` (default: a `recipe-cache` folder next to `--model`) |
+| `--no-recipe-cache` | start the containers without an HPU recipe cache |
 | `--dry-run` | print the `docker run` command and exit |
 | `--no-disk-check` | skip both free-space checks |
 
 When the run stops at a stop rule, restart after fixing the cause with `--run-id <same id>
 --from <phase>` to keep the results in one folder.
+
+## Warmup and the recipe cache (RUK-3200)
+
+Bucket warmup is **off by default**: every variant server starts with `VLLM_SKIP_WARMUP=true`,
+and so does the tiny gate's checkpoint build. `--full-warmup` starts the servers as before, and
+`summary.md` then prints `Warmup: full` at the top (with `Server health timeout: <S> s` next to
+it; the manifest records both).
+
+Skipping warmup means the graphs are not compiled at server start — they compile **on first
+use**, inside the first requests. Two consequences:
+
+- **Startup is minutes, not tens of minutes.** The `/v1/models` health check does not wait for
+  graph compilation. When a cold-cache run's compile-only startup is expected to exceed 30 min,
+  give it room: `--server-timeout 3600` (the coherence gate already allows 3,600 s per request
+  when the warmup is skipped, so a first request that triggers compilation is not cut off).
+- **The recipe cache keeps the compiled graphs.** `run_rental.sh` mounts a recipe cache at
+  `/recipe-cache` with `PT_HPU_RECIPE_CACHE_CONFIG=/recipe-cache,false,16384`. The default
+  folder is `recipe-cache` **next to the checkpoint**, so it lives on the checkpoint's disk: on
+  the prepared data disk it survives reboots and container rebuilds, and the second run on the
+  same checkpoint and node starts with the graphs already compiled. Keep it on the data disk,
+  never under Docker's root (which has its own 30 GB free-space check). `--recipe-cache DIR`
+  picks another folder; `--no-recipe-cache` drops the mount and the variable.
+
+Graph-count guidance for the report-back: the first server start on a cold cache compiles every
+shape the run touches, and the console shows the graph builders working through the buckets;
+the same server with a warm cache reports far fewer compiled graphs. The G3 line records the
+startup seconds per server (`startup.json`), so a startup that is "only" graph compilation is
+visible there. A **startup of tens of minutes with a cold recipe cache is not a hang** — do not
+stop the run while the graphs compile. The health timeout (`--server-timeout`) is the line, and
+`hl-smi` showing TPC activity is the proof of life.
 
 ## Expected duration per phase
 
@@ -253,7 +287,7 @@ When the run stops at a stop rule, restart after fixing the cause with `--run-id
 | install (vLLM, plugin with native kernels, model deps) | 20–40 min |
 | fused GDN gate | about 15 min |
 | tiny TP8 | about 10 min |
-| each variant | about 35–45 min (startup up to 30 min including warmup, context fill, four turns) |
+| each variant | about 35–45 min; with the default skipped warmup the server startup is minutes (graphs compile on first use, the recipe cache makes this cheap from the second run — see [Warmup and the recipe cache](#warmup-and-the-recipe-cache-ruk-3200)), then context fill and four turns |
 
 A full run (three variants, no `--download`) is about 3–4 h; add the download on top.
 
@@ -266,7 +300,7 @@ A full run (three variants, no `--download`) is about 3–4 h; add the download 
 | G1b fused GDN kernel | op numerics of both GDN decode ops on the card against the CPU reference (`test_hpu_op.py`), 1,000-step graph replay against eager (two cases), then the verification op's numerics and two replays (only after the decode checks pass), then the speed measurement; all of these run with `PT_HPU_LAZY_MODE=1`, the servers' bridge mode, and only they decide the kernel. The two decode replays then run once more with `PT_HPU_LAZY_MODE=0` for `torch.compile` and are recorded only (`replay_eager`, `eager_compile_ok`): an eager failure never turns the kernel off. Every step runs in its own process group and is killed with its whole group at its timeout (op tests 600 s, each replay 900 s, bench 1200 s). When `test_hpu_verify_op.py` crashes or times out, G1b runs `gdn_verify_crash_probe.sh` (at most 4500 s) into `fused_gdn/verify_crash/`; recorded only | never stops: on a failure, a skip or a missing library, every later server runs with `VLLM_HPU_GDN_CORE_DECODE=0` (the PyTorch GDN path), recorded in the manifest and the summary; a verify failure leaves `VLLM_HPU_GDN_CORE_VERIFY=0`, only a pass sets it to 1 |
 | G2 tiny TP8 | stage 2a's tiny 8-head checkpoint at TP8: greedy agreement with `reference.json` | fewer than 16/16 tokens match on any prompt |
 | card_tests (after the gates) | the two HPU-only unit-test files on the card, in lazy mode (`PT_HPU_LAZY_MODE=1`), 600 s each: `tests/unit_tests/test_defragmentation.py` and `tests/unit_tests/ops/test_hpu_fused_moe.py`; each file's output is kept as `<stem>.log` and the pytest counts are recorded in `details.json` | never stops the run: a failure, a timeout or a skip is recorded only |
-| G3 startup, per server | `Maximum concurrency for 131,072 tokens per request` ≥ agents on that server; `Usable num_blocks`, KV tokens, weights and warmup recorded | the concurrency is too low, or no healthy `/v1/models` within 1,800 s |
+| G3 startup, per server | `Maximum concurrency for 131,072 tokens per request` ≥ agents on that server; `Usable num_blocks`, KV tokens, weights and warmup recorded | the concurrency is too low, or no healthy `/v1/models` within the health timeout (default 1,800 s, `--server-timeout`; warmup is skipped by default, so startup is usually minutes) |
 | G4 coherence (variant A's server) | the 8 short prompts of stage 2b; one 120K-token needle prompt | an empty answer, repetition, a JSON prompt that does not parse, or a missed needle |
 | G5 load, per variant | the workload finishes in 5,400 s with no request error and `Running` reaching the agent count | any of these (then the variant's "on failure" rule applies: A stops the run, B and C continue) |
 
@@ -329,8 +363,10 @@ and `run_rental.sh` ends with two lines:
   (status and reason per gate), the variants table (max concurrency, TTFT cold and warm, decode
   tok/s per agent, aggregate tok/s, prefix-cache hit rate, preemptions, MTP acceptance length,
   errors, wall time), one section per variant, the GDN decode line (fused kernel or PyTorch path)
-  and the native-kernel line from `toolchain.json`. Paste it whole into a comment on RUK-2709. It
-  is written at the end of every run that reached the orchestrator, passed or failed.
+  and the native-kernel line from `toolchain.json`. Its header also carries the run's warmup mode
+  (`Warmup: skipped ...` / `Warmup: full`) and the server health timeout (RUK-3200). Paste it
+  whole into a comment on RUK-2709. It is written at the end of every run that reached the
+  orchestrator, passed or failed.
 - `SEND THIS FILE: <results>/<run-id>.tar.gz` — the whole run folder, made even when the run
   failed: `console.log` (everything the run printed, kept across `--from` resumes),
   `manifest.json`, `toolchain.json`, the `install-<n>.log` files, each gate's and variant's
