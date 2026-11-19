@@ -42,6 +42,7 @@ CARD_FREE_WAIT_S = 20.0
 STUB_STAGGER_S = 0.0
 STUB_MONITOR_INTERVAL_S = 0.05
 STUB_TOKENS_PER_SECOND = "400"
+STUB_PORT_TIMEOUT_S = 30.0
 
 
 def repo_root() -> Path:
@@ -372,14 +373,24 @@ class Runner:
         procs = []
         try:
             for k, srv in enumerate(servers):
-                cmd = self._stub_command(int(srv["port"])) if self.stub else planned[k]
+                port_file = vdir / ("server%d.port" % k)
+                if self.stub:
+                    port_file.unlink(missing_ok=True)
+                cmd = self._stub_command(port_file) if self.stub else planned[k]
                 env = self._child_env() if self.stub else envs[k]
                 proc = serve.start_server(cmd, env, vdir / ("server%d.log" % k), vdir)
                 procs.append(proc)
                 self.active.append(("server", proc))
             try:
                 for k, srv in enumerate(servers):
-                    if not serve.wait_healthy(int(srv["port"]), SERVER_HEALTH_TIMEOUT_S, procs[k]):
+                    port = int(srv["port"])
+                    if self.stub:
+                        port = serve.wait_port_file(vdir / ("server%d.port" % k), STUB_PORT_TIMEOUT_S, procs[k])
+                        if port is None:
+                            failures.append((GateStatus.FAILED, "server %d (stub) did not report its port" % k))
+                            break
+                        urls[k] = "http://127.0.0.1:%d" % port
+                    if not serve.wait_healthy(port, SERVER_HEALTH_TIMEOUT_S, procs[k]):
                         failures.append((GateStatus.TIMED_OUT,
                                          "server %d not healthy within %d s" % (k, int(SERVER_HEALTH_TIMEOUT_S))))
                         break
@@ -635,13 +646,15 @@ class Runner:
             records.append(rec)
         return records
 
-    def _stub_command(self, port: int) -> list:
+    def _stub_command(self, port_file: Path) -> list:
         return [
             sys.executable,
             "-m",
             "tools.flash_next.rental.stub_server",
             "--port",
-            str(port),
+            "0",
+            "--port-file",
+            str(port_file),
             "--model",
             self.served_name,
             "--tokens-per-second",

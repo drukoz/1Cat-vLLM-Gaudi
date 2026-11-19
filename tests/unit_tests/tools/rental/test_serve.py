@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import os
 import socket
+import subprocess
 import sys
 import time
 
@@ -258,3 +259,21 @@ class TestProcessHandling:
         finally:
             serve.stop_server(proc)
         assert time.time() - started < 5
+
+    def test_wait_port_file(self, tmp_path):
+        proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+        try:
+            port_file = tmp_path / "p"
+            port_file.write_text("4321\n", encoding="utf-8")
+            assert serve.wait_port_file(port_file, 10.0, proc) == 4321
+            assert serve.wait_port_file(tmp_path / "missing", 0.3, proc) is None
+        finally:
+            proc.kill()
+            proc.wait(timeout=10)
+
+    def test_wait_port_file_none_when_process_exited(self, tmp_path):
+        proc = subprocess.Popen([sys.executable, "-c", "pass"])
+        proc.wait(timeout=30)
+        started = time.time()
+        assert serve.wait_port_file(tmp_path / "missing", 10.0, proc) is None
+        assert time.time() - started < 2

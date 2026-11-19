@@ -3,6 +3,7 @@
 
 import json
 import shutil
+import socket
 from pathlib import Path
 
 from tools.flash_next.rental import main as rental_main, serve
@@ -98,6 +99,38 @@ def test_c_inherits_b_spec(tmp_path, capsys):
     assert "mtp" in c_dump
     assert "VLLM_FLASH_NEXT_DRAFT_RANK_LOG" in c_dump
     assert c["reason"] and "B" in c["reason"]
+
+
+def hold_ports(*ports):
+    """Listening sockets on 127.0.0.1 for each port we can bind (one already held by someone else is held anyway)."""
+    held = []
+    for port in ports:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            sock.bind(("127.0.0.1", port))
+            sock.listen(1)
+            held.append(sock)
+        except OSError:
+            sock.close()
+    return held
+
+
+def test_stub_run_ignores_held_config_ports(tmp_path, capsys):
+    held = hold_ports(8000, 8001)
+    try:
+        model = make_model(tmp_path)
+        rc = run_stub(tmp_path, model, "rheld", "--variants", "A,C")
+        capsys.readouterr()
+    finally:
+        for sock in held:
+            sock.close()
+    assert rc == 0
+    c = read_json(tmp_path / "results" / "rheld" / "C" / "status.json")
+    assert c["status"] == int(GateStatus.PASSED), c
+    urls = [srv["url"] for srv in c["servers"]]
+    assert len(set(urls)) == 2
+    assert not any(u.endswith((":8000", ":8001")) for u in urls)
+    assert "8000" in c["servers"][0]["planned_command"]
 
 
 def test_from_b_runs_only_b_and_c(tmp_path, capsys):

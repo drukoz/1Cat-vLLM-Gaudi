@@ -4,7 +4,8 @@
 `build_command` turns one variant and one server entry of `variants.json` into
 the exact `vllm serve` command and environment; `start_server` launches it with
 its log in a file in its own process group; `wait_healthy` polls `/health` and
-`/v1/models`; `parse_startup` reads the startup lines into the `startup.json`
+`/v1/models`; `wait_port_file` reads the port a server wrote to a file once
+listening; `parse_startup` reads the startup lines into the `startup.json`
 record of `schema.STARTUP_KEYS`; `stop_server` ends the whole process group.
 
 Runs on Python 3.10 with the standard library only (the node's container).
@@ -165,6 +166,24 @@ def wait_healthy(port: int, timeout_s: float, proc: subprocess.Popen) -> bool:
         if not _sleep_polling_exit(proc, min(_HEALTH_POLL_S, deadline - time.monotonic())):
             return False
     return False
+
+
+def wait_port_file(path: Path, timeout_s: float, proc: subprocess.Popen) -> int | None:
+    """The port a server wrote to `path` (one decimal line).
+
+    None when the process exits or `timeout_s` passes before the file holds a number.
+    """
+    deadline = time.monotonic() + timeout_s
+    while True:
+        try:
+            text = path.read_text(encoding="utf-8").strip()
+        except OSError:
+            text = ""
+        if text.isdigit():
+            return int(text)
+        if proc.poll() is not None or time.monotonic() >= deadline:
+            return None
+        time.sleep(_LIVENESS_STEP_S)
 
 
 def parse_startup(log_text: str, server: int, startup_seconds: float) -> dict:
