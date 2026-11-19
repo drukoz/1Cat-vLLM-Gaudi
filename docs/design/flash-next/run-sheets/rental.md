@@ -272,7 +272,11 @@ use**, inside the first requests. Two consequences:
 
 Graph-count guidance for the report-back: the first server start on a cold cache compiles every
 shape the run touches, and the console shows the graph builders working through the buckets;
-the same server with a warm cache reports far fewer compiled graphs. The G3 line records the
+the same server with a warm cache reports far fewer compiled graphs. With `--full-warmup` the
+servers compile the buckets up front — 249 graphs for variant A (TP8, 32 agents), 397 for
+variant B (A + MTP k=3) and 237 per server for variant C (TP4, 16 agents); at the observed
+13–35 s per prompt graph that is hours per server, so run `--full-warmup` with a
+`--server-timeout` of several hours (e.g. 14400–21600). The G3 line records the
 startup seconds per server (`startup.json`), so a startup that is "only" graph compilation is
 visible there. A **startup of tens of minutes with a cold recipe cache is not a hang** — do not
 stop the run while the graphs compile. The health timeout (`--server-timeout`) is the line, and

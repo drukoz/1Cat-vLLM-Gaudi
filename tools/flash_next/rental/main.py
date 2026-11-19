@@ -492,7 +492,8 @@ class Runner:
             return GateStatus.SKIPPED, "stub mode"
         agents = w.get("agents") or []
         messages = agents[0].get("messages") if agents else []
-        status, details = gates.coherence(url, self.served_name, messages or [], request_timeout_s=self.request_timeout_s)
+        status, details = gates.coherence(url, self.served_name, messages or [],
+                                          request_timeout_s=self.request_timeout_s)
         reason = details.get("reason") or details.get("error")
         write_status(cdir, "coherence", status, reason, time.time() - t0)
         write_json(cdir / "details.json", details)
