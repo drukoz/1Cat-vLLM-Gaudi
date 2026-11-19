@@ -162,7 +162,7 @@ build_commands() {
     INSTALL_CMD=(docker exec "$NAME" bash "/bundle/$ENTRY" --install-only --results /results --run-id "$RUN_ID")
     SMOKE_CMD=(docker exec -w /bundle/plugin)
     if [ "$NO_COMBINED_DB" -eq 1 ]; then
-        # The env reaches every process in the container: the check's servers then treat the
+        # docker exec -e reaches the check and the servers it starts: they then treat the
         # combined kernel database as absent and use the colon-list GC_KERNEL_PATH (RUK-3249).
         SMOKE_CMD+=(-e FLASHINFER_GAUDI_COMBINED_KERNEL_DB=0)
     fi
