@@ -54,6 +54,11 @@ class _MtpTargetOutputs:
                 intermediate_tensors: IntermediateTensors | None = None,
                 inputs_embeds: torch.Tensor | None = None,
                 **kwargs: object) -> torch.Tensor | IntermediateTensors:
+        # The engine widens embeddings to the HC streams with repeat(1, hc_count), which needs [T] ids / [T, H] embeds;
+        # the HPU runner flattens [bs, seq] batches only when the flatten_input feature is on (RUK-3102).
+        if (input_ids is not None and input_ids.dim() != 1) or (inputs_embeds is not None and inputs_embeds.dim() != 2):
+            shape = tuple((input_ids if input_ids is not None else inputs_embeds).shape)
+            raise ValueError(f"Flash-Next takes flat [num_tokens] input_ids (the flatten_input feature); got {shape}")
         # The runner schedules [-1] for an empty n-gram draft (always rejected); id 0 keeps ids in embedding range.
         if input_ids is not None:
             input_ids = input_ids.clamp(min=0)
