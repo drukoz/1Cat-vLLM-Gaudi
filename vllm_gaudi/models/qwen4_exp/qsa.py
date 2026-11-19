@@ -179,7 +179,7 @@ class HpuQsaIndexer(nn.Module):
             keys = compress_block_keys(blocks, self.k_layernorm.weight, self.eps, cs, sn)
             last_slots = compressed_row_slots(slot_mapping.view(rows, seq)[:, ratio - 1:n_full * ratio:ratio].
                                               reshape(-1), ratio)
-            cache.index_put_((last_slots,), keys)
+            cache.index_copy_(0, last_slots, keys.to(cache.dtype))
             tail = seq - n_full * ratio
             if tail:
                 ring_write(self.key_ring, store.repeat_interleave(tail), positions2[:, n_full * ratio:].reshape(-1),
@@ -188,8 +188,8 @@ class HpuQsaIndexer(nn.Module):
             # rows come from the row's kernel blocks (block_list, rpb compressed rows each), the
             # chunk's blocks go at ctx // ratio + j (overwriting a partial last context block).
             n_ctx = 0 if md.block_list is None else md.block_list.numel() // rows
-            ctx_keys = (cache.view(-1, rpb, D)[md.block_list.long().clamp_min(0)].reshape(rows, n_ctx * rpb, D)
-                        if n_ctx else cache.new_zeros((rows, 0, D)))
+            ctx_keys = (cache.view(-1, rpb, D).index_select(0, md.block_list.long().clamp_min(0).reshape(-1)).reshape(
+                rows, n_ctx * rpb, D) if n_ctx else cache.new_zeros((rows, 0, D)))
             all_rows = torch.cat((ctx_keys, cache.new_zeros((rows, n_full, D))), dim=1)
             dst = (ctx // ratio)[:, None] + torch.arange(n_full, device=hidden.device)[None, :]
             all_rows.scatter_(1, dst[..., None].expand(-1, -1, D), keys.view(rows, n_full, D).to(cache.dtype))
@@ -225,7 +225,7 @@ class HpuQsaIndexer(nn.Module):
         Write-then-score: the step's raw keys go into the ring and the
         completed blocks' compressed rows into ``compressed_key_cache``
         BEFORE any row is scored.  Both caches are position-addressed
-        (``ring[slot, pos % R]``, ``compressed_row_slots(slot_mapping)``), so a
+        (the request slot's ring row ``pos % R``, ``compressed_row_slots(slot_mapping)``), so a
         token re-processed at a position overwrites the row a rejected draft
         left there: after a verification step the caches hold the accepted
         tokens' rows and rollback needs no extra state (no checkpoint, no
@@ -281,13 +281,13 @@ class HpuQsaIndexer(nn.Module):
         # row from a row that does not complete it would race the completing row's write.
         row_slots = compressed_row_slots(slot_mapping, ratio)
         scratch_row = torch.full_like(row_slots, cache.shape[0] - 1)
-        cache.index_put_((torch.where(complete, row_slots, scratch_row),), keys)
+        cache.index_copy_(0, torch.where(complete, row_slots, scratch_row), keys.to(cache.dtype))
         MB = int(md.block_table.shape[1])
         n = MB * rpb
         bt = md.block_table.long()
         blk_idx = torch.arange(n, device=positions.device)
         idx = bt.gather(1, (blk_idx // rpb)[None, :].expand(T, -1)) * rpb + (blk_idx % rpb)[None, :]
-        all_rows = cache[idx.reshape(-1)].view(T, n, D)
+        all_rows = cache.index_select(0, idx.reshape(-1)).view(T, n, D)
         scores = torch.relu(torch.einsum("thd,tnd->thn", q.float(), all_rows.float())).sum(1) / (D**0.5)
         blocks_sel = select_blocks(scores, visible_blocks(positions, ratio), topk)
         return expand_selection(blocks_sel, positions, ratio)
