@@ -406,9 +406,32 @@ def test_tiny_smoke_dry_run(tmp_path):
     assert install == ["docker", "exec", "fn-smoke", "bash",
                        "/bundle/plugin/tools/flash_next/rental/container_entry.sh", "--install-only", "--results",
                        "/results", "--run-id", "t1"]
-    assert smoke == ["docker", "exec", "-w", "/bundle/plugin", "fn-smoke", "python", "-m",
+    assert smoke == ["docker", "exec", "-w", "/bundle/plugin", "-e",
+                     "PT_HPU_RECIPE_CACHE_CONFIG=/results/recipe-cache,false,8192", "fn-smoke", "python", "-m",
                      "tools.flash_next.rental.tiny_smoke", "--out", "/results/t1", "--ckpt", "/tmp/fn-smoke-ckpt",
                      "--gdn", "pytorch,fused"]
+    assert not results.exists()  # a dry run writes nothing
+
+
+def test_tiny_smoke_dry_run_options(tmp_path):
+    results = tmp_path / "results"
+    proc = subprocess.run(
+        ["bash", str(SCRIPTS_DIR / "tiny_smoke.sh"), "--dry-run", "--results", str(results), "--run-id", "t1",
+         "--full-warmup", "--health-timeout", "2400", "--env", "X=1", "--env", "Y=2", "--no-recipe-cache"],
+        capture_output=True,
+        text=True,
+        cwd=tmp_path,
+        timeout=60,
+    )
+    assert proc.returncode == 0, proc.stderr
+    lines = [shlex.split(ln) for ln in proc.stdout.splitlines() if ln.startswith("docker ")]
+    assert len(lines) == 3, proc.stdout
+    smoke = lines[2]
+    assert smoke == ["docker", "exec", "-w", "/bundle/plugin", "fn-smoke", "python", "-m",
+                     "tools.flash_next.rental.tiny_smoke", "--out", "/results/t1", "--ckpt", "/tmp/fn-smoke-ckpt",
+                     "--gdn", "pytorch,fused", "--full-warmup", "--health-timeout", "2400", "--env", "X=1",
+                     "--env", "Y=2"]
+    assert not any("PT_HPU_RECIPE_CACHE_CONFIG" in word for word in smoke)  # --no-recipe-cache drops the -e pair
     assert not results.exists()  # a dry run writes nothing
 
 

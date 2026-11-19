@@ -144,8 +144,14 @@ and compares the served tokens with the reference each time:
 
 | Mode | GDN flags | A pass means |
 |---|---|---|
-| `pytorch` | `VLLM_HPU_GDN_CORE_DECODE=0`, `VLLM_HPU_GDN_CORE_VERIFY=0` | the server builds, warms up and decodes on the torch GDN path |
+| `pytorch` | `VLLM_HPU_GDN_CORE_DECODE=0`, `VLLM_HPU_GDN_CORE_VERIFY=0` | the server builds and decodes on the torch GDN path |
 | `fused` | `VLLM_HPU_GDN_CORE_DECODE=1`, `VLLM_HPU_GDN_CORE_VERIFY=0` | the same with the fused decode kernel, and no layer fell back to the torch path |
+
+By default the servers skip the bucket warmup (`VLLM_SKIP_WARMUP=true`) and the health wait is 1800 s:
+the warmup alone takes about 15 minutes per mode on the tiny model, while the four short prompts need
+only a handful of graphs, which compile on first use. A run then takes about 5 minutes per mode. The
+servers share a compiled-recipe cache under `results/recipe-cache`, reused on every start, so a second
+run is faster than the first.
 
 It prints one line per mode (`tiny smoke [pytorch]: PASSED ...`) and, on a failure, the error lines of
 the server log and the path of that log. Results are in `results/smoke-<UTC>/` (`summary.json`,
@@ -168,6 +174,10 @@ minutes instead of a full run:
 | `--reinstall` | install the stack again in the same container; needed after any change under `plugin/` (the servers run the installed plugin, not the source tree) |
 | `--fresh` | remove the container first: new install, new tiny checkpoint |
 | `--gdn LIST` | the modes to serve, in order (default `pytorch,fused`) |
+| `--full-warmup` | run the real bucket warmup (about 15 minutes per mode); the default skips it, see above |
+| `--health-timeout S` | seconds to wait for a server to get healthy, passed to the check (default 1800) |
+| `--env KEY=VALUE` | extra server environment variable, repeatable; applied after the mode's own flags, so it can override them (a `KEY` without `=` is a usage error) |
+| `--no-recipe-cache` | do not share the compiled-recipe cache under `results/recipe-cache` (see above) |
 | `--results DIR`, `--run-id ID`, `--image IMG`, `--dry-run` | as for `run_rental.sh`; `--results` is fixed once the container exists |
 
 It refuses to start while the rental run's container (`fn-rental`) is running, because that run holds
