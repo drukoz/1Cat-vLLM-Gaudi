@@ -150,8 +150,10 @@ and compares the served tokens with the reference each time:
 By default the servers skip the bucket warmup (`VLLM_SKIP_WARMUP=true`) and the health wait is 1800 s:
 the warmup alone takes about 15 minutes per mode on the tiny model, while the four short prompts need
 only a handful of graphs, which compile on first use. A run then takes about 5 minutes per mode. The
-servers share a compiled-recipe cache under `results/recipe-cache`, reused on every start, so a second
-run is faster than the first.
+`pytorch` mode's server shares a compiled-recipe cache under `results/recipe-cache`, reused on every
+start, so its second run is faster. The `fused` mode runs without it: its kernel database must be
+registered in `GC_KERNEL_PATH`, and the Habana 1.24.1 bridge accepts only one kernel library there
+next to a recipe cache (until the combined kernel database is installed).
 
 It prints one line per mode (`tiny smoke [pytorch]: PASSED ...`) and, on a failure, the error lines of
 the server log and the path of that log. Results are in `results/smoke-<UTC>/` (`summary.json`,
@@ -177,7 +179,7 @@ minutes instead of a full run:
 | `--full-warmup` | run the real bucket warmup (about 15 minutes per mode); the default skips it, see above |
 | `--health-timeout S` | seconds to wait for a server to get healthy, passed to the check (default 1800) |
 | `--env KEY=VALUE` | extra server environment variable, repeatable; applied after the mode's own flags, so it can override them (a `KEY` without `=` is a usage error) |
-| `--no-recipe-cache` | do not share the compiled-recipe cache under `results/recipe-cache` (see above) |
+| `--no-recipe-cache` | do not give the `pytorch` mode's server the compiled-recipe cache under `results/recipe-cache` (the `fused` mode never gets it, see above) |
 | `--results DIR`, `--run-id ID`, `--image IMG`, `--dry-run` | as for `run_rental.sh`; `--results` is fixed once the container exists |
 
 It refuses to start while the rental run's container (`fn-rental`) is running, because that run holds

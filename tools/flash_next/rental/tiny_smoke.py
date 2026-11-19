@@ -18,11 +18,16 @@ which then compile on first use. `--full-warmup` keeps the warmup (it measures t
 `--env KEY=VALUE` (repeatable) adds a server environment variable applied last, after the mode's own
 flags, so it can override anything. The health wait defaults to 1800 s.
 
+`--recipe-cache DIR` gives the compiled-recipe cache to the servers that may carry it
+(`serve.recipe_cache_env`): the `pytorch` mode's, and every server once the combined kernel database
+is installed. The `fused` mode runs without it: its kernel database must be registered in
+`GC_KERNEL_PATH`, and the Habana bridge accepts only one kernel library there next to a recipe cache.
+
 Runs on Python 3.10 with the standard library only, from the plugin root of the bundle:
 `python -m tools.flash_next.rental.tiny_smoke --out DIR [--ckpt DIR] [--gdn pytorch,fused] [--port N]
-[--health-timeout S] [--full-warmup] [--env KEY=VALUE]`. `--ckpt` names a folder the checkpoint is
-built in once and reused from then on (default: `<out>/ckpt`, built every time). tiny_smoke.sh starts
-this inside the container.
+[--health-timeout S] [--full-warmup] [--recipe-cache DIR] [--recipe-cache-mb N] [--env KEY=VALUE]`.
+`--ckpt` names a folder the checkpoint is built in once and reused from then on (default: `<out>/ckpt`,
+built every time). tiny_smoke.sh starts this inside the container.
 """
 
 from __future__ import annotations
@@ -100,12 +105,15 @@ def build_checkpoint(ckpt: Path) -> str | None:
 
 
 def run_mode(mode: str, ckpt: Path, out_dir: Path, port: int, health_timeout_s: float, skip_warmup: bool = True,
-             extra_env: dict | None = None) -> dict:
+             extra_env: dict | None = None, recipe_cache: str | None = None, recipe_cache_mb: int = 8192,
+             combined_db: bool = False) -> dict:
     """Serve the tiny checkpoint in one GDN mode, compare it with the reference, stop the server.
 
-    The overrides are the mode's GDN flags, then `VLLM_SKIP_WARMUP=true` when `skip_warmup`, then
-    `extra_env` applied last so it may override any of them. Returns the mode's summary entry; the
-    comparison's own record goes to `<out_dir>/details.json`.
+    The overrides are the mode's GDN flags, then `VLLM_SKIP_WARMUP=true` when `skip_warmup`, then the
+    recipe cache where `serve.recipe_cache_env` allows it for this mode (the fused mode's kernel
+    database must stay alone in `GC_KERNEL_PATH`), then `extra_env` applied last so it may override
+    any of them. Returns the mode's summary entry; the comparison's own record goes to
+    `<out_dir>/details.json`.
     """
     out_dir.mkdir(parents=True, exist_ok=True)
     log_path = out_dir / "server0.log"
@@ -120,9 +128,14 @@ def run_mode(mode: str, ckpt: Path, out_dir: Path, port: int, health_timeout_s: 
         overrides = dict(GDN_MODES[mode])
         if skip_warmup:
             overrides["VLLM_SKIP_WARMUP"] = "true"
+        cache_env, note = serve.recipe_cache_env(recipe_cache, recipe_cache_mb, overrides, combined_db)
+        overrides.update(cache_env)
         overrides.update(extra_env or {})
         env = serve.server_environment(overrides)
-        print("tiny smoke [%s]: starting the server (log: %s)" % (mode, log_path), flush=True)
+        entry["recipe_cache"] = note
+        cache_word = "on" if cache_env else "off"
+        print("tiny smoke [%s]: starting the server (recipe cache %s; log: %s)" % (mode, cache_word, log_path),
+              flush=True)
         popen = serve.start_server(serve_command(ckpt, port), env, log_path, out_dir)
         try:
             started = time.monotonic()
@@ -157,8 +170,10 @@ def report_mode(entry: dict) -> None:
     """One result line for the console, and on a failure the error lines and the log to read."""
     mode = entry["mode"]
     if entry["status"] == "passed":
-        print("tiny smoke [%s]: PASSED (server up in %s s, tokens match the reference, %s)" %
-              (mode, entry["startup_seconds"], entry.get("warmup", "warmup skipped")), flush=True)
+        note = entry.get("recipe_cache", serve.RECIPE_CACHE_NONE)
+        cache_word = "off" if note in (serve.RECIPE_CACHE_NONE, serve.RECIPE_CACHE_OFF_REASON) else "on"
+        print("tiny smoke [%s]: PASSED (server up in %s s, tokens match the reference, %s, recipe cache %s)" %
+              (mode, entry["startup_seconds"], entry.get("warmup", "warmup skipped"), cache_word), flush=True)
         return
     word = "TIMED OUT" if entry["status"] == "timed_out" else "FAILED"
     print("tiny smoke [%s]: %s (%s)" % (mode, word, entry["reason"]), flush=True)
@@ -181,6 +196,11 @@ def main(argv: list[str] | None = None) -> int:
                         "skip it (VLLM_SKIP_WARMUP=true) and the graphs compile on first use")
     parser.add_argument("--env", action="append", metavar="KEY=VALUE",
                         help="extra server environment variable, repeatable; applied after the mode's own flags")
+    parser.add_argument("--recipe-cache", default=None, metavar="DIR",
+                        help="compiled-recipe cache folder: given to the servers that may carry it (the pytorch "
+                        "mode's, and every server once the combined kernel database is installed)")
+    parser.add_argument("--recipe-cache-mb", type=int, default=8192, metavar="N",
+                        help="recipe cache size in MB (default: 8192)")
     args = parser.parse_args(argv)
     modes = [m for m in args.gdn.split(",") if m]
     if not modes or any(m not in GDN_MODES for m in modes):
@@ -195,12 +215,18 @@ def main(argv: list[str] | None = None) -> int:
     out = Path(args.out).absolute()
     out.mkdir(parents=True, exist_ok=True)
     ckpt = Path(args.ckpt).absolute() if args.ckpt else out / "ckpt"
+    try:
+        combined_db = orchestrator.combined_kernel_db_installed()
+    except Exception:  # noqa: BLE001 - no lookup: the plan of record is the fallback
+        combined_db = False
     summary: dict = {"passed": False, "reason": None, "checkpoint": str(ckpt), "modes": []}
     summary["reason"] = build_checkpoint(ckpt)
     if summary["reason"] is None:
         for mode in modes:
             entry = run_mode(mode, ckpt, out / mode, args.port, args.health_timeout,
-                             skip_warmup=not args.full_warmup, extra_env=extra_env)
+                             skip_warmup=not args.full_warmup, extra_env=extra_env,
+                             recipe_cache=args.recipe_cache, recipe_cache_mb=args.recipe_cache_mb,
+                             combined_db=combined_db)
             summary["modes"].append(entry)
             report_mode(entry)
         summary["passed"] = all(entry["status"] == "passed" for entry in summary["modes"])

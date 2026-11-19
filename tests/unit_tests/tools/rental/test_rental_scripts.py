@@ -544,10 +544,10 @@ def test_tiny_smoke_dry_run(tmp_path):
     assert install == ["docker", "exec", "fn-smoke", "bash",
                        "/bundle/plugin/tools/flash_next/rental/container_entry.sh", "--install-only", "--results",
                        "/results", "--run-id", "t1"]
-    assert smoke == ["docker", "exec", "-w", "/bundle/plugin", "-e",
-                     "PT_HPU_RECIPE_CACHE_CONFIG=/results/recipe-cache,false,8192", "fn-smoke", "python", "-m",
+    assert smoke == ["docker", "exec", "-w", "/bundle/plugin", "fn-smoke", "python", "-m",
                      "tools.flash_next.rental.tiny_smoke", "--out", "/results/t1", "--ckpt", "/tmp/fn-smoke-ckpt",
-                     "--gdn", "pytorch,fused"]
+                     "--gdn", "pytorch,fused", "--recipe-cache", "/results/recipe-cache"]
+    assert not any("PT_HPU_" in word for word in smoke)  # the cache moves to the check, not to the docker exec
     assert not results.exists()  # a dry run writes nothing
 
 
@@ -569,7 +569,8 @@ def test_tiny_smoke_dry_run_options(tmp_path):
                      "tools.flash_next.rental.tiny_smoke", "--out", "/results/t1", "--ckpt", "/tmp/fn-smoke-ckpt",
                      "--gdn", "pytorch,fused", "--full-warmup", "--health-timeout", "2400", "--env", "X=1",
                      "--env", "Y=2"]
-    assert not any("PT_HPU_RECIPE_CACHE_CONFIG" in word for word in smoke)  # --no-recipe-cache drops the -e pair
+    assert "--recipe-cache" not in smoke  # --no-recipe-cache drops the option
+    assert not any("PT_HPU_" in word for word in smoke)
     assert not results.exists()  # a dry run writes nothing
 
 

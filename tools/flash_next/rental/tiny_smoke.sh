@@ -15,8 +15,10 @@
 #
 # By default the servers skip the bucket warmup (VLLM_SKIP_WARMUP=true): the graphs compile on first
 # use and a run takes about 5 minutes per mode. --full-warmup keeps the real warmup, about 15 minutes
-# per mode on the tiny model. The servers share a compiled-recipe cache under /results/recipe-cache,
-# so the second run is faster; --no-recipe-cache drops it. --health-timeout S and --env KEY=VALUE
+# per mode on the tiny model. The pytorch mode's server gets a compiled-recipe cache under
+# /results/recipe-cache, reused on the next start, so its second run is faster; the fused mode runs
+# without it (its kernel database must be in GC_KERNEL_PATH, which the Habana bridge accepts only
+# without a recipe cache). --no-recipe-cache drops the cache. --health-timeout S and --env KEY=VALUE
 # (repeatable) are passed through to the check.
 #
 # The container stays. A second call reuses it, skips the install and the checkpoint build, and takes
@@ -45,7 +47,7 @@ usage() {
     echo "  --full-warmup   run the real bucket warmup (about 15 minutes per mode); the default skips it"
     echo "  --health-timeout S  seconds to wait for the server to get healthy (default in the check: 1800)"
     echo "  --env KEY=VALUE extra server environment variable, repeatable; applied after the mode's own flags"
-    echo "  --no-recipe-cache   do not share the compiled-recipe cache under /results/recipe-cache"
+    echo "  --no-recipe-cache   do not give the pytorch mode's server the compiled-recipe cache under /results/recipe-cache (the fused mode never gets it)"
     echo "  --dry-run       print the docker commands and exit 0"
 }
 
@@ -152,16 +154,17 @@ build_commands() {
         sleep infinity
     )
     INSTALL_CMD=(docker exec "$NAME" bash "/bundle/$ENTRY" --install-only --results /results --run-id "$RUN_ID")
-    SMOKE_CMD=(docker exec -w /bundle/plugin)
-    if [ "$NO_RECIPE_CACHE" -eq 0 ]; then
-        # The compiled recipes live under the mounted results directory and are reused on the next start.
-        SMOKE_CMD+=(-e "PT_HPU_RECIPE_CACHE_CONFIG=/results/recipe-cache,false,8192")
-    fi
-    SMOKE_CMD+=(
+    SMOKE_CMD=(
+        docker exec -w /bundle/plugin
         "$NAME"
         python -m tools.flash_next.rental.tiny_smoke
         --out "/results/$RUN_ID" --ckpt "$CKPT" --gdn "$GDN"
     )
+    if [ "$NO_RECIPE_CACHE" -eq 0 ]; then
+        # The check hands the cache to the pytorch mode's server only: the fused mode's kernel database
+        # must be registered in GC_KERNEL_PATH, which the Habana bridge accepts only without a cache.
+        SMOKE_CMD+=(--recipe-cache /results/recipe-cache)
+    fi
     if [ "$FULL_WARMUP" -eq 1 ]; then
         SMOKE_CMD+=(--full-warmup)
     fi
