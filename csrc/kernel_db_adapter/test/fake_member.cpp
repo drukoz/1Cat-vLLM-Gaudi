@@ -27,7 +27,7 @@ const char* guid_name(char* buffer, size_t size) {
 
 void set_guid(GuidInfo* info, const char* name) {
     std::memset(info, 0, sizeof(*info));
-    std::strncpy(info->name, name, MAX_NODE_NAME - 1);
+    std::snprintf(info->name, MAX_NODE_NAME, "%s", name);
 }
 
 }  // namespace
