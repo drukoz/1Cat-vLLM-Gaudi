@@ -152,9 +152,11 @@ void ensure_loaded() { std::call_once(g_once, load_members); }
 // The "stock" member is the last opened member (the required stock library position).
 Member* stock_member() { return g_members.empty() ? nullptr : &g_members.back(); }
 
-size_t route(const char* name) {
+// A name no member listed goes to the stock member, as the DeepSeek glue does: the stock library
+// may serve names it does not enumerate, and non-Gaudi2 GUIDs are not in the map at all.
+Member& route(const char* name) {
     auto it = g_owner.find(std::string(name ? name : ""));
-    return it == g_owner.end() ? g_members.size() : it->second;
+    return it == g_owner.end() ? g_members.back() : g_members[it->second];
 }
 
 }  // namespace
@@ -199,11 +201,7 @@ extern "C" GlueCodeReturn InstantiateTpcKernel(const HabanaKernelParams* params,
     if (g_members.empty() || !params) {
         return GLUE_FAILED;
     }
-    const size_t index = route(params->guid.name);
-    if (index >= g_members.size()) {
-        return GLUE_NODE_NOT_FOUND;
-    }
-    Member& m = g_members[index];
+    Member& m = route(params->guid.name);
     return m.instantiate ? m.instantiate(params, instance) : GLUE_FAILED;
 }
 
@@ -214,11 +212,7 @@ extern "C" GlueCodeReturn GetShapeInference(DeviceId deviceId, const ShapeInfere
         return GLUE_FAILED;
     }
     const GuidInfo* guid = inputParams->pGuid ? inputParams->pGuid : &inputParams->guid;
-    const size_t index = route(guid->name);
-    if (index >= g_members.size()) {
-        return GLUE_NODE_NOT_FOUND;
-    }
-    Member& m = g_members[index];
+    Member& m = route(guid->name);
     return m.shapeInference ? m.shapeInference(deviceId, inputParams, outputData) : GLUE_FAILED;
 }
 
@@ -227,11 +221,7 @@ extern "C" GlueCodeReturn GetSuggestedManipulation(const HabanaKernelParams* par
     if (g_members.empty() || !params) {
         return GLUE_FAILED;
     }
-    const size_t index = route(params->guid.name);
-    if (index >= g_members.size()) {
-        return GLUE_NODE_NOT_FOUND;
-    }
-    Member& m = g_members[index];
+    Member& m = route(params->guid.name);
     return m.suggestedManipulation ? m.suggestedManipulation(params, manipulation) : GLUE_FAILED;
 }
 
@@ -241,11 +231,7 @@ extern "C" GlueCodeReturn GetSupportedDataLayouts(const HabanaKernelParams* para
     if (g_members.empty() || !params) {
         return GLUE_FAILED;
     }
-    const size_t index = route(params->guid.name);
-    if (index >= g_members.size()) {
-        return GLUE_NODE_NOT_FOUND;
-    }
-    Member& m = g_members[index];
+    Member& m = route(params->guid.name);
     return m.supportedDataLayouts ? m.supportedDataLayouts(params, supportedLayouts, layoutCount) : GLUE_FAILED;
 }
 

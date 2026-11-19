@@ -107,8 +107,9 @@ void scenario_two_members() {
     check(rc == GLUE_SUCCESS && inst.kernel.paramsNr == 1, "Instantiate fake_shared -> member a (first wins)");
 
     set_name(&params.guid, "totally_unknown_guid");
+    inst.kernel.paramsNr = 0;
     rc = instantiate(&params, &inst);
-    check(rc == GLUE_NODE_NOT_FOUND, "Instantiate unknown GUID -> GLUE_NODE_NOT_FOUND");
+    check(rc == GLUE_SUCCESS && inst.kernel.paramsNr == 2, "Instantiate unknown GUID -> stock (last) member b");
 
     // GetLibVersion comes from the stock (last) member: member b.
     check(libVersion() == 1002ULL, "GetLibVersion is the last member's (stock) value 1002");

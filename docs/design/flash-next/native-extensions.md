@@ -135,7 +135,7 @@ entry point returns `GLUE_FAILED` and `GetKernelGuids` reports 0.
 | Entry point | Routing rule |
 |---|---|
 | `GetKernelGuids` | merged list of all members for `DEVICE_ID_GAUDI2` (first wins on a duplicate); two-call size protocol; capacity smaller than the total is `GLUE_FAILED`; a non-Gaudi2 device forwards to the stock member only |
-| `InstantiateTpcKernel` | by `p->guid.name` to the owning member; unknown name `GLUE_NODE_NOT_FOUND` |
+| `InstantiateTpcKernel` | by `p->guid.name` to the owning member; a name no member lists goes to the stock member (as the DeepSeek glue does) |
 | `GetShapeInference` | by `(p->pGuid ? p->pGuid : &p->guid)->name` |
 | `GetSuggestedManipulation` | by `p->guid.name`; a member without the symbol is `GLUE_FAILED` |
 | `GetSupportedDataLayouts` | by `p->guid.name` |
