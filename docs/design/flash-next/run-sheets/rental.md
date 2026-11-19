@@ -167,9 +167,34 @@ the cards. `Ctrl-C` stops the check inside the container too, so the tiny server
 `sudo docker exec -it fn-smoke bash` opens a shell in the container; `sudo docker rm -f fn-smoke`
 removes it when you are done.
 
-`tiny_smoke.sh` has not run on a card yet (it was written after rental run 1). The steps it runs are
-the ones done by hand on 2026-11-18: about 2 minutes for the install, several minutes for the first
-checkpoint build, about 2 minutes for a tiny server to start.
+`tiny_smoke.sh` first ran on a card on 2026-11-19 (rental run 2): the install, the checkpoint build and
+the server start worked as designed, and it caught two prompt-warmup failures that no Mac test could see
+(the MoE fast path's engine drift, `ca676dd`; `torch.cummax` without an HPU kernel, `b89bdd7`). Both were
+applied to the running container one file at a time, as below, and rerun in minutes.
+
+### Updating the bundle on a prepared node
+
+When the branch changes after the node was prepared, copy the new tarball and extract it over the same
+folder:
+
+```bash
+# workstation
+scp -i <key> dist/flash-next-rental-<sha>.tar.gz <node>:~/
+# node
+tar xzf ~/flash-next-rental-<sha>.tar.gz -C ~/rental && cat ~/rental/BUNDLE.txt
+```
+
+The tarball holds only `BUNDLE.txt`, the three scripts, `plugin/` and `vllm/`, so `results/`, the
+containers and the data disk are untouched, and `BUNDLE.txt` names the plugin commit the run's manifest
+records. `run_rental.sh` installs from the bundle folder into its own container (`fn-rental`), so it always
+runs the replaced `plugin/`. The smoke container keeps its installed stack: run
+`sudo bash tiny_smoke.sh --reinstall` when the change is on the smoke test's path, or patch one file into it
+without a reinstall (`/bundle` is the bind-mounted bundle folder, so the copied file is the one the bundle
+now carries):
+
+```bash
+sudo docker exec fn-smoke bash -c 'cd / && d=$(python -c "import importlib.util as u; print(u.find_spec(\"vllm_gaudi\").submodule_search_locations[0])") && cp /bundle/plugin/vllm_gaudi/<path>.py "$d/<path>.py" && echo "patched $d/<path>.py"'
+```
 
 ## The one command (on the node)
 
