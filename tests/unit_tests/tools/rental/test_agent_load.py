@@ -14,6 +14,7 @@ from pathlib import Path
 
 from aiohttp import web
 
+from tools.flash_next.rental import serve
 from tools.flash_next.rental.agent_load import main as agent_load_main
 from tools.flash_next.rental.agent_load import run_load
 from tools.flash_next.rental.schema import REQUEST_KEYS, RequestStatus
@@ -239,17 +240,23 @@ def test_rows_flush_as_they_finish(tmp_path: Path) -> None:
     asyncio.run(scenario())
 
 
-def _stub_subprocess(port: int, extra: list) -> subprocess.Popen:
+def _stub_subprocess(tmp_path: Path, extra: list) -> tuple[subprocess.Popen, int]:
     root = Path(__file__).resolve().parents[4]
-    cmd = [sys.executable, "-m", "tools.flash_next.rental.stub_server", "--port",
-           str(port), "--tokens-per-second", "400"] + extra
+    port_file = tmp_path / "stub.port"
+    port_file.unlink(missing_ok=True)
+    cmd = [sys.executable, "-m", "tools.flash_next.rental.stub_server", "--port", "0", "--port-file",
+           str(port_file), "--tokens-per-second", "400"] + extra
     proc = subprocess.Popen(cmd, cwd=str(root))
+    port = serve.wait_port_file(port_file, 15.0, proc)
+    if port is None:
+        proc.kill()
+        raise RuntimeError("stub server did not start")
     deadline = time.monotonic() + 15.0
     while time.monotonic() < deadline:
         try:
             with urllib.request.urlopen("http://127.0.0.1:%d/health" % port, timeout=0.5) as resp:
                 if resp.status == 200:
-                    return proc
+                    return proc, port
         except OSError:
             time.sleep(0.1)
     proc.kill()
@@ -275,9 +282,9 @@ def test_cli_exit_codes(tmp_path: Path) -> None:
     workload_path = tmp_path / "workload.json"
     workload_path.write_text(json.dumps(make_workload(agents=2, turns=2, max_tokens=8)), encoding="utf-8")
 
-    proc = _stub_subprocess(8931, [])
+    proc, port = _stub_subprocess(tmp_path, [])
     try:
-        rc = _run_cli(workload_path, 8931, tmp_path / "ok.jsonl")
+        rc = _run_cli(workload_path, port, tmp_path / "ok.jsonl")
         assert rc == 0
         rows = read_rows(tmp_path / "ok.jsonl")
         assert len(rows) == 4 and all(r["status"] == 0 for r in rows)
@@ -285,9 +292,9 @@ def test_cli_exit_codes(tmp_path: Path) -> None:
         proc.terminate()
         proc.wait(timeout=10)
 
-    proc = _stub_subprocess(8932, ["--fail-after", "1"])
+    proc, port = _stub_subprocess(tmp_path, ["--fail-after", "1"])
     try:
-        rc = _run_cli(workload_path, 8932, tmp_path / "bad.jsonl")
+        rc = _run_cli(workload_path, port, tmp_path / "bad.jsonl")
         assert rc == 1
         rows = read_rows(tmp_path / "bad.jsonl")
         assert any(r["status"] == int(RequestStatus.HTTP_ERROR) for r in rows)
