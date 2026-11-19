@@ -55,6 +55,15 @@ def test_container_entry_installs_pytest():
     assert 'install_step 3b "test tools" pip install pytest' in text
 
 
+def test_container_entry_forwards_recipe_cache():
+    # The entry accepts --recipe-cache and forwards it to the orchestrator (RUK-3244).
+    text = (SCRIPTS_DIR / "container_entry.sh").read_text()
+    assert "--recipe-cache)" in text
+    assert 'MAIN_ARGS+=(--recipe-cache "$RECIPE_CACHE")' in text
+    proc = subprocess.run(["bash", "-n", str(SCRIPTS_DIR / "container_entry.sh")], capture_output=True, text=True)
+    assert proc.returncode == 0, proc.stderr
+
+
 def test_run_rental_dry_run(tmp_path):
     proc = subprocess.run(
         ["bash", str(SCRIPTS_DIR / "run_rental.sh"), "--dry-run", "--model", "/tmp/x"],
@@ -74,7 +83,9 @@ def test_run_rental_dry_run(tmp_path):
     # printf %q escapes `:` and `,` on bash 3.2; compare on the unescaped line (RUK-3200).
     flat = out.replace("\\", "")
     assert "/tmp/recipe-cache:/recipe-cache" in flat  # the default sits next to the model
-    assert "-e PT_HPU_RECIPE_CACHE_CONFIG=/recipe-cache,false,16384" in flat
+    # The env is not set on the container; the orchestrator gets the folder (RUK-3244).
+    assert "PT_HPU_RECIPE_CACHE_CONFIG" not in flat
+    assert "--recipe-cache /recipe-cache" in flat
     assert "--full-warmup" not in out  # warmup is skipped by default
     assert "--no-warm-pass" not in out  # the warm pass runs by default
 
@@ -102,7 +113,8 @@ def test_run_rental_dry_run_warmup_options(tmp_path):
     assert proc.returncode == 0, proc.stderr
     flat = proc.stdout.replace("\\", "")
     assert "/x:/recipe-cache" in flat
-    assert "PT_HPU_RECIPE_CACHE_CONFIG=/recipe-cache,false,16384" in flat
+    assert "PT_HPU_RECIPE_CACHE_CONFIG" not in flat
+    assert "--recipe-cache /recipe-cache" in flat
     assert "--full-warmup" in proc.stdout
     assert "--server-timeout 7200" in flat
 
@@ -129,6 +141,32 @@ def test_run_rental_dry_run_no_warm_pass(tmp_path):
     line = proc.stdout.strip()
     assert line.endswith("--no-warm-pass")
     assert line.count("--no-warm-pass") == 1
+
+
+def test_run_rental_recipe_cache_before_no_warm_pass(tmp_path):
+    """The recipe-cache option reaches the entry before --no-warm-pass, which stays last
+    (RUK-3244 with RUK-3203)."""
+    proc = subprocess.run(
+        [
+            "bash",
+            str(SCRIPTS_DIR / "run_rental.sh"),
+            "--dry-run",
+            "--model",
+            "/tmp/x",
+            "--no-disk-check",
+            "--no-warm-pass",
+        ],
+        capture_output=True,
+        text=True,
+        cwd=tmp_path,
+        timeout=60,
+    )
+    assert proc.returncode == 0, proc.stderr
+    line = proc.stdout.strip()
+    flat = line.replace("\\", "")
+    assert "--recipe-cache /recipe-cache" in flat
+    assert line.endswith("--no-warm-pass")
+    assert flat.index("--recipe-cache /recipe-cache") < flat.index("--no-warm-pass")
 
 
 def test_run_rental_dry_run_no_recipe_cache(tmp_path):

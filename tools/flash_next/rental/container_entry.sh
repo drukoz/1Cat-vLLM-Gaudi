@@ -29,6 +29,7 @@ SKIP_INSTALL=0
 INSTALL_ONLY=0
 FULL_WARMUP=0
 SERVER_TIMEOUT=""
+RECIPE_CACHE=""
 NO_WARM_PASS=0
 
 while [ $# -gt 0 ]; do
@@ -75,6 +76,10 @@ while [ $# -gt 0 ]; do
             ;;
         --server-timeout)
             SERVER_TIMEOUT="$2"
+            shift 2
+            ;;
+        --recipe-cache)
+            RECIPE_CACHE="$2"
             shift 2
             ;;
         --no-warm-pass)
@@ -274,6 +279,7 @@ if [ -n "$SERVER_TIMEOUT" ]; then MAIN_ARGS+=(--server-timeout "$SERVER_TIMEOUT"
 if [ -n "$VARIANTS" ]; then MAIN_ARGS+=(--variants "$VARIANTS"); fi
 if [ "$WITH_PROFILE" -eq 1 ]; then MAIN_ARGS+=(--with-profile); fi
 if [ -n "$FROM_PHASE" ]; then MAIN_ARGS+=(--from "$FROM_PHASE"); fi
+if [ -n "$RECIPE_CACHE" ]; then MAIN_ARGS+=(--recipe-cache "$RECIPE_CACHE"); fi
 if [ "$NO_WARM_PASS" -eq 1 ]; then MAIN_ARGS+=(--no-warm-pass); fi
 
 echo "phase: orchestrator (python -m tools.flash_next.rental.main)"

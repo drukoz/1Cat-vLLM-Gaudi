@@ -29,9 +29,10 @@ usage() {
     echo "                    compile on first use)"
     echo "  --server-timeout S  seconds to wait for a server to become healthy (default: 1800, enough"
     echo "                    with the default skipped warmup; raise it with --full-warmup)"
-    echo "  --recipe-cache DIR  host folder for the HPU recipe cache, mounted at /recipe-cache"
-    echo "                    (default: a recipe-cache folder next to --model, i.e. on the data disk;"
-    echo "                    an empty DIR disables the mount)"
+    echo "  --recipe-cache DIR  host folder for the HPU recipe cache, mounted at /recipe-cache and"
+    echo "                    handed to the orchestrator, which gives it only to servers that run"
+    echo "                    without the fused GDN kernel (the bridge accepts one kernel library next"
+    echo "                    to a recipe cache); default: a recipe-cache folder next to --model"
     echo "  --no-recipe-cache   do not mount an HPU recipe cache"
     echo "  --dry-run         print the docker command and exit 0"
     echo "  --no-disk-check   skip the free-space checks (download folder and Docker root)"
@@ -226,17 +227,19 @@ if [ -n "$VARIANTS" ]; then ENTRY_ARGS+=(--variants "$VARIANTS"); fi
 if [ "$WITH_PROFILE" -eq 1 ]; then ENTRY_ARGS+=(--with-profile); fi
 if [ -n "$FROM_PHASE" ]; then ENTRY_ARGS+=(--from "$FROM_PHASE"); fi
 if [ "$DOWNLOAD" -eq 1 ]; then ENTRY_ARGS+=(--download); fi
+if [ "$NO_RECIPE_CACHE" -eq 0 ]; then ENTRY_ARGS+=(--recipe-cache /recipe-cache); fi
 # Appended last so the --dry-run line ends with --no-warm-pass.
 if [ "$NO_WARM_PASS" -eq 1 ]; then ENTRY_ARGS+=(--no-warm-pass); fi
 
-# The recipe-cache mount and its env are optional, so they are collected separately and spliced
-# into the command with the `${arr[@]+"${arr[@]}"}` guard (bash 3.2 keeps `set -u` quiet for the
-# empty array of --no-recipe-cache).
+# The recipe-cache mount is optional, so it is collected separately and spliced into the command
+# with the `${arr[@]+"${arr[@]}"}` guard (bash 3.2 keeps `set -u` quiet for the empty array of
+# --no-recipe-cache). PT_HPU_RECIPE_CACHE_CONFIG is not set here: the orchestrator hands it per
+# server (RUK-3242), because the Habana bridge rejects the plugin's colon-list GC_KERNEL_PATH
+# next to a recipe cache.
 RECIPE_CACHE_ARGS=()
 if [ "$NO_RECIPE_CACHE" -eq 0 ]; then
     RECIPE_CACHE_ARGS=(
         -v "$RECIPE_CACHE:/recipe-cache"
-        -e PT_HPU_RECIPE_CACHE_CONFIG=/recipe-cache,false,16384
     )
 fi
 
