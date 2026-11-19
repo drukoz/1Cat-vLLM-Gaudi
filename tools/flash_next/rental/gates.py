@@ -669,8 +669,14 @@ def tiny_compare(base_url: str, reference_path: Path) -> tuple[GateStatus, dict]
         return GateStatus.FAILED, details
 
 
-def coherence(base_url: str, model: str, needle_messages: list) -> tuple[GateStatus, dict]:
-    """Stage 2b: the 8 short-prompt coherence check plus the 120K-token needle."""
+def coherence(base_url: str,
+              model: str,
+              needle_messages: list,
+              request_timeout_s: float = HTTP_TIMEOUT_S) -> tuple[GateStatus, dict]:
+    """Stage 2b: the 8 short-prompt coherence check plus the 120K-token needle.
+
+    request_timeout_s is the per-request HTTP timeout; the orchestrator raises it above HTTP_TIMEOUT_S
+    when the servers skip the bucket warmup and the first prompts pay the graph compilation."""
     details: dict = {"answers": [], "needle": None}
     try:
         failed = False
@@ -681,7 +687,7 @@ def coherence(base_url: str, model: str, needle_messages: list) -> tuple[GateSta
                                   "prompt": prompt,
                                   "max_tokens": COHERENCE_MAX_TOKENS,
                                   "temperature": 0,
-                              }, HTTP_TIMEOUT_S)
+                              }, request_timeout_s)
             text = (resp.get("choices") or [{}])[0].get("text")
             text = "" if text is None else text
             words = text.split()
@@ -721,7 +727,7 @@ def coherence(base_url: str, model: str, needle_messages: list) -> tuple[GateSta
                 "chat_template_kwargs": {
                     "enable_thinking": False
                 },
-            }, HTTP_TIMEOUT_S)
+            }, request_timeout_s)
         answer = (resp.get("choices") or [{}])[0].get("message", {}).get("content")
         answer = "" if answer is None else answer
         hit = NEEDLE_CODE in answer

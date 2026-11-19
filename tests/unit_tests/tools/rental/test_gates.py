@@ -525,6 +525,27 @@ def test_coherence_server_down():
     assert "error" in details
 
 
+def test_coherence_passes_request_timeout_to_post_json(monkeypatch):
+    timeouts = []
+
+    def fake_post(base_url, path, payload, timeout_s):
+        timeouts.append(timeout_s)
+        if path == "/v1/completions":
+            return {"choices": [{"text": JSON_ANSWER}]}
+        return {"choices": [{"message": {"content": gates.NEEDLE_CODE}}]}
+
+    monkeypatch.setattr(gates, "_post_json", fake_post)
+    status, _ = gates.coherence("http://server", "model", NEEDLE_MESSAGES, request_timeout_s=3600.0)
+    assert status is GateStatus.PASSED
+    assert len(timeouts) == 9  # 8 coherence prompts + the needle chat request
+    assert all(t == 3600.0 for t in timeouts)
+
+    timeouts.clear()
+    status, _ = gates.coherence("http://server", "model", NEEDLE_MESSAGES)
+    assert status is GateStatus.PASSED
+    assert all(t == gates.HTTP_TIMEOUT_S for t in timeouts)
+
+
 # --------------------------------------------------------------------------- card_tests
 
 CARD_TESTS_FAKE_PY = """

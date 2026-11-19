@@ -429,3 +429,26 @@ def test_expected_rows_follow_workload_agents(tmp_path: Path) -> None:
     summary = summarize_run(run)
     assert summary["variants"]["A"]["requests"]["expected"] == 4  # 2 agents x 2 turns, not 4 x 2
     assert summary["variants"]["B"]["requests"]["expected"] == 4
+
+
+def test_summary_header_warmup_and_timeout(tmp_path: Path) -> None:
+    run = build_run(tmp_path)
+    manifest = json.loads((run / "manifest.json").read_text(encoding="utf-8"))
+    manifest["skip_warmup"] = True
+    manifest["server_timeout_s"] = 7200.0
+    write_json(run / "manifest.json", manifest)
+    assert report_main([str(run)]) == 0
+    summary = summarize_run(run)
+    assert summary["run"]["skip_warmup"] is True
+    assert summary["run"]["server_timeout_s"] == 7200.0
+    md = (run / "summary.md").read_text(encoding="utf-8")
+    assert "- Warmup: skipped (graphs compiled on first use)" in md
+    assert "- Server health timeout: 7200.0 s" in md
+
+    manifest["skip_warmup"] = False
+    del manifest["server_timeout_s"]
+    write_json(run / "manifest.json", manifest)
+    assert report_main([str(run)]) == 0
+    md = (run / "summary.md").read_text(encoding="utf-8")
+    assert "- Warmup: full" in md
+    assert "- Server health timeout: n/a" in md

@@ -11,8 +11,9 @@ names. Python 3.10 standard library only.
 
 ``manifest.json`` (written by main.py, M4-H6) is read for these keys; unknown
 keys are ignored and missing ones become null: ``run_id``, ``bundle_commit``,
-``workload_sha``, ``mode``, ``created``, ``workload`` (the workload.json
-header, for ``turns``) and ``variants`` (the variants.json entries that ran).
+``workload_sha``, ``mode``, ``created``, ``skip_warmup``, ``server_timeout_s``,
+``workload`` (the workload.json header, for ``turns``) and ``variants`` (the
+variants.json entries that ran).
 """
 
 from __future__ import annotations
@@ -369,6 +370,8 @@ def summarize_run(run_dir: Path) -> dict:
         "workload_sha": _manifest_pick(manifest, "workload_sha", "workload_sha256"),
         "mode": manifest.get("mode"),
         "created": manifest.get("created"),
+        "skip_warmup": manifest.get("skip_warmup"),
+        "server_timeout_s": manifest.get("server_timeout_s"),
         "workload": {
             "version": workload.get("version"),
             "shared_prefix_tokens": workload.get("shared_prefix_tokens"),
@@ -454,6 +457,9 @@ def render_markdown(summary: dict) -> str:
     lines.append("- Run: %s" % (run.get("run_id") or "n/a"))
     lines.append("- Bundle commit: %s" % (run.get("bundle_commit") or "n/a"))
     lines.append("- Workload sha: %s" % (run.get("workload_sha") or "n/a"))
+    lines.append("- Warmup: %s" % ("skipped (graphs compiled on first use)" if run.get("skip_warmup") else "full"))
+    server_timeout = run.get("server_timeout_s")
+    lines.append("- Server health timeout: %s" % ("%s s" % server_timeout if server_timeout is not None else "n/a"))
     lines.append("")
 
     lines.append("## Gates")
