@@ -130,6 +130,11 @@ json_str() {
 
 TOOLS_INSTALLED_BY_SCRIPT=false
 
+# Debs for habanalabs-tools and the packages the image lacks (libboost-dev, ...) are kept on the data
+# disk (/models, the checkpoint's parent folder), so only the first run on a node pays for
+# `apt-get update`; later containers install from this cache without it. Delete the folder to refresh.
+APT_DEB_CACHE="/models/apt-cache/habanalabs-tools-$HABANA_TOOLS_VERSION"
+
 install_toolchain() {
     # install_toolchain — installs habanalabs-tools (tpc-clang) when the image lacks it (the
     # proven tpcsim recipe). Never exits: on failure the run continues with NATIVE=0.
@@ -141,22 +146,50 @@ install_toolchain() {
     # errexit is off in here (the caller runs `install_toolchain || true`), so the group's status
     # would be ldconfig's; success is judged by tpc-clang being on PATH afterwards.
     {
-        # The image configures the Habana repo for habanalabs-graph; add it only when absent.
-        if ! grep -qs vault.habana.ai /etc/apt/sources.list.d/*; then
-            curl -fsSL https://vault.habana.ai/artifactory/api/gpg/key/public \
-                | gpg --dearmor -o /usr/share/keyrings/habana-artifactory.gpg
-            echo "deb [signed-by=/usr/share/keyrings/habana-artifactory.gpg] https://vault.habana.ai/artifactory/debian jammy main" \
-                > /etc/apt/sources.list.d/habanalabs.list
-        fi
-        # An unrelated stale repo of the image can fail the update; the install decides.
-        apt-get update || true
         export DEBIAN_FRONTEND=noninteractive  # no debconf prompt can wait on stdin
-        apt-get install -y --no-install-recommends habanalabs-tools=1.24.1-482 \
-            || (echo "apt install failed, falling back to the direct deb" \
-                && curl -fsSL -o /tmp/habanalabs-tools.deb \
-                   https://vault.habana.ai/artifactory/debian/jammy/pool/main/h/habanalabs-tools/habanalabs-tools_1.24.1-482_amd64.deb \
-                && apt-get install -y --no-install-recommends /tmp/habanalabs-tools.deb \
-                && rm -f /tmp/habanalabs-tools.deb)
+        local cache_ok=0
+        if [ -d /models ] && mkdir -p "$APT_DEB_CACHE/partial"; then
+            cache_ok=1
+        fi
+        # Rerun on the same node: the data-disk cache carries the debs, so no apt-get update.
+        if [ "$cache_ok" -eq 1 ] && [ -f "$APT_DEB_CACHE/complete" ] \
+            && ls "$APT_DEB_CACHE"/*.deb >/dev/null 2>&1; then
+            echo "installing habanalabs-tools from the deb cache $APT_DEB_CACHE (no apt-get update)"
+            apt-get install -y --no-install-recommends "$APT_DEB_CACHE"/*.deb \
+                || { echo "deb cache install failed; falling back to apt-get update"; \
+                     rm -f "$APT_DEB_CACHE/complete"; }
+            hash -r
+        fi
+        if ! command -v tpc-clang >/dev/null 2>&1; then
+            # The image configures the Habana repo for habanalabs-graph; add it only when absent.
+            if ! grep -qs vault.habana.ai /etc/apt/sources.list.d/*; then
+                curl -fsSL https://vault.habana.ai/artifactory/api/gpg/key/public \
+                    | gpg --dearmor -o /usr/share/keyrings/habana-artifactory.gpg
+                echo "deb [signed-by=/usr/share/keyrings/habana-artifactory.gpg] https://vault.habana.ai/artifactory/debian jammy main" \
+                    > /etc/apt/sources.list.d/habanalabs.list
+            fi
+            # An unrelated stale repo of the image can fail the update; the install decides.
+            apt-get update || true
+            # First run (or a broken cache): download the debs into the cache, then install them
+            # from there, so the next container on this node needs no update and no download.
+            if [ "$cache_ok" -eq 1 ]; then
+                rm -f "$APT_DEB_CACHE"/*.deb
+                if apt-get install -y --no-install-recommends --download-only \
+                        -o Dir::Cache::Archives="$APT_DEB_CACHE" habanalabs-tools=1.24.1-482 \
+                    && apt-get install -y --no-install-recommends "$APT_DEB_CACHE"/*.deb; then
+                    touch "$APT_DEB_CACHE/complete"
+                fi
+                hash -r
+            fi
+            if ! command -v tpc-clang >/dev/null 2>&1; then
+                apt-get install -y --no-install-recommends habanalabs-tools=1.24.1-482 \
+                    || (echo "apt install failed, falling back to the direct deb" \
+                        && curl -fsSL -o /tmp/habanalabs-tools.deb \
+                           https://vault.habana.ai/artifactory/debian/jammy/pool/main/h/habanalabs-tools/habanalabs-tools_1.24.1-482_amd64.deb \
+                        && apt-get install -y --no-install-recommends /tmp/habanalabs-tools.deb \
+                        && rm -f /tmp/habanalabs-tools.deb)
+            fi
+        fi
         # habanalabs-tools ships its .so files without RPATH, so the loader needs:
         echo "/usr/lib/habanatools" > /etc/ld.so.conf.d/habanatools.conf
         ldconfig
