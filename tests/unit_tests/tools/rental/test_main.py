@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for the rental orchestrator (stub mode) and its helpers."""
 
+import copy
 import json
 import shutil
 import socket
@@ -291,3 +292,53 @@ def test_tiny_env_matches_variant_env(tmp_path, monkeypatch):
         assert tiny.get(key) == venv.get(key)
     assert tiny["PT_HPU_LAZY_MODE"] == "1"
     assert "VLLM_COMPACT_GDN" not in tiny
+
+
+def node_runner(tmp_path):
+    args = rental_main._parse_args(["--mode", "node", "--model", str(tmp_path / "model"),
+                                    "--results", str(tmp_path / "results"), "--run-id", "r",
+                                    "--variants", "A"])
+    return rental_main.Runner(args, rental_main.load_variants())
+
+
+def test_tiny_gate_refuses_held_port(tmp_path, monkeypatch):
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.bind(("127.0.0.1", 0))
+    sock.listen(1)
+    held_port = int(sock.getsockname()[1])
+    try:
+
+        def no_run(*args, **kwargs):
+            raise AssertionError("the tiny checkpoint must not be built")
+
+        monkeypatch.setattr(rental_main, "TINY_PORT", held_port)
+        monkeypatch.setattr(rental_main.subprocess, "run", no_run)
+        runner = node_runner(tmp_path)
+        status, details = runner.gate_tiny(tmp_path / "tiny")
+        assert status == GateStatus.FAILED
+        assert "already in use" in details["reason"]
+    finally:
+        sock.close()
+
+
+def test_node_variant_refuses_held_port(tmp_path, monkeypatch):
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.bind(("127.0.0.1", 0))
+    sock.listen(1)
+    port = int(sock.getsockname()[1])
+    try:
+
+        def no_start(*args, **kwargs):
+            raise AssertionError("no server must start on a held port")
+
+        monkeypatch.setattr(rental_main.serve, "start_server", no_start)
+        runner = node_runner(tmp_path)
+        v = copy.deepcopy(runner.variant_by_id("A"))
+        v["servers"][0]["port"] = port
+        v["on_fail"] = 1
+        runner.run_variant(v)
+        status = read_json(tmp_path / "results" / "r" / "A" / "status.json")
+        assert status["status"] == int(GateStatus.FAILED)
+        assert "port %d already in use" % port in status["reason"]
+    finally:
+        sock.close()

@@ -277,3 +277,13 @@ class TestProcessHandling:
         started = time.time()
         assert serve.wait_port_file(tmp_path / "missing", 10.0, proc) is None
         assert time.time() - started < 2
+
+
+def test_port_in_use():
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        sock.listen(1)
+        port = int(sock.getsockname()[1])
+        assert serve.port_in_use(port) is True
+    assert serve.port_in_use(port) is False
+    assert serve.port_in_use(free_port()) is False
