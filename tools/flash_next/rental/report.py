@@ -2,8 +2,9 @@
 """Per-variant summary and comparison report of a rental run (plan M4, RUK-2709).
 
 ``python -m tools.flash_next.rental.report RUN_DIR`` reads every variant folder
-of a run (``status.json``, ``startup.json``, ``requests.jsonl``,
-``metrics.jsonl``), the gates' ``status.json`` files and ``manifest.json``, and
+of a run (``status.json``, ``startup.json``, ``warm-pass.json``,
+``requests.jsonl``, ``metrics.jsonl``), the gates' ``status.json`` files and
+``manifest.json``, and
 writes ``RUN_DIR/summary.json`` and ``RUN_DIR/summary.md``. Every file may be
 missing (a stopped run): the report is still written, with nulls and the
 reason. Statuses stay integers in the JSON; only the markdown turns them into
@@ -36,6 +37,7 @@ from tools.flash_next.rental.schema import (
 SUMMARY_JSON = "summary.json"
 SUMMARY_MD = "summary.md"
 MANIFEST_FILE = "manifest.json"
+WARM_PASS_FILE = "warm-pass.json"
 
 GATE_DIRS = ("preflight", "build", "tiny")
 
@@ -247,6 +249,11 @@ def summarize_variant(variant_dir: Path, agents: int, turns: Optional[int] = Non
         startup = None
         reasons["startup"] = startup_reason
 
+    # warm-pass.json is legitimately absent (--no-warm-pass, a run before RUK-3203): no reason entry
+    warm_pass, _ = _read_json(variant_dir / WARM_PASS_FILE)
+    if not isinstance(warm_pass, dict):
+        warm_pass = None
+
     rows, requests_reason = _read_jsonl(variant_dir / REQUESTS_FILE)
     if requests_reason is not None:
         reasons["requests"] = requests_reason
@@ -329,6 +336,7 @@ def summarize_variant(variant_dir: Path, agents: int, turns: Optional[int] = Non
         "reason": reason,
         "seconds": seconds,
         "startup": startup,
+        "warm_pass": warm_pass,
         "ttft_cold_s": ttft_cold,
         "ttft_warm_s": ttft_warm,
         "decode_tps_per_agent": decode_stats,
@@ -477,6 +485,8 @@ def render_markdown(summary: dict) -> str:
 
     lines.append("## Variants")
     lines.append("")
+    lines.append("TTFT cold is turn 1 of the measured load, which runs after the warm pass.")
+    lines.append("")
     lines.append("| id | title | status | max conc | TTFT cold p50/p90 (s) | TTFT warm p50/p90 (s) | "
                  "decode tok/s p50/min | agg tok/s | hit rate | MTP accept | preemptions | errors | wall (s) |")
     lines.append("|---|---|---|---|---|---|---|---|---|---|---|---|---|")
@@ -516,6 +526,7 @@ def render_markdown(summary: dict) -> str:
         lines.append("- reason: %s" % (v.get("reason") or "-"))
         lines.append("- seconds: %s" % _fmt(v.get("seconds"), ".1f"))
         lines.append("- startup: %s" % _format_startup(v.get("startup")))
+        lines.append("- Warm pass: %s" % _format_warm_pass(v.get("warm_pass")))
         for key, label, spec in (
             ("ttft_cold_s", "TTFT cold (s)", ".2f"),
             ("ttft_warm_s", "TTFT warm (s)", ".2f"),
@@ -559,6 +570,17 @@ def _format_startup(startup: Any) -> str:
             _fmt(_as_float(entry.get("weights_gib")), ".1f"),
         ))
     return "; ".join(parts) if parts else "-"
+
+
+def _format_warm_pass(warm_pass: Any) -> str:
+    """The warm-pass line of a variant section; ``none`` when the pass did not run."""
+    if not isinstance(warm_pass, dict):
+        return "none"
+    return "%s requests in %s s, %s non-OK (graphs compiled on first use; shared block cached)" % (
+        _fmt(_as_float(warm_pass.get("requests")), ".0f"),
+        _fmt(_as_float(warm_pass.get("seconds")), ".1f"),
+        _fmt(_as_float(warm_pass.get("non_ok")), ".0f"),
+    )
 
 
 def main(argv: Optional[list] = None) -> int:

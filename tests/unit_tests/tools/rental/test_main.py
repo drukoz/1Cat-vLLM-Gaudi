@@ -60,6 +60,7 @@ def test_full_stub_run(tmp_path, capsys):
     assert [v["id"] for v in manifest["variants"]] == ["A", "B"]
     assert manifest["gdn_core_decode_mode"] is None
     assert manifest["skip_warmup"] is True
+    assert manifest["warm_pass"] is True
     assert manifest["server_timeout_s"] == rental_main.SERVER_HEALTH_TIMEOUT_S
     for key in manifest["env"]:
         assert key.startswith(("VLLM_", "HABANA_", "PT_", "HF_"))
@@ -68,6 +69,11 @@ def test_full_stub_run(tmp_path, capsys):
     assert len(workload["agents"]) == 4
     assert manifest["workload"]["sha256"] == manifest["workload_sha"]
 
+    warm = read_json(run / "warm-workload.json")
+    assert warm["turns"] == 1
+    assert warm["file_offset"] == 1
+    assert len(warm["agents"]) == 4
+
     for vid in ("A", "B"):
         status = read_json(run / vid / "status.json")
         assert status["status"] == int(GateStatus.PASSED), status
@@ -75,6 +81,14 @@ def test_full_stub_run(tmp_path, capsys):
         assert startup[0]["max_concurrency"] == 64.0
         assert (run / vid / "requests.jsonl").read_text(encoding="utf-8").strip()
         assert (run / vid / "metrics.jsonl").read_text(encoding="utf-8").strip()
+
+        warm_pass = read_json(run / vid / "warm-pass.json")
+        assert warm_pass["requests"] == 4
+        assert warm_pass["non_ok"] == 0
+        assert warm_pass["max_tokens"] == rental_main.WARM_PASS_MAX_TOKENS
+        assert warm_pass["file_offset"] == rental_main.WARM_PASS_FILE_OFFSET
+        warm_rows = (run / vid / "warm-requests.jsonl").read_text(encoding="utf-8").strip().splitlines()
+        assert len(warm_rows) == 4
 
     fused = read_json(run / "fused_gdn" / "status.json")
     assert fused["status"] == int(GateStatus.SKIPPED)
@@ -85,6 +99,48 @@ def test_full_stub_run(tmp_path, capsys):
 
     summary = (run / "summary.md").read_text(encoding="utf-8").splitlines()
     assert summary[-1] == "GDN decode: not checked (stub mode)"
+
+
+def test_no_warm_pass_writes_no_warm_files(tmp_path, capsys):
+    model = make_model(tmp_path)
+    rc = run_stub(tmp_path, model, "rnowarm", "--variants", "A", "--no-warm-pass")
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert out.splitlines()[-1] == "RUN rnowarm: PASSED"
+    run = tmp_path / "results" / "rnowarm"
+
+    manifest = read_json(run / "manifest.json")
+    assert manifest["warm_pass"] is False
+    assert not (run / "warm-workload.json").exists()
+    assert not (run / "A" / "warm-pass.json").exists()
+    assert not (run / "A" / "warm-requests.jsonl").exists()
+    assert read_json(run / "A" / "status.json")["status"] == int(GateStatus.PASSED)
+
+
+def test_warm_pass_non_ok_rows_fails_the_variant(tmp_path, capsys, monkeypatch):
+    real_run_load = rental_main.agent_load.run_load
+
+    async def fake_run_load(workload, servers, model, out_path, **kwargs):
+        if Path(out_path).name == "warm-requests.jsonl":
+            return 1
+        return await real_run_load(workload, servers, model, out_path, **kwargs)
+
+    monkeypatch.setattr(rental_main.agent_load, "run_load", fake_run_load)
+    model = make_model(tmp_path)
+    rc = run_stub(tmp_path, model, "rwarm", "--variants", "A")
+    out = capsys.readouterr().out
+
+    assert rc == 1
+    assert out.splitlines()[-1] == "RUN rwarm: FAILED at A"
+    run = tmp_path / "results" / "rwarm"
+
+    status = read_json(run / "A" / "status.json")
+    assert status["status"] == int(GateStatus.FAILED)
+    assert status["reason"] == "warm pass: 1 non-OK rows"
+    warm_pass = read_json(run / "A" / "warm-pass.json")
+    assert warm_pass["non_ok"] == 1
+    assert warm_pass["requests"] == 4
+    assert not (run / "A" / "requests.jsonl").exists()  # the measured load never started
 
 
 def test_c_inherits_b_spec(tmp_path, capsys):

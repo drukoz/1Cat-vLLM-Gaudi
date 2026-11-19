@@ -273,6 +273,7 @@ Useful options:
 | `--no-recipe-cache` | start the containers without an HPU recipe cache |
 | `--dry-run` | print the `docker run` command and exit |
 | `--no-disk-check` | skip both free-space checks |
+| `--no-warm-pass` | skip the warm pass (a one-turn pass that compiles the variant's graphs and caches the shared block before the coherence gate; on by default — see [Warm pass](#warm-pass-ruk-3203)) |
 
 When the run stops at a stop rule, restart after fixing the cause with `--run-id <same id>
 --from <phase>` to keep the results in one folder.
@@ -311,6 +312,29 @@ visible there. A **startup of tens of minutes with a cold recipe cache is not a 
 stop the run while the graphs compile. The health timeout (`--server-timeout`) is the line, and
 `hl-smi` showing TPC activity is the proof of life.
 
+## Warm pass (RUK-3203)
+
+Bucket warmup is skipped by default, so graphs compile **on first use**, inside the first
+requests. The warm pass puts that first use before the measurement instead of inside it: after a
+variant's servers pass G3, the orchestrator runs **one turn of the measured workload** — every
+agent of the variant, its real prompt with the shared system block, `max_tokens=64` — on that
+variant's own servers, and only then runs the coherence gate (variant A) and the measured load.
+
+- **What it buys:** the shapes the workload touches are compiled once (the recipe cache keeps
+  them), and the shared system block is in the prefix cache before G4 and G5. Cold TTFT then
+  measures the first turn of the real load, not graph compilation.
+- **Cost:** about 2–4 min per variant on a warm cache. On a cold recipe cache the variant's
+  graph compilation happens inside its warm pass — minutes, not the hours of `--full-warmup`,
+  because only the shapes the workload touches are compiled.
+- **Files:** `<variant>/warm-pass.json` (requests, seconds, non-OK), `<variant>/warm-requests.jsonl`
+  (the rows), `warm-workload.json` at the run level, and `warm_pass: true` in the manifest.
+  `summary.md` prints one `Warm pass: ... requests in ... s, ... non-OK` line per variant
+  (`Warm pass: none` when it is switched off).
+- **Stop rule:** a non-OK warm-pass row fails the variant with `warm pass: <n> non-OK rows`,
+  the same rule as G5 (A stops the run, B and C continue).
+- **`--no-warm-pass`** skips the pass and prints `Warm pass: none`: the first measured request
+  compiles the graphs, so cold TTFT includes compilation (the pre-RUK-3203 behavior).
+
 ## Expected duration per phase
 
 | Phase | Expected duration |
@@ -320,7 +344,7 @@ stop the run while the graphs compile. The health timeout (`--server-timeout`) i
 | install (vLLM, plugin with native kernels, model deps) | 20–40 min |
 | fused GDN gate | about 15 min |
 | tiny TP8 | about 10 min |
-| each variant | about 35–45 min; with the default skipped warmup the server startup is minutes (graphs compile on first use, the recipe cache makes this cheap from the second run — see [Warmup and the recipe cache](#warmup-and-the-recipe-cache-ruk-3200)), then context fill and four turns |
+| each variant | about 35–45 min; with the default skipped warmup the server startup is minutes (graphs compile on first use, the recipe cache makes this cheap from the second run — see [Warmup and the recipe cache](#warmup-and-the-recipe-cache-ruk-3200)), then the [warm pass](#warm-pass-ruk-3203) (a few min on a warm cache; it absorbs the graph compilation on a cold one), then context fill and four turns |
 
 A full run (three variants, no `--download`) is about 3–4 h; add the download on top.
 
@@ -334,7 +358,8 @@ A full run (three variants, no `--download`) is about 3–4 h; add the download 
 | G2 tiny TP8 | stage 2a's tiny 8-head checkpoint at TP8: greedy agreement with `reference.json` | fewer than 16/16 tokens match on any prompt |
 | card_tests (after the gates) | the two HPU-only unit-test files on the card, in lazy mode (`PT_HPU_LAZY_MODE=1`), 600 s each: `tests/unit_tests/test_defragmentation.py` and `tests/unit_tests/ops/test_hpu_fused_moe.py`; each file's output is kept as `<stem>.log` and the pytest counts are recorded in `details.json` | never stops the run: a failure, a timeout or a skip is recorded only |
 | G3 startup, per server | `Maximum concurrency for 131,072 tokens per request` ≥ agents on that server; `Usable num_blocks`, KV tokens, weights and warmup recorded | the concurrency is too low, or no healthy `/v1/models` within the health timeout (default 1,800 s, `--server-timeout`; warmup is skipped by default, so startup is usually minutes) |
-| G4 coherence (variant A's server) | the 8 short prompts of stage 2b; one 120K-token needle prompt | an empty answer, repetition, a JSON prompt that does not parse, or a missed needle |
+| G4w warm pass, per variant (RUK-3203) | one turn of the measured workload on the variant's own servers (`max_tokens=64`): compiles the workload's graphs on first use and caches the shared system block; `warm-pass.json` records requests, seconds and non-OK rows; `--no-warm-pass` switches it off | any non-OK row fails the variant with `warm pass: <n> non-OK rows` (the variant's "on failure" rule applies: A stops the run, B and C continue) — see [Warm pass](#warm-pass-ruk-3203) |
+| G4 coherence (variant A's server, after A's warm pass) | the 8 short prompts of stage 2b; one 120K-token needle prompt | an empty answer, repetition, a JSON prompt that does not parse, or a missed needle |
 | G5 load, per variant | the workload finishes in 5,400 s with no request error and `Running` reaching the agent count | any of these (then the variant's "on failure" rule applies: A stops the run, B and C continue) |
 
 Notes:
@@ -395,16 +420,18 @@ and `run_rental.sh` ends with two lines:
 - `PASTE THIS FILE: <results>/<run-id>/summary.md` — the result, as text. It has the gates table
   (status and reason per gate), the variants table (max concurrency, TTFT cold and warm, decode
   tok/s per agent, aggregate tok/s, prefix-cache hit rate, preemptions, MTP acceptance length,
-  errors, wall time), one section per variant, the GDN decode line (fused kernel or PyTorch path)
-  and the native-kernel line from `toolchain.json`. Its header also carries the run's warmup mode
-  (`Warmup: skipped ...` / `Warmup: full`) and the server health timeout (RUK-3200). Paste it
-  whole into a comment on RUK-2709. It is written at the end of every run that reached the
-  orchestrator, passed or failed.
+  errors, wall time), one section per variant — each with its `Warm pass:` line, the numbers of
+  the [warm pass](#warm-pass-ruk-3203) (`none` with `--no-warm-pass`) —, the GDN decode line
+  (fused kernel or PyTorch path) and the native-kernel line from `toolchain.json`. Its header
+  also carries the run's warmup mode (`Warmup: skipped ...` / `Warmup: full`) and the server
+  health timeout (RUK-3200). Paste it whole into a comment on RUK-2709. It is written at the end
+  of every run that reached the orchestrator, passed or failed.
 - `SEND THIS FILE: <results>/<run-id>.tar.gz` — the whole run folder, made even when the run
   failed: `console.log` (everything the run printed, kept across `--from` resumes),
   `manifest.json`, `toolchain.json`, the `install-<n>.log` files, each gate's and variant's
-  `status.json` and `details.json`, `startup.json`, `server<k>.log`, `requests.jsonl`,
-  `metrics.jsonl`, `hlsmi.csv`, `workload.json` and `summary.json`. Copy it to the Mac at
+  `status.json` and `details.json`, `startup.json`, `warm-pass.json` and `warm-requests.jsonl`
+  (the variant's warm pass), `server<k>.log`, `requests.jsonl`, `metrics.jsonl`, `hlsmi.csv`,
+  `workload.json`, `warm-workload.json` and `summary.json`. Copy it to the Mac at
   `/Volumes/Storage/paperclip/tmp/rental-results/` (scp from the node to your workstation, then to
   the Mac). The deeper readings of the plan's M5 table (the drafter-rank log, the profiler trace, a
   failing server's log) are read from there.

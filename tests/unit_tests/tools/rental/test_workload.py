@@ -16,7 +16,7 @@ from pathlib import Path
 
 import pytest
 
-from tools.flash_next.rental.workload import TEMPLATES, build_workload, estimate_counter, tokenize_counter
+from tools.flash_next.rental.workload import (TEMPLATES, build_workload, estimate_counter, main, tokenize_counter)
 
 REPO_ROOT = Path(__file__).resolve().parents[4]
 
@@ -61,8 +61,9 @@ def test_templates_match_the_contract():
 
 def test_output_shape(workload):
     assert set(workload) == {
-        "version", "shared_prefix_tokens", "target_initial_tokens", "turns", "max_tokens", "agents"
+        "version", "shared_prefix_tokens", "target_initial_tokens", "turns", "max_tokens", "file_offset", "agents"
     }
+    assert workload["file_offset"] == 0
     assert workload["version"] == "agent-128k-v1"
     assert workload["turns"] == SMALL["turns"]
     assert workload["max_tokens"] == SMALL["max_tokens"]
@@ -105,6 +106,23 @@ def test_first_prompts_in_window(workload):
 def test_agents_start_at_different_files(workload):
     starts = [first_file_path(entry["messages"][1]["content"]) for entry in workload["agents"]]
     assert len(set(starts)) == len(starts)
+
+
+def test_file_offset_shifts_the_files_after_the_shared_block():
+    measured = build()
+    warm = build(file_offset=1)
+    assert measured["file_offset"] == 0
+    assert warm["file_offset"] == 1
+    assert len(warm["agents"]) == len(measured["agents"])
+    assert warm["shared_prefix_tokens"] == measured["shared_prefix_tokens"]
+    for base, shifted in zip(measured["agents"], warm["agents"]):
+        assert shifted["agent"] == base["agent"]
+        assert shifted["messages"][0] == base["messages"][0]  # the shared system block is unchanged
+        base_user = base["messages"][1]["content"]
+        shifted_user = shifted["messages"][1]["content"]
+        assert shifted_user != base_user  # the prompt differs right after the shared block
+        assert first_file_path(shifted_user) != first_file_path(base_user)
+        assert SMALL["initial_tokens"] - 512 <= estimate_counter(shifted["messages"]) <= SMALL["initial_tokens"]
 
 
 def test_followups(workload):
@@ -176,3 +194,29 @@ def test_full_size_build_with_estimate_under_60s():
     for entry in workload["agents"]:
         count = estimate_counter(entry["messages"])
         assert 124000 - 512 <= count <= 124000, entry["agent"]
+
+
+def test_cli_accepts_file_offset(tmp_path):
+    out = tmp_path / "warm-workload.json"
+    rc = main([
+        "--out",
+        str(out),
+        "--estimate",
+        "--agents",
+        "2",
+        "--shared-tokens",
+        "512",
+        "--initial-tokens",
+        "2000",
+        "--turns",
+        "1",
+        "--max-tokens",
+        "16",
+        "--file-offset",
+        "1",
+    ])
+    assert rc == 0
+    workload = json.loads(out.read_text(encoding="utf-8"))
+    assert workload["file_offset"] == 1
+    assert workload["turns"] == 1
+    assert len(workload["agents"]) == 2

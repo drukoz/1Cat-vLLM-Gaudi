@@ -7,14 +7,17 @@ the same commit (plan M4 rules, version ``agent-128k-v1``): a system message sha
 still short, trimmed by a binary search on the character count to
 ``[shared_tokens - 64, shared_tokens]`` tokens), and per agent a first user message made of
 ``File: <path>`` blocks of the eligible ``vllm_gaudi`` sources (80 to 400 lines, files taken cyclically
-from index ``(i * len(files)) // agents``) whose last block is cut to whole lines so the conversation
-counts land in ``[initial_tokens - 512, initial_tokens]``, plus ``turns - 1`` follow-up prompts.
+from index ``(i * len(files)) // agents + file_offset``) whose last block is cut to whole lines so the
+conversation counts land in ``[initial_tokens - 512, initial_tokens]``, plus ``turns - 1`` follow-up
+prompts. ``file_offset`` shifts every agent's file window, so a warm pass with ``file_offset=1`` plays
+prompts that differ from the measured ones right after the shared system block.
 Token counts come from a counter function: ``tokenize_counter`` asks a running server's ``/tokenize``
 endpoint, ``estimate_counter`` is the offline fallback for tests and dry runs. The JSON is written with
 ``json.dump(..., ensure_ascii=False, sort_keys=True)`` so its sha256 is stable.
 
 Usage: ``python -m tools.flash_next.rental.workload --out PATH (--tokenize-url URL --model NAME |
---estimate) [--agents 32 --shared-tokens 16384 --initial-tokens 124000 --turns 4 --max-tokens 1024]``.
+--estimate) [--agents 32 --shared-tokens 16384 --initial-tokens 124000 --turns 4 --max-tokens 1024]
+[--file-offset N]``.
 """
 
 from __future__ import annotations
@@ -223,13 +226,15 @@ def build_workload(root: Path,
                    turns: int,
                    max_tokens: int,
                    count_tokens: Callable[[list[dict]], int],
-                   on_agent: Callable[[int, int, int], None] | None = None) -> dict:
+                   on_agent: Callable[[int, int, int], None] | None = None,
+                   file_offset: int = 0) -> dict:
     """The ``workload.json`` dict of the ``agent-128k-v1`` rules, built over the repository at ``root``.
 
     ``count_tokens(messages)`` returns the token count of a message list (a server counter from
     ``tokenize_counter`` or ``estimate_counter``); ``on_agent(agent, prompt_tokens, files)`` is called
-    once per agent, after its first prompt is sized. Raises ``ValueError`` when the prompt and output
-    budget does not fit the model length.
+    once per agent, after its first prompt is sized; ``file_offset`` shifts each agent's first file
+    index (the measured workload uses ``0``, the warm pass ``1``). Raises ``ValueError`` when the
+    prompt and output budget does not fit the model length.
     """
     budget = initial_tokens + turns * max_tokens + (turns - 1) * FOLLOWUP_TOKEN_ALLOWANCE
     if budget > MAX_MODEL_LEN - BUDGET_SLACK:
@@ -246,7 +251,7 @@ def build_workload(root: Path,
 
     entries = []
     for i in range(agents):
-        start = (i * len(files)) // agents
+        start = (i * len(files)) // agents + file_offset
         user, paths, count, n_files = _first_message(sys_msg, files, start, i, count_tokens, initial_tokens)
         followups = [
             f"Now, in File: {paths[min(t, len(paths) - 1)]}, {TEMPLATES[(i + t) % 3]}"
@@ -270,6 +275,7 @@ def build_workload(root: Path,
         "target_initial_tokens": initial_tokens,
         "turns": turns,
         "max_tokens": max_tokens,
+        "file_offset": file_offset,
         "agents": entries,
     }
 
@@ -287,6 +293,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--initial-tokens", type=int, default=124000)
     parser.add_argument("--turns", type=int, default=4)
     parser.add_argument("--max-tokens", type=int, default=1024)
+    parser.add_argument("--file-offset",
+                        type=int,
+                        default=0,
+                        help="shift of each agent's first file index (the warm pass uses 1)")
     args = parser.parse_args(argv)
 
     if args.tokenize_url is not None and not args.model:
@@ -309,9 +319,10 @@ def main(argv: list[str] | None = None) -> int:
                                   args.shared_tokens,
                                   args.initial_tokens,
                                   args.turns,
-                                  args.max_tokens,
-                                  counter,
-                                  on_agent=on_agent)
+                                   args.max_tokens,
+                                   counter,
+                                   on_agent=on_agent,
+                                   file_offset=args.file_offset)
     except ValueError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1

@@ -452,3 +452,21 @@ def test_summary_header_warmup_and_timeout(tmp_path: Path) -> None:
     md = (run / "summary.md").read_text(encoding="utf-8")
     assert "- Warmup: full" in md
     assert "- Server health timeout: n/a" in md
+
+
+def test_warm_pass_line_and_absent_falls_back_to_none(tmp_path: Path) -> None:
+    """warm-pass.json renders as one line per variant; a run without it (the
+    --no-warm-pass case, or a run from before RUK-3203) renders "none"."""
+    run = build_run(tmp_path)
+    write_json(run / "A" / "warm-pass.json", {"requests": 4, "seconds": 250.0, "non_ok": 0})
+
+    v = summarize_variant(run / "A", 4, turns=2)
+    assert v["warm_pass"] == {"requests": 4, "seconds": 250.0, "non_ok": 0}
+    assert v["reasons"] == {}  # an absent warm-pass.json is not a missing-field reason
+    assert summarize_variant(run / "B", 4, turns=2)["warm_pass"] is None
+
+    assert report_main([str(run)]) == 0
+    md = (run / "summary.md").read_text(encoding="utf-8")
+    assert "- Warm pass: 4 requests in 250.0 s, 0 non-OK (graphs compiled on first use; shared block cached)" in md
+    assert "- Warm pass: none" in md  # variant B, which has no warm-pass.json
+    assert "TTFT cold is turn 1 of the measured load, which runs after the warm pass." in md
