@@ -8448,6 +8448,13 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                     batch_size = candidates[idx] if is_batch_based else count
                     self.log_warmup_multimodal(phase, idx, len(candidates), batch_size, 0, width, height)
 
+    def _has_recurrent_state_caches(self) -> bool:
+        """True when a KV cache group holds recurrent states (Mamba, GDN, short-conv): their rows are state slots,
+        which the online defragmenter must not swap."""
+        kv_cache_config = getattr(self, "kv_cache_config", None)
+        return kv_cache_config is not None and any(
+            isinstance(group.kv_cache_spec, MambaSpec) for group in kv_cache_config.kv_cache_groups)
+
     @torch.inference_mode()
     def warmup_model(self) -> None:
         if not self.enable_bucketing:
@@ -8516,7 +8523,8 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             )
 
         if not self.is_pooling_model:
-            self.defragmenter = OnlineDefragmenter(self.kv_caches, self.block_size)
+            self.defragmenter = OnlineDefragmenter(self.kv_caches, self.block_size,
+                                                   recurrent=self._has_recurrent_state_caches())
         # Profiling
         prompt_profile_cfg, decode_profile_cfg = self._read_profiling_cfg()
         if prompt_profile_cfg or decode_profile_cfg:
@@ -8666,7 +8674,8 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         # reusing defragmenter used in warmup causes accuracy drops, which is why we re-create
         # and re-initialize it.
         if not self.is_pooling_model:
-            self.defragmenter = OnlineDefragmenter(self.kv_caches, self.block_size)
+            self.defragmenter = OnlineDefragmenter(self.kv_caches, self.block_size,
+                                                   recurrent=self._has_recurrent_state_caches())
 
     def shutdown_inc(self, suppress=suppress, finalize_calibration=finalize_calibration):
         global shutdown_inc_called

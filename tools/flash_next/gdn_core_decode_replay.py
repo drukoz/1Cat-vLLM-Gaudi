@@ -1,27 +1,31 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Replay N decode steps of each GDN op three ways: eager, HPU-graph replay, and ``torch.compile``.
+"""Replay N decode steps of each GDN op in the bridge mode of this process: one process runs one mode.
 
-The states are carried from step to step (the ops mutate them in place), so an exact match with
-eager over every step output and the final states rules out aliasing, stale graph buffers and
-dropped state writes on replay.  Run sheet row 3f step 2 (``docs/design/flash-next/
-run-sheets/qualification.md``) runs ``--steps 1000`` on the card and expects, per op, the lines
-``lazy+hpu_graph: exact``, ``torch.compile: exact`` and ``recompiles after warmup: 0``.
-
-On a Mac there is no HPU: use ``--device cpu``, where ``aot_eager`` stands in for the HPU
-compiler (the HPU-graph variant is reported as ``skipped (cpu)``).  The compile run on CPU
-already checks that functionalization keeps the in-place state writes through ``torch.compile``.
+CPU (``--device cpu``) and eager on a card (``PT_HPU_LAZY_MODE=0``) run eager and
+``torch.compile`` (``aot_eager`` on CPU, ``hpu_backend`` on the card) and report the HPU-graph
+variant as ``skipped (cpu)`` / ``skipped (eager mode)``; lazy on a card (``PT_HPU_LAZY_MODE=1``)
+runs eager and the HPU graph and reports ``torch.compile`` and the recompile count as
+``skipped (lazy mode)``: the HPU graph exists only in lazy mode and ``hpu_backend`` only in
+eager mode, so one process can run only one of the two.  The states are carried from step to
+step (the ops mutate them in place), so an exact match with eager over every step output and the
+final states rules out aliasing, stale graph buffers and dropped state writes on replay.  On a
+card run the tool twice: ``PT_HPU_LAZY_MODE=1`` for the HPU graph and ``PT_HPU_LAZY_MODE=0`` for
+``torch.compile`` (run sheet row 1b-3, ``docs/design/flash-next/run-sheets/qualification.md``,
+``--steps 1000``).
 
 Usage: ``PYTHONPATH=$PWD python tools/flash_next/gdn_core_decode_replay.py [--steps 1000]
 [--device auto|cpu|hpu] [--case tp8_b16|ver_tp8_b16] [--ops core,recurrent|verify]``; ``--ops
 verify`` runs alone on a ``ver_`` case (default ``ver_tp8_b16``, others default to ``tp8_b16``).
-Exit code 0 only when every variant that ran is exact against eager and every recompile count
-after warmup is 0.
+Exit code 0 only when every variant that ran is exact against eager, every measured recompile
+count after warmup is 0, and at least one variant (HPU graph or ``torch.compile``) ran for every
+op; argument errors exit 2.
 """
 
 from __future__ import annotations
 
 import argparse
 import dataclasses
+import enum
 import sys
 
 import torch
@@ -38,6 +42,41 @@ OPS = ("core", "recurrent", "verify")
 DEFAULT_CASE = "tp8_b16"
 DEFAULT_VERIFY_CASE = "ver_tp8_b16"
 WARMUP_STEPS = 3  # steps after which the recompile count baseline is read
+
+
+class BridgeMode(enum.IntEnum):
+    """The bridge mode of the running process: one process runs exactly one of these."""
+    CPU = 0    # --device cpu: no HPU graph; torch.compile runs with aot_eager
+    EAGER = 1  # PT_HPU_LAZY_MODE=0 on a card: no HPU graph; torch.compile runs with hpu_backend
+    LAZY = 2   # PT_HPU_LAZY_MODE=1 on a card: the HPU graph runs; no torch.compile
+
+
+BRIDGE_NAMES = {BridgeMode.CPU: "cpu", BridgeMode.EAGER: "eager", BridgeMode.LAZY: "lazy"}
+
+
+def bridge_mode(device: torch.device) -> BridgeMode:
+    """CPU for a CPU device; on HPU, LAZY or EAGER from the bridge itself (not from the environment)."""
+    if device.type != "hpu":
+        return BridgeMode.CPU
+    import habana_frameworks.torch as htorch
+    return BridgeMode.LAZY if htorch.utils.internal.is_lazy() else BridgeMode.EAGER
+
+
+def graph_skip_reason(mode: BridgeMode) -> str | None:
+    """None when the HPU-graph variant runs in this mode, else the text after 'skipped '."""
+    if mode == BridgeMode.LAZY:
+        return None
+    return "(cpu)" if mode == BridgeMode.CPU else "(eager mode)"
+
+
+def compile_skip_reason(mode: BridgeMode) -> str | None:
+    """None when the torch.compile variant runs in this mode, else the text after 'skipped '."""
+    return "(lazy mode)" if mode == BridgeMode.LAZY else None
+
+
+def wrap_in_hpu_graph(module: nn.Module) -> nn.Module:
+    import habana_frameworks.torch as htorch
+    return htorch.hpu.wrap_in_hpu_graph(module)
 
 
 @dataclasses.dataclass
@@ -270,6 +309,7 @@ def main(argv: list[str] | None = None) -> int:
                   "--gdn-fused-only, or point GDN_FUSED_GAUDI_KERNEL_LIBRARY and GDN_FUSED_GAUDI_NATIVE_LIBRARY "
                   "at the built files", file=sys.stderr)
             return 2
+    mode = bridge_mode(device)
 
     if case.name.startswith("ver_"):
         base = {name: tensor.to(device) for name, tensor in make_verify_inputs(case).items()}
@@ -278,28 +318,41 @@ def main(argv: list[str] | None = None) -> int:
         base = {name: tensor.to(device) for name, tensor in make_inputs(case).items()}
         args = scalars(case)
     activations = [{k: v.to(device) for k, v in d.items()} for d in draw_activations(base, ns.steps)]
-    print(f"device={device_str} case={case.name} steps={ns.steps} ops={','.join(ops)}", flush=True)
+    print(f"device={device_str} bridge={BRIDGE_NAMES[mode]} case={case.name} steps={ns.steps} "
+          f"ops={','.join(ops)}", flush=True)
 
     ok = True
     for op in ops:
         states = _op_states(op, base)
         acts = _op_activations(op, activations)
         eager = run(_make_step(op, base, args), states, acts, device)
+        variants_run = 0
 
-        if device.type == "hpu":
-            import habana_frameworks.torch as htorch
-            graphed = htorch.hpu.wrap_in_hpu_graph(_make_step(op, base, args))
+        graph_reason = graph_skip_reason(mode)
+        if graph_reason is None:
+            graphed = wrap_in_hpu_graph(_make_step(op, base, args))
             message = compare_runs(eager, run(graphed, states, acts, device))
             print(f"{op} lazy+hpu_graph: {'exact' if message is None else message}", flush=True)
             ok = ok and message is None
+            variants_run += 1
         else:
-            print(f"{op} lazy+hpu_graph: skipped (cpu)", flush=True)
+            print(f"{op} lazy+hpu_graph: skipped {graph_reason}", flush=True)
 
-        result, recompiles = run_compiled(_make_step(op, base, args), states, acts, device)
-        message = compare_runs(eager, result)
-        print(f"{op} torch.compile: {'exact' if message is None else message}", flush=True)
-        print(f"{op} recompiles after warmup: {recompiles}", flush=True)
-        ok = ok and message is None and recompiles == 0
+        compile_reason = compile_skip_reason(mode)
+        if compile_reason is None:
+            result, recompiles = run_compiled(_make_step(op, base, args), states, acts, device)
+            message = compare_runs(eager, result)
+            print(f"{op} torch.compile: {'exact' if message is None else message}", flush=True)
+            print(f"{op} recompiles after warmup: {recompiles}", flush=True)
+            ok = ok and message is None and recompiles == 0
+            variants_run += 1
+        else:
+            print(f"{op} torch.compile: skipped {compile_reason}", flush=True)
+            print(f"{op} recompiles after warmup: skipped {compile_reason}", flush=True)
+
+        if variants_run == 0:
+            print(f"{op}: no replay variant runs in bridge mode {BRIDGE_NAMES[mode]}", file=sys.stderr)
+            ok = False
     return 0 if ok else 1
 
 

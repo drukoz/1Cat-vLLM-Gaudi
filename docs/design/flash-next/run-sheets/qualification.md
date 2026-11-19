@@ -86,18 +86,20 @@ PYTHONPATH=$PWD python -m pytest -q -rs -p no:cacheprovider --noconftest tests/s
 ```
 Expected: `8 passed`, no skips (`-rs` prints any skip reason): two disassembly checks and three cases per kernel.
 
-**1b-2: op numerics on the card**
+**1b-2: op numerics on the card** (the servers run lazy mode)
 ```bash
-PYTHONPATH=$PWD python -m pytest -q -rs -p no:cacheprovider tests/unit_tests/gdn_core_decode/test_hpu_op.py 2>&1 | tee /tmp/1b-hpu-op.log
+PT_HPU_LAZY_MODE=1 PYTHONPATH=$PWD python -m pytest -q -rs -p no:cacheprovider tests/unit_tests/gdn_core_decode/test_hpu_op.py 2>&1 | tee /tmp/1b-hpu-op.log
 ```
 Expected: every case passes, none skipped. Both ops run against their CPU references at the TP8, TP4 and TP1 head counts, with load == store, load != store and padded rows, at batch 1, 16 and 64. Bars: output max abs error ≤ 1e-3, state ≤ 1e-5, conv state exact (vllm-gaudi #1834's bar for the recurrence alone was 2.4e-4 to 4.9e-4).
 
-**1b-3: graph modes and replay**
+**1b-3: graph modes and replay** (one bridge mode per process: run each case twice, lazy for the HPU graph, eager for `torch.compile`)
 ```bash
-PYTHONPATH=$PWD python tools/flash_next/gdn_core_decode_replay.py --steps 1000 2>&1 | tee /tmp/1b-replay.log
-PYTHONPATH=$PWD python tools/flash_next/gdn_core_decode_replay.py --steps 1000 --case tp8_b64 2>&1 | tee -a /tmp/1b-replay.log
+PT_HPU_LAZY_MODE=1 PYTHONPATH=$PWD python tools/flash_next/gdn_core_decode_replay.py --steps 1000 2>&1 | tee /tmp/1b-replay.log
+PT_HPU_LAZY_MODE=0 PYTHONPATH=$PWD python tools/flash_next/gdn_core_decode_replay.py --steps 1000 2>&1 | tee -a /tmp/1b-replay.log
+PT_HPU_LAZY_MODE=1 PYTHONPATH=$PWD python tools/flash_next/gdn_core_decode_replay.py --steps 1000 --case tp8_b64 2>&1 | tee -a /tmp/1b-replay.log
+PT_HPU_LAZY_MODE=0 PYTHONPATH=$PWD python tools/flash_next/gdn_core_decode_replay.py --steps 1000 --case tp8_b64 2>&1 | tee -a /tmp/1b-replay.log
 ```
-Expected, for each op in each run: `lazy+hpu_graph: exact`, `torch.compile: exact` and `recompiles after warmup: 0`. An exact match with eager over 1,000 steps rules out aliasing, stale graph buffers and dropped state writes on replay.
+Expected: the lazy runs print, per op, `lazy+hpu_graph: exact` and `torch.compile: skipped (lazy mode)`; the eager runs print `lazy+hpu_graph: skipped (eager mode)`, `torch.compile: exact` and `recompiles after warmup: 0`; every run exits 0. Only the lazy runs decide the kernel (every server runs lazy mode); an eager failure is reported, not a reason for `VLLM_HPU_GDN_CORE_DECODE=0`. An exact match with eager over 1,000 steps rules out aliasing, stale graph buffers and dropped state writes on replay.
 
 **1b-4: kernel speed against the bandwidth floor** (measures; gates nothing)
 ```bash
@@ -122,7 +124,7 @@ docker logs <name> 2>&1 | grep -E "has no HPU kernel|GDN core decode .* is off f
 |---|---|---|---|---|
 | 1b-1 | simulator | `8 passed`, no skips | | |
 | 1b-2 | `test_hpu_op.py` | all pass, none skipped | | |
-| 1b-3 | replay, 2 cases × 2 ops | `exact`, `exact`, `0` | | |
+| 1b-3 | replay, 2 cases × 2 ops × 2 modes | lazy: `exact`; eager: `exact`, `0` | | |
 | 1b-4 | slope, core / recurrent, tp2 (ms/seq/layer, × floor) | ≤ 2× floor (reported) | | |
 | 1b-4 | slope, core / recurrent, tp8 (ms/seq/layer, × floor) | ≤ 2× floor (reported) | | |
 | 1b-4 | `core tp8 B=1` (ms/call) | reported | | |

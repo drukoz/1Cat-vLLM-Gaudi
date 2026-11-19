@@ -67,6 +67,22 @@ def _configure_kernel_database_path() -> None:
     _prepend_kernel_database(str(kernel_db))
 
 
+def _exception_text(exc: BaseException) -> str:
+    """``Type: message`` of ``exc`` and of each exception it was raised from, joined by ``; caused by ``.
+
+    ``torch.ops.load_library`` raises ``OSError("Could not load this library: <path>")`` from the ``ctypes.CDLL``
+    error, so the dlopen reason (a missing NEEDED library, an undefined symbol) is only in ``__cause__``.
+    """
+    parts: list[str] = []
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        parts.append(f"{type(current).__name__}: {current}")
+        current = current.__cause__
+    return "; caused by ".join(parts)
+
+
 def _gdn_fused_error(message: str) -> None:
     """Record one fused GDN loader failure in the shared list and in the GDN-only list."""
     _LOAD_ERRORS.append(message)
@@ -114,7 +130,7 @@ def load_gdn_fused_extension() -> bool:
         try:
             torch.ops.load_library(extension)
         except Exception as exc:  # pragma: no cover - requires an HPU runtime
-            _gdn_fused_error(f"{extension}: {type(exc).__name__}: {exc}")
+            _gdn_fused_error(f"{extension}: {_exception_text(exc)}")
             _GDN_FUSED_LOADED = False
             return False
         _LOADED_PATHS.append(extension)
@@ -142,7 +158,7 @@ def load_native_extensions() -> tuple[str, ...]:
             try:
                 torch.ops.load_library(candidate)
             except Exception as exc:  # pragma: no cover - requires an HPU runtime
-                _LOAD_ERRORS.append(f"{candidate}: {type(exc).__name__}: {exc}")
+                _LOAD_ERRORS.append(f"{candidate}: {_exception_text(exc)}")
             else:
                 _LOADED_PATHS.append(candidate)
         try:

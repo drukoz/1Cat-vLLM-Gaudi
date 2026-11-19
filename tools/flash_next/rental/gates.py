@@ -18,6 +18,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import socket
 import subprocess
 import sys
@@ -170,7 +171,7 @@ def preflight(model_dir: Path,
             details["checks"]["cards"] = "skipped"
         else:
             cmd = list(hlsmi_cmd) if hlsmi_cmd else list(DEFAULT_HLSMI_CMD)
-            out = subprocess.run(cmd, capture_output=True, text=True, timeout=HLSMI_TIMEOUT_S)
+            out = run_step(cmd, tempfile.gettempdir(), HLSMI_TIMEOUT_S)
             cards = len([ln for ln in out.stdout.splitlines() if ln.strip()])
             details["cards"] = cards
             if cards == expected_cards:
@@ -269,6 +270,39 @@ def _last_line(text: str) -> str:
     return lines[-1] if lines else ""
 
 
+STEP_KILL_WAIT_S = 30.0  # after SIGKILL, how long to wait for the pipes to close
+
+
+def run_step(cmd: list, cwd, timeout_s: float, env: dict = None) -> subprocess.CompletedProcess:
+    """Run one gate step in its own process group, stdout and stderr captured as text.
+
+    On timeout, SIGKILL the whole group (pytest's workers and anything else the step started),
+    then raise subprocess.TimeoutExpired. After a normal exit, SIGKILL whatever is left in the
+    group, so no step can keep holding a card.
+    """
+    args = [str(arg) for arg in cmd]
+    proc = subprocess.Popen(args, cwd=str(cwd), env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            text=True, start_new_session=True)
+    try:
+        out, err = proc.communicate(timeout=timeout_s)
+    except subprocess.TimeoutExpired:
+        _kill_group(proc.pid)
+        try:
+            proc.communicate(timeout=STEP_KILL_WAIT_S)
+        except subprocess.TimeoutExpired:
+            pass
+        raise subprocess.TimeoutExpired(args, timeout_s) from None
+    _kill_group(proc.pid)
+    return subprocess.CompletedProcess(args, proc.returncode, out, err)
+
+
+def _kill_group(pgid: int) -> None:
+    try:
+        os.killpg(pgid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        pass
+
+
 def build_check(python: str = sys.executable) -> tuple[GateStatus, dict]:
     """The G1 gate: the installed vLLM version, vllm_gaudi and flashinfer_gaudi import."""
     details: dict = {
@@ -284,11 +318,8 @@ def build_check(python: str = sys.executable) -> tuple[GateStatus, dict]:
                "print(json.dumps(flashinfer_gaudi.get_capabilities(), default=str))"))
     try:
         for name, code in checks:
-            proc = subprocess.run([str(python), "-c", code],
-                                  cwd=tempfile.gettempdir(),  # never the repository root
-                                  capture_output=True,
-                                  text=True,
-                                  timeout=BUILD_TIMEOUT_S)
+            proc = run_step([str(python), "-c", code], tempfile.gettempdir(),  # never the repository root
+                            BUILD_TIMEOUT_S)
             if proc.returncode != 0:
                 details["reason"] = "%s: exit %d: %s" % (name, proc.returncode, (proc.stderr or "").strip()[:500])
                 return GateStatus.FAILED, details
@@ -314,10 +345,11 @@ def build_check(python: str = sys.executable) -> tuple[GateStatus, dict]:
 
 GDN_MODE_ENV = "VLLM_HPU_GDN_CORE_DECODE"
 GDN_VERIFY_ENV = "VLLM_HPU_GDN_CORE_VERIFY"
+GDN_LAZY_ENV = "PT_HPU_LAZY_MODE"  # the Habana bridge mode: "1" lazy (the servers), "0" eager (torch.compile)
 GDN_VERIFY_OP_TEST = "tests/unit_tests/gdn_core_decode/test_hpu_verify_op.py"
 GDN_FALLBACK_RE = re.compile(r"has no HPU kernel|GDN core (decode|verify) .* is off for")
-GDN_OP_TIMEOUT_S = 1800.0      # test_hpu_op.py and test_hpu_verify_op.py
-GDN_REPLAY_TIMEOUT_S = 1800.0  # each replay run
+GDN_OP_TIMEOUT_S = 600.0       # test_hpu_op.py and test_hpu_verify_op.py (about 16x the card's 37 s)
+GDN_REPLAY_TIMEOUT_S = 900.0   # each replay run
 GDN_BENCH_TIMEOUT_S = 1200.0
 
 GDN_LIB_LOOKUP_CODE = ("import flashinfer_gaudi, pathlib; "
@@ -352,7 +384,15 @@ def fused_gdn(plugin_root: Path, out_dir: Path, python: str = sys.executable) ->
     """G1b. details always has "mode" (1 = the fused kernel stays on, 0 = later servers run the PyTorch path),
     "verify_mode" (1 = the GDN verify op's card checks all passed, 0 = the op stays off) and "env" (the GDN
     flags of every later server, added by the orchestrator: the decode entry as before, and
-    "VLLM_HPU_GDN_CORE_VERIFY" = "1" only when every verify check passed, else an explicit "0")."""
+    "VLLM_HPU_GDN_CORE_VERIFY" = "1" only when every verify check passed, else an explicit "0").
+
+    Only the lazy checks decide the kernel: the op tests, the lazy replays, the verify checks and the bench
+    all run with PT_HPU_LAZY_MODE=1, the bridge mode every server uses. The two decode replays run once
+    more with PT_HPU_LAZY_MODE=0 for torch.compile and are recorded only ("replay_eager", one entry per
+    case with the integer "lazy_mode" 0, and "eager_compile_ok" = True only when both eager replays exit
+    0): an eager failure or timeout never turns the kernel off and never changes the gate's status,
+    because no server runs eager mode or torch.compile. Every step runs in its own process group and is
+    SIGKILLed with all of its children at its timeout (run_step), so no step can outlive it and hold a card."""
     started = time.monotonic()
     details: dict = {"mode": GDN_MODE_PYTORCH, "env": dict(GDN_FALLBACK_ENV), "verify_mode": GDN_VERIFY_OFF}
 
@@ -370,11 +410,8 @@ def fused_gdn(plugin_root: Path, out_dir: Path, python: str = sys.executable) ->
         out_dir.mkdir(parents=True, exist_ok=True)
 
         # 1. the installed library folder (the bundle's source tree has an empty flashinfer_gaudi/lib/)
-        lookup = subprocess.run([str(python), "-c", GDN_LIB_LOOKUP_CODE],
-                                cwd=tempfile.gettempdir(),  # never the repository root
-                                capture_output=True,
-                                text=True,
-                                timeout=timeout_s)
+        lookup = run_step([str(python), "-c", GDN_LIB_LOOKUP_CODE], tempfile.gettempdir(),  # never the repo root
+                          timeout_s)
         if lookup.returncode != 0:
             return finish(GateStatus.SKIPPED, "the fused GDN library is not installed: the interpreter exited %d: %s" %
                           (lookup.returncode, (lookup.stderr or "").strip()[:200]))
@@ -395,19 +432,15 @@ def fused_gdn(plugin_root: Path, out_dir: Path, python: str = sys.executable) ->
         env["PYTHONPATH"] = str(plugin_root)
         env["GDN_FUSED_GAUDI_KERNEL_LIBRARY"] = str(kernel)
         env["GDN_FUSED_GAUDI_NATIVE_LIBRARY"] = str(ops_files[0])
+        env[GDN_LAZY_ENV] = "1"  # the bridge mode of every server; the container leaves it unset
         env.pop(GDN_MODE_ENV, None)
         env.pop(GDN_VERIFY_ENV, None)
 
-        def run(cmd: list, log_name: str, limit: float, append: bool = False):
+        def run(cmd: list, log_name: str, limit: float, append: bool = False, lazy_mode: int = 1):
             nonlocal step, timeout_s
             step = " ".join(str(arg) for arg in cmd[1:])
             timeout_s = limit
-            proc = subprocess.run([str(arg) for arg in cmd],
-                                  cwd=str(plugin_root),
-                                  env=env,
-                                  capture_output=True,
-                                  text=True,
-                                  timeout=limit)
+            proc = run_step(cmd, plugin_root, limit, dict(env, **{GDN_LAZY_ENV: str(lazy_mode)}))
             text = (proc.stdout or "") + (proc.stderr or "")
             with open(out_dir / log_name, "a" if append else "w", encoding="utf-8") as f:
                 f.write(text)
@@ -442,7 +475,7 @@ def fused_gdn(plugin_root: Path, out_dir: Path, python: str = sys.executable) ->
                 if case != "tp8_b16":
                     cmd += ["--case", case]
                 proc, _ = run(cmd, "replay.log", GDN_REPLAY_TIMEOUT_S, append=True)
-                details["replay"].append({"case": case, "exit": proc.returncode})
+                details["replay"].append({"case": case, "lazy_mode": 1, "exit": proc.returncode})
                 if proc.returncode != 0:
                     details["verify"] = _gdn_verify_not_run("decode checks failed")
                     return finish(GateStatus.FAILED,
@@ -450,6 +483,21 @@ def fused_gdn(plugin_root: Path, out_dir: Path, python: str = sys.executable) ->
         except subprocess.TimeoutExpired:
             details["verify"] = _gdn_verify_not_run("decode checks failed")
             raise
+
+        # 4c. the same two decode replays in eager mode, where the replay tool exercises torch.compile's
+        #     hpu_backend. Recorded only: an eager failure or timeout never turns the kernel off and
+        #     never changes the gate's status, because no server runs eager mode.
+        details["replay_eager"] = []
+        for case in ("tp8_b16", "tp8_b64"):
+            cmd = [python, "tools/flash_next/gdn_core_decode_replay.py", "--steps", "1000"]
+            if case != "tp8_b16":
+                cmd += ["--case", case]
+            try:
+                proc, _ = run(cmd, "replay.log", GDN_REPLAY_TIMEOUT_S, append=True, lazy_mode=0)
+                details["replay_eager"].append({"case": case, "lazy_mode": 0, "exit": proc.returncode})
+            except subprocess.TimeoutExpired:
+                details["replay_eager"].append({"case": case, "lazy_mode": 0, "exit": None, "timed_out": True})
+        details["eager_compile_ok"] = all(entry["exit"] == 0 for entry in details["replay_eager"])
 
         # 4b. the GDN verify op's own card checks, only after the decode checks passed and only when its
         #     test file is in the bundle; a verify failure never changes the gate's status
@@ -495,7 +543,7 @@ def fused_gdn(plugin_root: Path, out_dir: Path, python: str = sys.executable) ->
                         verify["reason"] = ("gdn_core_decode_replay.py (verify %s) did not finish in %s s" %
                                             (case, GDN_REPLAY_TIMEOUT_S))
                         break
-                    verify["replay"].append({"case": case, "exit": proc.returncode})
+                    verify["replay"].append({"case": case, "lazy_mode": 1, "exit": proc.returncode})
                     if proc.returncode != 0:
                         verify_ok = False
                         verify["status"] = "failed"

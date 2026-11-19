@@ -316,7 +316,7 @@ class Runner:
             "--fixture",
             TINY_FIXTURE,
         ]
-        proc = subprocess.run(cmd, cwd=str(repo_root()), capture_output=True, text=True, timeout=900)
+        proc = gates.run_step(cmd, repo_root(), 900)
         if proc.returncode != 0:
             tail = (proc.stderr or proc.stdout or "")[-400:]
             reason = "tiny checkpoint failed (exit %d): %s" % (proc.returncode, tail.strip())
@@ -340,8 +340,7 @@ class Runner:
             "--host",
             "127.0.0.1",
         ]
-        env = dict(os.environ)
-        env.update(self.gdn_env)
+        env = self.tiny_env()
         popen = serve.start_server(serve_cmd, env, phase_dir / "server0.log", phase_dir)
         self.active.append(("server", popen))
         try:
@@ -648,6 +647,10 @@ class Runner:
             "--tokens-per-second",
             STUB_TOKENS_PER_SECOND,
         ]
+
+    def tiny_env(self) -> dict:
+        """The tiny gate's server environment: a variant's environment without a variant's own flags."""
+        return serve.server_environment(server_env({}, self.gdn_env))
 
     def _child_env(self) -> dict:
         env = dict(os.environ)
