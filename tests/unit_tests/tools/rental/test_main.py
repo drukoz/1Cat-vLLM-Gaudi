@@ -5,7 +5,7 @@ import json
 import shutil
 from pathlib import Path
 
-from tools.flash_next.rental import main as rental_main
+from tools.flash_next.rental import main as rental_main, serve
 from tools.flash_next.rental.main import gdn_summary_lines, server_env
 from tools.flash_next.rental.schema import GateStatus
 
@@ -238,3 +238,23 @@ def test_summary_lines_toolchain(tmp_path):
     }), encoding="utf-8")
     assert gdn_summary_lines(run, [])[-1] == (
         "Native kernels: NOT compiled, PyTorch GDN path (tpc-clang: absent; habanalabs-tools: absent)")
+
+
+def test_tiny_env_matches_variant_env(tmp_path, monkeypatch):
+    monkeypatch.delenv("PT_HPU_LAZY_MODE", raising=False)
+    monkeypatch.setenv("VLLM_COMPACT_GDN", "1")
+    args = rental_main._parse_args([
+        "--mode", "node", "--model", str(tmp_path / "m"), "--results", str(tmp_path / "r"), "--run-id", "t"
+    ])
+    runner = rental_main.Runner(args, rental_main.load_variants())
+    runner.gdn_env = {"VLLM_HPU_GDN_CORE_DECODE": "0", "VLLM_HPU_GDN_CORE_VERIFY": "0"}
+    variant = runner.variant_by_id("C")
+    eff, _ = runner.effective_variant(variant)
+    eff["env"] = server_env(eff["env"], runner.gdn_env)
+    _, venv = serve.build_command(eff, variant["servers"][0], runner.model, runner.served_name)
+    tiny = runner.tiny_env()
+    for key in ("PT_HPU_LAZY_MODE", "VLLM_HPU_FLASH_NEXT_QSA_MODE", "VLLM_HPU_RECURRENT_STATE_POOL",
+                "VLLM_HPU_GDN_CORE_DECODE", "VLLM_HPU_GDN_CORE_VERIFY", "VLLM_COMPACT_GDN"):
+        assert tiny.get(key) == venv.get(key)
+    assert tiny["PT_HPU_LAZY_MODE"] == "1"
+    assert "VLLM_COMPACT_GDN" not in tiny
