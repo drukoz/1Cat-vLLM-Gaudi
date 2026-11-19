@@ -49,7 +49,9 @@ class HpuQwen4ExpNGramEmbedding(Qwen4ExpNGramEmbedding):
     tensors to int32, so every one of those values (up to 2**62) fails to build.
     This subclass keeps the buffer as zeros, keeps the real hash tables on the host
     and mirrors them into int32 limb buffers, and computes the ids with
-    ``ple_ngram_ids_int32``, which reproduces the engine's int64 hash exactly.
+    ``ple_ngram_ids_int32``, which reproduces the engine's int64 hash exactly. Its
+    ``_shift_precompute`` replaces the engine's ``torch.cummax`` (no HPU kernel) with a
+    doubling max-scan, so the EOS cut of the n-gram history runs inside HPU graphs.
     """
 
     @classmethod
@@ -59,6 +61,53 @@ class HpuQwen4ExpNGramEmbedding(Qwen4ExpNGramEmbedding):
         # multipliers are computed on the host in __init__ and live in the
         # int32 ``hash_multiplier_limbs`` buffer, never in ``layer_multipliers``.
         return [0] * int(kwargs["ngram_size"])  # type: ignore[arg-type]
+
+    @staticmethod
+    def _shift_precompute(tokens: torch.Tensor, eos_token_id: int) -> tuple[torch.Tensor, torch.Tensor]:
+        """The engine's ``_shift_precompute`` without ``torch.cummax``, which has no HPU kernel.
+
+        On the Gaudi bridge ``torch.cummax`` runs on the CPU through the fallback path,
+        which HPU graph capture rejects (rental run 2: ``cpu fallback is not supported
+        during hpu graph capturing`` in prompt warmup). The inclusive running maximum of
+        the EOS positions is computed instead by a doubling scan of ``torch.maximum`` over
+        lagged copies: ``ceil(log2(L))`` fixed-shape steps, every op with an HPU kernel.
+        Same return values as the engine: ``(positions [L], position_in_segment [B, L])``.
+        """
+        if tokens.dim() != 2:
+            raise ValueError("tokens must be a 2D tensor")
+        batch_size, seq_len = tokens.shape
+        positions = torch.arange(seq_len, device=tokens.device, dtype=torch.int64)
+        eos_positions = torch.where(tokens == eos_token_id, positions, -1)
+        running = eos_positions
+        step = 1
+        while step < seq_len:
+            lag = torch.full((batch_size, step), -1, dtype=running.dtype, device=running.device)
+            running = torch.maximum(running, torch.cat([lag, running[:, :-step]], dim=1))
+            step *= 2
+        first = torch.full((batch_size, 1), -1, dtype=running.dtype, device=running.device)
+        previous_eos = torch.cat([first, running[:, :-1]], dim=1)
+        return positions, positions.unsqueeze(0) - previous_eos - 1
+
+    @staticmethod
+    def _shift_apply(
+        tokens: torch.Tensor,
+        positions: torch.Tensor,
+        position_in_segment: torch.Tensor,
+        shift: int,
+        eos_token_id: int,
+    ) -> torch.Tensor:
+        """The engine's ``_shift_apply`` with ``masked_fill`` instead of ``where`` over a ``new_full`` scalar.
+
+        Same result; ``Tensor.new_full`` has no int64 row in the Gaudi operator table while
+        ``masked_fill`` has, so the shifted tokens are filled with ``eos_token_id`` directly.
+        """
+        if shift == 0:
+            return tokens
+        source = positions - shift
+        gather_indices = source.clamp_min(0).unsqueeze(0).expand(tokens.shape[0], -1)
+        shifted = tokens.gather(1, gather_indices)
+        valid = (source.unsqueeze(0) >= 0) & (position_in_segment >= shift)
+        return shifted.masked_fill(~valid, eos_token_id)
 
     def __init__(
         self,
