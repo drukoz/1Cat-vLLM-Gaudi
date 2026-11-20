@@ -279,8 +279,10 @@ def _validate_flash_next_speculative_config(vllm_config: VllmConfig) -> None:
     if not prefix_caching and os.environ.get("VLLM_COMPACT_GDN", "1").strip().lower() not in ("1", "true"):
         raise ValueError("Flash-Next MTP needs compact GDN state for the per-token verification checkpoints: "
                          "unset VLLM_COMPACT_GDN or set it to 1")
-    if not 1 <= speculative_config.num_speculative_tokens <= 4:
-        raise ValueError("Flash-Next MTP on HPU runs 1 to 4 speculative tokens (the recipe is 3)")
+    # 5 is the largest lattice (1 + k = 6 nodes) the fused GDN verification op takes (GDN_CORE_VERIFY_MAX_NODES);
+    # the CPU tests run the speculative path at k = 3, 4 and 5 (tests/unit_tests/flash_next_spec_sizes.py).
+    if not 1 <= speculative_config.num_speculative_tokens <= 5:
+        raise ValueError("Flash-Next MTP on HPU runs 1 to 5 speculative tokens (the recipe is 3)")
 
 
 class HpuPlatform(Platform):

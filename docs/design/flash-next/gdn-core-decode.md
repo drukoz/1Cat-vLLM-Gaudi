@@ -339,8 +339,9 @@ speculative path run at `k` = 3, 4 and 5 (`tests/unit_tests/flash_next_spec_size
 and `T` = 6 lattices to the op, and the op equals the torch path on 1, 2, 4 and 8 ranks
 (`test_gdn_core_verify_layer.py`, `test_gdn_core_verify_tp.py`); the whole model keeps the non-speculative stream
 and the recurrent state for every accepted count `0..k`, with prefix caching off and on (`test_mtp_end_to_end.py`,
-`test_mtp_align_continuity.py`). No code changed for it. The platform still refuses `k` above 4 at startup
-(`_validate_flash_next_speculative_config`), for memory, not for correctness: each speculative token adds
+`test_mtp_align_continuity.py`). No code changed for it. The platform refused `k` above 4 at startup
+(`_validate_flash_next_speculative_config`), for memory, not for correctness; since 2026-11-20 it accepts 1 to 5
+(5 is the op's largest lattice) and the engine's own KV sizing reports the lower concurrency at k = 5: each speculative token adds
 `4 x max_num_seqs` slots to the recurrent state pool and one row to both conv states, and `k` = 5 takes the QSA key
 ring from 8 to 12 rows per slot. At TP8 with 32 sequences the pool grows from 6.15 GiB per card (`k` = 3: 1280 slots
 of 5,148,672 bytes) to 7.52 GiB (`k` = 5: 1536 slots of 5,251,072 bytes), so one 8-card FP8 server with 32
