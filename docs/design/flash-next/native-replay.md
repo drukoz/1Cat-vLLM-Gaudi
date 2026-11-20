@@ -538,10 +538,13 @@ lost if the hold runs short): `base`, `cutpin` (`VLLM_HPU_DECODE_CUT_INTERVAL=10
 passed), `cut` (`VLLM_HPU_DECODE_CUT_INTERVAL=1000`); each with `VLLM_GRAPH_RESERVED_MEM=0.5` (BRIEF.md 23:50 UTC), one
 server start per arm. Per arm: `real4-<arm>/scaling.json`, `server0.log`, `probe.log`, `hostwatch/` (rank 0's threads
 every 2 s, stacks after the second 32-stream round), `cpuwatch/cpus_series.txt` and `.jsonl` (`late/cpu_watch.py` on
-CPU 151: per rank every 5 s the main thread and the two busiest other threads, their CPU share, the CPUs they ran on
+CPU 151: per rank every 2 s the main thread and the two busiest other threads, their CPU share, the CPUs they ran on
 and their CPU changes; asked for by the coordinator: whether a worker needs about 3 CPUs of its own), `hlsmi.txt`
 (device memory every 15 s). When it ends: `bin/farm fetch native-replay 00134 real4-hashtiny real4-hashtiny-hash
-real4-base real4-cutpin real4-cuthash real4-cut`, then report to the coordinator per arm (as asked): ms per step at
+real4-base real4-cutpin real4-cuthash real4-cut`, then `python3 reports/native-replay/probes/ab_report.py
+reports/native-replay/card base cutpin cuthash cut` (per arm and level the steady ms per step, the 1-stream text against
+`base`, the pin and cut log lines, per rank the main thread's CPU share and CPUs in the measured 1-stream round and
+the 32-stream rounds), then report to the coordinator per arm (as asked): ms per step at
 1 and 32 streams (the probe's median gap), the 1-stream text against `base`, the per-rank spread (`cpuwatch`: the
 main thread's CPU share per rank at 1 stream; a fast rank waits blocked at the read). Read also: `cutpin/server0.log`
 has one line per worker `VLLM_HPU_WORKER_CPU_PIN=1: rank r module m: share i of 4, CPUs a-b (18 of the 72 ...)`.
