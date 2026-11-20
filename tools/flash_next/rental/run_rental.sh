@@ -28,7 +28,7 @@ HF_HUB_VERSION="1.33.0"
 # --with-profile), then "report". --from is checked against them here, before the container starts,
 # so a misspelt phase costs nothing. A test keeps these lists equal to main.py and variants.json.
 GATE_PHASES="preflight build fused_gdn tiny card_tests"
-KNOWN_VARIANTS="A B C P"
+KNOWN_VARIANTS="A B B4 B5 C P"
 DEFAULT_VARIANTS="A B C"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
