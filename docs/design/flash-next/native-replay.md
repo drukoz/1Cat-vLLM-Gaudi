@@ -359,7 +359,7 @@ change in each module.
 
 ## Handoff (if this agent stops)
 
-State at 2026-11-20 19:30 UTC (third agent of this track, started 19:00 UTC). Branch
+State at 2026-11-20 19:45 UTC (third agent of this track, started 19:00 UTC). Branch
 `feat/flash-next-gaudi-native-replay` (worktree `/Volumes/Storage/Claude/gaudi-work/wt/native-replay`), pushed to
 `origin`, the program head `b0cd0bb` merged in (`b0140c3f`); nothing of this track is merged into
 `feat/flash-next-gaudi` yet. No uncommitted change in the repository. This harness refuses report files, so this
@@ -378,25 +378,34 @@ the settings that exist), `probes/const_ops.py` (section 7.3), `logs/` (CPU test
 - `VLLM_HPU_DECODE_CUT_INTERVAL` (commit `021f9bf6`) and `VLLM_HPU_GRAPH_ASYNC_REPLAY` (`6966226e`), both default 0,
   CPU tests green: `tests/unit_tests/worker/test_decode_cut_interval.py` (11),
   `tests/unit_tests/worker/test_hpu_graph_async_replay.py` (4).
-- The benchmark separates a launch from a collective and looks at the host from outside (commit `649d32f6`,
-  `tests/unit_tests/tools/test_bench_replay.py`, 17 tests; gloo self-test of every new regime): `replay_seg`,
-  `*_cache`, host CPU per call, `--env-sets`, `--hold-file` with `tools/flash_next/replay/host_sampler.sh`
-  (thread CPU from /proc, gdb stacks, strace of rank 0; its process matching tested in the Linux VM), `--ranks 1`.
+- The benchmark separates a launch from a collective and looks at the host from outside (commits `649d32f6`,
+  `eefaf058`, `22ec52cf`; `tests/unit_tests/tools/test_bench_replay.py`, 21 tests; gloo self-test of every new
+  regime): `replay_seg`, `*_cache`, `*_busy` (the device's floor behind one long operation), `replay_ag`
+  (all-gather plus local sum), host CPU per call, `--env-sets`, `--hold-file` with
+  `tools/flash_next/replay/host_sampler.sh` (thread CPU and context switches from /proc, gdb stacks, strace of
+  rank 0; its process matching tested in the Linux VM; gdb and strace themselves first run in job 00067),
+  `--ranks 1`.
+- Both flags log one line when they take effect (commit `6423a274`): look for
+  `VLLM_HPU_DECODE_CUT_INTERVAL=1000: a decode forward cuts after every 1000-th decoder layer` in a server log.
 - Device incident of job 00012 (module 0, "No progress error" in `replay_coll` at 128 rows, 8 ranks): card-farm's
   verdict is a workload trigger, not a flaky module. No job of this track runs `replay_coll`.
 
 ### Queued card jobs (submitted 19:22-19:24 UTC) and what to do with each result
 
-Every job is a stub that runs `~/farm/native-replay/late/replay_job.sh RUN MODE 649d32f69cb2`; fetch with
+Every job is a stub that runs `~/farm/native-replay/late/replay_job.sh RUN MODE 649d32f69cb2`; the commit that
+really runs is the one in `~/farm/native-replay/late/SHA` (now `22ec52cf4480`, image built): write a newer
+synced commit there to move the queued jobs to it. Fetch with
 `bin/farm wait <id>; bin/farm fetch native-replay <id> <RUN>...` into `reports/native-replay/card/`.
+`reports/native-replay/probes/knob_table.py <knobs_rN.json>` prints the per-setting table,
+`probes/stacks.py <bench/sampler/stacks.txt>` the stack histogram.
 
-1. **00065** `replay-host-path-r8-tiny-cut` (`all`, 20 min; took 00027's place). Run folders `host-r8` and
-   `host-r8-cut`. Steps: (a) `bench/replay_r8.log|json`: 13 regimes at rows 1 and 32, a hold loop of 2,500 replays
-   with the sampler (`bench/sampler/threads.txt`, `stacks.txt`, `strace_c.txt`, `strace_main.txt`), a profiler
-   trace; (b) `tiny-cut.log` and `../host-r8-cut/summary.json`: the tiny model at TP8 with
-   `VLLM_HPU_DECODE_CUT_INTERVAL=1000` (PASSED = token parity = the merge condition of that flag);
-   (c) `bench/knobs_r8.log|json`: `replay` and `replay_seg` under 7 settings (`replay@<name>` lines, "against
-   replay").
+1. **00065** `replay-host-path-r8-tiny-cut` (`all`, 20 min; the coordinator bumps it behind prefill's 00014).
+   Run folders `host-r8` and `host-r8-cut`. Steps: (a) `bench/replay_r8.log|json`: 14 regimes at rows 1 and 32,
+   a hold loop of 2,500 replays with the sampler (`bench/sampler/threads.txt`, `stacks.txt`, `stacks_full.txt`,
+   `strace_c.txt`, `strace_main.txt`), a profiler trace; (b) `tiny-cut.log` and `../host-r8-cut/summary.json`:
+   the tiny model at TP8 with `VLLM_HPU_DECODE_CUT_INTERVAL=1000` (PASSED = token parity = the merge condition of
+   that flag); (c) `bench/busy_r8.log|json`: the device's floor (`*_busy`: valid where the printed host call is
+   shorter than the long operation); (d) `bench/knobs_r8.log|json`: `replay` under 8 settings (`replay@<name>`).
    Readings: `replay_async_tail` against `replay_tail` (`vs_total_ms`): what an asynchronous replay overlaps
    (expected under 1 ms: only the logits and sampler issue can overlap). `replay_seg`: "one launch" and "one
    collective alone" (the two parts of 00012's 130-195 us). `replay_fused2` against `replay_par2`: one collective
@@ -408,12 +417,16 @@ Every job is a stub that runs `~/farm/native-replay/late/replay_job.sh RUN MODE 
 2. **00066** `tiny-tp4-cut-then-async` (`any:4`, 14 min; took 00053's place). Run folders `tiny4-cut`,
    `tiny4-cut-async`, logs `tiny4/tiny-cut.log`, `tiny4/tiny-cut-async.log`. PASSED on the first = parity of the cut
    flag at TP4; on the second = parity with the asynchronous replay as well.
-3. **00067** `replay-launch-path-1card` (`any:1`, 10 min, end of the queue). Run folder `launch-r1`: the launch
-   path on one card (no collectives): `replay_seg` and `replay_layer` (cost per launch), `*_cache`, the sampler on
-   a loop of `replay_seg` replays, then 10 bridge and Synapse settings (`bench/knobs_r1.log`).
+3. **00067** `replay-launch-path-1card` (`any:1`, 10 min; bumped by the coordinator, expected 20:20 to 21:15
+   UTC). Run folder `launch-r1`: the launch path on one card (no collectives): `replay_seg` and `replay_layer`
+   (cost per launch), `*_cache`, the sampler on a loop of `replay_seg` replays, the device's floor per launch
+   (`bench/busy_r1.log`), then 12 bridge and Synapse settings (`bench/knobs_r1.log`).
 4. **00068** `replay-host-path-r4` (`any:4`, 14 min, end of the queue). Run folder `host-r4`: job 00065's bench
    steps at 4 ranks (the layout of E1).
-The coordinator was asked (19:25 UTC) to bump 00067 and 00065. `late/real_ab.sh` is ready for a real-model A/B
+The coordinator bumped 00067 and bumps 00065 (19:28 UTC) and asked for: the host cost per launch and per
+collective under every setting, and which settings are safe for every server (output unchanged on the tiny
+model). For the second: `replay_job.sh RUN tinyenv <sha12> name:KEY=VALUE[,KEY=VALUE]...` serves the tiny model
+once per setting (submit it as a stub like the others, `any:4` or `any:1`, about 4 min per setting). `late/real_ab.sh` is ready for a real-model A/B
 (not submitted yet): `printf 'bash $HOME/farm/native-replay/late/real_ab.sh real4 1,32 128 base cut:VLLM_HPU_DECODE_CUT_INTERVAL=1000\n' | bin/farm submit native-replay real4-cut-ab any:4 32m`
 (two server starts on the same four cards; results in `real4-base/` and `real4-cut/`, `scaling.json`).
 
