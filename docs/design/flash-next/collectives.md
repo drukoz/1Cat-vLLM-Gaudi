@@ -152,6 +152,25 @@ rows and 62 us at 32 rows, that is 4.2 to 6.0 ms per 98; one all-reduce as its o
 and sync) 0.16 to 0.24 ms at 8 to 32 rows, an all-gather of the same rows 0.19 to 0.21 ms. A `mark_step` before
 every collective (`VLLM_HPU_COLLECTIVE_MARK_STEP=1`, the plugin's default) added 2.1 to 11 ms per 98.
 
+At 8 ranks (MEASURED, native-replay job 00012, `tools/flash_next/replay/bench_replay.py` on its branch, a 48-layer
+body with GEMMs): one all-reduce costs 177 / 129 / 195 us at 1 / 32 / 128 rows under HPU-graph replay as the runner
+does it (`wrap_in_hpu_graph`, `asynchronous=False`), 73 to 93 % of it host time inside the replay; 89 to 164 us in
+plain lazy mode; 74 to 158 us under `torch.compile`. So the collectives of a decode step, 98 x about 150 us = 13 to
+19 ms, are most of the fixed term of today's step, and **every collective removed is worth about 0.15 ms per step**
+at TP8, whatever its payload. In that light (INFERRED from the counts of section 1):
+
+- the cuts of sections 2 and 4 remove 1 collective per target step (0.15 ms) and, with the replicated embedding and
+  the unsharded MTP entry linears, 9 per k = 3 draft pass set (1.35 ms per MTP step); the bytes of the logits
+  gather matter less than its existence, which stays;
+- the per-layer floor of section 3 stays at 2 for every layout that keeps the experts sharded over the ranks that
+  also shard the mixers: with a tensor-parallel degree above 1, `2 x (layers per stage) x (micro-batches)` is 96
+  collectives per card per round for any pipeline split (PP2 x TP4 and PP4 x TP2 included); only TP1 stages
+  (a pipeline of 8 single-card stages) have none, at the price of reading each stage's weights once per micro-batch
+  and of 8 graph replays per card per round;
+- the cost of each collective is therefore the lever: it is mostly the host's work per collective inside the
+  replay, which is native replay's (B10) and C6's territory, and possibly the replay's `asynchronous=True` mode;
+  job 00019 measures that mode next to the default one.
+
 The decision between C4, C6 and the two-server layout (G4-1) comes from the collectives track's job 00019, which
-opens with the same payloads on 8 and then 4 ranks, lazy and HPU-graph replay, all-reduce against all-gather plus
-local sum (`reports/collectives/job/bench_c4.py`), and from the track report.
+opens with the same payloads on 8 and then 4 ranks, lazy, HPU-graph replay and asynchronous replay, all-reduce
+against all-gather plus local sum (`reports/collectives/job/bench_c4.py`), and from the track report.
