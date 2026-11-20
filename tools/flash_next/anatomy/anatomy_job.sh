@@ -160,6 +160,13 @@ plan_a() {
     PROBE_EXTRA="--trace-tokens 160" serve a2-trace "warm:32,1:160;1:32,1:96" "32,1" \
         --profiler-config '{"profiler": "torch", "torch_profiler_dir": "'"$RESULTS"'/a2-trace/trace", "torch_profiler_with_stack": false, "torch_profiler_use_gzip": true, "torch_profiler_record_shapes": false}'
     ls -la $RESULTS/a2-trace/trace 2>/dev/null | head -n 20
+    # A3: the one-card benches with what is left of the job's 50-minute hold (SIGTERM at 3,000 s), 2 minutes spare.
+    local left=$(( ${ANATOMY_HOLD_S:-3000} - SECONDS - 120 ))
+    if [ "$left" -ge 240 ]; then
+        run_benches $(( left > 600 ? 600 : left ))
+    else
+        say "no time left for the one-card benches ($SECONDS s used)"
+    fi
 }
 
 plan_t() {
@@ -183,25 +190,31 @@ JSON
     ls -la $RESULTS/t-trace/trace 2>/dev/null | head -n 20
 }
 
-plan_b() {
-    # G1-1 while no server holds the cards: one case per card on cards 0-4; on card 5 the lazy-op cases that
-    # job 00009 lost (mix family, cuts, mark_step alone, copies, LM head), in accumulation mode 0, sizes up to
-    # 3,000 under the script's compile budget. The copies next to this script kill their children when they are
-    # stopped (the bundle's copies did not: job 00009's 8-rank collective bench found card 0 still held). The
-    # collective latencies are the collectives track's job 00019 (coordinator, 18:00 UTC), not run here.
-    local pids=()
-    say "MME row sweep on cards 0-4, lazy-op cases (mode 0) on card 5"
-    PT_HPU_LAZY_MODE=1 PT_HPU_LAZY_ACC_PAR_MODE=0 timeout 900 \
-        python3 "$HERE/bench_mme_rows.py" --cards 0,1,2,3,4 --out $RESULTS/mme_rows.json > $RESULTS/mme_rows.log 2>&1 &
+# run_benches SECONDS: the one-card benches side by side, each stopped after SECONDS: the MME row sweep (G1-1,
+# predictions 3 and 4) one case per card on cards 0-4, and on card 5 the lazy-op cases that job 00009 lost (mix family,
+# cuts, mark_step alone, copies, LM head; accumulation mode 0, sizes up to 3,000 under the script's compile budget).
+# The copies next to this script kill their children when they are stopped (job 00009: an orphan kept card 0).
+run_benches() {
+    local limit="$1" pids=() mme_cards="0,1,2,3,4" lazy_card=5
+    if [ "$STAGE" -eq 2 ]; then mme_cards=""; lazy_card=""; fi  # a 1-card job: everything on its card, in turn
+    say "one-card benches for at most $limit s: MME row sweep (cards ${mme_cards:-of the job}), lazy-op cases (card ${lazy_card:-of the job})"
+    PT_HPU_LAZY_MODE=1 PT_HPU_LAZY_ACC_PAR_MODE=0 timeout "$limit" \
+        python3 "$HERE/bench_mme_rows.py" ${mme_cards:+--cards "$mme_cards"} --child-timeout "$limit" \
+        --out "$RESULTS/mme_rows.json" > "$RESULTS/mme_rows.log" 2>&1 &
     pids+=($!)
-    HABANA_VISIBLE_MODULES=5 timeout 700 python3 "$HERE/bench_lazy_ops.py" --acc-modes 0 \
-        --out $RESULTS/lazy_ops_mode0.json > $RESULTS/lazy_ops_mode0.log 2>&1 &
+    HABANA_VISIBLE_MODULES="${lazy_card:-${HABANA_VISIBLE_MODULES:-}}" timeout "$limit" \
+        python3 "$HERE/bench_lazy_ops.py" --acc-modes 0 --child-budget $(( limit > 300 ? limit - 120 : limit / 2 )) \
+        --out "$RESULTS/lazy_ops_mode0.json" > "$RESULTS/lazy_ops_mode0.log" 2>&1 &
     pids+=($!)
     for pid in "${pids[@]}"; do wait "$pid"; done
     pkill -9 -f "bench_(mme_rows|lazy_ops).py" 2>/dev/null
     say "one-card benches done"
-    tail -n 45 $RESULTS/mme_rows.log 2>/dev/null | cut -c1-250
-    tail -n 30 $RESULTS/lazy_ops_mode0.log 2>/dev/null | cut -c1-250
+    tail -n 45 "$RESULTS/mme_rows.log" 2>/dev/null | cut -c1-250
+    tail -n 30 "$RESULTS/lazy_ops_mode0.log" 2>/dev/null | cut -c1-250
+}
+
+plan_b() {
+    run_benches 600
     # I10 / G4-2: the per-decoder-layer mark_step every 4 layers (default every layer). A bigger recipe compiles
     # far longer (00009: 1,000 ops 14 s, 3,000 ops 135 s), so 4 first; 12 only when the job has time left.
     base_env
