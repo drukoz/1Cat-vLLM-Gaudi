@@ -1,10 +1,17 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 // Fake kernel-library member for the combined kernel database host test
-// (RUK-3243). Compiled twice: -DFAKE_TAG=a exports GUIDs fake_a_only +
-// fake_shared, -DFAKE_TAG=b exports fake_b_only + fake_shared. Each entry point
-// records its name in the exported fake_last_call() string and returns values
-// that let the test tell the members apart.
+// (RUK-3243). -DFAKE_TAG=<t> exports the GUIDs fake_<t>_only + fake_shared.
+// Each entry point records its name in the exported fake_last_call() string and
+// returns values that let the test tell the members apart.
+//
+// Variants:
+//   FAKE_TAG=a, FAKE_TAG=b   all six entry points (like Intel's libtpc_kernels.so)
+//   -DFAKE_MINIMAL           only the three entry points the graph compiler requires
+//                            (GetKernelGuids, InstantiateTpcKernel, GetShapeInference),
+//                            like libgdn_fused_gaudi2.so / libflashinfer_gaudi_kernels.so
+//   -DFAKE_NO_SHAPE_INFERENCE  additionally drops GetShapeInference: not a loadable
+//                            kernel library (the graph compiler refuses it)
 #include <tpc_kernel_lib_interface.h>
 
 #include <cstdio>
@@ -17,8 +24,22 @@ using namespace tpc_lib_api;
 
 namespace {
 
-const char* const kTag = KDA_XSTR(FAKE_TAG);  // "a" or "b"
+const char* const kTag = KDA_XSTR(FAKE_TAG);  // "a", "b", "m" (minimal) or "n" (no shape inference)
 const char* g_last = "none";
+
+// What InstantiateTpcKernel writes to kernel.paramsNr, so the test can tell which member answered.
+unsigned member_number() {
+    switch (kTag[0]) {
+        case 'a':
+            return 1U;
+        case 'b':
+            return 2U;
+        case 'm':
+            return 3U;
+        default:
+            return 4U;
+    }
+}
 
 const char* guid_name(char* buffer, size_t size) {
     std::snprintf(buffer, size, "fake_%s_only", kTag);
@@ -70,10 +91,11 @@ extern "C" GlueCodeReturn InstantiateTpcKernel(const HabanaKernelParams* params,
     if (!params || !instance) {
         return GLUE_FAILED;
     }
-    instance->kernel.paramsNr = (kTag[0] == 'a') ? 1U : 2U;
+    instance->kernel.paramsNr = member_number();
     return GLUE_SUCCESS;
 }
 
+#ifndef FAKE_NO_SHAPE_INFERENCE
 extern "C" GlueCodeReturn GetShapeInference(DeviceId deviceId, const ShapeInferenceParams* inputParams,
                                             ShapeInferenceOutput* outputData) {
     g_last = "GetShapeInference";
@@ -82,7 +104,9 @@ extern "C" GlueCodeReturn GetShapeInference(DeviceId deviceId, const ShapeInfere
     (void)outputData;
     return GLUE_SUCCESS;
 }
+#endif  // FAKE_NO_SHAPE_INFERENCE
 
+#ifndef FAKE_MINIMAL
 extern "C" GlueCodeReturn GetSuggestedManipulation(const HabanaKernelParams* params, void* manipulation) {
     g_last = "GetSuggestedManipulation";
     (void)params;
@@ -103,5 +127,6 @@ extern "C" GlueCodeReturn GetSupportedDataLayouts(const HabanaKernelParams* para
 
 extern "C" uint64_t GetLibVersion() {
     g_last = "GetLibVersion";
-    return (kTag[0] == 'a') ? 1001ULL : 1002ULL;
+    return 1000ULL + member_number();
 }
+#endif  // FAKE_MINIMAL

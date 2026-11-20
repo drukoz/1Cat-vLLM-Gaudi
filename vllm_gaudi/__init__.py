@@ -173,6 +173,13 @@ def register_ops():
         errors = gdn_fused_extension_errors()
         _warn_gdn_core_decode_without_kernel(decode_mode, loaded, on_hpu, errors)
         _warn_gdn_core_verify_without_kernel(verify_mode, decode_mode, loaded, on_hpu, errors)
+    # One line per process with what the loader decided (state, GC_KERNEL_PATH, combined database, errors):
+    # the server log then shows which kernel database every worker really runs.
+    from flashinfer_gaudi._native import kernel_database_status
+    from vllm.logger import init_logger
+
+    init_logger(__name__).info("FlashInfer-Gaudi kernel database: %s",
+                               json.dumps(kernel_database_status(), sort_keys=True))
     import vllm_gaudi.attention.oot_mla  # noqa: F401
     """Register custom ops for the HPU platform."""
     import vllm_gaudi.v1.sample.hpu_rejection_sampler  # noqa: F401

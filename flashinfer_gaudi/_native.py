@@ -29,6 +29,9 @@ _COMBINED_DB_ACTIVE: str | None = None  # the combined kernel database this proc
 RECIPE_CACHE_ENV = "PT_HPU_RECIPE_CACHE_CONFIG"
 COMBINED_KERNEL_DB = "libflashinfer_gaudi_combined_gaudi2.so"  # built by RUK-3243; one file carrying every GUID
 COMBINED_KERNEL_DB_ENV = "FLASHINFER_GAUDI_COMBINED_KERNEL_DB"  # kill switch: "0" ignores the combined database
+FLASHINFER_KERNEL_DB = "libflashinfer_gaudi_kernels.so"  # the FlashInfer kernel database; a member of the combined one
+GDN_FUSED_KERNEL_DB = "libgdn_fused_gaudi2.so"  # the fused GDN kernel database; a member of the combined one
+GDN_FUSED_KERNEL_LIBRARY_ENV = "GDN_FUSED_GAUDI_KERNEL_LIBRARY"  # its path, when it is not in the package's lib/
 
 
 class KernelDbState(IntEnum):
@@ -97,12 +100,30 @@ def _prepend_kernel_database(path: str) -> str | None:
 
 
 def _combined_kernel_db_path() -> Path | None:
-    """The combined kernel database next to this module, or None when absent or switched off."""
-    path = Path(__file__).resolve().parent / "lib" / COMBINED_KERNEL_DB
-    if not path.is_file():
+    """The combined kernel database this process may use, or None when absent or switched off.
+
+    It is looked for in this package's ``lib`` folder first. When it is not there, it is looked for next to the
+    library named by ``GDN_FUSED_GAUDI_KERNEL_LIBRARY``: a process that imports this package from a source tree
+    (an empty ``lib``) and takes the installed libraries by path, as the rental's kernel gate does, must load the
+    same single file the servers load. The combined database serves only the libraries next to itself, so that
+    second location counts only when it serves what this process would otherwise register one by one: the
+    variable names an existing file called ``libgdn_fused_gaudi2.so``, and this package's ``lib`` holds no
+    ``libflashinfer_gaudi_kernels.so`` of its own (which the other folder's combined file would leave out).
+    ``FLASHINFER_GAUDI_COMBINED_KERNEL_DB=0`` switches every location off.
+    """
+    if os.environ.get(COMBINED_KERNEL_DB_ENV, "1").strip() == "0":
         return None
-    if os.environ.get(COMBINED_KERNEL_DB_ENV, "1").strip() != "0":
+    package_lib = Path(__file__).resolve().parent / "lib"
+    path = package_lib / COMBINED_KERNEL_DB
+    if path.is_file():
         return path
+    if (package_lib / FLASHINFER_KERNEL_DB).is_file():
+        return None
+    configured = os.environ.get(GDN_FUSED_KERNEL_LIBRARY_ENV, "")
+    if configured and os.path.isfile(configured) and os.path.basename(configured) == GDN_FUSED_KERNEL_DB:
+        path = Path(os.path.abspath(configured)).parent / COMBINED_KERNEL_DB
+        if path.is_file():
+            return path
     return None
 
 
@@ -133,7 +154,7 @@ def _configure_kernel_database_path() -> KernelDbState:
         _FLASHINFER_DB_STATE = KernelDbState.COMBINED
         return KernelDbState.COMBINED
     package_lib = Path(__file__).resolve().parent / "lib"
-    kernel_db = package_lib / "libflashinfer_gaudi_kernels.so"
+    kernel_db = package_lib / FLASHINFER_KERNEL_DB
     if not kernel_db.is_file():
         _FLASHINFER_DB_STATE = KernelDbState.MISSING
         return KernelDbState.MISSING
@@ -183,9 +204,9 @@ def load_gdn_fused_extension() -> bool:
         if _GDN_FUSED_LOADED is not None:
             return _GDN_FUSED_LOADED
         package_lib = Path(__file__).resolve().parent / "lib"
-        kernel_db = os.environ.get("GDN_FUSED_GAUDI_KERNEL_LIBRARY", "")
+        kernel_db = os.environ.get(GDN_FUSED_KERNEL_LIBRARY_ENV, "")
         if not kernel_db:
-            kernel_db = str(package_lib / "libgdn_fused_gaudi2.so")
+            kernel_db = str(package_lib / GDN_FUSED_KERNEL_DB)
         extension = os.environ.get("GDN_FUSED_GAUDI_NATIVE_LIBRARY", "")
         if not extension:
             matches = sorted(glob.glob(str(package_lib / "gdn_fused_ops*.so")))
@@ -319,6 +340,34 @@ def native_dflash2_score_select_op() -> Callable | None:
 
 def native_dflash2_top_k_op() -> Callable | None:
     return _resolve_op("flashinfer_gaudi", "dflash2_top_k")
+
+
+def kernel_database_status() -> dict[str, object]:
+    """What the loader decided about ``GC_KERNEL_PATH`` in this process, as plain (JSON-serializable) data.
+
+    It only reports: it loads nothing and changes nothing, so it can be called at any point and logged.
+
+    - ``state``: the name of the ``KernelDbState`` of the FlashInfer kernel database (``MISSING``, ``REGISTERED``,
+      ``BLOCKED`` or ``COMBINED``).
+    - ``gc_kernel_path``: the value of ``GC_KERNEL_PATH`` now, the one SynapseAI reads (``""`` when unset).
+    - ``combined_active``: True only when this loader activated the combined kernel database and
+      ``GC_KERNEL_PATH`` is still exactly that one file.
+    - ``combined_kernel_db``: the combined kernel database this loader activated, or None.
+    - ``gdn_fused_loaded``: the result of ``load_gdn_fused_extension`` (None when it was never called).
+    - ``load_errors``: every recorded loader error, in order.
+
+    The member libraries are opened by the combined database itself, inside SynapseAI: a member it cannot
+    use is reported on stderr by that file and makes its ``GetKernelGuids`` fail; it is not visible here.
+    """
+    gc_kernel_path = os.environ.get("GC_KERNEL_PATH", "")
+    return {
+        "state": _FLASHINFER_DB_STATE.name,
+        "gc_kernel_path": gc_kernel_path,
+        "combined_active": _COMBINED_DB_ACTIVE is not None and gc_kernel_path == _COMBINED_DB_ACTIVE,
+        "combined_kernel_db": _COMBINED_DB_ACTIVE,
+        "gdn_fused_loaded": _GDN_FUSED_LOADED,
+        "load_errors": list(_LOAD_ERRORS),
+    }
 
 
 def native_diagnostics() -> dict[str, object]:
