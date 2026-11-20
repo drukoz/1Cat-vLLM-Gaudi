@@ -1,10 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for the rental orchestrator (stub mode) and its helpers."""
 
+import ast
 import copy
+import hashlib
 import json
 import shutil
 import socket
+import subprocess
+import sys
 from pathlib import Path
 
 from tools.flash_next.rental import gates, main as rental_main, serve
@@ -64,8 +68,9 @@ def test_full_stub_run(tmp_path, capsys):
     assert manifest["server_timeout_s"] == rental_main.SERVER_HEALTH_TIMEOUT_S
     assert manifest["recipe_cache"]["dir"] is None
     assert manifest["recipe_cache"]["variants"] == {"A": "none", "B": "none"}
-    for key in manifest["env"]:
-        assert key.startswith(("VLLM_", "HABANA_", "PT_", "HF_"))
+    for key in manifest["env"]:  # the kernel-loader prefixes and the fault handler joined the list on purpose
+        assert key.startswith(rental_main.ENV_PREFIXES) or key in rental_main.ENV_KEYS
+    assert set(rental_main.ENV_PREFIXES) >= {"VLLM_", "HABANA_", "PT_", "HF_", "FLASHINFER_", "GC_", "GDN_"}
 
     workload = read_json(run / "workload.json")
     assert len(workload["agents"]) == 4
@@ -509,3 +514,227 @@ def test_card_tests_stub_mode_skips(tmp_path, monkeypatch):
     status = read_json(runner.run_dir / "card_tests" / "status.json")
     assert status["status"] == int(GateStatus.SKIPPED)
     assert status["reason"] == "stub mode"
+
+
+# --------------------------------------------------------------------------- the tiny checkpoint and its server
+
+GENERATOR = REPO / "tools" / "flash_next" / "make_tiny_checkpoint.py"
+COMMITTED_REFERENCE = REPO / "tests" / "unit_tests" / "models" / "flash_next" / "reference.json"
+
+
+def generator_constants() -> dict:
+    """The generator's module-level literals, read from its source: importing it would import torch."""
+    out = {}
+    for node in ast.parse(GENERATOR.read_text(encoding="utf-8")).body:
+        if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
+            try:
+                out[node.targets[0].id] = ast.literal_eval(node.value)
+            except ValueError:
+                pass
+    return out
+
+
+def serve_length(cmd: list) -> int:
+    return int(cmd[cmd.index("--max-model-len") + 1])
+
+
+def write_tiny_reference(ckpt: Path, lengths, build=None) -> None:
+    ckpt.mkdir(parents=True, exist_ok=True)
+    prompts = [{"prompt_ids": list(range(n)), "generated_ids": list(range(16))} for n in lengths]
+    reference = {"schema": 2, "max_new_tokens": 16, "prompts": prompts}
+    if build is not None:
+        reference["build"] = build
+    (ckpt / "reference.json").write_text(json.dumps(reference), encoding="utf-8")
+
+
+def test_tiny_serve_length_covers_the_longest_reference_prompt(tmp_path):
+    # Session 1: the server ran with --max-model-len 512 and answered HTTP 400 to the 700 and 2600 token prompts.
+    ckpt = tmp_path / "ckpt"
+    ckpt.mkdir()
+    shutil.copyfile(COMMITTED_REFERENCE, ckpt / "reference.json")
+    reference = read_json(ckpt / "reference.json")
+    longest = max(len(p["prompt_ids"]) for p in reference["prompts"])
+    assert longest == max(generator_constants()["PROMPT_LENGTHS"]) == 2600
+    length = serve_length(rental_main.tiny_serve_command(ckpt, 8010))
+    assert length >= longest + reference["max_new_tokens"]
+    assert length >= longest + gates.TINY_MAX_TOKENS
+    fixture = read_json(REPO / rental_main.TINY_FIXTURE)
+    assert length <= fixture["text_config"]["max_position_embeddings"]
+
+
+def test_tiny_serve_length_follows_the_reference(tmp_path):
+    ckpt = tmp_path / "ckpt"
+    write_tiny_reference(ckpt, [1, 7])
+    assert serve_length(rental_main.tiny_serve_command(ckpt, 8010)) == 512
+    write_tiny_reference(ckpt, [1, 496])  # 496 + 16 fits 512 exactly
+    assert serve_length(rental_main.tiny_serve_command(ckpt, 8010)) == 512
+    write_tiny_reference(ckpt, [1, 497])
+    assert serve_length(rental_main.tiny_serve_command(ckpt, 8010)) == 1024
+    write_tiny_reference(ckpt, [5000, 3])
+    assert serve_length(rental_main.tiny_serve_command(ckpt, 8010)) == 8192
+
+
+def test_tiny_serve_length_without_a_reference_covers_the_generator_prompts(tmp_path):
+    constants = generator_constants()
+    length = serve_length(rental_main.tiny_serve_command(tmp_path / "no-ckpt", 8010))
+    assert length == rental_main.TINY_DEFAULT_MODEL_LEN
+    assert length >= max(constants["PROMPT_LENGTHS"]) + constants["MAX_NEW_TOKENS"]
+    assert gates.TINY_MAX_TOKENS == constants["MAX_NEW_TOKENS"]
+
+
+def test_tiny_checkpoint_command_builds_the_gdn_layers_at_head_dim_128(tmp_path):
+    # The HPU fused GDN kernel needs head dim 128; the committed fixture has 16 and stays as it is.
+    cmd = rental_main.tiny_checkpoint_command(tmp_path / "ckpt")
+    assert cmd[cmd.index("--gdn-head-dim") + 1] == "128"
+    assert rental_main.TINY_GDN_HEAD_DIM == 128
+    fixture = read_json(REPO / rental_main.TINY_FIXTURE)["text_config"]
+    assert (fixture["linear_key_head_dim"], fixture["linear_value_head_dim"]) == (16, 16)
+
+
+def test_tiny_build_settings_name_the_generator_and_the_fixture():
+    assert rental_main.tiny_build_settings() == {
+        "seed": 0,
+        "gdn_head_dim": 128,
+        "fixture_sha256": hashlib.sha256((REPO / rental_main.TINY_FIXTURE).read_bytes()).hexdigest(),
+        "generator_sha256": hashlib.sha256(GENERATOR.read_bytes()).hexdigest(),
+    }
+
+
+def test_tiny_checkpoint_stale_reasons(tmp_path):
+    ckpt = tmp_path / "ckpt"
+    wanted = rental_main.tiny_build_settings()
+    assert "no reference.json" in rental_main.tiny_checkpoint_stale_reason(ckpt)
+    write_tiny_reference(ckpt, [1, 7])  # a reference from before the build settings were recorded
+    assert "no build settings" in rental_main.tiny_checkpoint_stale_reason(ckpt)
+    build = dict(wanted, schema=2, prompt_lengths=[1, 7], max_new_tokens=16)
+    write_tiny_reference(ckpt, [1, 7], build)
+    assert rental_main.tiny_checkpoint_stale_reason(ckpt) is None
+    write_tiny_reference(ckpt, [1, 7], dict(build, gdn_head_dim=16))
+    assert "gdn_head_dim" in rental_main.tiny_checkpoint_stale_reason(ckpt)
+    write_tiny_reference(ckpt, [1, 7], dict(build, generator_sha256="0" * 64))
+    assert "generator_sha256" in rental_main.tiny_checkpoint_stale_reason(ckpt)
+    write_tiny_reference(ckpt, [1, 7], dict(build, prompt_lengths=[1, 7, 33]))  # prompts cut out of the file
+    assert "prompt_lengths" in rental_main.tiny_checkpoint_stale_reason(ckpt)
+    write_tiny_reference(ckpt, [1, 7], dict(build, schema=1))
+    assert "schema" in rental_main.tiny_checkpoint_stale_reason(ckpt)
+
+
+def fake_builder(tmp_path: Path, build: dict) -> list:
+    """A checkpoint command that counts its runs in <ckpt>/builds and writes a reference with `build`."""
+    script = tmp_path / "fake_builder.py"
+    script.write_text(
+        "import json, sys\nfrom pathlib import Path\n"
+        "out = Path(sys.argv[1]); out.mkdir(parents=True, exist_ok=True)\n"
+        "count = out / 'builds'\n"
+        "count.write_text(str(int(count.read_text()) + 1 if count.exists() else 1))\n"
+        "prompts = [{'prompt_ids': [1], 'generated_ids': list(range(16))}]\n"
+        "(out / 'reference.json').write_text(json.dumps({'schema': 2, 'prompts': prompts, "
+        "'build': json.loads(sys.argv[2])}))\n", encoding="utf-8")
+    return [sys.executable, str(script)]
+
+
+def test_ensure_tiny_checkpoint_rebuilds_on_other_settings(tmp_path):
+    ckpt = tmp_path / "ckpt"
+    wanted = dict(rental_main.tiny_build_settings(), schema=2, prompt_lengths=[1], max_new_tokens=16)
+    good = fake_builder(tmp_path, wanted) + [str(ckpt), json.dumps(wanted)]
+    said = []
+    assert rental_main.ensure_tiny_checkpoint(ckpt, good, say=said.append) is None
+    assert (ckpt / "builds").read_text() == "1"
+    assert "building the tiny checkpoint" in said[-1]
+    assert rental_main.ensure_tiny_checkpoint(ckpt, good, say=said.append) is None
+    assert (ckpt / "builds").read_text() == "1"  # same settings: reused
+    assert "reusing the tiny checkpoint" in said[-1]
+
+    reference = read_json(ckpt / "reference.json")
+    reference["build"]["gdn_head_dim"] = 16  # as built by the smoke test of an earlier bundle
+    (ckpt / "reference.json").write_text(json.dumps(reference), encoding="utf-8")
+    assert rental_main.ensure_tiny_checkpoint(ckpt, good, say=said.append) is None
+    assert (ckpt / "builds").read_text() == "2"
+    assert "gdn_head_dim" in said[-1] and "building the tiny checkpoint" in said[-1]
+    assert read_json(ckpt / "reference.json")["build"]["gdn_head_dim"] == 128
+
+
+def test_ensure_tiny_checkpoint_reports_a_failed_build(tmp_path):
+    ckpt = tmp_path / "ckpt"
+    write_tiny_reference(ckpt, [1])  # stale: it must not survive the failed build either
+    failing = [sys.executable, "-c", "import sys; print('tokenizer: download failed', file=sys.stderr); sys.exit(1)"]
+    reason = rental_main.ensure_tiny_checkpoint(ckpt, failing, say=lambda text: None)
+    assert reason.startswith("tiny checkpoint failed (exit 1)") and "tokenizer: download failed" in reason
+    assert not (ckpt / "reference.json").exists()
+    reason = rental_main.ensure_tiny_checkpoint(ckpt, [str(tmp_path / "no-such-interpreter")], say=lambda text: None)
+    assert reason.startswith("tiny checkpoint could not start")
+
+
+def test_the_tiny_checkpoint_build_runs_on_one_cpu_thread(tmp_path, monkeypatch):
+    # The tiny model's tensors are too small for CPU threads to pay off: measured on the CPU venv, the
+    # head-dim-128 build takes 13 s on one thread and 172 s on the default count, with the same reference.
+    ckpt = tmp_path / "ckpt"
+    code = ("import os, sys; from pathlib import Path; out = Path(sys.argv[1]); out.mkdir(parents=True, exist_ok=True); "
+            "(out / 'threads').write_text(os.environ.get('OMP_NUM_THREADS', 'unset') + ' ' + "
+            "os.environ.get('MKL_NUM_THREADS', 'unset'))")
+    cmd = [sys.executable, "-c", code, str(ckpt)]
+    monkeypatch.delenv("OMP_NUM_THREADS", raising=False)
+    monkeypatch.delenv("MKL_NUM_THREADS", raising=False)
+    assert rental_main.ensure_tiny_checkpoint(ckpt, cmd, say=lambda text: None) is None
+    assert (ckpt / "threads").read_text() == "1 1"
+    monkeypatch.setenv("OMP_NUM_THREADS", "4")  # a count the operator set is kept
+    assert rental_main.ensure_tiny_checkpoint(ckpt, cmd, say=lambda text: None) is None
+    assert (ckpt / "threads").read_text() == "4 1"
+
+
+# --------------------------------------------------------------------------- the combined kernel database switch
+
+
+def fake_combined_db_lookup(tmp_path: Path, monkeypatch) -> Path:
+    """An installed flashinfer_gaudi/lib with the combined kernel database, found by the orchestrator's lookup."""
+    lib = tmp_path / "site" / "flashinfer_gaudi" / "lib"
+    lib.mkdir(parents=True)
+    (lib / serve.COMBINED_KERNEL_DB).write_bytes(b"\0")
+    real_run_step = gates.run_step
+
+    def run_step(cmd, cwd, timeout_s, env=None):
+        if list(cmd[1:3]) == ["-c", gates.GDN_LIB_LOOKUP_CODE]:
+            return subprocess.CompletedProcess(cmd, 0, "%s\n" % lib, "")
+        return real_run_step(cmd, cwd, timeout_s, env)
+
+    monkeypatch.setattr(gates, "run_step", run_step)
+    return lib
+
+
+def test_combined_kernel_db_installed_honours_the_operator_switch(tmp_path, monkeypatch):
+    fake_combined_db_lookup(tmp_path, monkeypatch)
+    monkeypatch.delenv(serve.COMBINED_KERNEL_DB_ENV, raising=False)
+    assert rental_main.combined_kernel_db_installed() is True
+    monkeypatch.setenv(serve.COMBINED_KERNEL_DB_ENV, "1")
+    assert rental_main.combined_kernel_db_installed() is True
+    monkeypatch.setenv(serve.COMBINED_KERNEL_DB_ENV, "0")  # run_rental.sh --no-combined-kernel-db
+    assert rental_main.combined_kernel_db_installed() is False
+
+
+def test_fused_server_gets_no_recipe_cache_when_the_operator_switched_the_database_off(tmp_path, monkeypatch):
+    # With the switch at 0 the loader registers the kernel libraries as a colon list, which the bridge
+    # rejects next to a recipe cache: a fused server that got the cache would run the torch path.
+    fake_combined_db_lookup(tmp_path, monkeypatch)
+    monkeypatch.setenv(serve.COMBINED_KERNEL_DB_ENV, "0")
+    args = rental_main._parse_args([
+        "--mode", "node", "--model", str(tmp_path / "model"), "--results", str(tmp_path / "results"),
+        "--run-id", "r", "--variants", "A", "--recipe-cache", str(tmp_path / "rc")])
+    runner = rental_main.Runner(args, rental_main.load_variants())
+    assert runner.combined_db_installed is False
+    assert runner.combined_db_disabled_by == "operator"
+    runner.gdn_env = {"VLLM_HPU_GDN_CORE_VERIFY": "1"}
+    runner.gdn_mode = gates.GDN_MODE_FUSED
+    variant = runner.variant_by_id("A")
+    eff, _ = runner.effective_variant(variant)
+    eff["env"] = runner.variant_server_env(eff["env"])
+    _, env = serve.build_command(eff, variant["servers"][0], runner.model, runner.served_name)
+    assert serve.RECIPE_CACHE_ENV not in env
+    assert env[serve.COMBINED_KERNEL_DB_ENV] == "0"
+    assert runner.recipe_cache_note == serve.RECIPE_CACHE_OFF_REASON
+
+    monkeypatch.delenv(serve.COMBINED_KERNEL_DB_ENV)  # the same run without the switch: the cache is safe
+    runner = rental_main.Runner(args, rental_main.load_variants())
+    runner.gdn_env = {"VLLM_HPU_GDN_CORE_VERIFY": "1"}
+    runner.gdn_mode = gates.GDN_MODE_FUSED
+    assert runner.combined_db_disabled_by is None
+    assert serve.RECIPE_CACHE_ENV in runner.variant_server_env({})

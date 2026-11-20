@@ -179,7 +179,10 @@ async def _stream_chat(resp: web.StreamResponse, state: StubState, max_tokens: i
 
 async def handle_completions(request: web.Request) -> web.Response:
     await request.read()
-    return web.json_response({"choices": [{"text": 'stub answer 7319-ALPHA {"name": "a"}', "token_ids": [1, 2, 3]}]})
+    return web.json_response({
+        "choices": [{"text": 'stub answer 7319-ALPHA {"name": "a"}', "token_ids": [1, 2, 3]}],
+        "usage": {"prompt_tokens": 5, "completion_tokens": 3, "total_tokens": 8},
+    })
 
 
 async def handle_metrics(request: web.Request) -> web.Response:

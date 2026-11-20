@@ -508,3 +508,48 @@ def test_recipe_cache_line_shapes(tmp_path: Path) -> None:
     md = (run / "summary.md").read_text(encoding="utf-8")
     assert "- Recipe cache: off for all variants: %s" % reason in md
     assert "TTFT cold is turn 1 of the measured load, which runs after the warm pass." in md
+
+
+def test_summary_shows_the_request_timeouts(tmp_path: Path) -> None:
+    run = build_run(tmp_path)
+    manifest = json.loads((run / "manifest.json").read_text(encoding="utf-8"))
+    assert report_main([str(run)]) == 0  # a run from before the timeouts were recorded
+    md = (run / "summary.md").read_text(encoding="utf-8")
+    assert "- Load read timeout: n/a" in md and "- Warm request timeout: n/a" in md
+
+    manifest["load_read_timeout_s"] = 900.0
+    manifest["warm_request_timeout_s"] = 7200.0
+    write_json(run / "manifest.json", manifest)
+    assert report_main([str(run)]) == 0
+    summary = summarize_run(run)
+    assert summary["run"]["load_read_timeout_s"] == 900.0
+    assert summary["run"]["warm_request_timeout_s"] == 7200.0
+    md = (run / "summary.md").read_text(encoding="utf-8")
+    assert "- Load read timeout: 900.0 s" in md
+    assert "- Warm request timeout: 7200.0 s" in md
+
+
+def test_summary_shows_the_error_lines_of_a_failed_gate_and_variant(tmp_path: Path) -> None:
+    run = build_run(tmp_path)
+    write_json(run / "tiny" / "status.json", {
+        "id": "tiny", "status": int(GateStatus.FAILED), "seconds": 252.0,
+        "reason": "tiny server exited with code 1 after 220 s",
+        "errors": ["IndexError: tuple index out of range", "RuntimeError: Engine core initialization failed."],
+    })
+    status = json.loads((run / "B" / "status.json").read_text(encoding="utf-8"))
+    status.update(status=int(GateStatus.FAILED), reason="server 0 exited with code -9 after 31 s",
+                  errors=["server0: ValueError: bad | pipe"])
+    write_json(run / "B" / "status.json", status)
+    assert report_main([str(run)]) == 0
+    summary = summarize_run(run)
+    assert summary["gates"]["tiny"]["errors"] == ["IndexError: tuple index out of range",
+                                                  "RuntimeError: Engine core initialization failed."]
+    assert summary["gates"]["preflight"]["errors"] == []
+    assert summary["variants"]["B"]["errors"] == ["server0: ValueError: bad | pipe"]
+    assert summary["variants"]["A"]["errors"] == []
+    md = (run / "summary.md").read_text(encoding="utf-8")
+    assert "| tiny | FAILED | tiny server exited with code 1 after 220 s | 252.0 |" in md
+    assert "- tiny, last error line: IndexError: tuple index out of range" in md
+    assert "- tiny, last error line: RuntimeError: Engine core initialization failed." in md
+    assert "- last error line: server0: ValueError: bad | pipe" in md
+    assert md.count("last error line") == 3

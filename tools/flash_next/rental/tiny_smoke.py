@@ -2,15 +2,18 @@
 """The tiny smoke test: can a Flash-Next server start and decode on this node at all (RUK-2709).
 
 The first thing to run on a new rental node, before the checkpoint download and the gates. It builds
-the tiny checkpoint and its CPU reference (`make_tiny_checkpoint.py`), then, once per GDN mode, starts
-the tiny gate's `vllm serve` command with the environment every rental server gets
-(`serve.server_environment`), waits for `/health`, compares the served tokens with the reference
-(`gates.tiny_compare`) and stops the server, so the cards are free again.
+the tiny checkpoint and its CPU reference (`make_tiny_checkpoint.py`, with the GDN layers at head dim
+128, the only one the HPU fused kernel accepts), then, once per GDN mode, starts the tiny gate's
+`vllm serve` command with the environment every rental server gets (`serve.server_environment`), waits
+for `/health`, compares the served tokens with the reference (`gates.tiny_compare`) and stops the
+server, so the cards are free again.
 
 Modes: `pytorch` turns the fused GDN kernel off (the flags gate G1b sets when it fails); `fused` turns
 the decode kernel on and keeps the verify op off, and fails when the server log says a layer fell back
 to the torch decode path. Each mode writes `<out>/<mode>/server0.log` and `details.json`;
 `<out>/summary.json` holds one entry per mode. The exit code is 0 only when every requested mode passed.
+A server that exits before it is healthy is a failure with its exit code and the last error lines of
+its log (`serve.unhealthy_reason`, `serve.error_lines`: the run's gates report it the same way).
 
 By default the servers skip the bucket warmup (`VLLM_SKIP_WARMUP=true`): the warmup alone takes about
 15 minutes per mode on the tiny model, while the four short prompts need only a handful of graphs,
@@ -20,22 +23,23 @@ flags, so it can override anything. The health wait defaults to 1800 s.
 
 `--recipe-cache DIR` gives the compiled-recipe cache to the servers that may carry it
 (`serve.recipe_cache_env`): the `pytorch` mode's, and every server once the combined kernel database
-is installed. The `fused` mode runs without it: its kernel database must be registered in
-`GC_KERNEL_PATH`, and the Habana bridge accepts only one kernel library there next to a recipe cache.
+is installed and not switched off (`FLASHINFER_GAUDI_COMBINED_KERNEL_DB=0`). The `fused` mode runs
+without it otherwise: its kernel database must be registered in `GC_KERNEL_PATH`, and the Habana bridge
+accepts only one kernel library there next to a recipe cache. The cache lives in the per-bundle
+subfolder the run uses, `DIR/<first 12 characters of the plugin commit>` (`unknown` without a commit).
 
 Runs on Python 3.10 with the standard library only, from the plugin root of the bundle:
 `python -m tools.flash_next.rental.tiny_smoke --out DIR [--ckpt DIR] [--gdn pytorch,fused] [--port N]
 [--health-timeout S] [--full-warmup] [--recipe-cache DIR] [--recipe-cache-mb N] [--env KEY=VALUE]`.
 `--ckpt` names a folder the checkpoint is built in once and reused from then on (default: `<out>/ckpt`,
-built every time). tiny_smoke.sh starts this inside the container.
+built every time); a folder built with other settings (another GDN head dim, generator or fixture: the
+`build` block of its reference.json) is rebuilt. tiny_smoke.sh starts this inside the container.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
-import re
-import subprocess
 import sys
 import time
 from pathlib import Path
@@ -50,27 +54,17 @@ GDN_MODES = {
 }
 DEFAULT_MODES = "pytorch,fused"
 HEALTH_TIMEOUT_S = 1800.0
-MAX_LINES = 5
+MAX_LINES = serve.MAX_ERROR_LINES
 DECODE_FALLBACK = "GDN core decode"
-
-# "TypeError: ...", "torch._dynamo.exc.TorchRuntimeError: ..." up to the end of the line
-_ERROR_RE = re.compile(r"[A-Za-z_][\w.]*(?:Error|Exception): .*")
 
 # The two commands are the tiny gate's own, so the smoke test starts what the run will start.
 checkpoint_command = orchestrator.tiny_checkpoint_command
 serve_command = orchestrator.tiny_serve_command
 
 
-def error_lines(log_text: str, limit: int = MAX_LINES) -> list[str]:
-    """The last `limit` distinct `SomeError: message` texts of a server log, in order of first appearance."""
-    seen: list[str] = []
-    for line in (log_text or "").splitlines():
-        match = _ERROR_RE.search(line)
-        if match is not None:
-            text = match.group(0).strip()
-            if text not in seen:
-                seen.append(text)
-    return seen[-limit:]
+# One definition for the smoke test, the tiny gate and the variants (the orchestrator reports a server
+# that exited the same way).
+error_lines = serve.error_lines
 
 
 def _read(path: Path) -> str:
@@ -86,22 +80,11 @@ def _write_json(path: Path, obj) -> None:
 
 
 def build_checkpoint(ckpt: Path) -> str | None:
-    """Build the tiny checkpoint in `ckpt` unless its reference is already there; the failure reason or None."""
-    if (ckpt / "reference.json").is_file():
-        print("tiny smoke: reusing the tiny checkpoint in %s" % ckpt, flush=True)
-        return None
-    print("tiny smoke: building the tiny checkpoint in %s (a few minutes)" % ckpt, flush=True)
-    timeout_s = orchestrator.TINY_CHECKPOINT_TIMEOUT_S
-    try:
-        proc = gates.run_step(checkpoint_command(ckpt), orchestrator.repo_root(), timeout_s)
-    except subprocess.TimeoutExpired:
-        return "tiny checkpoint did not finish in %d s" % int(timeout_s)
-    except OSError as e:
-        return "tiny checkpoint could not start: %s" % e
-    if proc.returncode != 0:
-        tail = (proc.stderr or proc.stdout or "")[-400:]
-        return "tiny checkpoint failed (exit %d): %s" % (proc.returncode, tail.strip())
-    return None
+    """Build the tiny checkpoint in `ckpt` unless it is there with the build settings of this bundle
+    (the GDN head dim, the generator, the fixture: `orchestrator.ensure_tiny_checkpoint`); the failure
+    reason or None."""
+    return orchestrator.ensure_tiny_checkpoint(ckpt, checkpoint_command(ckpt),
+                                               say=lambda text: print("tiny smoke: %s" % text, flush=True))
 
 
 def run_mode(mode: str, ckpt: Path, out_dir: Path, port: int, health_timeout_s: float, skip_warmup: bool = True,
@@ -129,6 +112,12 @@ def run_mode(mode: str, ckpt: Path, out_dir: Path, port: int, health_timeout_s: 
         if skip_warmup:
             overrides["VLLM_SKIP_WARMUP"] = "true"
         cache_env, note = serve.recipe_cache_env(recipe_cache, recipe_cache_mb, overrides, combined_db)
+        if cache_env:
+            try:
+                Path(recipe_cache).mkdir(parents=True, exist_ok=True)
+            except OSError as e:  # the bridge reports an unusable folder itself
+                print("tiny smoke [%s]: cannot create the recipe cache folder %s: %s" % (mode, recipe_cache, e),
+                      flush=True)
         overrides.update(cache_env)
         overrides.update(extra_env or {})
         env = serve.server_environment(overrides)
@@ -144,11 +133,8 @@ def run_mode(mode: str, ckpt: Path, out_dir: Path, port: int, health_timeout_s: 
             if healthy:
                 status, details = gates.tiny_compare("http://127.0.0.1:%d" % port, ckpt / "reference.json")
                 entry["reason"] = details.get("reason") or details.get("error")
-            elif popen.poll() is None:
-                status = GateStatus.TIMED_OUT
-                entry["reason"] = "server not healthy within %d s" % int(health_timeout_s)
             else:
-                entry["reason"] = "server exited before it was healthy (exit %d)" % popen.returncode
+                status, entry["reason"] = serve.unhealthy_reason(popen, entry["startup_seconds"], health_timeout_s)
         finally:
             serve.stop_server(popen)  # also on Ctrl-C: the workers must not keep the cards
         log_text = _read(log_path)
@@ -198,7 +184,8 @@ def main(argv: list[str] | None = None) -> int:
                         help="extra server environment variable, repeatable; applied after the mode's own flags")
     parser.add_argument("--recipe-cache", default=None, metavar="DIR",
                         help="compiled-recipe cache folder: given to the servers that may carry it (the pytorch "
-                        "mode's, and every server once the combined kernel database is installed)")
+                        "mode's, and every server once the combined kernel database is installed), in the "
+                        "per-bundle subfolder DIR/<plugin commit, 12 characters>")
     parser.add_argument("--recipe-cache-mb", type=int, default=8192, metavar="N",
                         help="recipe cache size in MB (default: 8192)")
     args = parser.parse_args(argv)
@@ -219,13 +206,15 @@ def main(argv: list[str] | None = None) -> int:
         combined_db = orchestrator.combined_kernel_db_installed()
     except Exception:  # noqa: BLE001 - no lookup: the plan of record is the fallback
         combined_db = False
+    # the per-bundle subfolder, keyed like the run's cache: a new bundle starts a fresh folder
+    recipe_cache = orchestrator.keyed_recipe_cache_dir(args.recipe_cache, orchestrator.bundle_commit())
     summary: dict = {"passed": False, "reason": None, "checkpoint": str(ckpt), "modes": []}
     summary["reason"] = build_checkpoint(ckpt)
     if summary["reason"] is None:
         for mode in modes:
             entry = run_mode(mode, ckpt, out / mode, args.port, args.health_timeout,
                              skip_warmup=not args.full_warmup, extra_env=extra_env,
-                             recipe_cache=args.recipe_cache, recipe_cache_mb=args.recipe_cache_mb,
+                             recipe_cache=recipe_cache, recipe_cache_mb=args.recipe_cache_mb,
                              combined_db=combined_db)
             summary["modes"].append(entry)
             report_mode(entry)

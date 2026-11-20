@@ -13,6 +13,8 @@ from tools.flash_next.rental import gates
 from tools.flash_next.rental.schema import GateStatus
 
 OPS_SO = "gdn_fused_ops.cpython-310-x86_64-linux-gnu.so"
+COMBINED_DB = "libflashinfer_gaudi_combined_gaudi2.so"
+KILL_SWITCH = "FLASHINFER_GAUDI_COMBINED_KERNEL_DB"
 
 
 def write_fake_python(path: Path, body: str) -> str:
@@ -31,13 +33,22 @@ FAKE_PY = r"""
   echo "GDNMODE: ${VLLM_HPU_GDN_CORE_DECODE-<unset>}"
   echo "GDNVERIFY: ${VLLM_HPU_GDN_CORE_VERIFY-<unset>}"
   echo "LAZY: ${PT_HPU_LAZY_MODE-<unset>}"
+  echo "COMBINED: ${FLASHINFER_GAUDI_COMBINED_KERNEL_DB-<unset>}"
 } >> "$FAKE_PY_LOG"
 case "$1" in
   -c) if [ -n "$FAKE_LOOKUP_NOISE" ]; then echo "$FAKE_LOOKUP_NOISE"; fi
       echo "$FAKE_LIB_DIR"
       exit ${FAKE_LOOKUP_EXIT:-0} ;;
   -m) case "$*" in
-        *test_hpu_op.py*) if [ -n "$FAKE_OP_PRINT" ]; then
+        *test_hpu_op.py*) if [ "$FLASHINFER_GAUDI_COMBINED_KERNEL_DB" != "0" ]; then
+                            if [ -n "$FAKE_COMBINED_OP_SLEEP" ]; then sleep "$FAKE_COMBINED_OP_SLEEP"; fi
+                            if [ -n "$FAKE_COMBINED_OP_FAILS" ]; then
+                              echo "FAILED tests/unit_tests/gdn_core_decode/test_hpu_op.py::test_a - synStatus=26"
+                              echo "1 failed in 0.20s"
+                              exit 1
+                            fi
+                          fi
+                          if [ -n "$FAKE_OP_PRINT" ]; then
                             echo "$FAKE_OP_PRINT"
                             sleep 60
                           fi
@@ -71,6 +82,11 @@ case "$1" in
            if [ -n "$FAKE_EAGER_REPLAY_SLEEP" ]; then sleep "$FAKE_EAGER_REPLAY_SLEEP"; fi
            exit ${FAKE_EAGER_REPLAY_EXIT:-0}
          fi
+         if [ -n "$FAKE_COMBINED_REPLAY_FAILS" ] && [ "$FLASHINFER_GAUDI_COMBINED_KERNEL_DB" != "0" ]; then
+           echo "replay through the combined database: mismatch at step 3"
+           exit 1
+         fi
+         echo "replay ok"
          if [ -n "$FAKE_REPLAY_SLEEP" ]; then sleep "$FAKE_REPLAY_SLEEP"; fi
          case "$*" in
            *--case*) exit ${FAKE_REPLAY2_EXIT:-0} ;;
@@ -87,19 +103,23 @@ exit 0
 """
 
 
-def make_lib(tmp_path: Path, ops: bool = True) -> Path:
-    """A fake installed flashinfer_gaudi/lib/ with the fused kernel library (and optionally the op)."""
+def make_lib(tmp_path: Path, ops: bool = True, combined: bool = False) -> Path:
+    """A fake installed flashinfer_gaudi/lib/ with the fused kernel library (and optionally the op and
+    the combined kernel database)."""
     lib = tmp_path / "site" / "flashinfer_gaudi" / "lib"
     lib.mkdir(parents=True)
     (lib / "libgdn_fused_gaudi2.so").write_bytes(b"\0")
     if ops:
         (lib / OPS_SO).write_bytes(b"\0")
+    if combined:
+        (lib / COMBINED_DB).write_bytes(b"\0")
     return lib
 
 
 def setup(tmp_path: Path, monkeypatch, *, lib: Path, pytest_out: str = "..... [100%]\n5 passed in 12.34s",
           pytest_exit: int = 0, verify_test: bool = True,
           verify_pytest_out: str = "... [100%]\n3 passed in 8.90s", **extra) -> tuple:
+    monkeypatch.delenv(KILL_SWITCH, raising=False)  # a test that wants the operator's switch sets it afterwards
     log = tmp_path / "fake.log"
     monkeypatch.setenv("FAKE_PY_LOG", str(log))
     monkeypatch.setenv("FAKE_LIB_DIR", str(lib))
@@ -519,3 +539,205 @@ def test_gdn_fallback_lines_finds_all_forms():
 
 def test_gdn_fallback_lines_nothing():
     assert gates.gdn_fallback_lines("INFO all good\nno kernel here, decode is on\n") == []
+
+
+# --------------------------------------------------------------------------- the combined kernel database (RUK-3248)
+
+
+def test_fused_gdn_records_the_combined_database_state(tmp_path, monkeypatch):
+    lib = make_lib(tmp_path)
+    fake, plugin, log = setup(tmp_path, monkeypatch, lib=lib)
+    status, details = gates.fused_gdn(plugin, tmp_path / "g1b", python=fake)
+    assert status is GateStatus.PASSED
+    assert details["combined_kernel_db"] == "not_installed"
+    assert "combined_attempt" not in details
+
+    (lib / COMBINED_DB).write_bytes(b"\0")
+    log.unlink()
+    status, details = gates.fused_gdn(plugin, tmp_path / "g1b-2", python=fake)
+    assert status is GateStatus.PASSED
+    assert details["combined_kernel_db"] == "active"  # the loader finds it next to the kernel library
+    assert details["env"] == {"VLLM_HPU_GDN_CORE_VERIFY": "1"}  # no kill switch for the servers
+    recs = records(log)
+    assert len(recs) == 10 and all(rec["COMBINED"] == "<unset>" for rec in recs)
+    assert "combined_attempt" not in details
+
+
+def test_fused_gdn_reruns_the_decode_checks_without_the_combined_database(tmp_path, monkeypatch):
+    # The adapter has never run on a card: when the op test fails through it, the decode checks run once
+    # more with the kill switch, and the kernel stays on when they pass.
+    lib = make_lib(tmp_path, combined=True)
+    fake, plugin, log = setup(tmp_path, monkeypatch, lib=lib, FAKE_COMBINED_OP_FAILS=1)
+    out = tmp_path / "g1b"
+    status, details = gates.fused_gdn(plugin, out, python=fake)
+    assert status is GateStatus.PASSED
+    assert details["mode"] == 1 and details["verify_mode"] == 1
+    assert details["combined_kernel_db"] == "disabled_by_g1b"
+    assert details["env"] == {"VLLM_HPU_GDN_CORE_VERIFY": "1", KILL_SWITCH: "0"}  # for every later server
+    assert details["hpu_op"] == {"exit": 0, "passed": 5, "skipped": 0, "failed": 0}  # the attempt that decided
+    assert details["failed_tests"] == []
+    assert details["replay"] == [{"case": "tp8_b16", "lazy_mode": 1, "exit": 0},
+                                 {"case": "tp8_b64", "lazy_mode": 1, "exit": 0}]
+    first = details["combined_attempt"]
+    assert first["status"] == "failed" and first["reason"] == "test_hpu_op.py failed (exit 1)"
+    assert first["hpu_op"] == {"exit": 1, "passed": 0, "skipped": 0, "failed": 1}
+    assert first["failed_tests"] == ["FAILED tests/unit_tests/gdn_core_decode/test_hpu_op.py::test_a - synStatus=26"]
+    assert first["replay"] is None  # the replays did not run in the first attempt
+    assert first["logs"] == ["hpu_op.combined.log"]
+    assert "synStatus=26" in (out / "hpu_op.combined.log").read_text(encoding="utf-8")
+    assert "5 passed" in (out / "hpu_op.log").read_text(encoding="utf-8")
+    assert "synStatus=26" not in (out / "hpu_op.log").read_text(encoding="utf-8")
+
+    recs = records(log)
+    assert len(recs) == 11  # the lookup, the failed op test, then the nine steps of a full pass
+    assert "test_hpu_op.py" in recs[1]["args"] and recs[1]["COMBINED"] == "<unset>"
+    assert "test_hpu_op.py" in recs[2]["args"]
+    assert all(rec["COMBINED"] == "0" for rec in recs[2:])  # the rerun and every later step of the gate
+    assert sum(1 for rec in recs if "test_hpu_op.py" in rec["args"]) == 2  # once more, not more
+
+
+def test_fused_gdn_reruns_after_a_replay_failed_through_the_combined_database(tmp_path, monkeypatch):
+    lib = make_lib(tmp_path, combined=True)
+    fake, plugin, log = setup(tmp_path, monkeypatch, lib=lib, FAKE_COMBINED_REPLAY_FAILS=1)
+    out = tmp_path / "g1b"
+    status, details = gates.fused_gdn(plugin, out, python=fake)
+    assert status is GateStatus.PASSED
+    assert details["combined_kernel_db"] == "disabled_by_g1b"
+    first = details["combined_attempt"]
+    assert first["status"] == "failed"
+    assert first["reason"] == "gdn_core_decode_replay.py (tp8_b16) failed (exit 1)"
+    assert first["hpu_op"] == {"exit": 0, "passed": 5, "skipped": 0, "failed": 0}
+    assert first["replay"] == [{"case": "tp8_b16", "lazy_mode": 1, "exit": 1}]
+    assert first["logs"] == ["hpu_op.combined.log", "replay.combined.log"]
+    assert "mismatch at step 3" in (out / "replay.combined.log").read_text(encoding="utf-8")
+    assert "mismatch" not in (out / "replay.log").read_text(encoding="utf-8")
+    assert details["replay"] == [{"case": "tp8_b16", "lazy_mode": 1, "exit": 0},
+                                 {"case": "tp8_b64", "lazy_mode": 1, "exit": 0}]
+    recs = records(log)
+    assert [rec["COMBINED"] for rec in recs[:3]] == ["<unset>", "<unset>", "<unset>"]  # lookup, op, replay 1
+    assert all(rec["COMBINED"] == "0" for rec in recs[3:])
+    assert len(recs) == 12
+
+
+def test_fused_gdn_rerun_after_a_timeout_through_the_combined_database(tmp_path, monkeypatch):
+    monkeypatch.setattr(gates, "GDN_OP_TIMEOUT_S", 2)
+    lib = make_lib(tmp_path, combined=True)
+    fake, plugin, log = setup(tmp_path, monkeypatch, lib=lib, FAKE_COMBINED_OP_SLEEP=6)
+    status, details = gates.fused_gdn(plugin, tmp_path / "g1b", python=fake)
+    assert status is GateStatus.PASSED
+    assert details["mode"] == 1
+    assert details["combined_kernel_db"] == "disabled_by_g1b"
+    assert details["combined_attempt"]["status"] == "timed_out"
+    assert "test_hpu_op.py did not finish in 2 s" in details["combined_attempt"]["reason"]
+
+
+def test_fused_gdn_failing_with_and_without_the_combined_database_turns_the_kernel_off(tmp_path, monkeypatch):
+    lib = make_lib(tmp_path, combined=True)
+    fake, plugin, log = setup(tmp_path, monkeypatch, lib=lib, pytest_out="F\n1 failed in 0.20s", pytest_exit=1)
+    status, details = gates.fused_gdn(plugin, tmp_path / "g1b", python=fake)
+    assert status is GateStatus.FAILED  # as before the fallback existed
+    assert details["mode"] == 0 and details["verify_mode"] == 0
+    assert details["env"] == {"VLLM_HPU_GDN_CORE_DECODE": "0", "VLLM_HPU_GDN_CORE_VERIFY": "0"}
+    assert details["reason"] == "test_hpu_op.py failed (exit 1)"
+    assert details["verify"] == {"status": "not_run", "reason": "decode checks failed", "hpu_op": None, "replay": []}
+    assert details["combined_kernel_db"] == "failed_with_and_without"
+    assert details["combined_attempt"]["reason"] == "test_hpu_op.py failed (exit 1)"
+    recs = records(log)
+    assert len(recs) == 3  # the lookup and the op test twice: exactly one rerun
+    assert [rec["COMBINED"] for rec in recs] == ["<unset>", "<unset>", "0"]
+
+
+def test_fused_gdn_does_not_rerun_when_the_operator_switched_the_database_off(tmp_path, monkeypatch):
+    lib = make_lib(tmp_path, combined=True)
+    fake, plugin, log = setup(tmp_path, monkeypatch, lib=lib, pytest_out="F\n1 failed in 0.20s", pytest_exit=1)
+    monkeypatch.setenv(KILL_SWITCH, "0")
+    status, details = gates.fused_gdn(plugin, tmp_path / "g1b", python=fake)
+    assert status is GateStatus.FAILED
+    assert details["combined_kernel_db"] == "switched_off"
+    assert "combined_attempt" not in details
+    assert len(records(log)) == 2  # the database was never in the steps: nothing to retry without
+
+
+def test_fused_gdn_does_not_rerun_without_the_combined_database(tmp_path, monkeypatch):
+    lib = make_lib(tmp_path)
+    fake, plugin, log = setup(tmp_path, monkeypatch, lib=lib, FAKE_COMBINED_OP_FAILS=1)
+    status, details = gates.fused_gdn(plugin, tmp_path / "g1b", python=fake)
+    assert status is GateStatus.FAILED
+    assert details["combined_kernel_db"] == "not_installed"
+    assert "combined_attempt" not in details
+    assert len(records(log)) == 2
+
+
+# --------------------------------------------------------------------------- --quick-gates, --no-verify-probe
+
+
+def test_fused_gdn_default_skips_nothing(tmp_path, monkeypatch):
+    lib = make_lib(tmp_path)
+    fake, plugin, log = setup(tmp_path, monkeypatch, lib=lib)
+    status, details = gates.fused_gdn(plugin, tmp_path / "g1b", python=fake)
+    assert status is GateStatus.PASSED
+    assert details["skipped_steps"] == {}
+    assert gates.GDN_RECORDED_ONLY_STEPS == ("replay_eager", "bench", "verify_crash_probe")
+
+
+def test_fused_gdn_quick_skips_the_recorded_only_steps(tmp_path, monkeypatch):
+    lib = make_lib(tmp_path)
+    fake, plugin, log = setup(tmp_path, monkeypatch, lib=lib)
+    out = tmp_path / "g1b"
+    status, details = gates.fused_gdn(plugin, out, python=fake, skip_recorded_only="--quick-gates")
+    assert status is GateStatus.PASSED
+    assert details["mode"] == 1 and details["verify_mode"] == 1  # the deciding checks all ran
+    assert details["env"] == {"VLLM_HPU_GDN_CORE_VERIFY": "1"}
+    assert details["skipped_steps"] == {"replay_eager": "--quick-gates", "bench": "--quick-gates",
+                                        "verify_crash_probe": "--quick-gates"}
+    assert details["replay_eager"] == [] and details["eager_compile_ok"] is None
+    assert details["bench"] == {"exit": None, "skipped": "--quick-gates", "lines": []}
+    assert details["verify"]["status"] == "passed"
+    recs = records(log)
+    assert len(recs) == 7  # the lookup, the op test, two lazy replays, the verify op test, two verify replays
+    assert all(rec["LAZY"] in ("1", "<unset>") for rec in recs)  # no eager replay
+    assert not any("bench.py" in rec["args"] for rec in recs)
+    assert not (out / "bench.log").exists()
+
+
+def test_fused_gdn_quick_skips_the_crash_probe(tmp_path, monkeypatch):
+    lib = make_lib(tmp_path)
+
+    def no_probe(*args):
+        raise AssertionError("the crash probe must not run with --quick-gates")
+
+    monkeypatch.setattr(gates, "_gdn_crash_probe", no_probe)
+    fake, plugin, log = setup(tmp_path, monkeypatch, lib=lib, FAKE_VERIFY_CRASH=1)
+    status, details = gates.fused_gdn(plugin, tmp_path / "g1b", python=fake, skip_recorded_only="--quick-gates")
+    assert status is GateStatus.PASSED and "error" not in details
+    assert details["verify_mode"] == 0 and details["verify"]["status"] == "failed"
+    assert details["verify"]["crash_probe"] == {"exit": None, "skipped": "--quick-gates", "summary": []}
+
+
+def test_fused_gdn_no_verify_probe_skips_only_the_probe(tmp_path, monkeypatch):
+    lib = make_lib(tmp_path)
+
+    def no_probe(*args):
+        raise AssertionError("the crash probe must not run with --no-verify-probe")
+
+    monkeypatch.setattr(gates, "_gdn_crash_probe", no_probe)
+    fake, plugin, log = setup(tmp_path, monkeypatch, lib=lib, FAKE_VERIFY_CRASH=1)
+    status, details = gates.fused_gdn(plugin, tmp_path / "g1b", python=fake, skip_verify_probe="--no-verify-probe")
+    assert status is GateStatus.PASSED and "error" not in details
+    assert details["skipped_steps"] == {"verify_crash_probe": "--no-verify-probe"}
+    assert details["verify"]["crash_probe"] == {"exit": None, "skipped": "--no-verify-probe", "summary": []}
+    recs = records(log)
+    assert sum(1 for rec in recs if rec["LAZY"] == "0") == 2  # the eager replays still ran
+    assert any("bench.py" in rec["args"] for rec in recs)  # and the bench
+    assert details["bench"]["exit"] == 0
+
+
+def test_fused_gdn_no_verify_probe_after_a_verify_timeout(tmp_path, monkeypatch):
+    monkeypatch.setattr(gates, "GDN_OP_TIMEOUT_S", 2)
+    monkeypatch.setattr(gates, "_gdn_crash_probe", lambda *args: (_ for _ in ()).throw(AssertionError("probe ran")))
+    lib = make_lib(tmp_path)
+    fake, plugin, log = setup(tmp_path, monkeypatch, lib=lib, FAKE_VERIFY_PYTEST_SLEEP=6)
+    status, details = gates.fused_gdn(plugin, tmp_path / "g1b", python=fake, skip_verify_probe="--no-verify-probe")
+    assert status is GateStatus.PASSED and "error" not in details
+    assert details["verify"]["status"] == "timed_out"
+    assert details["verify"]["crash_probe"]["skipped"] == "--no-verify-probe"

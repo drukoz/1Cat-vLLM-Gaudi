@@ -45,4 +45,7 @@ STARTUP_FILE = "startup.json"  # a list: one STARTUP_KEYS object per server
 REQUESTS_FILE = "requests.jsonl"
 METRICS_FILE = "metrics.jsonl"
 HLSMI_FILE = "hlsmi.csv"
-STATUS_FILE = "status.json"  # {"id": str, "status": GateStatus, "reason": str | None, "seconds": float}
+# {"id": str, "status": GateStatus, "reason": str | None, "seconds": float}, plus "errors" (the last error
+# lines of the server log) after a failure and, for a variant, "servers"
+STATUS_FILE = "status.json"
+FIRST_TOKEN_FILE = "first-token.json"  # a list: one record per server, the first short completion after startup

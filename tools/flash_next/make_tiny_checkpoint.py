@@ -9,8 +9,15 @@ predictor (MTP), built from the Hugging Face component modules, so the draft pat
 last-prefill logits, and the MTP teacher-forced draft reference (per-prompt argmax draft ids and the last-row
 top-5) of six token-id prompts, computed by reloading the **saved** checkpoint in float32.
 
+``--gdn-head-dim N`` builds the gated-delta-net layers with key and value head dim N instead of the
+fixture's (the HPU fused kernel needs 128): the override goes into the checkpoint's ``config.json``,
+the committed fixture file is never rewritten. ``reference.json`` records the settings of its build under
+``build`` (schema, seed, GDN head dim, prompt lengths, new tokens, sha256 of the fixture and of this file), so
+a caller can tell whether a checkpoint folder was built with the settings it wants. The tokenizer files are
+fetched first, and a failed fetch stops the build with exit code 1.
+
 Usage: ``python tools/flash_next/make_tiny_checkpoint.py --out DIR [--seed 0] [--tokenizer-from DIR |
---skip-tokenizer] [--reference-only] [--fixture PATH]``.
+--skip-tokenizer] [--reference-only] [--fixture PATH] [--gdn-head-dim N]``.
 """
 
 import argparse
@@ -55,6 +62,7 @@ WEIGHTS_FILE = "model.safetensors"
 CONFIG_FILE = "config.json"
 REFERENCE_FILE = "reference.json"
 MTP_PREFIX = "mtp."
+GDN_HEAD_DIM_KEYS = ("linear_key_head_dim", "linear_value_head_dim")
 # The MTP reference dumps the last row's top-k; keep it aligned with the target's TOP_K.
 # The 31 multi-token-predictor tensors the checkpoint gains, in module order. vLLM's
 # ``Qwen4ExpMultiTokenPredictor`` loads these (prefix ``mtp.``); the target ignores them.
@@ -122,11 +130,45 @@ def make_prompts(seed: int) -> list[list[int]]:
     return prompts
 
 
-def write_config(out_dir: Path, fixture: Path) -> bytes:
-    """Write the fixture as ``config.json`` and return its bytes (the checkpoint must keep them byte-identical)."""
+def config_bytes(fixture: Path, gdn_head_dim: int | None) -> bytes:
+    """The bytes of the checkpoint's ``config.json``: the fixture's own, or, with ``gdn_head_dim``, the fixture
+    with ``linear_key_head_dim`` and ``linear_value_head_dim`` replaced (nothing else changes)."""
     fixture_bytes = fixture.read_bytes()
-    (out_dir / CONFIG_FILE).write_bytes(fixture_bytes)
-    return fixture_bytes
+    if gdn_head_dim is None:
+        return fixture_bytes
+    config = json.loads(fixture_bytes.decode("utf-8"))
+    for key in GDN_HEAD_DIM_KEYS:
+        config["text_config"][key] = int(gdn_head_dim)
+    return (json.dumps(config, indent=2) + "\n").encode("utf-8")
+
+
+def write_config(out_dir: Path, fixture: Path, gdn_head_dim: int | None = None) -> bytes:
+    """Write ``config.json`` (see ``config_bytes``) and return its bytes: the checkpoint must keep them
+    byte-identical."""
+    written = config_bytes(fixture, gdn_head_dim)
+    (out_dir / CONFIG_FILE).write_bytes(written)
+    return written
+
+
+def built_gdn_head_dim(out_dir: Path) -> int | None:
+    """The GDN head dim of the checkpoint in ``out_dir``, from its ``config.json``; None when the key and value
+    head dims differ."""
+    text_config = json.loads((out_dir / CONFIG_FILE).read_text(encoding="utf-8"))["text_config"]
+    key_dim, value_dim = (text_config.get(key) for key in GDN_HEAD_DIM_KEYS)
+    return int(key_dim) if key_dim == value_dim and key_dim is not None else None
+
+
+def build_settings(out_dir: Path, fixture: Path, seed: int) -> dict:
+    """What this build of the checkpoint in ``out_dir`` depends on: the ``build`` block of ``reference.json``."""
+    return {
+        "schema": SCHEMA_VERSION,
+        "seed": seed,
+        "gdn_head_dim": built_gdn_head_dim(out_dir),
+        "prompt_lengths": list(PROMPT_LENGTHS),
+        "max_new_tokens": MAX_NEW_TOKENS,
+        "fixture_sha256": sha256_file(fixture),
+        "generator_sha256": sha256_file(Path(__file__).resolve()),
+    }
 
 
 def perturb_constant_weights(model: torch.nn.Module, seed: int) -> None:
@@ -186,11 +228,12 @@ def build_mtp_container(hf_model: Qwen4ExpForConditionalGeneration, seed: int) -
     return container
 
 
-def build_checkpoint(out_dir: Path, fixture: Path, seed: int) -> None:
-    """Build the random bf16 model from the fixture config and save it; the config.json is restored afterwards."""
+def build_checkpoint(out_dir: Path, fixture: Path, seed: int, gdn_head_dim: int | None = None) -> None:
+    """Build the random bf16 model from the fixture config (with the GDN head-dim override, when given) and save
+    it; the config.json is restored afterwards."""
     # Not AutoConfig: vLLM's create_engine_config() replaces CONFIG_MAPPING["qwen4_exp"] with its own config
     # class (no text_config.seed), which breaks this builder when it runs in the same process after vLLM.
-    fixture_bytes = write_config(out_dir, fixture)
+    fixture_bytes = write_config(out_dir, fixture, gdn_head_dim)
     config = Qwen4ExpConfig.from_pretrained(out_dir)
     torch.manual_seed(seed)
     model = Qwen4ExpForConditionalGeneration(config).to(torch.bfloat16)
@@ -209,8 +252,17 @@ def build_checkpoint(out_dir: Path, fixture: Path, seed: int) -> None:
     (out_dir / CONFIG_FILE).write_bytes(fixture_bytes)
 
 
+class TokenizerError(RuntimeError):
+    """The tokenizer files did not reach the checkpoint folder: a server cannot start from it."""
+
+
 def setup_tokenizer(out_dir: Path, tokenizer_from: str | None, skip_tokenizer: bool) -> str:
-    """Fetch the real tokenizer files into ``out_dir``; print and return what happened."""
+    """Fetch the real tokenizer files into ``out_dir``; print and return what happened.
+
+    Raises ``TokenizerError`` when the download or the copy fails, or brings no ``tokenizer*`` file: a
+    checkpoint without its tokenizer must not look like a finished build.
+    """
+    remedy = "re-run with --tokenizer-from DIR to copy local files, or --skip-tokenizer to write none"
     if skip_tokenizer:
         print("tokenizer: skipped (--skip-tokenizer), no tokenizer files written")
         return "skipped"
@@ -221,18 +273,22 @@ def setup_tokenizer(out_dir: Path, tokenizer_from: str | None, skip_tokenizer: b
             for src in sorted(source.glob(pattern)):
                 shutil.copy2(src, out_dir / src.name)
                 copied.append(src.name)
+        if not any(out_dir.glob("tokenizer*")):
+            raise TokenizerError(f"tokenizer: no tokenizer file in {source} (copied {len(copied)} file(s)); {remedy}")
         print(f"tokenizer: copied {len(copied)} file(s) from {source}")
         return "copied"
     try:
         from huggingface_hub import snapshot_download
 
         snapshot_download(repo_id=HF_REPO_ID, allow_patterns=TOKENIZER_PATTERNS, local_dir=out_dir)
-        print(f"tokenizer: downloaded from {HF_REPO_ID}")
-        return "downloaded"
-    except Exception as exc:  # noqa: BLE001
-        print(f"tokenizer: download from {HF_REPO_ID} failed ({type(exc).__name__}: {exc}); "
-              f"re-run with --tokenizer-from DIR to copy local files, or --skip-tokenizer to write none")
-        return "download-failed"
+    except Exception as exc:  # noqa: BLE001 - every cause (network, repo id, access) is the same failed build
+        raise TokenizerError(f"tokenizer: download from {HF_REPO_ID} failed ({type(exc).__name__}: {exc}); "
+                             f"{remedy}") from exc
+    if not any(out_dir.glob("tokenizer*")):
+        raise TokenizerError(f"tokenizer: the download from {HF_REPO_ID} brought no tokenizer file into "
+                             f"{out_dir}; {remedy}")
+    print(f"tokenizer: downloaded from {HF_REPO_ID}")
+    return "downloaded"
 
 
 def load_reference_model(out_dir: Path) -> Qwen4ExpForConditionalGeneration:
@@ -385,7 +441,8 @@ def write_reference(out_dir: Path, fixture: Path, seed: int) -> dict:
     reference = {
         "schema": SCHEMA_VERSION,
         "seed": seed,
-        "config_sha256": sha256_file(fixture),
+        "build": build_settings(out_dir, fixture, seed),
+        "config_sha256": sha256_file(out_dir / CONFIG_FILE),
         "weights_sha256": sha256_file(out_dir / WEIGHTS_FILE),
         "transformers_version": transformers.__version__,
         "torch_version": torch.__version__,
@@ -410,7 +467,16 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser.add_argument("--reference-only", action="store_true",
                         help="only rebuild reference.json from the checkpoint already in --out")
     parser.add_argument("--fixture", type=Path, default=None, help=f"fixture config (default: {DEFAULT_FIXTURE})")
-    return parser.parse_args(argv)
+    parser.add_argument("--gdn-head-dim", type=int, default=None, metavar="N",
+                        help="build the GDN layers with key and value head dim N instead of the fixture's "
+                        "(the HPU fused kernel needs 128); the fixture file is not changed")
+    args = parser.parse_args(argv)
+    if args.reference_only and args.gdn_head_dim is not None:
+        parser.error("--gdn-head-dim cannot be combined with --reference-only: the reference is computed from "
+                     "the checkpoint already in --out, with the head dim of its config.json")
+    if args.gdn_head_dim is not None and args.gdn_head_dim < 1:
+        parser.error("--gdn-head-dim must be a positive integer")
+    return args
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -426,8 +492,15 @@ def main(argv: list[str] | None = None) -> int:
 
     args.out.mkdir(parents=True, exist_ok=True)
     if not args.reference_only:
-        build_checkpoint(args.out, fixture, args.seed)
-        setup_tokenizer(args.out, args.tokenizer_from, args.skip_tokenizer)
+        # A reference from an earlier build must not survive a build that fails: callers reuse a folder
+        # whose reference.json matches the settings they want.
+        (args.out / REFERENCE_FILE).unlink(missing_ok=True)
+        try:  # first: it needs the network and fails in seconds, the weights take minutes
+            setup_tokenizer(args.out, args.tokenizer_from, args.skip_tokenizer)
+        except TokenizerError as exc:
+            print(f"{exc}\nno checkpoint was built in {args.out}", file=sys.stderr)
+            return 1
+        build_checkpoint(args.out, fixture, args.seed, args.gdn_head_dim)
     reference = write_reference(args.out, fixture, args.seed)
     n_tensors, n_bytes = safetensors_stats(weights)
     print(f"wrote {args.out}: {n_tensors} tensors, {n_bytes} bytes, "

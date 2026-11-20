@@ -5,8 +5,10 @@ One function per gate: preflight (cards, checkpoint, FP8 layout, disk),
 build (installed vLLM / vllm_gaudi / flashinfer_gaudi), the fused GDN
 decode kernel and the GDN verify op on the card (G1b: the kernel's own
 checks, then the verify op's checks, and the GDN decode and verify
-modes every later server must use), tiny TP8 token agreement,
-capacity from the startup line, and coherence with a 120K-token needle.
+modes every later server must use, with one rerun without the combined
+kernel database when the decode checks fail through it), tiny TP8 token
+agreement, capacity from the startup line, the first token of a started
+server, and coherence with a 120K-token needle.
 Every gate returns ``(GateStatus, details)`` and never raises for an
 expected failure: the exception text goes into ``details["error"]``.
 Python 3.10 standard library only.
@@ -29,6 +31,7 @@ import urllib.request
 from collections import Counter
 from pathlib import Path
 
+from tools.flash_next.rental import serve
 from tools.flash_next.rental.schema import MAX_MODEL_LEN, GateStatus
 
 try:  # M4-H0 (written in parallel): the FP8 layout checker
@@ -47,6 +50,8 @@ BUILD_TIMEOUT_S = 300.0
 HTTP_TIMEOUT_S = 600.0
 
 TINY_MAX_TOKENS = 16
+FIRST_TOKEN_PROMPT = "The capital of France is"
+FIRST_TOKEN_MAX_TOKENS = 8
 COHERENCE_MAX_TOKENS = 64
 NEEDLE_MAX_TOKENS = 32
 
@@ -363,6 +368,20 @@ GDN_VERIFY_ON = 1
 GDN_VERIFY_OFF = 0
 GDN_FALLBACK_ENV = {GDN_MODE_ENV: "0", GDN_VERIFY_ENV: "0"}
 
+# The steps of G1b whose result is recorded only (it never changes the gate's status, the GDN mode or the
+# verify mode): `skip_recorded_only` leaves all of them out, `skip_verify_probe` only the crash probe.
+GDN_STEP_EAGER_REPLAYS = "replay_eager"
+GDN_STEP_BENCH = "bench"
+GDN_STEP_CRASH_PROBE = "verify_crash_probe"
+GDN_RECORDED_ONLY_STEPS = (GDN_STEP_EAGER_REPLAYS, GDN_STEP_BENCH, GDN_STEP_CRASH_PROBE)
+
+# details["combined_kernel_db"] of G1b: the combined kernel database (RUK-3243) in the gate's steps.
+COMBINED_DB_NOT_INSTALLED = "not_installed"  # no such file next to the fused kernel library
+COMBINED_DB_SWITCHED_OFF = "switched_off"    # the operator's FLASHINFER_GAUDI_COMBINED_KERNEL_DB=0
+COMBINED_DB_ACTIVE = "active"                # the steps ran through it and the decode checks passed
+COMBINED_DB_DISABLED_BY_G1B = "disabled_by_g1b"  # the decode checks failed with it and passed without
+COMBINED_DB_FAILED_BOTH = "failed_with_and_without"  # they failed either way: not the database's fault
+
 
 def _gdn_pytest_summary(output: str) -> dict:
     """The counts of pytest's last summary line ("2 failed, 5 passed in 3.4s"); zeros when absent."""
@@ -413,7 +432,8 @@ def _gdn_crash_probe(plugin_root: Path, out_dir: Path, env: dict, python: str) -
         return {"exit": None, "reason": "%s: %s" % (type(e).__name__, e), "summary": []}
 
 
-def fused_gdn(plugin_root: Path, out_dir: Path, python: str = sys.executable) -> tuple[GateStatus, dict]:
+def fused_gdn(plugin_root: Path, out_dir: Path, python: str = sys.executable, skip_recorded_only: str = None,
+              skip_verify_probe: str = None) -> tuple[GateStatus, dict]:
     """G1b. details always has "mode" (1 = the fused kernel stays on, 0 = later servers run the PyTorch path),
     "verify_mode" (1 = the GDN verify op's card checks all passed, 0 = the op stays off) and "env" (the GDN
     flags of every later server, added by the orchestrator: the decode entry as before, and
@@ -425,9 +445,29 @@ def fused_gdn(plugin_root: Path, out_dir: Path, python: str = sys.executable) ->
     case with the integer "lazy_mode" 0, and "eager_compile_ok" = True only when both eager replays exit
     0): an eager failure or timeout never turns the kernel off and never changes the gate's status,
     because no server runs eager mode or torch.compile. Every step runs in its own process group and is
-    SIGKILLed with all of its children at its timeout (run_step), so no step can outlive it and hold a card."""
+    SIGKILLed with all of its children at its timeout (run_step), so no step can outlive it and hold a card.
+
+    The combined kernel database (RUK-3248). The loader finds it next to GDN_FUSED_GAUDI_KERNEL_LIBRARY, so
+    with the file installed and the operator's switch not at 0 the steps run through it
+    (details["combined_kernel_db"] = "active"). When the decode checks (the op test or a lazy decode
+    replay) then fail or time out, they run ONCE more with FLASHINFER_GAUDI_COMBINED_KERNEL_DB=0 in the
+    step environment. If they pass, the gate goes on with the switch set and passes with the fused kernel
+    on: "combined_kernel_db" is "disabled_by_g1b", "env" carries the switch for every later server, and
+    the first attempt is kept in "combined_attempt" with its logs renamed to hpu_op.combined.log and
+    replay.combined.log. If they fail again the kernel goes off as without the database
+    ("failed_with_and_without").
+
+    `skip_recorded_only` (a reason text, the orchestrator's "--quick-gates") leaves out the steps that
+    are recorded only (GDN_RECORDED_ONLY_STEPS: the eager replays, the bench, the verify crash probe);
+    `skip_verify_probe` leaves out only the probe. details["skipped_steps"] maps each such step to the
+    reason; the checks that decide the kernel and the verify op always run."""
     started = time.monotonic()
     details: dict = {"mode": GDN_MODE_PYTORCH, "env": dict(GDN_FALLBACK_ENV), "verify_mode": GDN_VERIFY_OFF}
+    probe_skip = skip_recorded_only or skip_verify_probe
+    if skip_recorded_only:
+        details["skipped_steps"] = {name: skip_recorded_only for name in GDN_RECORDED_ONLY_STEPS}
+    else:
+        details["skipped_steps"] = {GDN_STEP_CRASH_PROBE: skip_verify_probe} if skip_verify_probe else {}
 
     def finish(status: GateStatus, reason: str = None) -> tuple[GateStatus, dict]:
         if reason is not None:
@@ -468,6 +508,12 @@ def fused_gdn(plugin_root: Path, out_dir: Path, python: str = sys.executable) ->
         env[GDN_LAZY_ENV] = "1"  # the bridge mode of every server; the container leaves it unset
         env.pop(GDN_MODE_ENV, None)
         env.pop(GDN_VERIFY_ENV, None)
+        if not (lib_dir / serve.COMBINED_KERNEL_DB).is_file():
+            details["combined_kernel_db"] = COMBINED_DB_NOT_INSTALLED
+        elif env.get(serve.COMBINED_KERNEL_DB_ENV, "1").strip() == "0":
+            details["combined_kernel_db"] = COMBINED_DB_SWITCHED_OFF
+        else:
+            details["combined_kernel_db"] = COMBINED_DB_ACTIVE
 
         def run(cmd: list, log_name: str, limit: float, append: bool = False, lazy_mode: int = 1):
             nonlocal step, timeout_s
@@ -484,58 +530,93 @@ def fused_gdn(plugin_root: Path, out_dir: Path, python: str = sys.executable) ->
                 f.write(text)
             return proc, text
 
-        # 3-4. the decode checks: a verify run is only attempted when they all pass
-        try:
-            # 3. the op numerics on the card; a module skip counts as a failure
-            proc, text = run(
-                [python, "-m", "pytest", "-q", "-rs", "-p", "no:cacheprovider",
-                 "tests/unit_tests/gdn_core_decode/test_hpu_op.py"], "hpu_op.log", GDN_OP_TIMEOUT_S)
-            counts = _gdn_pytest_summary(text)
-            details["hpu_op"] = {
-                "exit": proc.returncode,
-                "passed": counts["passed"],
-                "skipped": counts["skipped"],
-                "failed": counts["failed"],
-            }
-            details["failed_tests"] = [ln for ln in text.splitlines() if ln.startswith("FAILED ")]
-            op_ok = (proc.returncode == 0 and counts["passed"] > 0 and counts["skipped"] == 0 and
-                     counts["failed"] == 0 and counts["error"] == 0)
-            if not op_ok:
-                details["verify"] = _gdn_verify_not_run("decode checks failed")
-                if counts["skipped"] > 0:
-                    return finish(GateStatus.FAILED, "test_hpu_op.py skipped")
-                return finish(GateStatus.FAILED, "test_hpu_op.py failed (exit %d)" % proc.returncode)
+        def decode_checks() -> tuple:
+            """Steps 3 and 4, the checks that decide the kernel; (None, None) when they all passed, else
+            the (status, reason) of the first one that did not. A verify run is only attempted after them."""
+            try:
+                # 3. the op numerics on the card; a module skip counts as a failure
+                proc, text = run(
+                    [python, "-m", "pytest", "-q", "-rs", "-p", "no:cacheprovider",
+                     "tests/unit_tests/gdn_core_decode/test_hpu_op.py"], "hpu_op.log", GDN_OP_TIMEOUT_S)
+                counts = _gdn_pytest_summary(text)
+                details["hpu_op"] = {
+                    "exit": proc.returncode,
+                    "passed": counts["passed"],
+                    "skipped": counts["skipped"],
+                    "failed": counts["failed"],
+                }
+                details["failed_tests"] = [ln for ln in text.splitlines() if ln.startswith("FAILED ")]
+                op_ok = (proc.returncode == 0 and counts["passed"] > 0 and counts["skipped"] == 0 and
+                         counts["failed"] == 0 and counts["error"] == 0)
+                if not op_ok:
+                    if counts["skipped"] > 0:
+                        return GateStatus.FAILED, "test_hpu_op.py skipped"
+                    return GateStatus.FAILED, "test_hpu_op.py failed (exit %d)" % proc.returncode
 
-            # 4. the 1,000-step graph replay against eager, two cases, in one appended log
-            details["replay"] = []
-            for case in ("tp8_b16", "tp8_b64"):
-                cmd = [python, "tools/flash_next/gdn_core_decode_replay.py", "--steps", "1000"]
-                if case != "tp8_b16":
-                    cmd += ["--case", case]
-                proc, _ = run(cmd, "replay.log", GDN_REPLAY_TIMEOUT_S, append=True)
-                details["replay"].append({"case": case, "lazy_mode": 1, "exit": proc.returncode})
-                if proc.returncode != 0:
-                    details["verify"] = _gdn_verify_not_run("decode checks failed")
-                    return finish(GateStatus.FAILED,
-                                  "gdn_core_decode_replay.py (%s) failed (exit %d)" % (case, proc.returncode))
-        except subprocess.TimeoutExpired:
+                # 4. the 1,000-step graph replay against eager, two cases, in one appended log
+                details["replay"] = []
+                for case in ("tp8_b16", "tp8_b64"):
+                    cmd = [python, "tools/flash_next/gdn_core_decode_replay.py", "--steps", "1000"]
+                    if case != "tp8_b16":
+                        cmd += ["--case", case]
+                    proc, _ = run(cmd, "replay.log", GDN_REPLAY_TIMEOUT_S, append=True)
+                    details["replay"].append({"case": case, "lazy_mode": 1, "exit": proc.returncode})
+                    if proc.returncode != 0:
+                        return GateStatus.FAILED, "gdn_core_decode_replay.py (%s) failed (exit %d)" % (
+                            case, proc.returncode)
+            except subprocess.TimeoutExpired:
+                return GateStatus.TIMED_OUT, "%s did not finish in %s s" % (step, timeout_s)
+            return None, None
+
+        # 3-4. the decode checks; once more without the combined kernel database when they fail through it
+        failed_status, failed_reason = decode_checks()
+        if failed_status is not None and details["combined_kernel_db"] == COMBINED_DB_ACTIVE:
+            first = {
+                "status": failed_status.name.lower(),
+                "reason": failed_reason,
+                "hpu_op": details.pop("hpu_op", None),
+                "failed_tests": details.pop("failed_tests", []),
+                "replay": details.pop("replay", None),
+                "logs": [],
+            }
+            for log_name in ("hpu_op.log", "replay.log"):  # the rerun writes these names again
+                if (out_dir / log_name).is_file():
+                    kept = log_name[:-len(".log")] + ".combined.log"
+                    os.replace(out_dir / log_name, out_dir / kept)
+                    first["logs"].append(kept)
+            details["combined_attempt"] = first
+            env[serve.COMBINED_KERNEL_DB_ENV] = "0"  # for the rerun and, when it passes, the rest of the gate
+            failed_status, failed_reason = decode_checks()
+            details["combined_kernel_db"] = (COMBINED_DB_DISABLED_BY_G1B if failed_status is None else
+                                             COMBINED_DB_FAILED_BOTH)
+        if failed_status is not None:
             details["verify"] = _gdn_verify_not_run("decode checks failed")
-            raise
+            return finish(failed_status, failed_reason)
 
         # 4c. the same two decode replays in eager mode, where the replay tool exercises torch.compile's
         #     hpu_backend. Recorded only: an eager failure or timeout never turns the kernel off and
         #     never changes the gate's status, because no server runs eager mode.
         details["replay_eager"] = []
-        for case in ("tp8_b16", "tp8_b64"):
-            cmd = [python, "tools/flash_next/gdn_core_decode_replay.py", "--steps", "1000"]
-            if case != "tp8_b16":
-                cmd += ["--case", case]
-            try:
-                proc, _ = run(cmd, "replay.log", GDN_REPLAY_TIMEOUT_S, append=True, lazy_mode=0)
-                details["replay_eager"].append({"case": case, "lazy_mode": 0, "exit": proc.returncode})
-            except subprocess.TimeoutExpired:
-                details["replay_eager"].append({"case": case, "lazy_mode": 0, "exit": None, "timed_out": True})
-        details["eager_compile_ok"] = all(entry["exit"] == 0 for entry in details["replay_eager"])
+        if skip_recorded_only:
+            details["eager_compile_ok"] = None
+        else:
+            for case in ("tp8_b16", "tp8_b64"):
+                cmd = [python, "tools/flash_next/gdn_core_decode_replay.py", "--steps", "1000"]
+                if case != "tp8_b16":
+                    cmd += ["--case", case]
+                try:
+                    proc, _ = run(cmd, "replay.log", GDN_REPLAY_TIMEOUT_S, append=True, lazy_mode=0)
+                    details["replay_eager"].append({"case": case, "lazy_mode": 0, "exit": proc.returncode})
+                except subprocess.TimeoutExpired:
+                    details["replay_eager"].append({"case": case, "lazy_mode": 0, "exit": None, "timed_out": True})
+            details["eager_compile_ok"] = all(entry["exit"] == 0 for entry in details["replay_eager"])
+
+        def crash_probe() -> dict:
+            """Ask gdn_verify_crash_probe.sh why V1 crashed or hung (up to GDN_CRASH_PROBE_TIMEOUT_S), unless
+            the caller left the probe out."""
+            if probe_skip:
+                return {"exit": None, "skipped": probe_skip, "summary": []}
+            return _gdn_crash_probe(plugin_root, out_dir, env, python)
 
         # 4b. the GDN verify op's own card checks, only after the decode checks passed and only when its
         #     test file is in the bundle; a verify failure never changes the gate's status
@@ -564,12 +645,12 @@ def fused_gdn(plugin_root: Path, out_dir: Path, python: str = sys.executable) ->
                     verify["reason"] = ("test_hpu_verify_op.py skipped" if counts["skipped"] > 0 else
                                         "test_hpu_verify_op.py failed (exit %d)" % proc.returncode)
                 if proc.returncode < 0 or proc.returncode in (134, 139):  # SIGSEGV/SIGABRT: ask the probe why
-                    verify["crash_probe"] = _gdn_crash_probe(plugin_root, out_dir, env, python)
+                    verify["crash_probe"] = crash_probe()
             except subprocess.TimeoutExpired:
                 verify_ok = False
                 verify["status"] = "timed_out"
                 verify["reason"] = "test_hpu_verify_op.py did not finish in %s s" % GDN_OP_TIMEOUT_S
-                verify["crash_probe"] = _gdn_crash_probe(plugin_root, out_dir, env, python)
+                verify["crash_probe"] = crash_probe()
             if verify_ok:
                 # V2. the 1,000-step verify replay against eager, two cases, appended to the replay log
                 for case in ("ver_tp8_b16", "ver_tp8_b64"):
@@ -595,20 +676,26 @@ def fused_gdn(plugin_root: Path, out_dir: Path, python: str = sys.executable) ->
         details["verify_mode"] = GDN_VERIFY_ON if verify_ok else GDN_VERIFY_OFF
 
         # 5. the speed measurement: recorded only, its result never changes the status
-        try:
-            proc, text = run(
-                [python, "tools/flash_next/gdn_core_decode_bench.py", "--tp", "2,8", "--batches", "1,16,64"],
-                "bench.log", GDN_BENCH_TIMEOUT_S)
-            details["bench"] = {
-                "exit": proc.returncode,
-                "lines": [ln.strip() for ln in text.splitlines() if "slope" in ln or "B=1" in ln],
-            }
-        except subprocess.TimeoutExpired:  # a slow measurement never turns the verified kernel off
-            details["bench"] = {"exit": None, "timed_out": True, "lines": []}
+        if skip_recorded_only:
+            details["bench"] = {"exit": None, "skipped": skip_recorded_only, "lines": []}
+        else:
+            try:
+                proc, text = run(
+                    [python, "tools/flash_next/gdn_core_decode_bench.py", "--tp", "2,8", "--batches", "1,16,64"],
+                    "bench.log", GDN_BENCH_TIMEOUT_S)
+                details["bench"] = {
+                    "exit": proc.returncode,
+                    "lines": [ln.strip() for ln in text.splitlines() if "slope" in ln or "B=1" in ln],
+                }
+            except subprocess.TimeoutExpired:  # a slow measurement never turns the verified kernel off
+                details["bench"] = {"exit": None, "timed_out": True, "lines": []}
 
-        # 6. the fused kernel stays on; the verify op only when its own checks passed
+        # 6. the fused kernel stays on; the verify op only when its own checks passed; and the combined
+        #    kernel database stays out of every later server when the decode checks only passed without it
         details["mode"] = GDN_MODE_FUSED
         details["env"] = {GDN_VERIFY_ENV: "1" if verify_ok else "0"}
+        if details["combined_kernel_db"] == COMBINED_DB_DISABLED_BY_G1B:
+            details["env"][serve.COMBINED_KERNEL_DB_ENV] = "0"
         return finish(GateStatus.PASSED)
     except subprocess.TimeoutExpired:
         return finish(GateStatus.TIMED_OUT, "%s did not finish in %s s" % (step, timeout_s))
@@ -622,51 +709,103 @@ def gdn_fallback_lines(log_text: str) -> list[str]:
     return [ln.strip() for ln in (log_text or "").splitlines() if GDN_FALLBACK_RE.search(ln)]
 
 
+TINY_ERROR_TEXT_LIMIT = 300
+TINY_NOT_SENT = "not sent: an earlier prompt timed out"
+
+
 def tiny_compare(base_url: str, reference_path: Path) -> tuple[GateStatus, dict]:
-    """Stage 2a: the served tiny checkpoint must reproduce reference.json 16/16 on every prompt."""
+    """Stage 2a: the served tiny checkpoint must reproduce reference.json 16/16 on every prompt.
+
+    The prompts go out shortest first. Every prompt gets one entry in details["prompts"] (in the order
+    sent; "index" is its place in reference.json): a compared answer has "match", "expected",
+    "first_diff" and "full_match"; a request that failed has "error" (the exception text) and
+    "full_match" False, and the loop goes on, so the record always shows which lengths passed. Only a
+    timeout stops the sending: the remaining prompts are recorded as not sent. The gate fails when any
+    prompt fails (TIMED_OUT when a request timed out) and details["reason"] names the shortest failing
+    prompt length."""
     details: dict = {"prompts": [], "n_prompts": 0}
     try:
         reference = json.loads(Path(reference_path).read_text(encoding="utf-8"))
-        prompts = reference["prompts"]
+        prompts = sorted(enumerate(reference["prompts"]), key=lambda item: len(item[1]["prompt_ids"]))
         details["n_prompts"] = len(prompts)
-        bad = 0
-        for i, p in enumerate(prompts):
-            resp = _post_json(
-                base_url, "/v1/completions", {
-                    "model": "tiny",
-                    "prompt": p["prompt_ids"],
-                    "max_tokens": TINY_MAX_TOKENS,
-                    "temperature": 0,
-                    "return_token_ids": True,
-                }, HTTP_TIMEOUT_S)
-            got = (resp.get("choices") or [{}])[0].get("token_ids") or []
+        failed = []  # (prompt_tokens, what went wrong), in the order sent
+        timed_out = False
+        for i, p in prompts:
+            entry: dict = {"index": i, "prompt_tokens": len(p["prompt_ids"])}
+            details["prompts"].append(entry)
+            if timed_out:
+                entry.update(full_match=False, error=TINY_NOT_SENT)
+                failed.append((entry["prompt_tokens"], TINY_NOT_SENT))
+                continue
+            try:
+                resp = _post_json(
+                    base_url, "/v1/completions", {
+                        "model": "tiny",
+                        "prompt": p["prompt_ids"],
+                        "max_tokens": TINY_MAX_TOKENS,
+                        "temperature": 0,
+                        "return_token_ids": True,
+                    }, HTTP_TIMEOUT_S)
+                got = (resp.get("choices") or [{}])[0].get("token_ids") or []
+            except Exception as e:  # noqa: BLE001 - one prompt's failure is recorded, the others still run
+                timed_out = isinstance(e, TimeoutError)
+                # _post_json's own texts ("HTTP 400 from ...", "request to ... timed out") need no type name
+                text = str(e) if type(e) in (TimeoutError, RuntimeError) else "%s: %s" % (type(e).__name__, e)
+                entry.update(full_match=False, error=text[:TINY_ERROR_TEXT_LIMIT])
+                failed.append((entry["prompt_tokens"], entry["error"]))
+                continue
             exp = p["generated_ids"]
             match = sum(1 for a, b in zip(got, exp) if a == b)
             first_diff = next((j for j, (a, b) in enumerate(zip(got, exp)) if a != b), None)
             if first_diff is None and len(got) != len(exp):
                 first_diff = min(len(got), len(exp))
             full = got == exp
-            details["prompts"].append({
-                "index": i,
-                "prompt_tokens": len(p["prompt_ids"]),
-                "match": match,
-                "expected": len(exp),
-                "first_diff": first_diff,
-                "full_match": full,
-            })
+            entry.update(match=match, expected=len(exp), first_diff=first_diff, full_match=full)
             if not full:
-                bad += 1
-        if bad:
-            details["reason"] = "%d of %d prompts do not match %d/%d" % (bad, len(prompts), TINY_MAX_TOKENS,
-                                                                          TINY_MAX_TOKENS)
-            return GateStatus.FAILED, details
+                failed.append((entry["prompt_tokens"],
+                               "%d of %d tokens match, first difference at token %s" % (match, len(exp), first_diff)))
+        if failed:
+            details["reason"] = "%d of %d prompts failed; the shortest failing prompt has %d tokens: %s" % (
+                len(failed), len(prompts), failed[0][0], failed[0][1])
+            return (GateStatus.TIMED_OUT if timed_out else GateStatus.FAILED), details
         return GateStatus.PASSED, details
-    except TimeoutError as e:
-        details["error"] = str(e)
-        return GateStatus.TIMED_OUT, details
     except Exception as e:  # noqa: BLE001 - the gate never raises
         details["error"] = "%s: %s" % (type(e).__name__, e)
         return GateStatus.FAILED, details
+
+
+def first_token(base_url: str, model: str, timeout_s: float = HTTP_TIMEOUT_S) -> tuple[GateStatus, dict]:
+    """The proof of life of a server that just started: one short completion (FIRST_TOKEN_PROMPT,
+    FIRST_TOKEN_MAX_TOKENS tokens, temperature 0), not streamed.
+
+    details has "prompt", "max_tokens", "timeout_s", "text", "tokens" (the answer's completion_tokens,
+    None when the server reports no usage) and "seconds" (the wall time of the whole request, which
+    includes the first graph compile when the warmup was skipped). PASSED when the answer has text or
+    tokens; FAILED with "reason" when it has neither, or with "error" when the request failed;
+    TIMED_OUT when it ran into `timeout_s`. Never raises."""
+    details: dict = {"prompt": FIRST_TOKEN_PROMPT, "max_tokens": FIRST_TOKEN_MAX_TOKENS, "timeout_s": timeout_s,
+                     "text": None, "tokens": None, "seconds": None}
+    started = time.monotonic()
+    try:
+        resp = _post_json(base_url, "/v1/completions", {
+            "model": model,
+            "prompt": FIRST_TOKEN_PROMPT,
+            "max_tokens": FIRST_TOKEN_MAX_TOKENS,
+            "temperature": 0,
+        }, timeout_s)
+        details["seconds"] = round(time.monotonic() - started, 3)
+        text = (resp.get("choices") or [{}])[0].get("text")
+        details["text"] = "" if text is None else text
+        usage = resp.get("usage")
+        details["tokens"] = usage.get("completion_tokens") if isinstance(usage, dict) else None
+        if not details["text"] and not details["tokens"]:
+            details["reason"] = "the server answered without a token"
+            return GateStatus.FAILED, details
+        return GateStatus.PASSED, details
+    except Exception as e:  # noqa: BLE001 - the gate never raises
+        details["seconds"] = round(time.monotonic() - started, 3)
+        details["error"] = str(e) if type(e) in (TimeoutError, RuntimeError) else "%s: %s" % (type(e).__name__, e)
+        return (GateStatus.TIMED_OUT if isinstance(e, TimeoutError) else GateStatus.FAILED), details
 
 
 def coherence(base_url: str,

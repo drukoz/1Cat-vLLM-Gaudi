@@ -54,7 +54,9 @@ def make_checkpoint(root: Path,
 
 @pytest.fixture
 def fake_api():
-    """Start canned-answer HTTP fakes; yields (start(responder) -> (url, received), teardown)."""
+    """Start canned-answer HTTP fakes; yields (start(responder) -> (url, received), teardown).
+
+    A responder returns the JSON body of a 200 answer, or (status, body) for another HTTP status."""
     servers = []
 
     def start(responder):
@@ -66,8 +68,10 @@ def fake_api():
                 length = int(self.headers.get("Content-Length") or 0)
                 req = json.loads(self.rfile.read(length).decode("utf-8"))
                 received.append((self.path, req))
-                body = json.dumps(responder(self.path, req)).encode("utf-8")
-                self.send_response(200)
+                answer = responder(self.path, req)
+                status, answer = answer if isinstance(answer, tuple) else (200, answer)
+                body = json.dumps(answer).encode("utf-8")
+                self.send_response(status)
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Content-Length", str(len(body)))
                 self.end_headers()
@@ -380,10 +384,10 @@ def test_build_check_missing_interpreter(tmp_path):
 # --------------------------------------------------------------------------- tiny_compare
 
 
-def write_reference(path: Path) -> dict:
+def write_reference(path: Path, lengths=(1, 7)) -> dict:
     prompts = []
     expected = {}
-    for i, n in enumerate([1, 7]):
+    for i, n in enumerate(lengths):
         prompt_ids = list(range(1, n + 1))
         generated_ids = list(range(100 + 16 * i, 100 + 16 * i + 16))
         prompts.append({"prompt_ids": prompt_ids, "generated_ids": generated_ids})
@@ -425,14 +429,124 @@ def test_tiny_compare_mismatch(tmp_path, fake_api):
     assert details["prompts"][0]["full_match"] is True
     assert details["prompts"][1]["match"] == 15
     assert details["prompts"][1]["first_diff"] == 15
+    assert details["reason"] == ("1 of 2 prompts failed; the shortest failing prompt has 7 tokens: "
+                                 "15 of 16 tokens match, first difference at token 15")
 
 
 def test_tiny_compare_server_down(tmp_path):
+    # Changed with the per-prompt errors: a request error is recorded on its prompt, not as details["error"].
     reference = tmp_path / "reference.json"
     write_reference(reference)
     status, details = gates.tiny_compare("http://127.0.0.1:1", reference)
     assert status is GateStatus.FAILED
-    assert "error" in details
+    assert [p["prompt_tokens"] for p in details["prompts"]] == [1, 7]
+    assert all(p["full_match"] is False and p["error"] for p in details["prompts"])
+    assert details["reason"].startswith("2 of 2 prompts failed; the shortest failing prompt has 1 tokens: ")
+
+
+def test_tiny_compare_request_error_is_recorded_and_the_loop_continues(tmp_path, fake_api):
+    # The session-1 shape: a server whose model length is below the longer reference prompts answers them 400.
+    reference = tmp_path / "reference.json"
+    expected = write_reference(reference, lengths=(2600, 1, 700, 7))
+
+    def responder(path, req):
+        if len(req["prompt"]) > 512:
+            return 400, {"error": {"message": "maximum context length is 512 tokens"}}
+        return {"choices": [{"token_ids": list(expected[tuple(req["prompt"])])}]}
+
+    url, received = fake_api(responder)
+    status, details = gates.tiny_compare(url, reference)
+    assert status is GateStatus.FAILED
+    assert [len(req["prompt"]) for _, req in received] == [1, 7, 700, 2600]  # shortest first, none left out
+    assert details["n_prompts"] == 4
+    assert [(p["index"], p["prompt_tokens"], p["full_match"]) for p in details["prompts"]] == [
+        (1, 1, True), (3, 7, True), (2, 700, False), (0, 2600, False)]
+    for entry in details["prompts"][2:]:
+        assert "HTTP 400" in entry["error"] and "maximum context length is 512 tokens" in entry["error"]
+    assert "error" not in details["prompts"][0]
+    assert details["reason"].startswith("2 of 4 prompts failed; the shortest failing prompt has 700 tokens: HTTP 400")
+    assert "error" not in details
+
+
+def test_tiny_compare_timeout_stops_sending(tmp_path, monkeypatch):
+    # A request that timed out is not followed by the longer prompts: each would wait the full timeout again.
+    reference = tmp_path / "reference.json"
+    expected = write_reference(reference, lengths=(1, 7, 33))
+    sent = []
+
+    def fake_post(base_url, path, payload, timeout_s):
+        sent.append(len(payload["prompt"]))
+        if len(payload["prompt"]) == 7:
+            raise TimeoutError("request to /v1/completions timed out after 600.0 s")
+        return {"choices": [{"token_ids": list(expected[tuple(payload["prompt"])])}]}
+
+    monkeypatch.setattr(gates, "_post_json", fake_post)
+    status, details = gates.tiny_compare("http://unused", reference)
+    assert status is GateStatus.TIMED_OUT
+    assert sent == [1, 7]
+    assert details["prompts"][0]["full_match"] is True
+    assert "timed out" in details["prompts"][1]["error"]
+    assert details["prompts"][2] == {"index": 2, "prompt_tokens": 33, "full_match": False,
+                                     "error": "not sent: an earlier prompt timed out"}
+    assert details["reason"].startswith("2 of 3 prompts failed; the shortest failing prompt has 7 tokens: ")
+
+
+def test_tiny_compare_unreadable_reference_fails_the_gate(tmp_path):
+    status, details = gates.tiny_compare("http://unused", tmp_path / "missing.json")
+    assert status is GateStatus.FAILED
+    assert "FileNotFoundError" in details["error"]
+
+
+# --------------------------------------------------------------------------- first_token
+
+
+def test_first_token_pass_records_prompt_text_seconds_and_tokens(fake_api):
+    def responder(path, req):
+        return {"choices": [{"text": " Paris, the city of"}], "usage": {"prompt_tokens": 5, "completion_tokens": 8}}
+
+    url, received = fake_api(responder)
+    status, details = gates.first_token(url, "flash-next", 30.0)
+    assert status is GateStatus.PASSED
+    assert details["prompt"] == gates.FIRST_TOKEN_PROMPT
+    assert details["text"] == " Paris, the city of" and details["tokens"] == 8
+    assert details["max_tokens"] == 8 and details["timeout_s"] == 30.0
+    assert 0 <= details["seconds"] < 30
+    path, req = received[0]
+    assert path == "/v1/completions"
+    assert req == {"model": "flash-next", "prompt": gates.FIRST_TOKEN_PROMPT, "max_tokens": 8, "temperature": 0}
+    assert len(received) == 1
+    assert len(gates.FIRST_TOKEN_PROMPT.split()) <= 8  # a few tokens: the cheapest request that decodes
+
+
+def test_first_token_http_error_fails(fake_api):
+    url, _ = fake_api(lambda path, req: (500, {"error": {"message": "EngineDeadError"}}))
+    status, details = gates.first_token(url, "flash-next", 30.0)
+    assert status is GateStatus.FAILED
+    assert "HTTP 500" in details["error"] and "EngineDeadError" in details["error"]
+    assert details["text"] is None and details["seconds"] >= 0
+
+
+def test_first_token_empty_answer_fails(fake_api):
+    url, _ = fake_api(lambda path, req: {"choices": [{"text": ""}], "usage": {"completion_tokens": 0}})
+    status, details = gates.first_token(url, "flash-next", 30.0)
+    assert status is GateStatus.FAILED
+    assert details["reason"] == "the server answered without a token"
+
+
+def test_first_token_timeout_is_timed_out(monkeypatch):
+    def fake_post(base_url, path, payload, timeout_s):
+        raise TimeoutError("request to /v1/completions timed out after %s s" % timeout_s)
+
+    monkeypatch.setattr(gates, "_post_json", fake_post)
+    status, details = gates.first_token("http://unused", "flash-next", 3600.0)
+    assert status is GateStatus.TIMED_OUT
+    assert details["error"] == "request to /v1/completions timed out after 3600.0 s"
+
+
+def test_first_token_server_down_never_raises():
+    status, details = gates.first_token("http://127.0.0.1:1", "flash-next", 5.0)
+    assert status is GateStatus.FAILED
+    assert details["error"]
 
 
 # --------------------------------------------------------------------------- coherence
