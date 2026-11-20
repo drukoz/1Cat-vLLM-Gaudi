@@ -8,9 +8,10 @@
 #include "../hc_fused_params.h"
 
 namespace {
-// The schemas, CPU kernels and fake kernels are defined in Python (flashinfer_gaudi/hc_fused.py;
-// staged as tests/unit_tests/hc_fused/hc_ops.py until integration); this file registers only the
-// HPU kernels. Schemas, in argument order:
+// The schemas and the fake kernels are defined in Python (flashinfer_gaudi/hc_fused.py, imported by
+// flashinfer_gaudi._native.load_hc_fused_extension before this library is loaded); this file
+// registers only the HPU kernels. There is no CPU kernel outside the tests
+// (tests/unit_tests/hc_fused/hc_ops.py adds the torch oracle). Schemas, in argument order:
 //   hc_norm(Tensor x, Tensor norm_weight, float eps, int hc_count) -> Tensor
 //   hc_silu(Tensor down, int hc_count) -> Tensor
 //   hc_silu_split(Tensor down, int hc_count, int lora_rank) -> (Tensor, Tensor)

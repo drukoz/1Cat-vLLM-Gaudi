@@ -41,6 +41,7 @@ if(KERNEL_DB_ADAPTER_TESTS)
 
     fake_member(fake_member_a a)  # all six entry points
     fake_member(fake_member_b b)  # all six entry points
+    fake_member(fake_member_h h)  # all six entry points; stands for libhc_fused_gaudi2.so
     fake_member(fake_member_min m FAKE_MINIMAL)  # only the three required entry points
     fake_member(fake_member_nosif n FAKE_MINIMAL FAKE_NO_SHAPE_INFERENCE)  # lacks a required entry point
 
@@ -52,6 +53,7 @@ if(KERNEL_DB_ADAPTER_TESTS)
         ADAPTER_PATH="$<TARGET_FILE:flashinfer_gaudi_combined_gaudi2>"
         FAKE_A_PATH="$<TARGET_FILE:fake_member_a>"
         FAKE_B_PATH="$<TARGET_FILE:fake_member_b>"
+        FAKE_H_PATH="$<TARGET_FILE:fake_member_h>"
         FAKE_MIN_PATH="$<TARGET_FILE:fake_member_min>"
         FAKE_NOSIF_PATH="$<TARGET_FILE:fake_member_nosif>"
     )
@@ -62,6 +64,7 @@ if(KERNEL_DB_ADAPTER_TESTS)
         flashinfer_gaudi_combined_gaudi2
         fake_member_a
         fake_member_b
+        fake_member_h
         fake_member_min
         fake_member_nosif
     )

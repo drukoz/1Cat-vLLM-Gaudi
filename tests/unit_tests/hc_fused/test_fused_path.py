@@ -1,12 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
 """CPU tests of the fused hyper-connection path against ``HpuGatedResidual`` (needs vLLM).
 
-1. ``fused_path`` (the executable form of the layer patch) returns exactly what
+1. ``fused_path`` (the layer's own fused methods, called directly) returns exactly what the torch
    ``HpuGatedResidual.mix`` / ``combine_and_mix`` / ``combine`` return, in bfloat16, for both
    norm-weight layouts and for the final mixer (``use_combine=False``).  On CPU the fused ops run
    the torch oracle, so this checks the wiring: argument order, the split, which tensor feeds what.
 2. A torch dispatch-mode counter over one decode-shaped call counts the torch ops of both paths.
    The numbers are the "ops per layer before/after" of ``docs/design/flash-next/hc-fused.md``.
+
+The modules here are built with the flag at its default (0), so their methods are the torch path.
+The flag, the preconditions and the fallback are tested in
+``tests/unit_tests/models/flash_next/test_hc_fused_layer.py``.
 """
 
 import os
@@ -54,8 +58,9 @@ def world1():
 
 
 @pytest.fixture
-def vllm_ctx():
-    """vLLM linear layers read get_current_vllm_config() at construction."""
+def vllm_ctx(monkeypatch):
+    """vLLM linear layers read get_current_vllm_config() at construction; the layers are built with the flag off."""
+    monkeypatch.delenv("VLLM_HPU_HC_FUSED", raising=False)
     with set_current_vllm_config(VllmConfig()):
         yield
 

@@ -13,6 +13,11 @@
 # and once with the fused GDN kernel. Every server is stopped again, so the cards are free when the
 # script returns.
 #
+# A third mode, hc, is the fused mode plus the fused hyper-connection kernels (VLLM_HPU_HC_FUSED=1).
+# It is not in the default list: --gdn hc (or --gdn pytorch,fused,hc) selects it. It fails when the
+# server log says a hyper-connection ran the torch path. The kernels are built by the install of
+# this bundle: in a container an older bundle installed, pass --reinstall first.
+#
 # By default the servers skip the bucket warmup (VLLM_SKIP_WARMUP=true): the graphs compile on first
 # use and a run takes about 4-6 minutes per mode. --full-warmup keeps the real warmup, about 15 minutes
 # per mode on the tiny model. The servers get a compiled-recipe cache under /results/recipe-cache,
@@ -43,7 +48,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 usage() {
     echo "usage: $(basename "${BASH_SOURCE[0]}") [options]"
-    echo "  --gdn LIST      GDN modes to serve, in order (default: pytorch,fused)"
+    echo "  --gdn LIST      GDN modes to serve, in order (default: pytorch,fused); the third mode, hc, is fused plus the fused hyper-connection kernels (VLLM_HPU_HC_FUSED=1) and runs only when named: --gdn hc"
     echo "  --results DIR   results directory on the host (default: ./results); fixed once the container exists"
     echo "  --run-id ID     folder name under the results directory (default: smoke-<UTC timestamp>)"
     echo "  --image IMG     container image (default: $DEFAULT_IMAGE)"

@@ -1,13 +1,15 @@
 # Fused hyper-connection kernels: contract and integration notes
 
-Version 1, 2026-11-19. Six Gaudi2 TPC kernels that replace the element-wise torch code of the Flash-Next
+Version 2, 2026-11-19. Six Gaudi2 TPC kernels that replace the element-wise torch code of the Flash-Next
 "hyper-connection" block (`vllm_gaudi/models/qwen4_exp/hyperconnection.py`, `HpuGatedResidual`). The two GEMMs of a
 block (the merged low-rank down+inject projection and the up projection) stay on the matrix engine; everything between
 and around them becomes one kernel each. The kernels pass on the Gaudi2 instruction simulator against the torch oracle;
 nothing here has run on a card yet ("Unproven without a card" lists what that leaves open).
 
-The track added new files only. The model layer, the loader, the build script, the combined kernel database and the
-rental gate are **not** changed; "Integration" below says exactly what to change in each.
+The kernels are wired into the plugin behind the flag `VLLM_HPU_HC_FUSED`, **default 0**: the layer, the loader, the
+build, the combined kernel database, the rental gate and the smoke test. With the flag at 0 nothing of this is loaded,
+registered or logged, and the torch path is the code it was. With the flag at 1 every piece falls back to the torch
+path by itself and none can stop a run. "What is wired" below describes each piece.
 
 ## Why
 
@@ -35,16 +37,19 @@ graph nodes is at most these numbers; the fused numbers are exact (one node per 
 | What | Name |
 |---|---|
 | Ops | `torch.ops.flashinfer_gaudi.hc_norm`, `hc_silu`, `hc_silu_split`, `hc_gate_mix`, `hc_combine`, `hc_combine_norm` |
-| Schemas, CPU kernels (the oracle), fake kernels | `tests/unit_tests/hc_fused/hc_ops.py`, to become `flashinfer_gaudi/hc_fused.py` |
+| Schemas and fake kernels (the only definition) | `flashinfer_gaudi/hc_fused.py`; imported only with the flag at 1. It registers no CPU kernel |
+| CPU stand-in for the tests (the oracle as the ops' CPU kernels) | `tests/unit_tests/hc_fused/hc_ops.py` |
 | Torch oracle (verbatim copies of the plugin's functions) | `tests/unit_tests/hc_fused/hc_reference.py` |
-| Fused path of `HpuGatedResidual` (executable form of the layer patch) | `tests/unit_tests/hc_fused/fused_path.py` |
+| Fused path of `HpuGatedResidual` | the layer itself (`_hc_fused_mix`, `_hc_fused_combine_and_mix`, `_hc_fused_mix_tail`); `tests/unit_tests/hc_fused/fused_path.py` calls them directly |
 | TPC kernels | `csrc/hc_fused/kernels/hc_fused_{norm,silu,silu_split,gate_mix,combine,combine_norm}_gaudi2.c` + `hc_fused_common.h`, `hc_fused_silu.h` |
 | GUIDs | `hc_fused_norm_bf16_gaudi2`, `hc_fused_silu_bf16_gaudi2`, `hc_fused_silu_split_bf16_gaudi2`, `hc_fused_gate_mix_bf16_gaudi2`, `hc_fused_combine_bf16_gaudi2`, `hc_fused_combine_norm_bf16_gaudi2` (`csrc/hc_fused/hc_fused_params.h`) |
 | Kernel database | `libhc_fused_gaudi2.so` (CMake target `hc_fused_gaudi2`, `csrc/hc_fused/CMakeLists.txt`); its own library, nothing shared with `libgdn_fused_gaudi2.so` |
 | Host glue | `csrc/hc_fused/host/hc_fused_gaudi2.cpp` (validation, index space, access patterns, ELF), `host/entry_points.cpp` |
 | PyTorch extension | `hc_fused_ops*.so` (`csrc/hc_fused/pytorch/hpu_hc_fused.cpp`, `setup.py`); registers only the `HPU` kernels |
-| Loader (staged) | `tests/unit_tests/hc_fused/hpu_loader.py::load_hc_fused_extension`, to move into `flashinfer_gaudi/_native.py` |
-| Flag (to add) | `VLLM_HPU_HC_FUSED`, default 0 |
+| Loader | `flashinfer_gaudi/_native.py::load_hc_fused_extension`, `hc_fused_extension_errors`, `hc_fused_extension_loaded`; overrides `HC_FUSED_GAUDI_KERNEL_LIBRARY`, `HC_FUSED_GAUDI_NATIVE_LIBRARY` (`tests/unit_tests/hc_fused/hpu_loader.py` forwards to it) |
+| Flag | `VLLM_HPU_HC_FUSED`, default 0 (`vllm_gaudi/envs.py`) |
+| Build switch | `VLLM_GAUDI_BUILD_HC_FUSED=1`, or `tools/build_flashinfer_gaudi.py --hc-fused-only` |
+| Operator switch in the rental | `run_rental.sh --hc-fused`; smoke mode `tiny_smoke.sh --gdn hc` |
 
 ## Where each kernel sits and what it replaces
 
@@ -110,7 +115,8 @@ contiguous bf16 activations with `T > 0`, a rank-1 bf16 norm weight of `H` or `W
 **`H % 128 == 0`** (the kernels walk a stream in whole 128-lane bf16 vectors; 2560 and the tiny model's 128 pass),
 `1 <= HC <= 64`, `eps` a positive normal fp32, `1 <= R` and `R + HC <= C`. Nothing else is fixed: `T`, `H`, `HC`, `R` and
 `C` come from the tensor dims and the node parameters. `R` need not be a multiple of 128 (320 and 16 are not).
-The CPU kernels are the oracle functions and take any float dtype and any leading dims.
+The package registers no CPU kernel. The test stand-in's CPU kernels are the oracle functions and take any float
+dtype and any leading dims.
 
 ## Semantics and rounding points
 
@@ -196,25 +202,32 @@ tools/flash_next/tpcsim.sh 'python3 -m pytest -q -p no:cacheprovider --noconftes
 (`GetShapeInference`, `InstantiateTpcKernel` with the two-call ELF handshake) and the instruction simulator. It also
 compiles each kernel alone with exactly `tpc-clang -Wall -Werror -O2 -march=gaudi2` and checks that the CMake build log
 has those flags and no `-vlm`. `test_hc_library.py` runs `lib_check.cpp` (`dlopen`, every entry point, every
-rejection) and the same checks through the real combined kernel database with our library as a member.
+rejection) and the same checks through the real combined kernel database with our library as a member: once
+named by the members override and once as the installed sibling (no override, the adapter finds it by name). It
+also runs the build script's `check_kernel_library` on the built library. 71 tests in the two files.
 
 Cases (`tests/unit_tests/hc_fused/hc_case.py`): per kernel, tiny geometry (hidden 128, 1 and 3 rows), real geometry
 (hidden 2560, rows 1, 2, 16, 32), prefill size (2048 rows), both norm-weight layouts, stress inputs (sigmoid arguments
 from 0 to +-1e30; groups with mean square 0, far below eps, about eps, one spike, 1e30), bf16 rounding edges (exact
 ties, bit-exact required), the rounding-point pin, and geometries with `HC` 2 and 3 and `R` = 130.
 
-**CPU** (venv): `python -m pytest -q -p no:cacheprovider tests/unit_tests/hc_fused` (375 passed, 1 skipped: the card file).
+**CPU** (venv), one file per process: `python -m pytest -q -p no:cacheprovider <file>`.
 
 | File | What it holds |
 |---|---|
-| `test_reference_copy.py` | the copied oracle functions have the plugin's source text and return its bits |
-| `test_hc_case.py` | every case's expected output passes; raw files round-trip; `compare` has teeth (2 steps, cancellation bound, propagation rule, exactness, unwritten output); the unrounded-norm result is rejected |
-| `test_hc_ops.py` | schemas, CPU kernels equal the oracle, fake kernels give the shapes |
-| `test_fused_path.py` | the fused path returns exactly what `HpuGatedResidual` returns; op counts before and after |
-| `test_op_callbacks_host.py` | `hpu_hc_fused.cpp` compiled against the stub `hpu_custom_op_pt2.h` under ASan + UBSan: output metadata, GUID and the 12 parameter bytes of all 81 HPU cases, 12 rejections |
-| `test_hpu_loader.py` | the staged loader: ordering, `GC_KERNEL_PATH`, recipe cache, combined database, failures |
-| `test_sources.py` | GUIDs, ABI and scalar order agree across the C++, TPC-C and Python sources |
-| `test_hpu_op.py` | card only: see "Rental gate" |
+| `tests/unit_tests/hc_fused/test_reference_copy.py` | the copied oracle functions have the plugin's source text and return its bits |
+| `.../hc_fused/test_hc_case.py` | every case's expected output passes; raw files round-trip; `compare` has teeth (2 steps, cancellation bound, propagation rule, exactness, unwritten output); the unrounded-norm result is rejected |
+| `.../hc_fused/test_hc_ops.py` | schemas; the package module is the only definition, registers no CPU kernel and is not imported by `import flashinfer_gaudi`; the stand-in's CPU kernels equal the oracle; fake kernels give the shapes |
+| `.../hc_fused/test_fused_path.py` | the layer's fused methods, called directly, return exactly what the torch methods return; op counts before and after |
+| `.../hc_fused/test_op_callbacks_host.py` | `hpu_hc_fused.cpp` compiled against the stub `hpu_custom_op_pt2.h` under ASan + UBSan: output metadata, GUID and the 12 parameter bytes of all 81 HPU cases, 12 rejections |
+| `.../hc_fused/test_hpu_loader.py` | `hpu_loader.py` is the package loader, not a second one |
+| `.../hc_fused/test_build_script.py` | the build step: on request only, after the GDN step and before the combined database; a failure removes its own two files only and the install goes on; `--hc-fused-only` |
+| `.../hc_fused/test_sources.py` | GUIDs, ABI and scalar order agree across the C++, TPC-C and Python sources |
+| `.../hc_fused/test_hpu_op.py` | card only: see "Rental gate" |
+| `tests/unit_tests/gdn_core_decode/test_hc_fused_loader.py` | the loader: ordering, `GC_KERNEL_PATH`, recipe cache, combined database (serving, old, switched off, foreign path), env overrides, failures, the status field |
+| `tests/unit_tests/gdn_core_decode/test_hc_fused_startup.py` | the flag; `register_ops` calls the loader only with the flag at 1, after the GDN loader and before the status line; the one startup warning |
+| `tests/unit_tests/models/flash_next/test_hc_fused_layer.py` | the layer with the flag: read once at construction; fused equals torch bit for bit (both norm-weight layouts, tiny and real geometry, 1 and 32 rows, 2048 rows, the final mixer, a chain of layers); the wiring through a stand-in that records every call and refuses what the HPU validation refuses; the rounding point (a stand-in that normalizes the unrounded combine differs); the whole fused path on meta tensors (no host read); every precondition with its one log line and the torch result; an op that raises; a process without any kernel |
+| `tests/unit_tests/models/flash_next/test_hc_fused_whole_model.py` | the tiny model built with the flag at 1 is bit-identical to the flag at 0 on every reference prompt and a one-token prompt, all 9 hyper-connections run fused, none logs |
 
 ### Measured tolerances (simulator, 2026-11-19)
 
@@ -317,146 +330,146 @@ Rounding pin: on `combine_norm_tiny_rounding` and `combine_norm_real_rounding_sh
 kernel matches the rounded oracle on all of them. A mutant kernel that normalizes the fp32 combine (tried on the
 simulator, not kept) is 65 to 67 % exact on these cases and 74 % on an ordinary one, and fails.
 
-## Integration
+## What is wired
 
-Nothing below is done. File and line references are to the tree of 2026-11-19; other tracks were editing
-`_native.py`, `csrc/kernel_db_adapter`, `csrc/gdn_fused`, `tools/` and `vllm_gaudi/models/qwen4_exp/*.py` at the time.
+Everything is behind `VLLM_HPU_HC_FUSED` (default 0) and follows the fused GDN kernel's integration
+(`VLLM_HPU_GDN_CORE_DECODE`, `load_gdn_fused_extension`, gate G1b).
 
-### 1. Python op module
+### 1. Op module (`flashinfer_gaudi/hc_fused.py`)
 
-Move `tests/unit_tests/hc_fused/hc_ops.py` to `flashinfer_gaudi/hc_fused.py` and `hc_reference.py` to
-`flashinfer_gaudi/hc_fused_reference.py`; fix the one import in each of `hc_ops.py`, `hc_case.py`, `fused_path.py`,
-`hpu_loader.py` (`HC_FUSED_SCHEMA_MODULE`) and the tests. Leave no second module that defines the schemas: defining a
-schema twice in one process raises. `test_reference_copy.py` then compares `flashinfer_gaudi/hc_fused_reference.py`
-with the plugin file.
+Defines the six schemas and the fake kernels, the wrappers `hc_norm` ... `hc_combine_norm`, and
+`hc_fused_missing_ops(device)` / `hc_fused_available(device)`. It is the only definition (defining a schema twice in
+one process raises) and nothing imports it unless the flag is 1. It registers no kernel that computes: the HPU kernels
+come from `hc_fused_ops*.so`, and a process without that extension has no kernel for any device. The CPU tests import
+`tests/unit_tests/hc_fused/hc_ops.py`, which adds the oracle as the CPU kernels.
 
-### 2. Layer patch (`vllm_gaudi/models/qwen4_exp/hyperconnection.py`, `vllm_gaudi/envs.py`)
+### 2. Layer (`vllm_gaudi/models/qwen4_exp/hyperconnection.py`)
 
-`envs.py`: add `VLLM_HPU_HC_FUSED: int = 0` next to `VLLM_HPU_GDN_CORE_DECODE` and
-`"VLLM_HPU_HC_FUSED": lambda: int(os.environ.get("VLLM_HPU_HC_FUSED", "0"))` to the table.
+`HpuGatedResidual.__init__` reads the flag once (`hc_fused_requested`; exactly 1 means fused) and keeps the layer's
+name (its prefix in the model). `mix`, `combine_and_mix` and `combine` start with `self._hc_fused(...)`; when it
+returns the op module they run the fused path, otherwise the torch code below them, which is unchanged.
 
-`HpuGatedResidual.__init__`: read the flag once and keep the layer's name.
+Layer check, once per layer on its first call (`_hc_fused_layer_reason`):
 
-```python
-self.layer_name = prefix or type(self).__name__
-self.hc_fused_requested = bool(gaudi_envs.VLLM_HPU_HC_FUSED)   # read once, here
-self._hc_fused_ok: bool | None = None                          # None: precondition not checked yet
+- `flashinfer_gaudi.hc_fused` imports, and every op has a kernel for the input's device type. No HPU kernel means no
+  extension or no kernel database for its GUIDs: the loader registers the kernels only after the database.
+- `1 <= hc_count <= 64`, `hidden_size % 128 == 0`, `hc_lowrank >= 1`, `rms_norm_eps` a positive normal fp32.
+- `hc_norm.weight` is a contiguous 1-D bfloat16 tensor of `hidden_size` or `hc_count * hidden_size` elements.
+- The weights of the two projections are bfloat16 (so the GEMM outputs the ops take are).
+
+Input check, on every call (`_hc_fused_call_reason`; ranks, dtypes, sizes, layout, devices: no tensor data):
+
+- hidden states: 2-D, bfloat16, `[tokens >= 1, hc_count * hidden_size]`, contiguous, on the norm weight's device.
+- `combine_and_mix` and `combine`: the block output is bfloat16 `[tokens, hidden_size]`, the injection bfloat16
+  `[tokens, hc_count]`, both contiguous and on the same device.
+
+These are the checks of the ops' validation callback and of the glue; the layer makes them first because an input
+the op refuses raises inside the op. Either check failing logs, once per layer,
+
+```
+HC fused (VLLM_HPU_HC_FUSED=1) is off for <layer>: <reason>; using the torch path
 ```
 
-Precondition, checked once per layer on its first call, with one line when it fails:
+and the call runs torch. A fused op that raises when it is called has the same effect: no op writes an input, so the
+torch path takes the same inputs, the layer logs its line (`a fused op raised ...`) and stays on the torch path. The
+line is a warning for every reason, the missing extension included: 97 layers per worker write it when the flag is on
+and the kernels are not there, which is what the smoke mode and the fallback file look for.
 
-```python
-def _hc_fused(self, hidden_states: torch.Tensor) -> bool:
-    if not self.hc_fused_requested:
-        return False
-    if self._hc_fused_ok is None:
-        reason = self._hc_fused_off_reason(hidden_states)
-        if reason is not None:
-            logger.warning("HC fused (VLLM_HPU_HC_FUSED=1) is off for %s: %s; using the torch path",
-                           self.layer_name, reason)
-        self._hc_fused_ok = reason is None
-    # Per call: static facts of this input only (rank and dtype), no data.
-    return self._hc_fused_ok and hidden_states.dim() == 2 and hidden_states.dtype == torch.bfloat16
-
-def _hc_fused_off_reason(self, hidden_states: torch.Tensor) -> str | None:
-    missing = hc_fused_missing_ops(hidden_states.device)      # flashinfer_gaudi.hc_fused
-    if missing:
-        return "the hc_fused_ops extension is not loaded (no kernel for " + ", ".join(missing) + ")"
-    return fused_precondition(self, hidden_states)            # fused_path.py: 2-D, bf16, H % 128, 1-D bf16 weight
-```
-
-`mix`, `combine_and_mix` and `combine` start with `if self._hc_fused(hidden_states): return <fused_path function>`;
-the bodies of `fused_mix`, `fused_combine_and_mix`, `fused_combine` and `fused_precondition` in
-`tests/unit_tests/hc_fused/fused_path.py` are the code to paste (replace `module` by `self`). The torch bodies stay
-unchanged below, which is the automatic fallback. The once-per-layer check uses the first input the layer sees: a
-layer whose first input is not `[tokens, W]` bfloat16 logs its line and stays on the torch path. The model always
-passes that shape; the per-call check only guards a later input that differs.
-
-The fallback covers a missing extension and missing GUIDs alike, because the loader (step 4) registers the HPU kernels
-only after the kernel database is registered with the graph compiler: without the database no op has an `HPU` kernel,
-`hc_fused_missing_ops` names them, and the layer logs its line and runs torch. On CPU the ops have their Python
-kernels (the oracle), so CPU tests of the model run the fused path with `VLLM_HPU_HC_FUSED=1` and must give the bits
-of the torch path.
-
-`injection` returned by the fused `mix` is a new `[T, HC]` tensor with the bits of the slice the torch path returns
-as a view; every consumer (`combine`, `combine_and_mix`, fused or torch) reads it the same way, so layers may mix
-paths. With the flag on, 97 layers each log at most one line; if that is too many when the extension is missing, log
-that one reason at debug level and warn once at startup, as the GDN track does (step 3).
+`injection` returned by the fused `mix` is a new contiguous `[T, HC]` tensor with the bits of the slice the torch
+path returns as a view. A fused `combine` does not take that view (it is not contiguous): a layer on the torch path
+in front of a fused one makes the fused one fall back too. All layers of a model share one geometry, so in practice
+all run fused or none does.
 
 ### 3. Startup (`vllm_gaudi/__init__.py::register_ops`)
 
-After the GDN block: `if _gaudi_envs.VLLM_HPU_HC_FUSED: load_hc_fused_extension()`, before warmup, because the loader
-changes `GC_KERNEL_PATH` and SynapseAI reads it when the graph compiler starts. On a Gaudi machine where it returns
-False, warn once with `hc_fused_extension_errors()` and the hint `tools/build_flashinfer_gaudi.py --hc-fused-only`.
+After the GDN block and before the kernel-database status line: `_load_hc_fused_if_requested(flag)`. With the flag at
+1 it calls `load_hc_fused_extension()` (before warmup: the loader changes `GC_KERNEL_PATH`, which SynapseAI reads when
+the graph compiler starts) and, on a Gaudi machine where that returns False, warns once:
+`HC fused (VLLM_HPU_HC_FUSED=1) has no HPU kernel: the hc_fused_ops extension did not load (<errors>); every
+hyper-connection runs the torch path. ...`. With any other value it does nothing.
 
-### 4. Loader patch (`flashinfer_gaudi/_native.py`)
+### 4. Loader (`flashinfer_gaudi/_native.py`)
 
-Move `load_hc_fused_extension`, `hc_fused_extension_errors`, `combined_db_serves` and the `HC_FUSED_*` constants of
-`tests/unit_tests/hc_fused/hpu_loader.py` into `_native.py` (drop the `native.` prefixes and the forwarding branch,
-use `_LOAD_LOCK`, `_exception_text`, append the extension to `_LOADED_PATHS`, set `HC_FUSED_SCHEMA_MODULE =
-"flashinfer_gaudi.hc_fused"`). Add `_HC_FUSED_LOADED` and `_HC_FUSED_ERRORS` to `_reset_native_state_for_tests` and
-`"hc_fused_loaded"` to `kernel_database_status()`. `test_hpu_loader.py` then tests the moved functions.
+`load_hc_fused_extension()` runs once per process and never raises; `hc_fused_extension_errors()` says why it
+returned False, and `kernel_database_status()` has `hc_fused_loaded` (None when it was never called). The order is
+what makes the fallback safe:
 
-Order inside the loader, which is what makes the fallback safe: both files exist; then the kernel database is
-registered (through the combined database when that file serves `libhc_fused_gaudi2.so`, otherwise first in the
-`GC_KERNEL_PATH` colon list, which `_prepend_kernel_database` refuses under `PT_HPU_RECIPE_CACHE_CONFIG`); only then
-the schemas are imported and the extension is loaded. `combined_db_serves` is true when the library sits next to the
-combined file and the combined file's bytes contain the name `libhc_fused_gaudi2.so`: an adapter built before step 6
-has no such member and would leave the six GUIDs unserved, which would otherwise show only as a graph-compile failure.
-Optional: let `_combined_kernel_db_path()` also look next to `HC_FUSED_GAUDI_KERNEL_LIBRARY`, as it does for
-`GDN_FUSED_GAUDI_KERNEL_LIBRARY`.
+1. Both files exist: `libhc_fused_gaudi2.so` (`HC_FUSED_GAUDI_KERNEL_LIBRARY`, else the package's `lib/`) and
+   `hc_fused_ops*.so` (`HC_FUSED_GAUDI_NATIVE_LIBRARY`, else the package's `lib/`).
+2. The kernel database is registered under the rules of the GDN library: through the combined kernel database when
+   it can be the single `GC_KERNEL_PATH` file, otherwise first in the colon list, which `_prepend_kernel_database`
+   refuses next to `PT_HPU_RECIPE_CACHE_CONFIG`. One condition more: the combined file must serve the library
+   (`combined_db_serves_hc_fused`: the library sits next to it and the file's bytes contain the name). An adapter
+   built before the library was a member does not, and would leave the six GUIDs unserved.
+3. Only then the schemas are imported and the extension, which registers the HPU kernels, is loaded.
 
-### 5. Build script (`tools/build_flashinfer_gaudi.py`)
+A failure at any step leaves the ops without an HPU kernel, and the layers run torch.
 
-Add `build_hc_fused(repository_root, build_root, output_dir)`: a copy of `build_gdn_fused` with `csrc/hc_fused`, the
-CMake build folder `hc_fused_kernel_db`, target `hc_fused_gaudi2`, output `libhc_fused_gaudi2.so`, the extension build
-folder `hc_fused_pytorch` and the glob `hc_fused_ops*.so`. Add `_remove_hc_fused_outputs` (both files), the switch
-`--hc-fused-only` (exit 3 on failure; mutually exclusive like `--gdn-fused-only`) and the env switch
-`VLLM_GAUDI_BUILD_HC_FUSED=1`. Call it in its own `try` block after the GDN block, so a failure removes only the two
-hc files and prints `Continuing without libhc_fused_gaudi2.so: the hyper-connections will run the torch path.` Add
-`libhc_fused_gaudi2.so` to `members_present`, so the combined database is rebuilt after it.
+### 5. Build (`tools/build_flashinfer_gaudi.py`)
 
-The CMake project defaults to `HABANA_INCLUDE_DIR=/usr/include/habanalabs`, as `csrc/gdn_fused` does; in the tpcsim
-container pass `-DHABANA_INCLUDE_DIR=/usr/lib/habanatools/include`.
+`build_hc_fused` is `build_gdn_fused` with the hyper-connection names (CMake folder `hc_fused_kernel_db`, target
+`hc_fused_gaudi2`, extension folder `hc_fused_pytorch`), followed by `check_kernel_library`: the built library must
+load, export the three required entry points and list its Gaudi2 kernels, which is what the combined database needs
+from a member. It runs with `VLLM_GAUDI_BUILD_HC_FUSED=1` or `--hc-fused-only`, in its own `try` block after the GDN
+block and before the combined database. A failure of any kind prints `HC fused build failed (the other libraries are
+unaffected): ...`, removes `libhc_fused_gaudi2.so` and `hc_fused_ops*.so` and nothing else, and the install goes on
+(`--hc-fused-only` exits 3). `container_entry.sh` sets the switch from the same `tpc-clang` check as the other two.
 
 ### 6. Combined kernel database (`csrc/kernel_db_adapter/adapter.cpp`)
 
-In `member_specs()` the sibling list becomes
-`{"libgdn_fused_gaudi2.so", "libhc_fused_gaudi2.so", "libflashinfer_gaudi_kernels.so"}` (no GUID is shared, so the
-position only fixes the order of the merged list). Update the header comment, the member list in
-`docs/design/flash-next/native-extensions.md` ("The combined kernel database") and the installed-layout case of
-`csrc/kernel_db_adapter/test/test_adapter.cpp`. Our library exports `GetSupportedDataLayouts` and
-`GetSuggestedManipulation` itself, so the adapter forwards both. `test_hc_library.py` already runs our library as a
-member of the real adapter (through `FLASHINFER_GAUDI_COMBINED_MEMBERS`).
+The sibling list is `libgdn_fused_gaudi2.so`, `libhc_fused_gaudi2.so`, `libflashinfer_gaudi_kernels.so`, each
+optional (no GUID is shared, so the position only fixes the order of the merged list). A sibling that is not there
+is not a member and not a failure; one that is there and cannot be used makes the database serve nothing, as for
+every member. The library exports `GetSupportedDataLayouts` and `GetSuggestedManipulation` itself, so the adapter
+forwards both. Host test: `csrc/kernel_db_adapter/test/test_adapter.cpp`; with the real library:
+`tests/standalone/hc_fused/test_hc_library.py`.
 
-### 7. Rental gate
+### 7. Rental gate (`tools/flash_next/rental/gates.py::hc_fused`)
 
-Run on the card, lazy mode, after the build of step 5:
+The orchestrator calls it right after G1b's own steps and records the result as G1b's `details["hc_fused"]`:
 
 ```bash
 PT_HPU_LAZY_MODE=1 python -m pytest -q -rs -p no:cacheprovider tests/unit_tests/hc_fused/test_hpu_op.py
 ```
 
-A pass is exit 0 with `90 passed` and no skip (a skip means the extension or the kernel database is missing and
-counts as a failure, as for `tests/unit_tests/gdn_core_decode/test_hpu_op.py`). The 90 tests are: every op has an HPU
-kernel; 81 cases against the CPU oracle with `hc_case.compare` (the 56 simulator cases plus rows 4, 8, 12, 20 and 8192
-at the real geometry for the five decode-loop kernels), each also checking that no input changed; 6 cases against the
-same torch functions run on the card (atol 5e-2, rtol 1e-2); a repeat call that must give the same bits; one chain
-`hc_combine_norm` -> GEMM -> `hc_silu_split` -> GEMM -> `hc_gate_mix` -> `hc_combine_norm` against the torch chain on the
-card. What a pass means: the extension builds and loads against the real bridge, the graph compiler accepts the six
-GUIDs with their glue, and the hardware gives the simulator's numbers. If only the two "against the torch path on
-the card" tests fail while the 81 oracle cases pass, the card's torch path differs from the CPU oracle; record the
-printed `HCHPU` lines before deciding.
+from the plugin tree with the installed libraries by path, in its own process group, 600 s, log
+`fused_gdn/hc_hpu_op.log`. `status` is `passed` (exit 0, tests passed (90 today), none skipped, failed or in error), `failed` (anything else the test did;
+a skip means the extension or the kernel database is missing and counts as a failure, a timeout too), `skipped` (the
+library is not installed, or `--quick-gates` without `--hc-fused`) or `not_run` (the test file is not in the bundle).
+It never changes G1b's status, the GDN mode or the GDN flags.
 
-Wire it like the GDN decode check of `tools/flash_next/rental/gates.py::fused_gdn` (a skip is a failure), or as a
-first step add the file to `CARD_TEST_FILES`. The gate for turning the flag on is separate: a served decode with
-`VLLM_HPU_HC_FUSED=1` against flag 0 (the tiny-model compare and the step time), which this track did not build.
+The 90 tests are: every op has an HPU kernel; 81 cases against the CPU oracle with `hc_case.compare` (the 56
+simulator cases plus rows 4, 8, 12, 20 and 8192 at the real geometry for the five decode-loop kernels), each also
+checking that no input changed; 6 cases against the same torch functions run on the card (atol 5e-2, rtol 1e-2); a
+repeat call that must give the same bits; one chain `hc_combine_norm` -> GEMM -> `hc_silu_split` -> GEMM ->
+`hc_gate_mix` -> `hc_combine_norm` against the torch chain on the card. What a pass means: the extension builds and
+loads against the real bridge, the graph compiler accepts the six GUIDs with their glue, and the hardware gives the
+simulator's numbers. If only the two "against the torch path on the card" tests fail while the 81 oracle cases pass,
+the card's torch path differs from the CPU oracle; record the printed `HCHPU` lines before deciding.
+
+### 8. Operator switch and smoke mode
+
+`run_rental.sh --hc-fused` (through `container_entry.sh` to `main.py --hc-fused`) asks for the kernels. A server gets
+`VLLM_HPU_HC_FUSED=1` only when the operator asked and the card test passed; every other server gets an explicit
+`VLLM_HPU_HC_FUSED=0`. A tiny gate (G2) that fails or times out with the kernels keeps the attempt under
+`tiny/attempt-hc-fused/` and runs once more without them, for the rest of the run. A server with the kernels gets
+the recipe cache only through the combined kernel database. The manifest's `hc_fused` (`requested`, `status`,
+`reason`, `on`, `disabled_by`, `outcome`) and the summary line `HC fused: on` / `off (not requested)` /
+`off (test_hpu_op.py failed)` record the outcome; `HC fused ... is off for` lines of a server land in the variant's
+`gdn_fallback.txt`.
+
+`tiny_smoke.sh --gdn hc` serves the tiny checkpoint with the `fused` flags and `VLLM_HPU_HC_FUSED=1` and fails when
+the tokens differ or the log has an `HC fused ... is off for` / `has no HPU kernel` line. It is not a default mode.
+The tiny checkpoint's geometry (hidden 128, `hc_count` 4, `hc_lowrank` 16, 12 padding columns) is the simulator's
+tiny geometry. This served decode against the reference is the first check of the kernels in a model; the step time
+with and without the flag on the real checkpoint is not measured by anything here.
 
 ## Graph safety of the fused path
 
 - No host read: the ops take tensors and Python scalars from the config (`eps`, `hc_count`, `lora_rank`); nothing
-  calls `.item()`, `.cpu()` or branches on tensor data. The precondition reads ranks, dtypes, sizes and the dispatch
-  table only, once per layer, and two static facts per call.
+  calls `.item()`, `.cpu()` or branches on tensor data. The layer check reads the dispatch table and the module's
+  geometry once per layer; the input check reads ranks, dtypes, sizes, contiguity and devices per call. The whole
+  fused path runs on meta tensors, which have no data (`test_no_host_read_on_the_fused_path`).
 - No data-dependent shape: every output shape is a function of input shapes and Python ints (`GetShapeInference`
   computes them from the input shapes and the node parameters; the simulator host checks it against every case).
 - No mutation: no schema has an alias annotation, no kernel writes an input (checked by `sim_host` on every case and
@@ -487,11 +500,21 @@ first step add the file to `CARD_TEST_FILES`. The gate for turning the flag on i
    runs them on the card, whose sigmoid and rsqrt may differ. `test_hpu_op.py` prints and bounds that difference.
 7. The loader and the combined database with a real stock library: tested with fakes and with the adapter's fake
    stock member.
+8. The build step in the Habana image: `tools/build_flashinfer_gaudi.py` has built `csrc/hc_fused` only through
+   stubs on CPU; the CMake project builds in the simulator container, the extension has never been built.
+9. The served model: no server has run the fused path. The first evidence will be `tiny_smoke.sh --gdn hc` (tokens
+   against the CPU reference at TP8, and no fallback line), then the tiny gate of a run with `--hc-fused`.
+10. The layer's input check against the real tensors of a card: on CPU every hyper-connection of the tiny model gets
+    a contiguous 2-D bfloat16 input; an HPU tensor that reports otherwise would show as `is off for` lines.
 
 ## Not done
 
-- No integration (by scope): flag, layer patch, loader, build script, adapter member list, rental gate. No served
-  model has run the fused path.
-- 3-D inputs `[batch, seq, W]` and non-bf16 dtypes are left to the torch path on HPU (the CPU kernels take them).
+- No served model has run the fused path, and no step time was measured.
+- 3-D inputs `[batch, seq, W]` and non-bf16 dtypes are left to the torch path: a layer that gets one logs its line.
+  The MTP drafter's layers are not checked with the flag.
+- A fused layer does not take the injection view of a torch-path layer in front of it (it falls back instead of
+  copying the view).
+- The card test in G1b has no rerun without the combined kernel database: a failure through that database turns
+  the kernels off for the run.
 - A hidden size that is not a multiple of 128 is rejected, not handled.
 - `supportsDynamicShapes` is not set and `GetLibVersion` is not exported, both as in `libgdn_fused_gaudi2.so`.

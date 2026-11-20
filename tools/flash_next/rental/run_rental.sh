@@ -52,6 +52,11 @@ usage() {
     echo "                    to the orchestrator; the checks that decide the GDN kernel still run)"
     echo "  --no-verify-probe skip only the automatic crash probe that follows a crashed or hung GDN"
     echo "                    verify op test (passed to the orchestrator)"
+    echo "  --hc-fused        ask for the fused hyper-connection kernels (off by default; passed to the"
+    echo "                    orchestrator): the servers get VLLM_HPU_HC_FUSED=1 only when the card test of"
+    echo "                    the kernels in gate fused_gdn passed, otherwise VLLM_HPU_HC_FUSED=0 and the run"
+    echo "                    goes on with the torch hyper-connections; a tiny gate that fails with the"
+    echo "                    kernels runs once more without them"
     echo "  --load-read-timeout S     measured load: seconds a request may go without receiving data"
     echo "                    (passed to the orchestrator; its default: 1800)"
     echo "  --warm-request-timeout S  warm pass: seconds a request may go without receiving data, first"
@@ -175,6 +180,7 @@ QUICK_GATES=0
 NO_VERIFY_PROBE=0
 LOAD_READ_TIMEOUT=""
 WARM_REQUEST_TIMEOUT=""
+HC_FUSED=0
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -265,6 +271,10 @@ while [ $# -gt 0 ]; do
             ;;
         --no-verify-probe)
             NO_VERIFY_PROBE=1
+            shift
+            ;;
+        --hc-fused)
+            HC_FUSED=1
             shift
             ;;
         --load-read-timeout)
@@ -475,6 +485,8 @@ if [ "$QUICK_GATES" -eq 1 ]; then ENTRY_ARGS+=(--quick-gates); fi
 if [ "$NO_VERIFY_PROBE" -eq 1 ]; then ENTRY_ARGS+=(--no-verify-probe); fi
 if [ -n "$LOAD_READ_TIMEOUT" ]; then ENTRY_ARGS+=(--load-read-timeout "$LOAD_READ_TIMEOUT"); fi
 if [ -n "$WARM_REQUEST_TIMEOUT" ]; then ENTRY_ARGS+=(--warm-request-timeout "$WARM_REQUEST_TIMEOUT"); fi
+# The operator's request only: the orchestrator sets VLLM_HPU_HC_FUSED per server, after the card test.
+if [ "$HC_FUSED" -eq 1 ]; then ENTRY_ARGS+=(--hc-fused); fi
 # Appended last so the --dry-run line ends with --no-warm-pass.
 if [ "$NO_WARM_PASS" -eq 1 ]; then ENTRY_ARGS+=(--no-warm-pass); fi
 

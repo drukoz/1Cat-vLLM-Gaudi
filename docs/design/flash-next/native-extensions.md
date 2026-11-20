@@ -25,7 +25,7 @@ The custom-op extensions call three Habana symbols:
 | `habana::custom_op::UserCustomOpDescriptor::getUserCustomOpDescriptor` | `libhabana_pytorch_backend.so` |
 | `habana::custom_op::UserCustomOpDescriptor::execute(std::vector<c10::IValue> const&)` | both plugin libraries |
 
-So `gdn_fused_ops`, `flashinfer_gaudi_ops` and `flashqla_pair_transform_pt2` link
+So `gdn_fused_ops`, `hc_fused_ops`, `flashinfer_gaudi_ops` and `flashqla_pair_transform_pt2` link
 `habana_pytorch_backend` (`habana_pytorch_backend.upstream` when `htorch.is_torch_fork` is false)
 and no plugin library. `execute` then binds to whichever plugin the interpreter has already mapped,
 so one build serves both modes. Consequence: the extension must be loaded after
@@ -42,7 +42,8 @@ Measured on the card with `patchelf` on the built `gdn_fused_ops` (source unchan
 | no Habana entry | loads | loads (load only checked) |
 
 Not yet checked on a card: `flashinfer_gaudi_ops` in lazy mode, `flashqla_pair_transform_pt2` in
-either mode, and a lazy server start with the backend-only build. The run sheet lines below cover
+either mode, `hc_fused_ops` in either mode (it has never been built against the real bridge), and a
+lazy server start with the backend-only build. The run sheet lines below cover
 the first and the last.
 
 ## What a lazy-mode server has
@@ -50,6 +51,7 @@ the first and the last.
 | Native piece | Loaded by | Eager | Lazy |
 |---|---|---|---|
 | `gdn_fused_ops` + kernel database `libgdn_fused_gaudi2.so` (GDN core decode and verify) | `vllm_gaudi.register_ops` → `load_gdn_fused_extension()`, when `VLLM_HPU_GDN_CORE_DECODE` or `VLLM_HPU_GDN_CORE_VERIFY` is nonzero | yes | yes (backend-only link) |
+| `hc_fused_ops` + kernel database `libhc_fused_gaudi2.so` (the six fused hyper-connection ops; [hc-fused.md](hc-fused.md)) | `vllm_gaudi.register_ops` → `load_hc_fused_extension()`, only when `VLLM_HPU_HC_FUSED=1` (default 0: not loaded, its schemas not defined) | not run on a card | not run on a card (backend-only link, as `gdn_fused_ops`) |
 | `flashinfer_gaudi_ops` + `libflashinfer_gaudi_kernels.so` (`silu_and_mul`, `add_rmsnorm_quant`) | `vllm_gaudi.register_ops` → `load_native_extensions()` | yes | yes (backend-only link) |
 | `flashqla_pair_transform_pt2` (Qwen3.8 native Q/K preparation) | `vllm_gaudi/ops/qwen38_native_qk.py`, opt-in `VLLM_GDN_QWEN38_NATIVE_QK_PREP`; not built by the rental | yes | yes (backend-only link) |
 | Native Bridge adapter (`flashinfer_gaudi_bridge_ops` with its private Bridge libraries and `bridge_artifact_v1.json`: `silu_mul_quant`, `block_fp8_dequant`, `block_fp8_linear`, `gemm_silu`, the Bridge packed GDN op) | `flashinfer_gaudi._bridge.load_bridge_adapter()`, explicit opt-in only | yes | **no, by design**: `_bridge.py` raises `Native Bridge adapter currently requires PT_HPU_LAZY_MODE=0`; those ops report unavailable and callers keep the PyTorch path |
@@ -67,6 +69,28 @@ link and stay eager-only. RUK-3103 does not change them.
 error in `__cause__`, so each entry reads `<path>: OSError: Could not load this library: <path>;
 caused by OSError: <dlopen message>`. The plugin's startup warning (`has no HPU kernel: ...`)
 prints the same text.
+
+The fused hyper-connection kernels follow the same pattern with their own names:
+`hc_fused_extension_errors()`, the startup warning `HC fused (VLLM_HPU_HC_FUSED=1) has no HPU kernel:
+...`, and one line per layer, `HC fused (VLLM_HPU_HC_FUSED=1) is off for <layer>: <reason>; using the
+torch path`. Every layer then runs the torch hyper-connection; nothing stops.
+
+## The fused hyper-connection kernels (`VLLM_HPU_HC_FUSED`)
+
+Off by default. With the flag at 0, `register_ops` does not call the loader, nothing imports
+`flashinfer_gaudi.hc_fused` (so the six `flashinfer_gaudi::hc_*` schemas are not defined), and
+`libhc_fused_gaudi2.so` is not added to `GC_KERNEL_PATH` by the loader. The one thing that happens with
+the flag at 0 is inside the combined kernel database: when `libhc_fused_gaudi2.so` is installed next to
+it, the adapter opens it as a member and lists its six GUIDs, which no graph uses.
+
+| Piece | Where |
+|---|---|
+| Flag | `VLLM_HPU_HC_FUSED` (0 default, 1 fused), read once per layer at construction |
+| Loader | `flashinfer_gaudi._native.load_hc_fused_extension()`, `hc_fused_extension_errors()`, `hc_fused_extension_loaded()`; status key `hc_fused_loaded` |
+| Path overrides | `HC_FUSED_GAUDI_KERNEL_LIBRARY` (the kernel database), `HC_FUSED_GAUDI_NATIVE_LIBRARY` (the op extension); default: the package's `lib` folder |
+| `GC_KERNEL_PATH` | the rules of `libgdn_fused_gaudi2.so`: the combined database when it is active and serves the library (its bytes name `libhc_fused_gaudi2.so`), otherwise first in the colon list, never next to `PT_HPU_RECIPE_CACHE_CONFIG` |
+| Build | `VLLM_GAUDI_BUILD_HC_FUSED=1` at install time, or `tools/build_flashinfer_gaudi.py --hc-fused-only`; a failed build removes its own two files only |
+| Card test | `tests/unit_tests/hc_fused/test_hpu_op.py`, run inside rental gate G1b (`gates.hc_fused`) |
 
 ## Run sheet lines for the next rental
 
@@ -122,9 +146,10 @@ and compiled graphs).
 
 **What the loader does now.** When `PT_HPU_RECIPE_CACHE_CONFIG` is set to a non-empty value, `flashinfer_gaudi._native`
 prepends no kernel database and leaves `GC_KERNEL_PATH` untouched. The op extensions that depend on a database
-(`flashinfer_gaudi_ops*.so`, `gdn_fused_ops*.so`) are not loaded either, because their ops name TPC GUIDs the graph
-compiler could not find and the first graph compile would fail instead of start-up. The reason is recorded once in
-`_LOAD_ERRORS` (and, for the fused path, in `gdn_fused_extension_errors()`). With the variable unset or empty,
+(`flashinfer_gaudi_ops*.so`, `gdn_fused_ops*.so`, `hc_fused_ops*.so`) are not loaded either, because their ops name TPC
+GUIDs the graph compiler could not find and the first graph compile would fail instead of start-up. The reason is
+recorded once in `_LOAD_ERRORS` (and, for the fused paths, in `gdn_fused_extension_errors()` and
+`hc_fused_extension_errors()`). With the variable unset or empty,
 registration proceeds exactly as before.
 
 **What the operator sees.** `register_ops()` logs one warning naming `PT_HPU_RECIPE_CACHE_CONFIG`,
@@ -167,6 +192,7 @@ JSON-serializable data; it loads nothing and changes nothing:
 | `combined_active` | `True` only when this loader activated the combined file and `GC_KERNEL_PATH` is still exactly that file |
 | `combined_kernel_db` | the combined file this loader activated, or `None` |
 | `gdn_fused_loaded` | the result of `load_gdn_fused_extension()`, `None` when it was never called |
+| `hc_fused_loaded` | the result of `load_hc_fused_extension()`, `None` when it was never called (every process without `VLLM_HPU_HC_FUSED=1`) |
 | `load_errors` | every recorded loader error, in order |
 
 It cannot see inside the combined file: the members are opened by that file inside SynapseAI (next section), and a
@@ -187,9 +213,16 @@ members.
 wins on a duplicate name):**
 
 1. `libgdn_fused_gaudi2.so` (optional: when the file is not next to the adapter it is not a member)
-2. `libflashinfer_gaudi_kernels.so` (optional, same rule)
-3. the stock library (required): `FLASHINFER_GAUDI_STOCK_KERNEL_DB` if set, else
+2. `libhc_fused_gaudi2.so` (optional, same rule; the fused hyper-connection kernels, [hc-fused.md](hc-fused.md))
+3. `libflashinfer_gaudi_kernels.so` (optional, same rule)
+4. the stock library (required): `FLASHINFER_GAUDI_STOCK_KERNEL_DB` if set, else
    `/usr/lib/habanalabs/libtpc_kernels.so`
+
+An optional sibling that is not there is not a failure. One that is there and cannot be used is, as for
+every member (next paragraph). `libhc_fused_gaudi2.so` is a member whenever the file is installed,
+whatever `VLLM_HPU_HC_FUSED` says, so `tools/build_flashinfer_gaudi.py` checks the built library the way
+the adapter uses it (it loads, exports the three required entry points, lists its Gaudi2 kernels) and
+removes it when the check fails, before the combined database is built.
 
 Siblings are found next to the adapter with `dladdr`. Members are opened once (`std::call_once`,
 `dlopen(RTLD_NOW | RTLD_LOCAL)`). The stock member is known by its role in this list, never by its
@@ -268,13 +301,17 @@ tools/flash_next/tpcsim.sh 'cmake -S csrc/kernel_db_adapter -B /tmp/kda -DKERNEL
 tools/flash_next/tpcsim.sh 'nm -D /tmp/kda/libflashinfer_gaudi_combined_gaudi2.so | grep " T "'  # the six entry points
 ```
 
-The host test (`test/test_adapter.cpp`) uses four fake members built from `test/fake_member.cpp`: two
-with all six entry points, one with only the three required ones (as the real custom members), and
-one without `GetShapeInference`. It checks the merging and routing, the count protocol, the all-`x`
-layout for the three-entry-point member, the installed layout (a copy of the adapter with
-`libgdn_fused_gaudi2.so` and `libflashinfer_gaudi_kernels.so` next to it and no members override), and
-that a missing stock member, a missing custom member and a member without a required entry point each
-make `GetKernelGuids` fail with the path on stderr. Each scenario loads a fresh image of the adapter;
+The host test (`test/test_adapter.cpp`) uses five fake members built from `test/fake_member.cpp`: three
+with all six entry points (one of them stands for `libhc_fused_gaudi2.so`), one with only the three
+required ones (as the GDN and FlashInfer members), and one without `GetShapeInference`. It checks the
+merging and routing, the count protocol, the all-`x` layout for the three-entry-point member, the
+installed layout (a copy of the adapter with `libgdn_fused_gaudi2.so` and
+`libflashinfer_gaudi_kernels.so` next to it and no members override; the absent `libhc_fused_gaudi2.so`
+is not reported and fails nothing), the installed layout with `libhc_fused_gaudi2.so` (five merged
+GUIDs in member order, its GUID routed to it), the same layout with a `libhc_fused_gaudi2.so` that is
+not a library (the database serves nothing and names the file), and that a missing stock member, a
+missing custom member and a member without a required entry point each make `GetKernelGuids` fail
+with the path on stderr. Each scenario loads a fresh image of the adapter;
 the test fails if `dlclose` does not unload it (glibc never unloads a library that defines a
 `STB_GNU_UNIQUE` symbol, which is why the adapter formats numbers with `snprintf`, not `std::to_string`).
 

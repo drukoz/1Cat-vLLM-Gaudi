@@ -60,8 +60,9 @@ RECIPE_CACHE_ENV = "PT_HPU_RECIPE_CACHE_CONFIG"
 COMBINED_KERNEL_DB = "libflashinfer_gaudi_combined_gaudi2.so"
 COMBINED_KERNEL_DB_ENV = "FLASHINFER_GAUDI_COMBINED_KERNEL_DB"
 RECIPE_CACHE_NONE = "none"
-RECIPE_CACHE_OFF_REASON = ("off: this server registers the fused GDN kernel's database in GC_KERNEL_PATH, and the "
-                           "Habana bridge accepts only one kernel library next to a recipe cache")
+RECIPE_CACHE_OFF_REASON = ("off: this server registers a fused kernel's database (the fused GDN kernel's, or the "
+                           "fused hyper-connection kernels') in GC_KERNEL_PATH, and the Habana bridge accepts only "
+                           "one kernel library next to a recipe cache")
 
 
 def recipe_cache_env(cache_dir: str | None, size_mb: int, server_env: dict,
@@ -69,15 +70,18 @@ def recipe_cache_env(cache_dir: str | None, size_mb: int, server_env: dict,
     """The recipe-cache variable for one server and a note for the manifest.
 
     Returns ({RECIPE_CACHE_ENV: f"{cache_dir},false,{size_mb}"}, cache_dir) when `cache_dir` is set and
-    either `combined_db` is True or `server_env` has VLLM_HPU_GDN_CORE_DECODE and VLLM_HPU_GDN_CORE_VERIFY
-    both equal to "0" (a missing key counts as "1", the plugin default). Returns ({}, RECIPE_CACHE_NONE)
-    when `cache_dir` is None or empty, and ({}, RECIPE_CACHE_OFF_REASON) otherwise.
+    either `combined_db` is True or the server registers no kernel database of its own: `server_env` has
+    VLLM_HPU_GDN_CORE_DECODE and VLLM_HPU_GDN_CORE_VERIFY both equal to "0" (a missing key counts as "1",
+    the plugin default) and VLLM_HPU_HC_FUSED is not "1" (a missing key counts as "0", the plugin
+    default). Returns ({}, RECIPE_CACHE_NONE) when `cache_dir` is None or empty, and
+    ({}, RECIPE_CACHE_OFF_REASON) otherwise.
     """
     if not cache_dir:
         return {}, RECIPE_CACHE_NONE
     if not combined_db:
         if server_env.get("VLLM_HPU_GDN_CORE_DECODE", "1") != "0" or \
-                server_env.get("VLLM_HPU_GDN_CORE_VERIFY", "1") != "0":
+                server_env.get("VLLM_HPU_GDN_CORE_VERIFY", "1") != "0" or \
+                server_env.get("VLLM_HPU_HC_FUSED", "0") == "1":
             return {}, RECIPE_CACHE_OFF_REASON
     return {RECIPE_CACHE_ENV: "%s,false,%s" % (cache_dir, size_mb)}, cache_dir
 

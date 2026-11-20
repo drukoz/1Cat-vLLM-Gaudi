@@ -8,8 +8,9 @@
 // makes GetKernelGuids fail instead of producing a database without it.
 //
 // The custom members come from FLASHINFER_GAUDI_COMBINED_MEMBERS (or, in
-// scenario_installed_layout, from the files next to a copy of the adapter, as
-// in production); the stock member is always FLASHINFER_GAUDI_STOCK_KERNEL_DB.
+// scenario_installed_layout and scenario_installed_layout_with_hc, from the
+// files next to a copy of the adapter, as in production); the stock member is
+// always FLASHINFER_GAUDI_STOCK_KERNEL_DB.
 #include <tpc_kernel_lib_interface.h>
 
 #include <cstdio>
@@ -162,13 +163,15 @@ void close_adapter(Adapter& a) {
 // The production layout in a temporary folder: a copy of the adapter with libgdn_fused_gaudi2.so (the
 // full fake member a) and libflashinfer_gaudi_kernels.so (the minimal fake member) next to it. With the
 // members override unset the adapter finds these siblings itself, as it does when installed.
+// `hcMember` adds the optional third sibling, libhc_fused_gaudi2.so, as a copy of that file (empty: the
+// layout of an install whose hyper-connection build was off or failed, which has no such file).
 struct InstalledLayout {
     std::filesystem::path dir;
     std::string adapter;
     bool ok = false;
 };
 
-InstalledLayout make_installed_layout() {
+InstalledLayout make_installed_layout(const std::string& hcMember = "") {
     namespace fs = std::filesystem;
     InstalledLayout layout;
     char tmpl[] = "/tmp/kda_layout_XXXXXX";
@@ -179,10 +182,19 @@ InstalledLayout make_installed_layout() {
         std::error_code ec;
         layout.ok = fs::copy_file(ADAPTER_PATH, layout.adapter, ec) &&
                     fs::copy_file(FAKE_A_PATH, layout.dir / "libgdn_fused_gaudi2.so", ec) &&
-                    fs::copy_file(FAKE_MIN_PATH, layout.dir / "libflashinfer_gaudi_kernels.so", ec);
+                    fs::copy_file(FAKE_MIN_PATH, layout.dir / "libflashinfer_gaudi_kernels.so", ec) &&
+                    (hcMember.empty() || fs::copy_file(hcMember, layout.dir / "libhc_fused_gaudi2.so", ec));
     }
-    check(layout.ok, "installed layout: the adapter and two members copied into one folder");
+    check(layout.ok, std::string("installed layout: the adapter and ") + (hcMember.empty() ? "two" : "three") +
+                         " members copied into one folder");
     return layout;
+}
+
+void remove_layout(const InstalledLayout& layout) {
+    if (!layout.dir.empty()) {
+        std::error_code ec;
+        std::filesystem::remove_all(layout.dir, ec);
+    }
 }
 
 void scenario_two_members() {
@@ -463,6 +475,9 @@ void scenario_installed_layout(const InstalledLayout& layout) {
             check(rc == GLUE_SUCCESS && count == 4,
                   "siblings + stock: 4 merged GUIDs (a_only, shared, m_only, b_only)");
             check(!contains(err, kMembersEnv), "no members-override line when the override is unset");
+            // libhc_fused_gaudi2.so is an optional sibling and this folder has none: not a failure, no line.
+            check(!contains(err, "libhc_fused_gaudi2.so"),
+                  "an absent optional sibling (libhc_fused_gaudi2.so) is not reported and fails nothing");
             GuidInfo guids[4];
             std::memset(guids, 0, sizeof(guids));
             count = 4;
@@ -518,6 +533,102 @@ void scenario_installed_layout(const InstalledLayout& layout) {
             close_adapter(adapter);
         }
     }
+}
+
+// The production layout with the optional hyper-connection library: libhc_fused_gaudi2.so (the full fake
+// member h) sits between libgdn_fused_gaudi2.so and libflashinfer_gaudi_kernels.so in the merged list, and
+// its GUID is routed to it. Like the real library, member h exports GetSupportedDataLayouts itself.
+void scenario_installed_layout_with_hc() {
+    std::printf("-- installed layout with libhc_fused_gaudi2.so next to the adapter\n");
+    const InstalledLayout layout = make_installed_layout(FAKE_H_PATH);
+    if (layout.ok) {
+        Adapter adapter = open_adapter(layout.adapter, "", FAKE_B_PATH, "installed layout with hc");
+        const std::string hcPath = (layout.dir / "libhc_fused_gaudi2.so").string();
+        void* fake_h = dlopen(hcPath.c_str(), RTLD_NOW | RTLD_LOCAL);
+        check(fake_h != nullptr, "dlopen the hyper-connection member of the layout");
+        if (adapter.handle && fake_h) {
+            StderrCapture capture;
+            uint32_t count = 0;
+            GlueCodeReturn rc = adapter.getGuids(DEVICE_ID_GAUDI2, &count, nullptr);
+            capture.finish();
+            check(rc == GLUE_SUCCESS && count == 5,
+                  "three siblings + stock: 5 merged GUIDs (a_only, shared, h_only, m_only, b_only)");
+            GuidInfo guids[5];
+            std::memset(guids, 0, sizeof(guids));
+            count = 5;
+            rc = adapter.getGuids(DEVICE_ID_GAUDI2, &count, guids);
+            check(rc == GLUE_SUCCESS && std::string(guids[0].name) == "fake_a_only" &&
+                      std::string(guids[1].name) == "fake_shared" && std::string(guids[2].name) == "fake_h_only" &&
+                      std::string(guids[3].name) == "fake_m_only" && std::string(guids[4].name) == "fake_b_only",
+                  "order: libgdn_fused_gaudi2.so, libhc_fused_gaudi2.so, libflashinfer_gaudi_kernels.so, then "
+                  "the stock member");
+            HabanaKernelParams params{};
+            HabanaKernelInstantiation inst{};
+            set_name(&params.guid, "fake_h_only");
+            rc = adapter.instantiate(&params, &inst);
+            check(rc == GLUE_SUCCESS && inst.kernel.paramsNr == 5,
+                  "Instantiate fake_h_only -> libhc_fused_gaudi2.so (paramsNr 5)");
+            uint32_t layoutCount = 0;
+            rc = adapter.dataLayouts(&params, nullptr, &layoutCount);
+            check(rc == GLUE_SUCCESS && layoutCount == 1 &&
+                      std::strcmp(member_last_call(fake_h), "GetSupportedDataLayouts") == 0,
+                  "GetSupportedDataLayouts for a GUID of libhc_fused_gaudi2.so -> the member answers itself");
+            ShapeInferenceParams sip{};
+            ShapeInferenceOutput out{};
+            set_name(&sip.guid, "fake_h_only");
+            rc = adapter.shapeInference(DEVICE_ID_GAUDI2, &sip, &out);
+            check(rc == GLUE_SUCCESS && std::strcmp(member_last_call(fake_h), "GetShapeInference") == 0,
+                  "GetShapeInference for a GUID of libhc_fused_gaudi2.so -> the member");
+            // The other members still answer their own GUIDs.
+            set_name(&params.guid, "fake_shared");
+            inst.kernel.paramsNr = 0;
+            rc = adapter.instantiate(&params, &inst);
+            check(rc == GLUE_SUCCESS && inst.kernel.paramsNr == 1,
+                  "fake_shared still goes to libgdn_fused_gaudi2.so (the first member wins)");
+            set_name(&params.guid, "fake_m_only");
+            inst.kernel.paramsNr = 0;
+            rc = adapter.instantiate(&params, &inst);
+            check(rc == GLUE_SUCCESS && inst.kernel.paramsNr == 3, "fake_m_only -> libflashinfer_gaudi_kernels.so");
+        }
+        if (fake_h) {
+            dlclose(fake_h);
+        }
+        close_adapter(adapter);
+    }
+    remove_layout(layout);
+}
+
+// libhc_fused_gaudi2.so is present next to the adapter but is not a loadable kernel library (here: a text
+// file). The existing rule applies to it as to every member that is there: the database serves nothing
+// and says why, with the file's path. Only an absent optional sibling is not a failure.
+void scenario_installed_layout_with_an_unusable_hc() {
+    std::printf("-- installed layout with an unusable libhc_fused_gaudi2.so\n");
+    const InstalledLayout layout = make_installed_layout();
+    if (layout.ok) {
+        const std::string hcPath = (layout.dir / "libhc_fused_gaudi2.so").string();
+        {
+            std::ofstream broken(hcPath);
+            broken << "not a shared object\n";
+        }
+        Adapter adapter = open_adapter(layout.adapter, "", FAKE_B_PATH, "installed layout, unusable hc");
+        if (adapter.handle) {
+            StderrCapture capture;
+            uint32_t count = 77;
+            GlueCodeReturn rc = adapter.getGuids(DEVICE_ID_GAUDI2, &count, nullptr);
+            HabanaKernelParams params{};
+            HabanaKernelInstantiation inst{};
+            set_name(&params.guid, "fake_a_only");
+            GlueCodeReturn rcOther = adapter.instantiate(&params, &inst);
+            const std::string err = capture.finish();
+            check(rc == GLUE_FAILED && count == 0,
+                  "unusable libhc_fused_gaudi2.so: GetKernelGuids -> GLUE_FAILED, count 0");
+            check(contains(err, hcPath), "unusable libhc_fused_gaudi2.so: stderr names its path");
+            check(rcOther == GLUE_FAILED,
+                  "unusable libhc_fused_gaudi2.so: no kernel is served, not even another member's");
+            close_adapter(adapter);
+        }
+    }
+    remove_layout(layout);
 }
 
 // A custom member that is listed but cannot be loaded: the database would silently lack its GUIDs
@@ -581,7 +692,8 @@ void scenario_no_member() {
 // test_adapter --installed <folder> [<stock library>]
 //
 // Checks a real build instead of the fakes: <folder>/libflashinfer_gaudi_combined_gaudi2.so with the member
-// libraries next to it (libgdn_fused_gaudi2.so, libflashinfer_gaudi_kernels.so) and the given stock library
+// libraries next to it (libgdn_fused_gaudi2.so, libhc_fused_gaudi2.so, libflashinfer_gaudi_kernels.so; each
+// optional) and the given stock library
 // (default: Intel's /usr/lib/habanalabs/libtpc_kernels.so). Every GUID that is not the stock library's own
 // must be in the merged list and must get a supported-layouts answer the graph compiler accepts.
 int check_installed(const std::string& folder, const std::string& stockArg) {
@@ -678,10 +790,9 @@ int main(int argc, char** argv) {
         scenario_count_protocol(layout);
         scenario_installed_layout(layout);
     }
-    if (!layout.dir.empty()) {
-        std::error_code ec;
-        std::filesystem::remove_all(layout.dir, ec);
-    }
+    remove_layout(layout);
+    scenario_installed_layout_with_hc();
+    scenario_installed_layout_with_an_unusable_hc();
     scenario_broken_custom_member();
     scenario_member_without_a_required_entry_point();
     scenario_no_member();

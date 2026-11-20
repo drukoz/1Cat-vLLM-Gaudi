@@ -206,6 +206,12 @@ and compares the served tokens with the reference each time:
 |---|---|---|
 | `pytorch` | `VLLM_HPU_GDN_CORE_DECODE=0`, `VLLM_HPU_GDN_CORE_VERIFY=0` | the server builds and decodes on the torch GDN path |
 | `fused` | `VLLM_HPU_GDN_CORE_DECODE=1`, `VLLM_HPU_GDN_CORE_VERIFY=0` | the same with the fused decode kernel, and no layer fell back to the torch path |
+| `hc` (only when named: `--gdn hc`) | the `fused` flags and `VLLM_HPU_HC_FUSED=1` | the same with the fused hyper-connection kernels too, and no hyper-connection fell back to the torch path (no `HC fused ... is off for` and no `HC fused ... has no HPU kernel` line in the server log) |
+
+The `hc` mode is not in the default list: the hyper-connection kernels have passed the instruction
+simulator and the CPU tests, not a card. The tiny checkpoint has the geometry the kernels take
+(hidden size 128, 4 streams, low rank 16; the simulator cases include it). See
+[Experiments that cost one smoke run each](#experiments-that-cost-one-smoke-run-each).
 
 The tiny checkpoint's GDN layers are built with head dim 128 (`make_tiny_checkpoint.py
 --gdn-head-dim 128`), the head dim of the real model and the only one the fused kernel accepts, so
@@ -230,7 +236,10 @@ If a server fails at start with the combined kernel database, run the mode again
 itself, see [The one command](#the-one-command-on-the-node)).
 
 It prints one line per mode (`tiny smoke [pytorch]: PASSED ...`) and, on a failure, the error lines of
-the server log and the path of that log. Results are in `results/smoke-<UTC>/` (`summary.json`,
+the server log and the path of that log. A passed mode also prints `tiny smoke [<mode>]: decode <n>
+ms/token` (the shortest prompt generated with 16 tokens and with 1 token, best of three each, the
+difference divided by 15; `decode_ms_per_token` in `summary.json`): a number for comparing two runs of
+one mode, not a result. Results are in `results/smoke-<UTC>/` (`summary.json`,
 `<mode>/server0.log`, `console.log`, and `habana_logs/` with the Habana runtime logs of the check
 and its servers). The exit code is 0 only when every mode passed.
 
@@ -250,7 +259,7 @@ minutes instead of a full run:
 |---|---|
 | `--reinstall` | install the stack again in the same container; needed after any change under `plugin/` (the servers run the installed plugin, not the source tree) |
 | `--fresh` | remove the container first: new install, new tiny checkpoint |
-| `--gdn LIST` | the modes to serve, in order (default `pytorch,fused`) |
+| `--gdn LIST` | the modes to serve, in order (default `pytorch,fused`); the third mode, `hc`, runs only when named (`--gdn hc`, `--gdn pytorch,fused,hc`) |
 | `--full-warmup` | run the real bucket warmup (about 15 minutes per mode); the default skips it, see above |
 | `--health-timeout S` | seconds to wait for a server to get healthy, passed to the check (default 1800) |
 | `--env KEY=VALUE` | extra server environment variable, repeatable; applied after the mode's own flags, so it can override them (a `KEY` without `=` is a usage error) |
@@ -332,6 +341,46 @@ now carries):
 sudo docker exec fn-smoke bash -c 'cd / && d=$(python -c "import importlib.util as u; print(u.find_spec(\"vllm_gaudi\").submodule_search_locations[0])") && cp /bundle/plugin/vllm_gaudi/<path>.py "$d/<path>.py" && echo "patched $d/<path>.py"'
 ```
 
+## Experiments that cost one smoke run each
+
+Each is one call of the smoke test in the prepared `fn-smoke` container: about 4–6 minutes, no
+checkpoint, and nothing `run_rental.sh` does changes. Run them after the two default modes passed.
+
+1. **Do the hyper-connection kernels work in a server?**
+
+   ```bash
+   sudo bash tiny_smoke.sh --gdn hc
+   ```
+
+   `PASSED`: the tokens match the reference at TP8 and every hyper-connection ran its kernels; pass
+   `--hc-fused` to `run_rental.sh`. `FAILED` with `the fused hyper-connection kernels did not run`:
+   the printed log lines say why (in a container an older bundle installed: `--reinstall` first).
+   `FAILED` on the tokens: the kernels run and are wrong in a served model; leave `--hc-fused` out
+   and send `hc/server0.log`.
+2. **Does the server still match the reference without the `mark_step` before each collective?**
+
+   ```bash
+   sudo bash tiny_smoke.sh --gdn fused --env VLLM_HPU_COLLECTIVE_MARK_STEP=0
+   ```
+
+   `HpuCommunicator` issues `mark_step()` before every all-reduce and all-gather, a workaround for a
+   bridge bug with lazy collectives; a decode step of the real model at TP8 has 99 collectives, so
+   up to 99 graph cuts (commit `fb7b2d3`; default 1, unchanged). `FAILED`: the workaround is still
+   needed. `PASSED`: compare the `decode ... ms/token` line of this run with the one of the plain
+   `--gdn fused` run; the difference is what the cuts cost per token on the tiny model, which has
+   4 layers against the real model's 48.
+3. **Is a failure in the sparse attention path, or elsewhere?**
+
+   ```bash
+   sudo bash tiny_smoke.sh --gdn pytorch --env VLLM_HPU_FLASH_NEXT_QSA_MODE=0
+   ```
+
+   This serves with dense attention instead of sparse QSA. The 2,600-token reference prompt is
+   then expected to differ (dense equals sparse only up to 2,050 tokens), so the mode reports
+   `FAILED` with that one prompt; `pytorch/details.json` lists every prompt. The five shorter
+   prompts matching here, when they do not in the plain `pytorch` mode, puts the fault in the
+   sparse attention path.
+
 ## The one command (on the node)
 
 ```bash
@@ -372,6 +421,7 @@ Useful options:
 | `--run-id ID` | fixed run id (default: UTC timestamp) |
 | `--quick-gates` | skip the recorded-only steps before the first measurement: G1b's eager replays and its bench, the verify crash probe, and the `card_tests` phase (recorded as skipped). The checks that decide the GDN kernel and the verify op still run |
 | `--no-verify-probe` | skip only the automatic crash probe that follows a crashed or hung GDN verify op test |
+| `--hc-fused` | ask for the fused hyper-connection kernels (off by default). The kernels' card test runs inside gate `fused_gdn` (`tests/unit_tests/hc_fused/test_hpu_op.py`, log `hc_hpu_op.log` in `fused_gdn/`); the servers get `VLLM_HPU_HC_FUSED=1` only when it passed, otherwise an explicit `VLLM_HPU_HC_FUSED=0`, and the run goes on with the torch hyper-connections. A tiny gate that fails with the kernels runs once more without them. `summary.md` says `HC fused: on` or why not. Try `tiny_smoke.sh --gdn hc` first |
 | `--load-read-timeout S` | measured load: seconds a request may go without receiving data (default 1800) |
 | `--warm-request-timeout S` | warm pass: seconds a request may go without receiving data, first graph compiles included (default 3600) |
 | `--image IMG` | container image (default the 1.24.1 base image) |
@@ -394,6 +444,19 @@ database and pass without it, and at the tiny gate, when the tiny server fails o
 (the first attempt is kept under `tiny/attempt-combined/` and the gate runs once more without it).
 Either way the database then stays out of every later server of the run, and the manifest records
 who took it out (`combined_kernel_db_disabled_by`: `operator`, `g1b` or `tiny`).
+
+**The fused hyper-connection kernels (`--hc-fused`)** cannot stop a run either. Their card test is
+recorded in gate G1b's details (`hc_fused`: `status` `passed`, `failed`, `skipped` or `not_run`, the
+reason and the pytest counts) and never changes that gate's status or the GDN flags. Without the
+option the test still runs and is recorded (not with `--quick-gates`), and every server gets
+`VLLM_HPU_HC_FUSED=0`. With it, a tiny gate that fails or times out with the kernels keeps that
+attempt under `tiny/attempt-hc-fused/`, switches the kernels off for the rest of the run and runs
+once more (before the combined database's own retry). The summary header then reads `HC fused: on`,
+`HC fused: off (not requested)`, `HC fused: off (test_hpu_op.py failed)` or `HC fused: off (the tiny
+gate failed with it and passed without)`; the manifest's `hc_fused` has the same (`requested`,
+`status`, `on`, `disabled_by`, `outcome`). A server that got the kernels and did not use them on a
+layer leaves `HC fused ... is off for <layer>` lines in `<variant>/gdn_fallback.txt`, counted in the
+summary as `HC fused fallback lines in <variant>`.
 
 ### The container
 
@@ -507,8 +570,8 @@ variant yet.
 |---|---|---|
 | G0 preflight | 8 cards in `hl-smi`; the checkpoint config is block-FP8 [128, 128]; the FP8 layout check passes for each layout in the run; free disk; records the bundle commit, the image, `hl-smi -q` and the environment | any check fails |
 | G1 build | stage 1's install from the bundle; `vllm.__version__` is `0.28.1rc1.dev392+g8f816a3f6`; `import vllm_gaudi`; `flashinfer_gaudi.get_capabilities()` | install or import fails, or the version is wrong |
-| G1b fused GDN kernel | op numerics of both GDN decode ops on the card against the CPU reference (`test_hpu_op.py`), 1,000-step graph replay against eager (two cases), then the verification op's numerics and two replays (only after the decode checks pass), then the speed measurement; all of these run with `PT_HPU_LAZY_MODE=1`, the servers' bridge mode, and only they decide the kernel. The two decode replays then run once more with `PT_HPU_LAZY_MODE=0` for `torch.compile` and are recorded only (`replay_eager`, `eager_compile_ok`): an eager failure never turns the kernel off. Every step runs in its own process group and is killed with its whole group at its timeout (op tests 600 s, each replay 900 s, bench 1200 s). When `test_hpu_verify_op.py` crashes or times out, G1b runs `gdn_verify_crash_probe.sh` (at most 4500 s) into `fused_gdn/verify_crash/`; recorded only. `--quick-gates` skips the recorded-only steps (the eager replays, the bench and the crash probe); `--no-verify-probe` skips only the probe | never stops: on a failure, a skip or a missing library, every later server runs with `VLLM_HPU_GDN_CORE_DECODE=0` (the PyTorch GDN path), recorded in the manifest and the summary; a verify failure leaves `VLLM_HPU_GDN_CORE_VERIFY=0`, only a pass sets it to 1 |
-| G2 tiny TP8 | stage 2a's tiny 8-head checkpoint (GDN head dim 128) at TP8: greedy agreement with `reference.json` on its six prompts (1 to 2,600 tokens). The server gets a fixed 1,200 s to become healthy (`--server-timeout` does not apply). When the gate fails or times out with the combined kernel database loaded, that attempt is kept under `tiny/attempt-combined/` and the gate runs once more without the database | fewer than 16/16 tokens match on any prompt, or the server is not healthy in time (after the retry, when there is one) |
+| G1b fused GDN kernel | op numerics of both GDN decode ops on the card against the CPU reference (`test_hpu_op.py`), 1,000-step graph replay against eager (two cases), then the verification op's numerics and two replays (only after the decode checks pass), then the speed measurement; all of these run with `PT_HPU_LAZY_MODE=1`, the servers' bridge mode, and only they decide the kernel. The two decode replays then run once more with `PT_HPU_LAZY_MODE=0` for `torch.compile` and are recorded only (`replay_eager`, `eager_compile_ok`): an eager failure never turns the kernel off. Every step runs in its own process group and is killed with its whole group at its timeout (op tests 600 s, each replay 900 s, bench 1200 s). When `test_hpu_verify_op.py` crashes or times out, G1b runs `gdn_verify_crash_probe.sh` (at most 4500 s) into `fused_gdn/verify_crash/`; recorded only. `--quick-gates` skips the recorded-only steps (the eager replays, the bench and the crash probe); `--no-verify-probe` skips only the probe. Right after these steps the fused hyper-connection kernels' own card test runs (`tests/unit_tests/hc_fused/test_hpu_op.py`, lazy mode, the installed libraries by path, its own process group, 600 s, log `hc_hpu_op.log`): recorded as `hc_fused` in this gate's details, it never changes this gate's status or the GDN flags; with `--quick-gates` it runs only when `--hc-fused` was passed | never stops: on a failure, a skip or a missing library, every later server runs with `VLLM_HPU_GDN_CORE_DECODE=0` (the PyTorch GDN path), recorded in the manifest and the summary; a verify failure leaves `VLLM_HPU_GDN_CORE_VERIFY=0`, only a pass sets it to 1 |
+| G2 tiny TP8 | stage 2a's tiny 8-head checkpoint (GDN head dim 128) at TP8: greedy agreement with `reference.json` on its six prompts (1 to 2,600 tokens). The server gets a fixed 1,200 s to become healthy (`--server-timeout` does not apply). When the gate fails or times out with the fused hyper-connection kernels on (`--hc-fused` and a passed card test), that attempt is kept under `tiny/attempt-hc-fused/` and the gate runs once more without them. When the gate fails or times out with the combined kernel database loaded, that attempt is kept under `tiny/attempt-combined/` and the gate runs once more without the database | fewer than 16/16 tokens match on any prompt, or the server is not healthy in time (after the retry, when there is one) |
 | card_tests (after the gates) | the two HPU-only unit-test files on the card, in lazy mode (`PT_HPU_LAZY_MODE=1`), 600 s each: `tests/unit_tests/test_defragmentation.py` and `tests/unit_tests/ops/test_hpu_fused_moe.py`; each file's output is kept as `<stem>.log` and the pytest counts are recorded in `details.json`. Skipped with `--quick-gates` | never stops the run: a failure, a timeout or a skip is recorded only |
 | G3 startup, per server | `Maximum concurrency for 131,072 tokens per request` ≥ agents on that server; `Usable num_blocks`, KV tokens, weights and warmup recorded | the concurrency is too low, or no healthy `/v1/models` within the health timeout (default 1,800 s, `--server-timeout`; warmup is skipped by default, so startup is usually minutes) |
 | G4w warm pass, per variant (RUK-3203) | a one-turn copy of the workload, files shifted by one, on the variant's own servers (`max_tokens=64`): compiles the workload's graphs on first use and caches the shared system block; `warm-pass.json` records requests, seconds and non-OK rows; `--no-warm-pass` switches it off | any non-OK row fails the variant with `warm pass: <n> non-OK rows` (the variant's "on failure" rule applies: A stops the run, B and C continue) — see [Warm pass](#warm-pass-ruk-3203) |
@@ -518,8 +581,10 @@ variant yet.
 Notes:
 
 - The install adds `habanalabs-tools` 1.24.1-482 (tpc-clang) to the container when the image
-  lacks it, so the fused GDN decode and verification kernels and the flashinfer kernels are
-  compiled from the bundle (`install-0-toolchain.log`, `toolchain.json`). Only if that install
+  lacks it, so the fused GDN decode and verification kernels, the fused hyper-connection kernels
+  and the flashinfer kernels are compiled from the bundle (`install-0-toolchain.log`,
+  `toolchain.json`). A failed build of the hyper-connection library removes only its own two files
+  and the install goes on (`install-2.log` has the line `HC fused build failed`). Only if that install
   fails does the run continue without native kernels on the PyTorch GDN path, with
   `native_build: 0` in `toolchain.json`, the G1b gate recording the missing library, and a
   warning in the console.
@@ -591,7 +656,7 @@ and `run_rental.sh` ends with two lines:
   errors, wall time), one section per variant — each with its `Warm pass:` line, the numbers of
   the [warm pass](#warm-pass-ruk-3203) (`none` with `--no-warm-pass`) —, the GDN decode line
   (fused kernel or PyTorch path) and the native-kernel line from `toolchain.json`. Its header
-  also carries the run's warmup mode (`Warmup: skipped ...` / `Warmup: full`) and the server
+  also carries the `HC fused:` line (`on`, or `off (<why>)`), the run's warmup mode (`Warmup: skipped ...` / `Warmup: full`) and the server
   health timeout (RUK-3200). Paste it whole into a comment on RUK-2709. It is written at the end
   of every run that reached the orchestrator, passed or failed.
 - `SEND THIS FILE: <results>/<run-id>.tar.gz` — the whole run folder, made even when the run

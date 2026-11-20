@@ -7,6 +7,8 @@
 //
 // Variants:
 //   FAKE_TAG=a, FAKE_TAG=b   all six entry points (like Intel's libtpc_kernels.so)
+//   FAKE_TAG=h               all six entry points; stands for libhc_fused_gaudi2.so, which answers
+//                            GetSupportedDataLayouts and GetSuggestedManipulation itself
 //   -DFAKE_MINIMAL           only the three entry points the graph compiler requires
 //                            (GetKernelGuids, InstantiateTpcKernel, GetShapeInference),
 //                            like libgdn_fused_gaudi2.so / libflashinfer_gaudi_kernels.so
@@ -24,7 +26,7 @@ using namespace tpc_lib_api;
 
 namespace {
 
-const char* const kTag = KDA_XSTR(FAKE_TAG);  // "a", "b", "m" (minimal) or "n" (no shape inference)
+const char* const kTag = KDA_XSTR(FAKE_TAG);  // "a", "b", "h", "m" (minimal) or "n" (no shape inference)
 const char* g_last = "none";
 
 // What InstantiateTpcKernel writes to kernel.paramsNr, so the test can tell which member answered.
@@ -36,6 +38,8 @@ unsigned member_number() {
             return 2U;
         case 'm':
             return 3U;
+        case 'h':
+            return 5U;
         default:
             return 4U;
     }

@@ -392,6 +392,7 @@ def test_kernel_database_status_reports_what_the_loader_decided(tmp_path, monkey
         "combined_active": False,
         "combined_kernel_db": None,
         "gdn_fused_loaded": None,
+        "hc_fused_loaded": None,
         "load_errors": [],
     }
 
@@ -404,6 +405,7 @@ def test_kernel_database_status_reports_what_the_loader_decided(tmp_path, monkey
         "combined_active": True,
         "combined_kernel_db": str(combined),
         "gdn_fused_loaded": True,
+        "hc_fused_loaded": None,  # the hyper-connection loader runs only with VLLM_HPU_HC_FUSED=1
         "load_errors": [],
     }
     assert json.loads(json.dumps(status)) == status  # plain data: it goes into a log line and a JSON file

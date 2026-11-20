@@ -1,8 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
-"""CPU tests of the fused hyper-connection op definitions (``hc_ops.py``): schemas, CPU and fake kernels.
+"""CPU tests of the fused hyper-connection op definitions: schemas, fake kernels and the CPU stand-in.
 
-No vLLM, no toolchain.  The HPU kernels are tested on a card by ``test_hpu_op.py``.
+``flashinfer_gaudi/hc_fused.py`` defines the six schemas and the fake kernels and nothing else: the
+HPU kernels come from the ``hc_fused_ops`` extension, and a CPU process has no kernel at all.
+``hc_ops.py`` (this folder) is that module plus the torch oracle registered as the CPU kernels, the
+stand-in the CPU tests run the ops through.  No vLLM, no toolchain.  The HPU kernels are tested on a
+card by ``test_hpu_op.py``.
 """
+
+import subprocess
+import sys
+from pathlib import Path
 
 import pytest
 import torch
@@ -66,3 +74,54 @@ def test_availability():
     assert hc_ops.hc_fused_missing_ops("cuda") == hc_ops.OP_NAMES
     if not hc_ops.hc_fused_available("hpu"):
         assert set(hc_ops.hc_fused_missing_ops("hpu")) <= set(hc_ops.OP_NAMES)
+
+
+REPO_ROOT = Path(__file__).resolve().parents[3]
+
+
+def _python(code: str) -> subprocess.CompletedProcess:
+    """A fresh interpreter from the repository root: this process already holds the CPU stand-in."""
+    return subprocess.run([sys.executable, "-c", code], cwd=REPO_ROOT, capture_output=True, text=True, timeout=300)
+
+
+def test_the_package_module_is_the_only_definition():
+    """One module defines the schemas (a second definition raises); hc_ops only adds the CPU kernels."""
+    from flashinfer_gaudi import hc_fused
+
+    assert hc_ops.SCHEMAS is hc_fused.SCHEMAS and hc_ops.OP_NAMES is hc_fused.OP_NAMES
+    for name in hc_fused.OP_NAMES:
+        assert getattr(hc_ops, name) is getattr(hc_fused, name)
+    assert hc_ops.hc_fused_missing_ops is hc_fused.hc_fused_missing_ops
+    assert hc_ops.hc_fused_available is hc_fused.hc_fused_available
+
+
+def test_the_package_module_registers_no_cpu_kernel():
+    """In a process without the stand-in, no op has a kernel for any device: a layer then runs torch."""
+    proc = _python("import torch\n"
+                   "from flashinfer_gaudi import hc_fused as m\n"
+                   "assert m.hc_fused_missing_ops('cpu') == m.OP_NAMES, m.hc_fused_missing_ops('cpu')\n"
+                   "assert m.hc_fused_missing_ops(torch.device('hpu')) == m.OP_NAMES\n"
+                   "assert not m.hc_fused_available('cpu')\n"
+                   "for name in m.OP_NAMES:\n"
+                   "    schema = getattr(torch.ops.flashinfer_gaudi, name).default._schema\n"
+                   "    assert str(schema).replace('flashinfer_gaudi::', '') == m.SCHEMAS[name]\n"
+                   "out = m.hc_gate_mix(torch.empty(3, 512, dtype=torch.bfloat16, device='meta'),\n"
+                   "                    torch.empty(3, 512, dtype=torch.bfloat16, device='meta'), 4)\n"
+                   "assert tuple(out.shape) == (3, 128)\n"
+                   "print('ok')\n")
+    assert proc.returncode == 0, proc.stderr[-2000:]
+    assert proc.stdout.strip().splitlines()[-1] == "ok"
+
+
+def test_importing_the_package_does_not_define_the_ops():
+    """With VLLM_HPU_HC_FUSED=0 nothing imports the op module, so nothing new is registered."""
+    proc = _python("import torch, flashinfer_gaudi\n"
+                   "from flashinfer_gaudi import _native\n"
+                   "import sys\n"
+                   "assert 'flashinfer_gaudi.hc_fused' not in sys.modules\n"
+                   "names = [n for n in torch._C._dispatch_get_all_op_names()\n"
+                   "         if n.startswith('flashinfer_gaudi::hc_')]\n"
+                   "assert names == [], names\n"
+                   "print('ok')\n")
+    assert proc.returncode == 0, proc.stderr[-2000:]
+    assert proc.stdout.strip().splitlines()[-1] == "ok"

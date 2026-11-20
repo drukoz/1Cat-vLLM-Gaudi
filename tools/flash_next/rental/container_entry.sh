@@ -19,9 +19,10 @@ usage() {
     echo "       [--variants LIST] [--with-profile] [--from PHASE] [--download] [--skip-install]"
     echo "       [--full-warmup] [--server-timeout S] [--recipe-cache DIR] [--no-warm-pass]"
     echo "       [--quick-gates] [--no-verify-probe] [--load-read-timeout S] [--warm-request-timeout S]"
+    echo "       [--hc-fused]"
     echo "       $(basename "${BASH_SOURCE[0]}") --install-only [--results DIR] [--run-id ID]"
-    echo "  --quick-gates, --no-verify-probe, --load-read-timeout S and --warm-request-timeout S are"
-    echo "  handed to the orchestrator unchanged (python -m tools.flash_next.rental.main --help)."
+    echo "  --quick-gates, --no-verify-probe, --load-read-timeout S, --warm-request-timeout S and"
+    echo "  --hc-fused are handed to the orchestrator unchanged (python -m tools.flash_next.rental.main --help)."
 }
 
 need_value() {
@@ -55,6 +56,7 @@ QUICK_GATES=0
 NO_VERIFY_PROBE=0
 LOAD_READ_TIMEOUT=""
 WARM_REQUEST_TIMEOUT=""
+HC_FUSED=0
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -123,6 +125,10 @@ while [ $# -gt 0 ]; do
             ;;
         --no-verify-probe)
             NO_VERIFY_PROBE=1
+            shift
+            ;;
+        --hc-fused)
+            HC_FUSED=1
             shift
             ;;
         --load-read-timeout)
@@ -304,8 +310,8 @@ if [ "$SKIP_INSTALL" -eq 0 ]; then
         TPC_CLANG=false
         TPC_CLANG_VERSION=""
         echo "WARNING: tpc-clang unavailable after the habanalabs-tools install attempt;" \
-            "building WITHOUT native kernels (fused GDN and flashinfer): the servers run the" \
-            "PyTorch GDN path" >&2
+            "building WITHOUT native kernels (fused GDN, fused hyper-connections and flashinfer):" \
+            "the servers run the PyTorch GDN path" >&2
     fi
     # toolchain.json records what the toolchain step did; the G1b gate reads the libraries, this
     # records why they are (or are not) there.
@@ -325,8 +331,13 @@ if [ "$SKIP_INSTALL" -eq 0 ]; then
         VLLM_VERSION_OVERRIDE=0.28.1rc1.dev392+g8f816a3f6 \
         pip install --no-build-isolation "$BUNDLE_ROOT/vllm"
     remove_stale_build
+    # One NATIVE value for the three native builds. The fused hyper-connection library is always built
+    # with the others (a failed build of it removes only its own two files and the install goes on);
+    # whether a server uses it is the orchestrator's decision (--hc-fused and the card test), not this
+    # script's.
     install_step 2 "plugin (vllm-gaudi)" env VLLM_TARGET_DEVICE=hpu \
         VLLM_GAUDI_BUILD_FLASHINFER="$NATIVE" VLLM_GAUDI_BUILD_GDN_FUSED="$NATIVE" \
+        VLLM_GAUDI_BUILD_HC_FUSED="$NATIVE" \
         pip install "$BUNDLE_ROOT/plugin" --no-build-isolation
     record_build_sha
     install_step 3 "model deps" \
@@ -372,6 +383,7 @@ if [ "$QUICK_GATES" -eq 1 ]; then MAIN_ARGS+=(--quick-gates); fi
 if [ "$NO_VERIFY_PROBE" -eq 1 ]; then MAIN_ARGS+=(--no-verify-probe); fi
 if [ -n "$LOAD_READ_TIMEOUT" ]; then MAIN_ARGS+=(--load-read-timeout "$LOAD_READ_TIMEOUT"); fi
 if [ -n "$WARM_REQUEST_TIMEOUT" ]; then MAIN_ARGS+=(--warm-request-timeout "$WARM_REQUEST_TIMEOUT"); fi
+if [ "$HC_FUSED" -eq 1 ]; then MAIN_ARGS+=(--hc-fused); fi
 if [ "$NO_WARM_PASS" -eq 1 ]; then MAIN_ARGS+=(--no-warm-pass); fi
 
 phase "orchestrator (python -m tools.flash_next.rental.main)"

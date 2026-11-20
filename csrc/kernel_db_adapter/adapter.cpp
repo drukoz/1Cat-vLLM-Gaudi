@@ -10,8 +10,9 @@
 // to an ordered list of members. See docs/design/flash-next/native-extensions.md.
 //
 // Members: the custom libraries next to this file (libgdn_fused_gaudi2.so,
-// libflashinfer_gaudi_kernels.so; each optional), then Intel's stock library
-// (required). A member that is present but cannot be used (dlopen fails, a
+// libhc_fused_gaudi2.so, libflashinfer_gaudi_kernels.so; each optional: a file
+// that is not there is not a member and not a failure), then Intel's stock
+// library (required). A member that is present but cannot be used (dlopen fails, a
 // required entry point is missing, its GetKernelGuids fails) is reported on
 // stderr with its path, and the database then serves nothing: GetKernelGuids
 // returns GLUE_FAILED rather than a list without that member's kernels.
@@ -114,9 +115,13 @@ std::vector<MemberSpec> member_specs() {
             specs.push_back({path, false});
         }
     } else if (!self.empty()) {
-        // Optional siblings, in the same precedence order the Python loader prepends today.
+        // Optional siblings, in the same precedence order the Python loader prepends today. No GUID is
+        // shared between them, so the position only fixes the order of the merged list. The name
+        // libhc_fused_gaudi2.so in this file's bytes is also how the Python loader tells an adapter that
+        // serves the hyper-connection kernels from one built before they existed (_native.py).
         const std::filesystem::path dir = std::filesystem::path(self).parent_path();
-        for (const char* sibling : {"libgdn_fused_gaudi2.so", "libflashinfer_gaudi_kernels.so"}) {
+        for (const char* sibling :
+             {"libgdn_fused_gaudi2.so", "libhc_fused_gaudi2.so", "libflashinfer_gaudi_kernels.so"}) {
             std::filesystem::path candidate = dir / sibling;
             std::error_code ec;
             if (std::filesystem::exists(candidate, ec)) {
@@ -329,10 +334,11 @@ extern "C" GlueCodeReturn GetSuggestedManipulation(const HabanaKernelParams* par
 }
 
 // A member without this entry point (libgdn_fused_gaudi2.so, libflashinfer_gaudi_kernels.so) gets one
-// explicit don't-care layout. Loaded directly, the graph compiler treats the missing symbol as "every
-// layout is don't-care"; but this file always exports the symbol, and a non-success return or zero
-// layouts fails the supported-layouts pass (node_io_manager.cpp, "Glue Code GetSupportedLayouts
-// failed"). Same answer as csrc/deepseek_v4/host/entry_points.cpp gives for its own GUIDs.
+// explicit don't-care layout; libhc_fused_gaudi2.so exports it and answers itself. Loaded directly, the
+// graph compiler treats the missing symbol as "every layout is don't-care"; but this file always exports
+// the symbol, and a non-success return or zero layouts fails the supported-layouts pass
+// (node_io_manager.cpp, "Glue Code GetSupportedLayouts failed"). Same answer as
+// csrc/deepseek_v4/host/entry_points.cpp gives for its own GUIDs.
 extern "C" GlueCodeReturn GetSupportedDataLayouts(const HabanaKernelParams* params, NodeDataLayouts* supportedLayouts,
                                                   uint32_t* layoutCount) {
     ensure_loaded();

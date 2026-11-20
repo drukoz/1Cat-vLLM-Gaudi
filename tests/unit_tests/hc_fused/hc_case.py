@@ -33,7 +33,7 @@ GUIDS = {
     "combine": "hc_fused_combine_bf16_gaudi2",
     "combine_norm": "hc_fused_combine_norm_bf16_gaudi2",
 }
-# The op of each kind: torch.ops.flashinfer_gaudi.<name> (schemas in hc_ops.py).
+# The op of each kind: torch.ops.flashinfer_gaudi.<name> (schemas in flashinfer_gaudi/hc_fused.py).
 OP_NAME = {kind: f"hc_{kind}" for kind in KINDS}
 # Op argument order (tensors only) and output names, per kind.
 INPUT_ORDER = {

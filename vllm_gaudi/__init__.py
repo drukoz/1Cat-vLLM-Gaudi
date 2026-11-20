@@ -149,6 +149,42 @@ def _warn_gdn_core_verify_without_kernel(verify_mode: int, decode_mode: int, loa
     return message
 
 
+def _warn_hc_fused_without_kernel(flag: int, loaded: bool, on_hpu: bool, errors, warn=None) -> str | None:
+    """Warn once at plugin start when VLLM_HPU_HC_FUSED=1 runs without an HPU kernel.
+
+    Returns the logged message, or ``None`` when nothing was logged: the flag is off, the extension loaded,
+    or no HPU. ``warn`` defaults to the vLLM logger's ``warning``.
+    """
+    if not flag or loaded or not on_hpu:
+        return None
+    reason = "; ".join(errors) if errors else "no error recorded"
+    message = (f"HC fused (VLLM_HPU_HC_FUSED={int(flag)}) has no HPU kernel: the hc_fused_ops extension did not "
+               f"load ({reason}); every hyper-connection runs the torch path. Build it with "
+               "tools/build_flashinfer_gaudi.py --hc-fused-only, or set VLLM_HPU_HC_FUSED=0.")
+    if warn is None:
+        from vllm.logger import init_logger
+
+        warn = init_logger(__name__).warning
+    warn(message)
+    return message
+
+
+def _load_hc_fused_if_requested(flag: int, warn=None) -> bool | None:
+    """With VLLM_HPU_HC_FUSED=1, load the fused hyper-connection kernels and warn once when they are not usable.
+
+    Returns the loader's result, or ``None`` when the flag is not 1: then nothing is imported, loaded or logged.
+    It must run before warmup, because the loader registers libhc_fused_gaudi2.so in GC_KERNEL_PATH and
+    SynapseAI reads that variable when its graph compiler starts. The loader never raises.
+    """
+    if flag != 1:
+        return None
+    from flashinfer_gaudi._native import hc_fused_extension_errors, load_hc_fused_extension
+
+    loaded = load_hc_fused_extension()
+    _warn_hc_fused_without_kernel(flag, loaded, _hpu_visible(), hc_fused_extension_errors(), warn=warn)
+    return loaded
+
+
 def register_ops():
     """Register custom PluggableLayers for the HPU platform"""
     from flashinfer_gaudi import load_native_extensions
@@ -173,6 +209,8 @@ def register_ops():
         errors = gdn_fused_extension_errors()
         _warn_gdn_core_decode_without_kernel(decode_mode, loaded, on_hpu, errors)
         _warn_gdn_core_verify_without_kernel(verify_mode, decode_mode, loaded, on_hpu, errors)
+    # The fused hyper-connection kernels, only with VLLM_HPU_HC_FUSED=1 (default 0: nothing happens here).
+    _load_hc_fused_if_requested(_gaudi_envs.VLLM_HPU_HC_FUSED)
     # One line per process with what the loader decided (state, GC_KERNEL_PATH, combined database, errors):
     # the server log then shows which kernel database every worker really runs.
     from flashinfer_gaudi._native import kernel_database_status

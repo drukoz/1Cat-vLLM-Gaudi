@@ -9,6 +9,12 @@ folder. `--from PHASE` resumes a run that has a manifest.json; `--quick-gates` a
 leave out steps that are recorded only; `--load-read-timeout` and `--warm-request-timeout` replace two
 request timeouts. The combined kernel database has an automatic fallback at gate G1b and at the tiny
 gate (`gate_tiny`), and the operator's FLASHINFER_GAUDI_COMBINED_KERNEL_DB=0 switches it off.
+
+`--hc-fused` asks for the fused hyper-connection kernels (VLLM_HPU_HC_FUSED=1, off by default). Their card
+test runs right after G1b's own steps and is recorded in G1b's details; it never changes G1b's status or
+the GDN flags. The servers get the kernels only when the operator asked and the card test passed, every
+other server gets an explicit VLLM_HPU_HC_FUSED=0, and a tiny gate that fails with the kernels runs once
+more without them. The manifest's `hc_fused` and the summary's `HC fused:` line record the outcome.
 """
 
 from __future__ import annotations
@@ -42,7 +48,7 @@ VARIANTS_FILE = Path(__file__).resolve().parent / "variants.json"
 GATE_PHASES = ("preflight", "build", "fused_gdn", "tiny", "card_tests")
 # What a manifest and a status file keep of an environment: the plugin, bridge, kernel-loader and Hub
 # variables, plus the names of ENV_KEYS; a value whose name looks like a secret is never written.
-ENV_PREFIXES = ("VLLM_", "HABANA_", "PT_", "HF_", "FLASHINFER_", "GC_", "GDN_")
+ENV_PREFIXES = ("VLLM_", "HABANA_", "PT_", "HF_", "FLASHINFER_", "GC_", "GDN_", "HC_")
 ENV_KEYS = ("PYTHONFAULTHANDLER",)
 ENV_SECRET_SUFFIXES = ("_TOKEN", "_SECRET", "_PASSWORD", "_API_KEY")  # HF_TOKEN, VLLM_API_KEY
 HLSMI_Q_LIMIT = 200 * 1024
@@ -58,6 +64,8 @@ TINY_GDN_HEAD_DIM = 128  # the head dim of the real model's GDN layers and the o
 TINY_MIN_MODEL_LEN = 512
 TINY_DEFAULT_MODEL_LEN = 4096
 TINY_ATTEMPT_COMBINED = "attempt-combined"
+TINY_ATTEMPT_HC_FUSED = "attempt-hc-fused"
+HC_QUICK_SKIP_REASON = "--quick-gates without --hc-fused"
 LOAD_TIMEOUT_S = 5400.0
 LOAD_REQUEST_TIMEOUT_S = 1800.0
 LOAD_STAGGER_S = 60.0
@@ -388,9 +396,14 @@ def gdn_summary_lines(run_dir, variant_ids) -> list:
         path = run_dir / vid / "gdn_fallback.txt"
         if not path.is_file():
             continue
-        count = sum(1 for ln in path.read_text(encoding="utf-8").splitlines() if ln.strip())
+        found = [ln for ln in path.read_text(encoding="utf-8").splitlines() if ln.strip()]
+        hc_count = sum(1 for ln in found if gates.HC_FALLBACK_RE.search(ln))
+        count = len(found) - hc_count
         if count:
             lines.append("GDN fallback lines in %s: %d (the kernel did not run on every layer)" % (vid, count))
+        if hc_count:
+            lines.append("HC fused fallback lines in %s: %d (the hyper-connection kernels did not run on every "
+                         "layer)" % (vid, hc_count))
     toolchain = read_json(run_dir / "toolchain.json")  # written by container_entry.sh before the build
     if isinstance(toolchain, dict):
         lines.append("Native kernels: %s (tpc-clang: %s; habanalabs-tools: %s)" % (
@@ -440,6 +453,12 @@ class Runner:
         self.gdn_env = {}
         self.gdn_mode = None
         self.gdn_reason = None
+        # The fused hyper-connection kernels: the operator's request (--hc-fused), the card test's result
+        # in G1b (None before G1b ran), and who took the kernels out of this run's servers ("tiny").
+        self.hc_fused_requested = bool(args.hc_fused)
+        self.hc_fused_status = None
+        self.hc_fused_reason = None
+        self.hc_fused_disabled_by = None
         self.skip_warmup = not args.full_warmup
         self.warm_pass = not args.no_warm_pass
         self.server_timeout_s = float(args.server_timeout)
@@ -485,6 +504,7 @@ class Runner:
             self.hl_smi_q = manifest.get("hl_smi_q", "")
             self.restore_gdn()
             self.restore_combined_db(manifest)
+            self.restore_hc_fused(manifest)
         else:
             self.run_dir.mkdir(parents=True, exist_ok=True)
             self.bundle_commit = bundle_commit()
@@ -568,6 +588,8 @@ class Runner:
         write_status(phase_dir, name, status, reason, seconds, extra={"errors": errors} if errors else None)
         write_json(phase_dir / "details.json", details)
         self.announce(name, status, reason, seconds, errors, details.get("log") or [])
+        if name == "fused_gdn" and not self.stub:
+            self.announce_hc_fused(phase_dir, details.get("hc_fused"))
         if status in (GateStatus.FAILED, GateStatus.TIMED_OUT):
             self.failure_evidence(name)
         if name in ("fused_gdn", "card_tests"):
@@ -584,6 +606,17 @@ class Runner:
                 print("    %s" % text, flush=True)
             for log in logs:
                 print("    log: %s" % log, flush=True)
+
+    def announce_hc_fused(self, phase_dir: Path, hc_fused) -> None:
+        """One console line after G1b's own: the hyper-connection kernels' card test and what the servers get."""
+        hc_fused = hc_fused if isinstance(hc_fused, dict) else {}
+        status = hc_fused.get("status") or gates.HC_NOT_RUN
+        reason = hc_fused.get("reason")
+        line = "fused_gdn: hyper-connection kernels' card test %s%s; HC fused: %s" % (
+            status, " (%s)" % reason if reason else "", self.hc_fused_outcome())
+        print(line, flush=True)
+        if status == gates.HC_FAILED and hc_fused.get("log"):
+            print("    log: %s" % (phase_dir / hc_fused["log"]), flush=True)
 
     def failure_evidence(self, phase: str) -> None:
         """pip-freeze.txt and a fresh hl-smi.txt in the run folder (not in stub mode: no card, no stack)."""
@@ -620,9 +653,11 @@ class Runner:
         return gates.preflight(model_dir, layouts, self.results_dir)
 
     def gate_fused_gdn(self, phase_dir: Path):
+        self.hc_fused_disabled_by = None  # a rerun of the gates decides again
         if self.stub:
             status = GateStatus.SKIPPED
             details = {"mode": None, "env": {}, "reason": "stub mode"}
+            hc_fused = {"status": gates.HC_NOT_RUN, "reason": "stub mode", "hpu_op": None}
         else:
             if self.combined_db_disabled_by in ("g1b", "tiny"):
                 self.combined_db_disabled_by = None  # a rerun of the gates decides again
@@ -638,6 +673,16 @@ class Runner:
                     "env": {"VLLM_HPU_GDN_CORE_DECODE": "0"},
                     "reason": "%s: %s" % (type(exc).__name__, exc),
                 }
+            hc_fused = self.check_hc_fused(phase_dir, details)
+        # The hyper-connection kernels' card test is recorded next to G1b's own result; `status`, the
+        # GDN mode and the GDN flags above are final and nothing below changes them.
+        hc_fused["requested"] = self.hc_fused_requested
+        details["hc_fused"] = hc_fused
+        self.hc_fused_status = hc_fused.get("status")
+        self.hc_fused_reason = hc_fused.get("reason")
+        if not self.stub:
+            details["env"] = dict(details.get("env") or {})
+            details["env"][gates.HC_FUSED_ENV] = "1" if self.hc_fused_on() else "0"
         self.gdn_env = dict(details.get("env") or {})
         self.gdn_mode = details.get("mode")
         self.gdn_reason = details.get("reason")
@@ -646,20 +691,74 @@ class Runner:
             self.combined_db_disabled_by = "g1b"  # the kill switch itself is in details["env"]
         return status, details
 
+    def check_hc_fused(self, phase_dir: Path, gdn_details: dict) -> dict:
+        """The fused hyper-connection kernels' card test, right after G1b's own steps (gates.hc_fused).
+
+        It runs unless --quick-gates is set and the operator did not ask for the kernels: without the
+        request its result is recorded only, with it the result decides a kernel. It runs without the
+        combined kernel database when this run's servers will not load that database either. Never raises."""
+        skip = HC_QUICK_SKIP_REASON if self.quick_gates and not self.hc_fused_requested else None
+        combined_db_off = not (gdn_details.get("combined_kernel_db") == gates.COMBINED_DB_ACTIVE and
+                               gdn_details.get("mode") == gates.GDN_MODE_FUSED)
+        try:
+            return dict(gates.hc_fused(repo_root(), phase_dir, sys.executable, skip=skip,
+                                       combined_db_off=combined_db_off))
+        except Exception as exc:  # noqa: BLE001 - recorded only
+            return {"status": gates.HC_NOT_RUN, "reason": "%s: %s" % (type(exc).__name__, exc), "hpu_op": None}
+
+    def hc_fused_on(self) -> bool:
+        """True when this run's servers get VLLM_HPU_HC_FUSED=1: the operator asked (--hc-fused), the card
+        test in G1b passed, and the tiny gate did not fail with the kernels."""
+        return (self.hc_fused_requested and self.hc_fused_status == gates.HC_PASSED and
+                self.hc_fused_disabled_by is None)
+
+    def hc_fused_outcome(self) -> str:
+        """"on", or "off (<why>)": the manifest's hc_fused.outcome and the summary's `HC fused:` line."""
+        if not self.hc_fused_requested:
+            return "off (not requested)"
+        if self.hc_fused_disabled_by == "tiny":
+            passed = self.variant_status("tiny") == int(GateStatus.PASSED)
+            return "off (the tiny gate failed with it%s)" % (" and passed without" if passed else "")
+        if self.hc_fused_status == gates.HC_PASSED:
+            return "on"
+        if self.hc_fused_status is None:
+            return "off (the card test has not run)"
+        return "off (%s)" % (self.hc_fused_reason or self.hc_fused_status)
+
     def gate_tiny(self, phase_dir: Path):
-        """G2. When the gate fails or times out with a server that loaded the combined kernel database
-        (first hardware run of the adapter in a full server), the attempt is kept under
-        tiny/attempt-combined/, the database is switched off for the rest of the run and the gate runs
-        once more (RUK-3248)."""
+        """G2. When the gate fails or times out with a server that ran the fused hyper-connection
+        kernels (--hc-fused), the attempt is kept under tiny/attempt-hc-fused/, the kernels are switched
+        off for the rest of the run and the gate runs once more. When it (still) fails or times out with
+        a server that loaded the combined kernel database (first hardware run of the adapter in a full
+        server), the attempt is kept under tiny/attempt-combined/, the database is switched off for the
+        rest of the run and the gate runs once more (RUK-3248). The newest piece goes first."""
         if self.stub:
             return GateStatus.SKIPPED, {"reason": "stub mode"}
         if self.combined_db_disabled_by == "tiny":
             self.combined_db_disabled_by = None  # a rerun of the gate decides again
+        if self.hc_fused_disabled_by == "tiny":
+            self.hc_fused_disabled_by = None
+        failed = (GateStatus.FAILED, GateStatus.TIMED_OUT)
+        hc_attempt = None
         combined = self.combined_db_active()
         t0 = time.time()
         status, details, server_ran = self.tiny_attempt(phase_dir)
         details["combined_kernel_db"] = combined
-        if not (combined and server_ran and status in (GateStatus.FAILED, GateStatus.TIMED_OUT)):
+        details["hc_fused"] = self.hc_fused_on()
+        if details["hc_fused"] and server_ran and status in failed:
+            hc_attempt = self.keep_tiny_attempt(phase_dir, status, details, time.time() - t0, TINY_ATTEMPT_HC_FUSED)
+            self.hc_fused_disabled_by = "tiny"
+            self.write_manifest()
+            print("tiny: %s with the fused hyper-connection kernels (%s); kept under %s, running the gate once "
+                  "more with %s=0" % (GateStatus(status).name, hc_attempt["reason"],
+                                      phase_dir / TINY_ATTEMPT_HC_FUSED, gates.HC_FUSED_ENV), flush=True)
+            for text in hc_attempt["errors"]:
+                print("    %s" % text, flush=True)
+            t0 = time.time()
+            status, details, server_ran = self.tiny_attempt(phase_dir)
+            details["combined_kernel_db"] = combined
+            self.note_hc_attempt(details, hc_attempt)
+        if not (combined and server_ran and status in failed):
             return status, details
         first = self.keep_tiny_attempt(phase_dir, status, details, time.time() - t0)
         self.combined_db_disabled_by = "tiny"
@@ -673,7 +772,16 @@ class Runner:
         details["combined_kernel_db"] = False
         details["combined_kernel_db_disabled_by"] = "tiny"
         details["attempt_combined"] = first
+        self.note_hc_attempt(details, hc_attempt)
         return status, details
+
+    def note_hc_attempt(self, details: dict, hc_attempt) -> None:
+        """What a tiny attempt's details say about the hyper-connection kernels: whether its server ran
+        them, and the kept attempt that ran them and failed, if there was one."""
+        details["hc_fused"] = self.hc_fused_on()
+        if hc_attempt is not None:
+            details["hc_fused_disabled_by"] = "tiny"
+            details["attempt_hc_fused"] = hc_attempt
 
     def tiny_attempt(self, phase_dir: Path) -> tuple:
         """One run of the tiny gate: (status, details, whether its server was started)."""
@@ -708,9 +816,11 @@ class Runner:
             details["log"] = [str(log_path)]
         return status, details, True
 
-    def keep_tiny_attempt(self, phase_dir: Path, status, details: dict, seconds: float) -> dict:
-        """Move the failed attempt's server log, status and details to tiny/attempt-combined/; its summary."""
-        keep = phase_dir / TINY_ATTEMPT_COMBINED
+    def keep_tiny_attempt(self, phase_dir: Path, status, details: dict, seconds: float,
+                          name: str = TINY_ATTEMPT_COMBINED) -> dict:
+        """Move the failed attempt's server log, status and details to tiny/<name>/ (attempt-combined or
+        attempt-hc-fused); its summary."""
+        keep = phase_dir / name
         keep.mkdir(parents=True, exist_ok=True)
         log_path = phase_dir / "server0.log"
         if log_path.is_file():
@@ -720,7 +830,7 @@ class Runner:
         errors = list(details.get("errors") or [])
         write_status(keep, "tiny", status, reason, seconds, extra={"errors": errors} if errors else None)
         write_json(keep / "details.json", details)
-        return {"dir": TINY_ATTEMPT_COMBINED, "status": int(status), "reason": reason, "errors": errors}
+        return {"dir": name, "status": int(status), "reason": reason, "errors": errors}
 
     def run_variant(self, variant) -> bool:
         vid = variant["id"]
@@ -1076,6 +1186,19 @@ class Runner:
             if details.get("combined_kernel_db") == gates.COMBINED_DB_DISABLED_BY_G1B and \
                     self.combined_db_disabled_by is None:
                 self.combined_db_disabled_by = "g1b"
+            hc_fused = details.get("hc_fused")  # absent in a run made before the kernels were wired in
+            if isinstance(hc_fused, dict):
+                self.hc_fused_status = hc_fused.get("status")
+                self.hc_fused_reason = hc_fused.get("reason")
+
+    def restore_hc_fused(self, manifest: dict) -> None:
+        """On a resume: a tiny gate of the earlier start that took the fused hyper-connection kernels out
+        of the run keeps its decision (a gate that runs again resets its own). The request itself is this
+        start's --hc-fused, and the card test's result comes back with G1b's details (restore_gdn)."""
+        hc_fused = manifest.get("hc_fused")
+        by = hc_fused.get("disabled_by") if isinstance(hc_fused, dict) else None
+        if self.hc_fused_disabled_by is None and by == "tiny":
+            self.hc_fused_disabled_by = by
 
     def restore_combined_db(self, manifest: dict) -> None:
         """On a resume: a gate of the earlier start that took the combined kernel database out of the
@@ -1117,6 +1240,14 @@ class Runner:
             "combined_kernel_db": self.combined_db_installed,
             "combined_kernel_db_disabled_by": self.combined_db_disabled_by,
             "variants": dict(self.recipe_cache_notes),
+        }
+        manifest["hc_fused"] = {
+            "requested": self.hc_fused_requested,
+            "status": self.hc_fused_status,
+            "reason": self.hc_fused_reason,
+            "on": self.hc_fused_on(),
+            "disabled_by": self.hc_fused_disabled_by,
+            "outcome": self.hc_fused_outcome(),
         }
         if self.workload_info is not None:
             manifest["workload"] = self.workload_info
@@ -1165,10 +1296,13 @@ class Runner:
         ]
 
     def variant_server_env(self, variant_env: dict) -> dict:
-        """The environment of a variant's servers: the variant's flags, the GDN flags, the recipe cache
-        for the servers that run without the fused GDN kernel (`serve.recipe_cache_env`) and, by default,
-        the skipped bucket warmup (the compiled graphs land in the recipe cache)."""
+        """The environment of a variant's servers: the variant's flags, the GDN flags, the fused
+        hyper-connection flag (always explicit: "1" only when the operator asked and the card test
+        passed, `hc_fused_on`), the recipe cache for the servers that register no kernel database of
+        their own (`serve.recipe_cache_env`) and, by default, the skipped bucket warmup (the compiled
+        graphs land in the recipe cache)."""
         env = server_env(variant_env, self.gdn_env)
+        env[gates.HC_FUSED_ENV] = "1" if self.hc_fused_on() else "0"
         if self.skip_warmup:
             env["VLLM_SKIP_WARMUP"] = "true"
         combined = self.combined_db_active()
@@ -1244,6 +1378,10 @@ def _parse_args(argv):
                         "the GDN kernel and the verify op still run")
     parser.add_argument("--no-verify-probe", action="store_true",
                         help="skip only the automatic crash probe that follows a crashed or hung verify op test")
+    parser.add_argument("--hc-fused", action="store_true",
+                        help="ask for the fused hyper-connection kernels: the servers get VLLM_HPU_HC_FUSED=1 "
+                        "when the kernels' card test in G1b passed (default: off, every server gets "
+                        "VLLM_HPU_HC_FUSED=0); a tiny gate that fails with them runs once more without")
     parser.add_argument("--recipe-cache", metavar="DIR", default=None,
                         help="folder for the HPU recipe cache; a server gets it only when it runs without the "
                         "fused GDN kernel, or when the combined kernel database is installed, G1b passed "

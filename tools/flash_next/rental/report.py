@@ -16,7 +16,9 @@ keys are ignored and missing ones become null: ``run_id``, ``bundle_commit``,
 ``load_read_timeout_s``, ``warm_request_timeout_s``, ``skipped_steps`` (the
 recorded-only steps left out by ``--quick-gates`` or ``--no-verify-probe``),
 ``recipe_cache`` (the RUK-3242 cache folder, size, combined-kernel-database flag,
-who switched that database off, and per-variant notes), ``workload`` (the
+who switched that database off, and per-variant notes), ``hc_fused`` (the
+operator's request for the fused hyper-connection kernels and its outcome),
+``workload`` (the
 workload.json header, for ``turns``) and ``variants`` (the variants.json entries
 that ran). A gate's or a variant's ``status.json`` may carry ``errors``, the last
 error lines of its server log: they are printed under the gate table and in the
@@ -398,6 +400,7 @@ def summarize_run(run_dir: Path) -> dict:
         "warm_request_timeout_s": manifest.get("warm_request_timeout_s"),
         "skipped_steps": manifest.get("skipped_steps"),
         "recipe_cache": manifest.get("recipe_cache"),
+        "hc_fused": manifest.get("hc_fused"),
         "workload": {
             "version": workload.get("version"),
             "shared_prefix_tokens": workload.get("shared_prefix_tokens"),
@@ -517,6 +520,12 @@ def _combined_db_text(recipe: Any) -> Optional[str]:
         who.get(str(by), "switched off by %s" % by), serve.COMBINED_KERNEL_DB_ENV)
 
 
+def _hc_fused_text(hc_fused: Any) -> Optional[str]:
+    """`on` or `off (<why>)` from the manifest's hc_fused; None for a manifest without it (an older run)."""
+    outcome = hc_fused.get("outcome") if isinstance(hc_fused, dict) else None
+    return str(outcome) if outcome else None
+
+
 def render_markdown(summary: dict) -> str:
     """The human-readable report: header, gate table, one comparison table,
     then one section per variant. Statuses appear as names here, never ints."""
@@ -532,6 +541,9 @@ def render_markdown(summary: dict) -> str:
     combined_db = _combined_db_text(run.get("recipe_cache"))
     if combined_db is not None:
         lines.append("- Combined kernel database: %s" % combined_db)
+    hc_fused = _hc_fused_text(run.get("hc_fused"))
+    if hc_fused is not None:
+        lines.append("- HC fused: %s" % hc_fused)
     lines.append("- Server health timeout: %s" % _seconds_text(run.get("server_timeout_s")))
     lines.append("- Load read timeout: %s" % _seconds_text(run.get("load_read_timeout_s")))
     lines.append("- Warm request timeout: %s" % _seconds_text(run.get("warm_request_timeout_s")))

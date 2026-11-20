@@ -10,8 +10,15 @@ server, so the cards are free again.
 
 Modes: `pytorch` turns the fused GDN kernel off (the flags gate G1b sets when it fails); `fused` turns
 the decode kernel on and keeps the verify op off, and fails when the server log says a layer fell back
-to the torch decode path. Each mode writes `<out>/<mode>/server0.log` and `details.json`;
+to the torch decode path; `hc` is `fused` plus the fused hyper-connection kernels (`VLLM_HPU_HC_FUSED=1`),
+and also fails when the log says a hyper-connection ran the torch path ("HC fused ... is off for", or the
+startup line "HC fused ... has no HPU kernel"). `hc` is not in the default list: `--gdn pytorch,fused,hc`
+or `--gdn hc` selects it. Each mode writes `<out>/<mode>/server0.log` and `details.json`;
 `<out>/summary.json` holds one entry per mode. The exit code is 0 only when every requested mode passed.
+A mode whose tokens match also records `decode_ms_per_token` (printed on a line of its own after the
+PASSED line): the shortest reference prompt generated with 16 tokens and with 1 token, best of three
+each, the difference divided by 15. It is recorded only, for comparing two runs of one mode (for
+example with and without an `--env` pair); it never changes a result.
 A server that exits before it is healthy is a failure with its exit code and the last error lines of
 its log (`serve.unhealthy_reason`, `serve.error_lines`: the run's gates report it the same way).
 
@@ -23,13 +30,13 @@ flags, so it can override anything. The health wait defaults to 1800 s.
 
 `--recipe-cache DIR` gives the compiled-recipe cache to the servers that may carry it
 (`serve.recipe_cache_env`): the `pytorch` mode's, and every server once the combined kernel database
-is installed and not switched off (`FLASHINFER_GAUDI_COMBINED_KERNEL_DB=0`). The `fused` mode runs
-without it otherwise: its kernel database must be registered in `GC_KERNEL_PATH`, and the Habana bridge
-accepts only one kernel library there next to a recipe cache. The cache lives in the per-bundle
+is installed and not switched off (`FLASHINFER_GAUDI_COMBINED_KERNEL_DB=0`). The `fused` and `hc` modes
+run without it otherwise: their kernel databases must be registered in `GC_KERNEL_PATH`, and the Habana
+bridge accepts only one kernel library there next to a recipe cache. The cache lives in the per-bundle
 subfolder the run uses, `DIR/<first 12 characters of the plugin commit>` (`unknown` without a commit).
 
 Runs on Python 3.10 with the standard library only, from the plugin root of the bundle:
-`python -m tools.flash_next.rental.tiny_smoke --out DIR [--ckpt DIR] [--gdn pytorch,fused] [--port N]
+`python -m tools.flash_next.rental.tiny_smoke --out DIR [--ckpt DIR] [--gdn pytorch,fused[,hc]] [--port N]
 [--health-timeout S] [--full-warmup] [--recipe-cache DIR] [--recipe-cache-mb N] [--env KEY=VALUE]`.
 `--ckpt` names a folder the checkpoint is built in once and reused from then on (default: `<out>/ckpt`,
 built every time); a folder built with other settings (another GDN head dim, generator or fixture: the
@@ -52,8 +59,15 @@ GDN_MODES = {
     "pytorch": dict(gates.GDN_FALLBACK_ENV),
     "fused": {gates.GDN_MODE_ENV: str(gates.GDN_MODE_FUSED), gates.GDN_VERIFY_ENV: str(gates.GDN_VERIFY_OFF)},
 }
+# `hc`: the fused mode plus the fused hyper-connection kernels. Not a default mode: the kernels have not
+# run in a server yet, and the two default modes are the ones the run's gates depend on.
+GDN_MODES["hc"] = dict(GDN_MODES["fused"], **{gates.HC_FUSED_ENV: "1"})
 DEFAULT_MODES = "pytorch,fused"
+DECODE_KERNEL_MODES = ("fused", "hc")  # fail when a GDN layer ran the torch decode path
+HC_KERNEL_MODES = ("hc", )  # fail when a hyper-connection ran the torch path
 HEALTH_TIMEOUT_S = 1800.0
+DECODE_TIMING_REPEATS = 3
+DECODE_TIMING_TIMEOUT_S = 120.0  # per request; the graphs are compiled by the comparison that ran before
 MAX_LINES = serve.MAX_ERROR_LINES
 DECODE_FALLBACK = "GDN core decode"
 
@@ -87,6 +101,36 @@ def build_checkpoint(ckpt: Path) -> str | None:
                                                say=lambda text: print("tiny smoke: %s" % text, flush=True))
 
 
+def decode_ms_per_token(base_url: str, reference_path: Path, post=None, clock=time.monotonic):
+    """The decode time per token of the served tiny model in ms, or None when it cannot be measured.
+
+    The shortest reference prompt is generated with gates.TINY_MAX_TOKENS tokens and with 1 token,
+    DECODE_TIMING_REPEATS times each; the best long time minus the best short time, divided by the
+    extra tokens. The prefill and the HTTP round trip are in both and cancel. The comparison just ran
+    this prompt, so no graph compiles here. Recorded only: nothing depends on the value. Never raises."""
+    post = post or gates._post_json
+    try:
+        reference = json.loads(Path(reference_path).read_text(encoding="utf-8"))
+        prompt = min((p["prompt_ids"] for p in reference["prompts"]), key=len)
+        best = {}
+        tokens = 0
+        for max_tokens in (gates.TINY_MAX_TOKENS, 1):
+            for _ in range(DECODE_TIMING_REPEATS):
+                started = clock()
+                resp = post(base_url, "/v1/completions", {"model": "tiny", "prompt": prompt,
+                                                          "max_tokens": max_tokens, "temperature": 0,
+                                                          "return_token_ids": True}, DECODE_TIMING_TIMEOUT_S)
+                seconds = clock() - started
+                best[max_tokens] = min(best.get(max_tokens, seconds), seconds)
+                if max_tokens != 1:
+                    tokens = len((resp.get("choices") or [{}])[0].get("token_ids") or [])
+        if tokens < 2:
+            return None
+        return max(0.0, (best[gates.TINY_MAX_TOKENS] - best[1]) / (tokens - 1) * 1000.0)
+    except Exception:  # noqa: BLE001 - a measurement, not a check
+        return None
+
+
 def run_mode(mode: str, ckpt: Path, out_dir: Path, port: int, health_timeout_s: float, skip_warmup: bool = True,
              extra_env: dict | None = None, recipe_cache: str | None = None, recipe_cache_mb: int = 8192,
              combined_db: bool = False) -> dict:
@@ -102,7 +146,7 @@ def run_mode(mode: str, ckpt: Path, out_dir: Path, port: int, health_timeout_s: 
     log_path = out_dir / "server0.log"
     entry: dict = {"mode": mode, "status": None, "reason": None, "startup_seconds": None, "errors": [],
                    "fallback_lines": [], "log": str(log_path),
-                   "warmup": "warmup skipped" if skip_warmup else "full warmup"}
+                   "warmup": "warmup skipped" if skip_warmup else "full warmup", "decode_ms_per_token": None}
     details: dict = {}
     status = GateStatus.FAILED
     if serve.port_in_use(port):
@@ -133,17 +177,27 @@ def run_mode(mode: str, ckpt: Path, out_dir: Path, port: int, health_timeout_s: 
             if healthy:
                 status, details = gates.tiny_compare("http://127.0.0.1:%d" % port, ckpt / "reference.json")
                 entry["reason"] = details.get("reason") or details.get("error")
+                if status is GateStatus.PASSED:  # recorded only, while the server is still up
+                    entry["decode_ms_per_token"] = decode_ms_per_token("http://127.0.0.1:%d" % port,
+                                                                       ckpt / "reference.json")
             else:
                 status, entry["reason"] = serve.unhealthy_reason(popen, entry["startup_seconds"], health_timeout_s)
         finally:
             serve.stop_server(popen)  # also on Ctrl-C: the workers must not keep the cards
         log_text = _read(log_path)
-        if status is GateStatus.PASSED and mode == "fused":
+        if status is GateStatus.PASSED and mode in DECODE_KERNEL_MODES:
             fallback = [ln for ln in gates.gdn_fallback_lines(log_text) if DECODE_FALLBACK in ln]
             if fallback:
                 status = GateStatus.FAILED
                 entry["reason"] = ("the fused kernel did not run: %d log line(s) say a layer used the torch "
                                    "decode path" % len(fallback))
+                entry["fallback_lines"] = fallback[:MAX_LINES]
+        if status is GateStatus.PASSED and mode in HC_KERNEL_MODES:
+            fallback = gates.hc_fallback_lines(log_text)
+            if fallback:
+                status = GateStatus.FAILED
+                entry["reason"] = ("the fused hyper-connection kernels did not run: %d log line(s) say a layer "
+                                   "used the torch path" % len(fallback))
                 entry["fallback_lines"] = fallback[:MAX_LINES]
         if status is not GateStatus.PASSED:
             entry["errors"] = error_lines(log_text)
@@ -160,6 +214,10 @@ def report_mode(entry: dict) -> None:
         cache_word = "off" if note in (serve.RECIPE_CACHE_NONE, serve.RECIPE_CACHE_OFF_REASON) else "on"
         print("tiny smoke [%s]: PASSED (server up in %s s, tokens match the reference, %s, recipe cache %s)" %
               (mode, entry["startup_seconds"], entry.get("warmup", "warmup skipped"), cache_word), flush=True)
+        decode = entry.get("decode_ms_per_token")
+        if decode is not None:  # its own line: the PASSED line keeps its form
+            print("tiny smoke [%s]: decode %.1f ms/token (the shortest prompt, %d tokens against 1, best of %d)" %
+                  (mode, decode, gates.TINY_MAX_TOKENS, DECODE_TIMING_REPEATS), flush=True)
         return
     word = "TIMED OUT" if entry["status"] == "timed_out" else "FAILED"
     print("tiny smoke [%s]: %s (%s)" % (mode, word, entry["reason"]), flush=True)
@@ -174,7 +232,9 @@ def main(argv: list[str] | None = None) -> int:
                                      "CPU reference, once per GDN mode.")
     parser.add_argument("--out", required=True, help="results folder of this call")
     parser.add_argument("--ckpt", default=None, help="checkpoint folder, built once and reused (default: OUT/ckpt)")
-    parser.add_argument("--gdn", default=DEFAULT_MODES, help="comma-separated modes: pytorch, fused")
+    parser.add_argument("--gdn", default=DEFAULT_MODES,
+                        help="comma-separated modes: pytorch, fused, hc (default: %(default)s; hc is fused plus "
+                        "the fused hyper-connection kernels, VLLM_HPU_HC_FUSED=1)")
     parser.add_argument("--port", type=int, default=orchestrator.TINY_PORT)
     parser.add_argument("--health-timeout", type=float, default=HEALTH_TIMEOUT_S, metavar="S")
     parser.add_argument("--full-warmup", action="store_true",
