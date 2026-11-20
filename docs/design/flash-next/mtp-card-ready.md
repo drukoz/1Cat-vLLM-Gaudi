@@ -39,33 +39,50 @@ and fixed on the way (6, 7 below; the CPU-only break of the first fix).
   per step the verification part and the draft with a lap per draft pass; log lines `MTP step timing: ...` and
   `mtp_step_timing_r<rank>_<pid>.jsonl` in the server's working directory, with `Ft_ms` and `Fd_ms`.
 
-**Branch state.** `9d013a36` and `317c33c5` are committed; they are pushed when the CPU engine run on the fixed
-tree is green (`reports/mtp-card-ready/cpu/fix2-engine.log`; a k = 3 engine rehearsal against k = 0 was the
-quick check). spec-lookup, qsa-fused and engine-step build on this branch and wait for the push: tell the
-coordinator the head (engine-step's agent id is `ad4fd8b387ee2314a`).
-Not yet verified: commit `9722b888` (WIP, `VLLM_HPU_MTP_CHUNK_KV`, default 0, inert at 0). Needed for every
-prompt above about two attention blocks on an MTP server with prefix caching (the scheduler ends a prefill
-chunk at the last cacheable block boundary, one block earlier with MTP; the block is 512 tokens at TP8 with
-MTP, 896 at TP4 + EP4 without speculation: read it from the pair's log), so the draft layer has KV for the
-whole prompt. Its engine test is `test_the_draft_runs_over_every_chunk_of_a_chunked_prompt`.
+**Branch state (20:20 UTC).** Pushed: `origin/feat/flash-next-gaudi-mtp-card-ready` = `f1aa2292` (all card
+fixes, the timer; `test_engine_mtp.py` 14 passed on `9d013a36`). LOCAL, NOT PUSHED (`git log
+origin/feat/flash-next-gaudi-mtp-card-ready..HEAD`): `6285cfae` = the merge of the program head `1b28bbff`
+(PR 12, PR 13; one conflict in `hpu_flash_next_mtp.py`: PR 13's `_draft_tokens` kept, `draft_argmax` inside it,
+the row gather stays `index_select`; the stale `test_proposer_only_reaches_topk_under_the_gate` updated) and
+`015003a3` = `tools/flash_next/rental/mtp_sampled_card.py` (I07's first card check). Push them when the common
+gate is green on the merged tree: it runs detached on a snapshot (`bin/gate` now queues gates, mine waits behind
+other tracks'), output `reports/mtp-card-ready/gate/merge-6285cfae-gate.txt`; the worker tests on the merged tree
+passed (`gate/merge-6285cfae-worker.txt`; `test_hpu_model_runner.py` needs the real bridge, as before the merge).
+Then: pull request to `feat/flash-next-gaudi` (the card-proven fixes are what every other track's MTP needs).
+Dry-run merges onto the merged head: qsa-fused, engine-step and collectives-dev merge clean; step-anatomy
+conflicts in `envs.py` and in `sample_tokens` next to the three timer hooks (keep both).
+Not yet verified on a card: commit `9722b888` (`VLLM_HPU_MTP_CHUNK_KV`, default 0, inert at 0; its engine test
+passes on CPU in the 14). Needed for every prompt above about two attention blocks on an MTP server with prefix
+caching (the scheduler ends a prefill chunk at the last cacheable block boundary, one block earlier with MTP;
+the block is 512 tokens at TP8 with MTP, 896 at TP4 + EP4 without speculation: read it from the pair's log), so
+the draft layer has KV for the whole prompt. Without it acceptance at long prompts will be far below the
+short-prompt numbers.
 
 **Card jobs of this track**
 - 00021 ended 19:54 UTC (exit 0). Everything is fetched: `reports/mtp-card-ready/card/mtp3-fix/` (and
   `00021-mtp3-fix/` for the early copies): `mtp3-torchverify`, `mtp3-fusedverify` (failure 6), `base-nospec`
   (reference), `run1` (tiny, failure 7), `run2` (tiny, PASSED), `run3` + `mtp3-retry` (real model, the numbers).
 - 00022 is cancelled; its place in the queue went to the matched 4-card pair (TP4 + EP4, 1 / 8 / 32 streams,
-  256 tokens):
-  - **00099 `real4-nospec-ref`** (any:4, 30 min, commit `9d013a36`): the reference.
-  - **`real4-mtp3-timed`** (any:4, 35 min, commit `317c33c5`, `--mtp 3`, `VLLM_HPU_GDN_CORE_VERIFY=1`,
-    `VLLM_HPU_MTP_TIMING=1`): the id is in `reports/mtp-card-ready/card/submit-real4-mtp3-timed.log`.
-  The coordinator bumps both once it has the ids. The `farm serve` commands that submitted them wait in the
-  background of the agent's session and copy the results when the jobs end; if the agent is gone:
-  `bin/farm ledger | grep -w mtp-card-ready`, then `bin/farm fetch mtp-card-ready <id> <id>-<name>`.
+  256 tokens), bumped by the coordinator to run after 00014 (it starts by 21:59 UTC at the latest):
+  - **00099 `real4-nospec-ref`** (any:4, 30 min, commit `9d013a36`): the reference. Its local `farm` waiter is
+    gone: when it ends, `bin/farm fetch mtp-card-ready 00099 00099-real4-nospec-ref`.
+  - **00104 `real4-mtp3-timed`** (any:4, 35 min, commit `317c33c5`, `--mtp 3`, `VLLM_HPU_GDN_CORE_VERIFY=1`,
+    `VLLM_HPU_MTP_TIMING=1`). A local waiter copies its results if it still runs; else `bin/farm fetch
+    mtp-card-ready 00104 00104-real4-mtp3-timed`.
   What to read: `scaling.json` / `probe.log` (ms per step = `steady_ms_per_token_p50 x tokens_per_chunk_p50`,
   tokens per step = `tokens_per_chunk_p50`), the `SpecDecoding metrics` lines of `server0.log` (per-position
-  acceptance per 10 s window), the `MTP step timing` lines (Ft, Fd, the draft passes), the TEXT lines. Report
-  to the coordinator: Ft, Fd and acceptance per position at 1, 8, 32 streams against the reference; then
-  `python tools/flash_next/mtp_k_choice.py` for the best k.
+  acceptance per 10 s window), the `MTP step timing` lines and `mtp_step_timing_r*.jsonl` (Ft, Fd, the draft
+  passes), the TEXT lines, and for engine-step the lines `Recurrent state pool: ... slots x ... MiB` and
+  `Maximum concurrency` of the TP4 k = 3 server. Report to the coordinator: Ft, Fd and acceptance per position
+  at 1, 8, 32 streams against the reference; then `python tools/flash_next/mtp_k_choice.py` for the best k.
+- **00105 `tiny2-mtp-arms`** (any:2, 12 min, image `317c33c5`, at the end of the queue: ask the coordinator for a
+  bump): `bash tools/flash_next/rental/mtp_tiny_card.sh 3`: arm `base` (the tree's defaults: the int64 index of
+  the GDN copies on a card), arm `loop-chunk` (`VLLM_HPU_MTP_DRAFT_LOOP=1`, `VLLM_HPU_MTP_CHUNK_KV=1`, neither
+  ever ran on a card). Once the merged head is pushed, replace it by one job from the head that also runs
+  `python tools/flash_next/rental/mtp_sampled_card.py --k 3` (arms plain, refuse, sampled: I07 on the tiny
+  model): `bin/farm job mtp-card-ready tiny2-mtp-all any:2 20m --replaces 00105 -- bash -c 'bash
+  tools/flash_next/rental/mtp_tiny_card.sh 3; python tools/flash_next/rental/mtp_sampled_card.py --k 3'`.
+- spec-lookup's 00097 (`tiny2-mtp3-lookup-oracle`): accepted counts 1 to 3 on the tiny model on a card; read it.
 
 **Pending, in order**
 1. The pair above: read, report, write the numbers here.
@@ -73,15 +90,24 @@ whole prompt. Its engine test is `test_the_draft_runs_over_every_chunk_of_a_chun
    tools/flash_next/rental/mtp_tiny_card.sh 3` (arms: the tree's defaults with the int64 index; then
    `VLLM_HPU_MTP_DRAFT_LOOP=1` + `VLLM_HPU_MTP_CHUNK_KV=1`). spec-lookup's job 00097 runs accepted counts 1 to 3
    on the tiny model with an oracle: read its result.
-3. 32 streams with the qsa-fused data flow: merge `origin/feat/flash-next-gaudi-qsa-fused` into this branch (it
-   contains the program head; `git merge-tree` shows one conflict, in `hpu_flash_next_mtp.py`), flags
-   `VLLM_HPU_QSA_FUSED`, `VLLM_HPU_QSA_INDEXER_SHARD`, `VLLM_HPU_QSA_TABLE_WIDTH` as its A/B pair 00062 / 00063
-   confirms them; then an `any:4` MTP arm at 32 streams.
-4. I07 sampled verification on the card (the owner's agents sample: temperature 1.0, top_k 20, top_p 0.95):
-   `VLLM_HPU_SPEC_SAMPLED_VERIFY=1`, acceptance and step time with the server's default sampling. engine-step
-   will provide `candidate_probs(values, temperature, top_k, top_p)` (the processed distribution on the 64
-   largest logits per row, `vllm_gaudi/v1/sample/candidate_sampling.py` on its branch): build the sampled
-   rejection path so it can take that in place of the full-vocabulary distribution.
+3. 32 streams with the qsa-fused data flow: `git merge origin/feat/flash-next-gaudi-qsa-fused` (clean onto the
+   merged head), flags `VLLM_HPU_QSA_FUSED=1`, `VLLM_HPU_QSA_INDEXER_SHARD=1`, `VLLM_HPU_QSA_TABLE_WIDTH=1` as its
+   A/B pair 00062 / 00063 confirms them; a CPU engine rehearsal of k = 3 against k = 0 with those flags on a
+   scratch merge was started 20:17 UTC (results in the agent's scratchpad `qsa_k3/`, `qsa_k0/`; repeat it with
+   `python -m tests.unit_tests.hpu_cpu_engine --ckpt <tiny checkpoint> --out k3.json --k 3`). Then an `any:4`
+   MTP arm at 32 streams with the timer. engine-step's I01 (`VLLM_HPU_FLASH_NEXT_DECODE_METADATA=1`, on the
+   program branch after its gate) is one more `--env` on the same arm: the timer's `passN_meta` laps and `Ft_ms`
+   read its effect.
+4. I07 sampled verification on the card (the owner's agents sample: temperature 1.0, top_k 20, top_p 0.95).
+   First the tiny model (`mtp_sampled_card.py`, above), then the real model: `VLLM_HPU_SPEC_SAMPLED_VERIFY=1`
+   and sampled rounds (the farm's probe sends none: use `reports/mtp-card-ready/job/spec_scaling.py --sampled
+   N:T` from a `farm job`, or add the round to a probe in the tree). Today's `=1` path is exact in distribution
+   over the full vocabulary in torch (`hpu_rejection_sampler.sampled_rejection_sample`). Target form: engine-step's
+   `vllm_gaudi/v1/sample/candidate_sampling.py` (its branch `9bf1920f`: `take_candidates(logits, C=64)`,
+   `candidate_probs(values, temperature, top_k_index, top_p)`) or collectives' `vocab_parallel.top_k(model,
+   hidden_states, C)` (branch `collectives-dev`, `ea3bc30a`) give `(values fp32 [rows, C], ids)`: p(draft) is
+   the column whose id equals the draft (int32 compare; zero when the draft is no candidate), the recovery token
+   comes from the same row with that column zeroed, the noise is host-made and identical on every rank.
 5. I02 (the timer shows what each draft pass costs; engine-step's I01 removes the drafter's per-step
    paged-attention buffers), I37 memory (the k = 3 pool is 6.147 GiB per card at TP8; read `Maximum
    concurrency`), I43 / k = 4 and 5 (`tools/flash_next/mtp_k_choice.py`).
