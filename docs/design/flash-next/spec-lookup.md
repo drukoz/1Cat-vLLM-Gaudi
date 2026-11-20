@@ -10,7 +10,7 @@ repository is under `/Volumes/Storage/Claude/gaudi-work/reports/spec-lookup/` (`
 
 ## Handoff (if this agent stops)
 
-State at **2026-11-20 23:35 UTC** (fourth agent, Opus 5.5). Branch head: the commit that holds this text, pushed.
+State at **2026-11-20 23:45 UTC** (fourth agent, Opus 5.5). Branch head: the commit that holds this text, pushed.
 It contains the program head `938dada4` (merged as `49eb18cb`: PR #14 collectives), mtp-card-ready through
 `f1aa2292` and every commit of this track. The node ends about 04:00 UTC on 2026-11-21: everything on it is lost.
 
@@ -53,14 +53,25 @@ the old head; the tree is the current one). Do not start a second one; check tha
    vLLM's search; real model: 00129), the hybrid (tiny model, 00107 torch and 00114 fused verification). All flags
    of this track default off (`VLLM_HPU_FLASH_NEXT_SPEC_LOOKUP`, `..._LOOKUP_MIN_NGRAM`, `..._LOOKUP_MAX_NGRAM`,
    `..._LOOKUP_ORACLE`); n-gram itself is chosen by `--speculative-config`. This branch contains mtp-card-ready's
-   commits through `f1aa2292` (not yet on the program head): a pull request of this branch brings them along;
-   say so in its body or wait for mtp-card-ready's own merge.
+   commits through `f1aa2292` (not yet on the program head). **Blocked on mtp-card-ready (23:45 UTC):** on the
+   merged head `tests/unit_tests/models/flash_next/test_engine_mtp.py` fails one test, run alone
+   (`test_sampled_requests_through_the_speculative_engine`: "output with shape [1, 248320] doesn't match the
+   broadcast shape [4, 248320]"; 13 passed; `reports/spec-lookup/logs/m8_test_engine_mtp_54990f1f.log`). It is
+   their sampled-verification path, red since the program head's merge; their fix `0d1be6fc` exists only in
+   their local worktree (origin still at `f1aa2292`). Do not cherry-pick it: wait until it is on origin or on
+   the program head (their pull request), merge the program head again, rerun the gate, then this pull request.
+   The coordinator knows (23:45 UTC). Their commit also says every speculative step on `f1aa2292` + head runs
+   one discarded sampler pass over the `1 + k` padded rows: a small extra cost inside 00129's numbers.
 3. **Rows at 32 streams** (section 7): an n-gram step is as wide as its longest draft, an empty draft is the
    2-row placeholder, so 32 streams carry `32 (1 + k)` rows as soon as one stream drafts. Two code steps would
    fix the economics of a mixed load: per-request (ragged) verification rows (rows `sum(1 + d_i)`, not
    `32 (1 + max d_i)`), and no placeholder row for a request without a draft. Both need the runner's decode
-   batch to carry per-request query lengths; not started. A smaller step for warm-up and graph memory: a flag
-   that pins the n-gram width to `1 + k` (one HPU graph per bucket instead of `k`; `verification_width`).
+   batch to carry per-request query lengths; not started. A smaller step, needed before an n-gram server runs
+   with warm-up in production: a flag that pins the n-gram verification width to `1 + k` (in
+   `_create_decode_input_data`, `num_tokens = max(num_tokens, 1 + k)` for a verification step), so every step
+   uses the warmed `batch x (1 + k)` buckets instead of compiling the narrower widths on first use (section 2);
+   it costs `k - 1` padding rows per request on steps whose longest draft is short (no effect at 32 editing
+   streams, which run at full width anyway).
 4. Depth beyond 5 with the fused verification op needs a 9-node lattice (`GDN_CORE_VERIFY_MAX_NODES = 6`);
    k = 8 runs the torch recurrence today (rehearsed on the tiny model, 00087).
 
@@ -120,9 +131,12 @@ by `test_lookup_engine.py`):
 
 Every decode step of an n-gram server is a verification step: a request without a match gets the placeholder
 draft `[-1]` (never accepted), so the narrowest batch is 2 tokens wide and the width changes from step to step
-(2 to `1 + k`). INFERRED consequence for the card: each (batch bucket, width, block bucket) is its own HPU
-graph, so an n-gram server compiles up to `k` times the decode graphs of an MTP server; the hybrid keeps
-MTP's one width.
+(2 to `1 + k`). Consequence for the card: each (batch bucket, width, block bucket) is its own HPU graph, so
+an n-gram server compiles up to `k` times the decode graphs of an MTP server (INFERRED); the hybrid keeps
+MTP's one width. The warm-up does not cover the narrower widths: `generate_spec_decode_buckets`
+(`vllm_gaudi/extension/bucketing/common.py`) adds decode buckets for `batch x (1 + k)` flattened rows only
+(VERIFIED by reading the code), so a production n-gram server with warm-up would still compile every narrower
+width on its first use (the longest gaps of 00095's rounds at TP4, compiles and prefills: 12.7 to 32.8 s).
 
 ## 3. The lookup + MTP hybrid
 
