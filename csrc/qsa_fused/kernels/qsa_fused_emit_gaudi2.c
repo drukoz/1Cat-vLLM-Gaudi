@@ -17,9 +17,9 @@
 // gives it (the softmax of an all -inf row is NaN). A block table column outside [0, MB) is clamped:
 // the kernel never reads outside its tensors, and for the indexer's own selection it never happens.
 //
-// One index-space point is one row. Per block one scalar load of its id and one of its page, the
-// ratio slots of the block go into lanes of a 64-lane int32 vector, one full vector store per
-// 64 / ratio blocks. ratio and B are powers of two (the glue checks), ratio <= 64.
+// One index-space point is one row. Per block one scalar load of its id and one of its page (four blocks
+// in flight), the ratio slots of the block go into lanes of a 64-lane int32 vector, one full vector store
+// per 64 / ratio blocks. ratio and B are powers of two (the glue checks), ratio <= 64.
 #pragma clang fp contract(off)
 
 #define QSA_LANES32 64
@@ -52,17 +52,42 @@ void main(tensor blocks, tensor positions, tensor block_table, tensor slots, ten
             int64 slot_vec = origin;
             int64 valid_vec = no_selection;
             const int count = topk - first < per_vector ? topk - first : per_vector;
-            for (int j = 0; j < count; ++j) {
-                const int b = s_i32_ld_g(gen_addr((int5){first + j, row, 0, 0, 0}, blocks));
-                const int kept = b >= 0;
-                const int pos0 = kept ? (b << ratio_log2) : 0;
-                const int base = (qsa_page(block_table, pos0 >> block_log2, columns, row) << block_log2) +
-                                 (pos0 & block_mask);
-                const bool64 group = v_i32_cmp_eq_b(lane_block, j);
-                // kept: base + r in the ratio lanes of the block; dropped: the slot of position 0
-                const int64 value = kept ? base + lane_in_block : (int64)origin;
-                slot_vec = v_i32_mov_vb(value, 0, slot_vec, group, 0);
-                valid_vec = v_i32_mov_vb((int64)(kept | no_selection), 0, valid_vec, group, 0);
+            // Four blocks per iteration, their loads independent of each other: the scalar loads of one block
+            // (its id, then its page) are a dependent chain, four chains overlap.
+            for (int j = 0; j < count; j += 4) {
+                const int j1 = j + 1 < count ? j + 1 : j;
+                const int j2 = j + 2 < count ? j + 2 : j;
+                const int j3 = j + 3 < count ? j + 3 : j;
+                const int b0 = s_i32_ld_g(gen_addr((int5){first + j, row, 0, 0, 0}, blocks));
+                const int b1 = s_i32_ld_g(gen_addr((int5){first + j1, row, 0, 0, 0}, blocks));
+                const int b2 = s_i32_ld_g(gen_addr((int5){first + j2, row, 0, 0, 0}, blocks));
+                const int b3 = s_i32_ld_g(gen_addr((int5){first + j3, row, 0, 0, 0}, blocks));
+                const int p0 = b0 >= 0 ? (b0 << ratio_log2) : 0;
+                const int p1 = b1 >= 0 ? (b1 << ratio_log2) : 0;
+                const int p2 = b2 >= 0 ? (b2 << ratio_log2) : 0;
+                const int p3 = b3 >= 0 ? (b3 << ratio_log2) : 0;
+                const int base0 = (qsa_page(block_table, p0 >> block_log2, columns, row) << block_log2) + (p0 & block_mask);
+                const int base1 = (qsa_page(block_table, p1 >> block_log2, columns, row) << block_log2) + (p1 & block_mask);
+                const int base2 = (qsa_page(block_table, p2 >> block_log2, columns, row) << block_log2) + (p2 & block_mask);
+                const int base3 = (qsa_page(block_table, p3 >> block_log2, columns, row) << block_log2) + (p3 & block_mask);
+                // kept: base + r in the ratio lanes of the block; dropped: the slot of position 0. A lane group
+                // past `count` (j1..j3 clamped to j) is never stored: the partial store below ends at count.
+                slot_vec = v_i32_mov_vb(b0 >= 0 ? base0 + lane_in_block : (int64)origin, 0, slot_vec,
+                                        v_i32_cmp_eq_b(lane_block, j), 0);
+                slot_vec = v_i32_mov_vb(b1 >= 0 ? base1 + lane_in_block : (int64)origin, 0, slot_vec,
+                                        v_i32_cmp_eq_b(lane_block, j + 1), 0);
+                slot_vec = v_i32_mov_vb(b2 >= 0 ? base2 + lane_in_block : (int64)origin, 0, slot_vec,
+                                        v_i32_cmp_eq_b(lane_block, j + 2), 0);
+                slot_vec = v_i32_mov_vb(b3 >= 0 ? base3 + lane_in_block : (int64)origin, 0, slot_vec,
+                                        v_i32_cmp_eq_b(lane_block, j + 3), 0);
+                valid_vec = v_i32_mov_vb((int64)((b0 >= 0) | no_selection), 0, valid_vec,
+                                         v_i32_cmp_eq_b(lane_block, j), 0);
+                valid_vec = v_i32_mov_vb((int64)((b1 >= 0) | no_selection), 0, valid_vec,
+                                         v_i32_cmp_eq_b(lane_block, j + 1), 0);
+                valid_vec = v_i32_mov_vb((int64)((b2 >= 0) | no_selection), 0, valid_vec,
+                                         v_i32_cmp_eq_b(lane_block, j + 2), 0);
+                valid_vec = v_i32_mov_vb((int64)((b3 >= 0) | no_selection), 0, valid_vec,
+                                         v_i32_cmp_eq_b(lane_block, j + 3), 0);
             }
             const int5 out = {first << ratio_log2, row, 0, 0, 0};
             const int lanes_used = count << ratio_log2;

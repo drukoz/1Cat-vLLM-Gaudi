@@ -42,6 +42,19 @@ stand-ins of the HPU attention), counted with a `TorchDispatchMode` that attribu
 A verification step (`bs` requests of `1 + k` rows) dispatches 182 (118) in `select` at 4, 128 and 192 rows. The
 node count does not depend on the rows; the bytes do.
 
+The same count for each mode (`reports/qsa-fused/measure/qsa_ops_v2.py`, VERIFIED; mode 2 with the references
+registered as the ops' CPU kernels, one node per op as on the card):
+
+| Mode | One QSA layer, 1 row: total (compute) | 32 rows | 12 layers at 32 rows |
+|---|---|---|---|
+| 0 (torch path) | 256 (157) | 258 (159) | 3,096 (1,908) |
+| 1 (torch data flow) | 244 (155) | 246 (157) | 2,952 (1,884) |
+| 2 (K1 + K4) | 136 (68) | 138 (70) | 1,656 (840) |
+
+Mode 2 by stage at 32 rows: the row table and K1 31 ops (the ring, cache and query work is one node), the
+request-major scores and top-k 36, K4 1, the attention 41 (cache write, gather, grouped GEMMs, softmax), the
+layer's projections, norms, RoPE and gate 29.
+
 ### Bytes: the block table is as wide as the engine's longest context
 
 VERIFIED (`hpu_model_runner.py:7204`, `flash_next_inputs.build_block_table`): the decode block table has
@@ -305,10 +318,11 @@ block_size, rotary_half}`, 24 bytes, the same for both GUIDs (unused fields 0; K
 - **Access patterns.** K1: every input whole (data-dependent rows of the ring, the cache, `cos_sin`; `qk` and
   `rows` of other rows for write-then-read); `q_idx` by row. K4: `blocks`, `positions`, `block_table`, `slots`,
   `valid` by row. The simulator runs every case with its index-space mapping test and partition shuffle on.
-- **Instruction counts** (simulator, VERIFIED): K1 5.6 K words per row at the real geometry (180,746 for 32 rows);
-  K4 31 K words per row (1,005,978 for 32 rows: about 60 words per selected block, mostly waits on the two scalar
-  loads of each block). INFERRED at 1.5 to 2 GHz: K1 about 3 to 4 us and K4 about 16 to 21 us per layer at 32 rows
-  (two rows per engine).
+- **Instruction counts** (simulator, VERIFIED): K1 5.6 K words per row at the real geometry (180,746 for 32 rows)
+  and 8.8 K at 32 x 4 rows (1,122,610 for 128 rows: the write-then-read search scans the 128 rows); K4 11.8 K
+  words per row (378,328 for 32 rows, 1,513,048 for 128: about 23 words per selected block, four blocks' scalar
+  loads in flight; 60 with one). INFERRED at 1.5 to 2 GHz: K1 about 6 to 8 us and K4 about 12 to 16 us per layer at
+  32 rows (two rows per engine), K1 30 to 40 us and K4 35 to 50 us at 128 rows.
 
 ## Card rules (BRIEF.md) and how each is met
 
@@ -355,8 +369,8 @@ attention. Rule 6 applies (Gaudi2 range 240).
 - **The fp32 copy of the gathered keys** (mode 1's largest byte term): a bf16 x bf16 -> fp32 GEMM (the HPU
   `fp8_gemm_v2` takes bf16 operands with an fp32 output in some releases; unverified), or a TPC kernel that gathers
   and widens in one pass.
-- **K4 at fewer words per block**: issue the 16 block-id loads of a vector before their page loads (the scalar
-  chain is what the 60 words wait on), or split the row over 8 points.
+- **K4 at fewer words per block** (23 now): split a row over several index-space points (24 engines for 32 rows
+  leave most engines at two rows).
 - **K3**, a radix-select threshold for the top-512 (the DeepSeek V4.1 `index_threshold` precedent), only if card
   job `qsa-select-attn-bench` shows `torch.topk` over `[T, 32768]` costs more than the rest of the indexer.
 - **Tile layout of the compressed key cache** and a TPC scan (version 1's "Next"): only worth it if the MME path
