@@ -25,8 +25,10 @@ wait, divided by ten (the device time once the host is ahead). Per case: the eff
 from __future__ import annotations
 
 import argparse
+import atexit
 import json
 import os
+import signal
 import subprocess
 import sys
 import tempfile
@@ -46,6 +48,43 @@ ROWS = {
 }
 SELFTEST_ROWS = (1, 4)
 
+
+
+# Child processes of this parent: each in its own session, killed (with whatever it started) when the parent is
+# stopped by SIGTERM or SIGINT or exits. A child left behind keeps its card, and the next job on that card fails
+# with "Device acquire failed" (job 00009: a timed-out parent left its child on card 0).
+_CHILDREN = []
+
+
+def _reap_children(signum=None, frame=None):
+    for proc in list(_CHILDREN):
+        if proc.poll() is None:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except Exception:  # noqa: BLE001 - not a group leader, or already gone
+                try:
+                    proc.kill()
+                except Exception:  # noqa: BLE001
+                    pass
+    if signum is not None:
+        sys.exit(128 + int(signum))
+
+
+def install_reaper():
+    """In the parent only: SIGTERM, SIGINT and exit kill every child started with ``spawn``."""
+    atexit.register(_reap_children)
+    for signum in (signal.SIGTERM, signal.SIGINT):
+        try:
+            signal.signal(signum, _reap_children)
+        except (ValueError, OSError):  # not the main thread
+            pass
+
+
+def spawn(cmd, **kwargs):
+    """``subprocess.Popen`` in a new session, remembered for ``_reap_children``."""
+    proc = subprocess.Popen(cmd, start_new_session=True, **kwargs)
+    _CHILDREN.append(proc)
+    return proc
 
 def _median(values):
     ordered = sorted(values)
@@ -235,7 +274,7 @@ def start_child(case, rows_list, selftest, card):
         env["HABANA_VISIBLE_MODULES"] = str(card)
     out = tempfile.TemporaryFile(mode="w+")
     err = tempfile.TemporaryFile(mode="w+")
-    proc = subprocess.Popen(cmd, env=env, cwd=tempfile.gettempdir(), stdout=out, stderr=err, text=True)
+    proc = spawn(cmd, env=env, cwd=tempfile.gettempdir(), stdout=out, stderr=err, text=True)
     return {"case": case, "card": card, "proc": proc, "out": out, "err": err, "started": time.monotonic()}
 
 
@@ -289,6 +328,7 @@ def main(argv=None):
     if args.child:
         rows = [int(r) for r in args.rows.split(",")] if args.rows else list(ROWS[args.child])
         return child(args.child, rows, args.selftest)
+    install_reaper()
     cases = [c for c in args.cases.split(",") if c in UNITS]
     cards = [c.strip() for c in args.cards.split(",") if c.strip()] if args.cards else [None]
     runs, pending = [], []

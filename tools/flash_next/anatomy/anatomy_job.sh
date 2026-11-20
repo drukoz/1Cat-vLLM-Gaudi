@@ -168,25 +168,29 @@ JSON
 
 plan_b() {
     # G1-1 while no server holds the cards: one case per card on cards 0-4; on card 5 the lazy-op cases that
-    # job 00009 lost (its 3,000- and 10,000-op graphs compile for minutes and time its children out).
+    # job 00009 lost (its 3,000- and 10,000-op graphs compile for minutes and time its children out). The copies
+    # next to this script kill their children when they are stopped (the bundle's copies did not: job 00009's
+    # collective bench found card 0 still held by an orphaned lazy-op child).
     local pids=()
-    if [ -f "$HERE/bench_mme_rows.py" ]; then
-        say "MME row sweep on cards 0-4"
-        PT_HPU_LAZY_MODE=1 PT_HPU_LAZY_ACC_PAR_MODE=0 timeout 900 \
-            python3 "$HERE/bench_mme_rows.py" --cards 0,1,2,3,4 --out /results/mme_rows.json > /results/mme_rows.log 2>&1 &
-        pids+=($!)
-    fi
-    if [ -f /bundle/plugin/tools/flash_next/anatomy/bench_lazy_ops.py ]; then
-        say "lazy-op cases on card 5 (sizes 100, 300, 1000; accumulation mode 0)"
-        HABANA_VISIBLE_MODULES=5 timeout 900 python3 /bundle/plugin/tools/flash_next/anatomy/bench_lazy_ops.py \
-            --sizes 100,300,1000 --acc-modes 0 --child-timeout 800 --out /results/lazy_ops_small.json \
-            > /results/lazy_ops_small.log 2>&1 &
-        pids+=($!)
-    fi
+    say "MME row sweep on cards 0-4, lazy-op cases (100 to 1,000 ops, accumulation mode 0) on card 5"
+    PT_HPU_LAZY_MODE=1 PT_HPU_LAZY_ACC_PAR_MODE=0 timeout 900 \
+        python3 "$HERE/bench_mme_rows.py" --cards 0,1,2,3,4 --out /results/mme_rows.json > /results/mme_rows.log 2>&1 &
+    pids+=($!)
+    HABANA_VISIBLE_MODULES=5 timeout 900 python3 "$HERE/bench_lazy_ops.py" --sizes 100,300,1000 --acc-modes 0 \
+        --child-timeout 800 --out /results/lazy_ops_small.json > /results/lazy_ops_small.log 2>&1 &
+    pids+=($!)
     for pid in "${pids[@]}"; do wait "$pid"; done
+    pkill -9 -f "bench_(mme_rows|lazy_ops).py" 2>/dev/null
     say "one-card benches done"
     tail -n 45 /results/mme_rows.log 2>/dev/null | cut -c1-250
     tail -n 30 /results/lazy_ops_small.log 2>/dev/null | cut -c1-250
+    # The HCCL latency job 00009 could not measure: 8 ranks at the decode rows and the k = 3 verify rows.
+    say "collectives on 8 ranks"
+    timeout 600 python3 "$HERE/bench_collectives.py" --ranks 8 --rows 1,8,32,128 --out /results/collectives_r8.json \
+        > /results/coll8.log 2>&1
+    say "collectives rc $?"
+    pkill -9 -f "bench_collectives.py" 2>/dev/null
+    tail -n 16 /results/coll8.log | cut -c1-250
     # I10 / G4-2: the per-decoder-layer mark_step every 4 layers (default every layer). A bigger recipe compiles
     # far longer (00009: 1,000 ops 14 s, 3,000 ops 135 s), so 4 first; 12 only when the job has time left.
     base_env

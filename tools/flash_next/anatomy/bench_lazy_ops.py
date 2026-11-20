@@ -34,8 +34,10 @@ child (accumulation mode 0, no recipe cache on disk) gave every ``graph`` result
 from __future__ import annotations
 
 import argparse
+import atexit
 import json
 import os
+import signal
 import subprocess
 import sys
 import tempfile
@@ -59,6 +61,43 @@ CUT_SEGMENTS = (1, 2, 4, 12, 50, 100)
 HEAD_ROWS = (1, 8, 32)
 FAMILIES = ("chain", "mix")
 
+
+
+# Child processes of this parent: each in its own session, killed (with whatever it started) when the parent is
+# stopped by SIGTERM or SIGINT or exits. A child left behind keeps its card, and the next job on that card fails
+# with "Device acquire failed" (job 00009: a timed-out parent left its child on card 0).
+_CHILDREN = []
+
+
+def _reap_children(signum=None, frame=None):
+    for proc in list(_CHILDREN):
+        if proc.poll() is None:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except Exception:  # noqa: BLE001 - not a group leader, or already gone
+                try:
+                    proc.kill()
+                except Exception:  # noqa: BLE001
+                    pass
+    if signum is not None:
+        sys.exit(128 + int(signum))
+
+
+def install_reaper():
+    """In the parent only: SIGTERM, SIGINT and exit kill every child started with ``spawn``."""
+    atexit.register(_reap_children)
+    for signum in (signal.SIGTERM, signal.SIGINT):
+        try:
+            signal.signal(signum, _reap_children)
+        except (ValueError, OSError):  # not the main thread
+            pass
+
+
+def spawn(cmd, **kwargs):
+    """``subprocess.Popen`` in a new session, remembered for ``_reap_children``."""
+    proc = subprocess.Popen(cmd, start_new_session=True, **kwargs)
+    _CHILDREN.append(proc)
+    return proc
 
 def _now() -> float:
     return time.perf_counter()
@@ -478,7 +517,7 @@ def run_child(label: str, env: dict, child_args: list, timeout_s: float, echo=pr
     """Run this script as ``--child``; keep every result line it printed, also when it is killed at the timeout."""
     cmd = [sys.executable, os.path.abspath(__file__), "--child", *child_args]
     started = time.monotonic()
-    proc = subprocess.Popen(cmd, env=env, cwd=tempfile.gettempdir(), stdout=subprocess.PIPE,
+    proc = spawn(cmd, env=env, cwd=tempfile.gettempdir(), stdout=subprocess.PIPE,
                             stderr=subprocess.STDOUT, text=True)
     records, tail = [], []
 
@@ -663,6 +702,7 @@ def main(argv=None) -> int:
         args.rows_probe_n = sizes[-1]
     if args.child:
         return child_main(args)
+    install_reaper()
 
     child_args = ["--sizes", ",".join(str(n) for n in sizes), "--rows", ",".join(str(r) for r in args.rows),
                   "--rows-probe-n", str(args.rows_probe_n), "--families", ",".join(args.families)]

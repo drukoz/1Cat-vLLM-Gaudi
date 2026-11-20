@@ -31,8 +31,10 @@ the slowest rank. Exit code 0 when every rank finished, 2 otherwise.
 from __future__ import annotations
 
 import argparse
+import atexit
 import json
 import os
+import signal
 import subprocess
 import sys
 import tempfile
@@ -48,6 +50,43 @@ DECODE_ALL_REDUCES = 98
 DEFAULT_ROWS = (1, 8, 32)
 EXIT_GRACE_S = 20.0
 
+
+
+# Child processes of this parent: each in its own session, killed (with whatever it started) when the parent is
+# stopped by SIGTERM or SIGINT or exits. A child left behind keeps its card, and the next job on that card fails
+# with "Device acquire failed" (job 00009: a timed-out parent left its child on card 0).
+_CHILDREN = []
+
+
+def _reap_children(signum=None, frame=None):
+    for proc in list(_CHILDREN):
+        if proc.poll() is None:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except Exception:  # noqa: BLE001 - not a group leader, or already gone
+                try:
+                    proc.kill()
+                except Exception:  # noqa: BLE001
+                    pass
+    if signum is not None:
+        sys.exit(128 + int(signum))
+
+
+def install_reaper():
+    """In the parent only: SIGTERM, SIGINT and exit kill every child started with ``spawn``."""
+    atexit.register(_reap_children)
+    for signum in (signal.SIGTERM, signal.SIGINT):
+        try:
+            signal.signal(signum, _reap_children)
+        except (ValueError, OSError):  # not the main thread
+            pass
+
+
+def spawn(cmd, **kwargs):
+    """``subprocess.Popen`` in a new session, remembered for ``_reap_children``."""
+    proc = subprocess.Popen(cmd, start_new_session=True, **kwargs)
+    _CHILDREN.append(proc)
+    return proc
 
 def _now() -> float:
     return time.perf_counter()
@@ -387,7 +426,7 @@ def run_ranks(args, echo=print) -> dict:
             cmd.append("--selftest")
         if args.quick:
             cmd.append("--quick")
-        proc = subprocess.Popen(cmd, env=env, cwd=workdir, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        proc = spawn(cmd, env=env, cwd=workdir, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                 text=True)
         procs.append(proc)
         thread = threading.Thread(target=reader, args=(rank, proc), daemon=True)
@@ -451,6 +490,7 @@ def main(argv=None) -> int:
     args.rows = [int(token) for token in str(args.rows).split(",") if token.strip()]
     if args.child:
         return rank_main(args)
+    install_reaper()
     if args.selftest and args.ranks > 4:
         args.ranks = 2
     run = run_ranks(args)

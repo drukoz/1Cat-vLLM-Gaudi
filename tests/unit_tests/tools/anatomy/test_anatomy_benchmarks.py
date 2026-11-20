@@ -6,8 +6,11 @@ collectives), so these tests check the scripts, not the numbers.
 """
 
 import json
+import os
+import signal
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 
@@ -44,3 +47,37 @@ def test_bench_collectives_selftest(tmp_path):
     data = json.loads(out.read_text())
     assert data["selftest"] is True
     assert data["derived"], "no derived per-collective numbers"
+
+
+REAPER_SCRIPT = r'''
+import os, signal, sys, time
+sys.path.insert(0, sys.argv[1])
+import {module} as bench
+bench.install_reaper()
+child = bench.spawn(["sleep", "60"])
+print(child.pid, flush=True)
+time.sleep(60)
+'''
+
+
+def _pid_alive(pid):
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    return True
+
+
+def test_parents_kill_their_children_on_sigterm():
+    """A parent stopped by SIGTERM (``timeout``, the queue's maximum hold) takes its children with it."""
+    for module in ("bench_lazy_ops", "bench_collectives", "bench_mme_rows"):
+        proc = subprocess.Popen([sys.executable, "-c", REAPER_SCRIPT.replace("{module}", module), str(ANATOMY)],
+                                stdout=subprocess.PIPE, text=True)
+        child_pid = int(proc.stdout.readline())
+        assert _pid_alive(child_pid)
+        proc.send_signal(signal.SIGTERM)
+        assert proc.wait(timeout=30) == 128 + signal.SIGTERM
+        deadline = time.time() + 10
+        while _pid_alive(child_pid) and time.time() < deadline:
+            time.sleep(0.05)
+        assert not _pid_alive(child_pid), module
