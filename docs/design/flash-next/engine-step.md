@@ -59,8 +59,10 @@ sampler instead: <reason>" (integration was told at 23:55 UTC).
 
 ### Pending subtasks after those steps, in order
 
-1. **Time to first token of a turn with a cached prefix** (coordinator 00:05 entry: 6 to 9 s at TP4 for 300 to 500
-   new tokens on a 34.5K or 64K cached prefix): what the host does before the first token. Not started.
+1. **Time to first token of a turn with a cached prefix** (coordinator: 6 to 9 s at TP4 for 300 to 500 new tokens
+   on a 34.5K or 64K cached prefix): the runner's host part is 2 to 4 ms (section 10), so the time is in the model's
+   prompt forward (device, or the lazy issue of the prompt graph): prefill's. A step timer or a device trace of
+   one such chunk on the card would split it; not run.
 2. **The replay call grows from 23 ms at 1 stream to 35 ms at 32** (step-anatomy's split): what in the runner makes
    the host wait inside it; split with native-replay. Not started.
 3. Sampled verification with MTP is mtp-card-ready's (`VLLM_HPU_SPEC_SAMPLED_VERIFY`, rows of
@@ -339,3 +341,20 @@ One server, flags flipped by the switch file, rounds in turn. Healthy after 426 
   against 133 s for the first; hit rate 0.0 % all job), so no long-context round ran. Prefill owns it.
 - 1-stream steps varied from 27 to 44 ms within the job (host-bound; a neighbour job loaded its weights, load
   average up to 132).
+
+## 10. Time to first token of a cached-prefix turn: the runner's host part (MEASURED on the Mac)
+
+`reports/engine-step/probes/ttft_cached_prefix.py` (output `ttft_cached_prefix_out.txt`): the engine harness with
+the stub model at the real geometry, TP4 (scheduler block 896, kernel block 128, align mode, recurrent pool, sparse
+QSA), `max_num_batched_tokens` 8192, `long_prefill_token_threshold` 2048. Request A prefills a prefix, then B and C
+send the same prefix plus their own new tokens.
+
+| prefix | new tokens | cached for B and C | steps to B's first token | host ms of that step |
+|---|---|---|---|---|
+| 34,048 | 501 | 34,048 | 1 | 2.2 (C: 1.8) |
+| 120,832 | 64 | 120,064 (134 x 896) | 1 | 3.5 (C: 3.6) |
+
+So the runner and the scheduler spend 2 to 4 ms on the host before such a turn's first token; qsa-fused's 6.5 to
+7.6 s per 501-token chunk over a 34K cached prefix (job 00063, warm) is in the model's prompt forward. The harness
+hits the 120,832-token prefix because its engine core cuts chunks at multiples of 896; the card's engine cut them
+at multiples of 2,048 and missed (prefill's root cause, `VLLM_HPU_PREFIX_ALIGN_SPLIT`).
