@@ -530,6 +530,7 @@ if TYPE_CHECKING:
     VLLM_HPU_FLASH_NEXT_QSA_MODE: int = 0
     VLLM_HPU_FLASH_NEXT_QSA_PREFILL_TILE: int = 2048
     VLLM_HPU_FLASH_NEXT_DECODE_METADATA: int = 0  # 0 dense paged-attention buffers (default), 1 sparse-QSA only
+    VLLM_HPU_RUNTIME_SWITCH_FILE: str = ""  # a file of per-step flags a running server rereads (an A/B on one server)
     VLLM_HPU_GDN_CORE_DECODE: int = 1  # GdnCoreDecodeMode: 1 fused (default), 0 off, 2 recurrence
     VLLM_HPU_GDN_CORE_DECODE_DEBUG: int = 0  # GdnCoreDecodeDebug: 0 off, 1 check slot indices every step (host sync)
     VLLM_HPU_GDN_CORE_VERIFY: int = 0  # GdnCoreVerifyMode: 0 off (default), 1 fused verification steps
@@ -1880,6 +1881,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # dense QSA, defragmenter on, ...) logs the reason once and keeps the dense buffers. Any other value is 0.
     "VLLM_HPU_FLASH_NEXT_DECODE_METADATA":
     lambda: int(os.environ.get("VLLM_HPU_FLASH_NEXT_DECODE_METADATA", "0")),
+
+    # An operator's A/B on one server (v1/worker/runtime_switches.py). Unset (default): nothing. A path: every
+    # worker looks at that file before each step and, when it changed, takes the flags it lists (NAME=VALUE lines).
+    # Only flags the runner reads at every step can be switched: VLLM_HPU_FLASH_NEXT_DECODE_METADATA and
+    # VLLM_HPU_FUSED_GREEDY_LOGITS. Replace the file with a rename while no request runs.
+    "VLLM_HPU_RUNTIME_SWITCH_FILE":
+    lambda: os.environ.get("VLLM_HPU_RUNTIME_SWITCH_FILE", "").strip(),
 
     # Flash-Next GDN decode through the fused core op (flashinfer_gaudi.gdn_core_decode).
     # 1 (default) = fused, 0 = off (the torch path), 2 = recurrence only (a bisect tool).

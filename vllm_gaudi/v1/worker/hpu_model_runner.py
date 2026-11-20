@@ -43,6 +43,7 @@ from vllm_gaudi.v1.worker.flash_next_inputs import (build_block_table, build_ple
 from vllm_gaudi.v1.worker.flash_next_decode_metadata import (compact_state_indices, fill_pad_slots,
                                                              request_block_table, sparse_decode_metadata_refusal)
 from vllm_gaudi.v1.sample.fused_greedy import STOP_ID_WIDTH, mask_stop_tokens, min_tokens_stop_ids
+from vllm_gaudi.v1.worker.runtime_switches import RuntimeSwitchFile
 from vllm_gaudi.v1.worker.recurrent_commit import (apply_align_precopy, boundary_commits, commit_conv, commit_ssm,
                                                    self_commit_requests)
 from vllm_gaudi.v1.worker.recurrent_lattice import align_lattices
@@ -2383,6 +2384,9 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             "Speculative decoding is not supported with async scheduling."
         self.mem_margin = None
         self.use_merged_prefill = get_config().merged_prefill
+        # An operator's A/B on one server: the per-step flags of this file are reread before every step.
+        switch_file = gaudi_envs.VLLM_HPU_RUNTIME_SWITCH_FILE
+        self._runtime_switches = RuntimeSwitchFile(switch_file) if switch_file else None
 
         self.use_hpu_graph = not self.model_config.enforce_eager
         self.max_batch_size = self.scheduler_config.max_num_seqs
@@ -6359,12 +6363,31 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         self.defragmenter.defragment()
 
     @torch.inference_mode()
+    def _poll_runtime_switches(self) -> None:
+        """VLLM_HPU_RUNTIME_SWITCH_FILE: take the per-step flags the operator changed since the last step
+        (``runtime_switches``). The flags are read from the environment at every step, so they are set there."""
+        switches = getattr(self, '_runtime_switches', None)
+        if switches is None:
+            return
+        try:
+            values = switches.poll()
+        except (OSError, ValueError) as error:
+            logger.error("Runtime switch file %s is ignored: %s", switches.path, error)
+            return
+        if values is None:
+            return
+        os.environ.update(values)
+        self._sparse_decode_md = None  # decided again at the next decode step
+        logger.info("Runtime switches from %s: %s", switches.path,
+                    ", ".join(f"{name}={value}" for name, value in sorted(values.items())) or "none")
+
     def execute_model(
         self,
         scheduler_output: "SchedulerOutput",
         warmup_mode: bool = False,
     ) -> ModelRunnerOutput | None:
 
+        self._poll_runtime_switches()
         self.run_defragmenter(scheduler_output, warmup_mode)
 
         batch_changed = self._update_states(scheduler_output)

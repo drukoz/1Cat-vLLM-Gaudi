@@ -18,7 +18,14 @@ Two questions, each answered against the CPU result of the same data:
    head with the arg max as one graph and as two (what the fused region saves in launches); a host round trip
    of the fp32 logits (what a CPU fallback of one logits op would cost per row).
 
-A second, short pass runs every case with ``LOG_LEVEL_PT_FALLBACK=1`` and lists the bridge's fallback lines.
+3. What does a sampled step cost (the checkpoint's default sampling: temperature 1.0, top_k 20, top_p 0.95,
+   which every request without a temperature gets)? Cases: vLLM's path as it runs on HPU today
+   (``apply_top_k_top_p_pytorch``: a full sort of ``[rows, 248320]``, the top-k and top-p masks, a scatter back,
+   a softmax, exponential noise over the whole vocabulary, an arg max; ``v1/sample/ops/topk_topp_sampler.py``),
+   its parts alone (sort, top-k of 64, the noise, the softmax), and the same sampling over 64 candidates per row
+   (``torch.topk`` first, everything else on ``[rows, 64]``; the noise made on the device or on the host).
+
+A last, short pass runs every case with ``LOG_LEVEL_PT_FALLBACK=1`` and lists the bridge's fallback lines.
 
 Needs only ``torch`` and, on the card, ``habana_frameworks``; ``mask_stop_tokens`` is loaded from the tree by file
 path (no plugin import). ``--selftest`` runs on the CPU with a small vocabulary: it checks this script only.
@@ -43,6 +50,8 @@ VOCAB = 248320
 HIDDEN = 2560
 BLOCKS = 1024  # block-table width at 131,072 tokens and blocks of 128
 STOPS = 2  # stop ids per row of the mask cases
+CANDIDATES = 64  # candidates per row of the candidate-space sampling cases
+TOP_K, TOP_P, TEMPERATURE = 20, 0.95, 1.0  # the checkpoint's default sampling
 TAG = "SAMPLING_OPS "
 
 
@@ -124,6 +133,14 @@ class Data:
         self.table_i64 = table.to(be.device)
         self.cols_cpu = (torch.arange(64, dtype=torch.int64) * 13 % BLOCKS)[None, :].expand(rows, -1).contiguous()
         self.cols = self.cols_cpu.to(be.device)
+        # Sampling parameters as the input batch holds them on the device, and logits without a dominant token.
+        self.temp = torch.full((rows, ), TEMPERATURE, dtype=torch.float32).to(be.device)
+        self.top_k = torch.full((rows, ), TOP_K, dtype=torch.int32).to(be.device)
+        self.top_p = torch.full((rows, ), TOP_P, dtype=torch.float32).to(be.device)
+        flat = (2.0 * torch.randn(rows, vocab, generator=gen)).to(torch.bfloat16)
+        self.flat = flat.to(be.device)
+        self.flat_top = flat.float().topk(TOP_K, dim=-1).indices  # a sampled id must be one of these
+        self.noise_gen = torch.Generator().manual_seed(7 + rows)
         self.hidden = self.weight = None
         if with_head:
             hid = torch.randn(rows, hidden, generator=gen)
@@ -212,7 +229,77 @@ def build_cases(be: Backend, data: Data, fused):
         back = host.to(be.device)
         return back[:, :1]
 
+    neg_inf = float("-inf")
+
+    def upstream_sampled(source):  # vLLM Sampler.sample of an all-random batch, forward_native, no Triton
+        logits = source.to(torch.float32)
+        logits = logits.div_(data.temp.unsqueeze(dim=1))
+        logits_sort, logits_idx = logits.sort(dim=-1, descending=False)
+        top_k_mask = logits_sort.size(1) - data.top_k.to(torch.long)
+        top_k_mask = logits_sort.gather(1, top_k_mask.unsqueeze(dim=1))
+        top_k_mask = logits_sort < top_k_mask
+        logits_sort.masked_fill_(top_k_mask, neg_inf)
+        probs_sort = logits_sort.softmax(dim=-1)
+        probs_sum = torch.cumsum(probs_sort, dim=-1, out=probs_sort)
+        top_p_mask = probs_sum <= 1 - data.top_p.unsqueeze(dim=1)
+        top_p_mask[:, -1] = False
+        logits_sort.masked_fill_(top_p_mask, neg_inf)
+        logits = logits.scatter_(dim=-1, index=logits_idx, src=logits_sort)
+        probs = logits.softmax(dim=-1, dtype=torch.float32)
+        q = torch.empty_like(probs)
+        q.exponential_()
+        return probs.div_(q).argmax(dim=-1).view(-1).long().to(torch.int32).unsqueeze(-1)
+
+    first_column = (torch.arange(CANDIDATES) == 0).view(1, -1).to(be.device)
+
+    def candidate_sampled(source, noise=None):
+        """The same sampling over CANDIDATES candidates per row: top-k first, the rest on [rows, CANDIDATES]."""
+        values, ids = source.to(torch.float32).topk(CANDIDATES, dim=-1)  # sorted, largest first; ids int64
+        values = values / data.temp.unsqueeze(dim=1)
+        kth = values.gather(1, (data.top_k.to(torch.long) - 1).unsqueeze(dim=1))
+        values = values.masked_fill(values < kth, neg_inf)
+        probs = values.softmax(dim=-1)
+        # vLLM drops the smallest tokens whose summed probability stays at or below 1 - top_p: in descending
+        # order that is the tail sum of a column, itself included.
+        tail = probs.sum(dim=-1, keepdim=True) - probs.cumsum(dim=-1) + probs
+        drop = (tail <= 1 - data.top_p.unsqueeze(dim=1)) & ~first_column
+        probs = values.masked_fill(drop, neg_inf).softmax(dim=-1)
+        if noise is None:
+            noise = torch.empty_like(probs)
+            noise.exponential_()
+        choice = probs.div(noise).argmax(dim=-1, keepdim=True)
+        return ids.gather(1, choice)  # the token ids as int64, as top-k made them
+
+    def host_noise():  # [rows, CANDIDATES] exponential noise made on the host, one small copy to the device
+        return torch.empty(rows, CANDIDATES).exponential_(generator=data.noise_gen).to(be.device)
+
+    def in_top(host):  # sampled ids outside the row's top-k set
+        return int((host.view(-1, 1).to(torch.int64) != data.flat_top).all(dim=-1).sum())
+
+    def sort_only():
+        return data.flat.to(torch.float32).sort(dim=-1, descending=False).values[:, -1:]
+
+    def topk_only():
+        return data.flat.to(torch.float32).topk(CANDIDATES, dim=-1).values[:, :1]
+
+    def noise_only():
+        q = torch.empty((rows, data.vocab), dtype=torch.float32, device=be.device)
+        q.exponential_()
+        return q[:, :1]
+
+    def softmax_only():
+        return data.flat.to(torch.float32).softmax(dim=-1, dtype=torch.float32)[:, :1]
+
     cases = {
+        "sampled_upstream": (lambda: upstream_sampled(data.logits), best32, 1),
+        "sampled_upstream_flat": (lambda: upstream_sampled(data.flat), in_top, 1),
+        "sampled_candidates": (lambda: candidate_sampled(data.logits), data.best.view(-1, 1), 1),
+        "sampled_candidates_flat": (lambda: candidate_sampled(data.flat), in_top, 1),
+        "sampled_candidates_host_noise": (lambda: candidate_sampled(data.flat, host_noise()), in_top, 1),
+        "sort_only": (sort_only, None, 1),
+        "topk_only": (topk_only, None, 1),
+        "noise_only": (noise_only, None, 1),
+        "softmax_only": (softmax_only, None, 1),
         "sampler": (sampler, best32, 1),
         "sampler_int64": (sampler_int64, data.best.view(-1, 1), 1),
         "sampler_cast_second_graph": (sampler_cast_second_graph, best32, 2),
@@ -251,6 +338,13 @@ def build_cases(be: Backend, data: Data, fused):
     return cases
 
 
+def count_wrong(host, expected) -> int:
+    """Entries of ``host`` that differ from the tensor ``expected``, or what the check ``expected(host)`` counts."""
+    if callable(expected):
+        return int(expected(host))
+    return int((host.to(expected.dtype) != expected).sum()) if host.shape == expected.shape else -1
+
+
 def run_case(be: Backend, name, body, expected, graphs, warm: int, repeats: int) -> dict:
     record = {"case": name, "graphs": graphs}
     issue, mark, read, total = [], [], [], []
@@ -268,20 +362,21 @@ def run_case(be: Backend, name, body, expected, graphs, warm: int, repeats: int)
                 first = t3 - t0
                 record["first_s"] = round(first, 3)
                 if expected is not None:
-                    wrong = int((host.to(expected.dtype) != expected).sum()) if host.shape == expected.shape else -1
+                    wrong = count_wrong(host, expected)
                     record["dtype"] = str(host.dtype)
                     record["wrong"] = wrong
                     record["ok"] = wrong == 0
                     if wrong:
                         record["got"] = host.flatten()[:8].tolist()
-                        record["want"] = expected.flatten()[:8].tolist()
+                        record["want"] = ("one of each row's top %d" % TOP_K if callable(expected) else
+                                          expected.flatten()[:8].tolist())
             elif index >= warm:
                 issue.append(t1 - t0)
                 mark.append(t2 - t1)
                 read.append(t3 - t2)
                 total.append(t3 - t0)
             if expected is not None and index == warm + repeats - 1:
-                last_wrong = int((host.to(expected.dtype) != expected).sum()) if host.shape == expected.shape else -1
+                last_wrong = count_wrong(host, expected)
                 record["wrong_last"] = last_wrong
                 record["ok"] = bool(record.get("ok")) and last_wrong == 0
             del out, host
@@ -335,6 +430,11 @@ VERDICTS = (
     ("table_int32_widened", "host-made int32 block table widened to int64 in the graph, then gather"),
     ("table_int64", "host-made int64 block table, gather"),
     ("table_gather_narrowed", "gathered int64 ids narrowed to int32 in the same graph"),
+    ("sampled_upstream", "vLLM's sampled path (full sort, top-k 20, top-p 0.95, noise) with one dominant token"),
+    ("sampled_upstream_flat", "vLLM's sampled path: the sampled id is one of the row's top 20"),
+    ("sampled_candidates", "sampling over 64 top-k candidates per row, one dominant token"),
+    ("sampled_candidates_flat", "sampling over 64 candidates: the sampled id is one of the row's top 20"),
+    ("sampled_candidates_host_noise", "the same with the noise made on the host"),
 )
 
 
@@ -377,21 +477,23 @@ def parent(args) -> int:
     # at once; then the timed cases, then vLLM's index_put_ mask, then every case once more with the bridge's
     # fallback log.
     risky = "min_tokens_index_put,min_tokens_index_put_empty"
+    timed_rows = ",".join(str(r) for r in args.rows if r != 2) or "1"  # 2 rows matter for the id checks only
     passes = [("ids", ["--repeats", "2", "--warm", "1", "--only", ",".join(name for name, _ in VERDICTS),
-                       "--no-head"], {}),
-              ("timing", ["--repeats", str(args.repeats), "--skip", risky], {}),
-              ("index_put", ["--repeats", str(args.repeats), "--only", risky, "--no-head"], {}),
-              ("fallback", ["--repeats", "2", "--rows", "8", "--no-head"],
-               {"LOG_LEVEL_PT_FALLBACK": "1", "ENABLE_CONSOLE": "true"})]
+                       "--no-head"], {}, 150.0),
+              ("timing", ["--repeats", str(args.repeats), "--skip", risky, "--rows", timed_rows], {}, 300.0),
+              ("index_put", ["--repeats", str(args.repeats), "--only", risky, "--no-head", "--rows", timed_rows],
+               {}, 90.0),
+              ("fallback", ["--repeats", "2", "--warm", "1", "--rows", "8", "--no-head"],
+               {"LOG_LEVEL_PT_FALLBACK": "1", "ENABLE_CONSOLE": "true"}, 120.0)]
     records, rc = [], 0
-    for label, extra, env_add in passes:
+    for label, extra, env_add, limit in passes:
         log_path = out_dir / ("sampling_ops_%s.log" % label)
         env = dict(os.environ, **env_add)
         started = time.time()
         with open(log_path, "w") as log:
             try:
                 code = subprocess.run(base + extra, env=env, stdout=log, stderr=subprocess.STDOUT,
-                                      timeout=args.timeout).returncode
+                                      timeout=min(limit * args.time_scale, args.timeout)).returncode
             except subprocess.TimeoutExpired:
                 code = 124
         text = log_path.read_text(errors="replace")
@@ -448,9 +550,10 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", default=os.environ.get("FARM_OUT", "."))
     ap.add_argument("--rows", default="1,2,8,16,32", type=lambda s: [int(x) for x in s.split(",") if x])
-    ap.add_argument("--warm", type=int, default=4)
-    ap.add_argument("--repeats", type=int, default=30)
+    ap.add_argument("--warm", type=int, default=3)
+    ap.add_argument("--repeats", type=int, default=20)
     ap.add_argument("--timeout", type=float, default=600.0)
+    ap.add_argument("--time-scale", type=float, default=1.0, help="multiplies every pass's time limit")
     ap.add_argument("--only", default="", type=lambda s: [x for x in s.split(",") if x])
     ap.add_argument("--skip", default="", type=lambda s: [x for x in s.split(",") if x])
     ap.add_argument("--no-head", action="store_true", help="leave out the LM-head cases (1.3 GB of weight)")

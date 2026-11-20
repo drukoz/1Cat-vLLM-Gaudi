@@ -2,10 +2,13 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 # serve_long_probe.sh: an engine-step card job (farm job ... -- bash tools/flash_next/engine_step/serve_long_probe.sh).
-# Starts the real-model server on the job's cards with the program head's best decode preset (the job's --env
-# wins), waits until it is healthy, runs long_context_probe.py (decode at 1 and N streams, short prompts and a
-# shared long prefix served from the prefix cache), counts the decode graphs compiled at run time, stops the
-# server. Options: --prefix TOKENS (default 65536), --streams N (default 32), --tokens N (default 128).
+# Starts ONE real-model server on the job's cards with the program head's best decode preset (the job's --env
+# wins) and a runtime switch file (VLLM_HPU_RUNTIME_SWITCH_FILE), waits until it is healthy, runs
+# long_context_probe.py (an A/B of VLLM_HPU_FLASH_NEXT_DECODE_METADATA and VLLM_HPU_FUSED_GREEDY_LOGITS on that
+# one server: N streams at a short context and over a shared long prefix served from the prefix cache, base and
+# flag-on rounds in turn), counts the switches the workers logged and the decode graphs compiled at run time,
+# stops the server. Options go to the probe: --prefix TOKENS (default 120832), --streams N (default 32),
+# --tokens N (default 128), --arms LIST (default both,i01,i05), --budget SECONDS, --no-long.
 set -u
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 OUT="${FARM_OUT:-/results/serve}"
@@ -19,6 +22,9 @@ for kv in PT_HPU_LAZY_MODE=1 PT_HPU_LAZY_ACC_PAR_MODE=0 VLLM_HPU_FLASH_NEXT_QSA_
     if [ -z "${!key+x}" ]; then export "$kv"; fi
 done
 mkdir -p "$OUT" && cd "$OUT" || exit 2
+# The server starts with both flags off (arm "base"); the probe switches them through this file.
+export VLLM_HPU_RUNTIME_SWITCH_FILE="${VLLM_HPU_RUNTIME_SWITCH_FILE:-$OUT/switches}"
+rm -f "$VLLM_HPU_RUNTIME_SWITCH_FILE"
 {
     python3 -c "import vllm, vllm_gaudi; print('vllm', vllm.__version__); print('vllm_gaudi', vllm_gaudi.__file__)" 2>&1
     echo "image: $(cat /farm-image 2>/dev/null)"; echo "cards: ${FARM_CARDS:-?} (modules ${FARM_MODULES:-?}), port $PORT, tp $TP"
@@ -44,14 +50,15 @@ while :; do
         echo "SERVER-DIED after $(( $(date +%s) - t0 )) s"
         grep -nE "Error|Traceback|error:" server0.log | tail -n 25 | cut -c1-400; exit 3
     fi
-    if [ $(( $(date +%s) - t0 )) -ge 1800 ]; then echo "SERVER-TIMEOUT"; tail -n 20 server0.log | cut -c1-300; stop_server; exit 4; fi
+    if [ $(( $(date +%s) - t0 )) -ge 1200 ]; then echo "SERVER-TIMEOUT"; tail -n 20 server0.log | cut -c1-300; stop_server; exit 4; fi
     sleep 5
 done
 echo "SERVER-HEALTHY after $(( $(date +%s) - t0 )) s"
 grep -hE "sparse-QSA decode metadata|FLASH_NEXT_DECODE_METADATA" server0.log | sort | uniq -c | head -3
 # The probe in the background and waited for: bash runs the TERM trap only after a foreground command ends.
 probe() {
-    python3 "$HERE/long_context_probe.py" --port "$PORT" --model fn --out "$OUT/probe.json" "${PROBE_ARGS[@]}" 2>&1 \
+    python3 "$HERE/long_context_probe.py" --port "$PORT" --model fn --out "$OUT/probe.json" \
+        --switch-file "$VLLM_HPU_RUNTIME_SWITCH_FILE" --server-log "$OUT/server0.log" "${PROBE_ARGS[@]}" 2>&1 \
         | tee probe.log
     return "${PIPESTATUS[0]}"
 }
@@ -60,6 +67,8 @@ CHILD=$!
 wait "$CHILD"
 RC=$?
 echo "PROBE-RC $RC"
+echo "runtime switches logged by the workers: $(grep -c "Runtime switches from" server0.log)"
+grep -h "Runtime switch file\|sparse-QSA decode metadata\|is off for this server" server0.log | sed 's/^.*\] //' | sort | uniq -c | head -8
 echo "decode configurations compiled at run time: $(grep -o "Configuration: ('decode'[^)]*)" server0.log | sort -u | wc -l)"
 grep -o "Configuration: ('decode'[^)]*)" server0.log | sort | uniq -c | head -40
 grep -ciE "fallback|is off for|has no HPU kernel" server0.log | xargs echo "fallback/off lines:"

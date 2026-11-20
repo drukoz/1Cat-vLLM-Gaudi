@@ -72,6 +72,14 @@ dense QSA, the defragmenter on, a draft method other than MTP or n-gram) logs th
 keeps the dense buffers. CPU-checked (bit-identical tokens and logits on the whole serving loop,
 decode and k = 3 verification); not yet checked on a card.
 
+`VLLM_HPU_RUNTIME_SWITCH_FILE` (a path, default unset) is an operator's tool for an A/B on one server.
+When set, every worker looks at that file before each step (one `stat`) and, when the file changed, takes
+the flags it lists, one `NAME=VALUE` per line. Only flags the runner reads at every step can be switched:
+`VLLM_HPU_FLASH_NEXT_DECODE_METADATA` and `VLLM_HPU_FUSED_GREEDY_LOGITS`; any other name is reported and
+the file is ignored. Replace the file with a rename while no request runs, so every worker sees the change
+at the same step. `tools/flash_next/engine_step/long_context_probe.py` measures two arms of one server
+this way.
+
 `VLLM_HPU_GDN_CORE_DECODE` selects the GDN decode core path as an integer.
 `1` (default) is fused: every non-speculative decode step runs through the
 fused core op `torch.ops.flashinfer_gaudi.gdn_core_decode` (conv, gates,
