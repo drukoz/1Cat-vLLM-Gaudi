@@ -186,3 +186,40 @@ def test_the_job_script_starts_the_server_runs_the_probe_and_stops(stand_in, tmp
     assert "VLLM_HPU_MTP_TIMING=1" in versions and "VLLM_HPU_HC_FUSED=1" in versions  # the job's env, the preset
     lines = (out / "probe.log").read_text().splitlines()
     assert sum(line.startswith("MEAS ") for line in lines) == 3 and sum(line.startswith("SAMPL ") for line in lines) == 1
+
+
+def test_a_probe_that_measured_nothing_exits_1(tmp_path):
+    """A server that died at its first prompt (nothing listens): no round measured anything, exit 1."""
+    out = tmp_path / "scaling.json"
+    assert spec_scaling.main(["--port", "1", "--out", str(out), "--levels", "1", "--tokens", "8", "--warm-tokens",
+                              "4", "--timeout", "5"]) == 1
+    assert json.loads(out.read_text())["levels"][0]["warm_failed"] is True
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="needs bash")
+def test_the_arms_script_runs_every_arm_in_its_folder_and_a_fallback_after_a_dead_server(tmp_path):
+    """mtp_arms.sh with a stand-in card script: arms in order, each in FARM_OUT/NAME with its variables, the
+    probe options passed on; an arm whose server died (exit 3) runs once more as NAME-fallback with the
+    fallback variables on top."""
+    card = tmp_path / "card.sh"
+    card.write_text(textwrap.dedent('''\
+        #!/bin/bash
+        mkdir -p "$FARM_OUT"
+        { echo "k=$1"; shift; echo "args=$*"; env | grep -E '^(ARM_|VLLM_HPU_MTP_DRAFT_LOOP)' | sort; } >"$FARM_OUT/seen.txt"
+        if [ "${ARM_DIES:-0}" = 1 ] && [ "${VLLM_HPU_MTP_DRAFT_LOOP:-1}" != 0 ]; then exit 3; fi
+        exit 0
+        '''))
+    out = tmp_path / "results"
+    env = dict(os.environ, FARM_OUT=str(out), MTP_ARMS_CARD_SCRIPT=str(card), MTP_ARMS_PAUSE="0")
+    done = subprocess.run(["bash", str(REPO / "tools/flash_next/rental/mtp_arms.sh"),
+                           "k3|3|ARM_A=1 VLLM_HPU_MTP_DRAFT_LOOP=1 ARM_DIES=1|--levels 1,32 --sampled-levels 32",
+                           "k0|0||--levels 1"], env=env, capture_output=True, text=True, timeout=60)
+    assert done.returncode == 0, done.stdout + done.stderr
+    seen_k3 = (out / "k3" / "seen.txt").read_text()
+    assert "k=3" in seen_k3 and "args=-- --levels 1,32 --sampled-levels 32" in seen_k3 and "ARM_A=1" in seen_k3
+    fallback = (out / "k3-fallback" / "seen.txt").read_text()
+    assert "VLLM_HPU_MTP_DRAFT_LOOP=0" in fallback and "ARM_A=1" in fallback
+    seen_k0 = (out / "k0" / "seen.txt").read_text()
+    assert "k=0" in seen_k0 and "args=-- --levels 1\n" in seen_k0 and "ARM_A" not in seen_k0
+    assert not (out / "k0-fallback").exists()
+    assert "arm k3 rc=3" in done.stdout and "arm k3-fallback rc=0" in done.stdout and "done, exit 0" in done.stdout

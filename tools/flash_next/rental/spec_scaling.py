@@ -246,7 +246,11 @@ def main(argv: list[str] | None = None) -> int:
         n, ctx_tokens = (int(word) for word in args.ctx.split(":"))
         rounds("ctx", "CTX", n, 1, ctx_tokens=ctx_tokens)
     save()
-    return 0
+    # Exit 1 when no round measured anything (the server died at its first prompt, or never answered): a job
+    # that runs arms (mtp_arms.sh) then knows that the arm gave no number.
+    measured_any = any(record.get("ok") and not record.get("warm_failed")
+                       for key in ("levels", "sampled", "ctx") for record in results[key])
+    return 0 if measured_any else 1
 
 
 if __name__ == "__main__":
