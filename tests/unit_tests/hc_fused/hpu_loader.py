@@ -7,12 +7,15 @@ the names the card test imports and forwards every one of them: there is one loa
 
 1. finds ``libhc_fused_gaudi2.so`` (``HC_FUSED_GAUDI_KERNEL_LIBRARY`` or ``flashinfer_gaudi/lib``) and
    ``hc_fused_ops*.so`` (``HC_FUSED_GAUDI_NATIVE_LIBRARY`` or ``flashinfer_gaudi/lib``); both must exist;
-2. registers the kernel database for the graph compiler: through the combined kernel database when
+2. refuses a lazy process whose accumulation thread is on (``PT_HPU_LAZY_ACC_PAR_MODE`` not 0): a custom op
+   is not safe there, so the card test runs with the variable at 0;
+3. registers the kernel database for the graph compiler: through the combined kernel database when
    that file serves the library, otherwise first in the ``GC_KERNEL_PATH`` colon list, which it
    refuses when ``PT_HPU_RECIPE_CACHE_CONFIG`` is set;
-3. only then imports the op schemas (``flashinfer_gaudi.hc_fused``) and loads the extension.
+4. only then imports the op schemas (``flashinfer_gaudi.hc_fused``) and loads the extension.
 
-Its tests are ``tests/unit_tests/gdn_core_decode/test_hc_fused_loader.py``.
+Its tests are ``tests/unit_tests/gdn_core_decode/test_hc_fused_loader.py`` and
+``test_hc_fused_lazy_accumulation.py`` in the same folder.
 """
 
 from __future__ import annotations

@@ -125,13 +125,12 @@ class HpuFlashNextMtpProposer(HpuEagleProposer):
         last_hidden_states, hidden_states = split_draft_output(ret_hidden_states)
         last_hidden_states = last_hidden_states.view(-1, last_hidden_states.shape[-1])
         sample_hidden_states = torch.index_select(last_hidden_states, 0, last_token_indices)
-        logits = self.model.compute_logits(sample_hidden_states)
+        draft_token_ids, top_ids = self._draft_tokens(sample_hidden_states)
 
         # Early exit if there is only one draft token to be generated.
         if self.num_speculative_tokens == 1:
-            draft_token_ids = draft_argmax(logits)
-            if self.draft_rank_stats is not None:
-                self.last_draft_top_ids = logits.topk(DRAFT_RANK_TOP, dim=-1).indices.unsqueeze(1)
+            if top_ids is not None:
+                self.last_draft_top_ids = top_ids.unsqueeze(1)
             return draft_token_ids.view(-1, 1)
 
         # [num_tokens, 1]
@@ -142,9 +141,8 @@ class HpuFlashNextMtpProposer(HpuEagleProposer):
         hidden_states = next_step_hidden(hidden_states, last_token_indices)
 
         # The first draft tokens
-        draft_token_ids = draft_argmax(logits)
-        if self.draft_rank_stats is not None:
-            draft_top_ids.append(logits.topk(DRAFT_RANK_TOP, dim=-1).indices)
+        if top_ids is not None:
+            draft_top_ids.append(top_ids)
         # Generate the remaining draft tokens.
         draft_token_ids_list = [draft_token_ids]
 
@@ -207,10 +205,9 @@ class HpuFlashNextMtpProposer(HpuEagleProposer):
             hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
 
             hidden_states = hidden_states[:batch_size]
-            logits = self.model.compute_logits(last_hidden_states[:batch_size])
-            draft_token_ids = draft_argmax(logits)
-            if self.draft_rank_stats is not None:
-                draft_top_ids.append(logits.topk(DRAFT_RANK_TOP, dim=-1).indices)
+            draft_token_ids, top_ids = self._draft_tokens(last_hidden_states[:batch_size])
+            if top_ids is not None:
+                draft_top_ids.append(top_ids)
             draft_token_ids_list.append(draft_token_ids)
             if timer is not None:
                 timer.lap("pass%d" % (token_index + 1))
@@ -347,3 +344,19 @@ class HpuFlashNextMtpProposer(HpuEagleProposer):
         )
 
         return common_attn_metadata
+
+    def _draft_tokens(self, hidden_states):
+        """``(draft token of every row [rows], top DRAFT_RANK_TOP ids [rows, top] or None)``.
+
+        ``VLLM_HPU_VOCAB_PARALLEL_LOGITS`` >= 1 and no draft-rank log: every rank reduces its own vocabulary shard
+        and only ``[rows, 2]`` fp32 per rank is gathered (``vocab_parallel.vocab_parallel_argmax``, int32 ids).
+        Otherwise the gathered logits and their arg max, as before (the rank log needs the logits).
+        """
+        from vllm_gaudi.distributed import vocab_parallel
+
+        if self.draft_rank_stats is None and vocab_parallel.enabled(self.model):
+            return vocab_parallel.vocab_parallel_argmax(self.model, hidden_states), None
+        logits = self.model.compute_logits(hidden_states)
+        top_ids = None if self.draft_rank_stats is None else logits.topk(DRAFT_RANK_TOP, dim=-1).indices
+        # draft_argmax: arg max, or int32 ids from an fp32 id table with VLLM_HPU_MTP_DRAFT_IDS=1 (card rule 9).
+        return draft_argmax(logits), top_ids
