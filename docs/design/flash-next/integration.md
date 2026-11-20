@@ -9,9 +9,18 @@ Labels: MEASURED (card, with its file), VERIFIED (CPU test or code line), INFERR
 
 ## Handoff (if this agent stops)
 
-Updated 2026-11-20 23:30 UTC (fourth agent of the track, Opus 5.5, started 23:12 UTC).
+Updated 2026-11-20 23:37 UTC (fourth agent of the track, Opus 5.5, started 23:12 UTC).
 
-**Build commit `5ec92ead`** (pushed). The plugin code is final since `b691faa8`; the later commits only add the
+**Now:** job **00121** `tiny8-build` (commit `b54ca4fd`) is at the front of the queue (starts when coord's 00025 ends,
+by 23:57 UTC); job **00128** `real8-headline` (commit `fbb685ac`) is placed right behind it by the coordinator. Both
+`farm job` commands wait in background shells of the agent's session and copy the results to
+`reports/integration/card/` when the jobs end. **Do not run `farm sync`, `farm job` or `farm serve` for this track
+while 00121 or 00128 waits**: the node keeps three images per track, a fourth build prunes the oldest (00121's).
+A first submit of the headline job (commit `5ec92ead`) failed at its image build: two syncs of this track ran at once,
+the later bundle folder `~/farm/integration/b/5ec92eadbe9b` vanished and was re-created empty and root-owned
+(reported to the coordinator as a queue problem; INFERRED cause: the first sync pruned it).
+
+**Build commit `fbb685ac`** (pushed; the headline job runs it). The plugin code is final since `b691faa8`; the later commits only add the
 job kit `tools/flash_next/integration/` and this file. What is in it (first-parent merges on top of the qsa-fused
 branch the first agent started from):
 
@@ -39,12 +48,12 @@ decode headline), spec-lookup (n-gram drafting, not asked for), card-farm (tools
 **Card jobs (track `integration`).** Results land in `reports/integration/card/<id>-<name>/` when the waiting `farm`
 command on the Mac copies them; if this agent is gone: `bin/farm ledger | grep -w integration`, then
 `bin/farm fetch integration <id> <id>-<name>`.
-- (a) `tiny8-build` (all, 20 min, commit `b54ca4fd`: same plugin code as `5ec92ead`): `bash
+- (a) **00121** `tiny8-build` (all, 20 min, commit `b54ca4fd`: same plugin code as `fbb685ac`): `bash
   tools/flash_next/rental/mtp_tiny_card.sh 3 "build:<every flag above>"` = the tiny model at TP8, mode `hc` without
   speculation, then `hc+mtp3` (fused verification), tokens against the CPU reference and against the plain server.
   Read the `ARM build:` lines and `summary.json`. Job id: first lines of `reports/integration/card/submit-tiny8-build.log`.
   (Coordinator: a mismatch at token 4 of the tiny model's 700-token prompt is a known near tie, not a defect.)
-- (b) `real8-headline` (all, 40 min, commit `5ec92ead`): `tools/flash_next/integration/headline_job.sh nospec mtp3`,
+- (b) **00128** `real8-headline` (all, 40 min, commit `fbb685ac`): `tools/flash_next/integration/headline_job.sh nospec mtp3`,
   late-bound: if `~/farm/integration/results/late/run.sh` exists on the node when the job starts, the job runs that
   file instead (upload with `bin/node-scp` to change arms or flags without losing the queue place). Job id: first
   lines of `reports/integration/card/submit-real8-headline.log`. Results: `<id>-real8-headline/headline.md` (the
