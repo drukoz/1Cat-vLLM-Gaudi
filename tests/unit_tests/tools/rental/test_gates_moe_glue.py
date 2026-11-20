@@ -127,8 +127,8 @@ def test_the_result_has_the_keys_of_the_hyper_connection_test(tmp_path, monkeypa
     moe = gates.moe_glue(plugin, tmp_path / "g1b", python=fake)
     hc = gates.hc_fused(plugin, tmp_path / "g1b", python=fake)
 
-    assert sorted(moe) == sorted(hc) == ["combined_kernel_db", "failed_tests", "hpu_op", "log", "reason", "seconds",
-                                         "status"]
+    assert sorted(moe) == sorted(hc) == ["combined_kernel_db", "empty_inputs", "failed_tests", "hpu_op",
+                                         "lazy_acc_par_mode", "log", "reason", "seconds", "status"]
     assert sorted(moe["hpu_op"]) == sorted(hc["hpu_op"])
     assert (moe["status"], hc["status"]) == ("passed", "passed")
     assert (moe["log"], hc["log"]) == ("moe_hpu_op.log", "hc_hpu_op.log")  # two logs in one folder
