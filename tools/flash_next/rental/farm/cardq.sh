@@ -6,7 +6,8 @@
 #   cardq.sh submit --track T --name NAME --cards SPEC [--max-hold DUR] [--script FILE | -- COMMAND...]
 #       Queue a job. Without --script and without "--" the job's script is read from standard input
 #       (the safe form over SSH: nothing is quoted twice). Prints the job id on standard output.
-#       SPEC is "all", a list such as "0,1,2,3", or "any:N" (N cards, chosen by the queue).
+#       SPEC is "all", "any:N" (N cards chosen by the queue; any:2 and any:4 give one module group),
+#       or a list such as "3,4,5,6".
 #       DUR is seconds, or a number with s, m or h (default 45m).
 #   cardq.sh wait ID [--timeout S]   wait for the job's end; the exit code is the job's
 #                                    (124: --timeout passed, 125: cancelled before it ran, 126: lost)
@@ -14,16 +15,31 @@
 #   cardq.sh log ID [-f]             the job's log; -f follows it until the job ends
 #   cardq.sh cancel --track T ID     stop a job of track T (a track stops only its own jobs)
 #   cardq.sh ledger                  one line per ended job: track, cards, start, end, seconds
+#   cardq.sh bump --by coord ID [WHY]  (the coordinator only) move a waiting job to the front
+#   cardq.sh adopt                   (after an update of this file) the waiting jobs get supervisors
+#                                    that run it, so its rules apply to them too
 #
 # How it works. One lock file per card, held with flock(1) by the job's supervisor for as long as
 # the job runs, so a dead supervisor frees its cards by itself. Locks are only ever tried, never
 # waited for, and tried in ascending card order under one short queue lock, so two jobs cannot
 # deadlock. Jobs start in submission order; a later job starts ahead of an earlier waiting one only
 # on cards that job cannot use yet and only when its own maximum hold ends before that job can start.
+# Two exceptions. Fairness: a job that wants all cards for more than 45 minutes (CARDQ_LONG_HOLD_S)
+# counts as submitted 10 minutes (CARDQ_LONG_DELAY_S) later, so shorter jobs submitted in those 10
+# minutes start before it (for jobs submitted from 2026-11-20 17:55 UTC on). Bump: a job the
+# coordinator bumped starts before every other waiting job.
+#
+# Cards and modules. A card number is the card's index (hl-smi's, the one HABANA_VISIBLE_DEVICES and
+# /dev/accel/accel<N> take). Its module id can differ (on the 2026-11-20 node index 0..7 is module
+# 3,0,1,6,7,4,5,2), and Habana supports partial workloads on the module groups 0,1 2,3 4,5 6,7 and
+# 0,1,2,3 4,5,6,7 only, so any:2 and any:4 hand out the cards of one such group. The map comes from
+# CARDQ_MODULE_MAP (the module of card 0, 1, ..., comma-separated) or from $Q/module_map, which is
+# written from hl-smi on first use; without either, card N is module N.
 #
 # A job runs detached from the SSH connection (setsid, nohup) in its own session and process group,
-# with CARDQ_JOB, CARDQ_TRACK, CARDQ_NAME, CARDQ_CARDS (the granted cards, for example 4,5,6,7),
-# CARDQ_NCARDS, CARDQ_PORT_BASE (100 free ports from there), CARDQ_DEADLINE and CARDQ_JOB_DIR set.
+# with CARDQ_JOB, CARDQ_TRACK, CARDQ_NAME, CARDQ_CARDS (the granted cards, for example 3,4,5,6),
+# CARDQ_MODULES (their module ids, ascending: the HABANA_VISIBLE_MODULES a container of these cards
+# sees), CARDQ_NCARDS, CARDQ_PORT_BASE (100 free ports from there), CARDQ_DEADLINE and CARDQ_JOB_DIR set.
 # At the maximum hold, or on cancel, the process group gets SIGTERM and, CARDQ_GRACE_S seconds
 # later, SIGKILL. When a job ends, whatever is left of its process group is killed and every
 # container labelled cardq.job=<id> is removed; a job that held every card and did not end by itself
@@ -42,6 +58,8 @@ GRACE_S="${CARDQ_GRACE_S:-120}"
 MARGIN_S="${CARDQ_MARGIN_S:-15}"
 DEFAULT_HOLD_S="${CARDQ_DEFAULT_HOLD_S:-2700}"
 HOLD_CAP_S="${CARDQ_HOLD_CAP_S:-10800}"
+LONG_HOLD_S="${CARDQ_LONG_HOLD_S:-2700}"
+LONG_DELAY_S="${CARDQ_LONG_DELAY_S:-600}"
 PORT_BASE="${CARDQ_PORT_FIRST:-8100}"
 INF=99999999999
 FD_BASE=20
@@ -140,6 +158,84 @@ qlock() {
     flock 9 || die "cannot take the queue lock"
 }
 
+# ------------------------------------------------------------------ cards and modules
+
+MOD=() # MOD[card] = the card's module id
+IDX=() # IDX[module] = the module's card
+
+# set_map TEXT: MOD and IDX from "m0,m1,...", or return 1 when TEXT is not a permutation of 0..NC-1.
+set_map() {
+    local t="$1" i=0 m
+    MOD=()
+    IDX=()
+    case "$t" in '' | *[!0-9,]* | ,* | *, | *,,*) return 1 ;; esac
+    for m in ${t//,/ }; do
+        m=$((10#$m))
+        if [ "$i" -ge "$NC" ] || [ "$m" -ge "$NC" ] || [ -n "${IDX[m]:-}" ]; then return 1; fi
+        MOD[i]="$m"
+        IDX[m]="$i"
+        i=$((i + 1))
+    done
+    [ "$i" -eq "$NC" ]
+}
+
+identity_map() {
+    local c
+    MOD=()
+    IDX=()
+    for ((c = 0; c < NC; c++)); do
+        MOD[c]="$c"
+        IDX[c]="$c"
+    done
+}
+
+# map_from_hlsmi: the map as hl-smi reports it ("m0,m1,..."), or nothing.
+map_from_hlsmi() {
+    command -v hl-smi >/dev/null 2>&1 || return 0
+    hl-smi -Q index,module_id -f csv,noheader 2>/dev/null | tr -d ' ' | sort -t, -k1,1n | cut -d, -f2 | paste -sd, -
+}
+
+# load_map: MOD and IDX for this node (see the header). A bad map is reported and the identity used.
+load_map() {
+    local t="${CARDQ_MODULE_MAP:-}" from="CARDQ_MODULE_MAP"
+    if [ -z "$t" ]; then
+        from="$Q/module_map"
+        if [ ! -s "$Q/module_map" ] && [ -d "$Q" ]; then
+            t="$(map_from_hlsmi)"
+            if [ -n "$t" ] && set_map "$t"; then put "$Q/module_map" "$t" 2>/dev/null || true; fi
+        fi
+        rd "$Q/module_map"
+        t="$R"
+    fi
+    if [ -z "$t" ]; then
+        identity_map
+    elif ! set_map "$t"; then
+        note "warning: $from is '$t', not the module id of each of the $NC cards: card N is taken as module N"
+        identity_map
+    fi
+}
+
+# modules_of "C C C": the module ids of those cards, ascending and comma-separated, in R.
+modules_of() {
+    local c m out=""
+    for ((m = 0; m < NC; m++)); do
+        for c in $1; do
+            if [ "${MOD[c]}" = "$m" ]; then out="$out${out:+,}$m"; fi
+        done
+    done
+    R="$out"
+}
+
+# cards_of_modules FIRST COUNT: the cards of modules FIRST..FIRST+COUNT-1, ascending, space-separated, in R.
+cards_of_modules() {
+    local first="$1" count="$2" c m out=""
+    for ((c = 0; c < NC; c++)); do
+        m="${MOD[c]}"
+        if [ "$m" -ge "$first" ] && [ "$m" -lt $((first + count)) ]; then out="$out${out:+ }$c"; fi
+    done
+    R="$out"
+}
+
 qunlock() {
     flock -u 9 2>/dev/null
     exec 9>&-
@@ -197,10 +293,12 @@ BLOCK=""
 SHADOW=0
 
 # blocks_for SPEC: the card sets SPEC accepts, best first, in BLOCKS. Returns 1 for an "any:N"
-# that has no fixed sets (N other than 1, 2, 4). Fours come from the bottom and ones and twos
-# from the top, so small jobs leave a whole half free for a four-card job.
+# that has no fixed sets (N other than 1, 2, 4). A set of 2 or 4 is the cards of one module group
+# (modules 0,1 2,3 4,5 6,7 and 0,1,2,3 4,5,6,7, the partial workloads Habana supports). Fours come
+# from the bottom modules and ones and twos from the top, so small jobs leave a whole group free for
+# a four-card job.
 blocks_for() {
-    local spec="$1" n i j b
+    local spec="$1" n i b
     BLOCKS=()
     case "$spec" in
         all)
@@ -211,14 +309,16 @@ blocks_for() {
         any:*)
             n="${spec#any:}"
             if [ "$n" -eq 1 ]; then
-                for ((i = NC - 1; i >= 0; i--)); do BLOCKS[${#BLOCKS[@]}]="$i"; done
+                for ((i = NC - 1; i >= 0; i--)); do BLOCKS[${#BLOCKS[@]}]="${IDX[i]}"; done
             elif [ "$n" -eq 2 ] && [ $((NC % 2)) -eq 0 ]; then
-                for ((i = NC - 2; i >= 0; i -= 2)); do BLOCKS[${#BLOCKS[@]}]="$i $((i + 1))"; done
+                for ((i = NC - 2; i >= 0; i -= 2)); do
+                    cards_of_modules "$i" 2
+                    BLOCKS[${#BLOCKS[@]}]="$R"
+                done
             elif [ "$n" -eq 4 ] && [ $((NC % 4)) -eq 0 ]; then
                 for ((i = 0; i < NC; i += 4)); do
-                    b=""
-                    for ((j = i; j < i + 4; j++)); do b="$b $j"; done
-                    BLOCKS[${#BLOCKS[@]}]="${b# }"
+                    cards_of_modules "$i" 4
+                    BLOCKS[${#BLOCKS[@]}]="$R"
                 done
             else
                 return 1
@@ -227,6 +327,18 @@ blocks_for() {
         *) BLOCKS[0]="${spec//,/ }" ;;
     esac
     return 0
+}
+
+# is_group "C C": 0 when the cards are exactly one module group of 2 or 4 (or all cards, or one card).
+is_group() {
+    local n=0 c b
+    for c in $1; do n=$((n + 1)); done
+    if [ "$n" -eq 1 ] || [ "$n" -eq "$NC" ]; then return 0; fi
+    blocks_for "any:$n" || return 1
+    for b in "${BLOCKS[@]}"; do
+        if [ "$b" = "$1" ]; then return 0; fi
+    done
+    return 1
 }
 
 # pick_cards SPEC: the cards SPEC gets from the usable ones (U[c] = 1) in PICK, or return 1.
@@ -293,10 +405,42 @@ plan_block() {
     BLOCK="${BLOCK# }"
 }
 
+# start_order: one "KEY ID" line per waiting job, in the order the jobs may start: by submission time,
+# except that a job that wants every card for more than LONG_HOLD_S counts as submitted LONG_DELAY_S
+# later, so shorter jobs submitted within that time go before it (and nothing waits more than that
+# on its account).
+start_order() {
+    local d id sub spec hold key
+    for d in "$Q"/jobs/*/; do
+        d="${d%/}"
+        rd "$d/state"
+        [ "$R" = waiting ] || continue
+        id="${d##*/}"
+        rd "$d/submitted"
+        sub="$R"
+        case "$sub" in '' | *[!0-9]*) sub=0 ;; esac
+        rd "$d/spec"
+        spec="$R"
+        rd "$d/maxhold"
+        hold="${R:-$DEFAULT_HOLD_S}"
+        key="$sub"
+        # the rule holds for jobs submitted under it (a "rules" file), not for jobs queued before it
+        if [ "$spec" = all ] && [ "$hold" -gt "$LONG_HOLD_S" ] && [ -f "$d/rules" ]; then
+            key=$((sub + LONG_DELAY_S))
+        fi
+        rd "$d/bump"
+        case "${R%% *}" in
+            '' | *[!0-9]*) ;;
+            *) key=$((${R%% *} - 10000000000)) ;; # bumped: before every other job, the first bump first
+        esac
+        printf '%s %s\n' "$key" "$id"
+    done | sort -n -k1,1 -k2,2
+}
+
 # plan MYID: with the queue lock held and FREE[] filled, decide whether job MYID may start now.
-# PICK holds its cards on return 0. Waiting jobs are walked oldest first: one that can start claims
-# its cards; one that cannot reserves the set it will get first from the time that set is free, and
-# a later job may use a reserved card only if its own maximum hold ends before that time.
+# PICK holds its cards on return 0. Waiting jobs are walked in start order (start_order): one that can
+# start claims its cards; one that cannot reserves the set it will get first from the time that set
+# is free, and a later job may use a reserved card only if its own maximum hold ends before that time.
 # With MYID "status" nothing is decided and one line per waiting job is printed instead.
 plan() {
     local me="$1" now d id st spec hold total c dl cards
@@ -320,13 +464,11 @@ plan() {
             if [ "${FREE[c]}" != 1 ]; then AVAIL[c]=$((dl + GRACE_S + MARGIN_S)); fi
         done
     done
-    for d in "$Q"/jobs/*/; do
-        d="${d%/}"
-        id="${d##*/}"
+    while read -r _ id; do
+        d="$Q/jobs/$id"
         rd "$d/state"
         st="$R"
         [ "$st" = waiting ] || continue
-        if [ "$me" != status ] && [ "$((10#$id))" -gt "$((10#$me))" ]; then continue; fi
         if [ "$id" != "$me" ]; then
             if ! sup_alive "$d"; then
                 if [ "$me" != status ]; then lose_job "$d" "$id"; fi
@@ -359,16 +501,16 @@ plan() {
             plan_block "$spec"
             if [ "$me" = status ]; then
                 rd "$d/submitted"
-                printf '  %s  %-14s %-28s wants %-9s waiting %s, max hold %s, starts by %s at the latest (cards %s)\n' \
+                printf '  %s  %-14s %-28s wants %-9s waiting %s, max hold %s, starts by %s at the latest (cards %s)%s\n' \
                     "$id" "$(cat "$d/track")" "$(cat "$d/name")" "$spec" "$(dur $((now - ${R:-$now})))" "$(dur "$hold")" \
-                    "$(iso "$SHADOW")" "${BLOCK// /,}"
+                    "$(iso "$SHADOW")" "${BLOCK// /,}" "$(if [ -f "$d/bump" ]; then printf '  [bumped: %s]' "$(cut -d' ' -f2- "$d/bump")"; fi)"
             fi
             for c in $BLOCK; do
                 if [ "${LIMIT[c]}" -gt "$SHADOW" ]; then LIMIT[c]="$SHADOW"; fi
                 AVAIL[c]=$((SHADOW + total))
             done
         fi
-    done
+    done < <(start_order)
     PICK=""
     return 1
 }
@@ -437,7 +579,7 @@ cmd_submit() {
             *) die "submit: unknown option: $1" ;;
         esac
     done
-    case "$track" in '' | *[!a-z0-9-]*) die "--track is required: lower-case letters, digits and '-' (your track's name)" ;; esac
+    case "$track" in '' | *[!abcdefghijklmnopqrstuvwxyz0123456789-]*) die "--track is required: lower-case letters, digits and '-' (your track's name)" ;; esac
     case "$name" in '' | *[!A-Za-z0-9._-]*) die "--name is required: letters, digits, '.', '_' and '-' (say what the job is for)" ;; esac
     [ -n "$spec" ] || die "--cards is required: all, a list such as 0,1,2,3, or any:N"
     parse_spec "$spec" || die "--cards: '$spec' is not all, a list of cards 0..$((NC - 1)) without repeats, or any:1..any:$NC"
@@ -459,6 +601,15 @@ cmd_submit() {
     command -v flock >/dev/null 2>&1 || die "no flock(1) on this host"
     command -v setsid >/dev/null 2>&1 || die "no setsid(1) on this host"
     mkdir -p "$Q/jobs" "$Q/locks" || die "cannot create $Q"
+    load_map
+    case "$spec" in
+        all | any:*) ;;
+        *)
+            if ! is_group "${spec//,/ }"; then
+                note "note: cards $spec are not one module group (modules of cards 0..$((NC - 1)): ${MOD[*]}); HCCL across them is not a setup Habana supports: use any:2 or any:4 for a job on several cards"
+            fi
+            ;;
+    esac
     qlock
     for d in "$Q"/jobs/*/; do
         d="${d%/}"
@@ -487,6 +638,7 @@ cmd_submit() {
     put "$d/spec" "$spec"
     put "$d/maxhold" "$hold"
     put "$d/submitted" "$(date -u +%s)"
+    put "$d/rules" "fair-long-all-card-jobs"
     printf '%s\n' "$body" >"$d/cmd.sh"
     : >"$d/log"
     put "$d/state" waiting
@@ -605,12 +757,13 @@ watchdog() {
 }
 
 cmd_run() {
-    local id="$1" d="$Q/jobs/$1" track name spec hold sub now c start deadline cards rc reason wd fds="" n=0 allc=0 abnormal=0 lowest
+    local id="$1" d="$Q/jobs/$1" track name spec hold sub now c start deadline cards modules rc reason wd fds="" n=0 allc=0 abnormal=0 lowest
     [ -d "$d" ] || exit 1
     JOB_DIR="$d"
     exec >>"$d/supervisor.log" 2>&1
     put "$d/pid" "$$"
     set_sudo
+    load_map
     rd "$d/track"
     track="$R"
     rd "$d/name"
@@ -647,8 +800,11 @@ cmd_run() {
                 esac
             done
             cards="${PICK// /,}"
+            modules_of "$PICK"
+            modules="$R"
             start="$(date -u +%s)"
             deadline=$((start + hold))
+            put "$d/modules" "$modules"
             put "$d/cards" "$cards"
             put "$d/start" "$start"
             put "$d/deadline" "$deadline"
@@ -672,9 +828,10 @@ cmd_run() {
     if [ "$n" -eq "$NC" ]; then allc=1; fi
     lowest="${PICK%% *}"
     export CARDQ_JOB="$id" CARDQ_TRACK="$track" CARDQ_NAME="$name" CARDQ_CARDS="$cards" CARDQ_NCARDS="$n"
+    export CARDQ_MODULES="$modules"
     export CARDQ_DEADLINE="$deadline" CARDQ_JOB_DIR="$d" CARDQ_PORT_BASE=$((PORT_BASE + 100 * lowest))
     {
-        echo "cardq: job $id (track $track, name $name) on cards $cards from $(iso "$start"), waited $(dur $((start - sub)))"
+        echo "cardq: job $id (track $track, name $name) on cards $cards (modules $modules) from $(iso "$start"), waited $(dur $((start - sub)))"
         echo "cardq: max hold $(dur "$hold"): SIGTERM at $(iso "$deadline"), SIGKILL $GRACE_S s later; ports $CARDQ_PORT_BASE..$((CARDQ_PORT_BASE + 99))"
     } >>"$d/log"
     watchdog "$$" "$deadline" "$allc" &
@@ -882,6 +1039,83 @@ cmd_cancel() {
     note "job $ID: $R"
 }
 
+# ------------------------------------------------------------------ bump, adopt
+
+# bump --by coord ID [WHY]: the waiting job ID goes before every other waiting job (bumped jobs among
+# themselves in bump order). Only the coordinator decides a bump; each one is a line in the ledger
+# (end column: the bump time, reason: "bump by WHO: WHY") and in the job's log.
+cmd_bump() {
+    local by="" why d now
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --by)
+                [ $# -ge 2 ] || die "--by needs a value"
+                by="$2"
+                shift 2
+                ;;
+            -*) die "bump: unknown option: $1" ;;
+            *) break ;;
+        esac
+    done
+    [ "$by" = coord ] || DIE_RC=4 die "bump: only the coordinator moves jobs: cardq.sh bump --by coord ID [WHY]"
+    [ $# -ge 1 ] || die "usage: cardq.sh bump --by coord ID [WHY]"
+    norm_id "$1"
+    shift
+    why="${*:-no reason given}"
+    d="$Q/jobs/$ID"
+    qlock
+    rd "$d/state"
+    if [ "$R" != waiting ]; then
+        qunlock
+        die "job $ID is $R, not waiting: nothing to bump"
+    fi
+    now="$(date -u +%s)"
+    put "$d/bump" "$now $by: $why"
+    rd "$d/submitted"
+    ledger "$ID" "$(cat "$d/track")" "$(cat "$d/name")" "$(cat "$d/spec")" - "$(iso "$R")" - "$(iso "$now")" 0 - \
+        "bump by $by: $why"
+    qunlock
+    echo "cardq: bumped to the front of the queue at $(iso "$now") by $by: $why" >>"$d/log"
+    note "job $ID: bumped to the front by $by ($why)"
+}
+
+# adopt: every waiting job gets a supervisor that runs this file. The new supervisor starts and records
+# its pid before the old one is stopped, under the queue lock, so the job never looks lost and nobody
+# plans meanwhile. A waiting supervisor holds no card. Running jobs are not touched.
+cmd_adopt() {
+    local d id old i n=0
+    mkdir -p "$Q/jobs" "$Q/locks" || die "cannot create $Q"
+    qlock
+    for d in "$Q"/jobs/*/; do
+        d="${d%/}"
+        id="${d##*/}"
+        rd "$d/state"
+        [ "$R" = waiting ] || continue
+        rd "$d/pid"
+        old="$R"
+        case "$old" in '' | *[!0-9]*) continue ;; esac
+        kill -0 "$old" 2>/dev/null || continue # a dead supervisor: the next plan marks the job lost
+        setsid -f nohup bash "$SELF" _run "$id" </dev/null >/dev/null 2>&1 || {
+            note "job $id: cannot start a new supervisor; the old one ($old) stays"
+            continue
+        }
+        for ((i = 0; i < 100; i++)); do
+            rd "$d/pid"
+            if [ "$R" != "$old" ] && [ -n "$R" ]; then break; fi
+            sleep 0.1
+        done
+        if [ "$R" = "$old" ] || [ -z "$R" ]; then
+            note "job $id: the new supervisor did not start; the old one ($old) stays"
+            continue
+        fi
+        kill -KILL "$old" 2>/dev/null
+        echo "cardq: supervisor $old replaced by $R (cardq.sh adopt at $(iso "$(date -u +%s)"))" >>"$d/log"
+        n=$((n + 1))
+    done
+    qunlock
+    note "adopt: $n waiting jobs now have supervisors that run $SELF"
+}
+
 # ------------------------------------------------------------------ status, ledger
 
 # One line per job that is over, oldest first. (A function of its own: bash 3.2 cannot read a
@@ -905,8 +1139,12 @@ ended_lines() {
 cmd_status() {
     local now c d id st cards hold start dl owner ended n=0 mem
     mkdir -p "$Q/jobs" "$Q/locks" || die "cannot create $Q"
+    load_map
     now="$(date -u +%s)"
     echo "cardq status at $(iso "$now") ($NC cards, queue $Q)"
+    mem=""
+    for ((c = 0; c < NC; c++)); do mem="$mem $c:${MOD[c]}"; done
+    echo "card:module${mem} (any:4 and any:2 take whole module groups)"
     qlock
     for ((c = 0; c < NC; c++)); do
         if try_card "$c"; then
@@ -942,7 +1180,7 @@ cmd_status() {
             printf '  %s  locked, by no running job of this queue\n' "$c"
         fi
     done
-    echo "waiting (oldest first):"
+    echo "waiting (in the order they start):"
     { plan status || true; } | grep . || echo "  (none)"
     qunlock
     echo "ended (the last 8):"
@@ -960,7 +1198,7 @@ cmd_ledger() {
 }
 
 usage() {
-    sed -n '3,15p' "$SELF" | sed 's/^# \{0,1\}//'
+    sed -n '3,20p' "$SELF" | sed 's/^# \{0,1\}//'
 }
 
 if [ "$(id -u)" -eq 0 ] && [ "${CARDQ_ALLOW_ROOT:-0}" != 1 ]; then
@@ -992,6 +1230,14 @@ case "${1:-}" in
     ledger)
         shift
         cmd_ledger "$@"
+        ;;
+    bump)
+        shift
+        cmd_bump "$@"
+        ;;
+    adopt)
+        shift
+        cmd_adopt "$@"
         ;;
     _run)
         shift

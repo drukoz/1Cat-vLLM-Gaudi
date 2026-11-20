@@ -486,3 +486,163 @@ def test_root_is_refused(farm):
         pytest.skip("needs root to see the refusal")
     proc = farm.cq("status", CARDQ_ALLOW_ROOT="0")
     assert proc.returncode == 1 and "do not run cardq.sh as root" in proc.stderr
+
+
+# ------------------------------------------------------------------ stage 2: module groups, fairness
+
+NODE_MAP = "3,0,1,6,7,4,5,2"  # the 2026-11-20 node: the module id of card (index) 0..7
+
+
+def test_any_4_and_any_2_take_whole_module_groups_on_a_scrambled_node(farm):
+    farm.env["CARDQ_MODULE_MAP"] = NODE_MAP
+    script = ('echo "S $CARDQ_JOB $CARDQ_CARDS $(%s)" >>"$EVENTS"\necho "modules=$CARDQ_MODULES"\nsleep 1.5\n'
+              'echo "E $CARDQ_JOB $CARDQ_CARDS $(%s)" >>"$EVENTS"\n' % (NOW, NOW))
+    first = farm.submit("any:4", script)
+    assert farm.until(lambda: farm.file(first, "cards") != "")
+    second = farm.submit("any:4", script)
+    assert farm.until(lambda: farm.file(second, "cards") != "")
+    assert farm.file(first, "cards") == "0,1,2,7"  # modules 3,0,1,2: the group 0-3
+    assert farm.file(second, "cards") == "3,4,5,6"  # modules 6,7,4,5: the group 4-7
+    for job in (first, second):
+        assert farm.wait(job).returncode == 0
+    assert "modules=0,1,2,3" in farm.cq("log", first).stdout
+    assert "modules=4,5,6,7" in farm.cq("log", second).stdout
+    assert "on cards 0,1,2,7 (modules 0,1,2,3)" in farm.cq("log", first).stdout
+    pair = farm.submit("any:2", script)
+    one = farm.submit("any:1", script)
+    for job in (pair, one):
+        assert farm.wait(job).returncode == 0
+    assert farm.file(pair, "cards") == "3,4"  # modules 6,7, the top pair
+    assert farm.file(one, "cards") == "6"  # module 5: the top module the pair left free... (7 and 6 are taken)
+    assert _overlaps(farm.intervals()) == []
+
+
+def test_single_cards_come_from_the_top_modules(farm):
+    farm.env["CARDQ_MODULE_MAP"] = NODE_MAP
+    jobs = []
+    for _ in range(3):
+        jobs.append(farm.hold("any:1", 2.0))
+        assert farm.until(lambda: farm.file(jobs[-1], "cards") != "")
+    assert [farm.file(j, "cards") for j in jobs] == ["4", "3", "6"]  # modules 7, 6, 5
+    four = farm.hold("any:4", 0.1)
+    assert farm.until(lambda: farm.file(four, "cards") != "")
+    assert farm.file(four, "cards") == "0,1,2,7"  # the whole group 0-3 is still free
+    for job in jobs + [four]:
+        assert farm.wait(job).returncode == 0
+
+
+def test_the_module_map_comes_from_the_queue_folder_and_a_bad_one_is_refused(farm):
+    farm.q.mkdir(parents=True, exist_ok=True)
+    (farm.q / "module_map").write_text(NODE_MAP + "\n")
+    job = farm.hold("any:4", 0.1)
+    assert farm.wait(job).returncode == 0
+    assert farm.file(job, "cards") == "0,1,2,7" and farm.file(job, "modules") == "0,1,2,3"
+    out = farm.cq("status").stdout
+    assert "card:module 0:3 1:0 2:1 3:6 4:7 5:4 6:5 7:2" in out
+    proc = farm.cq("status", CARDQ_MODULE_MAP="1,1,2,3,4,5,6,7")
+    assert "not the module id of each of the 8 cards" in proc.stderr
+    assert "card:module 0:0 1:1" in proc.stdout
+
+
+def test_an_explicit_list_that_is_no_module_group_is_run_with_a_note(farm):
+    farm.env["CARDQ_MODULE_MAP"] = NODE_MAP
+    proc = farm.submit("0,1,2,3", "echo hi\n", check=False)
+    assert proc.returncode == 0 and "not one module group" in proc.stderr
+    assert farm.wait(proc.stdout.strip()).returncode == 0
+    proc = farm.submit("0,1,2,7", "echo hi\n", check=False)
+    assert proc.returncode == 0 and "module group" not in proc.stderr
+    assert farm.wait(proc.stdout.strip()).returncode == 0
+
+
+def test_without_a_map_card_n_is_module_n(farm):
+    job = farm.hold("any:4", 0.1)
+    assert farm.wait(job).returncode == 0
+    assert farm.file(job, "cards") == "0,1,2,3" and farm.file(job, "modules") == "0,1,2,3"
+
+
+def test_a_long_all_card_job_waits_behind_shorter_ones_submitted_soon_after(farm):
+    farm.env.update(CARDQ_LONG_HOLD_S="30", CARDQ_LONG_DELAY_S="600")
+    busy = farm.hold("0", 3.0)
+    assert farm.until(lambda: farm.file(busy, "state") == "running")
+    long_one = farm.hold("all", 0.3, hold="60s", name="long-all")  # more than 30 s of every card
+    short_all = farm.hold("all", 0.3, hold="20s", name="short-all")
+    short_one = farm.hold("any:1", 0.3, hold="20s", name="short-one")
+    time.sleep(0.3)
+    lines = farm.cq("status").stdout.split("waiting (in the order they start):")[1].splitlines()
+    order = [ln.split()[0] for ln in lines if ln.startswith("  0")]
+    assert order.index(short_all) < order.index(long_one), lines
+    for job in (busy, long_one, short_all, short_one):
+        assert farm.wait(job).returncode == 0
+    iv = farm.intervals()
+    assert iv[short_all][1] < iv[long_one][1], "the long all-card job went first"
+    assert iv[short_one][1] < iv[long_one][1]
+    assert _overlaps(iv) == []
+
+
+def test_an_all_card_job_up_to_the_limit_keeps_its_place(farm):
+    farm.env.update(CARDQ_LONG_HOLD_S="30", CARDQ_LONG_DELAY_S="600")
+    busy = farm.hold("0", 2.0)
+    assert farm.until(lambda: farm.file(busy, "state") == "running")
+    first = farm.hold("all", 0.3, hold="30s", name="at-the-limit")
+    second = farm.hold("all", 0.3, hold="20s", name="later")
+    for job in (busy, first, second):
+        assert farm.wait(job).returncode == 0
+    iv = farm.intervals()
+    assert iv[first][1] < iv[second][1]
+
+
+def test_the_coordinator_bumps_a_waiting_job_to_the_front(farm):
+    busy = farm.hold("0", 2.0)
+    assert farm.until(lambda: farm.file(busy, "state") == "running")
+    a = farm.hold("all", 0.2, name="first-all")
+    b = farm.hold("all", 0.2, name="second-all")
+    c = farm.hold("all", 0.2, name="bumped-all")
+    proc = farm.cq("bump", "--by", "prefill", c)
+    assert proc.returncode == 4 and "only the coordinator" in proc.stderr
+    proc = farm.cq("bump", "--by", "coord", c, "unlocks", "partial", "cards")
+    assert proc.returncode == 0, proc.stderr
+    assert "bumped to the front by coord (unlocks partial cards)" in proc.stderr
+    assert "[bumped: coord: unlocks partial cards]" in farm.cq("status").stdout
+    proc = farm.cq("bump", "--by", "coord", busy)
+    assert proc.returncode == 1 and "not waiting" in proc.stderr
+    for job in (busy, a, b, c):
+        assert farm.wait(job).returncode == 0
+    iv = farm.intervals()
+    assert iv[c][1] < iv[a][1] < iv[b][1], iv
+    rows = [ln.split("\t") for ln in farm.cq("ledger").stdout.splitlines() if ln.startswith(c)]
+    assert rows[0][10] == "bump by coord: unlocks partial cards" and rows[0][9] == "-"
+    assert rows[1][10] == "ok"
+    assert "bumped to the front of the queue" in farm.cq("log", c).stdout
+
+
+def test_adopt_gives_a_waiting_job_a_new_supervisor_and_keeps_it(farm):
+    busy = farm.hold("0", 3.0)
+    assert farm.until(lambda: farm.file(busy, "state") == "running")
+    w = farm.hold("0", 0.2, name="waits")
+    assert farm.until(lambda: farm.file(w, "pid") != "")
+    old = int(farm.file(w, "pid"))
+    running_pid = farm.file(busy, "pid")
+    waiter = subprocess.Popen(["bash", str(CARDQ), "wait", w, "--timeout", "60"], env=farm.env,
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    proc = farm.cq("adopt")
+    assert proc.returncode == 0 and "adopt: 1 waiting jobs" in proc.stderr, proc.stderr
+    new = int(farm.file(w, "pid"))
+    assert new != old and farm.until(lambda: _gone(old))
+    assert farm.file(busy, "pid") == running_pid, "a running job's supervisor was touched"
+    out, err = waiter.communicate(timeout=90)
+    assert waiter.returncode == 0, err
+    assert farm.file(w, "state") == "ended" and farm.wait(busy).returncode == 0
+    assert "replaced by %d" % new in farm.cq("log", w).stdout
+
+
+def test_a_long_job_queued_before_the_fairness_rule_keeps_its_place(farm):
+    farm.env.update(CARDQ_LONG_HOLD_S="30", CARDQ_LONG_DELAY_S="600")
+    busy = farm.hold("0", 2.5)
+    assert farm.until(lambda: farm.file(busy, "state") == "running")
+    old_long = farm.hold("all", 0.2, hold="60s", name="queued-before-the-rule")
+    (farm.q / "jobs" / old_long / "rules").unlink()
+    short = farm.hold("all", 0.2, hold="20s", name="short-after")
+    for job in (busy, old_long, short):
+        assert farm.wait(job).returncode == 0
+    iv = farm.intervals()
+    assert iv[old_long][1] < iv[short][1]
