@@ -49,6 +49,12 @@ sampled tokens waits for: every launch and collective of the step, on every rank
 Derived per regime and row count: one all-reduce (with minus without, over 2L), one cut (``*_layer`` minus the
 regime without cuts, over L - 1), and the host share of a replay.
 
+``BENCH_PIN`` in a rank's environment (for example through ``--env-sets pin:BENCH_PIN=core``) places the rank's
+threads: ``module`` keeps the whole process on the CPUs of its card's module (module m of 8: the m-th eighth of the
+host's CPUs, the slices the card farm gives its containers); ``core`` does the same and then gives the calling
+thread the slice's first CPU for itself. The step ends when the slowest rank has issued, so a rank whose calling
+thread is moved or shares its CPU sets the time of all of them.
+
 Run on a Gaudi2 node, inside the container with ``habana_frameworks``, with ``--ranks`` free cards::
 
     python3 bench_replay.py --ranks 8 --out replay_r8.json --dump-dir bridge_src
@@ -158,6 +164,35 @@ def thread_usage():
         return cpu, None, None
     usage = resource.getrusage(who)
     return cpu, usage.ru_stime, usage.ru_nvcsw
+
+
+TOTAL_MODULES = 8  # the modules of one node: a module's CPUs are the m-th eighth of the host's
+
+
+def pin_cpus(rank: int, mode: str, allowed=None, total=None, modules=None) -> tuple:
+    """(CPUs of the whole process, CPU of the calling thread or None) for ``BENCH_PIN=mode`` on this rank.
+
+    The rank's module is the rank-th of HABANA_VISIBLE_MODULES (ascending), else the rank itself. Its slice is the
+    module's eighth of the host's CPUs, cut to the CPUs this process may use; when nothing of it is allowed (a
+    container with another CPU set) the allowed CPUs are split evenly over the visible modules instead.
+    """
+    if allowed is None:
+        allowed = sorted(os.sched_getaffinity(0))
+    if total is None:
+        total = os.cpu_count() or len(allowed)
+    if modules is None:
+        text = os.environ.get("HABANA_VISIBLE_MODULES", "")
+        modules = sorted(int(m) for m in text.split(",") if m.strip().isdigit())
+    module = modules[rank] if rank < len(modules) else rank
+    per = max(total // TOTAL_MODULES, 1)
+    cpus = [c for c in allowed if c // per == module]
+    if not cpus:
+        count = max(len(modules), rank + 1)
+        share = max(len(allowed) // count, 1)
+        cpus = allowed[rank * share:(rank + 1) * share] or list(allowed)
+    if mode == "core" and len(cpus) > 1:
+        return cpus[1:], cpus[0]
+    return cpus, None
 
 
 def emit(record: dict) -> None:
@@ -473,6 +508,8 @@ class Rank:
         # synchronize, CPU seconds of the whole process (every thread) during both, the calling thread's system
         # time and its voluntary context switches (a thread that waits sleeps; one that issues or polls burns CPU).
         cpu_calls, cpu_totals, cpu_procs, sys_totals, switches = [], [], [], [], []
+        where = getattr(os, "sched_getcpu", None)
+        seen_cpus, moves, last_cpu = set(), 0, None
         out = None
         for i in range(warmup + repeats):
             x = inputs[i % len(inputs)]
@@ -491,6 +528,11 @@ class Rank:
             # the next call starts with nothing in flight.
             self.read_back(out)
             t3 = _now()
+            if where is not None:
+                cpu_now = where()
+                moves += int(last_cpu is not None and cpu_now != last_cpu)
+                last_cpu = cpu_now
+                seen_cpus.add(cpu_now)
             if i == 0:
                 first = t2 - t0
             elif i >= warmup:
@@ -512,7 +554,9 @@ class Rank:
                         "total_ms": _median([1e3 * v for v in cpu_totals]),
                         "process_ms": _median([1e3 * v for v in cpu_procs]),
                         "thread_sys_ms": _median([1e3 * v for v in sys_totals]),
-                        "thread_voluntary_switches": _median(switches)}}
+                        "thread_voluntary_switches": _median(switches),
+                        # the CPUs the calling thread was seen on after the calls, and how often it had moved
+                        "cpus_seen": sorted(seen_cpus), "cpu_moves": moves}}
 
     # ------------------------------------------------------------------------------- lazy process
     def lazy_case(self, regime: str, rows: int, collectives: bool, repeats: int) -> dict:
@@ -815,14 +859,24 @@ def dump_bridge_sources(dump_dir: str) -> dict:
 
 def rank_main(args) -> int:
     try:
+        pin_mode = os.environ.get("BENCH_PIN", "")
+        pinned, own_cpu = None, None
+        if pin_mode in ("module", "core") and hasattr(os, "sched_setaffinity"):
+            # Before torch and the bridge start their threads: they inherit the calling thread's CPUs.
+            pinned, own_cpu = pin_cpus(args.rank, pin_mode)
+            os.sched_setaffinity(0, pinned)
         rank = Rank(args)
+        if own_cpu is not None:
+            os.sched_setaffinity(0, {own_cpu})  # the calling thread alone (pid 0 names the calling thread)
         repeats = 4 if args.quick else args.repeats
         emit({
             "case": "env", "rank": args.rank, "ranks": args.ranks, "device": rank.device, "process": args.process,
             "lazy_mode_env": os.environ.get("PT_HPU_LAZY_MODE"),
             "acc_par_env": os.environ.get("PT_HPU_LAZY_ACC_PAR_MODE"),
             "lazy_collectives_env": os.environ.get("PT_HPU_ENABLE_LAZY_COLLECTIVES"),
-            "selftest": args.selftest
+            "selftest": args.selftest, "pin": pin_mode or None, "pin_cpus": pinned, "pin_own_cpu": own_cpu,
+            "allowed_cpus": len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else None,
+            "visible_modules": os.environ.get("HABANA_VISIBLE_MODULES"),
         })
         if args.rank == 0 and args.dump_dir and not args.selftest and args.process == "lazy":
             emit({"case": "bridge_sources", "rank": 0, "found": dump_bridge_sources(args.dump_dir)})

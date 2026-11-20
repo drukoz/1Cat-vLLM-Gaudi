@@ -325,3 +325,20 @@ def test_read_back_takes_a_tensor_or_the_first_of_a_tuple():
     rank.read_back(torch.zeros(2, 3))  # a CPU tensor: nothing to read
     rank.read_back((torch.zeros(2), torch.zeros(1)))
     rank.read_back(None)
+
+
+def test_pin_cpus_gives_each_rank_its_modules_slice():
+    allowed = list(range(152))
+    # card farm numbering: module m holds CPUs 19 m .. 19 m + 18; the rank-th visible module is the rank's
+    cpus, own = bench.pin_cpus(2, "module", allowed=allowed, total=152, modules=[0, 1, 2, 3, 4, 5, 6, 7])
+    assert cpus == list(range(38, 57)) and own is None
+    cpus, own = bench.pin_cpus(1, "core", allowed=allowed, total=152, modules=[4, 5, 6, 7])
+    assert own == 95 and cpus == list(range(96, 114))  # module 5: the calling thread gets the slice's first CPU
+    # a one-card container limited to its module's CPUs
+    cpus, own = bench.pin_cpus(0, "core", allowed=list(range(114, 133)), total=152, modules=[6])
+    assert own == 114 and cpus == list(range(115, 133))
+    # CPUs that are not the module's slice: an even split of what is allowed
+    cpus, own = bench.pin_cpus(1, "module", allowed=list(range(8)), total=8, modules=[0, 1])
+    assert cpus == [1] and own is None
+    cpus, own = bench.pin_cpus(1, "module", allowed=list(range(4, 12)), total=152, modules=[0, 1])
+    assert cpus == [8, 9, 10, 11]
