@@ -29,6 +29,14 @@
 # FARM_TRACK, FARM_JOB, FARM_SHA, FARM_RECIPE_CACHE, and PT_HPU_LAZY_MODE=1,
 # PT_HPU_LAZY_ACC_PAR_MODE=0, PYTHONFAULTHANDLER=1, HABANA_LOGS=$FARM_OUT/habana_logs. Every --env
 # KEY=VALUE comes last and wins over these. The exit code is the command's.
+#
+# CPUs: a container of fewer than all cards gets its cards' share of the host CPUs (module m: CPUs
+# m x C/8 .. (m+1) x C/8 - 1, so modules 0-3 get the first NUMA half on the 2026-11-20 node). vLLM sizes
+# its workers' weight-loading threads by the CPUs a process may use (available_cpu_count: affinity and
+# cgroup quota), so two 4-card servers then share the host instead of each giving its 4 workers 152/4
+# threads: that oversubscription made a checkpoint shard take 55 s instead of 4 s (engine-step 00030 and
+# 00031, 18:39 UTC). OMP_NUM_THREADS stays unset on purpose: set from outside, vLLM would keep that many
+# torch threads for serving instead of 1. --all-cpus keeps the whole host; a job of all cards has it.
 
 set -euo pipefail
 
@@ -45,6 +53,7 @@ CARDS=""
 PORT_BASE=""
 MODEL_DIR="${FARM_MODEL_DIR:-/models/Qwen3.8-Flash-Next-FP8}"
 WITH_MODEL=1
+ALL_CPUS=0
 DRY_RUN=0
 EXTRA_ENV=()
 while [ $# -gt 0 ]; do
@@ -87,6 +96,10 @@ while [ $# -gt 0 ]; do
             ;;
         --no-model)
             WITH_MODEL=0
+            shift
+            ;;
+        --all-cpus)
+            ALL_CPUS=1
             shift
             ;;
         --dry-run)
@@ -153,6 +166,18 @@ for ((m = 0; m < 64; m++)); do
 done
 if [ -z "$MAP" ]; then MODULES="$CARDS"; fi  # no map: card N is module N
 
+# The container's CPUs (see the header): its modules' slices of the host's CPUs.
+HOST_CPUS="${FARM_HOST_CPUS:-$(nproc 2>/dev/null || echo 0)}"
+TOTAL_CARDS="${CARDQ_NCARDS_TOTAL:-8}"
+CPUSET=""
+PER_CARD_CPUS=0
+if [ "$ALL_CPUS" -eq 0 ] && [ "$NCARDS" -lt "$TOTAL_CARDS" ] && [ "$HOST_CPUS" -ge "$TOTAL_CARDS" ]; then
+    PER_CARD_CPUS=$((HOST_CPUS / TOTAL_CARDS))
+    for m in ${MODULES//,/ }; do
+        CPUSET="$CPUSET${CPUSET:+,}$((m * PER_CARD_CPUS))-$(((m + 1) * PER_CARD_CPUS - 1))"
+    done
+fi
+
 if [ -z "$SHA" ]; then
     if [ -L "$TRACK_DIR/current" ]; then
         SHA="$(basename "$(readlink "$TRACK_DIR/current")")"
@@ -187,6 +212,9 @@ CMD=($DOCKER run --rm --name "$NAME"
     -v "$FARM/tools:/farm:ro")
 if [ "$WITH_MODEL" -eq 1 ]; then
     CMD+=(-v "$MODEL_DIR:$MODEL_DIR:ro")
+fi
+if [ -n "$CPUSET" ]; then
+    CMD+=(--cpuset-cpus "$CPUSET")
 fi
 for kv in "HABANA_VISIBLE_DEVICES=$CARDS" "HABANA_VISIBLE_MODULES=$MODULES" \
     OMPI_MCA_btl_vader_single_copy_mechanism=none PYTHONUNBUFFERED=1 PYTHONFAULTHANDLER=1 \
@@ -227,5 +255,5 @@ if ! $DOCKER image inspect "$IMAGE" >/dev/null 2>&1; then
     esac
 fi
 mkdir -p "$TRACK_DIR/results/$RUN_ID/habana_logs" "$RECIPE_DIR"
-echo "farm_job: container $NAME, image $IMAGE, cards $CARDS (modules $MODULES), ports $PORT_BASE+, results ~/farm/$CARDQ_TRACK/results/$RUN_ID"
+echo "farm_job: container $NAME, image $IMAGE, cards $CARDS (modules $MODULES), ports $PORT_BASE+, CPUs ${CPUSET:-all}, results ~/farm/$CARDQ_TRACK/results/$RUN_ID"
 exec "${CMD[@]}" </dev/null

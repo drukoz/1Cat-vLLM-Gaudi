@@ -268,6 +268,11 @@ minutes instead of a full run:
 | `--no-recipe-cache` | give no server the compiled-recipe cache under `results/recipe-cache` |
 | `--no-combined-kernel-db` | keep the combined kernel database out of the smoke servers (`FLASHINFER_GAUDI_COMBINED_KERNEL_DB=0` for the check and its servers). The check then treats the database as not installed: the `fused` mode's server runs the colon-list `GC_KERNEL_PATH` and gets no recipe cache; the `pytorch` mode keeps its cache |
 | `--results DIR`, `--run-id ID`, `--image IMG`, `--dry-run` | as for `run_rental.sh`; `--results` is fixed once the container exists |
+| `--cards LIST` | mount only these cards (card indices, as a job of the card queue gets them); a running container of other cards is replaced |
+| `--tp N` | tensor parallel size of the tiny server (default: the number of `--cards`, else 8) |
+| `--name-suffix S` | name the container `fn-smoke-S`, so two jobs on different cards each have their own |
+| `--port N` | the tiny server's port (default 8010); with host networking, two servers side by side need two ports |
+| `--job ID` | label the container `cardq.job=ID`: the card queue removes it when that job ends |
 
 It refuses to start while the rental run's container (`fn-rental`) is running, because that run holds
 the cards. `Ctrl-C`, `SIGTERM` and a dropped SSH session (`SIGHUP`) stop the check inside the

@@ -646,3 +646,136 @@ def test_a_long_job_queued_before_the_fairness_rule_keeps_its_place(farm):
         assert farm.wait(job).returncode == 0
     iv = farm.intervals()
     assert iv[old_long][1] < iv[short][1]
+
+
+def _replace(farm, cards, old, seconds=0.2, track="alpha", name=None):
+    script = ('echo "S $CARDQ_JOB $CARDQ_CARDS $(%s)" >>"$EVENTS"\nsleep %s\n'
+              'echo "E $CARDQ_JOB $CARDQ_CARDS $(%s)" >>"$EVENTS"\n' % (NOW, seconds, NOW))
+    return farm.cq("submit", "--track", track, "--name", name or "new-%s" % cards.replace(":", ""), "--cards", cards,
+                   "--replaces", old, stdin=script)
+
+
+def test_a_job_on_fewer_cards_takes_the_place_of_the_job_it_replaces(farm):
+    busy = farm.hold("0", 2.5)
+    assert farm.until(lambda: farm.file(busy, "state") == "running")
+    old = farm.hold("all", 0.2, track="alpha", name="old-all")
+    other = farm.hold("all", 0.2, track="beta", name="other-all")
+    proc = _replace(farm, "any:4", old)
+    assert proc.returncode == 0, proc.stderr
+    new = proc.stdout.strip()
+    assert "replaces job %s and takes its place" % old in proc.stderr
+    assert farm.until(lambda: farm.file(old, "state") == "cancelled")
+    for job in (busy, other, new):
+        assert farm.wait(job).returncode == 0
+    iv = farm.intervals()
+    assert iv[new][1] < iv[other][1], "the replacement lost the old job's place"
+    assert old not in iv
+    assert "replaced by job %s" % new in farm.cq("log", old).stdout
+    assert "takes the place of job %s" % old in farm.cq("log", new).stdout
+
+
+def test_replacements_hold_at_most_the_cards_of_the_old_job(farm):
+    busy = farm.hold("all", 2.0)
+    assert farm.until(lambda: farm.file(busy, "state") == "running")
+    old = farm.hold("any:4", 0.1, name="old-four")
+    first = _replace(farm, "any:2", old, name="half-a")
+    assert first.returncode == 0, first.stderr
+    assert farm.until(lambda: farm.file(old, "state") == "cancelled")
+    second = _replace(farm, "any:2", old, name="half-b")  # the old job is cancelled now: still its place
+    assert second.returncode == 0, second.stderr
+    third = _replace(farm, "any:1", old, name="one-more")
+    assert third.returncode == 1 and "do not fit" in third.stderr
+    for job in (busy, first.stdout.strip(), second.stdout.strip()):
+        assert farm.wait(job).returncode == 0
+
+
+def test_only_the_tracks_own_waiting_or_recently_cancelled_job_can_be_replaced(farm):
+    busy = farm.hold("0", 1.5)
+    assert farm.until(lambda: farm.file(busy, "state") == "running")
+    theirs = farm.hold("0", 0.1, track="beta", name="theirs")
+    proc = _replace(farm, "any:1", theirs, track="alpha")
+    assert proc.returncode == 4 and "belongs to track beta" in proc.stderr
+    proc = _replace(farm, "any:1", busy, track="alpha")
+    assert proc.returncode == 1 and "is running" in proc.stderr
+    assert farm.wait(busy).returncode == 0 and farm.wait(theirs).returncode == 0
+    proc = _replace(farm, "any:1", busy, track="alpha")
+    assert proc.returncode == 1 and "is ended" in proc.stderr
+    proc = _replace(farm, "any:1", "777", track="alpha")
+    assert proc.returncode == 1 and "no job 00777" in proc.stderr
+
+
+FAKE_DMESG = r"""#!/bin/bash
+cat <<'LINES'
+[  999.000001] habanalabs 0000:0b:00.0: Received unexpected user error interrupt
+[ 1001.500000] habanalabs 0000:0b:00.0: Received unexpected user error interrupt
+[ 1002.000000] habanalabs 0000:0b:00.0: user process got signal while waiting for interrupt ID 52
+[ 1003.000000] habanalabs 0000:0c:00.0 enp12s0d8: renamed from eth3
+[ 1004.000000] habanalabs 0000:0e:00.0: Received unexpected user error interrupt
+LINES
+"""
+
+
+def _fake_dmesg(farm, uptime):
+    bin_dir = Path(farm.env["PATH"].split(":")[0])
+    (bin_dir / "dmesg").write_text(FAKE_DMESG)
+    (bin_dir / "dmesg").chmod(0o755)
+    up = farm.tmp / "uptime"
+    up.write_text("%s 5.0\n" % uptime)
+    farm.env.update(CARDQ_UPTIME_FILE=str(up))
+
+
+def test_the_kernel_lines_of_the_cards_during_a_job_go_to_its_log_and_the_ledger(farm):
+    _fake_dmesg(farm, "1000.25")
+    farm.env.update(CARDQ_MODULE_MAP=NODE_MAP)
+    farm.q.mkdir(parents=True, exist_ok=True)
+    (farm.q / "pci_map").write_text("".join("%d 0000:%02x:00.0\n" % (i, 0x0a + i) for i in range(8)))
+    job = farm.hold("any:4", 0.1)  # cards 0,1,2,7 = modules 0-3; card 1 = 0000:0b:00.0 = module 0
+    assert farm.wait(job).returncode == 0
+    assert farm.file(job, "cards") == "0,1,2,7"
+    log = farm.cq("log", job).stdout
+    assert "card 1 (module 0, 0000:0b:00.0): 2 (one of this job's cards)" in log
+    assert "card 4 (module 7, 0000:0e:00.0): 1;" in log  # another card's line: reported, not this job's
+    assert "0000:0c:00.0" not in log  # routine lines are left out
+    row = [ln.split("\t") for ln in farm.cq("ledger").stdout.splitlines() if ln.startswith(job)][0]
+    assert row[10] == "ok; habanalabs: card 1 (module 0, 0000:0b:00.0) 2 lines, card 4 (module 7, 0000:0e:00.0) 1 lines"
+    health = (farm.q / "health.tsv").read_text().splitlines()
+    assert health[0].split("\t")[4:] == ["1", "0", "0000:0b:00.0", "2"]
+
+
+def test_without_kernel_lines_since_the_start_the_reason_stays_ok(farm):
+    _fake_dmesg(farm, "5000.0")
+    job = farm.hold("any:1", 0.1)
+    assert farm.wait(job).returncode == 0
+    row = [ln.split("\t") for ln in farm.cq("ledger").stdout.splitlines() if ln.startswith(job)][0]
+    assert row[10] == "ok"
+
+
+def test_the_coordinator_gives_a_converted_job_the_place_of_the_cancelled_one(farm):
+    busy = farm.hold("0", 2.5)
+    assert farm.until(lambda: farm.file(busy, "state") == "running")
+    old = farm.hold("all", 0.2, track="alpha", name="old-all")
+    other = farm.hold("all", 0.2, track="beta", name="other-all")
+    assert farm.cq("cancel", "--track", "alpha", old).returncode == 0
+    new = farm.hold("any:4", 0.2, track="alpha", name="converted")
+    assert farm.cq("place", "--by", "alpha", new, old).returncode == 4
+    assert farm.cq("place", "--by", "coord", other, old).returncode == 4  # another track's job
+    proc = farm.cq("place", "--by", "coord", new, old)
+    assert proc.returncode == 0, proc.stderr
+    for job in (busy, other, new):
+        assert farm.wait(job).returncode == 0
+    iv = farm.intervals()
+    assert iv[new][1] < iv[other][1]
+    rows = [ln.split("\t") for ln in farm.cq("ledger").stdout.splitlines() if ln.startswith(new)]
+    assert rows[0][10] == "place of %s by coord" % old
+
+
+def test_place_never_cancels_a_waiting_job(farm):
+    busy = farm.hold("0", 1.5)
+    assert farm.until(lambda: farm.file(busy, "state") == "running")
+    old = farm.hold("0", 0.1, name="still-waiting")
+    new = farm.hold("0", 0.1, name="newer")
+    proc = farm.cq("place", "--by", "coord", new, old)
+    assert proc.returncode == 1 and "only gives the place of a job its track cancelled" in proc.stderr
+    assert farm.file(old, "state") == "waiting"
+    for job in (busy, old, new):
+        assert farm.wait(job).returncode == 0

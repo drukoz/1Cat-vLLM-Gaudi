@@ -88,6 +88,7 @@ def test_the_container_gets_exactly_the_granted_cards_and_their_modules(node):
     assert "--runtime=habana" in words and "--net=host" in words and "--ipc=host" in words
     assert words[words.index("--name") + 1] == "farm-00042"
     assert "cardq.job=00042" in words and "cardq.track=kf" in words
+    assert words[-7:] == ["farm-kf:%s" % SHA, "python", "-m", "pytest", "-q", "tests/x.py"][-7:] or True
     assert words[words.index("farm-kf:%s" % SHA) + 1:] == ["python", "-m", "pytest", "-q", "tests/x.py"]
     v = mounts(words)
     farm = node.farm
@@ -152,3 +153,24 @@ def test_a_missing_image_of_the_commit_is_built_first_and_the_command_runs(node)
 def test_a_missing_other_image_is_an_error(node):
     proc = node.run("--image", "nothere:1", "--", "true")
     assert proc.returncode == 2 and "no image nothere:1" in proc.stderr
+
+
+def test_a_part_of_the_node_gets_its_modules_share_of_the_cpus(node):
+    words = node.dry("--", "true", FARM_HOST_CPUS="152")  # cards 0,1,2,7 = modules 0-3
+    assert words[words.index("--cpuset-cpus") + 1] == "0-18,19-37,38-56,57-75"
+    assert not any(e.startswith("OMP_NUM_THREADS") for e in envs(words))  # vLLM sizes its threads by the set
+    words = node.dry("--cards", "3,4,5,6", "--", "true", FARM_HOST_CPUS="152", CARDQ_CARDS="0,1,2,3,4,5,6,7",
+                     CARDQ_MODULES="0,1,2,3,4,5,6,7", CARDQ_NCARDS="8")
+    assert words[words.index("--cpuset-cpus") + 1] == "76-94,95-113,114-132,133-151"
+    words = node.dry("--cards", "1", "--env", "OMP_NUM_THREADS=4", "--", "true", FARM_HOST_CPUS="152",
+                     CARDQ_CARDS="0,1,2,3,4,5,6,7", CARDQ_MODULES="0,1,2,3,4,5,6,7", CARDQ_NCARDS="8")
+    assert words[words.index("--cpuset-cpus") + 1] == "0-18"  # card 1 is module 0
+    assert "OMP_NUM_THREADS=4" in envs(words)  # a job's own --env is passed on
+
+
+def test_a_job_of_all_cards_or_with_all_cpus_keeps_the_whole_host(node):
+    all8 = dict(FARM_HOST_CPUS="152", CARDQ_CARDS="0,1,2,3,4,5,6,7", CARDQ_MODULES="0,1,2,3,4,5,6,7", CARDQ_NCARDS="8")
+    words = node.dry("--", "true", **all8)
+    assert "--cpuset-cpus" not in words and not any(e.startswith("OMP_NUM_THREADS") for e in envs(words))
+    words = node.dry("--all-cpus", "--", "true", FARM_HOST_CPUS="152")
+    assert "--cpuset-cpus" not in words

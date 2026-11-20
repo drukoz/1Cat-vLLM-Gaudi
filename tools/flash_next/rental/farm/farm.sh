@@ -26,7 +26,8 @@
 #   farm tiny TRACK NAME CARDS MAX_HOLD [OPTIONS] [TINY OPTIONS]    the tiny model, TP = card count
 #   farm serve TRACK NAME CARDS MAX_HOLD [OPTIONS] [SERVE OPTIONS] [-- VLLM SERVE ARGS...]
 #                                            the real model, TP = card count, EP, decode probe
-#   OPTIONS: --env KEY=VALUE (repeatable), --image IMG, --no-model, --no-sync
+#   OPTIONS: --env KEY=VALUE (repeatable), --image IMG, --no-model, --no-sync, --replaces ID (take the
+#     place in the queue of your own waiting job ID, which is cancelled; up to its card count in total)
 #   TINY OPTIONS: --gdn MODES (pytorch,fused,hc,moe; default pytorch,fused), --full-warmup
 #   SERVE OPTIONS (serve_probe.sh): --mtp K, --spec JSON, --levels LIST, --tokens N, --warm-tokens N,
 #     --repeat-top N, --ctx N:TOKENS, --no-probe, --max-model-len N, --max-num-seqs N,
@@ -48,7 +49,7 @@ die() {
 }
 
 usage() {
-    sed -n '6,38p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '6,36p' "$0" | sed 's/^# \{0,1\}//'
 }
 
 need_track() {
@@ -90,13 +91,14 @@ cmd_bundle() {
 }
 
 cmd_submit() {
-    local track="${1:-}" name="${2:-}" cards="${3:-}" hold="${4:-45m}"
+    local track="${1:-}" name="${2:-}" cards="${3:-}" hold="${4:-45m}" replaces="${5:-}"
     need_track "$track"
     need_word NAME "$name"
     need_word CARDS "$cards"
     need_word MAX_HOLD "$hold"
+    if [ -n "$replaces" ]; then need_word REPLACES "$replaces"; fi
     if [ -t 0 ]; then die "the job's script comes on standard input (a here-document or a file)"; fi
-    "$SSH" "~/farm/cardq.sh submit --track $track --name $name --cards $cards --max-hold $hold"
+    "$SSH" "~/farm/cardq.sh submit --track $track --name $name --cards $cards --max-hold $hold${replaces:+ --replaces $replaces}"
 }
 
 cmd_wait() {
@@ -185,8 +187,8 @@ need_hold() {
 # submit_job TRACK NAME CARDS HOLD SCRIPT: queue SCRIPT, wait, fetch the log and results/<id>-NAME,
 # print the end of the log; returns the job's exit code.
 submit_job() {
-    local track="$1" name="$2" cards="$3" hold="$4" script="$5" id rc=0 dest
-    id="$(printf '%s\n' "$script" | cmd_submit "$track" "$name" "$cards" "$hold")" || die "the submit failed"
+    local track="$1" name="$2" cards="$3" hold="$4" script="$5" replaces="${6:-}" id rc=0 dest
+    id="$(printf '%s\n' "$script" | cmd_submit "$track" "$name" "$cards" "$hold" "$replaces")" || die "the submit failed"
     echo "farm: job $id (log: farm log $id -f; results: reports/$track/card/$id-$name/)"
     cmd_wait "$id" || rc=$?
     dest="$G/reports/$track/card"
@@ -212,7 +214,7 @@ job_line() {
 
 # cmd_stage2 KIND TRACK NAME CARDS HOLD ARGS...: farm job, farm tiny and farm serve.
 cmd_stage2() {
-    local kind="$1" track="${2:-}" name="${3:-}" cards="${4:-}" hold="${5:-}" sync=1 script
+    local kind="$1" track="${2:-}" name="${3:-}" cards="${4:-}" hold="${5:-}" sync=1 script replaces=""
     local -a fj=() inner=() extra=()
     [ $# -ge 5 ] || die "usage: farm $kind TRACK NAME CARDS MAX_HOLD [OPTIONS] ... (farm help)"
     shift 5
@@ -240,6 +242,11 @@ cmd_stage2() {
             --no-sync)
                 sync=0
                 shift
+                ;;
+            --replaces)
+                [ $# -ge 2 ] || die "--replaces needs the id of your waiting (or just cancelled) job"
+                replaces="$2"
+                shift 2
                 ;;
             --)
                 shift
@@ -298,7 +305,7 @@ cmd_stage2() {
         tiny) script="${script}exec ~/farm/farm_job.sh $(job_line "${fj[@]}" -- python /farm/farm_tiny.py ${inner[@]+"${inner[@]}"})" ;;
         serve) script="${script}exec ~/farm/farm_job.sh $(job_line "${fj[@]}" -- bash /farm/serve_probe.sh ${inner[@]+"${inner[@]}"} -- ${extra[@]+"${extra[@]}"})" ;;
     esac
-    submit_job "$track" "$name" "$cards" "$hold" "$script"
+    submit_job "$track" "$name" "$cards" "$hold" "$script" "$replaces"
 }
 
 # install: the farm scripts of wt/card-farm onto the node (each replaced by a rename, so a supervisor

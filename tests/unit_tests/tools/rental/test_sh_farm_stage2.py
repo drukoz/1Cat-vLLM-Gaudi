@@ -225,3 +225,24 @@ def test_bad_calls_are_refused_before_anything_is_queued(rig, args, text):
     proc = rig.farm(*args)
     assert proc.returncode != 0 and text in proc.stderr
     assert not (rig.node / "farm" / "q" / "jobs").exists() or not list((rig.node / "farm" / "q" / "jobs").iterdir())
+
+
+def test_image_builds_wait_for_a_free_node_slot(rig):
+    import fcntl
+    slots = rig.node / "farm" / "images-slots"
+    slots.mkdir(parents=True)
+    held = open(slots / "slot1.lock", "a")
+    fcntl.flock(held, fcntl.LOCK_EX)
+    try:
+        proc = rig.farm("sync", "kf", FARM_IMAGE_SLOTS="1", timeout=8)
+    except subprocess.TimeoutExpired as e:
+        out = (e.stdout or b"").decode() if isinstance(e.stdout, bytes) else (e.stdout or "")
+        assert "waiting for a slot" in out
+    else:
+        raise AssertionError("the build did not wait: %s" % (proc.stdout + proc.stderr))
+    finally:
+        fcntl.flock(held, fcntl.LOCK_UN)
+        held.close()
+    proc = rig.farm("sync", "kf", FARM_IMAGE_SLOTS="1")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "IMAGE-READY" in proc.stdout

@@ -7,7 +7,8 @@
 # --install-only, and the tiny checkpoint of the commit built in /tmp/fn-smoke-ckpt. A job from that
 # commit then starts in seconds. Needs no card: the build container has no habana runtime, at most
 # FARM_BUILD_CPUS cores (default 24) and runs niced, so it can run next to card jobs. One build per
-# track at a time (a lock); a second call for a commit that has its image returns at once. Keeps the
+# track at a time (a lock) and at most FARM_IMAGE_SLOTS builds on the node (default 3), so builds do not
+# crowd the host side of card jobs; a second call for a commit that has its image returns at once. Keeps the
 # newest FARM_KEEP_IMAGES images of the track (default 3) and removes older ones that no container uses.
 # The bundle is ~/farm/TRACK/b/SHA12 (farm_unpack.sh --sha); logs go to ~/farm/TRACK/images/SHA12/.
 
@@ -61,8 +62,29 @@ case "$free_kb" in
         ;;
 esac
 
+# One of FARM_IMAGE_SLOTS node-wide build slots (lock files under ~/farm/images-slots), held to the end.
+SLOTS="${FARM_IMAGE_SLOTS:-3}"
+mkdir -p "$FARM/images-slots"
+slot=""
+waited=0
+while [ -z "$slot" ]; do
+    for ((i = 1; i <= SLOTS; i++)); do
+        exec 7>>"$FARM/images-slots/slot$i.lock"
+        if flock -n 7; then
+            slot="$i"
+            break
+        fi
+        exec 7>&-
+    done
+    if [ -z "$slot" ]; then
+        if [ "$waited" -eq 0 ]; then echo "build_track_image: $SLOTS image builds are running on the node; waiting for a slot"; fi
+        waited=1
+        sleep 5
+    fi
+done
+
 started="$(date -u +%s)"
-echo "build_track_image: $TAG from $BASE: installing the plugin of $BUNDLE (about two minutes) [$(date -u +%Y-%m-%dT%H:%M:%SZ)]"
+echo "build_track_image: $TAG from $BASE: installing the plugin of $BUNDLE (about three minutes) [$(date -u +%Y-%m-%dT%H:%M:%SZ)]"
 $DOCKER rm -f "$NAME" >/dev/null 2>&1 || true
 cleanup() { $DOCKER rm -f "$NAME" >/dev/null 2>&1 || true; }
 trap cleanup EXIT

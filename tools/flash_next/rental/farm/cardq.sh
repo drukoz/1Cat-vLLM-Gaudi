@@ -3,9 +3,13 @@
 #
 # cardq.sh: the card queue of the rented Gaudi node. Every use of a card goes through it.
 #
-#   cardq.sh submit --track T --name NAME --cards SPEC [--max-hold DUR] [--script FILE | -- COMMAND...]
+#   cardq.sh submit --track T --name NAME --cards SPEC [--max-hold DUR] [--replaces ID]
+#                   [--script FILE | -- COMMAND...]
 #       Queue a job. Without --script and without "--" the job's script is read from standard input
 #       (the safe form over SSH: nothing is quoted twice). Prints the job id on standard output.
+#       --replaces ID: the new job takes the place in the queue of the track's own job ID, which is
+#       cancelled if it still waits (or was cancelled by the track in the last 90 minutes); the jobs
+#       that replace one job may hold at most as many cards in total as it asked for.
 #       SPEC is "all", "any:N" (N cards chosen by the queue; any:2 and any:4 give one module group),
 #       or a list such as "3,4,5,6".
 #       DUR is seconds, or a number with s, m or h (default 45m).
@@ -16,6 +20,8 @@
 #   cardq.sh cancel --track T ID     stop a job of track T (a track stops only its own jobs)
 #   cardq.sh ledger                  one line per ended job: track, cards, start, end, seconds
 #   cardq.sh bump --by coord ID [WHY]  (the coordinator only) move a waiting job to the front
+#   cardq.sh place --by coord NEW OLD  (the coordinator only) the waiting job NEW takes the place of
+#                                    the job OLD its track cancelled (as submit --replaces would have)
 #   cardq.sh adopt                   (after an update of this file) the waiting jobs get supervisors
 #                                    that run it, so its rules apply to them too
 #
@@ -45,7 +51,12 @@
 # container labelled cardq.job=<id> is removed; a job that held every card and did not end by itself
 # also loses every running container of the habana runtime. Nothing else is ever stopped.
 #
-# State: $CARDQ_DIR (default ~/farm/q): jobs/<id>/, locks/, ledger.tsv. Plain bash 3.2 and later.
+# Health: when a job ends, the habanalabs kernel lines since its start (dmesg, read with sudo) are
+# counted per PCI address and card; they go to the job's log, to its ledger reason ("ok; habanalabs: card
+# 1 (module 0, 0000:0b:00.0) 2 lines") and to $Q/health.tsv, so a card that errs is seen at once. Routine
+# lines (link renames, IB registration) are left out.
+#
+# State: $CARDQ_DIR (default ~/farm/q): jobs/<id>/, locks/, ledger.tsv, health.tsv. Plain bash 3.2 and later.
 
 set -u
 set -o pipefail
@@ -189,7 +200,39 @@ identity_map() {
     done
 }
 
-# map_from_hlsmi: the map as hl-smi reports it ("m0,m1,..."), or nothing.
+# pci_of CARD: the card's PCI address (from $Q/pci_map, written from hl-smi with the module map), in R.
+pci_of() {
+    local line
+    R=""
+    if [ -f "$Q/pci_map" ]; then
+        while read -r line; do
+            case "$line" in "$1 "*) R="${line#* }" ;; esac
+        done <"$Q/pci_map"
+    fi
+}
+
+# card_of_pci BUS: the card index of a PCI address, in R ("" when unknown).
+card_of_pci() {
+    local line
+    R=""
+    if [ -f "$Q/pci_map" ]; then
+        while read -r line; do
+            case "$line" in *" $1") R="${line%% *}" ;; esac
+        done <"$Q/pci_map"
+    fi
+}
+
+# map_from_hlsmi: the map as hl-smi reports it ("m0,m1,..."), or nothing. Also writes $Q/pci_map
+# ("index bus" lines) once.
+write_pci_map() {
+    if [ ! -s "$Q/pci_map" ] && [ -d "$Q" ] && command -v hl-smi >/dev/null 2>&1; then
+        hl-smi -Q index,bus_id -f csv,noheader 2>/dev/null | tr -d ' ' | sort -t, -k1,1n \
+            | awk -F, '{ b = tolower($2); sub(/^0000:/, "", b); print $1 " 0000:" b }' >"$Q/pci_map.tmp.$$" \
+            && mv -f "$Q/pci_map.tmp.$$" "$Q/pci_map"
+        rm -f "$Q/pci_map.tmp.$$"
+    fi
+}
+
 map_from_hlsmi() {
     command -v hl-smi >/dev/null 2>&1 || return 0
     hl-smi -Q index,module_id -f csv,noheader 2>/dev/null | tr -d ' ' | sort -t, -k1,1n | cut -d, -f2 | paste -sd, -
@@ -207,6 +250,7 @@ load_map() {
         rd "$Q/module_map"
         t="$R"
     fi
+    write_pci_map
     if [ -z "$t" ]; then
         identity_map
     elif ! set_map "$t"; then
@@ -410,7 +454,7 @@ plan_block() {
 # later, so shorter jobs submitted within that time go before it (and nothing waits more than that
 # on its account).
 start_order() {
-    local d id sub spec hold key
+    local d id sub spec hold key tie
     for d in "$Q"/jobs/*/; do
         d="${d%/}"
         rd "$d/state"
@@ -428,13 +472,23 @@ start_order() {
         if [ "$spec" = all ] && [ "$hold" -gt "$LONG_HOLD_S" ] && [ -f "$d/rules" ]; then
             key=$((sub + LONG_DELAY_S))
         fi
+        tie="$id"
+        rd "$d/place" # the place of the job this one replaces (submit --replaces), its id breaking ties
+        case "$R" in
+            '' | *[!0-9]*) ;;
+            *)
+                key="$R"
+                rd "$d/replaces"
+                case "$R" in [0-9]*) tie="$R" ;; esac
+                ;;
+        esac
         rd "$d/bump"
         case "${R%% *}" in
             '' | *[!0-9]*) ;;
             *) key=$((${R%% *} - 10000000000)) ;; # bumped: before every other job, the first bump first
         esac
-        printf '%s %s\n' "$key" "$id"
-    done | sort -n -k1,1 -k2,2
+        printf '%s %s %s\n' "$key" "$tie" "$id"
+    done | sort -n -k1,1 -k2,2 -k3,3
 }
 
 # plan MYID: with the queue lock held and FREE[] filled, decide whether job MYID may start now.
@@ -464,7 +518,7 @@ plan() {
             if [ "${FREE[c]}" != 1 ]; then AVAIL[c]=$((dl + GRACE_S + MARGIN_S)); fi
         done
     done
-    while read -r _ id; do
+    while read -r _ _ id; do
         d="$Q/jobs/$id"
         rd "$d/state"
         st="$R"
@@ -540,8 +594,75 @@ lose_job() {
 
 # ------------------------------------------------------------------ submit
 
+# cards_in SPEC: the number of cards SPEC asks for, in R.
+cards_in() {
+    case "$1" in
+        all) R="$NC" ;;
+        any:*) R="${1#any:}" ;;
+        *)
+            local c n=0
+            for c in ${1//,/ }; do n=$((n + 1)); done
+            R="$n"
+            ;;
+    esac
+}
+
+# check_replace OLD TRACK SPEC: with the queue lock held, whether a new job of TRACK on SPEC may take the
+# place of job OLD; sets PLACE_AT (OLD's submission time) and OLD_STATE, or dies (the lock released).
+PLACE_AT=""
+OLD_STATE=""
+check_replace() {
+    local old="$1" track="$2" spec="$3" od used=0 want have now ended line
+    case "$old" in '' | *[!0-9]*) qunlock; die "--replaces takes a job id, got '$old'" ;; esac
+    old="$(printf '%05d' "$((10#$old))")"
+    od="$Q/jobs/$old"
+    if [ ! -d "$od" ]; then qunlock; die "--replaces: no job $old"; fi
+    rd "$od/track"
+    if [ "$R" != "$track" ]; then qunlock; DIE_RC=4 die "--replaces: job $old belongs to track $R, not to $track"; fi
+    rd "$od/state"
+    OLD_STATE="$R"
+    case "$OLD_STATE" in
+        waiting) ;;
+        cancelled)
+            rd "$od/end"
+            ended="$R"
+            now="$(date -u +%s)"
+            case "$ended" in '' | *[!0-9]*) ended=0 ;; esac
+            if [ $((now - ended)) -gt 5400 ]; then
+                qunlock
+                die "--replaces: job $old was cancelled more than 90 minutes ago; its place is gone"
+            fi
+            ;;
+        *) qunlock; die "--replaces: job $old is $OLD_STATE: only a waiting job (or one cancelled in the last 90 minutes) can be replaced" ;;
+    esac
+    rd "$od/spec"
+    cards_in "$R"
+    have="$R"
+    if [ -f "$od/replaced_by" ]; then
+        while read -r _ line; do used=$((used + line)); done <"$od/replaced_by"
+    fi
+    cards_in "$spec"
+    want="$R"
+    if [ $((used + want)) -gt "$have" ]; then
+        qunlock
+        die "--replaces: job $old asked for $have cards and jobs on $used of them replace it already; $want more do not fit"
+    fi
+    rd "$od/place"
+    case "$R" in
+        '' | *[!0-9]*)
+            rd "$od/submitted"
+            PLACE_AT="$R"
+            ;;
+        *) PLACE_AT="$R" ;; # the old job held a place of its own: pass it on
+    esac
+    REPLACES_ID="$old"
+    REPLACES_CARDS="$want"
+}
+REPLACES_ID=""
+REPLACES_CARDS=0
+
 cmd_submit() {
-    local track="" name="" spec="" hold="$DEFAULT_HOLD_S" script="" body="" have_cmd=0 d id seq st i=0
+    local track="" name="" spec="" hold="$DEFAULT_HOLD_S" script="" body="" have_cmd=0 d id seq st i=0 replaces=""
     while [ $# -gt 0 ]; do
         case "$1" in
             --track)
@@ -568,6 +689,11 @@ cmd_submit() {
             --script)
                 [ $# -ge 2 ] || die "--script needs a file"
                 script="$2"
+                shift 2
+                ;;
+            --replaces)
+                [ $# -ge 2 ] || die "--replaces needs a job id"
+                replaces="$2"
                 shift 2
                 ;;
             --)
@@ -624,6 +750,7 @@ cmd_submit() {
         qunlock
         DIE_RC=3 die "track $track already has the job '$name' $st as ${d##*/}; wait for it (cardq.sh wait ${d##*/}), cancel it, or use another name"
     done
+    if [ -n "$replaces" ]; then check_replace "$replaces" "$track" "$spec"; fi
     rd "$Q/seq"
     seq=$((10#${R:-0} + 1))
     put "$Q/seq" "$seq"
@@ -633,6 +760,15 @@ cmd_submit() {
         qunlock
         die "cannot create $d"
     }
+    if [ -n "$REPLACES_ID" ]; then
+        put "$d/place" "$PLACE_AT"
+        put "$d/replaces" "$REPLACES_ID"
+        printf '%s %s\n' "$id" "$REPLACES_CARDS" >>"$Q/jobs/$REPLACES_ID/replaced_by"
+        if [ "$OLD_STATE" = waiting ]; then
+            put "$Q/jobs/$REPLACES_ID/cancel" "by $track at $(iso "$(date -u +%s)"): replaced by job $id"
+        fi
+        echo "cardq: replaced by job $id ($name, $spec), which takes this job's place in the queue" >>"$Q/jobs/$REPLACES_ID/log"
+    fi
     put "$d/track" "$track"
     put "$d/name" "$name"
     put "$d/spec" "$spec"
@@ -650,6 +786,10 @@ cmd_submit() {
         i=$((i + 1))
     done
     [ -s "$d/pid" ] || die "the supervisor of job $id did not start (no $d/pid)"
+    if [ -n "$REPLACES_ID" ]; then
+        echo "cardq: takes the place of job $REPLACES_ID (submitted $(iso "$PLACE_AT"))" >>"$d/log"
+        note "job $id replaces job $REPLACES_ID and takes its place in the queue (submitted $(iso "$PLACE_AT"))"
+    fi
     note "job $id queued: track $track, name $name, cards $spec, max hold $(dur "$hold"); log: $d/log"
     printf '%s\n' "$id"
 }
@@ -756,6 +896,48 @@ watchdog() {
     exit 0
 }
 
+# uptime_now: seconds since boot (the clock of dmesg), in R ("" where there is no /proc/uptime).
+uptime_now() {
+    local f="${CARDQ_UPTIME_FILE:-/proc/uptime}"
+    R=""
+    if [ -r "$f" ]; then read -r R _ <"$f" 2>/dev/null || R=""; fi
+    R="${R%%.*}"
+}
+
+# health_scan JOB_DIR CARDS: the habanalabs kernel lines since the job started, per PCI address; one
+# log line per address, a short summary in HEALTH ("" when there is none or no dmesg), rows in health.tsv.
+HEALTH=""
+health_scan() {
+    local d="$1" cards="$2" t0 lines bus n card mod mine first
+    HEALTH=""
+    rd "$d/uptime_start"
+    t0="$R"
+    case "$t0" in '' | *[!0-9]*) return 0 ;; esac
+    lines="$( (${SUDO:+$SUDO }dmesg 2>/dev/null || dmesg 2>/dev/null) | awk -v t0="$t0" '
+        /habanalabs/ && !/renamed from|IB device registered|hwmon|Successfully|firmware|version|device found|Found GAUDI/ {
+            if (match($0, /^\[ *[0-9]+\.[0-9]+\]/)) {
+                t = substr($0, 2, RLENGTH - 2) + 0
+                if (t >= t0) print
+            }
+        }')" || lines=""
+    [ -n "$lines" ] || return 0
+    for bus in $(printf '%s\n' "$lines" | grep -oE '[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-9]' | sort -u); do
+        n="$(printf '%s\n' "$lines" | grep -c "$bus")"
+        first="$(printf '%s\n' "$lines" | grep "$bus" | head -n 1 | cut -c1-160)"
+        card_of_pci "$bus"
+        card="${R:-?}"
+        mod="?"
+        if [ -n "$R" ]; then mod="${MOD[R]:-?}"; fi
+        mine=""
+        case ",$cards," in *",$card,"*) mine=" (one of this job's cards)" ;; esac
+        echo "cardq: habanalabs kernel lines during the job: card $card (module $mod, $bus): $n$mine; first: $first" >>"$d/log"
+        HEALTH="$HEALTH${HEALTH:+, }card $card (module $mod, $bus) $n lines"
+        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "${d##*/}" "$(cat "$d/track")" "$(cat "$d/name")" "$cards" "$card" \
+            "$mod" "$bus" "$n" >>"$Q/health.tsv"
+    done
+    return 0
+}
+
 cmd_run() {
     local id="$1" d="$Q/jobs/$1" track name spec hold sub now c start deadline cards modules rc reason wd fds="" n=0 allc=0 abnormal=0 lowest
     [ -d "$d" ] || exit 1
@@ -805,6 +987,8 @@ cmd_run() {
             start="$(date -u +%s)"
             deadline=$((start + hold))
             put "$d/modules" "$modules"
+            uptime_now
+            if [ -n "$R" ]; then put "$d/uptime_start" "$R"; fi
             put "$d/cards" "$cards"
             put "$d/start" "$start"
             put "$d/deadline" "$deadline"
@@ -856,6 +1040,8 @@ cmd_run() {
     fi
     kill_group KILL
     sweep_containers "$id" "$allc" "$abnormal"
+    health_scan "$d" "$cards"
+    if [ -n "$HEALTH" ]; then reason="$reason; habanalabs: $HEALTH"; fi
     now="$(date -u +%s)"
     echo "cardq: job $id ended at $(iso "$now"): exit code $rc, $((now - start)) s on cards $cards, $reason" >>"$d/log"
     qlock
@@ -1079,6 +1265,48 @@ cmd_bump() {
     note "job $ID: bumped to the front by $by ($why)"
 }
 
+# place --by coord NEW OLD: what submit --replaces OLD would have done for the waiting job NEW, for a job
+# its track submitted after cancelling OLD itself. OLD must be cancelled (never cancelled here).
+cmd_place() {
+    local by="" new old nd spec track
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --by)
+                [ $# -ge 2 ] || die "--by needs a value"
+                by="$2"
+                shift 2
+                ;;
+            -*) die "place: unknown option: $1" ;;
+            *) break ;;
+        esac
+    done
+    [ "$by" = coord ] || DIE_RC=4 die "place: only the coordinator moves jobs: cardq.sh place --by coord NEW OLD"
+    [ $# -eq 2 ] || die "usage: cardq.sh place --by coord NEW OLD"
+    norm_id "$1"
+    new="$ID"
+    norm_id "$2"
+    old="$ID"
+    nd="$Q/jobs/$new"
+    qlock
+    rd "$nd/state"
+    if [ "$R" != waiting ]; then qunlock; die "job $new is $R, not waiting"; fi
+    rd "$Q/jobs/$old/state"
+    if [ "$R" != cancelled ]; then qunlock; die "job $old is $R: place only gives the place of a job its track cancelled"; fi
+    rd "$nd/track"
+    track="$R"
+    rd "$nd/spec"
+    spec="$R"
+    check_replace "$old" "$track" "$spec"
+    put "$nd/place" "$PLACE_AT"
+    put "$nd/replaces" "$REPLACES_ID"
+    printf '%s %s\n' "$new" "$REPLACES_CARDS" >>"$Q/jobs/$REPLACES_ID/replaced_by"
+    ledger "$new" "$track" "$(cat "$nd/name")" "$spec" - "$(iso "$(cat "$nd/submitted")")" - "$(iso "$(date -u +%s)")" 0 - \
+        "place of $old by $by"
+    qunlock
+    echo "cardq: takes the place of job $old (submitted $(iso "$PLACE_AT")), given by $by" >>"$nd/log"
+    note "job $new: takes the place of job $old (submitted $(iso "$PLACE_AT")), given by $by"
+}
+
 # adopt: every waiting job gets a supervisor that runs this file. The new supervisor starts and records
 # its pid before the old one is stopped, under the queue lock, so the job never looks lost and nobody
 # plans meanwhile. A waiting supervisor holds no card. Running jobs are not touched.
@@ -1198,7 +1426,7 @@ cmd_ledger() {
 }
 
 usage() {
-    sed -n '3,20p' "$SELF" | sed 's/^# \{0,1\}//'
+    sed -n '3,27p' "$SELF" | sed 's/^# \{0,1\}//'
 }
 
 if [ "$(id -u)" -eq 0 ] && [ "${CARDQ_ALLOW_ROOT:-0}" != 1 ]; then
@@ -1238,6 +1466,10 @@ case "${1:-}" in
     adopt)
         shift
         cmd_adopt "$@"
+        ;;
+    place)
+        shift
+        cmd_place "$@"
         ;;
     _run)
         shift
