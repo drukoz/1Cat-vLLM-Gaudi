@@ -100,8 +100,9 @@ serve() {
     say "$label: SERVER-HEALTHY after $(( $(date +%s) - t0 )) s"
     grep -E "Maximum concurrency|Usable num_blocks|Loading model weights took|Wrapping in HPUGraph|step timing: on" \
         server0.log | head -n 8 | cut -c1-260
+    # shellcheck disable=SC2086  # PROBE_EXTRA is a list of probe options
     python3 "$PROBE" --port "$PORT" --model fn --timing-dir "$out/timing" --phases "$phases" \
-        ${trace:+--trace "$trace"} --out "$out/probe.json" 2>&1 | tee "$out/probe.log"
+        ${trace:+--trace "$trace"} ${PROBE_EXTRA:-} --out "$out/probe.json" 2>&1 | tee "$out/probe.log"
     rc=${PIPESTATUS[0]}
     say "$label: probe rc $rc"
     [ -f "$HERE/summarize_timing.py" ] && python3 "$HERE/summarize_timing.py" "$out" --json "$out/timing_summary.json" \
@@ -137,7 +138,9 @@ plan_a() {
         export VLLM_HPU_STEP_TIMING=0
     fi
     export HABANA_PROFILE=profile_api_light
-    serve a2-trace "warm:32,1:96;1:32,1:96" "32,1" \
+    # The capture rounds are as long as the warm rounds (160 tokens): no bucket compiles inside a capture, and
+    # every stream still decodes for seconds after the capture starts.
+    PROBE_EXTRA="--trace-tokens 160" serve a2-trace "warm:32,1:160;1:32,1:96" "32,1" \
         --profiler-config '{"profiler": "torch", "torch_profiler_dir": "/results/a2-trace/trace", "torch_profiler_with_stack": false, "torch_profiler_use_gzip": true, "torch_profiler_record_shapes": false}'
     ls -la /results/a2-trace/trace 2>/dev/null | head -n 20
 }
@@ -158,7 +161,7 @@ plan_t() {
              "parseOptions": {"addFuserMetadata": {"value": false}, "showNullDescs": {"value": false}}}}]}
 JSON
     export HABANA_PROFILE=1 HABANA_PROF_CONFIG=/results/t-trace/prof-config.json
-    serve t-trace "warm:32,1:96" "32,1" \
+    PROBE_EXTRA="--trace-tokens 160" serve t-trace "warm:32,1:160" "32,1" \
         --profiler-config '{"profiler": "torch", "torch_profiler_dir": "/results/t-trace/trace", "torch_profiler_with_stack": false, "torch_profiler_use_gzip": true, "torch_profiler_record_shapes": false}'
     ls -la /results/t-trace/trace 2>/dev/null | head -n 20
 }
