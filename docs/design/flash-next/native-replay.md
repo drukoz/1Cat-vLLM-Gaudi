@@ -39,9 +39,10 @@ belongs here too.
 
 Card baseline (coordinator job 00007, program head e238f84, fused GDN and HC kernels,
 `VLLM_HPU_COLLECTIVE_MARK_STEP=0`, PLE host n-gram ids, short prompts, 256 tokens; compile pauses included):
-51.5 ms per token at 1 stream, 48.8 at 8, 67.3 at 16, 83.6 to 102 at 32 (`reports/coord/RESULTS.md`). After compiles
-a single stream ran at 33 to 37 ms this morning (`ref/card-20261120/live/fused_gdn_hc_probe.txt`). A step costs the
-same at 1 and 8 rows: the fixed part dominates up to 8 streams (INFERRED).
+51.5 ms per token at 1 stream, 48.8 at 8, 67.3 at 16, 83.6 to 102 at 32 (`reports/coord/RESULTS.md`). Step-anatomy
+found live bucket compiles inside every round except the second at 32 streams, so the clean numbers are 83.6 ms at
+32 streams and, from this morning, 31-35 ms (median gap) at one stream (`reports/step-anatomy/REPORT.md` section 2;
+`ref/card-20261120/live/fused_gdn_hc_probe.txt`). A 32-stream step costs about 2.5 times a one-stream step.
 
 ## 2. What a decode step is today: lazy mode, replayed from an HPU graph
 
@@ -55,9 +56,9 @@ same at 1 and 8 rows: the fixed part dominates up to 8 streams (INFERRED).
 | Flash-Next takes the legacy metadata path, so decode replays: its QSA layer gives the KV cache to a plain `Attention` child, GDN layers are `MambaBase`, the QSA side caches are runner tensors; the framework layout is chosen only for `AttentionLayerBase` layers that are none of these | VERIFIED `models/qwen4_exp/qsa.py:405-417, 506-514`; `hpu_model_runner.py:2818-2823, 9050-9056`; `qsa_side_caches.py:1-27` |
 | The graph key is the bridge's `input_hash` over the inputs: tensors by metadata, Python scalars by value; Flash-Next's metadata fields are whitelisted for it | VERIFIED `hpu_model_runner.py:1909-1935` (`trim_attn_metadata`), `tests/unit_tests/worker/test_flash_next_trim_metadata.py` |
 | The fused GDN decode op replays correctly from an HPU graph at TP8 geometry (1,000 steps, exact against eager) | VERIFIED `docs/design/flash-next/native-extensions.md:40` |
-| On a replay the host does not run the Python forward, so `HpuModelAdapter.forward` (metadata processing, forward context, the per-layer hooks) runs only when a graph is captured | INFERRED from the wrapper's role; the bridge source is read on the card (job 00012 dumps `habana_frameworks/torch/hpu/graphs.py`) |
+| On a replay the host does not run the Python forward: the wrapper calls the original `forward` only on a cache miss (capture), and on a hit hashes the inputs, copies the unmatched ones and calls `replayV3` with `asynchronous=False` unless asked; so `HpuModelAdapter.forward` (metadata processing, forward context, the per-layer hooks) runs only when a graph is captured | VERIFIED in the bridge 1.24.1.482 source dumped on the card by job 00012: `reports/native-replay/card/replay-bench-r8/bridge_src/habana_frameworks_torch_hpu_graphs.py:635-770` (`wrapped_hpugraph_forward`), `:840-905` (`wrap_in_hpu_graph`, `module.forward = forward` at `:905`), `:547-561` (`input_hash`) |
 | Per step the runner copies 14 tensors to the device and reads the sampled tokens back once, at 1 and at 32 rows | VERIFIED by the engine-step track's CPU harness (`wt/engine-step`, commit 84aace3a message) |
-| `compute_logits` and the sampler run after the replayed forward, outside the captured graph | INFERRED (only `forward` is wrapped); to confirm |
+| `compute_logits` (the logits gather, `lm_head`, the logits all-gather) and the sampler run after the replayed forward, outside the captured graph, as lazy ops every step | VERIFIED: only `forward` is wrapped (row above); `select_and_compute_logits` is called after it, `hpu_model_runner.py:1764-1767, 5752-5760` (e238f84) |
 
 So a decode step on the card is: host-side input preparation, the wrapper's input hash and copies into the captured
 inputs, the replay (the captured recipes and collectives launched in order), the logits and sampler as ordinary lazy
@@ -313,7 +314,14 @@ Readings:
    host call every layer (6.6-15.7 ms without collectives). O2 is rejected.
 5. Plain lazy mode spends 25-35 ms of host time building this body every step; replay removes that (and the
    replayed output equals the lazy one bit for bit, `check` in the log).
-6. Rank 0 of the lazy process was killed in the last case (`replay_coll`, 128 rows, with collectives) by
+6. **Removing the per-layer cuts does not make the recipes much bigger when collectives are present**, so the
+   compile-time growth step-anatomy measured for bigger recipes (about quadratic in size) does not apply to
+   `VLLM_HPU_DECODE_CUT_INTERVAL`: the first call (capture and compile) of the body with collectives took 103 ms
+   without the per-layer cuts against 88 ms with them at 1 row, 364 against 64 ms at 32 rows and 391 against 46 ms
+   at 128 rows (`lazy` against `lazy_layer`); without collectives, the uncut body is one recipe and its first call
+   took 539 ms against 179 ms. In a Flash-Next decode graph the cut after a layer only separates the layer's
+   residual add from the next layer's first segment, between two collectives (INFERRED).
+7. Rank 0 of the lazy process was killed in the last case (`replay_coll`, 128 rows, with collectives) by
    "Synapse detected a device critical error ... [No progress error]" at 18:20:39 UTC on module 0 (PCI
    0000:0b:00.0, which logged the same "unexpected user error interrupt" at 17:48:02 during job 00009). The
    other seven ranks finished; the next process acquired all cards. Later jobs leave that regime out.
