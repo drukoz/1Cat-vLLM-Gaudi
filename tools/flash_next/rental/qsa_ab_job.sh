@@ -187,6 +187,8 @@ serve_and_probe() {
     probe() {
         "$PY" "$PROBE" --port "$PORT" --model fn --out "$OUT/$json" \
             --levels "$LEVELS" --tokens "$TOKENS" --ctx "$CTX" --docs "$TREE/docs/design/flash-next" \
+            ${QSA_AB_LONG_STREAMS:+--long-streams "$QSA_AB_LONG_STREAMS"} \
+            ${QSA_AB_LONG_REPEAT:+--long-repeat "$QSA_AB_LONG_REPEAT"} \
             --deadline "$((DEADLINE - RESERVE))" 2>&1 | tee "probe$tag.log"
         return "${PIPESTATUS[0]}"
     }
@@ -224,7 +226,17 @@ PY
     return 0
 }
 
-say "step 2 and 3: the server and the probe"
+# Device memory every 15 s (a server can run out of device memory at run time with warmup skipped): hlsmi.log.
+MEMLOG=""
+if command -v hl-smi >/dev/null 2>&1; then
+    (while :; do
+        echo "$(date -u +%H:%M:%S) $(hl-smi --query-aip=index,memory.used,memory.total --format=csv,noheader 2>&1 | tr '\n' ';')"
+        sleep 15
+    done) >"$OUT/hlsmi.log" 2>&1 &
+    MEMLOG=$!
+fi
+say "step 2 and 3: the server and the probe (VLLM_GRAPH_RESERVED_MEM=${VLLM_GRAPH_RESERVED_MEM:-default}," \
+    "long streams ${QSA_AB_LONG_STREAMS:-auto}, long repeats ${QSA_AB_LONG_REPEAT:-default})"
 serve_and_probe ""
 RC=$?
 # The request-sharded indexer on its first run in a served model: when its server dies or a round loses streams,
@@ -241,6 +253,8 @@ if [ "$RUN_OK" != 1 ] && [ "${VLLM_HPU_QSA_INDEXER_SHARD:-0}" != 0 ] && [ "${QSA
         say "NO FALLBACK RUN: $(left) s to the deadline (1080 s wanted)"
     fi
 fi
+if [ -n "$MEMLOG" ]; then kill "$MEMLOG" 2>/dev/null; fi
+say "device memory, highest used per card (hlsmi.log): $(sed 's/^[0-9][0-9]:[0-9][0-9]:[0-9][0-9] //' "$OUT/hlsmi.log" 2>/dev/null | tr ';' '\n' | awk -F', *' 'NF >= 3 {g = $2; sub(/ .*/, "", g); if (g + 0 > m[$1]) m[$1] = g + 0} END {for (k in m) printf "%s:%d MiB ", k, m[k]}')"
 if [ "$RC" -eq 3 ] || [ "$RC" -eq 4 ]; then
     say "DONE (exit $RC)"
     exit "$RC"

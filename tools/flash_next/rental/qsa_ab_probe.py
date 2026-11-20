@@ -249,7 +249,11 @@ def main() -> int:
     ap.add_argument("--warm-tokens", type=int, default=48)
     ap.add_argument("--repeat-top", type=int, default=2, help="measured rounds at the largest level")
     ap.add_argument("--ctx", default="32000", help="tokens of the long-context documents, in order (0: no long rounds)")
-    ap.add_argument("--long-streams", type=int, default=0, help="streams of the long round (default: the top level)")
+    ap.add_argument("--long-streams", type=int, default=0,
+                    help="streams of the long round (default: the top level, fewer when the prefix is not reused); "
+                         "a value given here is kept whatever the trial shows")
+    ap.add_argument("--long-repeat", type=int, default=0,
+                    help="measured long rounds after the warm one (default: --repeat-top)")
     ap.add_argument("--docs", default="docs/design/flash-next", help="folder of the documents of the long prompt")
     ap.add_argument("--deadline", type=float, default=0.0, help="epoch seconds by which the probe must have ended")
     ap.add_argument("--timeout", type=float, default=1500.0)
@@ -361,7 +365,7 @@ def main() -> int:
         one_doc_s = trial["ttft_p50_s"]  # without reuse: the warm prefill of one whole document
         reuse = (trial.get("cached_tokens_p50") or 0) >= 0.5 * doc_tokens
         n_long = args.long_streams or levels[-1]
-        if not reuse:  # every stream prefills its document once: as many streams as the time covers
+        if not reuse and not args.long_streams:  # every stream prefills its document once: as many as the time covers
             while n_long > 1 and 180 + 1.3 * n_long * one_doc_s > left() - 120:
                 n_long //= 2
         say("prefix reuse (%s): %s (cached tokens %s of %d; the trial's first token after %.1f s, the first prefill "
@@ -372,11 +376,13 @@ def main() -> int:
             res = measured("long", 1, args.tokens)
             say("MEAS  " + line(res) + ", needle in %d of %d texts, context %d" % (res["needle_hits"], res["streams"],
                                                                                  ctx))
-        if n_long > 1 and not skip("long N=%d warm, %s" % (n_long, tag), 120):
+        # A round of n cached-prefix streams waits about 7 s per stream for its first tokens (jobs 00062 / 00063).
+        need_round = 60 + 8 * n_long
+        if n_long > 1 and not skip("long N=%d warm, %s" % (n_long, tag), max(120, need_round)):
             warm = measured("warm-long", n_long, 16)
             say("warm  " + line(warm))
-            for rep in range(args.repeat_top):
-                if skip("long N=%d rep %d, %s" % (n_long, rep, tag), 60):
+            for rep in range(args.long_repeat or args.repeat_top):
+                if skip("long N=%d rep %d, %s" % (n_long, rep, tag), max(60, need_round)):
                     break
                 res = measured("long", n_long, args.tokens, rep)
                 say("MEAS  " + line(res) + ", needle in %d of %d texts, context %d" % (
