@@ -161,11 +161,22 @@ def test_a_new_set_of_requests_logs_the_counters_of_the_load_that_ended(caplog):
     hybrid = HybridLookup(K, 2, 4, 4096)
     rep = [1, 5, 6, 7, 8, 9, 2, 5, 6]
     token_ids, num_tokens = np.stack([_row(rep)]), np.array([len(rep)], dtype=np.int32)
-    with caplog.at_level("INFO", logger="vllm_gaudi.v1.spec_decode.flash_next_lookup"):
-        hybrid.merge([[90, 91, 92]], ["a"], token_ids, num_tokens, [[6]], 1)
-        hybrid.merge([[90, 91, 92]], ["a"], token_ids, num_tokens, [[6, 7, 8]], 1)  # the lookup row accepted 2
-        assert not [r for r in caplog.records if "a new set of requests" in r.getMessage()]
-        hybrid.merge([[90, 91, 92]], ["b"], token_ids, num_tokens, [[6]], 1)  # "a" is gone: one line
+    import logging
+
+    from vllm_gaudi.v1.spec_decode import flash_next_lookup
+
+    # the module logs through the "vllm" logger (what a server prints); it does not propagate to the root logger
+    assert flash_next_lookup.logger.name == "vllm"
+    vllm_logger = logging.getLogger("vllm")
+    vllm_logger.addHandler(caplog.handler)
+    try:
+        with caplog.at_level("INFO", logger="vllm"):
+            hybrid.merge([[90, 91, 92]], ["a"], token_ids, num_tokens, [[6]], 1)
+            hybrid.merge([[90, 91, 92]], ["a"], token_ids, num_tokens, [[6, 7, 8]], 1)  # the lookup row accepted 2
+            assert not [r for r in caplog.records if "a new set of requests" in r.getMessage()]
+            hybrid.merge([[90, 91, 92]], ["b"], token_ids, num_tokens, [[6]], 1)  # "a" is gone: one line
+    finally:
+        vllm_logger.removeHandler(caplog.handler)
     lines = [r.getMessage() for r in caplog.records if "a new set of requests" in r.getMessage()]
     assert len(lines) == 1 and "lookup rows 2, accepted 2 over 1 verified rows" in lines[0]
     assert "after 2 steps" in lines[0]

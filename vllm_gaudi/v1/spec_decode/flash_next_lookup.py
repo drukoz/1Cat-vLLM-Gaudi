@@ -27,13 +27,17 @@ from __future__ import annotations
 
 import enum
 import json
-import logging
 import os
 from collections.abc import Sequence
 
 import numpy as np
 
-logger = logging.getLogger(__name__)
+from vllm_gaudi.extension.logger import logger as init_logger
+
+# The "vllm" logger, as the runner and the platform use it: a logger named after this module is outside vLLM's
+# configured hierarchy, and a server then prints nothing below WARNING from it (seen in card job 00021's log,
+# which has no INFO line of the spec_decode modules).
+logger = init_logger()
 
 PAD_DRAFT = -1  # the runner's empty-draft token (``propose_ngram_draft_token_ids``)
 LOG_EVERY_STEPS = 200
