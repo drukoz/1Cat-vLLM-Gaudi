@@ -35,6 +35,7 @@ from vllm_gaudi.extension.profiler import (HabanaHighLevelProfiler, HabanaMemory
 from vllm_gaudi.extension.runtime import clear_config, finalize_config, get_config
 from vllm_gaudi.extension.utils import align_and_pad, pad_list, with_default
 from vllm_gaudi.extension.debug import init_debug_logger
+from vllm_gaudi.v1.core.sched.prefill_pacing import prompt_graph_knob
 from vllm_gaudi.v1.core.recurrent_state_pool import pool_pad_block_id, pool_slots_from_env, pool_tensor_slots
 from vllm_gaudi.v1.worker.hpu_dp_utils import set_hpu_dp_metadata
 from vllm_gaudi.v1.worker.gdn_state_layout import has_contiguous_dflash_checkpoints
@@ -2396,6 +2397,8 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             logger.info("Prompt forwards up to %d tokens (batch x query + context) replay HPU graphs "
                         "(VLLM_HPU_PROMPT_GRAPH_MAX_TOKENS; capture size %d)", self.prompt_graph_max_tokens,
                         self.max_cudagraph_capture_size)
+        # The same threshold from the runtime knobs file (VLLM_HPU_SCHED_KNOBS_FILE), read at every step.
+        self._prompt_graph_knob = prompt_graph_knob(self.prompt_graph_max_tokens)
         self.use_prefix_caching = (self.vllm_config.cache_config.enable_prefix_caching)
         self.bucketing_manager = HPUBucketingManager()
         max_num_prefill_seqs = self.max_num_seqs if self.use_merged_prefill \
@@ -6259,6 +6262,9 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         warmup_mode: bool = False,
     ) -> ModelRunnerOutput | None:
 
+        knob = getattr(self, "_prompt_graph_knob", None)
+        if knob is not None:
+            self.prompt_graph_max_tokens = knob()
         self.run_defragmenter(scheduler_output, warmup_mode)
 
         batch_changed = self._update_states(scheduler_output)

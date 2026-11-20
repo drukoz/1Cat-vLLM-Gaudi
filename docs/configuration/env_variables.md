@@ -185,8 +185,14 @@ engine re-reads while it runs (checked every 0.25 s): `max_num_scheduled_tokens`
 per-request cap), and the pacing knobs `mode`, `share_percent`, `slice_tokens`.
 It exists so a settings sweep (`tools/flash_next/rental/prefill_sweep.py`)
 changes the step budget on a running server instead of restarting it for every
-pair. A file that does not parse keeps the last good values. Default: empty (no
-file, nothing wrapped).
+pair. A file that does not parse keeps the last good values. The same file
+carries one knob for the workers, `prompt_graph_max_tokens`: the model runner
+reads it at the start of every engine step and uses it as its prompt HPU-graph
+threshold (`-1` or absent = the server's `VLLM_HPU_PROMPT_GRAPH_MAX_TOKENS`,
+`0` = upstream's threshold, a positive value = the threshold), so one server
+measures prompt forwards with and without graph replay. Change it only while no
+request runs: every worker must take the change at the same step. Default:
+empty (no file, nothing wrapped, nothing read).
 
 `VLLM_HPU_PROMPT_GRAPH_MAX_TOKENS` sets the size up to which a prompt forward is
 replayed from an HPU graph: `batch x query + context blocks x block size` tokens.

@@ -1,3 +1,0 @@
-# One A/B arm: the same prompts in every arm (--nonce), greedy tokens kept for comparison.
-cold120k --plan baseline --cold-tokens 122880 --repeat 2 --warm-tokens 2048 --concurrent 8 --concurrent-tokens 32768 --turn2-tokens 0 --shared-prefix 0 --canaries 0 --case-max-tokens 8 --return-ids --nonce prefill-ab
-streams --plan baseline --cold-tokens 122880 --repeat 1 --warm-tokens "" --concurrent "" --turn2-tokens 0 --shared-prefix 0 --canaries 2 --nonce prefill-ab-streams

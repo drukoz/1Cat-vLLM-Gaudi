@@ -8,12 +8,14 @@ cap, the defer flag); ``test_prefill_pacing_scheduler.py`` runs the same wrapper
 """
 
 import json
+import os
 from types import SimpleNamespace
 
 import pytest
 
 from vllm_gaudi.v1.core.sched import prefill_pacing as pp
-from vllm_gaudi.v1.core.sched.prefill_pacing import Knobs, KnobsFile, PrefillPacer, PrefillPacingMode, StepKind
+from vllm_gaudi.v1.core.sched.prefill_pacing import (Knobs, KnobsFile, PrefillPacer, PrefillPacingMode, StepKind,
+                                                       prompt_graph_knob)
 
 PACED = Knobs(mode=int(PrefillPacingMode.TIME_SHARE), share_percent=25, slice_tokens=2048)
 
@@ -305,3 +307,65 @@ def test_install_wraps_once_and_only_on_request(monkeypatch):
     assert pp.install_prefill_pacing(Base) and Base.schedule is wrapped  # idempotent
     pp.uninstall_prefill_pacing(Base)
     assert Base.schedule is original
+
+
+# ----- the workers' knob: the prompt HPU-graph threshold of a running server -----
+
+
+def test_the_prompt_graph_knob_is_not_a_scheduler_setting():
+    knobs = Knobs().merged({"prompt_graph_max_tokens": 140000})
+    assert knobs.prompt_graph_max_tokens == 140000
+    assert knobs.is_noop  # a file with only this knob leaves the scheduler untouched
+    assert Knobs().prompt_graph_max_tokens == -1
+    with pytest.raises(ValueError):
+        Knobs(prompt_graph_max_tokens=-2)
+
+
+def test_prompt_graph_knob_is_off_without_the_knobs_file():
+    assert prompt_graph_knob(140000, environ={}) is None
+    assert prompt_graph_knob(0, environ={"VLLM_HPU_SCHED_KNOBS_FILE": ""}) is None
+
+
+def test_prompt_graph_knob_follows_the_file_at_every_call(tmp_path):
+    path = tmp_path / "knobs.json"
+    now = [100.0]
+    knob = prompt_graph_knob(0, environ={"VLLM_HPU_SCHED_KNOBS_FILE": str(path)}, clock=lambda: now[0])
+    assert knob() == 0  # no file yet: the server's own value
+    path.write_text(json.dumps({"prompt_graph_max_tokens": 140000}))
+    assert knob() == 140000  # the next step already, no poll interval (the clock has not moved)
+    path.write_text(json.dumps({"prompt_graph_max_tokens": 140000, "mode": 1, "share_percent": 50}))
+    assert knob() == 140000  # scheduler knobs in the same file do not disturb it
+    path.write_text(json.dumps({"long_prefill_token_threshold": 8192}))
+    assert knob() == 0  # the knob left the file: back to the server's value
+    path.write_text("{not json")
+    assert knob() == 0  # garbage keeps the last good value
+    path.unlink()
+    assert knob() == 0
+
+
+def test_prompt_graph_knob_overrides_a_server_that_started_with_graphs(tmp_path):
+    path = tmp_path / "knobs.json"
+    knob = prompt_graph_knob(140000, environ={"VLLM_HPU_SCHED_KNOBS_FILE": str(path)})
+    assert knob() == 140000
+    path.write_text(json.dumps({"prompt_graph_max_tokens": 0}))  # 0: upstream's threshold
+    assert knob() == 0
+    path.write_text(json.dumps({"prompt_graph_max_tokens": -1}))  # -1: the server's own value
+    assert knob() == 140000
+
+
+def test_every_worker_takes_a_change_at_its_next_step(tmp_path):
+    # eight workers each hold their own reader of the same file; a change made while the server is idle
+    # is seen by all of them at the step that follows
+    path = tmp_path / "knobs.json"
+    environ = {"VLLM_HPU_SCHED_KNOBS_FILE": str(path)}
+    workers = [prompt_graph_knob(0, environ=environ) for _ in range(8)]
+    assert [w() for w in workers] == [0] * 8
+    path.write_text(json.dumps({"prompt_graph_max_tokens": 140000}))
+    assert [w() for w in workers] == [140000] * 8
+    os.replace(_write(tmp_path / "next.json", {"prompt_graph_max_tokens": 0}), path)
+    assert [w() for w in workers] == [0] * 8
+
+
+def _write(path, value):
+    path.write_text(json.dumps(value))
+    return path

@@ -19,7 +19,10 @@ scheduler is covered through ``super()``). While at least one request is decodin
 
 With no request decoding nothing is paced: a cold start prefills at the server's full step budget.
 The wrapper also applies a step budget and a per-request prompt cap read from a JSON file, so a
-settings sweep changes them on a running server instead of restarting it for every pair.
+settings sweep changes them on a running server instead of restarting it for every pair. The same
+file carries one knob for the workers, ``prompt_graph_max_tokens`` (``prompt_graph_knob``: the model
+runner's prompt HPU-graph threshold), so one server measures prompt forwards with and without graph
+replay.
 
 Flags (``vllm_gaudi/envs.py``, all off by default): ``VLLM_HPU_PREFILL_PACING`` (``PrefillPacingMode``),
 ``VLLM_HPU_PREFILL_PACING_SHARE``, ``VLLM_HPU_PREFILL_PACING_SLICE_TOKENS``, ``VLLM_HPU_SCHED_KNOBS_FILE``.
@@ -76,7 +79,9 @@ class Knobs:
     (``--max-num-batched-tokens``, ``--long-prefill-token-threshold``); a threshold of 0 removes the
     per-request cap. ``share_percent`` is the wall-time share of prompt work while streams decode
     (100 = no deferral) and ``slice_tokens`` the prompt tokens of one step while streams decode
-    (0 = no cap); both act only in ``PrefillPacingMode.TIME_SHARE``.
+    (0 = no cap); both act only in ``PrefillPacingMode.TIME_SHARE``. ``prompt_graph_max_tokens`` is
+    not a scheduler setting: the workers read it (``prompt_graph_knob``); -1 keeps the server's
+    ``VLLM_HPU_PROMPT_GRAPH_MAX_TOKENS``, 0 is upstream's threshold, a positive value the threshold.
     """
 
     mode: int = int(PrefillPacingMode.OFF)
@@ -84,6 +89,7 @@ class Knobs:
     slice_tokens: int = DEFAULT_SLICE_TOKENS
     max_num_scheduled_tokens: int = 0
     long_prefill_token_threshold: int = -1
+    prompt_graph_max_tokens: int = -1
 
     def __post_init__(self) -> None:
         PrefillPacingMode(self.mode)  # raises on an unknown mode
@@ -95,6 +101,8 @@ class Knobs:
             raise ValueError(f"max_num_scheduled_tokens must be >= 0, got {self.max_num_scheduled_tokens}")
         if self.long_prefill_token_threshold < -1:
             raise ValueError(f"long_prefill_token_threshold must be >= -1, got {self.long_prefill_token_threshold}")
+        if self.prompt_graph_max_tokens < -1:
+            raise ValueError(f"prompt_graph_max_tokens must be >= -1, got {self.prompt_graph_max_tokens}")
 
     @property
     def paced(self) -> bool:
@@ -133,11 +141,13 @@ class KnobsFile:
     good knobs and is reported once per change, so a half-written file never stops the scheduler.
     """
 
-    def __init__(self, path: str, base: Knobs, clock: Callable[[], float] = time.monotonic) -> None:
+    def __init__(self, path: str, base: Knobs, clock: Callable[[], float] = time.monotonic,
+                 poll_s: float = KNOBS_POLL_S) -> None:
         self.path = path
         self.base = base
         self.current = base
         self._clock = clock
+        self._poll_s = poll_s
         self._next_poll = 0.0
         self._stamp: tuple | None = None
 
@@ -145,7 +155,7 @@ class KnobsFile:
         now = self._clock()
         if now < self._next_poll:
             return self.current
-        self._next_poll = now + KNOBS_POLL_S
+        self._next_poll = now + self._poll_s
         try:
             stat = os.stat(self.path)
             stamp = (stat.st_mtime_ns, stat.st_size)
@@ -168,6 +178,30 @@ class KnobsFile:
         except (OSError, ValueError) as exc:
             logger.warning("Scheduler knobs file %s ignored (%s); keeping %s", self.path, exc, self.current)
         return self.current
+
+
+def prompt_graph_knob(server_value: int, environ=None,
+                      clock: Callable[[], float] = time.monotonic) -> Callable[[], int] | None:
+    """For the model runner: the prompt HPU-graph threshold under the runtime knobs file.
+
+    ``None`` without ``VLLM_HPU_SCHED_KNOBS_FILE`` (the runner then keeps ``server_value``, its
+    ``VLLM_HPU_PROMPT_GRAPH_MAX_TOKENS``, and reads nothing). Otherwise a function for the start of every
+    engine step that returns the file's ``prompt_graph_max_tokens``, or ``server_value`` while the file
+    has none or says -1. The file is checked on every call (one ``stat``): every worker of a server must
+    take a change at the same step, since a rank that replays a graph next to ranks that trace the same
+    forward has never run. So change the knob only while the server is idle; it is a measurement knob.
+    """
+    environ = os.environ if environ is None else environ
+    path = environ.get(ENV_KNOBS_FILE, "")
+    if not path:
+        return None
+    source = KnobsFile(path, Knobs(), clock, poll_s=0.0)
+
+    def current() -> int:
+        value = source.get().prompt_graph_max_tokens
+        return server_value if value < 0 else value
+
+    return current
 
 
 class PrefillPacer:
@@ -374,5 +408,6 @@ __all__ = [
     "knobs_from_env",
     "paced_schedule",
     "pacing_requested",
+    "prompt_graph_knob",
     "uninstall_prefill_pacing",
 ]

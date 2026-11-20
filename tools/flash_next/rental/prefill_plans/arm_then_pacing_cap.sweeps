@@ -1,0 +1,13 @@
+# One arm of a prefill A/B. Every arm sends the same prompts (the nonces) and keeps 8 greedy tokens per request.
+# c32k, c120k: a cold prompt twice (pass 1 compiles the buckets it meets, pass 2 is the warm number); c120k then
+# sends its second prompt again with 2,048 new tokens (a next turn: a prefix hit, a short prefill at 120K).
+c32k --plan baseline --cold-tokens 32768 --repeat 2 --warm-tokens "" --concurrent "" --turn2-tokens 0 --shared-prefix 0 --canaries 0 --case-max-tokens 8 --return-ids --nonce arm-32k
+c120k --plan baseline --cold-tokens 122880 --repeat 2 --warm-tokens 2048 --concurrent "" --turn2-tokens 0 --shared-prefix 0 --canaries 0 --case-max-tokens 8 --return-ids --nonce arm-120k
+# streams: 4 streams decode while one 32,768-token prompt, then four 16,384-token prompts at once, are prefilled.
+streams --plan baseline --cold-tokens 32768 --repeat 1 --warm-tokens "" --concurrent 4 --concurrent-tokens 16384 --turn2-tokens 0 --shared-prefix 0 --canaries 4 --nonce arm-streams
+# multi: four 32,768-token prompts at once, nothing decoding.
+multi --plan baseline --cold-tokens "" --concurrent 4 --concurrent-tokens 32768 --turn2-tokens 0 --shared-prefix 0 --canaries 0 --case-max-tokens 8 --return-ids --nonce arm-multi
+# pacing: the 32,768-token prompt of "streams" again with prompt work at 50 % and at 25 % of wall time.
+pacing --knobs-file /tmp/prefill_knobs.json --plan pacing --pacing 50:2048,25:2048 --sweep-tokens 32768 --canaries 4 --nonce arm-pacing
+# cap8192: one 8,192-token forward of a prompt per step instead of 2,048 (its buckets compile on pass 1).
+cap8192 --knobs-file /tmp/prefill_knobs.json --knobs '{"long_prefill_token_threshold": 8192}' --label "cap 8192" --plan baseline --cold-tokens 32768 --repeat 2 --warm-tokens "" --concurrent "" --turn2-tokens 0 --shared-prefix 0 --canaries 0 --case-max-tokens 8 --return-ids --nonce arm-cap8192

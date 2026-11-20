@@ -8,13 +8,24 @@
 #       bash /bundle/plugin/tools/flash_next/rental/prefill_job.sh PLAN [-- EXTRA_VLLM_SERVE_ARGS...]
 #
 # PLAN: a file of prefill_sweep runs, one per line, "NAME ARGS..." (ARGS without --url, --model, --out;
-# '#' lines are comments); a plain name is looked up in prefill_plans/ next to this script.
+# '#' lines are comments); a plain name is looked up in prefill_plans/ next to this script: arm.sweeps (one
+# arm of an A/B: a cold 32,768 and a cold 122,880 prompt twice each, four streams decoding during a prefill,
+# four prompts at once), base_then_graphs.sweeps (the arm, then prompt HPU graphs through the runtime knob),
+# arm_then_pacing_cap.sweeps (the arm, then two pacing shares and the 8,192-token prompt cap).
 # Server: the rental's command (serve.py) at TP = the job's card count with expert parallelism,
 # --max-num-batched-tokens 8192 --long-prefill-token-threshold 2048 unless EXTRA args override them, and the
 # program head's preset environment of serve_probe.sh (each value only when the job did not set it), plus
-# VLLM_PROFILER_ENABLED=true (rank-0 server_events_*.json: one event per prompt forward).
+# VLLM_PROFILER_ENABLED=true (rank-0 server_events_*.json: one event per prompt forward) and
+# VLLM_HPU_SCHED_KNOBS_FILE=/tmp/prefill_knobs.json (the runtime knobs file: a plan line changes the step
+# budget, the prompt cap, the pacing or the prompt HPU-graph threshold of the running server with
+# `--knobs-file /tmp/prefill_knobs.json --knobs JSON`; no file = the server's own settings).
+# PREFILL_MAX_SECONDS=N (0 = no limit): the whole job ends inside N seconds: a plan line is stopped (SIGINT,
+# its report is written) and the lines after it are left out, so the server stops and every file is there
+# before the queue's maximum hold kills the job (PREFILL_STOP_RESERVE seconds, default 75, are kept for the
+# stop; a line is not started with less than PREFILL_MIN_LINE_SECONDS, default 30, left).
 # Writes: versions.txt, server0.log, <NAME>/ (prefill_sweep.json, prefill_sweep.md, cases.jsonl), <NAME>.log,
-# server_events_*.json. Exit: 0 every plan ran, 3 the server died, 4 not healthy in time, 5 a plan failed.
+# server_events_*.json. Exit: 0 every plan ran, 3 the server died, 4 not healthy in time, 5 a plan failed,
+# 6 the time ran out before the last plan line ended.
 
 set -u
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -30,13 +41,16 @@ PORT="${FARM_PORT_BASE:-8000}"
 TP="${FARM_NCARDS:-8}"
 PYTHON="${FARM_PYTHON:-python3}"
 HEALTH_TIMEOUT="${PREFILL_HEALTH_TIMEOUT:-1500}"
+MAX_SECONDS="${PREFILL_MAX_SECONDS:-0}"
+STOP_RESERVE="${PREFILL_STOP_RESERVE:-75}"  # seconds kept for stopping the server at the end
+MIN_LINE_SECONDS="${PREFILL_MIN_LINE_SECONDS:-30}"  # a plan line with less time than this is not started
 T0=$(date +%s)
 log() { echo "[$(date -u +%T)] prefill_job: $*"; }
 
 for kv in PT_HPU_LAZY_MODE=1 PT_HPU_LAZY_ACC_PAR_MODE=0 VLLM_HPU_FLASH_NEXT_QSA_MODE=1 \
     VLLM_HPU_RECURRENT_STATE_POOL=1 VLLM_HPU_GDN_CORE_DECODE=1 VLLM_HPU_HC_FUSED=1 \
     VLLM_HPU_PLE_HOST_NGRAM_IDS=1 VLLM_HPU_COLLECTIVE_MARK_STEP=0 VLLM_SKIP_WARMUP=true \
-    VLLM_PROFILER_ENABLED=true PYTHONDONTWRITEBYTECODE=1; do
+    VLLM_PROFILER_ENABLED=true VLLM_HPU_SCHED_KNOBS_FILE=/tmp/prefill_knobs.json PYTHONDONTWRITEBYTECODE=1; do
     key="${kv%%=*}"
     if [ -z "${!key+x}" ]; then export "$kv"; fi
 done
@@ -87,13 +101,22 @@ while read -r NAME REST; do
     [ -z "$NAME" ] && continue
     case "$NAME" in \#*) continue ;; esac
     if ! kill -0 "$SP" 2>/dev/null; then log "the server is gone before $NAME"; rc=3; break; fi
+    LIMIT=()
+    if [ "$MAX_SECONDS" -gt 0 ]; then
+        left=$(( MAX_SECONDS - STOP_RESERVE - ($(date +%s) - T0) ))
+        if [ "$left" -lt "$MIN_LINE_SECONDS" ]; then
+            log "no time left for $NAME and the lines after it ($left s)"; rc=6; break
+        fi
+        LIMIT=(timeout -s INT -k 20 "$left")
+    fi
     eval "ARGS=($REST)"
     log "plan $NAME: ${ARGS[*]}"
-    (cd "$TREE" && "$PYTHON" -m tools.flash_next.rental.prefill_sweep --url "http://127.0.0.1:$PORT" --model fn \
-        --out "$OUT/$NAME" "${ARGS[@]}") </dev/null >"$OUT/$NAME.log" 2>&1
+    (cd "$TREE" && ${LIMIT[@]+"${LIMIT[@]}"} "$PYTHON" -m tools.flash_next.rental.prefill_sweep --url "http://127.0.0.1:$PORT" \
+        --model fn --out "$OUT/$NAME" "${ARGS[@]}") </dev/null >"$OUT/$NAME.log" 2>&1
     prc=$?
     log "plan $NAME rc $prc"
     grep -vE "^\s*$|[Ww]arning" "$OUT/$NAME.log" | tail -n 25 | cut -c1-330
+    if [ "$prc" -eq 124 ] || [ "$prc" -eq 137 ]; then log "the time ran out in $NAME"; rc=6; break; fi
     [ "$prc" -ne 0 ] && rc=5
 done <"$PLAN"
 grep -ciE "fallback|is off for|has no HPU kernel" server0.log | xargs echo "fallback/off lines:"

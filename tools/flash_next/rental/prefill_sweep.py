@@ -26,6 +26,13 @@ per-request prompt cap; ``pacing`` repeats ``cold`` under every ``--pacing`` pai
 ``sweep`` and ``pacing`` change the settings of the RUNNING server through ``--knobs-file``, the file the
 server was started with as ``VLLM_HPU_SCHED_KNOBS_FILE`` (``vllm_gaudi/v1/core/sched/prefill_pacing.py``),
 so the server starts once, with ``--max-num-batched-tokens`` at the largest budget of the sweep.
+``--knobs JSON`` puts knobs of its own under every case of the run (for example
+``{"prompt_graph_max_tokens": 140000}``, the workers' prompt HPU-graph threshold, or a prompt cap), so one
+server measures several arms, one run after the other; ``--label`` names the arm in the report.
+
+Every request asks for an exact number of tokens with ``max_tokens`` and ``ignore_eos`` and never sends
+``min_tokens``: that field adds a logits processor that masks the stop tokens of its rows at every step
+(an ``index_put_`` per step), which would be part of every inter-token time measured here.
 
 Prompts are token ids sent to ``/v1/completions`` (exact lengths, no chat template): the ids of the
 repository's own documents and sources, tokenized once through the server's ``/tokenize``
@@ -43,8 +50,10 @@ import asyncio
 import hashlib
 import json
 import os
+import signal
 import statistics
 import sys
+import threading
 import time
 import urllib.request
 from pathlib import Path
@@ -238,11 +247,11 @@ def _consume_chunk(obj: dict, record: dict) -> None:
 
 
 def completion_payload(model: str, prompt_ids: list[int], max_tokens: int, return_ids: bool = False) -> dict:
+    """Exactly ``max_tokens`` greedy tokens: ``ignore_eos`` gives the length, no ``min_tokens`` (module text)."""
     payload = {
         "model": model,
         "prompt": prompt_ids,
         "max_tokens": max_tokens,
-        "min_tokens": max_tokens,
         "ignore_eos": True,
         "temperature": 0,
         "stream": True,
@@ -305,19 +314,22 @@ def window_stats(arrivals: list[list[float]], start: float, end: float) -> dict:
 
 def summarize_canaries(canaries: list[dict], t_ready: float, t_send: float, t_first_all: float, t_stop: float) -> dict:
     """Per window (``before``, ``during``, ``after`` the prefill): the streams' median tokens per second,
-    their slowest stream and the longest stall of any stream."""
+    their slowest stream, the inter-token latency (the median stream's median, the worst stream's 99th
+    percentile) and the longest stall of any stream."""
     out = {}
     for name, (start, end) in (("before", (t_ready, t_send)), ("during", (t_send, t_first_all)),
                                ("after", (t_first_all, t_stop))):
         rows = [window_stats(c["arrivals"], start, end) for c in canaries]
         rates = [r["tokens_per_s"] for r in rows if r["tokens_per_s"] is not None]
         stalls = [r["stall_ms"] for r in rows if r["stall_ms"] is not None]
+        p50s = [r["itl_p50_ms"] for r in rows if r["itl_p50_ms"] is not None]
         p99s = [r["itl_p99_ms"] for r in rows if r["itl_p99_ms"] is not None]
         out[name] = {
             "seconds": max(end - start, 0.0),
             "streams": len(rows),
             "tokens_per_s_p50": statistics.median(rates) if rates else None,
             "tokens_per_s_min": min(rates) if rates else None,
+            "itl_p50_ms": statistics.median(p50s) if p50s else None,
             "itl_p99_ms": max(p99s) if p99s else None,
             "stall_ms": max(stalls) if stalls else None,
         }
@@ -349,7 +361,9 @@ class Runner:
         self.corpus = corpus
         self.out_dir = out_dir
         self.rows: list[dict] = []
-        self.setting = {"label": "server", "knobs": None}
+        self.base_label = args.label
+        self.base_knobs: dict = dict(args.knobs or {})
+        self.setting = {"label": self.base_label, "knobs": None}
         self._session: aiohttp.ClientSession | None = None
         self._cases_file = None
 
@@ -374,7 +388,14 @@ class Runner:
         return {key: sums.get(name) for key, name in METRIC_NAMES.items()}
 
     async def set_knobs(self, label: str, knobs: dict | None) -> None:
-        """Write the scheduler knobs for the next cases (``None``: leave the server alone)."""
+        """Write the knobs for the next cases (``None``: leave the server alone). The run's own knobs
+        (``--knobs``) lie under them, and its label (``--label``) goes in front of ``label``."""
+        if knobs is not None:
+            knobs = {**self.base_knobs, **knobs}
+        if label == "server":
+            label = self.base_label
+        elif self.base_label != "server":
+            label = f"{self.base_label}, {label}"
         self.setting = {"label": label, "knobs": knobs}
         if knobs is None:
             return
@@ -555,8 +576,9 @@ def format_line(result: dict) -> str:
         "-" if agg["prefill_tokens_per_s"] is None else "%.0f" % agg["prefill_tokens_per_s"])
     canaries = result["canaries"]
     if canaries:
-        text += " | streams tok/s before %s during %s, stall %s ms" % (
+        text += " | streams tok/s before %s during %s, ITL p50 ms before %s during %s, stall %s ms" % (
             _fmt(canaries["before"]["tokens_per_s_p50"]), _fmt(canaries["during"]["tokens_per_s_p50"]),
+            _fmt(canaries["before"]["itl_p50_ms"]), _fmt(canaries["during"]["itl_p50_ms"]),
             _fmt(canaries["during"]["stall_ms"], 0))
     if agg["errors"]:
         text += " | ERRORS %d: %s" % (agg["errors"], next(r["error"] for r in rows if r["status"] != 0))
@@ -578,8 +600,9 @@ def write_report(out_dir: Path, rows: list[dict], meta: dict) -> None:
         "- rate = uncached prompt tokens over the time to the (last) first token; streams = the canaries, "
         "median tokens per second per stream and the longest stall of any stream while the case prefilled", "",
         "| setting | case | requests | uncached | cached | TTFT s (min..max) | rate tok/s | streams before tok/s | "
-        "streams during tok/s | slowest stream during | stall ms | ITL p99 ms | errors |",
-        "|---|---|---|---|---|---|---|---|---|---|---|---|---|",
+        "streams during tok/s | slowest stream during | stall ms | ITL p50 ms before | ITL p50 ms during | "
+        "ITL p99 ms during | errors |",
+        "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|",
     ]
     for row in clean:
         agg, reqs, can = row["aggregate"], row["requests"], row["canaries"]
@@ -587,12 +610,13 @@ def write_report(out_dir: Path, rows: list[dict], meta: dict) -> None:
         cached = sum(r["cached_tokens"] or 0 for r in reqs)
         during = can["during"] if can else {}
         before = can["before"] if can else {}
-        lines.append("| %s | %s | %d | %d | %d | %s | %s | %s | %s | %s | %s | %s | %d |" % (
+        lines.append("| %s | %s | %d | %d | %d | %s | %s | %s | %s | %s | %s | %s | %s | %s | %d |" % (
             row["setting"], row["case"], agg["requests"], agg["uncached_tokens"], cached,
             "-" if not ttfts else "%.2f..%.2f" % (min(ttfts), max(ttfts)),
             _fmt(agg["prefill_tokens_per_s"], 0), _fmt(before.get("tokens_per_s_p50")),
             _fmt(during.get("tokens_per_s_p50")), _fmt(during.get("tokens_per_s_min")),
-            _fmt(during.get("stall_ms"), 0), _fmt(during.get("itl_p99_ms")), agg["errors"]))
+            _fmt(during.get("stall_ms"), 0), _fmt(before.get("itl_p50_ms")), _fmt(during.get("itl_p50_ms")),
+            _fmt(during.get("itl_p99_ms")), agg["errors"]))
     marginals = depth_marginals(clean)
     if marginals:
         lines += ["", "## Rate by context depth (single cold requests of growing length)", "",
@@ -630,6 +654,13 @@ def _int_list(text: str) -> list[int]:
     return [int(part) for part in text.split(",") if part.strip()]
 
 
+def _json_object(text: str) -> dict:
+    value = json.loads(text)
+    if not isinstance(value, dict):
+        raise argparse.ArgumentTypeError("a JSON object is needed, got %r" % (value, ))
+    return value
+
+
 def _pairs(text: str) -> list[tuple[int, int]]:
     pairs = []
     for part in text.split(","):
@@ -648,6 +679,10 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     p.add_argument("--out", required=True, help="output directory")
     p.add_argument("--plan", default="baseline", help="comma-separated plans: " + ", ".join(PLANS))
     p.add_argument("--knobs-file", default="", help="the server's VLLM_HPU_SCHED_KNOBS_FILE (sweep and pacing plans)")
+    p.add_argument("--knobs", type=_json_object, default=None,
+                   help="a JSON object of knobs written to --knobs-file before the first case and kept under "
+                   "the knobs of the sweep and pacing plans, for example '{\"prompt_graph_max_tokens\": 140000}'")
+    p.add_argument("--label", default="server", help="the name of this run's setting in the report")
     p.add_argument("--cold-tokens", type=_int_list, default=[32000, 120000], help="baseline: cold prompt sizes")
     p.add_argument("--warm-tokens", type=_int_list, default=[64, 512, 2048],
                    help="baseline: new tokens appended to each cold prompt")
@@ -687,6 +722,8 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     unknown = [name for name in args.plans if name not in PLANS]
     if unknown:
         p.error("unknown plan(s) %s; known: %s" % (unknown, ", ".join(PLANS)))
+    if args.knobs is not None and not args.knobs_file:
+        p.error("--knobs needs --knobs-file (the server's VLLM_HPU_SCHED_KNOBS_FILE)")
     return args
 
 
@@ -708,6 +745,8 @@ async def run(args: argparse.Namespace) -> int:
     print("prefill_sweep: %d corpus token ids, plans %s, nonce %s" % (len(ids), args.plans, nonce), flush=True)
     async with Runner(args, corpus, out_dir) as runner:
         try:
+            if args.knobs is not None:
+                await runner.set_knobs("server", {})  # the run's own knobs, before its first case
             for name in args.plans:
                 await getattr(runner, "plan_" + name)()
         finally:
@@ -719,8 +758,19 @@ async def run(args: argparse.Namespace) -> int:
     return 0 if errors == 0 else 1
 
 
+def _interrupt(signum, frame) -> None:
+    raise KeyboardInterrupt
+
+
 def main(argv: Optional[list[str]] = None) -> int:
-    return asyncio.run(run(parse_args(argv)))
+    args = parse_args(argv)
+    if threading.current_thread() is threading.main_thread():
+        # A job that runs out of time stops this tool with SIGINT or SIGTERM: both end the run the way
+        # Ctrl-C does, so the report of the cases that finished is written (run's finally). SIGINT is set
+        # too because a shell that started its parent in the background leaves it ignored.
+        signal.signal(signal.SIGTERM, _interrupt)
+        signal.signal(signal.SIGINT, signal.default_int_handler)
+    return asyncio.run(run(args))
 
 
 if __name__ == "__main__":
