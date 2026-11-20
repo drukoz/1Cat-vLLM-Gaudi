@@ -53,6 +53,7 @@ def test_request_body_has_no_min_tokens_and_carries_the_mode():
     assert "min_tokens" not in body and body["max_tokens"] == 64 and body["ignore_eos"] is True
     assert body["temperature"] == 0 and body["stream"] is True and "vllm_xargs" not in body
     assert body["stream_options"] == {"include_usage": True, "continuous_usage_stats": True}
+    assert body["return_token_ids"] is True
     assert lp.request_body("fn", "hello", 64, 2)["vllm_xargs"] == {"spec_lookup": 2}
     whole = lp.request_body("fn", "hello", 64, None, ignore_eos=False)
     assert whole["ignore_eos"] is False and whole["max_tokens"] == 64 and "min_tokens" not in whole
@@ -69,17 +70,26 @@ def test_request_body_is_a_valid_vllm_request():
     assert params.max_tokens == 64 and params.min_tokens == 0 and params.ignore_eos and params.temperature == 0
     assert params.extra_args == {REQUEST_KEY: 1}
     assert request_mode(params.extra_args, SpecLookupMode.OFF) == SpecLookupMode.HYBRID
-    assert request.chat_template_kwargs == {"enable_thinking": False}
+    assert request.chat_template_kwargs == {"enable_thinking": False} and request.return_token_ids is True
     plain = protocol.ChatCompletionRequest(**lp.request_body("fn", "hello", 64, None)).to_sampling_params(64, {})
     assert not plain.extra_args
 
 
-def _sse(chunks):
-    """SSE lines of a chat stream: ``chunks`` = [(text, completion tokens so far)]."""
-    lines = [b'data: {"choices": [{"delta": {"role": "assistant", "content": ""}}], "usage": {"prompt_tokens": 9, '
-             b'"completion_tokens": 0}}\n', b"\n"]
+def _sse(chunks, ids=False):
+    """SSE lines of a chat stream: ``chunks`` = [(text, completion tokens so far)]; with ``ids`` the chunks carry
+    token ids (700, 701, ...) and the first chunk the prompt's ids, as a server asked for return_token_ids does."""
+    first = {"choices": [{"delta": {"role": "assistant", "content": ""}}],
+             "usage": {"prompt_tokens": 9, "completion_tokens": 0}}
+    if ids:
+        first["prompt_token_ids"] = list(range(9))
+    lines = [b"data: " + json.dumps(first).encode() + b"\n", b"\n"]
+    done = 0
     for text, tokens in chunks:
-        lines.append(b"data: " + json.dumps({"choices": [{"delta": {"content": text}}],
+        choice = {"delta": {"content": text}}
+        if ids:
+            choice["token_ids"] = list(range(700 + done, 700 + tokens))
+        done = tokens
+        lines.append(b"data: " + json.dumps({"choices": [choice],
                                              "usage": {"prompt_tokens": 9, "completion_tokens": tokens}}).encode()
                      + b"\n")
         lines.append(b"\n")
@@ -97,6 +107,18 @@ def test_stream_reading_and_step_sizes():
     assert rec["usage"]["prompt_tokens_details"] == {"cached_tokens": 4}
     assert lp.step_sizes(rec["tokens"]) == [1, 3, 1, 4]
     assert lp.step_sizes([1, None, 3]) == [] and lp.step_sizes([]) == []
+    assert rec["ids"] == [] and rec["prompt_ids"] is None  # this server sent no ids: the usage counted the tokens
+
+
+def test_stream_reading_with_token_ids():
+    """With return_token_ids a chunk without text still carries its tokens (one chunk per engine step): the ids
+    count the tokens, and the stream's ids and the prompt's ids are kept."""
+    clock = iter(range(100))
+    rec = lp.consume_stream(_sse([("a", 1), ("", 4), ("e", 5), ("fghi", 9)], ids=True),
+                            now=lambda: float(next(clock)))
+    assert rec["tokens"] == [1, 4, 5, 9] and rec["text"] == ["a", "", "e", "fghi"]
+    assert rec["ids"] == list(range(700, 709)) and rec["prompt_ids"] == list(range(9))
+    assert lp.step_sizes(rec["tokens"]) == [1, 3, 1, 4]
 
 
 def test_round_summary_arithmetic():
@@ -167,7 +189,7 @@ class _FakeServer(http.server.BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         self.end_headers()
-        for line in _sse(chunks):
+        for line in _sse(chunks, ids=bool(body.get("return_token_ids"))):
             self.wfile.write(line)
 
 
@@ -191,6 +213,9 @@ def test_probe_end_to_end_against_a_fake_server(tmp_path, capsys):
     first = record["rounds"][0]
     assert first["spec"]["drafts"] == 12 and first["spec"]["acceptance_length"] == pytest.approx(2.0)
     assert first["spec"]["position_rates"] == [1.0, 0.0] and first["step_sizes"] == {"2": 12}
+    assert first["token_ids"][0] == list(range(700, 708)) and "prompt_token_ids" not in first
+    assert set(first["prompt_sha"]) <= set(record["prompts"]) and len(record["prompts"]) == 4  # 3 edit + 1 prose
+    assert record["prompts"][first["prompt_sha"][0]] == list(range(9))
     assert len(record["warm"]) == 3 and "texts" not in record["warm"][0]  # one warm round per (kind, streams)
     # the warm round is as long as the round for edit and prose, 48 tokens for the whole-answer round
     assert [w["tokens"] for w in record["warm"]] == [8, 6, 48]

@@ -27,7 +27,9 @@ A round may carry a per-request lookup mode for a server with VLLM_HPU_FLASH_NEX
 Per round: tokens per verification step per request (vLLM's acceptance length ``1 + accepted / drafts`` from the
 counters) and the rate of every draft position; ms per engine step (the median gap between a stream's chunks: one
 chunk per step); effective ms per token over the decode span (compile pauses included) and steady
-(``gap / acceptance length``); the sizes of the client-side steps (tokens per chunk, from the usage of every chunk).
+(``gap / acceptance length``); the sizes of the client-side steps (tokens per chunk). The requests ask for the
+token ids (``return_token_ids``): every stream's generated ids and every prompt's ids are kept (``token_ids`` per
+round, ``prompts`` by the prompt's hash), exact and without a tokenizer.
 
 Usage:
   lookup_probe.py --port P --out OUT.json --label L --rounds edit:32:384:0,edit:32:384:1,prose:32:256:-
@@ -137,6 +139,9 @@ def request_body(model: str, prompt: str, ntok: int, mode: int | None, ignore_eo
     body = {"model": model, "messages": [{"role": "user", "content": prompt}], "max_tokens": ntok,
             "ignore_eos": bool(ignore_eos), "temperature": 0, "stream": True,
             "stream_options": {"include_usage": True, "continuous_usage_stats": True},
+            # the ids the model generated (and the prompt's, in the first chunk): exact step sizes, and the
+            # streams tools/flash_next/lookup_replay.py replays without a tokenizer
+            "return_token_ids": True,
             "chat_template_kwargs": {"enable_thinking": False}}
     if mode is not None:
         body["vllm_xargs"] = {"spec_lookup": mode}
@@ -156,10 +161,13 @@ def read_counters(host: str, port: int) -> dict | None:
 
 
 def consume_stream(lines, now=time.perf_counter) -> dict:
-    """Read the ``data:`` lines of one streamed chat completion: ``{"times", "tokens", "text", "usage"}`` with one
-    entry of ``times`` and ``tokens`` (the completion tokens so far, from the chunk's usage; None without it) per
-    chunk that carried text."""
-    rec = {"times": [], "tokens": [], "text": [], "usage": None}
+    """Read the ``data:`` lines of one streamed chat completion: ``{"times", "tokens", "text", "usage", "ids",
+    "prompt_ids"}`` with one entry of ``times`` and ``tokens`` per chunk that carried tokens or text (one chunk
+    per engine step). ``tokens`` is the completion tokens so far: the ids counted when the chunks carry them
+    (``return_token_ids``), else the chunk's usage (None without either). ``ids``: every generated token id;
+    ``prompt_ids``: the prompt's ids from the first chunk (None when the server sends none)."""
+    rec = {"times": [], "tokens": [], "text": [], "usage": None, "ids": [], "prompt_ids": None}
+    with_ids = False
     for line in lines:
         line = line.strip()
         if not line.startswith(b"data:"):
@@ -174,11 +182,20 @@ def consume_stream(lines, now=time.perf_counter) -> dict:
         usage = obj.get("usage")
         if usage:
             rec["usage"] = usage
+        if obj.get("prompt_token_ids"):
+            rec["prompt_ids"] = [int(t) for t in obj["prompt_token_ids"]]
         choices = obj.get("choices") or []
-        if choices and (choices[0].get("delta") or {}).get("content"):
+        if not choices:
+            continue
+        content = (choices[0].get("delta") or {}).get("content")
+        ids = choices[0].get("token_ids") or []
+        if ids:
+            with_ids = True
+            rec["ids"].extend(int(t) for t in ids)
+        if ids or content:
             rec["times"].append(now())
-            rec["tokens"].append((usage or {}).get("completion_tokens"))
-            rec["text"].append(choices[0]["delta"]["content"])
+            rec["tokens"].append(len(rec["ids"]) if with_ids else (usage or {}).get("completion_tokens"))
+            rec["text"].append(content or "")
     return rec
 
 
@@ -190,7 +207,8 @@ def step_sizes(tokens: list[int | None]) -> list[int]:
 
 
 def one_stream(args, body: dict, out: list, idx: int, barrier: threading.Barrier) -> None:
-    rec = {"status": None, "t0": None, "times": [], "tokens": [], "text": [], "usage": None, "err": None}
+    rec = {"status": None, "t0": None, "times": [], "tokens": [], "text": [], "usage": None, "ids": [],
+           "prompt_ids": None, "err": None}
     try:
         barrier.wait()
         conn = http.client.HTTPConnection(args.host, args.port, timeout=args.timeout)
@@ -232,6 +250,7 @@ def summarize_round(kind: str, n: int, ntok: int, mode: int | None, out: list, w
     res = {"kind": kind, "streams": n, "tokens": ntok, "mode": mode, "ok": len(per), "errors": errors,
            "wall_s": wall, "spec": spec,
            "texts": ["".join(r["text"]) if r else None for r in out],
+           "token_ids": [r.get("ids") or None if r else None for r in out],
            "error_samples": [r["err"] for r in out if r and r["err"]][:3]}
     if per:
         res["ms_per_token_p50"] = statistics.median(p["ms_per_token"] for p in per)
@@ -275,6 +294,9 @@ def run_round(args, kind: str, n: int, ntok: int, mode: int | None, files: dict)
     spec = spec_summary(counters_delta(before, read_counters(args.host, args.port)))
     res = summarize_round(kind, n, ntok, mode, out, wall, spec)
     res["prompt_sha"] = [hashlib.sha256(p.encode("utf-8")).hexdigest()[:12] for p in prompts]
+    # the prompts' token ids, once per prompt for the whole probe (run_round's caller keeps the dict)
+    res["prompt_token_ids"] = {sha: r["prompt_ids"] for sha, r in zip(res["prompt_sha"], out)
+                               if r and r.get("prompt_ids")}
     return res
 
 
@@ -370,7 +392,7 @@ def main(argv: list[str] | None = None) -> int:
             print(f"lookup_probe: none of the {kind} files exists under {args.tree}", file=sys.stderr)
             return 2
     results = {"label": args.label, "tree": args.tree, "files": {k: [f for f, _ in v] for k, v in files.items()},
-               "rounds": [], "warm": []}
+               "rounds": [], "warm": [], "prompts": {}}
     warmed = set()
 
     def save():
@@ -388,7 +410,9 @@ def main(argv: list[str] | None = None) -> int:
             w = run_round(args, kind, n, warm_tokens, mode, files)
             warmed.add((kind, n))
             print(round_line(args.label, "warm", w), flush=True)
+            results["prompts"].update(w.pop("prompt_token_ids", {}))
             w.pop("texts", None)
+            w.pop("token_ids", None)
             results["warm"].append(w)
             save()
             if not w["ok"]:
@@ -399,6 +423,7 @@ def main(argv: list[str] | None = None) -> int:
                 save()
                 continue
         m = run_round(args, kind, n, ntok, mode, files)
+        results["prompts"].update(m.pop("prompt_token_ids", {}))
         results["rounds"].append(m)
         save()
         print(round_line(args.label, "MEAS", m), flush=True)
