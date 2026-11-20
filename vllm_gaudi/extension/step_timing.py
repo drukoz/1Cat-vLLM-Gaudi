@@ -737,6 +737,9 @@ def install_component_cuts(timer: StepTimer | None, model) -> dict:
         def wrapper(*args, **kwargs):
             if not timer.active or timer.mode != MODE_SYNC:
                 return original(*args, **kwargs)
+            stack = timer._stack
+            if stack and stack[-1] == component:  # an entry point that calls another of its own component
+                return original(*args, **kwargs)
             timer.component_begin(component)
             try:
                 return original(*args, **kwargs)
