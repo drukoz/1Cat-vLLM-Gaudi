@@ -21,14 +21,14 @@ It contains the program head `938dada4` (merged as `49eb18cb`: PR #14 collective
 |---|---|---|
 | 00086, 00087, 00107, 00114 | tiny-model rehearsals (n-gram k = 3 and 8, vLLM's search, the hybrid with the torch and the fused GDN verification) | ended ok 20:33 to 20:38 UTC; read, reported to the coordinator; numbers in section 7 |
 | 00095 `real4-nospec-edit-prose` | real model, no speculation, TP4 + EP4: the reference and the token ids for the replay | ended ok 23:22 UTC; numbers and the replay in section 7 |
-| **00120 `real4-ngram5-edit`** (any:4, 40 min) | real model, n-gram k = 5 with prefix caching and the fused GDN verification op, rounds `edit:1:384`, `edit:32:384`, `prose:32:256`, `prose:1:256` (the same rounds and prompts as 00095); commit `49eb18cb` | **waiting** (submitted 23:27 UTC; the coordinator was asked for its place). Its local waiter wrote `reports/spec-lookup/card/submit-real4-ngram5-edit.log`; if that waiter is gone: `bin/farm fetch spec-lookup 00120 00120-real4-ngram5-edit` |
+| **00129 `real4-ngram5-edit2`** (any:4, 45 min; replaced 00120 with `--replaces`, keeping its place and the coordinator's bump) | real model, n-gram k = 5 with prefix caching and the fused GDN verification op (`--env VLLM_HPU_GDN_CORE_VERIFY=1`), rounds `edit:1:384`, `edit:32:384`, `prose:32:256`, `prose:1:256` (the same rounds and prompts as 00095); if that server dies, is not healthy or its probe fails (rc 3, 4, 5), the same job reruns n-gram k = 5 with the torch verification into `torch-verify/` (rounds `edit:1`, `edit:32`); commit `54990f1f` | **waiting** (submitted 23:36 UTC; "starts by 02:09 UTC at the latest", behind the integration and MTP jobs). Its local waiter writes `reports/spec-lookup/card/submit-real4-ngram5-edit2.log`; if that waiter is gone: `bin/farm fetch spec-lookup 00129 00129-real4-ngram5-edit2` |
 
-When 00120 ends:
+When 00129 ends:
 ```bash
 cd /Volumes/Storage/Claude/gaudi-work/wt/spec-lookup
 C=/Volumes/Storage/Claude/gaudi-work/reports/spec-lookup/card
-python3 tools/flash_next/lookup_summary.py $C/00095-real4-nospec-edit-prose $C/00120-real4-ngram5-edit
-grep -E "MEAS|fallback|DONE|ERROR" $C/00120-real4-ngram5-edit/probe.log $C/00120-real4-ngram5-edit.log
+python3 tools/flash_next/lookup_summary.py $C/00095-real4-nospec-edit-prose $C/00129-real4-ngram5-edit2
+grep -E "MEAS|fallback|DONE|ERROR|^job:" $C/00129-real4-ngram5-edit2/probe.log $C/00129-real4-ngram5-edit2.log
 ```
 and report to the coordinator (SendMessage `main`) and in section 7: measured tokens per step against the replay
 (edit k = 5: 4.72), ms per step at 1 stream and at 32 streams (192 rows), ms per token against 00095 (29.9 and
@@ -43,13 +43,14 @@ the old head; the tree is the current one). Do not start a second one; check tha
 
 **Pending, in order**
 
-1. 00120's numbers (above). If it fails in the fused verification op: the torch path is the fallback
-   (`--env VLLM_HPU_GDN_CORE_VERIFY=0`, rehearsed on the card in 00086 / 00087); if it fails elsewhere, the
-   traceback is in `00120-real4-ngram5-edit/server0.log`.
-2. **Merge** per the protocol once the gate is green and 00120 has run: `git fetch origin && git merge
+1. 00129's numbers (above); the coordinator asked for (a) the 1-stream edit ms per token and tok/s per stream,
+   (b) `c` at 32 streams on the head's path, (c) the hybrid on the mixed load from the same numbers (7.4). If the
+   fused-verification server failed, the job's own fallback ran the torch verification (`torch-verify/`); the
+   first server's traceback is in `00129-real4-ngram5-edit2/server0.log`.
+2. **Merge** per the protocol once the gate is green and 00129 has run: `git fetch origin && git merge
    origin/feat/flash-next-gaudi`, `bin/gate <worktree> --tools`, push, `gh pr create --base feat/flash-next-gaudi`,
    `gh pr merge --merge`. Card-proven so far: n-gram with prefix caching (tiny model: 00086 k = 3, 00087 k = 8 and
-   vLLM's search; real model: 00120), the hybrid (tiny model, 00107 torch and 00114 fused verification). All flags
+   vLLM's search; real model: 00129), the hybrid (tiny model, 00107 torch and 00114 fused verification). All flags
    of this track default off (`VLLM_HPU_FLASH_NEXT_SPEC_LOOKUP`, `..._LOOKUP_MIN_NGRAM`, `..._LOOKUP_MAX_NGRAM`,
    `..._LOOKUP_ORACLE`); n-gram itself is chosen by `--speculative-config`. This branch contains mtp-card-ready's
    commits through `f1aa2292` (not yet on the program head): a pull request of this branch brings them along;
@@ -259,7 +260,7 @@ accepted per row; MTP rows 0 accepted, a random model.)
   a random model with flat logits (INFERRED). Two (prompt, position) pairs differ only with accepted drafts
   (the 100-token prompt at token 28 in three jobs, the second turn at token 14 in two): **not classified**,
   because the baseline's log-probability request crashed the server (below). The real-model run at one stream
-  (00120 against 00095) is the check.
+  (00129 against 00095) is the check.
 - Defect found on the way (reported to the coordinator, owner engine-step / the sampler): a `/v1/completions`
   request with `logprobs: 5` killed the HPU server's output handler: `OverflowError: out of range integral type
   conversion attempted` in the detokenizer of the top-logprob ids (`00086-.../baseline/server0.log`, about line
@@ -327,7 +328,7 @@ per step (7.3). With `rho = c / T32` the speed-up on edits is `a / (1 + 32 k rho
 - Break-even `rho*` = `(a - 1) / (32 k)`: 0.026 (k = 3), 0.024 (k = 5), 0.021 (k = 8), 0.017 (k = 16).
 - The optimum is flat: k = 3 to 6 lie within 3 % of each other for rho 0.01 to 0.017.
 - One stream (T1 = 30 ms at TP4, a host-bound step): every depth pays; with an assumed 0.5 ms per extra row,
-  k = 5 gives about 6.7 ms per token (x4.5) and k = 8 about 5.2 (x5.8). 00120 measures it.
+  k = 5 gives about 6.7 ms per token (x4.5) and k = 8 about 5.2 (x5.8). 00129 measures it.
 - Prose at 32 streams: the n-gram server loses at every depth (x0.58 at rho 0.017, k = 3; x0.67 at rho 0.011).
 - Mixed load at 32 streams, a share `f` of the streams in an edit span: the n-gram server runs
   `(T32 + 32 k c) / (f a_L + (1 - f))`; the hybrid (MTP rows on prose, lookup rows on edits, always 1 + k wide,
@@ -340,7 +341,7 @@ per step (7.3). With `rho = c / T32` the speed-up on edits is `a / (1 + 32 k rho
   The hybrid is the safer server for a mixed load; the n-gram server only for a pure copy load, until the rows
   become per-request (Handoff, pending 3).
 
-### 7.5 n-gram on the real model (job 00120): pending
+### 7.5 n-gram on the real model (job 00129): pending
 
 ## 8. Notes for other tracks
 
