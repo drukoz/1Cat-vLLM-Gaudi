@@ -49,7 +49,9 @@ class HpuCommunicator(DeviceCommunicatorBase):
         # FIXME(kzawora): this is a workaround for a bug in Habana PT bridge
         # occurring when PT_HPU_ENABLE_LAZY_COLLECTIVES=true env var is used
         # (which is required for tensor parallel HPUGraph inference)
-        htorch.core.mark_step()
+        # VLLM_HPU_COLLECTIVE_MARK_STEP=0 leaves it out, to measure the step without the graph cut.
+        if gaudi_envs.VLLM_HPU_COLLECTIVE_MARK_STEP:
+            htorch.core.mark_step()
         dist.all_reduce(input_, group=self.device_group)
         return input_
 
@@ -66,7 +68,9 @@ class HpuCommunicator(DeviceCommunicatorBase):
         output_size = (input_size[0] * world_size, ) + input_size[1:]
         output_tensor = torch.empty(output_size, dtype=input_.dtype, device=input_.device)
         # All-gather.
-        htorch.core.mark_step()
+        from vllm_gaudi import envs as gaudi_envs
+        if gaudi_envs.VLLM_HPU_COLLECTIVE_MARK_STEP:
+            htorch.core.mark_step()
         dist.all_gather_into_tensor(output_tensor, input_, group=self.device_group)
         # Reshape
         output_tensor = output_tensor.reshape((world_size, ) + input_size)

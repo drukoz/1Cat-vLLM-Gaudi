@@ -532,6 +532,7 @@ if TYPE_CHECKING:
     VLLM_HPU_GDN_CORE_DECODE: int = 1  # GdnCoreDecodeMode: 1 fused (default), 0 off, 2 recurrence
     VLLM_HPU_GDN_CORE_DECODE_DEBUG: int = 0  # GdnCoreDecodeDebug: 0 off, 1 check slot indices every step (host sync)
     VLLM_HPU_GDN_CORE_VERIFY: int = 0  # GdnCoreVerifyMode: 0 off (default), 1 fused verification steps
+    VLLM_HPU_COLLECTIVE_MARK_STEP: int = 1  # 1 (default) mark_step() before every HPU collective, 0 none
     VLLM_HPU_RECURRENT_STATE_POOL: int = 0  # RecurrentStatePoolMode: 0 off, 1 pool
     VLLM_HPU_RECURRENT_STATE_POOL_SLOTS: int = 0  # resolved by the hook; positive overrides the formula
     VLLM_HPU_RECURRENT_STATE_POOL_CACHE_SLOTS: int = 512  # retained prefix states added to the live need
@@ -1884,6 +1885,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # docs/design/flash-next/gdn-core-decode.md, "Phase 2 contract, version 2".
     "VLLM_HPU_GDN_CORE_VERIFY":
     lambda: int(os.environ.get("VLLM_HPU_GDN_CORE_VERIFY", "0")),
+
+    # The htorch.core.mark_step() that HpuCommunicator issues before every all-reduce and all-gather
+    # (a workaround for a Habana bridge bug with PT_HPU_ENABLE_LAZY_COLLECTIVES). 1 (default) keeps it.
+    # 0 removes it: an experiment for a card, where a Flash-Next TP8 decode step has 99 collectives and
+    # so 99 graph cuts; only use it when the served tokens still match a reference (tiny_smoke.sh --env).
+    "VLLM_HPU_COLLECTIVE_MARK_STEP":
+    lambda: int(os.environ.get("VLLM_HPU_COLLECTIVE_MARK_STEP", "1")),
 
     # Recurrent (GDN / short-conv) state pool: 0 (default) keeps today's
     # one-recurrent-slot-per-attention-block-id allocation, 1 gives the
