@@ -55,7 +55,9 @@ MTP speculative config; the decode branch then verifies the drafts with
 batch with one sampled request, logprobs, `min_tokens`, penalties, logit bias, token masks, structured output or any other
 speculative method keeps today's path. `hpu_rejection_sampler.py` is not changed (the mtp-card-ready track builds
 sampled verification there). The MTP proposer takes its drafts through `HpuFlashNextMtpProposer._draft_tokens`
-(the draft-rank log keeps the gathered logits, it needs their top 4).
+(the draft-rank log keeps the gathered logits, it needs their top 4). Prompt chunks are sampled by the general
+sampler in the runner, so a prefill step keeps its logits all-gather (one row per prompt chunk, 497 KB); the gloo
+harness's prefill phase picks its token through `top_tokens`, so its "prefill" count shows the reduced gather.
 
 Mode 2 (`VLLM_HPU_VOCAB_PARALLEL_LOGITS=2`, `vocab_parallel.top_k`) gathers the per-rank top `K` instead of the
 logits. No serving path calls it yet. When it is exact for sampling:
