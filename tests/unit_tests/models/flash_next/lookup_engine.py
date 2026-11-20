@@ -270,12 +270,15 @@ _BOOT_ENV = ("VLLM_COMPACT_GDN", "VLLM_HPU_RECURRENT_STATE_POOL", "VLLM_HPU_RECU
 _ENV_AT_START = {name: os.environ.get(name) for name in _BOOT_ENV}
 
 
-def _boot(LLM, plan: dict, speculative_config: dict | None, prefix_caching: bool):
+def _boot(LLM, plan: dict, speculative_config: dict | None, prefix_caching: bool, env: dict | None = None):
     for name, value in _ENV_AT_START.items():
         if value is None:
             os.environ.pop(name, None)
         else:
             os.environ[name] = value
+    os.environ.pop("VLLM_HPU_FLASH_NEXT_SPEC_LOOKUP", None)
+    for name, value in (env or {}).items():
+        os.environ[name] = str(value)
     kwargs = dict(model=plan["ckpt"], tokenizer=plan["ckpt"], skip_tokenizer_init=True, dtype="bfloat16",
                   max_model_len=plan.get("max_model_len", 4096), max_num_seqs=plan.get("max_num_seqs", 4),
                   language_model_only=True, trust_remote_code=True, enable_prefix_caching=prefix_caching)
@@ -327,7 +330,7 @@ def run_baseline(LLM, SamplingParams, plan: dict) -> dict:
 
 def run_config(LLM, SamplingParams, plan: dict, config: dict, base: dict) -> dict:
     """One speculative engine over every scenario; each request runs to its baseline's tie-free length."""
-    llm = _boot(LLM, plan, config["speculative_config"], config["prefix_caching"])
+    llm = _boot(LLM, plan, config["speculative_config"], config["prefix_caching"], config.get("env"))
     runner = _runner(llm)
     record = {"drafter": type(runner.drafter).__name__, "prefix_caching": bool(runner.use_prefix_caching),
               "recurrent_spec": bool(runner._recurrent_spec), "steps": [], "widths": [], "boundary_commits": 0,
@@ -365,7 +368,45 @@ def run_config(LLM, SamplingParams, plan: dict, config: dict, base: dict) -> dic
 
     runner._commit_recurrent_boundaries = commit_spy
 
-    if oracle is not None:
+    lookup_oracle = config.get("lookup_oracle")
+    real_find = None
+    if lookup_oracle is not None:
+        import vllm_gaudi.v1.spec_decode.flash_next_lookup as lookup_module
+
+        real_find = lookup_module.find_lookup_draft
+        schedule = lookup_oracle["schedule"]
+        calls = {"n": 0}
+
+        def oracle_find(tokens, min_ngram, max_ngram, k, max_model_len):
+            row = [int(t) for t in tokens]
+            # the request whose prompt is the longest prefix of the row (a shorter prompt can be a prefix of it)
+            owners = [s for s in base.values() if len(row) >= len(s["prompt_ids"])
+                      and row[:len(s["prompt_ids"])] == list(s["prompt_ids"])]
+            stream = max(owners, key=lambda s: len(s["prompt_ids"])) if owners else None
+            length = schedule[calls["n"] % len(schedule)]
+            calls["n"] += 1
+            if stream is None or length == 0:
+                draft = []
+            else:
+                done = len(row) - len(stream["prompt_ids"])
+                draft = list(stream["tokens"][done:done + min(length, k)])
+            record["steps"].append({"step": calls["n"] - 1, "row": -1, "done": len(row), "sampled": [],
+                                    "draft": draft, "tampered": None, "lookup": True})
+            return draft
+
+        lookup_module.find_lookup_draft = oracle_find
+        real_spec_merge = runner._spec_lookup.merge if runner._spec_lookup is not None else None
+        if real_spec_merge is None:
+            raise RuntimeError("the lookup hook is not installed: VLLM_HPU_FLASH_NEXT_SPEC_LOOKUP did not reach the runner")
+
+        def merge_spy(mtp_drafts, req_ids, *args, **kwargs):
+            drafts = real_spec_merge(mtp_drafts, req_ids, *args, **kwargs)
+            record.setdefault("hybrid_rows", []).append({"drafts": drafts, "sources": [
+                runner._spec_lookup.last_source.get(r) for r in req_ids]})
+            return drafts
+
+        runner._spec_lookup.merge = merge_spy
+    elif oracle is not None:
         schedule, tamper_every = oracle["schedule"], int(oracle.get("tamper_every", 0))
 
         def oracle_propose(num_speculative_tokens, sampled_token_ids, num_tokens_no_spec, token_ids_cpu, *a, **kw):
@@ -392,7 +433,7 @@ def run_config(LLM, SamplingParams, plan: dict, config: dict, base: dict) -> dic
             return drafts
 
         runner.drafter.propose = oracle_propose
-    else:
+    elif config["speculative_config"].get("method") == "ngram":
         real_propose = runner.drafter.propose
 
         def propose_spy(*args, **kwargs):
@@ -416,6 +457,9 @@ def run_config(LLM, SamplingParams, plan: dict, config: dict, base: dict) -> dic
         for request, out in zip(scenario["requests"], outs):
             record["streams"][request["id"]] = list(out.outputs[0].token_ids)
     runner_module.verification_width = real_width
+    if real_find is not None:
+        lookup_module.find_lookup_draft = real_find
+        record["hybrid_counts"] = runner._spec_lookup.counts
     del llm
     return record
 
@@ -433,7 +477,11 @@ def main(argv: list[str] | None = None) -> int:
         with guard:
             result["baseline"] = run_baseline(LLM, SamplingParams, plan)
             for config in plan["configs"]:
-                result["configs"][config["name"]] = run_config(LLM, SamplingParams, plan, config, result["baseline"])
+                try:
+                    result["configs"][config["name"]] = run_config(LLM, SamplingParams, plan, config,
+                                                                   result["baseline"])
+                except Exception:  # noqa: BLE001 - one configuration's failure is that configuration's record
+                    result["configs"][config["name"]] = {"error": traceback.format_exc()}
     except Exception:  # noqa: BLE001 - the parent test prints the child's failure
         result["error"] = traceback.format_exc()
     result["index_guard"] = dict(guard.records)

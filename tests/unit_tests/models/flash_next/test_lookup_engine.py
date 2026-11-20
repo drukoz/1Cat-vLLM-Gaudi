@@ -72,12 +72,9 @@ def _plan(ckpt: Path) -> dict:
             "configs": configs}
 
 
-@pytest.fixture(scope="module")
-def engine_run(tiny_checkpoint, tmp_path_factory) -> dict:
-    """Run the child once for the module and return its record (the child's error, if any, fails here)."""
-    out_dir = tmp_path_factory.mktemp("lookup_engine")
+def _run_child(plan: dict, out_dir: Path) -> dict:
     plan_path, out_path = out_dir / "plan.json", out_dir / "out.json"
-    plan_path.write_text(json.dumps(_plan(Path(tiny_checkpoint))), encoding="utf-8")
+    plan_path.write_text(json.dumps(plan), encoding="utf-8")
     env = dict(os.environ)
     env["PYTHONPATH"] = os.pathsep.join([str(REPO_ROOT)] + [p for p in env.get("PYTHONPATH", "").split(os.pathsep)
                                                             if p])
@@ -89,6 +86,26 @@ def engine_run(tiny_checkpoint, tmp_path_factory) -> dict:
     record = json.loads(out_path.read_text(encoding="utf-8"))
     assert "error" not in record, f"the engine child failed:\n{record['error']}\n{done.stderr[-3000:]}"
     return record
+
+
+@pytest.fixture(scope="module")
+def engine_run(tiny_checkpoint, tmp_path_factory) -> dict:
+    """Run the child once for the module and return its record (the child's error, if any, fails here)."""
+    record = _run_child(_plan(Path(tiny_checkpoint)), tmp_path_factory.mktemp("lookup_engine"))
+    for name, config in record["configs"].items():
+        assert "error" not in config, f"configuration {name} failed:\n{config['error']}"
+    return record
+
+
+@pytest.fixture(scope="module")
+def hybrid_run(tiny_checkpoint, tmp_path_factory) -> dict:
+    """The lookup + MTP hybrid (VLLM_HPU_FLASH_NEXT_SPEC_LOOKUP=1, MTP k = 3) with an oracle lookup: on a schedule
+    the lookup search returns the baseline's continuation (1..3 tokens), otherwise nothing (the MTP row stays)."""
+    plan = _plan(Path(tiny_checkpoint))
+    plan["configs"] = [{"name": "hybrid-pc", "speculative_config": {"method": "mtp", "num_speculative_tokens": K},
+                        "prefix_caching": True, "env": {"VLLM_HPU_FLASH_NEXT_SPEC_LOOKUP": "1"}, "oracle": None,
+                        "lookup_oracle": {"schedule": [3, 0, 2, 0, 1, 3, 3]}}]
+    return _run_child(plan, tmp_path_factory.mktemp("lookup_engine_hybrid"))
 
 
 def _divergences(record: dict, config: str) -> tuple[int, list, list]:
@@ -180,3 +197,22 @@ def test_the_comparison_catches_a_missing_widening(engine_run):
     _matched, _ties, breaks = _divergences(engine_run, "no-widen-pc")
     assert breaks, "the stale-state load went unnoticed: the comparison is too weak"
     print(f"no-widen-pc: breaks {breaks}")
+
+
+def test_hybrid_lookup_beside_mtp_with_prefix_caching(hybrid_run):
+    """The hybrid through the engine: lookup rows (padded to k with -1) and MTP rows in the same streams, every
+    draft k long (the MTP drafter's row layout), lookup drafts accepted, the streams lossless."""
+    record = hybrid_run["configs"]["hybrid-pc"]
+    if "error" in record and "image_token_index" in record["error"]:
+        pytest.skip("the MTP engine does not start on this tree (load_model: image_token_index): it needs the MTP "
+                    "engine fixes of the mtp-card-ready track")
+    assert "error" not in record, record.get("error")
+    assert record["drafter"] == "HpuFlashNextMtpProposer"
+    compared = _compare(hybrid_run, "hybrid-pc")
+    sources = [s for row in record["hybrid_rows"] for s in row["sources"] if s]
+    assert {"lookup", "mtp"} <= set(sources), f"the hybrid never mixed the two sources: {set(sources)}"
+    assert all(len(d) == K for row in record["hybrid_rows"] for d in row["drafts"]), "a hybrid row is not k long"
+    drafted, accepted, verified = record["hybrid_counts"]["lookup"]
+    assert accepted > verified, f"the oracle lookup drafts were hardly accepted: {accepted} over {verified} rows"
+    print(f"hybrid-pc: {compared} tokens compared, lookup rows {drafted} accepted {accepted} over {verified}, "
+          f"MTP rows {record['hybrid_counts']['mtp']}")
