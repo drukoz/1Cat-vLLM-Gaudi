@@ -126,6 +126,12 @@ def sparse_decode_attention(query: torch.Tensor, key_cache: torch.Tensor, value_
     return out.reshape(bs, num_heads * head_dim)
 
 
+# The grouped decode attention from this many query rows up (a static choice per bucket). Card job 00011
+# (reports/qsa-fused/card/qsa-bench1): grouped against repeated K/V, device ms per layer at W = 2051, 3 query
+# heads per KV head: 0.51 vs 0.36 at 4 rows, 0.51 vs 0.78 at 32, 0.68 vs 1.85 at 128; bit-exact at every size.
+GROUPED_MIN_ROWS = 8
+
+
 def sparse_decode_attention_grouped(query: torch.Tensor, key_cache: torch.Tensor, value_cache: torch.Tensor,
                                     slots: torch.Tensor, valid: torch.Tensor, num_heads: int, num_kv_heads: int,
                                     head_dim: int, scale: float) -> torch.Tensor:
@@ -247,15 +253,18 @@ class HpuQsaSparseAttention(torch.nn.Module):
 
         from vllm_gaudi.models.qwen4_exp.qsa_fused_path import QsaDecodeSelection
         if isinstance(selected, QsaDecodeSelection):  # mode 2: the slots and flags come from qsa_index_emit
-            out = sparse_decode_attention_grouped(q, key_cache, value_cache, selected.slots, selected.valid != 0,
-                                                  num_heads, num_kv_heads, head_dim, impl.scale)
+            attend = (sparse_decode_attention_grouped if int(q.shape[0]) >= GROUPED_MIN_ROWS else
+                      sparse_decode_attention)
+            out = attend(q, key_cache, value_cache, selected.slots, selected.valid != 0, num_heads, num_kv_heads,
+                         head_dim, impl.scale)
             return out.reshape(q.shape[0], num_heads * head_dim)
         slots = decode_selected_slots(selected, md.block_table, int(md.block_size))
         # A row with no selected position (a padding row of the batch under M-RoPE: position -1)
         # attends to its gathered pad-block rows instead of to nothing: the softmax of an all
         # -inf row is NaN.
         valid = (selected >= 0) | rows_without_selection(selected)
-        attend = sparse_decode_attention_grouped if self.grouped_decode else sparse_decode_attention
+        attend = (sparse_decode_attention_grouped if self.grouped_decode and int(q.shape[0]) >= GROUPED_MIN_ROWS else
+                  sparse_decode_attention)
         out = attend(q, key_cache, value_cache, slots, valid, num_heads, num_kv_heads, head_dim, impl.scale)
         return out.reshape(q.shape[0], num_heads * head_dim)
 
@@ -267,4 +276,5 @@ __all__ = [
     "rows_without_selection",
     "sparse_decode_attention",
     "sparse_decode_attention_grouped",
+    "GROUPED_MIN_ROWS",
 ]

@@ -98,6 +98,31 @@ at 32 x 4 rows, under 0.2 ms at the band above. So version 2 keeps the scores, a
 the vendor TopK, and spends the TPC kernels where torch spends nodes: the per-row prepare work (K1, about 100 ops per
 layer) and the expansion of the selection to cache slots (K4, about 35 ops per layer).
 
+### Measured on one card (job 00011, 2026-11-20)
+
+`reports/qsa-fused/card-bench/qsa_bench.py` on one Gaudi2 card, lazy mode, the real shapes (32 requests, `N` =
+32,768, `D` = 128, `W` = 2,051, 3 query heads per KV head); device ms = median of 10 (issue + `mark_step` +
+`synchronize`) minus the host issue time; VERIFIED (`reports/qsa-fused/card/qsa-bench1/one_card.log`):
+
+| Per QSA layer, one rank | 32 rows | 32 x 4 rows (k = 3) |
+|---|---|---|
+| indexer, the torch path's form (`[T, N]` index, fp32) | 2.55 | 8.55 |
+| indexer, block gather with an int32 index | 2.37 | 7.89 |
+| indexer, request-major (I14) | = block gather | 2.41 |
+| indexer, one rank's share of 4 requests (I18) | 0.80 | 0.80 |
+| attention, repeated K/V (the torch path) | 0.78 | 1.85 |
+| attention, grouped (I21, G5-1) | 0.51 | 0.68 |
+
+Parts at 32 rows: the block gather 0.58, the fp32 cast of the gathered keys 0.68, cast + fp32 GEMM 1.65, the
+same GEMM in bf16 0.46, `topk(512)` over `[32, 32768]` 0.66. Every row's selected set of the block-gather and
+request-major forms equals the torch path's (32/32, 128/128 rows); the grouped attention equals the repeated one
+bit for bit; the int32 `index_select` index and an 8-rank int32 HCCL all-gather work. At 4 rows the grouped
+attention measured 0.51 against 0.36 ms, so it runs from `GROUPED_MIN_ROWS = 8` rows up
+(`qsa_hpu_attention.py`). The in-graph all-gather of this bench (0.53 to 0.62 ms each) ran without
+`PT_HPU_ENABLE_LAZY_COLLECTIVES` (vLLM's platform sets it in a server); in-graph all-reduces with it cost 0.02 to
+0.07 ms each (coordinator, 4 ranks). INFERRED per step at 32 streams: QSA about 40 ms on the torch path, 16 to 17
+ms with mode 1 + shard; at 32 x 4 rows 125 ms against about 18 ms.
+
 ## I17 or I18: shard by context range or by request
 
 Both cut the replicated indexer by the TP size. INFERRED, at TP8, 32 streams, `N = 32,768`:
@@ -352,7 +377,7 @@ block_size, rotary_half}`, 24 bytes, the same for both GUIDs (unused fields 0; K
 1. The extension against the real bridge (the schema with `Tensor(a!)`, an int32 pair of outputs).
 2. The graph compiler's reading of an input that the kernel stores to (`key_cache` in K1) next to a later node
    that reads it (the scores' gather): the dependency is `q_idx`.
-3. `index_select` with an int32 index, and HCCL `all_gather_into_tensor` of int32 (card job `qsa-select-attn-bench`).
+3. (Settled by job 00011: `index_select` with an int32 index and an 8-rank int32 HCCL all-gather work.)
 4. `v_rsqrt_f32` on hardware against the simulator.
 5. Speed: every ms in this page is arithmetic.
 
