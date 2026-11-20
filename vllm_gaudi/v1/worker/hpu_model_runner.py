@@ -2302,6 +2302,11 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                     from vllm_gaudi.v1.spec_decode.hpu_flash_next_mtp import HpuFlashNextMtpProposer
 
                     self.drafter = HpuFlashNextMtpProposer(self.vllm_config, self.device, self)  # type: ignore
+                    from vllm_gaudi.v1.spec_decode import mtp_step_timer
+                    self._mtp_step_timer = mtp_step_timer.from_env(rank=0 if is_driver_worker else 1,
+                                                                   is_driver=is_driver_worker, log=logger.info,
+                                                                   device_type=str(self.device).split(":")[0])
+                    self.drafter.mtp_step_timer = self._mtp_step_timer
                     self.use_aux_hidden_state_outputs = True
                 else:
                     from vllm_gaudi.v1.spec_decode.hpu_eagle import HpuEagleProposer
@@ -6387,11 +6392,17 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             # Swap
             self.input_batch.swap_states(first_prompt_index, last_decode_index)
 
+    # VLLM_HPU_MTP_TIMING=1: the speculative step's timer (mtp_step_timer.py). A class default, so a runner built
+    # without __init__ (unit tests) is untimed.
+    _mtp_step_timer = None
+
     @torch.inference_mode()
     def sample_tokens(self, grammar_output: "GrammarOutput | None") -> ModelRunnerOutput | AsyncModelRunnerOutput:
         if self.scheduler_output is None:
             # Nothing to do (PP non-final rank case), output isn't used.
             return None  # noqa
+        if self._mtp_step_timer is not None:
+            self._mtp_step_timer.step_start()
         scheduler_output = self.scheduler_output
         warmup_mode = self.warmup_mode
         self.scheduler_output = None
@@ -6928,6 +6939,12 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             if device_prepared_dflash_drafts is not None:
                 self._draft_token_ids = device_prepared_dflash_drafts
             else:
+                mtp_step_timer = None if warmup_mode else self._mtp_step_timer
+                if mtp_step_timer is not None:
+                    mtp_step_timer.draft_start(
+                        "prefill" if num_decodes == 0 else ("verify" if num_prefills == 0 else "mixed"),
+                        scheduler_output.total_num_scheduled_tokens, num_decodes + num_prefills,
+                        self.speculative_config.num_speculative_tokens)
                 with self.profiler.record_event('internal', 'propose_draft_tokens'):
                     self._draft_token_ids = self.propose_draft_token_ids(
                         scheduler_output, postprocessed_sampled_token_ids, sampling_metadata,
@@ -6936,6 +6953,8 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                         non_flattened_hidden_states_prefills, sample_hidden_states_prefills,
                         aux_hidden_states_prefills, num_decodes,
                         prefill_data if num_prefills > 0 else None, decode_data if num_decodes > 0 else None)
+                if mtp_step_timer is not None:
+                    mtp_step_timer.draft_end()
         ################## Spec Decode end ##################
 
         # Create output.
