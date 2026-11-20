@@ -772,6 +772,7 @@ def moe_fallback_lines(log_text: str) -> list[str]:
 
 
 HC_FUSED_ENV = "VLLM_HPU_HC_FUSED"
+LAZY_ACC_PAR_ENV = "PT_HPU_LAZY_ACC_PAR_MODE"  # the lazy bridge's accumulation thread: 0 off, what custom ops need
 HC_OP_TEST = "tests/unit_tests/hc_fused/test_hpu_op.py"
 HC_OP_LOG = "hc_hpu_op.log"
 HC_OP_TIMEOUT_S = 600.0  # 90 tests, each one graph compile; the limit of the GDN op tests
@@ -806,7 +807,8 @@ def hc_fused(plugin_root: Path, out_dir: Path, python: str = sys.executable, ski
     and GDN_FUSED_GAUDI_KERNEL_LIBRARY so the loader finds the combined kernel database next to it), in
     its own process group (run_step) with its own limit HC_OP_TIMEOUT_S and its own log out_dir/HC_OP_LOG.
     `combined_db_off` puts FLASHINFER_GAUDI_COMBINED_KERNEL_DB=0 into the step when the servers of this
-    run will not load the combined database either.
+    run will not load the combined database either. The step runs with PT_HPU_LAZY_ACC_PAR_MODE=0 unless
+    the operator's environment sets the variable ("lazy_acc_par_mode" records the value).
 
     Returns {"status", "reason", "hpu_op", ...}: "passed" (exit 0, at least one test passed, none
     skipped, failed or in error), "failed" (anything else the test did, a skip and a timeout included),
@@ -877,6 +879,12 @@ def _kernel_card_test(plugin_root: Path, out_dir: Path, python: str, skip: str, 
         if (lib_dir / GDN_KERNEL_LIB).is_file():
             env["GDN_FUSED_GAUDI_KERNEL_LIBRARY"] = str(lib_dir / GDN_KERNEL_LIB)
         env[GDN_LAZY_ENV] = "1"  # the bridge mode of every server
+        # A custom op is not safe next to the lazy bridge's accumulation thread, and the loader refuses the
+        # kernels without this at 0 (flashinfer_gaudi._native.lazy_accumulation_reason). The plugin sets it for
+        # a server that asks for the kernels; the test has no flag, so the step sets it. An operator's own
+        # value stays, and reaches the servers the same way.
+        env.setdefault(LAZY_ACC_PAR_ENV, "0")
+        result["lazy_acc_par_mode"] = env[LAZY_ACC_PAR_ENV]
         for flag in (HC_FUSED_ENV, MOE_GLUE_ENV):  # the test loads the kernels itself
             env.pop(flag, None)
         env.pop(serve.RECIPE_CACHE_ENV, None)  # a recipe cache would block the colon-list registration
