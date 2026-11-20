@@ -371,7 +371,7 @@ change in each module.
 
 ## Handoff (if this agent stops)
 
-State at 2026-11-20 20:05 UTC (third agent of this track, started 19:00 UTC). Branch
+State at 2026-11-20 20:20 UTC (third agent of this track, started 19:00 UTC). Branch
 `feat/flash-next-gaudi-native-replay` (worktree `/Volumes/Storage/Claude/gaudi-work/wt/native-replay`), pushed to
 `origin`, the program head `b0cd0bb` merged in (`b0140c3f`); nothing of this track is merged into
 `feat/flash-next-gaudi` yet. No uncommitted change in the repository. This harness refuses report files, so this
@@ -407,8 +407,11 @@ the settings that exist), `probes/const_ops.py` (section 7.3), `logs/` (CPU test
 ### Queued card jobs (submitted 19:22-19:24 UTC) and what to do with each result
 
 Every job is a stub that runs `~/farm/native-replay/late/replay_job.sh RUN MODE 649d32f69cb2`; the commit that
-really runs is the one in `~/farm/native-replay/late/SHA` (now `40b14e24f6b0`; the node keeps the images of
-the last three synced commits): write a newer synced commit there to move the queued jobs to it. Fetch with
+really runs is the one in `~/farm/native-replay/late/SHA` (now `1de7c3def13b`; the node keeps the images of
+the last three synced commits): write a newer synced commit there to move the queued jobs to it. The benchmark
+itself no longer comes from the image: the jobs run `~/farm/native-replay/late/bench_replay.py` (a copy of the
+branch's file; upload a new copy with `bin/node-scp`, no `farm sync`: image builds load the node's CPUs and
+disturb every host-bound measurement next door, so sync only when the plugin itself changed). Fetch with
 `bin/farm wait <id>; bin/farm fetch native-replay <id> <RUN>...` into `reports/native-replay/card/`.
 `reports/native-replay/probes/knob_table.py <knobs_rN.json>` prints the per-setting table,
 `probes/per_rank.py <json> [cases] [rows]` every rank's times and CPU, `probes/stacks.py
@@ -439,8 +442,8 @@ runs), when 5 minutes of its hold are left: run folder `<RUN>-winners`, log `<RU
    UTC). Run folder `launch-r1`: the launch path on one card (no collectives): `replay_seg` and `replay_layer`
    (cost per launch), `*_cache`, the sampler on a loop of `replay_seg` replays, the device's floor per launch
    (`bench/busy_r1.log`), then 12 bridge and Synapse settings (`bench/knobs_r1.log`).
-4. **00068** `replay-host-path-r4` (`any:4`, 14 min, end of the queue). Run folder `host-r4`: job 00065's bench
-   steps at 4 ranks (the layout of E1).
+4. **00068** `replay-host-path-r4`: cancelled at 20:09 UTC (the coordinator's layout decision at 20:06 UTC:
+   TP8 + EP8 stays; `replay_job.sh RUN r4` still runs the 4-rank form when a TP4 number is wanted).
 The coordinator bumped 00067 and bumps 00065 (19:28 UTC) and asked for: the host cost per launch and per
 collective under every setting, and which settings are safe for every server (output unchanged on the tiny
 model). For the second: `replay_job.sh RUN tinyenv <sha12> name:KEY=VALUE[,KEY=VALUE]...` serves the tiny model
@@ -453,16 +456,39 @@ before the node ends unless the coordinator bumps it). Each arm also writes `hos
 share at 1 and at 32 streams says whether the host is busy or waits inside the replay call), and native stacks
 after the second measured round at 32 streams.
 
+### The placement of the ranks' threads (coordinator's decision, 20:20 UTC)
+
+Step-anatomy's job 00013 has the replay call's host time at 19.3 / 23.0 / 32.3 ms over the 8 ranks at one stream
+(min / median / max) and forward + wait equal on every rank: the step ends when the slowest rank has issued.
+Jobs 00065 and 00067 therefore run the settings `pincore`, `pinmod` and (8 ranks) `pinfar` (`BENCH_PIN`, read by
+the benchmark: each rank on its module's CPU slice, the calling thread on a CPU of its own, or on the other NUMA
+half), and every case records the CPUs the calling thread ran on, how often it moved, and the host's load (the
+node ran at a load of 30 to 90 during the evening: image builds and loading servers; a spread that comes from
+that load is not one that placement inside a server removes). **If the spread closes under `pincore` or
+`pinmod`, this track builds the server flag** (engine-step leaves CPU pinning to this track): default 0, in
+`HPUWorker.init_device`, each worker on its share of the CPUs the server process may use
+(`os.sched_getaffinity`: the farm's containers will get 18 CPUs per module), a log line with the CPUs taken, CPU
+tests of the bookkeeping, tiny-model token parity, a real-model A/B at 1 and 32 streams. The code and its tests
+are drafted outside the repository, ready to move in once the gate that runs now has ended:
+`reports/native-replay/probes/pin/hpu_worker_cpus.py` (to `vllm_gaudi/v1/worker/`) and `test_worker_cpu_pin.py`
+(to `tests/unit_tests/worker/`; 13 cases pass with a plain Python harness); still to write: the call in
+`init_device` before `torch.hpu.set_device` (`pin_worker(device_index, self.parallel_config.world_size,
+gaudi_envs.VLLM_HPU_WORKER_CPU_PIN, logger)`), `give_calling_thread_its_own_cpu` at the end of
+`compile_or_warm_up_model` (mode 2), the flag in `vllm_gaudi/envs.py` and its row in
+`docs/configuration/env_variables.md`.
+
 ### Pending subtasks, in order
 
 1. **Merge the cut-interval flag** once 00065 step (b) or 00066 passes. Protocol:
    `git fetch origin && git merge origin/feat/flash-next-gaudi`, rerun the three test files above and
-   `/Volumes/Storage/Claude/gaudi-work/bin/gate <worktree> --tools` (its log for `b0140c3f`:
-   `reports/native-replay/logs/gate_b0140c3f.log`), `git push`,
+   `/Volumes/Storage/Claude/gaudi-work/bin/gate <worktree> --tools` (one gate at a time on the Mac since 20:12
+   UTC; a run on HEAD `1de7c3de` was started at 20:07 UTC, detached, log
+   `reports/native-replay/logs/gate_final.log`, expected about 20:50 UTC; the runner has not changed since
+   `6423a274`), `git push`,
    `gh pr create --base feat/flash-next-gaudi --title "Replay benchmark, decode graphs without per-layer cuts, and the native-replay design" --body-file <body>`,
    `gh pr merge --merge`. A body without raw numbers is drafted in the session scratchpad
-   (`pr_native_replay_1.md`; AGENTS.md forbids absolute performance numbers in PR text); if it is gone, write it
-   from section 0 and section 8.
+   (AGENTS.md forbids absolute performance numbers in PR text); the current text is
+   `reports/native-replay/probes/pr_body_1.txt`.
 2. **Write the results of 00065-00068 into section 7** (7.4 the launch and the collective apart, 7.5 the host
    inside a replay, 7.6 settings) and bring sections 0 and 5 in line.
 3. **Real-model A/B of the cut flag** (and of the asynchronous replay only if step (a) shows 0.3 ms or more):
