@@ -14,6 +14,8 @@
 #           --no-sampled-check (sampled verification is off in this build: a sampled request gets HTTP 400);
 #           acceptance per draft position per level from /metrics (SPEC lines).
 #   mtp3-32 server 2 with the 32-stream level only (a short hold).
+#   tiny    the tiny model at TP8 with the job's flags (farm_tiny.py --gdn hc; --spec 3 with HEADLINE_TINY_SPEC=1):
+#           tokens against the CPU reference. A failure ends the job (exit 7) unless HEADLINE_TINY_ABORT=0.
 #   mtp3-noshard  server 2 with VLLM_HPU_QSA_INDEXER_SHARD=0 (isolates the request-sharded indexer, never run in a
 #           served speculative step before this build). Run by itself after mtp3 when mtp3 ended with the server
 #           dead (3) or the probe failed (5) and HEADLINE_HOLD_S (default 2400, the job's hold) leaves 900 s or more;
@@ -36,7 +38,9 @@
 # every rank), VLLM_HPU_MOE_GLUE (no gain), VLLM_HPU_QSA_FUSED=2/3 and VLLM_HPU_QSA_TABLE_WIDTH (not card-proven).
 # The card memory of every card is logged every 15 s to $FARM_OUT/hlsmi_mem.log.
 #
-# Environment knobs: HEADLINE_TOKENS (measured tokens per stream, default 128), HEADLINE_WARM_TOKENS (default 48).
+# Environment knobs: HEADLINE_TOKENS (measured tokens per stream, default 128), HEADLINE_WARM_TOKENS (default 48),
+# HEADLINE_ROUNDS (measured rounds per level, greedy and sampled, after the warm round; default 0 = one per level
+# and two at the top level without speculation, as in job 00128).
 # Results: $FARM_OUT/<arm>/ (versions.txt, server0.log, scaling.json, probe.log, summary.json) and
 # $FARM_OUT/headline.md + headline.json (headline_table.py), written after every arm.
 # Exit code: the number of arms whose serve_probe.sh did not end with 0.
@@ -48,6 +52,7 @@ PYTHON="${FARM_PYTHON:-python3}"
 OUT="${FARM_OUT:-/results/headline}"
 TOKENS="${HEADLINE_TOKENS:-128}"
 WARM="${HEADLINE_WARM_TOKENS:-48}"
+ROUNDS="${HEADLINE_ROUNDS:-0}"
 T0="$(date -u +%s)"
 HOLD_S="${HEADLINE_HOLD_S:-2400}"
 FALLBACK="${HEADLINE_MTP_FALLBACK:-1}"
@@ -107,9 +112,17 @@ clear_cards() {
     done
     echo "headline_job: $(workers_left) left after ${i} s; waiting 8 s for the cards"
     sleep 8
+    # The card memory of a stopped server is released some seconds after its processes are gone (00128: 65 GB per
+    # card 10 s after the stop, 0.8 GB 25 s after): wait until every card holds less than 4 GB, at most 120 s.
     if command -v hl-smi >/dev/null 2>&1; then
+        for ((i = 0; i < 120; i += 3)); do
+            used="$(hl-smi -Q index,memory.used -f csv,noheader 2>/dev/null |
+                awk -F', *' '{ gsub(/[^0-9]/, "", $2); if ($2 + 0 > m) m = $2 + 0 } END { print m + 0 }')"
+            [ "${used:-0}" -lt 4096 ] && break
+            sleep 3
+        done
         hl-smi -Q index,memory.used -f csv,noheader 2>/dev/null | tr '\n' ';' | sed 's/^/headline_job: card memory: /'
-        echo
+        echo " (after ${i} s more)"
     fi
 }
 
@@ -124,9 +137,21 @@ while [ "$i_arm" -lt "${#ARMS[@]}" ]; do
     first=0
     echo "=== headline_job: arm $arm start $(date -u +%T)"
     case "$arm" in
+        tiny)
+            spec=()
+            if [ "${HEADLINE_TINY_SPEC:-0}" = 1 ]; then spec=(--spec 3); fi
+            "$PYTHON" /farm/farm_tiny.py --gdn hc ${spec[@]+"${spec[@]}"} --out "$OUT/tiny"
+            rc=$?
+            if [ "$rc" -ne 0 ] && [ "${HEADLINE_TINY_ABORT:-1}" = 1 ]; then
+                echo "headline_job: the tiny gate failed (rc $rc): no real-model server with these flags"
+                exit 7
+            fi
+            echo "=== headline_job: arm tiny rc=$rc end $(date -u +%T)"
+            continue
+            ;;
         nospec)
             bash "$HERE/serve_probe.sh" --out "$OUT/nospec" --levels 1,8,32 --tokens "$TOKENS" --warm-tokens "$WARM" \
-                --repeat-top 2 --no-mintok-check --probe-arg --sampled-levels=1,8,32
+                --repeat-top 2 --no-mintok-check --probe-arg --sampled-levels=1,8,32 --probe-arg "--rounds=$ROUNDS"
             ;;
         mtp3 | mtp3-32 | mtp3-noshard)
             levels=32,8,1
@@ -137,7 +162,8 @@ while [ "$i_arm" -lt "${#ARMS[@]}" ]; do
             VLLM_HPU_GDN_CORE_VERIFY="${VLLM_HPU_GDN_CORE_VERIFY:-1}" VLLM_HPU_MTP_TIMING="${VLLM_HPU_MTP_TIMING:-1}" \
                 VLLM_HPU_MTP_DRAFT_LOOP="${VLLM_HPU_MTP_DRAFT_LOOP:-1}" VLLM_HPU_MTP_CHUNK_KV="${VLLM_HPU_MTP_CHUNK_KV:-1}" \
                 bash "$HERE/serve_probe.sh" --out "$OUT/$arm" --mtp 3 --levels "$levels" --tokens "$TOKENS" \
-                --warm-tokens "$WARM" --repeat-top 1 --no-mintok-check --probe-arg --no-sampled-check
+                --warm-tokens "$WARM" --repeat-top 1 --no-mintok-check --probe-arg --no-sampled-check \
+                --probe-arg "--rounds=$ROUNDS"
             ;;
         *)
             echo "headline_job: unknown arm $arm (nospec, mtp3, mtp3-32)"

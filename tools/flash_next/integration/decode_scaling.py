@@ -219,6 +219,9 @@ def main():
                          "request). Pass it for a server with speculation: sampled verification is not built yet")
     ap.add_argument("--sampled-levels", default="",
                     help="stream counts of the SAMPLED rounds (default: the top level of --levels only)")
+    ap.add_argument("--rounds", type=int, default=0,
+                    help="measured rounds at EVERY level, greedy and sampled, after one warm round (default 0: one "
+                         "per level and --repeat-top at the top level, as the coordinator's probe)")
     ap.add_argument("--timeout", type=float, default=1800.0)
     ap.add_argument("--out", default="scaling.json")
     args = ap.parse_args()
@@ -236,7 +239,7 @@ def main():
         print("warm  N=%-3d ok=%d err=%d wall=%.1fs ms/tok p50=%s" % (
             n, w["ok"], w["errors"], w["wall_s"], ("%.1f" % w["ms_per_token_p50"]) if w.get("ok") else "-"),
               flush=True)
-        reps = args.repeat_top if n == levels[-1] else 1
+        reps = args.rounds if args.rounds > 0 else (args.repeat_top if n == levels[-1] else 1)
         for rep in range(reps):
             m = measured_round(args, n, args.tokens)
             m["rep"] = rep
@@ -279,21 +282,24 @@ def main():
     for n in (sampled_levels if levels and not args.no_sampled_check else []):
         # What a client that sets no temperature gets: the general sampler (top-k, top-p, multinomial) on every step.
         w = run_round(args, n, args.warm_tokens, sampled=True)
-        m = measured_round(args, n, args.tokens, sampled=True)
-        m["warm"] = {k: w.get(k) for k in ("ok", "errors", "wall_s", "ms_per_token_p50")}
-        results["sampled"].append(m)
-        save()
-        if m.get("ok"):
-            base = [x for x in results["levels"] if x["streams"] == n and x.get("ok")]
-            ref = min(x["steady_ms_per_token_p50"] for x in base) if base else float("nan")
-            print("SAMPLED N=%-3d server default sampling: ms/tok p50=%.2f, steady ms/tok p50=%.2f (greedy: %.2f), "
-                  "tok/s/stream=%.1f, aggregate=%.1f tok/s" % (
-                      n, m["ms_per_token_p50"], m["steady_ms_per_token_p50"], ref, m["tok_s_per_stream_p50"],
-                      m["aggregate_tok_s"] or 0), flush=True)
-            for k, t in m["samples"].items():
-                print("TEXT  N=%-3d sampled stream %-2s: %r" % (n, k, t[:110]), flush=True)
-        else:
-            print("SAMPLED N=%d FAILED: %s" % (n, m.get("error_samples")), flush=True)
+        for rep in range(max(1, args.rounds)):
+            m = measured_round(args, n, args.tokens, sampled=True)
+            m["rep"] = rep
+            m["warm"] = {k: w.get(k) for k in ("ok", "errors", "wall_s", "ms_per_token_p50")}
+            results["sampled"].append(m)
+            save()
+            if m.get("ok"):
+                base = [x for x in results["levels"] if x["streams"] == n and x.get("ok")]
+                ref = min(x["steady_ms_per_token_p50"] for x in base) if base else float("nan")
+                print("SAMPLED N=%-3d rep=%d server default sampling: ms/tok p50=%.2f, steady ms/tok p50=%.2f "
+                      "(greedy: %.2f), tok/s/stream=%.1f, aggregate=%.1f tok/s" % (
+                          n, rep, m["ms_per_token_p50"], m["steady_ms_per_token_p50"], ref,
+                          m["tok_s_per_stream_p50"], m["aggregate_tok_s"] or 0), flush=True)
+                for k, t in m["samples"].items():
+                    print("TEXT  N=%-3d sampled stream %-2s: %r" % (n, k, t[:110]), flush=True)
+            else:
+                print("SAMPLED N=%d rep=%d FAILED: %s" % (n, rep, m.get("error_samples")), flush=True)
+                break
     if args.ctx:
         n, ctx = (int(x) for x in args.ctx.split(":"))
         w = run_round(args, n, args.warm_tokens, ctx)
