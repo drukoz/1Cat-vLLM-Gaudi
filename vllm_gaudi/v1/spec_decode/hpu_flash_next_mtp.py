@@ -123,7 +123,7 @@ class HpuFlashNextMtpProposer(HpuEagleProposer):
         # draft step.
         last_hidden_states, hidden_states = split_draft_output(ret_hidden_states)
         last_hidden_states = last_hidden_states.view(-1, last_hidden_states.shape[-1])
-        sample_hidden_states = last_hidden_states[last_token_indices]
+        sample_hidden_states = torch.index_select(last_hidden_states, 0, last_token_indices)
         logits = self.model.compute_logits(sample_hidden_states)
 
         # Early exit if there is only one draft token to be generated.
@@ -136,7 +136,7 @@ class HpuFlashNextMtpProposer(HpuEagleProposer):
         # [num_tokens, 1]
         target_positions = target_positions.view(-1)
         # [batch_size]
-        positions = target_positions[last_token_indices]
+        positions = torch.index_select(target_positions, 0, last_token_indices)
         # [batch_size, 1, hc * hidden_size]: the draft's own multi' rows
         hidden_states = next_step_hidden(hidden_states, last_token_indices)
 
@@ -149,8 +149,7 @@ class HpuFlashNextMtpProposer(HpuEagleProposer):
 
         # Positions used by prepare_attn_metadata needs to be cpu because
         # compile only mode for warmup will not do any real computations
-        target_positions_cpu = target_positions.cpu()
-        positions_cpu = target_positions_cpu[last_token_indices.cpu()]
+        positions_cpu = self._draft_positions_cpu(target_positions, last_token_indices, batch_size)
 
         # The QSA raw-key ring is addressed by the request's GDN state slot:
         # the state lattice's column 0, identical for every draft step.
@@ -211,6 +210,20 @@ class HpuFlashNextMtpProposer(HpuEagleProposer):
             # [batch_size, num_speculative_tokens, DRAFT_RANK_TOP]
             self.last_draft_top_ids = torch.stack(draft_top_ids, dim=1)
         return draft_token_ids
+
+    # VLLM_HPU_MTP_DRAFT_LOOP=1: the runner's host books give each draft row's base position (the position of the
+    # request's last accepted token, num_tokens_no_spec - 2 after the step's tokens are counted), set right before
+    # propose and taken by it, so the draft loop reads no device value back (no sync behind draft step 0).
+    host_base_positions = None
+
+    def _draft_positions_cpu(self, target_positions, last_token_indices, batch_size):
+        """The base positions of the ``batch_size`` draft rows on the host: the runner's (VLLM_HPU_MTP_DRAFT_LOOP=1)
+        when it set them for this call, else read back from the device (a sync behind draft step 0)."""
+        host = self.host_base_positions
+        self.host_base_positions = None
+        if host is not None and int(host.shape[0]) == int(batch_size):
+            return host.clone()
+        return target_positions.cpu()[last_token_indices.cpu()]
 
     def prepare_attn_metadata(
             self,

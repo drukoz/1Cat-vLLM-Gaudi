@@ -10182,17 +10182,27 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                                         decode_data.spec_decode_metadata,
                                         sampled_token_ids)
 
-        target_token_ids = decode_sampled_token_ids_tensor.reshape(-1, 1)[hidden_states_indices]
-        target_positions = decode_data.position_ids[hidden_states_indices]
+        # hidden_states_indices holds -1 for the rows after a request's last accepted one (their draft outputs are
+        # never read): row 0 stands in for them, so no gather on the device gets a negative index, and
+        # index_select replaces the advanced indexing (card rule 3).
+        picked = hidden_states_indices.clamp(min=0)
+        target_token_ids = torch.index_select(decode_sampled_token_ids_tensor.reshape(-1, 1), 0, picked)
+        target_positions = torch.index_select(decode_data.position_ids, 0, picked)
 
         if self.use_aux_hidden_state_outputs and \
                 aux_hidden_states is not None:
-            target_hidden_states = torch.cat([h[hidden_states_indices] for h in aux_hidden_states], dim=-1)
+            target_hidden_states = torch.cat([torch.index_select(h, 0, picked) for h in aux_hidden_states], dim=-1)
         else:
-            target_hidden_states = hidden_states[hidden_states_indices]
+            target_hidden_states = torch.index_select(hidden_states, 0, picked)
 
         if target_hidden_states.dim() == 2:
             target_hidden_states = target_hidden_states.unsqueeze(1)
+        if gaudi_envs.VLLM_HPU_MTP_DRAFT_LOOP == 1 and hasattr(self.drafter, "host_base_positions"):
+            # The position of each request's last accepted token, from the host books (the step's tokens are
+            # counted already): the draft loop then reads nothing back from the device. Padded rows take 0.
+            rows = len(decode_data.spec_decode_metadata.num_draft_tokens)
+            bases = [int(self.input_batch.num_tokens_no_spec[i]) - 2 if i < num_decodes else 0 for i in range(rows)]
+            self.drafter.host_base_positions = torch.tensor(bases, dtype=torch.int64)
         draft_token_ids = self.drafter.propose(target_token_ids, target_positions, target_hidden_states,
                                                last_token_indices, common_attn_metadata, decode_block_table, self)
 
@@ -10234,10 +10244,16 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         token_ids = token_ids.squeeze()
         target_token_ids = token_ids.clone()
         target_token_ids[:-1].copy_(token_ids[1:])
-        target_token_ids[logits_indices] = next_token_ids
+        # index_copy_, not an indexed assignment (index_put_ has no HPU kernel, card rule 3)
+        target_token_ids.index_copy_(0, logits_indices.long(), next_token_ids.to(target_token_ids.dtype))
         target_token_ids = target_token_ids.unsqueeze(0)
         if target_hidden_states.dim() == 2:
             target_hidden_states = target_hidden_states.unsqueeze(0)
+        if gaudi_envs.VLLM_HPU_MTP_DRAFT_LOOP == 1 and hasattr(self.drafter, "host_base_positions"):
+            # the last prompt token's position (num_tokens_no_spec counts the token this prefill sampled)
+            self.drafter.host_base_positions = torch.tensor(
+                [int(self.input_batch.num_tokens_no_spec[batch_start_idx + i]) - 2 for i in range(batch_size)],
+                dtype=torch.int64)
         _draft_token_ids = self.drafter.propose(target_token_ids, position_ids, target_hidden_states, logits_indices,
                                                 attn_metadata, prefill_batch_block_table, self)
         return _draft_token_ids

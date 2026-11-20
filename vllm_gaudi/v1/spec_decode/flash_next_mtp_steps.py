@@ -137,7 +137,7 @@ def ring_slots_from_lattice(indices: torch.Tensor) -> torch.Tensor:
 def next_step_hidden(multi: torch.Tensor, last_token_indices: torch.Tensor) -> torch.Tensor:
     """multi viewed as [vbs, hc*H], rows last_token_indices -> [bs, 1, hc*H]."""
     hidden_size = multi.shape[-1]
-    rows = multi.view(-1, hidden_size)[last_token_indices]
+    rows = torch.index_select(multi.view(-1, hidden_size), 0, last_token_indices)  # no advanced indexing (rule 3)
     return rows.view(-1, 1, hidden_size)
 
 

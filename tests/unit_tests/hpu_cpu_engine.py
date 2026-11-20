@@ -34,6 +34,7 @@ tests start it with :func:`run`.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import enum
 import functools
 import json
@@ -293,6 +294,50 @@ def make_index_guard():
     return IndexGuard()
 
 
+# Ops the card rules name (BRIEF.md, "Rules the card taught us", rule 3): no HPU kernel, they fail at warmup.
+NO_HPU_KERNEL_OPS = ("aten::cummax", "aten::cummin", "aten::index_put", "aten::index_put_", "aten::_index_put_impl_")
+
+
+def make_op_audit():
+    """An :class:`OpAudit`: every dispatched op with the dtypes of its tensor arguments, counted with its first
+    site; for an op outside ``aten`` and ``prim`` (a custom op: the fused GDN, hyper-connection and MoE ops) every
+    tensor argument that is a view (card rule 1) or int64 (card rule 2)."""
+    import torch
+    from torch.utils._python_dispatch import TorchDispatchMode
+    from torch.utils._pytree import tree_flatten
+
+    class OpAudit(TorchDispatchMode):
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.ops: Counter = Counter()
+            self.sites: dict = {}
+            self.custom: Counter = Counter()  # (op, finding, where) -> count
+
+        def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+            kwargs = kwargs or {}
+            name = func._schema.name
+            tensors = [a for a in tree_flatten((args, kwargs))[0] if isinstance(a, torch.Tensor)]
+            key = (name, ",".join(sorted({str(t.dtype).replace("torch.", "") for t in tensors})))
+            self.ops[key] += 1
+            if key not in self.sites:
+                self.sites[key] = _frames(4)
+            if name.split("::")[0] not in ("aten", "prim"):
+                for t in tensors:
+                    for finding, hit in (("view", t._is_view()), ("int64", t.dtype == torch.int64)):
+                        if hit:
+                            self.custom[(name, finding, _frames(3))] += 1
+            return func(*args, **kwargs)
+
+        def record(self) -> dict:
+            return {"ops": [{"op": op, "dtypes": dtypes, "count": count, "where": self.sites[(op, dtypes)]}
+                            for (op, dtypes), count in sorted(self.ops.items())],
+                    "custom_findings": [{"op": op, "finding": finding, "where": where, "count": count}
+                                        for (op, finding, where), count in sorted(self.custom.items())]}
+
+    return OpAudit()
+
+
 def find_runner(llm):
     """The ``HPUModelRunner`` of an in-process ``vllm.LLM``."""
     core = llm.llm_engine.engine_core
@@ -420,6 +465,8 @@ def install_oracle_drafts(llm, runner, oracle: dict, k: int) -> list[dict]:
             if stream is None:
                 continue
             n_out = int(request.num_output_tokens)
+            if n_out == 0:  # a prefill chunk that completed no prompt: the scheduler drops its drafts
+                continue
             step = seen[req_id]
             seen[req_id] += 1
             want = accept[step % len(accept)]
@@ -459,6 +506,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--seed", type=int, default=None, help="per-request seed of a sampled run")
     parser.add_argument("--logprobs", type=int, default=None, help="record the top-N logprobs of every generated token")
+    parser.add_argument("--op-audit", action="store_true",
+                        help="record every dispatched op and the custom ops' view and int64 arguments (make_op_audit)")
     args = parser.parse_args(argv)
 
     install()
@@ -490,8 +539,9 @@ def main(argv: list[str] | None = None) -> int:
     params = SamplingParams(temperature=args.temperature, max_tokens=args.max_tokens, detokenize=False,
                             seed=args.seed, logprobs=args.logprobs)
     guard = make_index_guard()
+    audit = make_op_audit() if args.op_audit else None
     streams = []
-    with guard:
+    with guard, (audit if audit is not None else contextlib.nullcontext()):
         batches = [prompts] if args.concurrent else [[prompt] for prompt in prompts]
         for batch in batches:
             outputs = llm.generate([{"prompt_token_ids": prompt} for prompt in batch], params, use_tqdm=False)
@@ -510,6 +560,7 @@ def main(argv: list[str] | None = None) -> int:
               "draft_calls": draft_calls,
               "oracle": oracle_record,
               "index_events": guard.events(),
+              "op_audit": audit.record() if audit is not None else None,
               "runner": runner_facts(runner)}
     Path(args.out).write_text(json.dumps(record), encoding="utf-8")
     return 0
