@@ -17,7 +17,8 @@
 // two rows of three (first card run, 2026-11-20). The product of two bf16 values is exact in fp32,
 // so the scale is rounded once. The cast rounds to nearest even and clips to the largest fp8
 // value, the conversion csrc/deepseek_v4/kernels/deepseek_v41_dynamic_quant_bf16_gaudi2.c uses;
-// that kernel multiplies the row maximum by (float)(bf16)(1.0f / 240.0f) for the same reason.
+// that kernel, written to match the vendor's scale op, also multiplies the row maximum by
+// (float)(bf16)(1.0f / 240.0f).
 //
 // One index-space point is one token (dim 0 = token). Pass 1 takes the row maximum, pass 2 reads
 // the row again and writes the fp8 values.
