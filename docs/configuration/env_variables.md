@@ -109,6 +109,18 @@ a recipe compiled before the change keeps its kernel. A library built without
 the interleaved kernels (one that did not compile, or
 `-DGDN_FUSED_INTERLEAVE=OFF`) serves today's kernels. Any other value is `0`.
 
+`VLLM_HPU_GDN_GLUE_CACHE` (integer, default `0`) selects how a GDN layer
+prepares the inputs of the fused decode and verify ops. `0` makes them every
+step in every layer: the transposed conv weight, dt_bias cast to fp32, its cache
+group's row of the state indices and their int32 copies (and the verify step's
+row metadata), and an output buffer that the fused op's output replaces. `1`
+takes the conv weight and dt_bias from buffers that the weight-loader hooks
+fill at load, makes the state indices and their copies (and the verify row
+metadata) once per step and cache group for all of its layers, and makes no
+dead buffer. The ops get the same values, so the outputs are bit-identical. A
+layer whose hooks did not run makes the per-step copies. Any other value is
+`0`.
+
 `VLLM_HPU_HC_FUSED` selects the path of the Flash-Next hyper-connections as an
 integer. `0` (default) keeps the torch path. `1` runs the element-wise parts of
 every hyper-connection (the grouped norm, the silu with the injection split, the

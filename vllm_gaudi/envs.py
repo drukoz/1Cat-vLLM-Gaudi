@@ -533,6 +533,7 @@ if TYPE_CHECKING:
     VLLM_HPU_GDN_CORE_DECODE_DEBUG: int = 0  # GdnCoreDecodeDebug: 0 off, 1 check slot indices every step (host sync)
     VLLM_HPU_GDN_CORE_VERIFY: int = 0  # GdnCoreVerifyMode: 0 off (default), 1 fused verification steps
     VLLM_HPU_GDN_KERNEL_INTERLEAVE: int = 0  # 0 today's GDN decode/verify kernels, 1 four value rows per iteration
+    VLLM_HPU_GDN_GLUE_CACHE: int = 0  # 0 per-step glue of the fused GDN ops (default), 1 constants and indices cached
     VLLM_HPU_PLE_HOST_NGRAM_IDS: int = 0  # 0 PLE n-gram ids computed in the graph (default), 1 on the host
     VLLM_HPU_HC_FUSED: int = 0  # 0 torch hyper-connections (default), 1 the fused hyper-connection kernels
     VLLM_HPU_MOE_GLUE: int = 0  # 0 torch MoE glue (default), 1 the fused MoE glue kernels
@@ -1893,6 +1894,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # process; a library built without the interleaved kernels serves today's. Any other value is 0.
     "VLLM_HPU_GDN_KERNEL_INTERLEAVE":
     lambda: int(os.environ.get("VLLM_HPU_GDN_KERNEL_INTERLEAVE", "0")),
+
+    # The glue of the fused GDN decode and verify ops (idea I25). 0 (default) = every layer, every step, copies
+    # the transposed conv weight, casts dt_bias to fp32, selects its cache group's state indices, clones them
+    # to int32 and makes an output buffer the fused op replaces. 1 = the conv weight and dt_bias come from
+    # buffers filled at load by the weight-loader hooks, the state indices (and the verify step's row
+    # metadata) are selected and cloned once per step and cache group and shared by its layers, and no dead
+    # buffer is made. The same tensors reach the ops, so outputs are bit-identical. Read once per layer at
+    # construction; a layer whose hooks did not run makes the per-step copies. Any other value is 0.
+    "VLLM_HPU_GDN_GLUE_CACHE":
+    lambda: int(os.environ.get("VLLM_HPU_GDN_GLUE_CACHE", "0")),
 
     # Flash-Next GDN speculative verification steps (MTP) through the fused verify op
     # (flashinfer_gaudi.gdn_core_verify). 0 (default) = off (the torch path), 1 = fused.
