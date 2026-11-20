@@ -39,7 +39,16 @@ mkdir -p "$OUT" || exit 2
 say() { echo "QSAAB [$ARM $(date -u +%H:%M:%S)] $*"; }
 left() { echo $((DEADLINE - $(date -u +%s))); }
 
+# The probe and the selection check: this tree's, or the copies next to this script when it runs from another
+# folder (a later version of the three files on an image built from an earlier commit: the job is late-bound).
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROBE="$TREE/tools/flash_next/rental/qsa_ab_probe.py"
+IDS_TEST="tests/unit_tests/qsa_select/test_hpu_select_ids.py"
+if [ -f "$HERE/test_hpu_select_ids.py" ]; then IDS_TEST="$HERE/test_hpu_select_ids.py"; fi
+if [ "$HERE" != "$TREE/tools/flash_next/rental" ] && [ -f "$HERE/qsa_ab_probe.py" ]; then PROBE="$HERE/qsa_ab_probe.py"; fi
+
 say "arm $ARM, cards ${FARM_CARDS:-?} (modules ${FARM_MODULES:-?}), commit ${FARM_SHA:-?}, $(left) s to the deadline;" \
+    "script $(md5sum "${BASH_SOURCE[0]}" | cut -c1-8), probe $(md5sum "$PROBE" | cut -c1-8), check $(cd "$TREE" && md5sum "$IDS_TEST" | cut -c1-8);" \
     "VLLM_HPU_QSA_FUSED=${VLLM_HPU_QSA_FUSED:-0} VLLM_HPU_QSA_INDEXER_SHARD=${VLLM_HPU_QSA_INDEXER_SHARD:-0}"
 
 # The installed package's lib folder (the tree's copy is empty): the kernel libraries of the op tests.
@@ -54,7 +63,7 @@ if [ "${QSA_AB_SKIP_IDS:-0}" != 1 ]; then
         unset PT_HPU_RECIPE_CACHE_CONFIG VLLM_HPU_QSA_FUSED VLLM_HPU_QSA_INDEXER_SHARD VLLM_HPU_QSA_TOPK_IDS
         export PYTHONPATH="$TREE${PYTHONPATH:+:$PYTHONPATH}" PT_HPU_LAZY_MODE=1 FARM_OUT="$OUT"
         rm -f "$OUT/select_ids.json"
-        timeout 360 "$PY" -m pytest -q -s -rs -p no:cacheprovider tests/unit_tests/qsa_select/test_hpu_select_ids.py 2>&1 \
+        timeout 420 "$PY" -m pytest -q -s -rs -p no:cacheprovider "$IDS_TEST" 2>&1 \
             | tee "$OUT/select_ids.log" | grep --line-buffered -E "QSAIDS|passed|failed|skipped|rror" \
             | awk '{ print substr($0, 1, 600); fflush() }'
     )
@@ -176,7 +185,7 @@ grep -E "Maximum concurrency|QSA fused" server0.log | tail -n 6 | cut -c1-300
 RESERVE=150 # stopping the server, the summary
 if [ "$ARM" = mode1 ]; then RESERVE=420; fi # and the kernel op test
 probe() {
-    "$PY" "$TREE/tools/flash_next/rental/qsa_ab_probe.py" --port "$PORT" --model fn --out "$OUT/qsa_ab.json" \
+    "$PY" "$PROBE" --port "$PORT" --model fn --out "$OUT/qsa_ab.json" \
         --levels "$LEVELS" --tokens "$TOKENS" --ctx "$CTX" --docs "$TREE/docs/design/flash-next" \
         --deadline "$((DEADLINE - RESERVE))" 2>&1 | tee probe.log
     return "${PIPESTATUS[0]}"

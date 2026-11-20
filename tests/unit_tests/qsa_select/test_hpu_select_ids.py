@@ -12,6 +12,9 @@ answers, on one card, at the real model's geometry (``select_case``):
    ``HpuQsaIndexer._select_decode`` in mode 0 (the default path), mode 1 (request-major keys) and mode 1 sharded
    by request (each TP rank's share), on plain decode rows and on the verification lattice? These assert.
 
+The order is the order of urgency: the plugin's ``select_blocks``, then the cast and the candidates (1 and 2), then
+the decode steps.
+
 Every result is one ``QSAIDS`` line (run with ``-s``) and one entry of ``$FARM_OUT/select_ids.json``. The whole
 module skips without a Gaudi card. It needs no kernel library: every op is a stock bridge op.
 """
@@ -113,32 +116,6 @@ def test_select_blocks_on_the_card(decode8):
     assert entry["ok"], entry
 
 
-@pytest.mark.parametrize("name,mode", [("decode8", 0), ("decode8", 1), ("lattice4", 0), ("lattice4", 1)])
-def test_decode_selection_on_the_card(name, mode):
-    """One decode step of ``HpuQsaIndexer._select_decode`` on the card: mode 0 (default path) and mode 1."""
-    case = sc.build_case(name)
-    entry = verdict(case, sc.decode_selection(case, DEVICE, mode), None)
-    record(f"plugin/mode{mode}/{name}", entry)
-    assert entry["ok"], entry
-
-
-@pytest.mark.parametrize("name,world", [("decode8", 4), ("decode8", 8), ("lattice4", 4)])
-def test_sharded_decode_selection_on_the_card(name, world):
-    """Mode 1 sharded by request: every TP rank's share, computed on this card as that rank."""
-    case = sc.build_case(name)
-    want = sc.oracle(case)
-    total = {"rows": 0, "host_read_wrong_rows": 0, "in_graph_consumer_wrong_rows": 0, "detail": None}
-    for rank in range(world):
-        one = verdict(case, sc.decode_selection(case, DEVICE, 1, 1, (rank, world)), want)
-        for key in ("rows", "host_read_wrong_rows", "in_graph_consumer_wrong_rows"):
-            total[key] += one[key]
-        total["detail"] = total["detail"] or one["detail"]
-    total["ok"] = total["host_read_wrong_rows"] == 0 and total["in_graph_consumer_wrong_rows"] == 0
-    record(f"plugin/mode1-shard/{name}/world{world}", total)
-    assert total["rows"] == len(sc.real_rows(case))
-    assert total["ok"], total
-
-
 def test_the_cast_and_the_candidates(decode8):
     """Each narrowing form, read on the host and through an in-graph consumer (two graphs per form). Report only."""
     case, want = decode8
@@ -203,3 +180,29 @@ def test_the_cast_and_the_candidates(decode8):
                                   if e.get("host_read_wrong_rows") == 0 and e.get("in_graph_consumer_wrong_rows") == 0],
         "forms_right_in_graph": [n for n, e in results.items() if e.get("in_graph_consumer_wrong_rows") == 0],
     })
+
+
+@pytest.mark.parametrize("name,mode", [("decode8", 0), ("decode8", 1), ("lattice4", 0), ("lattice4", 1)])
+def test_decode_selection_on_the_card(name, mode):
+    """One decode step of ``HpuQsaIndexer._select_decode`` on the card: mode 0 (default path) and mode 1."""
+    case = sc.build_case(name)
+    entry = verdict(case, sc.decode_selection(case, DEVICE, mode), None)
+    record(f"plugin/mode{mode}/{name}", entry)
+    assert entry["ok"], entry
+
+
+@pytest.mark.parametrize("name,world", [("decode8", 4), ("lattice4", 4), ("decode8", 8)])
+def test_sharded_decode_selection_on_the_card(name, world):
+    """Mode 1 sharded by request: every TP rank's share, computed on this card as that rank."""
+    case = sc.build_case(name)
+    want = sc.oracle(case)
+    total = {"rows": 0, "host_read_wrong_rows": 0, "in_graph_consumer_wrong_rows": 0, "detail": None}
+    for rank in range(world):
+        one = verdict(case, sc.decode_selection(case, DEVICE, 1, 1, (rank, world)), want)
+        for key in ("rows", "host_read_wrong_rows", "in_graph_consumer_wrong_rows"):
+            total[key] += one[key]
+        total["detail"] = total["detail"] or one["detail"]
+    total["ok"] = total["host_read_wrong_rows"] == 0 and total["in_graph_consumer_wrong_rows"] == 0
+    record(f"plugin/mode1-shard/{name}/world{world}", total)
+    assert total["rows"] == len(sc.real_rows(case))
+    assert total["ok"], total
