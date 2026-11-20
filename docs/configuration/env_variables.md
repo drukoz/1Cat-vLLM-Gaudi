@@ -164,6 +164,22 @@ Default `0` (resolved, not set).
 states the pool formula adds to the live need of `max_num_seqs` requests.
 Default `512`.
 
+`VLLM_HPU_PREFIX_KEEP_PROMPT_END=1` makes the recurrent state pool keep the
+recurrent state at a prompt's end when the prompt ends on a scheduler block
+(512 tokens at TP8, 896 at TP4). At `--prefix-cache-retention-interval 0` (the
+default) a recurrent group keeps one state per request, at the prompt's last
+token aligned down to the block; for a prompt whose length is a multiple of the
+block that position is one block before its end, where a state exists only if
+a prompt chunk happened to end there. When none did (three of four aligned
+lengths at TP8, one of two at TP4, with the 2,048-token prompt cap) the next
+turn of the conversation gets no prefix-cache hit at all and prefills its whole
+context again. With `1` the state after the last prompt token is kept as well,
+so the next turn starts right behind the previous prompt. Cost: one more
+retained state per recurrent group for such a prompt. A retry of the same
+aligned prompt is not helped (it must compute its last token again). Default
+`0`. See `keep_block_aligned_prompt_end` in
+`vllm_gaudi/v1/core/recurrent_pool_coordinator.py`.
+
 `VLLM_HPU_PREFILL_PACING` keeps decoding streams alive while prompts are
 prefilled, as an integer mode. `0` (default) leaves vLLM's scheduler untouched.
 `1` (time share) wraps `Scheduler.schedule`: while at least one request is

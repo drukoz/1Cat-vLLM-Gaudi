@@ -546,6 +546,7 @@ if TYPE_CHECKING:
     VLLM_HPU_SCHED_KNOBS_FILE: str = ""  # JSON file of scheduler knobs re-read at run time (experiments)
     VLLM_HPU_PROMPT_GRAPH_MAX_TOKENS: int = 0  # 0 upstream; >0 prompt forwards up to this size replay HPU graphs
     VLLM_HPU_QSA_PREFILL_INDEXER_SPLIT: int = 0  # 0 every rank scores all prompt rows; 1 rows split over TP ranks
+    VLLM_HPU_PREFIX_KEEP_PROMPT_END: int = 0  # 0 upstream's sparse retention; 1 also a prompt end on a block boundary
 
 
 def _optional_bool_env(name: str) -> Optional[bool]:
@@ -1979,6 +1980,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # prompt row collects the block ids (fp32, exact); buckets that do not split evenly keep the default.
     "VLLM_HPU_QSA_PREFILL_INDEXER_SPLIT":
     lambda: int(os.environ.get("VLLM_HPU_QSA_PREFILL_INDEXER_SPLIT", "0")),
+    # Recurrent state pool: 0 keeps upstream's sparse retention; 1 also keeps the recurrent state at a prompt's
+    # end when the prompt ends on a scheduler block (without it the next turn of such a prompt misses the
+    # prefix cache completely at retention interval 0).
+    "VLLM_HPU_PREFIX_KEEP_PROMPT_END":
+    lambda: int(os.environ.get("VLLM_HPU_PREFIX_KEEP_PROMPT_END", "0")),
 }
 
 # end-env-vars-definition

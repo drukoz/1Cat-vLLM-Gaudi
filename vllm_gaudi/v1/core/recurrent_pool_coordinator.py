@@ -9,6 +9,7 @@ talks to `coordinator.block_pool`, so the attention pool is a `RecurrentRoutingB
 forwards the deferred frees, prefix-cache resets and events of recurrent blocks to the recurrent
 pool.
 """
+import os
 from collections.abc import Iterable, Sequence
 
 from vllm.distributed.kv_events import KVCacheEvent
@@ -19,6 +20,51 @@ from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_utils import BlockHash, KVCacheBlock
 from vllm.v1.core.single_type_kv_cache_manager import CrossAttentionManager
 from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheConfig, MambaSpec
+
+
+ENV_KEEP_PROMPT_END = "VLLM_HPU_PREFIX_KEEP_PROMPT_END"
+
+
+def keep_prompt_end_requested(environ=None) -> bool:
+    """``VLLM_HPU_PREFIX_KEEP_PROMPT_END``: 0 (default) upstream's sparse retention, 1 ``keep_block_aligned_prompt_end``."""
+    value = int((os.environ if environ is None else environ).get(ENV_KEEP_PROMPT_END, "0"))
+    if value not in (0, 1):
+        raise ValueError(f"{ENV_KEEP_PROMPT_END} must be 0 or 1, got {value}")
+    return value == 1
+
+
+def keep_block_aligned_prompt_end(manager) -> None:
+    """Make a recurrent group's sparse retention also keep the state at a prompt's end when the prompt ends
+    on a scheduler block.
+
+    Why. Under sparse retention (``--prefix-cache-retention-interval 0``, the default) a recurrent group
+    keeps only its "reachable boundaries", and the one a prompt of ``N`` tokens gets is ``N - 1`` aligned
+    down to the block (``SingleTypeKVCacheManager.cache_blocks``): the furthest point a replay of the same
+    prompt can reuse, since a replay computes its last token again. The scheduler ends a chunk there
+    (``Scheduler._mamba_block_aligned_split`` stops at ``N - N % block``), so a state exists at it, unless
+    ``N`` is a multiple of the block: then the split rule's stop is ``N`` itself, no chunk ends one block
+    earlier, the kept entry is a null block, and the state that does exist, after exactly ``N`` tokens, is
+    masked out and freed while the request decodes. The next turn of that conversation then finds no
+    recurrent state at all, the hybrid hit is 0 and the whole prompt is prefilled again (one turn in 512 at
+    TP8, one in 896 at TP4; tens of seconds at 128K).
+
+    What. ``N`` is a reuse point too: a longer prompt that starts with these ``N`` tokens (the next turn)
+    can start right behind it. For every reachable boundary ``b`` with ``b + 1`` on a block boundary the
+    mask is asked to keep ``b + 1`` as well. The only boundary of that form is the replay boundary
+    ``N - 1`` of a block-aligned prompt (shared-prefix junctions are block-aligned themselves), so other
+    prompts keep exactly what they kept. Cost: one more retained state per recurrent group for such a
+    prompt, evicted like every cached block. A replay of the same aligned prompt still misses.
+    """
+    base = manager.reachable_block_mask
+
+    def reachable_block_mask(*args, alignment_tokens=None, reachable_boundaries=(), **kwargs):
+        if alignment_tokens:
+            ends = [b + 1 for b in reachable_boundaries if (b + 1) % alignment_tokens == 0]
+            if ends:
+                reachable_boundaries = [*reachable_boundaries, *ends]
+        return base(*args, alignment_tokens=alignment_tokens, reachable_boundaries=reachable_boundaries, **kwargs)
+
+    manager.reachable_block_mask = reachable_block_mask
 
 
 class RecurrentRoutingBlockPool(BlockPool):
@@ -117,9 +163,12 @@ class HpuRecurrentPoolCoordinator(HybridKVCacheCoordinator):
             metrics_collector=metrics_collector,
             recurrent_pool=self.recurrent_pool,
         )
+        keep_prompt_end = keep_prompt_end_requested()
         for gid, manager in enumerate(self.single_type_managers):
             manager.block_pool = self._pool_for_group(gid)
             manager._null_block = manager.block_pool.null_block
+            if keep_prompt_end and gid in self.recurrent_group_ids:
+                keep_block_aligned_prompt_end(manager)
 
     def _pool_for_group(self, group_id: int) -> BlockPool:
         return self.recurrent_pool if group_id in self.recurrent_group_ids else self.block_pool
