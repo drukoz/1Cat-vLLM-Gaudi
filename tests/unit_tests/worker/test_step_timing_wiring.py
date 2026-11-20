@@ -280,11 +280,11 @@ def test_sample_tokens_calls_the_timer_at_every_boundary_of_a_step():
         'step_timer.tag(step_kind, num_reqs, scheduler_output.total_num_scheduled_tokens)',
         'step_timer.lap("prepare")',
         'step_timer.lap("launch_inputs")',  # the prefill loop
-        'step_timer.device_wait("device_forward")',
+        'step_timer.device_wait("device_forward", (logits_device, sample_hidden_states))',
         'step_timer.bucket(decode_data.token_ids.size(0))',
         'step_timer.lap("launch_inputs")',  # the decode batch
         'step_timer.lap("launch_model")',
-        'step_timer.device_wait("device_forward")',
+        'step_timer.device_wait("device_forward", (logits_device, fused_sampled_token_ids, sample_hidden_states))',
         'step_timer.lap("wait")',  # a verification step reads the accepted tokens here
         'step_timer.lap("wait")',  # every other step reads the sampled tokens here
         'step_timer.lap("draft")',

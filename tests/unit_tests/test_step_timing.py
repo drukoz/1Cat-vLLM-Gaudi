@@ -406,6 +406,70 @@ def test_mode_3_gives_every_component_its_device_collective_and_host_time(tmp_pa
     assert "components, device/collective/host ms p50 (calls): gdn 3.10/0.40/0.20 (1), hc 2.00/0.00/0.20 (1)" in lines[-1]
 
 
+class _Reads:
+    """Stands in for a device tensor: counts the one-element reads the timer makes."""
+
+    def __init__(self, log, name):
+        self.log, self.name = log, name
+
+    def reshape(self, *shape):
+        return self
+
+    def __getitem__(self, index):
+        return self
+
+    def cpu(self):
+        self.log.append(self.name)
+        return self
+
+
+def test_mode_3_reads_one_element_back_at_every_wait_that_is_given_a_tensor(tmp_path, clock, lines):
+    timer = make(tmp_path, clock, lines, mode=step_timing.MODE_SYNC, every=1)
+    calls, reads = [], []
+    runtime = FakeRuntime(clock, calls, [])
+    timer.bind_runtime(runtime, runtime)
+    timer.begin_step()
+    timer.tag("decode", 2)
+    token = timer.collective_begin(_Reads(reads, "partial"))
+    timer.collective_end(token, "all_reduce")  # no tensor: the wait is mark_step and synchronize only
+    token = timer.collective_begin()
+    timer.collective_end(token, "all_gather", torch.zeros(2, 3))  # a real tensor is read as well
+    timer.component_begin("hc", (None, _Reads(reads, "input")))
+    timer.component_end({"out": _Reads(reads, "output")})
+    timer.device_wait("device_forward", (None, _Reads(reads, "logits")))
+    timer.device_wait("device_sample", "not a tensor")
+    timer.end_step()
+    assert reads == ["partial", "input", "output", "logits"]
+    assert calls == ["mark_step", "synchronize"] * 8  # every wait still launches and synchronizes first
+    assert records(timer)[0]["counters"]["read_back"]["p50"] == 5
+
+
+def test_a_read_back_that_fails_is_reported_once_and_does_not_break_the_step(tmp_path, clock, lines):
+    timer = make(tmp_path, clock, lines, mode=step_timing.MODE_SYNC, every=1)
+    runtime = FakeRuntime(clock, [], [])
+    timer.bind_runtime(runtime, runtime)
+
+    class Broken(_Reads):
+
+        def cpu(self):
+            raise RuntimeError("no kernel")
+
+    timer.begin_step()
+    timer.tag("decode", 1)
+    timer.device_wait("device_forward", Broken([], "x"))
+    timer.device_wait("device_sample", Broken([], "y"))
+    timer.end_step()
+    assert sum("cannot read a Broken back: RuntimeError: no kernel" in line for line in lines) == 1
+    assert "read_back" not in records(timer)[0]["counters"]
+
+
+def test_first_tensor_finds_a_tensor_at_the_top_level_only():
+    t = torch.ones(3)
+    assert step_timing.first_tensor(t) is t and step_timing.first_tensor((None, 4, t)) is t
+    assert step_timing.first_tensor({"a": None, "b": t}) is t and step_timing.first_tensor([[t]]) is None
+    assert step_timing.first_tensor(None) is None and step_timing.first_tensor("text") is None
+
+
 def test_components_are_measured_in_mode_3_only(tmp_path, clock, lines):
     timer = make(tmp_path, clock, lines, mode=step_timing.MODE_SPANS, every=1)
     calls = []

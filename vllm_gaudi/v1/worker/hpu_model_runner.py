@@ -6127,7 +6127,7 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         htorch.core.mark_step()
         if step_timer is not None:
             step_timer.lap("launch_sample")
-            step_timer.device_wait("device_sample")
+            step_timer.device_wait("device_sample", getattr(sampler_output, "sampled_token_ids", None))
         return sampler_output, sampling_metadata
 
     def _pool(
@@ -6587,7 +6587,7 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                 htorch.core.mark_step()
                 if step_timer is not None:
                     step_timer.lap("launch_model")
-                    step_timer.device_wait("device_forward")
+                    step_timer.device_wait("device_forward", (logits_device, sample_hidden_states))
                 non_flattened_hidden_states_prefills.append(non_flattened_hidden_states)
                 # Collect prefill hidden states for prompt logprobs.
                 # req_id is a list of request IDs in this prefill batch.
@@ -6680,7 +6680,7 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             htorch.core.mark_step()
             if step_timer is not None:
                 step_timer.lap("launch_model")
-                step_timer.device_wait("device_forward")
+                step_timer.device_wait("device_forward", (logits_device, fused_sampled_token_ids, sample_hidden_states))
 
             if self.use_structured_output:
                 assert logits_device is not None

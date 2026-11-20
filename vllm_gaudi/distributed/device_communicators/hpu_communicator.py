@@ -54,7 +54,7 @@ class HpuCommunicator(DeviceCommunicatorBase):
         step_timer = step_timing.TIMER  # VLLM_HPU_STEP_TIMING: None when the flag is 0
         timed = step_timer is not None and step_timer.active
         if timed:
-            token = step_timer.collective_begin()
+            token = step_timer.collective_begin(input_)
         if gaudi_envs.VLLM_HPU_COLLECTIVE_MARK_STEP:
             htorch.core.mark_step()
         dist.all_reduce(input_, group=self.device_group)
@@ -79,7 +79,7 @@ class HpuCommunicator(DeviceCommunicatorBase):
         step_timer = step_timing.TIMER  # VLLM_HPU_STEP_TIMING: None when the flag is 0
         timed = step_timer is not None and step_timer.active
         if timed:
-            token = step_timer.collective_begin()
+            token = step_timer.collective_begin(input_)
         if gaudi_envs.VLLM_HPU_COLLECTIVE_MARK_STEP:
             htorch.core.mark_step()
         dist.all_gather_into_tensor(output_tensor, input_, group=self.device_group)
