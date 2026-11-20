@@ -27,7 +27,7 @@ log "watching job $JOB"
 for _ in $(seq 1 4320); do
     st=$(cat "$JD/state" 2>/dev/null)
     [ "$st" = running ] && break
-    [ "$st" = ended ] && { log "job ended before it ran"; exit 0; }
+    case "$st" in ended | cancelled) log "job $st before it ran"; exit 0 ;; esac
     sleep 5
 done
 RUN=$(ls -d "$T"/results/"$JOB"-* 2>/dev/null | head -n 1)
