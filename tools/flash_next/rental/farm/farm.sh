@@ -31,7 +31,8 @@
 #   TINY OPTIONS: --gdn MODES (pytorch,fused,hc,moe; default pytorch,fused), --full-warmup
 #   SERVE OPTIONS (serve_probe.sh): --mtp K, --spec JSON, --levels LIST, --tokens N, --warm-tokens N,
 #     --repeat-top N, --ctx N:TOKENS, --no-probe, --max-model-len N, --max-num-seqs N,
-#     --health-timeout S, --bare, --no-ep, --tp N
+#     --health-timeout S, --bare, --no-ep, --tp N, --no-mintok-check (skip the probe's one round with
+#     min_tokens), --min-tokens (send min_tokens in every round)
 #   farm install                             (card-farm only) put the farm scripts of wt/card-farm on
 #                                            the node and in bin/farm
 
@@ -49,7 +50,7 @@ die() {
 }
 
 usage() {
-    sed -n '6,36p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '6,37p' "$0" | sed 's/^# \{0,1\}//'
 }
 
 need_track() {
@@ -277,7 +278,7 @@ cmd_stage2() {
                                 inner+=("$1" "$2")
                                 shift 2
                                 ;;
-                            --no-probe | --bare | --no-ep)
+                            --no-probe | --bare | --no-ep | --no-mintok-check | --min-tokens)
                                 inner+=("$1")
                                 shift
                                 ;;

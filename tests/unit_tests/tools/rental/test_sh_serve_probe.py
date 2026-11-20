@@ -49,6 +49,8 @@ class H(BaseHTTPRequestHandler):
     def do_POST(self):
         body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
         n = body["max_tokens"]
+        with open(os.environ["FAKE_VLLM_REQUESTS"], "a") as f:
+            f.write(json.dumps({k: body.get(k) for k in ("max_tokens", "min_tokens", "ignore_eos")}) + "\n")
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         self.end_headers()
@@ -89,13 +91,14 @@ class Rig:
             (bin_dir / "setsid").chmod(0o755)
         self.port = free_port()
         self.record = tmp_path / "vllm.json"
+        self.requests_file = tmp_path / "requests.jsonl"
         self.env = {k: v for k, v in os.environ.items()
                     if not k.startswith(("FARM_", "VLLM_", "PT_HPU"))}
         self.env.update({
             "PATH": "%s:%s" % (bin_dir, os.environ.get("PATH", "/usr/bin:/bin")),
             "FARM_PYTHON": sys.executable, "FARM_OUT": str(self.out), "FARM_NCARDS": "4",
             "FARM_PORT_BASE": str(self.port), "FARM_CARDS": "0,1,2,7", "FARM_MODULES": "0,1,2,3",
-            "FAKE_VLLM_RECORD": str(self.record),
+            "FAKE_VLLM_RECORD": str(self.record), "FAKE_VLLM_REQUESTS": str(self.requests_file),
         })
 
     def popen(self, *args, **env):
@@ -112,6 +115,12 @@ class Rig:
 
     def summary(self):
         return json.loads((self.out / "summary.json").read_text())
+
+    def requests(self):
+        """Every completion request the stand-in server got, in arrival order; the file is emptied."""
+        lines = self.requests_file.read_text().splitlines() if self.requests_file.exists() else []
+        self.requests_file.write_text("")
+        return [json.loads(line) for line in lines]
 
 
 @pytest.fixture
@@ -147,6 +156,43 @@ def test_a_healthy_server_is_probed_and_stopped(rig):
     assert "cards: 0,1,2,7 (modules 0,1,2,3)" in versions and "--tensor-parallel-size 4" in versions
     assert (rig.out / "probe.log").read_text().count("MEAS") == 2
     assert (rig.out / "server0.log").read_text().startswith("fake vllm: listening")
+
+
+def test_the_probe_sends_no_min_tokens_and_measures_the_mask_in_one_labelled_round(rig):
+    # min_tokens makes vLLM mask the logits of every row on every step (MinTokensLogitsProcessor), so the
+    # probe fixes the length with max_tokens + ignore_eos and measures the mask once, at the top level.
+    rc, out = rig.run(*QUICK)
+    assert rc == 0, out
+    reqs = rig.requests()
+    assert all(r["ignore_eos"] is True for r in reqs)
+    plain = [r for r in reqs if r["min_tokens"] is None]
+    masked = [r for r in reqs if r["min_tokens"] is not None]
+    assert sorted(r["max_tokens"] for r in plain) == [3, 3, 3, 6, 6, 6]  # levels 1 and 2: warm, then measured
+    assert sorted(r["max_tokens"] for r in masked) == [3, 3, 6, 6]  # the MINTOK round at level 2: warm, measured
+    assert all(r["min_tokens"] == r["max_tokens"] for r in masked)
+    scaling = json.loads((rig.out / "scaling.json").read_text())
+    assert [m["min_tokens"] for m in scaling["levels"]] == [False, False]
+    (mintok,) = scaling["mintok"]
+    assert mintok["streams"] == 2 and mintok["min_tokens"] is True and mintok["ok"] == 2 and mintok["tokens"] == 6
+    probe_log = (rig.out / "probe.log").read_text()
+    assert probe_log.count("MINTOK N=2") == 1 and "with min_tokens" in probe_log and "(without: " in probe_log
+    assert probe_log.count("MEAS") == 2  # the MINTOK round is not one of the measured levels
+
+
+def test_no_mintok_check_skips_the_round_and_min_tokens_sends_it_in_every_round(rig):
+    rc, out = rig.run(*QUICK, "--no-mintok-check")
+    assert rc == 0, out
+    reqs = rig.requests()
+    assert len(reqs) == 6 and all(r["min_tokens"] is None for r in reqs)
+    assert json.loads((rig.out / "scaling.json").read_text())["mintok"] == []
+    assert "MINTOK" not in (rig.out / "probe.log").read_text()
+    rc, out = rig.run(*QUICK, "--min-tokens")
+    assert rc == 0, out
+    reqs = rig.requests()
+    assert len(reqs) == 6 and all(r["min_tokens"] == r["max_tokens"] for r in reqs)  # no extra round
+    scaling = json.loads((rig.out / "scaling.json").read_text())
+    assert scaling["mintok"] == [] and [m["min_tokens"] for m in scaling["levels"]] == [True, True]
+    assert "MINTOK" not in (rig.out / "probe.log").read_text()
 
 
 def test_the_job_env_wins_over_the_preset_and_bare_drops_it(rig):

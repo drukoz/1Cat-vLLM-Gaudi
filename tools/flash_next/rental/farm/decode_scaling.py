@@ -5,7 +5,8 @@
 """Decode scaling probe: N concurrent streaming completions of equal length against one vLLM server.
 
 Per level N: a warm round (short, compiles the decode graphs of batch N), then a measured round. Every stream
-generates exactly --tokens tokens (min_tokens = max_tokens, ignore_eos), temperature 0. Reports per stream the
+generates exactly --tokens tokens (max_tokens with ignore_eos; no min_tokens, whose logits mask runs on every row
+of every step; --min-tokens adds it back, and one labelled MINTOK round at the top level measures its cost), temperature 0. Reports per stream the
 time to first token and the decode time per token over the stream's own decode span, and for the round the
 aggregate output tokens per second over the window in which all N streams were decoding.
 
@@ -42,11 +43,12 @@ def prompt_for(i, ctx_tokens=0):
     return "Stream %d notes: " % i + " ".join(filler) + "\n\n" + head
 
 
-def one_stream(host, port, model, prompt, ntok, out, idx, barrier, timeout_s):
-    body = json.dumps({
-        "model": model, "prompt": prompt, "max_tokens": ntok, "min_tokens": ntok, "ignore_eos": True,
-        "temperature": 0, "stream": True, "stream_options": {"include_usage": True},
-    })
+def one_stream(host, port, model, prompt, ntok, out, idx, barrier, timeout_s, mintok=False):
+    req = {"model": model, "prompt": prompt, "max_tokens": ntok, "ignore_eos": True,
+           "temperature": 0, "stream": True, "stream_options": {"include_usage": True}}
+    if mintok:
+        req["min_tokens"] = ntok
+    body = json.dumps(req)
     rec = {"status": None, "t0": None, "times": [], "ntoks": [], "usage": None, "err": None}
     try:
         barrier.wait()
@@ -83,12 +85,13 @@ def one_stream(host, port, model, prompt, ntok, out, idx, barrier, timeout_s):
     out[idx] = rec
 
 
-def run_round(args, n, ntok, ctx_tokens=0):
+def run_round(args, n, ntok, ctx_tokens=0, mintok=None):
+    mintok = args.min_tokens if mintok is None else mintok
     out = [None] * n
     barrier = threading.Barrier(n)
     threads = [threading.Thread(target=one_stream,
                                 args=(args.host, args.port, args.model, prompt_for(i, ctx_tokens), ntok, out, i,
-                                      barrier, args.timeout), daemon=True) for i in range(n)]
+                                      barrier, args.timeout, mintok), daemon=True) for i in range(n)]
     t_start = time.perf_counter()
     for t in threads:
         t.start()
@@ -113,7 +116,8 @@ def run_round(args, n, ntok, ctx_tokens=0):
                     "ttft_s": r["times"][0] - r["t0"], "ms_per_token": 1000.0 * span / max(1, comp - 1),
                     "completion_tokens": comp, "prompt_tokens": prompt_toks, "chunks": len(r["times"]),
                     "first": r["times"][0], "last": r["times"][-1]})
-    res = {"streams": n, "tokens": ntok, "ctx_tokens": ctx_tokens, "ok": len(per), "errors": errors,
+    res = {"streams": n, "tokens": ntok, "ctx_tokens": ctx_tokens, "min_tokens": bool(mintok), "ok": len(per),
+           "errors": errors,
            "wall_s": wall}
     if per:
         ms = sorted(p["ms_per_token"] for p in per)
@@ -151,11 +155,14 @@ def main():
     ap.add_argument("--warm-tokens", type=int, default=48)
     ap.add_argument("--repeat-top", type=int, default=2, help="measured rounds at the largest level")
     ap.add_argument("--ctx", default="", help="N:TOKENS, one more measured round with long prompts")
+    ap.add_argument("--min-tokens", action="store_true", help="send min_tokens = max_tokens in every round")
+    ap.add_argument("--no-mintok-check", action="store_true",
+                    help="skip the extra round at the top level that sends min_tokens (its cost against the same level without)")
     ap.add_argument("--timeout", type=float, default=1800.0)
     ap.add_argument("--out", default="scaling.json")
     args = ap.parse_args()
     levels = [int(x) for x in args.levels.split(",") if x]
-    results = {"levels": [], "ctx": []}
+    results = {"levels": [], "ctx": [], "mintok": []}
 
     def save():
         with open(args.out, "w") as f:
@@ -188,6 +195,21 @@ def main():
         if not w.get("ok"):
             print("stopping: the warm round at N=%d failed: %s" % (n, w.get("error_samples")), flush=True)
             break
+    if levels and not args.min_tokens and not args.no_mintok_check:
+        n = levels[-1]
+        w = run_round(args, n, args.warm_tokens, mintok=True)  # compiles whatever the mask adds
+        m = run_round(args, n, args.tokens, mintok=True)
+        results["mintok"].append(m)
+        save()
+        if m.get("ok"):
+            base = [x for x in results["levels"] if x["streams"] == n and x.get("ok")]
+            ref = min(x["steady_ms_per_token_p50"] for x in base) if base else float("nan")
+            print("MINTOK N=%-3d with min_tokens: ms/tok p50=%.2f, steady ms/tok p50=%.2f (without: %.2f), "
+                  "tok/s/stream=%.1f, aggregate=%.1f tok/s" % (
+                      n, m["ms_per_token_p50"], m["steady_ms_per_token_p50"], ref, m["tok_s_per_stream_p50"],
+                      m["aggregate_tok_s"] or 0), flush=True)
+        else:
+            print("MINTOK N=%d FAILED: %s" % (n, m.get("error_samples")), flush=True)
     if args.ctx:
         n, ctx = (int(x) for x in args.ctx.split(":"))
         w = run_round(args, n, args.warm_tokens, ctx)

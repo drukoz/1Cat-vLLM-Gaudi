@@ -15,6 +15,8 @@
 #     --tokens N          tokens per measured stream (default 256); --warm-tokens N (default 48)
 #     --repeat-top N      measured rounds at the largest level (default 2)
 #     --ctx N:TOKENS      one more measured round: N streams with about TOKENS-token prompts
+#     --no-mintok-check   skip the MINTOK round (below); for a job that must be short
+#     --min-tokens        send min_tokens = max_tokens in every round (then no MINTOK round)
 #     --no-probe          start, check health and stop (a start test)
 #     --max-model-len N   (default 131072); --max-num-seqs N (default 32)
 #     --health-timeout S  seconds to wait for the server (default 2400)
@@ -26,6 +28,12 @@
 # program head's best decode setup of 2026-11-20: PT_HPU_LAZY_MODE=1 PT_HPU_LAZY_ACC_PAR_MODE=0
 # VLLM_HPU_FLASH_NEXT_QSA_MODE=1 VLLM_HPU_RECURRENT_STATE_POOL=1 VLLM_HPU_GDN_CORE_DECODE=1
 # VLLM_HPU_HC_FUSED=1 VLLM_HPU_PLE_HOST_NGRAM_IDS=1 VLLM_HPU_COLLECTIVE_MARK_STEP=0 VLLM_SKIP_WARMUP=true.
+#
+# The probe fixes each stream's length with max_tokens and ignore_eos. It sends no min_tokens, because
+# with min_tokens vLLM masks the logits of every row on every step (MinTokensLogitsProcessor), a cost an
+# agent's request does not have. One extra round at the largest level, labelled MINTOK in probe.log and
+# "mintok" in scaling.json, sends min_tokens and so measures the mask's cost against the same level
+# without it (about one warm and one measured round more).
 #
 # Writes to OUT: versions.txt, server0.log, scaling.json (decode_scaling.py), probe.log, summary.json.
 # Exit code: 0 the probe ran, 3 the server died, 4 it did not get healthy in time, 5 the probe failed,
@@ -44,6 +52,7 @@ TOKENS=256
 WARM_TOKENS=48
 REPEAT_TOP=2
 CTX=""
+MINTOK_ARGS=()
 PROBE=1
 MAX_MODEL_LEN=131072
 MAX_NUM_SEQS=32
@@ -81,6 +90,7 @@ while [ $# -gt 0 ]; do
             CTX="$2"
             shift 2
             ;;
+        --no-mintok-check | --min-tokens) MINTOK_ARGS+=("$1"); shift ;;
         --no-probe) PROBE=0; shift ;;
         --max-model-len) num "$1" "${2:-}"; MAX_MODEL_LEN="$2"; shift 2 ;;
         --max-num-seqs) num "$1" "${2:-}"; MAX_NUM_SEQS="$2"; shift 2 ;;
@@ -90,7 +100,7 @@ while [ $# -gt 0 ]; do
         --model) [ $# -ge 2 ] || die "--model needs a folder"; MODEL="$2"; shift 2 ;;
         --out) [ $# -ge 2 ] || die "--out needs a folder"; OUT="$2"; shift 2 ;;
         --) shift; break ;;
-        -h | --help) sed -n '3,33p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        -h | --help) sed -n '3,41p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) die "unknown option: $1 (extra vllm serve arguments follow --)" ;;
     esac
 done
@@ -220,6 +230,7 @@ if [ "$PROBE" -eq 1 ]; then
     PROBE_ARGS=(--port "$PORT" --model fn --out "$OUT/scaling.json" --levels "$LEVELS" --tokens "$TOKENS"
         --warm-tokens "$WARM_TOKENS" --repeat-top "$REPEAT_TOP")
     if [ -n "$CTX" ]; then PROBE_ARGS+=(--ctx "$CTX"); fi
+    PROBE_ARGS+=(${MINTOK_ARGS[@]+"${MINTOK_ARGS[@]}"})
     probe() {
         "$PYTHON" "$HERE/decode_scaling.py" "${PROBE_ARGS[@]}" 2>&1 | tee probe.log
         return "${PIPESTATUS[0]}"

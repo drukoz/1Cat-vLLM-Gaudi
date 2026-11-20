@@ -180,6 +180,19 @@ def test_farm_serve_writes_the_server_job_with_its_options(rig):
     assert "VLLM_HPU_HC_FUSED=0" in e and "FARM_NCARDS=4" in e and "FARM_PORT_BASE=8100" in e
 
 
+def test_farm_serve_passes_the_min_tokens_options_to_the_probe(rig):
+    rig.synced()
+    proc = rig.farm("serve", "kf", "real4-short", "any:4", "30m", "--no-sync", "--levels", "1,32",
+                    "--no-mintok-check")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    proc = rig.farm("serve", "kf", "real4-mask", "any:4", "30m", "--no-sync", "--min-tokens")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    short, mask = rig.runs()
+    assert after(short, "farm-kf:%s" % rig.sha) == ["bash", "/farm/serve_probe.sh", "--levels", "1,32",
+                                                     "--no-mintok-check", "--"]
+    assert after(mask, "farm-kf:%s" % rig.sha) == ["bash", "/farm/serve_probe.sh", "--min-tokens", "--"]
+
+
 def test_farm_tiny_runs_the_farms_tiny_runner(rig):
     rig.synced()
     proc = rig.farm("tiny", "kf", "tiny-tp2", "any:2", "20m", "--no-sync", "--gdn", "hc", "--full-warmup")
