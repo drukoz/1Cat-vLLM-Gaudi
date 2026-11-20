@@ -316,6 +316,12 @@ def _hpu_get_kv_cache_coordinator(**kwargs):
 
 _kv_cache_manager_module.get_kv_cache_coordinator = _hpu_get_kv_cache_coordinator
 
+# Prefill pacing and runtime step-budget knobs (prefill track): wraps Scheduler.schedule when
+# VLLM_HPU_PREFILL_PACING or VLLM_HPU_SCHED_KNOBS_FILE asks for it; with both unset nothing is patched.
+from vllm_gaudi.v1.core.sched.prefill_pacing import install_prefill_pacing as _install_prefill_pacing  # noqa: E402
+
+_install_prefill_pacing()
+
 # Guard Prometheus counters against negative prompt-token counts that can arise
 # when KV-cache blocks are invalidated during OOM and token-count bookkeeping
 # becomes temporarily inconsistent.  Prometheus counters require non-negative

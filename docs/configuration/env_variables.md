@@ -158,6 +158,40 @@ Default `0` (resolved, not set).
 states the pool formula adds to the live need of `max_num_seqs` requests.
 Default `512`.
 
+`VLLM_HPU_PREFILL_PACING` keeps decoding streams alive while prompts are
+prefilled, as an integer mode. `0` (default) leaves vLLM's scheduler untouched.
+`1` (time share) wraps `Scheduler.schedule`: while at least one request is
+decoding, prompt work gets `VLLM_HPU_PREFILL_PACING_SHARE` percent of wall time
+(default `25`; after a step that carried prompt tokens the following steps
+carry decode rows only until they have lasted `(100 - share) / share` times the
+extra time of that step) and one step carries at most
+`VLLM_HPU_PREFILL_PACING_SLICE_TOKENS` prompt tokens (default `2048`, rounded
+down to whole scheduler blocks and at least one block: 512 tokens at TP8, 896
+at TP4; `0` removes the cap). The slice bounds the longest stall of a stream,
+the share bounds the loss of decode speed. With no request decoding nothing is
+paced, so a cold start prefills at the full step budget. The mode needs async
+scheduling off (Flash-Next runs without it). See
+`vllm_gaudi/v1/core/sched/prefill_pacing.py`.
+
+`VLLM_HPU_SCHED_KNOBS_FILE` names a JSON file of scheduler knobs that the
+engine re-reads while it runs (checked every 0.25 s): `max_num_scheduled_tokens`
+(at most `--max-num-batched-tokens`), `long_prefill_token_threshold` (`0` = no
+per-request cap), and the pacing knobs `mode`, `share_percent`, `slice_tokens`.
+It exists so a settings sweep (`tools/flash_next/rental/prefill_sweep.py`)
+changes the step budget on a running server instead of restarting it for every
+pair. A file that does not parse keeps the last good values. Default: empty (no
+file, nothing wrapped).
+
+`VLLM_HPU_PROMPT_GRAPH_MAX_TOKENS` sets the size up to which a prompt forward is
+replayed from an HPU graph: `batch x query + context blocks x block size` tokens.
+`0` (default) keeps upstream's threshold, `max_cudagraph_capture_size`, which is
+`--max-num-batched-tokens` unless configured (vLLM caps a configured value
+there). With the rental settings a 2,048-token chunk of a long prompt is then
+traced op by op on the host once its context passes about 6,000 tokens. A
+positive value (for example `140000`) replays every chunk of a 128K prompt from
+graphs; each new (query, context) bucket is captured on first use. Decode is
+unchanged.
+
 `VLLM_COMPACT_GDN` selects the compact-GDN fast path with per-token state
 checkpoints for GDN hybrids. Under prefix caching the platform hook defaults
 it to `0`, and starting with `VLLM_COMPACT_GDN=1` and prefix caching enabled is

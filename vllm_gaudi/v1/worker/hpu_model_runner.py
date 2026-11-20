@@ -661,6 +661,21 @@ class BucketingFailedException(Exception):
     pass
 
 
+def resolve_prompt_graph_max_tokens() -> int:
+    """``VLLM_HPU_PROMPT_GRAPH_MAX_TOKENS``: 0 (default) keeps upstream's prompt graph threshold.
+
+    A positive value replaces ``max_cudagraph_capture_size`` in ``HPUModelRunner._use_graphs`` for prompt
+    forwards only: a prompt forward is replayed from an HPU graph while ``batch x query + context blocks x
+    block size`` is at most this many tokens. vLLM caps a configured capture size at
+    ``--max-num-batched-tokens``, so without the flag a 2,048-token chunk of a long prompt is replayed only
+    while its context is a few thousand tokens.
+    """
+    value = int(gaudi_envs.VLLM_HPU_PROMPT_GRAPH_MAX_TOKENS)
+    if value < 0:
+        raise ValueError(f"VLLM_HPU_PROMPT_GRAPH_MAX_TOKENS must be >= 0, got {value}")
+    return value
+
+
 def should_synchronize_hybrid_prefill_output(
     use_async_scheduling: bool,
     num_mamba_like_layers: int,
@@ -2375,6 +2390,12 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         self.max_cudagraph_capture_size = self.vllm_config.compilation_config.max_cudagraph_capture_size
         if self.max_cudagraph_capture_size is None:
             self.max_cudagraph_capture_size = self.max_num_batched_tokens
+        # 0 = the threshold above; positive = the prompt graph threshold in tokens (_use_graphs).
+        self.prompt_graph_max_tokens = resolve_prompt_graph_max_tokens()
+        if self.prompt_graph_max_tokens:
+            logger.info("Prompt forwards up to %d tokens (batch x query + context) replay HPU graphs "
+                        "(VLLM_HPU_PROMPT_GRAPH_MAX_TOKENS; capture size %d)", self.prompt_graph_max_tokens,
+                        self.max_cudagraph_capture_size)
         self.use_prefix_caching = (self.vllm_config.cache_config.enable_prefix_caching)
         self.bucketing_manager = HPUBucketingManager()
         max_num_prefill_seqs = self.max_num_seqs if self.use_merged_prefill \
@@ -7374,10 +7395,11 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             seq_len = attn_metadata.seq_len()
             num_blocks = attn_metadata.num_blocks()
             total_tokens = (batch_size * seq_len + num_blocks * attn_metadata.block_size)
-            if total_tokens > self.max_cudagraph_capture_size:
+            limit = getattr(self, "prompt_graph_max_tokens", 0) or self.max_cudagraph_capture_size
+            if total_tokens > limit:
                 logger.debug_once(f"Skipping HPU graph capture for prompt with [bs, query, num_blocks] = "
                                   f"[{batch_size}, {seq_len}, {num_blocks}] due to total token count "
-                                  f"{total_tokens} exceeding the threshold of {self.max_cudagraph_capture_size}.")
+                                  f"{total_tokens} exceeding the threshold of {limit}.")
                 return False
         return True
 

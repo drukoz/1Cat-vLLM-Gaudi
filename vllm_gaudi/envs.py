@@ -539,6 +539,11 @@ if TYPE_CHECKING:
     VLLM_HPU_RECURRENT_STATE_POOL: int = 0  # RecurrentStatePoolMode: 0 off, 1 pool
     VLLM_HPU_RECURRENT_STATE_POOL_SLOTS: int = 0  # resolved by the hook; positive overrides the formula
     VLLM_HPU_RECURRENT_STATE_POOL_CACHE_SLOTS: int = 512  # retained prefix states added to the live need
+    VLLM_HPU_PREFILL_PACING: int = 0  # PrefillPacingMode: 0 off (default), 1 time share while streams decode
+    VLLM_HPU_PREFILL_PACING_SHARE: int = 25  # percent of wall time prompt work may take while streams decode
+    VLLM_HPU_PREFILL_PACING_SLICE_TOKENS: int = 2048  # prompt tokens of one step while streams decode, 0 no cap
+    VLLM_HPU_SCHED_KNOBS_FILE: str = ""  # JSON file of scheduler knobs re-read at run time (experiments)
+    VLLM_HPU_PROMPT_GRAPH_MAX_TOKENS: int = 0  # 0 upstream; >0 prompt forwards up to this size replay HPU graphs
 
 
 def _optional_bool_env(name: str) -> Optional[bool]:
@@ -1933,6 +1938,34 @@ environment_variables: dict[str, Callable[[], Any]] = {
     lambda: int(os.environ.get("VLLM_HPU_RECURRENT_STATE_POOL_SLOTS", "0")),
     "VLLM_HPU_RECURRENT_STATE_POOL_CACHE_SLOTS":
     lambda: int(os.environ.get("VLLM_HPU_RECURRENT_STATE_POOL_CACHE_SLOTS", "512")),
+
+    # Prefill pacing (vllm_gaudi/v1/core/sched/prefill_pacing.py). The HPU runner runs a step's prompt
+    # chunks before its decode batch, so decoding streams wait for all prompt work of a step. Mode 1
+    # (PrefillPacingMode.TIME_SHARE) wraps Scheduler.schedule: while at least one request is decoding,
+    # prompt work gets VLLM_HPU_PREFILL_PACING_SHARE percent of wall time (the steps in between carry
+    # decode rows only) and at most VLLM_HPU_PREFILL_PACING_SLICE_TOKENS prompt tokens per step (whole
+    # scheduler blocks, at least one; 0 = no cap). With no request decoding nothing is paced. 0 (default)
+    # leaves the scheduler untouched. Needs async scheduling off.
+    "VLLM_HPU_PREFILL_PACING":
+    lambda: int(os.environ.get("VLLM_HPU_PREFILL_PACING", "0")),
+    "VLLM_HPU_PREFILL_PACING_SHARE":
+    lambda: int(os.environ.get("VLLM_HPU_PREFILL_PACING_SHARE", "25")),
+    "VLLM_HPU_PREFILL_PACING_SLICE_TOKENS":
+    lambda: int(os.environ.get("VLLM_HPU_PREFILL_PACING_SLICE_TOKENS", "2048")),
+
+    # A JSON object of scheduler knobs re-read while the server runs (checked every 0.25 s):
+    # max_num_scheduled_tokens (at most --max-num-batched-tokens), long_prefill_token_threshold (0 = no
+    # per-request cap), mode, share_percent, slice_tokens. For settings sweeps on one server start
+    # (tools/flash_next/rental/prefill_sweep.py); empty (default) = no file, no wrapper.
+    "VLLM_HPU_SCHED_KNOBS_FILE":
+    lambda: os.environ.get("VLLM_HPU_SCHED_KNOBS_FILE", ""),
+
+    # Prompt HPU-graph threshold (HPUModelRunner._use_graphs). 0 (default): a prompt forward replays an
+    # HPU graph only while batch x query + context blocks x block size <= max_cudagraph_capture_size,
+    # which is --max-num-batched-tokens unless configured (vLLM caps it there). Positive: that size in
+    # tokens instead, so long-context prompt chunks replay graphs too. Decode is unchanged.
+    "VLLM_HPU_PROMPT_GRAPH_MAX_TOKENS":
+    lambda: int(os.environ.get("VLLM_HPU_PROMPT_GRAPH_MAX_TOKENS", "0")),
 }
 
 # end-env-vars-definition
