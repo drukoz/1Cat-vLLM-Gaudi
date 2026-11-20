@@ -10,23 +10,33 @@ repository is under `/Volumes/Storage/Claude/gaudi-work/reports/spec-lookup/` (`
 
 ## Handoff (if this agent stops)
 
-State at **2026-11-20 19:55 UTC**. Branch head: the commit that holds this text, pushed.
+State at **2026-11-20 20:10 UTC**. Branch head: the commit that holds this text, pushed. It contains
+mtp-card-ready through `f1aa2292` (both card fixes of job 00021, the int64 conv index, the MTP step timer) and
+the program head `1b28bbff`.
 
 **Card jobs in the queue** (`bin/farm status`; results land in `reports/spec-lookup/card/<id>-<name>/`)
 
 | Job | What | State |
 |---|---|---|
-| 00086 `tiny2-ngram3-oracle` (any:2, 10 min) | tiny model: baseline, then n-gram k = 3 with prefix caching and the rehearsal oracle | waiting, bumped by the coordinator to the tail of the 1-card wave (expected 20:25 to 21:40 UTC); runs commit `628d9716` |
-| 00087 `tiny2-ngram8-search` (any:2, 14 min) | tiny model: baseline, n-gram k = 8 with the oracle, n-gram k = 3 with vLLM's own search | the same |
-| `real4-nospec-edit-prose` (any:4, 28 min, `--replaces 00029`) | real model without speculation: the edit, prose, whole-answer and large-file rounds (section 6) | submitted 19:51 UTC from commit `c13d1b97`; takes 00029's place (bound 03:38 UTC, realistically hours earlier) |
+| 00086 `tiny2-ngram3-oracle` (any:2, 10 min) | tiny model: baseline, then n-gram k = 3 with prefix caching and the rehearsal oracle | waiting, bumped by the coordinator to the tail of the 1-card wave (bound 21:09 UTC); runs commit `628d9716` |
+| 00087 `tiny2-ngram8-search` (any:2, 14 min) | tiny model: baseline, n-gram k = 8 with the oracle, n-gram k = 3 with vLLM's own search | the same (bound 21:14 UTC) |
+| `tiny2-mtp3-lookup-oracle2` (any:2, 12 min, `--replaces 00097`) | tiny model: baseline, then MTP k = 3 + the lookup hook with the oracle, three passes (hybrid, lookup-only, MTP alone) | resubmitted 20:08 UTC from `e121d61b` (00097 ran a commit without mtp-card-ready's second fix `9d013a36` and would have died at the first draft); the id is in `reports/spec-lookup/card/submit-tiny2-mtp3-lookup-oracle2.log`; 00097 had a bump, the replacement needs the coordinator's again |
+| 00095 `real4-nospec-edit-prose` (any:4, 28 min) | real model without speculation: the edit, prose, whole-answer and large-file rounds (section 6) | waiting in 00029's place (bound 02:34 UTC, realistically hours earlier); runs commit `c13d1b97` |
+
+The local `farm job` commands that submitted 00086, 00087 and 00095 were killed with the agent's shell at 20:05
+UTC; the jobs are on the node. Detached waiters copy their results when they end
+(`reports/spec-lookup/card/wait-<id>.txt` says so); if those are gone too:
+`bin/farm fetch spec-lookup <id> <id>-<name>`.
 
 When a tiny job ends: send its result lines (the `lookup tiny [...]` lines: tokens per step, the rate of every
 draft position, drafts and accepted; any failure with its traceback from `<config>/server0.log`) to the
 coordinator (`main`) and to the mtp-card-ready track at once: it is the first card run with accepted drafts
-(mtp-card-ready's tiny MTP run passed with 0 of 270 drafts accepted). When the no-speculation job ends: run
-`tools/flash_next/lookup_replay.py reports/spec-lookup/card/<id>-real4-nospec-edit-prose/probe.json --out ...`
-and send the acceptance per draft position for depths 3 to 16 on the edit prompts (section 5 has the
-synthetic preview).
+(mtp-card-ready's tiny and real MTP runs accept only what the MTP layer drafts: 0 of 270 on the tiny model).
+When the no-speculation job ends: run
+`python3 tools/flash_next/lookup_replay.py reports/spec-lookup/card/00095-real4-nospec-edit-prose/probe.json --out reports/spec-lookup/card/00095-replay.json`
+and send the acceptance per draft position for depths 3 to 16 on the edit prompts with the rows a verification
+step carries at 32 streams (the tool prints both), and
+`python3 tools/flash_next/lookup_summary.py reports/spec-lookup/card/<run folders>` for the table of section 7.
 
 **Done and verified on CPU**
 
@@ -43,18 +53,17 @@ synthetic preview).
 
 **Not verified yet**
 
-- The CPU engine tests on the head. mtp-card-ready's fix `f0e7d02f` passes an int32 index to `index_copy_`
-  (`vllm_gaudi/ops/causal_conv1d_pytorch.py:498`), which the CPU kernel refuses, so every CPU engine test of a
-  speculative config stops at its first prefill until that track casts the index (reported 19:45 UTC, their fix
-  was not pushed at 19:53; do not change those lines here, merge their commit). The card takes the int32 index
-  (their tiny MTP run passed with `f0e7d02f`). Then rerun `test_lookup_engine.py` (19 min under load) and
-  `test_engine_mtp.py` (30 min; a run that started on the tree of `3d536265` while later merges changed the
-  files under it had 12 passed, 1 failure from this defect and 1 from a file read mid-merge:
-  `reports/spec-lookup/logs/m1_test_engine_mtp.log`).
+- The CPU engine tests on the head (`test_lookup_engine.py`, 19 min under load; `test_engine_mtp.py`, 30 min).
+  `test_lookup_engine.py` is running on a copy of `7ec81b17` with the conv index cast by hand
+  (`reports/spec-lookup/logs/m4_scratch_test_lookup_engine.log`); mtp-card-ready's own cast (`9d013a36`) is
+  merged since `e121d61b`. An earlier `test_engine_mtp.py` run on a tree that changed under it had 12 passed
+  and 2 artefacts (`m1_test_engine_mtp.log`).
 - `bin/gate /Volumes/Storage/Claude/gaudi-work/wt/spec-lookup --tools` on the head (needed before a pull request).
-- **Nothing of this track has run on a card yet.** MTP on the card (mtp-card-ready): the real server starts
-  (job 00021, healthy after 435 s); its first prompt died on the conv-state slice write, fixed by `f0e7d02f`;
-  with the fix the tiny model passes MTP k = 3 with every draft rejected. Accepted drafts, widened steps and
+- **Nothing of this track has run on a card yet.** MTP on the card (mtp-card-ready's
+  `docs/design/flash-next/mtp-card-ready.md`, job 00021): two card failures fixed (`f0e7d02f`, `9d013a36`),
+  then MTP k = 3 on the real model at TP8 + EP8, one stream: 2.78 tokens per step, acceptance per position
+  0.83 / 0.57 / 0.39, 84.3 ms per step against 41.6 ms without speculation (31.0 against 41.6 ms per token).
+  On the tiny model every MTP draft is rejected. Accepted drafts beyond what MTP drafts, widened steps and
   block-completion commits have not run on a card: jobs 00086 and 00087 are the first.
 
 **Pending, in order**
@@ -105,7 +114,8 @@ synthetic preview).
 | `bf19334a` | the rehearsal oracle, `tools/flash_next/rental/lookup_tiny.py`, the hybrid's per-load log line |
 | `0953885a` | merge of the program head `1b28bbff` (PR #12, PR #13) |
 | `ffb4d87e`, `c13d1b97` | `lookup_probe.py`: whole answers (`editf`), the token ids of every stream and prompt |
-| `8c5ac747` | `tools/flash_next/lookup_replay.py`: lookup drafters replayed over recorded streams |
+| `8c5ac747`, `877cab29` | `tools/flash_next/lookup_replay.py` (lookup drafters replayed over recorded streams), `lookup_summary.py` (the table of the card jobs) |
+| `e121d61b` | merge of mtp-card-ready `f1aa2292` |
 
 ## 2. n-gram lookup with prefix caching
 
@@ -209,19 +219,34 @@ one server per job (TP4 + EP4, the card farm's serve command and preset, `VLLM_H
 `KIND:STREAMS:TOKENS:MODE`:
 
 - `edit`: an instruction plus one small file of this tree, the answer is the whole edited file. 664 to 859
-  prompt tokens (VERIFIED with the checkpoint's tokenizer and chat template). Under 1,024 tokens on purpose:
-  with prefix caching the scheduler's `_mamba_block_aligned_split` ends a prefill chunk at the last cacheable
-  512-token block boundary, one block earlier on an MTP server (`use_eagle_block_drop`), and the MTP drafter
-  never sees a chunk that completes no prompt (`VLLM_HPU_MTP_CHUNK_KV=0`); below 1,024 tokens an MTP server
-  prefills the prompt in one chunk, so MTP alone is measured with its full context.
+  prompt tokens (VERIFIED with the checkpoint's tokenizer and chat template). Short on purpose: with prefix
+  caching the scheduler's `_mamba_block_aligned_split` ends a prefill chunk at the last cacheable block
+  boundary, one block earlier on an MTP server (`use_eagle_block_drop`), and the MTP drafter never sees a
+  chunk that completes no prompt (`VLLM_HPU_MTP_CHUNK_KV=0`). The block is 512 tokens at TP8 with MTP (job
+  00021's log) and 896 at TP4 + EP4 without speculation (job 00024's log: "Setting attention block size to 896
+  tokens"), so below 1,024 tokens an MTP server prefills the prompt in one chunk in either layout and MTP
+  alone is measured with its full context. At TP4 these prompts are shorter than one block: no round gets a
+  prefix-cache hit (every round prefills its prompts again).
 - `editl`: the same with files of 3,164 to 3,601 tokens (on an MTP server most of the prompt is in chunks the
   drafter did not see: this round shows what that costs MTP, and what lookup accepts on longer copies).
+- `editf`: the edit prompts answered to the model's own end (no `ignore_eos`): whole answers for the replay.
 - `prose`: a story request, 39 to 41 tokens, nothing to copy.
 
 No `min_tokens`: `max_tokens` with `ignore_eos`. Stream `i` of a round always gets the same prompt, so the
-texts of all rounds and jobs compare token for token. Per round: tokens per verification step per request and
-the rate of each draft position (the server's counters), ms per engine step (the median gap between a stream's
-chunks), ms per token over the decode span and steady, the client-side step sizes.
+streams of all rounds and jobs compare token for token (`return_token_ids`: the probe keeps the ids). Per
+round: tokens per verification step per request and the rate of each draft position (the server's counters),
+ms per engine step (the median gap between a stream's chunks), ms per token over the decode span and steady,
+the client-side step sizes. `tools/flash_next/lookup_summary.py` turns the result folders into the table of
+section 7.
+
+**CPU check with the real checkpoint's config** (`reports/spec-lookup/realcfg/check_real_config.py`, the
+`config.json` copied from the node with `bin/node-scp`, no weights; VERIFIED 2026-11-20 20:00 UTC on
+`877cab29`): the engine config of the three servers (no speculation, n-gram k = 8, MTP k = 3 with the lookup
+hook) builds with the job's serve arguments (131,072 tokens, 32 sequences, prefix caching, align mode), the
+speculative validators pass, the target's config has `image_token_id` (248056) and no `image_token_index`
+(the line job 00008 died on), the proposer looks the target up as `Qwen3_5ForConditionalGeneration`, the
+draft's M-RoPE keys are removed, and `HybridLookup.from_env` gives HYBRID, n-gram 3..8, k = 3. What CPU cannot
+show without the weights is the load itself: on the card the MTP server is healthy after 435 s (job 00021).
 
 ## 7. Card results
 
