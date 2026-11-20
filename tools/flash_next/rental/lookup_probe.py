@@ -366,6 +366,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--out", default="lookup_probe.json")
     ap.add_argument("--compare", nargs="+", metavar="PROBE.json", help="compare the texts of probe files and exit")
     ap.add_argument("--list-prompts", action="store_true")
+    ap.add_argument("--no-flush", action="store_true", help="do not send the 4-token request after the last round")
     args = ap.parse_args(argv)
     if args.compare:
         runs = []
@@ -430,6 +431,11 @@ def main(argv: list[str] | None = None) -> int:
         failed += int(not m["ok"])
     for line in compare_texts([results]):
         print(args.label, "TEXT", line, flush=True)
+    if not args.no_flush:
+        # One more short request: a server with the lookup hook logs its per-source counters when a new set of
+        # requests arrives (HybridLookup.merge), so the last round's line needs a request after it.
+        flush = run_round(args, "prose", 1, 4, None, files)
+        results["flush"] = {"ok": flush["ok"], "errors": flush["errors"], "wall_s": flush["wall_s"]}
     save()
     return 3 if failed else 0
 

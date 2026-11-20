@@ -20,7 +20,11 @@ Drafters (``--policies``), all over the request's own context (prompt + output s
 Per (kind of prompt, policy, depth k): tokens per step (``1 + accepted per step``), the share of steps with a
 draft, and for every draft position j the share of all steps that accepted at least j tokens (the server's own
 "acceptance rate per position" counts the same way: every step of an n-gram server carries a draft, the empty
-placeholder included), and the same among the steps that had a draft.
+placeholder included), and the same among the steps that had a draft. Also the rows a verification step
+carries at 1, 8 and 32 streams: ``streams x (1 + k)`` in the MTP shapes of the lookup + MTP hybrid, and for
+the n-gram server, whose step is as wide as its longest draft (an empty draft is the 1-token placeholder),
+the expected width if the streams draft independently of each other (an assumption: streams of one workload
+reach their copy spans together).
 
 Usage:
   lookup_replay.py PROBE.json [PROBE.json ...] [--kinds edit,editf,editl,prose] [--depths 3,4,5,8,12,16]
@@ -115,6 +119,27 @@ def replay(prompt, output, min_n: int, max_n: int, k: int, policy: str) -> list[
     return steps
 
 
+ROW_STREAMS = (1, 8, 32)
+
+
+def expected_ngram_width(steps: list[tuple[int, int]], k: int, streams: int) -> float | None:
+    """The expected token width of an n-gram server's verification step with ``streams`` requests: one plus the
+    longest draft among them, an empty draft counting as the 1-token placeholder; the draft lengths are drawn
+    independently from the lengths of ``steps``."""
+    total = len(steps)
+    if not total:
+        return None
+    counts = [0] * (k + 1)  # by draft length 1..k (0 and 1 both run as one draft row)
+    for drafted, _accepted in steps:
+        counts[max(1, min(drafted, k))] += 1
+    expected, below = 0.0, 0.0
+    for length in range(1, k + 1):
+        upto = below + counts[length] / total
+        expected += (1 + length) * (upto**streams - below**streams)
+        below = upto
+    return expected
+
+
 def summarize(steps: list[tuple[int, int]], k: int) -> dict:
     """The figures of one drafter over the steps of all its streams."""
     total = len(steps)
@@ -128,7 +153,12 @@ def summarize(steps: list[tuple[int, int]], k: int) -> dict:
            "position_rates": [sum(1 for _d, a in steps if a >= j) / total if total else None for j in range(1, k + 1)],
            "position_rates_on_hits": [sum(1 for _d, a in hits if a >= j) / len(hits) if hits else None
                                       for j in range(1, k + 1)],
-           "accepted_histogram": [sum(1 for _d, a in steps if a == j) for j in range(0, k + 1)]}
+           "accepted_histogram": [sum(1 for _d, a in steps if a == j) for j in range(0, k + 1)],
+           "drafted_histogram": [sum(1 for d, _a in steps if d == j) for j in range(0, k + 1)],
+           # rows of one verification step: the MTP shapes (every row 1 + k wide), and the n-gram server
+           "rows_per_step_mtp_shapes": {str(n): n * (1 + k) for n in ROW_STREAMS},
+           "rows_per_step_ngram": {str(n): (n * expected_ngram_width(steps, k, n)) if total else None
+                                   for n in ROW_STREAMS}}
     return out
 
 
@@ -183,9 +213,9 @@ def table(record: dict) -> list[str]:
         for name, d in entry["drafters"].items():
             rates = " ".join("%.2f" % r for r in d["position_rates"])
             lines.append("  %-14s tokens/step %5.2f  draft on %3.0f%% of steps, %.2f accepted per draft  "
-                         "accepted>=j over all steps, j=1..%d: %s" % (
+                         "rows/step at 32 streams %d (n-gram server %.0f)  accepted>=j over all steps, j=1..%d: %s" % (
                              name, d["tokens_per_step"], 100.0 * d["hit_share"], d["accepted_per_hit"] or 0.0,
-                             d["k"], rates))
+                             d["rows_per_step_mtp_shapes"]["32"], d["rows_per_step_ngram"]["32"], d["k"], rates))
     return lines
 
 

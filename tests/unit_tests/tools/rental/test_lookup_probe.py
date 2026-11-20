@@ -221,10 +221,13 @@ def test_probe_end_to_end_against_a_fake_server(tmp_path, capsys):
     assert [w["tokens"] for w in record["warm"]] == [8, 6, 48]
     whole = [b for b in _FakeServer.bodies if b["max_tokens"] == 120]
     assert len(whole) == 2 and all(b["ignore_eos"] is False for b in whole)
+    # the request after the last round (a server with the lookup hook then logs the last round's counters)
+    assert record["flush"]["ok"] == 1 and _FakeServer.bodies[-1]["max_tokens"] == 4
     assert all(b["ignore_eos"] is True for b in _FakeServer.bodies if b["max_tokens"] in (8, 6))
     assert all("min_tokens" not in b for b in _FakeServer.bodies)
+    # the prose requests (warm, measured, the flush) carry no mode
     assert [b.get("vllm_xargs") for b in _FakeServer.bodies if b["messages"][0]["content"].startswith("Stream")] == [
-        None, None]
+        None, None, None]
     printed = capsys.readouterr().out
     assert "fake MEAS edit  N=3   mode=1" in printed and "fake TEXT edit" in printed and "identical 3/3" in printed
 

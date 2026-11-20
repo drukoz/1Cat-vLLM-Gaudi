@@ -78,6 +78,20 @@ def test_replay_stops_at_an_edit_and_follow_reads_on():
     assert sum(a + 1 for _d, a in follow) == len(edited) and len(follow) <= len(steps)
 
 
+def test_rows_per_verification_step():
+    # half of the steps draft nothing (the placeholder: 2 tokens wide), half draft 4 tokens (5 wide)
+    steps = [(0, 0), (4, 4)] * 50
+    assert lr.expected_ngram_width(steps, 4, 1) == pytest.approx(3.5)
+    assert lr.expected_ngram_width(steps, 4, 2) == pytest.approx(2 * 0.25 + 5 * 0.75)
+    assert lr.expected_ngram_width(steps, 4, 32) == pytest.approx(5.0, abs=1e-6)
+    assert lr.expected_ngram_width([], 4, 32) is None
+    summary = lr.summarize(steps, 4)
+    assert summary["rows_per_step_mtp_shapes"] == {"1": 5, "8": 40, "32": 160}
+    assert summary["rows_per_step_ngram"]["1"] == pytest.approx(3.5)
+    assert summary["rows_per_step_ngram"]["32"] == pytest.approx(160.0, abs=1e-4)
+    assert summary["drafted_histogram"] == [50, 0, 0, 0, 50]
+
+
 def test_run_over_a_probe_record(tmp_path, capsys):
     prompt = list(range(100, 160))
     answer = list(range(100, 160))
