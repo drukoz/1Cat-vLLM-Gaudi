@@ -49,7 +49,7 @@ def one_stream(host, port, model, prompt, ntok, out, idx, barrier, timeout_s, mi
     if mintok:
         req["min_tokens"] = ntok
     body = json.dumps(req)
-    rec = {"status": None, "t0": None, "times": [], "ntoks": [], "usage": None, "err": None}
+    rec = {"status": None, "t0": None, "times": [], "ntoks": [], "usage": None, "err": None, "text": ""}
     try:
         barrier.wait()
         conn = http.client.HTTPConnection(host, port, timeout=timeout_s)
@@ -79,6 +79,8 @@ def one_stream(host, port, model, prompt, ntok, out, idx, barrier, timeout_s, mi
                 ch = obj.get("choices") or []
                 if ch and ch[0].get("text"):
                     rec["times"].append(time.perf_counter())
+                    if len(rec["text"]) < 400:
+                        rec["text"] += ch[0]["text"]
         conn.close()
     except Exception as e:  # noqa: BLE001 - a probe records every failure
         rec["err"] = repr(e)
@@ -139,6 +141,8 @@ def run_round(args, n, ntok, ctx_tokens=0, mintok=None):
         total = sum(p["completion_tokens"] for p in per)
         span_all = max(p["last"] for p in per) - min(p["first"] for p in per)
         res["aggregate_tok_s"] = total / span_all if span_all > 0 else None
+    # The start of a few streams' text: a multi-stream round whose later streams decode garbage must be visible.
+    res["samples"] = {str(i): (out[i] or {}).get("text", "")[:160] for i in sorted({0, 1, n // 2, n - 1}) if i < n}
     errs = [r["err"] for r in out if r and r["err"]][:3]
     if errs:
         res["error_samples"] = errs
@@ -195,6 +199,10 @@ def main():
         if not w.get("ok"):
             print("stopping: the warm round at N=%d failed: %s" % (n, w.get("error_samples")), flush=True)
             break
+        last = [x for x in results["levels"] if x["streams"] == n and x.get("samples")]
+        if last:
+            for k, t in last[-1]["samples"].items():
+                print("TEXT  N=%-3d stream %-2s: %r" % (n, k, t[:110]), flush=True)
     if levels and not args.min_tokens and not args.no_mintok_check:
         n = levels[-1]
         w = run_round(args, n, args.warm_tokens, mintok=True)  # compiles whatever the mask adds

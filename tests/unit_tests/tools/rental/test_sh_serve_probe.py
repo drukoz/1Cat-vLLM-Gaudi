@@ -179,6 +179,21 @@ def test_the_probe_sends_no_min_tokens_and_measures_the_mask_in_one_labelled_rou
     assert probe_log.count("MEAS") == 2  # the MINTOK round is not one of the measured levels
 
 
+def test_the_probe_keeps_the_start_of_a_few_streams_text(rig):
+    # A round whose later streams decode garbage has good timings: the text of streams 0, 1, n/2 and n-1 is
+    # kept in scaling.json ("samples") and printed after each level (TEXT lines).
+    rc, out = rig.run("--levels", "1,4", "--tokens", "6", "--warm-tokens", "3", "--repeat-top", "1",
+                      "--no-mintok-check")
+    assert rc == 0, out
+    scaling = json.loads((rig.out / "scaling.json").read_text())
+    one, four = scaling["levels"]
+    assert one["samples"] == {"0": "t0 t1 t2 t3 t4 t5 "}
+    assert sorted(four["samples"]) == ["0", "1", "2", "3"] and four["samples"]["3"].startswith("t0 t1 ")
+    probe_log = (rig.out / "probe.log").read_text()
+    assert probe_log.count("TEXT  N=1") == 1 and probe_log.count("TEXT  N=4") == 4
+    assert "TEXT  N=4   stream 3 : 't0 t1 t2 t3 t4 t5 '" in probe_log
+
+
 def test_no_mintok_check_skips_the_round_and_min_tokens_sends_it_in_every_round(rig):
     rc, out = rig.run(*QUICK, "--no-mintok-check")
     assert rc == 0, out
