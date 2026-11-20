@@ -7106,7 +7106,9 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             with HabanaMemoryProfiler() as m:  # noqa: SIM117
                 #logger.info("Loading drafter model %s...", self.vllm_config.speculative_config.draft_model_config)
                 self.drafter.load_model(self.model.model)
-                if self.use_aux_hidden_state_outputs:
+                # The Flash-Next target returns (hidden, [multi]) itself (_MtpTargetOutputs): it has no EAGLE3
+                # auxiliary layers to set, and set_aux_hidden_state_layers asserts on a model without them.
+                if self.use_aux_hidden_state_outputs and not is_flash_next_mtp(self.speculative_config):
                     if self.speculative_config.use_dflash():
                         from vllm.v1.worker.gpu.spec_decode.eagle.eagle3_utils import (
                             set_eagle3_aux_hidden_state_layers, )
@@ -10143,7 +10145,10 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         # Decodes are the first num_decodes requests.
         # Prefill are the next num_reqs - num_decodes requests.
         # Note: sampled_token_ids includes both decode and prefill sampled tokens
-        block_table_cpu_tensor = self.input_batch.block_table[0].get_cpu_tensor()
+        # The drafter's attention layer reads the ATTENTION group's blocks. In a hybrid model group 0 can be a
+        # recurrent-state group (Flash-Next: the GDN layers come first), whose rows are state slots.
+        block_table_cpu_tensor = self.input_batch.block_table[
+            self._get_attention_group_id_for_hybrid()].get_cpu_tensor()
         decode_block_table = block_table_cpu_tensor[:num_decodes]
 
         common_attn_metadata = decode_data.attn_metadata
@@ -10185,7 +10190,9 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         # The input batch block table include both decodes and prefills
         # Decodes are the first num_decodes requests.
         # Prefill are the next num_reqs - num_decodes requests and divide into batches
-        block_table_cpu_tensor = self.input_batch.block_table[0].get_cpu_tensor()
+        # (the attention group's table, as in propose_eagle_decode)
+        block_table_cpu_tensor = self.input_batch.block_table[
+            self._get_attention_group_id_for_hybrid()].get_cpu_tensor()
         batch_size = logits_indices.shape[0]
         prefill_batch_block_table = block_table_cpu_tensor[batch_start_idx:batch_start_idx + batch_size]
 
@@ -10638,10 +10645,12 @@ class HPUAttentionMetadataProcessor:
             # Unfortunately one_hot on CPU
             # doesn't handle out of bounds classes so we need to convert
             # all negative values to 0 (block_mapping) or bs (block_groups)
+            # A second pass over the same metadata (the MTP drafter reuses the target's decode metadata) finds
+            # the padding already rewritten to batch_size by the masked_fill_ below: that is out of bounds too.
             block_groups = block_groups.to(torch.long)
-            block_mapping = torch.nn.functional.relu(block_groups)
+            oob_values = block_groups.lt(0) | block_groups.ge(batch_size)
+            block_mapping = block_groups.masked_fill(oob_values, 0)
             block_mapping = torch.nn.functional.one_hot(block_mapping, num_classes=batch_size)
-            oob_values = block_groups.lt(0)
             block_mapping.masked_fill_(oob_values.unsqueeze(-1), 0)
             block_groups.masked_fill_(oob_values, batch_size)
             if is_window_block:

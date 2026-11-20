@@ -36,6 +36,23 @@ def is_flash_next_mtp(speculative_config) -> bool:
     return FLASH_NEXT_MTP_ARCH in architectures
 
 
+FLASH_NEXT_MULTIMODAL_TARGET = "Qwen4ExpForConditionalGeneration"
+IMAGE_TOKEN_ID_TARGET = "Qwen3_5ForConditionalGeneration"
+
+
+def flash_next_target_model_name(class_name: str) -> str:
+    """The name the proposer's ``load_model`` should look the target up by.
+
+    The Flash-Next multimodal target (``Qwen4ExpForConditionalGeneration`` or the plugin's subclass of it,
+    ``HpuQwen4ExpForConditionalGeneration``) keeps its image token in ``config.image_token_id``, like
+    ``Qwen3_5ForConditionalGeneration``, which upstream's ``load_model`` lists: that name is returned for it.
+    Any other name is returned unchanged.
+    """
+    if class_name.endswith(FLASH_NEXT_MULTIMODAL_TARGET):
+        return IMAGE_TOKEN_ID_TARGET
+    return class_name
+
+
 def split_draft_output(ret) -> tuple[torch.Tensor, torch.Tensor]:
     """(sample, multi) from the draft's return.
 
@@ -50,6 +67,61 @@ def split_draft_output(ret) -> tuple[torch.Tensor, torch.Tensor]:
         raise TypeError(f"draft multi stream {tuple(multi.shape)} is not a whole multiple of the "
                         f"sample hidden size {sample.shape[-1]}")
     return sample, multi
+
+
+MROPE_KEYS = ("mrope_section", "mrope_interleaved")
+
+
+def _rope_parameter_dicts(model_config) -> list[dict]:
+    """The ``rope_parameters`` dicts of a model config's ``hf_config`` and ``hf_text_config`` (each once)."""
+    found: dict[int, dict] = {}
+    for config in (getattr(model_config, "hf_config", None), getattr(model_config, "hf_text_config", None)):
+        rope_parameters = getattr(config, "rope_parameters", None)
+        if isinstance(rope_parameters, dict):
+            found[id(rope_parameters)] = rope_parameters
+    return list(found.values())
+
+
+def config_uses_mrope(model_config) -> bool:
+    """True when a model config still carries an M-RoPE section (its attention layers build MRotaryEmbedding)."""
+    return any(rope_parameters.get("mrope_section") for rope_parameters in _rope_parameter_dicts(model_config))
+
+
+def align_draft_rope_with_target(target_model_config, draft_model_config) -> bool:
+    """Give the MTP draft the rotary embedding the target runs with. Returns True when the draft was changed.
+
+    With ``--language-model-only`` the engine strips the M-RoPE keys from the target's config, so its QSA
+    layers build the plain ``RotaryEmbedding`` and the runner sends one position per token. The draft's
+    config is built on its own (``SpeculativeConfig`` does not pass ``language_model_only`` on) and keeps
+    the keys of a checkpoint with a vision tower: its QSA layer then built ``MRotaryEmbedding`` and read
+    the runner's ``[rows, tokens]`` positions as the three M-RoPE rows, which fails on the first draft pass
+    ("index 1 is out of bounds for dimension 0 with size 1"). The keys are removed from the draft here,
+    before the draft model is built.
+
+    A target that keeps M-RoPE (a server without ``--language-model-only``) is refused: the drafter gathers
+    its positions per row and does not carry the three M-RoPE rows.
+    """
+    if config_uses_mrope(target_model_config):
+        raise NotImplementedError("Flash-Next MTP on HPU runs with --language-model-only: the target keeps "
+                                  "M-RoPE positions, which the drafter does not carry")
+    changed = False
+    for rope_parameters in _rope_parameter_dicts(draft_model_config):
+        for key in MROPE_KEYS:
+            if key in rope_parameters:
+                rope_parameters.pop(key)
+                changed = True
+    return changed
+
+
+def flat_token_rows(hidden: torch.Tensor) -> torch.Tensor:
+    """``hidden`` as ``[T, width]``, one row per token.
+
+    The runner hands the drafter ``[vbs, 1, width]`` after a decode step and ``[1, seq, width]`` after a
+    prefill (one bucket row); ``Qwen4ExpMultiTokenPredictor.forward`` reads the token count from dim 0 and
+    views the rows as ``[T, hc, H]``, so a prefill's ``[1, seq, width]`` failed there with "shape '[1, 4, H]'
+    is invalid".
+    """
+    return hidden.reshape(-1, hidden.shape[-1])
 
 
 def ring_slots_from_lattice(indices: torch.Tensor) -> torch.Tensor:

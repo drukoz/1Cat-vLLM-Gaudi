@@ -31,17 +31,27 @@ from vllm_gaudi.utils import async_h2d_copy
 from vllm_gaudi.v1.attention.backends.hpu_attn import HPUAttentionMetadataV1
 from vllm.model_executor.models.llama_eagle3 import Eagle3LlamaForCausalLM
 
-from vllm_gaudi.v1.spec_decode.flash_next_mtp_steps import (DRAFT_RANK_TOP, DraftRankStats, draft_rank_log_enabled,
-                                                             next_step_hidden, ring_slots_from_lattice,
-                                                             split_draft_output)
+from vllm_gaudi.v1.spec_decode.flash_next_mtp_steps import (DRAFT_RANK_TOP, DraftRankStats,
+                                                             align_draft_rope_with_target, draft_rank_log_enabled,
+                                                             flash_next_target_model_name, flat_token_rows,
+                                                             next_step_hidden,
+                                                             ring_slots_from_lattice, split_draft_output)
 from vllm_gaudi.v1.worker.flash_next_inputs import build_block_table
 from vllm_gaudi.v1.spec_decode.hpu_eagle import HpuEagleProposer
+from vllm.logger import init_logger
+
+logger = init_logger(__name__)
 
 
 class HpuFlashNextMtpProposer(HpuEagleProposer):
 
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
+    def __init__(self, vllm_config, *args, **kwargs):
+        # Before the base class reads the draft's config and before the draft model is built.
+        speculative_config = vllm_config.speculative_config
+        if align_draft_rope_with_target(vllm_config.model_config, speculative_config.draft_model_config):
+            logger.info("Flash-Next MTP: the draft runs with the target's plain RoPE (M-RoPE keys removed from "
+                        "the draft's config)")
+        super().__init__(vllm_config, *args, **kwargs)
         self._init_draft_rank_log()
 
     def _init_draft_rank_log(self) -> None:
@@ -52,6 +62,18 @@ class HpuFlashNextMtpProposer(HpuEagleProposer):
         """
         self.draft_rank_stats = DraftRankStats() if draft_rank_log_enabled() else None
         self.last_draft_top_ids = None
+
+    def get_model_name(self, model) -> str:
+        """The class name upstream's ``load_model`` looks up to find the target's image token id.
+
+        ``SpecDecodeBaseProposer.load_model`` copies the image token of a multimodal target into the draft's
+        config and knows where each listed class keeps it; for a class it does not list it reads
+        ``target_model.config.image_token_index``. The Flash-Next target is not listed (upstream serves it with
+        another runner) and ``Qwen4ExpConfig`` names the field ``image_token_id``, so the server died in
+        ``load_model`` with an ``AttributeError`` after the target's weights were loaded. Qwen3.5 keeps the id
+        in the same field and is listed: answer with its name for the Flash-Next multimodal class.
+        """
+        return flash_next_target_model_name(super().get_model_name(model))
 
     def propose(
         self,
@@ -82,6 +104,10 @@ class HpuFlashNextMtpProposer(HpuEagleProposer):
                 self.model.model.combine_hidden_states(
                     target_hidden_states)
             assert target_hidden_states.shape[-1] == self.hidden_size
+
+        # The draft takes one row per token, [T, hc * H]: a prefill hands [1, seq, hc * H] (one bucket row), and
+        # the draft reads the token count from dim 0.
+        target_hidden_states = flat_token_rows(target_hidden_states)
 
         ret_hidden_states = self.model(
             input_ids=target_token_ids,
