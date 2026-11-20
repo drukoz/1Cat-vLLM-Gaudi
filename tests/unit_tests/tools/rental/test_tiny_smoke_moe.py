@@ -210,12 +210,14 @@ def test_a_passed_moe_mode_records_and_prints_its_decode_time(smoke, capsys):
     assert "tiny smoke [moe]: decode %.1f ms/token" % value in capsys.readouterr().out
 
 
-def test_a_moe_mode_that_fell_back_keeps_no_decode_time_claim(smoke, monkeypatch, capsys):
-    """The tokens matched, so the time was measured, but the mode failed: the PASSED line and its decode
-    line are not printed for kernels that did not run."""
+def test_a_moe_mode_that_fell_back_is_not_reported_as_passed(smoke, monkeypatch, capsys):
+    """The tokens matched, but the kernels did not run: the mode fails and prints no PASSED line. Its decode
+    time is still printed, under the FAILED line that says the torch path ran: a failed mode is measured
+    whenever its server answered."""
     out, port = smoke
     monkeypatch.setenv("FAKE_SERVER_LINE", NO_KERNEL_LINE)
     code, _ = run(out, port, "--gdn", "moe")
     assert code == 1
     printed = capsys.readouterr().out
-    assert "tiny smoke [moe]: PASSED" not in printed and "ms/token" not in printed
+    assert "tiny smoke [moe]: PASSED" not in printed
+    assert "tiny smoke [moe]: FAILED (the MoE glue kernels did not run" in printed

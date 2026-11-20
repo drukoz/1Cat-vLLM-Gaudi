@@ -73,6 +73,7 @@ TINY_DEFAULT_MODEL_LEN = 4096
 TINY_ATTEMPT_COMBINED = "attempt-combined"
 TINY_ATTEMPT_HC_FUSED = "attempt-hc-fused"
 TINY_ATTEMPT_MOE_GLUE = "attempt-moe-glue"
+TINY_ATTEMPT_GDN_FUSED = "attempt-gdn-fused"
 HC_QUICK_SKIP_REASON = "--quick-gates without --hc-fused"
 MOE_QUICK_SKIP_REASON = "--quick-gates without --moe-glue"
 LOAD_TIMEOUT_S = 5400.0
@@ -478,6 +479,7 @@ class Runner:
         self.moe_glue_status = None
         self.moe_glue_reason = None
         self.moe_glue_disabled_by = None
+        self.gdn_fused_disabled_by = None  # "tiny" when the tiny gate only passed on the PyTorch GDN path
         self.skip_warmup = not args.full_warmup
         self.warm_pass = not args.no_warm_pass
         self.server_timeout_s = float(args.server_timeout)
@@ -794,6 +796,40 @@ class Runner:
         return "off (%s)" % (reason or status)
 
     def gate_tiny(self, phase_dir: Path):
+        """G2 with every fallback. After the newest pieces (``gate_tiny_kernels``), the fused GDN decode
+        kernel: gate G1b qualifies it with op tests, and a server is still its first run inside the full
+        model (on 2026-11-20 the op tests passed on the card and the tiny server died with
+        "ValidateSyncInputTensors tensor_data is empty"). When the gate still fails or times out with
+        the kernel on, the attempt is kept under tiny/attempt-gdn-fused/, every later server runs the
+        PyTorch GDN path (VLLM_HPU_GDN_CORE_DECODE=0) and the gate runs once more."""
+        status, details = self.gate_tiny_kernels(phase_dir)
+        failed = (GateStatus.FAILED, GateStatus.TIMED_OUT)
+        if (self.stub or status not in failed or self.gdn_mode != gates.GDN_MODE_FUSED or
+                str(details.get("reason") or "").startswith("tiny port")):
+            return status, details
+        first = self.keep_tiny_attempt(phase_dir, status, details, 0.0, TINY_ATTEMPT_GDN_FUSED)
+        self.gdn_env = dict(gates.GDN_FALLBACK_ENV)
+        self.gdn_mode = gates.GDN_MODE_PYTORCH
+        self.gdn_fused_disabled_by = "tiny"
+        self.write_manifest()
+        print("tiny: %s with the fused GDN decode kernel (%s); kept under %s, running the gate once more on "
+              "the PyTorch GDN path (%s=0), which every later server then uses" %
+              (GateStatus(status).name, first["reason"], phase_dir / TINY_ATTEMPT_GDN_FUSED, gates.GDN_MODE_ENV),
+              flush=True)
+        for text in first["errors"]:
+            print("    %s" % text, flush=True)
+        earlier = details
+        status, details, _ = self.tiny_attempt(phase_dir)
+        for key in ("combined_kernel_db", "combined_kernel_db_disabled_by", "attempt_combined", "hc_fused",
+                    "hc_fused_disabled_by", "attempt_hc_fused", "moe_glue", "moe_glue_disabled_by",
+                    "attempt_moe_glue"):  # what the earlier fallbacks decided
+            if key in earlier:
+                details.setdefault(key, earlier[key])
+        details["gdn_fused_disabled_by"] = "tiny"
+        details["attempt_gdn_fused"] = first
+        return status, details
+
+    def gate_tiny_kernels(self, phase_dir: Path):
         """G2. When the gate fails or times out with a server that ran the fused hyper-connection
         kernels (--hc-fused), the MoE glue kernels (--moe-glue) or both, the attempt is kept (under
         tiny/attempt-hc-fused/ when only the hyper-connection kernels were on, under

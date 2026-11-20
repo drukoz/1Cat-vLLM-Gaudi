@@ -152,8 +152,44 @@ class HpuQsaIndexer(nn.Module):
         self.k_layernorm = GemmaRMSNorm(self.index_head_dim, eps=self.eps)
 
         self.compressed_key_cache: torch.Tensor | None = None
-        self.key_ring: torch.Tensor | None = None
+        # The raw-key ring as the flat table [slots * rows, D] and its rows per slot (see key_ring).
+        self._key_ring_flat: torch.Tensor | None = None
+        self._key_ring_rows: int = 0
         self.ring_group_idx: torch.Tensor | None = None
+
+    @property
+    def key_ring(self) -> torch.Tensor | None:
+        """The raw-key ring as ``[slots, rows, D]``: a view of the flat table the layer works on.
+
+        The forward never uses this view. The ring is stored and written as the flat table
+        ``[slots * rows, D]`` (``bind_key_ring``): an in-place write through a view of a three-axis
+        ring does not compile on a card (rental 2026-11-20, see ``qsa_sparse_ops.ring_write``).
+        """
+        if self._key_ring_flat is None:
+            return None
+        return self._key_ring_flat.view(-1, self._key_ring_rows, self._key_ring_flat.shape[1])
+
+    @key_ring.setter
+    def key_ring(self, ring: torch.Tensor | None) -> None:
+        """Bind a three-axis ring ``[slots, rows, D]`` (the CPU tests): the layer works on its flat view."""
+        if ring is None:
+            self._key_ring_flat, self._key_ring_rows = None, 0
+            return
+        if ring.dim() != 3:
+            raise ValueError(f"key_ring takes [slots, rows, D], got {tuple(ring.shape)}; use bind_key_ring for the "
+                             "flat table")
+        self._key_ring_flat, self._key_ring_rows = ring.view(-1, ring.shape[2]), int(ring.shape[1])
+
+    def bind_key_ring(self, flat: torch.Tensor, rows: int) -> None:
+        """Bind the flat ring table ``[slots * rows, D]`` (what the runner allocates on the card)."""
+        if flat.dim() != 2 or rows <= 0 or flat.shape[0] % rows:
+            raise ValueError(f"the flat key ring must be [slots * rows, D] with rows={rows}, got {tuple(flat.shape)}")
+        self._key_ring_flat, self._key_ring_rows = flat, int(rows)
+
+    @property
+    def key_ring_slots(self) -> int:
+        """Slots of the bound ring (the last one is the scratch slot)."""
+        return self._key_ring_flat.shape[0] // self._key_ring_rows
 
     def _state_indices(self, md: object, name: str) -> torch.Tensor | None:
         """Resolve one state-index tensor for this layer's ring group (see ``HpuQwen4ExpPLELayer``).
@@ -247,9 +283,10 @@ class HpuQsaIndexer(nn.Module):
             tail_real = (tail_cols < lens[:, None]).reshape(-1)
             tail_rows = (torch.arange(rows, device=hidden.device)[:, None] * seq
                          + tail_cols.clamp(max=seq - 1)).reshape(-1)
-            ring_scratch = torch.full_like(tail_rows, self.key_ring.shape[0] - 1)
-            ring_write(self.key_ring, torch.where(tail_real, store.repeat_interleave(ratio - 1), ring_scratch),
-                       positions.index_select(0, tail_rows).clamp_min(0), raw_k.index_select(0, tail_rows))
+            ring_scratch = torch.full_like(tail_rows, self.key_ring_slots - 1)
+            ring_write(self._key_ring_flat, torch.where(tail_real, store.repeat_interleave(ratio - 1), ring_scratch),
+                       positions.index_select(0, tail_rows).clamp_min(0), raw_k.index_select(0, tail_rows),
+                       rows=self._key_ring_rows)
             # Block keys per row in absolute block order (column i = tokens 4*i ..): the context
             # rows come from the row's kernel blocks (block_list, rpb compressed rows each), the
             # chunk's blocks go at ctx // ratio + j (overwriting a partial last context block).
@@ -335,9 +372,11 @@ class HpuQsaIndexer(nn.Module):
             load_rows, store_rows = load.repeat_interleave(T_cols), store.repeat_interleave(T_cols)
         else:
             raise NotImplementedError(f"QSA decode got {n_slots} state slots for {T} rows of {bs} requests")
-        scratch = torch.full((T,), self.key_ring.shape[0] - 1, dtype=torch.long, device=positions.device)
-        ring_write(self.key_ring, torch.where(valid, store_rows, scratch), positions, raw_k)
-        blk = ring_block_rows(self.key_ring, torch.where(valid, load_rows, scratch), positions, raw_k, ratio)
+        scratch = torch.full((T,), self.key_ring_slots - 1, dtype=torch.long, device=positions.device)
+        ring_write(self._key_ring_flat, torch.where(valid, store_rows, scratch), positions, raw_k,
+                   rows=self._key_ring_rows)
+        blk = ring_block_rows(self._key_ring_flat, torch.where(valid, load_rows, scratch), positions, raw_k, ratio,
+                              rows=self._key_ring_rows)
         complete = valid & ((positions % ratio) == ratio - 1)
         cs, sn = cos_sin_at(positions - (ratio - 1))
         keys = compress_block_keys(blk, self.k_layernorm.weight, self.eps, cs, sn)

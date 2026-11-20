@@ -10,8 +10,11 @@ import torch  # noqa: E402
 from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum  # noqa: E402
 from vllm.v1.kv_cache_interface import FullAttentionSpec, MambaSpec  # noqa: E402
 
+import vllm.v1.core.kv_cache_utils as kv_cache_utils  # noqa: E402
+
 from vllm_gaudi.v1.core.recurrent_state_pool import (  # noqa: E402
-    ENV_MODE, ENV_SLOTS, LIVE_SLOTS_PER_REQUEST, RecurrentStatePoolMode, is_recurrent_spec, num_recurrent_groups,
+    ENV_MODE, ENV_SLOTS, LIVE_SLOTS_PER_REQUEST, RecurrentStatePoolMode, hpu_kv_cache_groups,
+    install_hpu_kv_cache_grouping, is_recurrent_spec, minor_recurrent_layers, num_recurrent_groups,
     pool_mode_from_env, pool_pad_block_id, pool_slot_bytes, pool_slots_from_env, pool_tensor_slots,
     recurrent_positions, resolve_pool_slots)
 
@@ -185,6 +188,75 @@ def test_pool_from_env_reads_at_call_time(monkeypatch):
     monkeypatch.setenv(ENV_MODE, "1")
     monkeypatch.setenv(ENV_SLOTS, "64")
     assert pool_slots_from_env() == 64
+
+
+def _engine_groups():
+    """vLLM's own grouping of same-page-size layers (never the wrapper another test may have installed)."""
+    installed = kv_cache_utils._get_kv_cache_groups_uniform_page_size
+    return getattr(installed, "__wrapped__", installed)
+
+
+def _group_sizes(groups, kind) -> list[int]:
+    return [len(group.layer_names) for group in groups if isinstance(group.kv_cache_spec, kind)]
+
+
+def test_engine_splits_flash_next_attention_into_single_layer_groups():
+    """The cause of the 12x KV cache: one PLE layer makes vLLM's group size 1."""
+    groups = _engine_groups()(_flash_next_specs())
+    assert _group_sizes(groups, FullAttentionSpec) == [1] * 12
+    assert _group_sizes(groups, MambaSpec) == [1] * 37
+
+
+def test_flash_next_groups_keep_attention_whole():
+    specs = _flash_next_specs()
+    ple = specs["layers.2.ple"]
+    assert minor_recurrent_layers(specs) == {ple: ["layers.2.ple"]}
+    groups = hpu_kv_cache_groups(specs, _engine_groups())
+    # The engine's order: by the first layer of each spec (GDN at layer 0, attention at layer 3, PLE last here).
+    assert [len(group.layer_names) for group in groups] == [12, 12, 12, 12, 1]
+    assert [type(group.kv_cache_spec) for group in groups] == [MambaSpec] * 3 + [FullAttentionSpec, MambaSpec]
+    assert groups[3].layer_names == [f"layers.{i}.attn" for i in range(3, 48, 4)]
+    assert groups[4].layer_names == ["layers.2.ple"] and groups[4].kv_cache_spec == ple
+    gdn_layers = [name for group in groups[:3] for name in group.layer_names]
+    assert sorted(gdn_layers) == sorted(name for name, spec in specs.items() if is_recurrent_spec(spec) and spec != ple)
+    # What the platform hook and the worker assume: 4 recurrent groups, 12 GDN positions and 1 PLE position.
+    assert len(_group_sizes(groups, MambaSpec)) == num_recurrent_groups(specs) == 4
+    assert {group.kv_cache_spec: len(group.layer_names) for group in groups if is_recurrent_spec(group.kv_cache_spec)} \
+        == recurrent_positions(specs)
+
+
+def test_groups_without_a_minor_recurrent_spec_are_the_engines():
+    engine_groups = _engine_groups()
+    tiny = {"layers.0.linear_attn": None, "layers.1.ple": None, "layers.1.linear_attn": None,
+            "layers.2.linear_attn": None, "layers.3.self_attn.attn": None}
+    flash_next = _flash_next_specs()
+    attn = flash_next["layers.3.attn"]
+    gdn = flash_next["layers.0.attn"]
+    for name in tiny:
+        tiny[name] = attn if name.endswith(".attn") else flash_next["layers.2.ple"] if name.endswith(".ple") else gdn
+    for specs in (_qwen35_27b_specs(), tiny, {"layers.0.attn": attn, "layers.1.attn": attn}, {"layers.0.mixer": gdn}):
+        assert minor_recurrent_layers(specs) == {}
+        assert hpu_kv_cache_groups(specs, engine_groups) == engine_groups(specs)
+    assert _group_sizes(engine_groups(_qwen35_27b_specs()), FullAttentionSpec) == [16]
+    assert _group_sizes(engine_groups(tiny), FullAttentionSpec) == [1]
+
+
+def test_install_wraps_the_engine_grouping_once(monkeypatch):
+    engine_groups = _engine_groups()
+    monkeypatch.setattr(kv_cache_utils, "_get_kv_cache_groups_uniform_page_size", engine_groups)
+    assert install_hpu_kv_cache_grouping()
+    installed = kv_cache_utils._get_kv_cache_groups_uniform_page_size
+    assert installed is not engine_groups and installed.__wrapped__ is engine_groups
+    assert install_hpu_kv_cache_grouping()
+    assert kv_cache_utils._get_kv_cache_groups_uniform_page_size is installed
+    specs = _flash_next_specs()
+    assert _group_sizes(installed(specs), FullAttentionSpec) == [12]
+    assert installed(_qwen35_27b_specs()) == engine_groups(_qwen35_27b_specs())
+
+
+def test_install_reports_a_missing_engine_function(monkeypatch):
+    monkeypatch.delattr(kv_cache_utils, "_get_kv_cache_groups_uniform_page_size")
+    assert not install_hpu_kv_cache_grouping()
 
 
 if __name__ == "__main__":

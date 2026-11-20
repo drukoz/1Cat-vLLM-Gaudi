@@ -69,13 +69,15 @@ def prefill_selection_bias(selected: torch.Tensor, context_lens: torch.Tensor, n
     col = torch.where(pos < ctx, pos, n_ctx_cols + (pos - ctx))
     # Redirect padding (-1) entries to the dump column at index `cols`.
     col = torch.where(valid, col, torch.full_like(col, cols))
-    mask = torch.zeros(bs, num_queries, cols + 1, dtype=torch.bool, device=selected.device)
-    mask.scatter_(2, col, True)
-    selected_cols = mask[:, :, :cols]  # drop the dump column
+    # The zeros are scattered straight into the bias, in its own float dtype and with a numeric
+    # value. A bool mask filled with ``scatter_(2, col, True)`` does not run on a card: the Habana
+    # graph has no scatter_ overload for a bool value ("We don't have an op for aten::scatter_ ...
+    # Argument types: Tensor, int, Tensor, bool", rental 2026-11-20).
+    bias = torch.full((bs, num_queries, cols + 1), float("-inf"), dtype=dtype, device=selected.device)
+    bias.scatter_(2, col, 0.0)
+    bias = bias[:, :, :cols]  # drop the dump column
     nothing_selected = rows_without_selection(selected)  # [bs, T, 1]
-    bias = torch.full((bs, 1, num_queries, cols), float("-inf"), dtype=dtype, device=selected.device)
-    bias.masked_fill_((selected_cols | nothing_selected).unsqueeze(1), 0.0)
-    return bias
+    return bias.masked_fill(nothing_selected, 0.0).unsqueeze(1)
 
 
 def decode_selected_slots(selected: torch.Tensor, block_table: torch.Tensor, block_size: int) -> torch.Tensor:

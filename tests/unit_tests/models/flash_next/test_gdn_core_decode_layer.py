@@ -322,3 +322,30 @@ def test_fused_output_is_used(tiny_checkpoint, monkeypatch):
         diff = (fused_rows - off_rows).abs().max().item()
         assert diff > ZERO_OUTPUT_MIN_GAP, (f"zeroing the op output moved the logits by only {diff:.3e}: the layer "
                                             "ignores the fused output")
+
+
+def test_the_fused_op_never_gets_a_view(tiny_checkpoint, monkeypatch):
+    """The per-step inputs (mixed_qkv, z, a, b) reach the op as tensors of their own.
+
+    They are slices of the projections. ``contiguous()`` copies a slice only when it is not
+    contiguous, and a slice of one row always is, so at decode batch 1 the op got views. The first
+    server that ran the kernel on a card (rental 2026-11-20) died at its first decode step:
+    "ValidateSyncInputTensors tensor_data is empty ... Strided Params Has Value: 1". The op's own
+    card test builds fresh tensors, so only the layer can show this.
+    """
+    with cpu_model(tiny_checkpoint, fp32=True) as (vllm_config, model):
+        eos = eos_token_id(vllm_config)
+        atts = install_cached_attention(model)
+        real = qwen3_5.gdn_core_decode
+        views = []
+
+        def recording_op(*args, **kwargs):
+            for name, tensor in zip(("mixed_qkv", "z", "a", "b"), args[2:6]):
+                if tensor._is_view() or not tensor.is_contiguous():
+                    views.append((name, tuple(tensor.shape)))
+            return real(*args, **kwargs)
+
+        monkeypatch.setattr(qwen3_5, "gdn_core_decode", recording_op)
+        set_mode(model, GdnCoreDecodeMode.FUSED)
+        run(model, vllm_config, eos, atts)
+        assert not views, f"the fused op was given views: {sorted(set(views))}"

@@ -145,6 +145,11 @@ def _try_triton_gdn_decode_packed(
     )
 
 
+def _owned(x: torch.Tensor) -> torch.Tensor:
+    """``x`` as a contiguous tensor that is not a view: what a custom HPU op must be given."""
+    return x.clone(memory_format=torch.contiguous_format)
+
+
 def _save_ssm_state(core_attn_out, final_state, ssm_state, state_indices):
     """Persist GDN final_state into ssm_state cache for chunked prefill.
 
@@ -347,10 +352,16 @@ class HPUGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         conv_pool, ssm_pool = self.kv_cache[0], self.kv_cache[1]
         weight = self.conv1d.weight
         conv_weight_t = weight.view(weight.size(0), weight.size(2)).t().contiguous()
-        return gdn_core_decode(conv_pool, ssm_pool, mixed_qkv.contiguous(),
-                               z.reshape(num_tokens, -1).contiguous(), a.contiguous(), b.contiguous(),
+        # The per-step inputs are slices of the projections (split / chunk). contiguous() copies them
+        # only when the slice is not contiguous, and a slice of ONE row always is: at decode batch 1 the
+        # op got views, and the Habana lazy bridge cannot hand a view to a custom op ("ValidateSyncInput
+        # Tensors tensor_data is empty ... Strided Params Has Value: 1", first server run of the kernel,
+        # 2026-11-20). owned() always makes a tensor of its own.
+        return gdn_core_decode(conv_pool, ssm_pool, _owned(mixed_qkv),
+                               _owned(z.reshape(num_tokens, -1)), _owned(a), _owned(b),
                                self.A_log.float(), self.dt_bias.float(), conv_weight_t, self.norm.weight,
-                               load_state_indices.to(torch.int32), store_state_indices.to(torch.int32),
+                               _owned(load_state_indices.to(torch.int32)),
+                               _owned(store_state_indices.to(torch.int32)),
                                self.head_k_dim**-0.5, self.norm.eps, int(self._gdn_core_gate))
 
     def _use_gdn_recurrent_decode(self, load_state_indices, store_state_indices, num_tokens,
@@ -441,9 +452,10 @@ class HPUGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                                   dim=1).to(torch.int32).contiguous()
         weight = self.conv1d.weight
         conv_weight_t = weight.view(weight.size(0), weight.size(2)).t().contiguous()
-        return gdn_core_verify(conv_pool, ssm_pool, mixed_qkv.contiguous(), z.reshape(num_tokens, -1).contiguous(),
-                               a.contiguous(), b.contiguous(), self.A_log.float(), self.dt_bias.float(), conv_weight_t,
-                               self.norm.weight, row_indices, ssm_store.to(torch.int32).contiguous(),
+        # _owned, not contiguous(): a custom HPU op cannot be given a view (see _maybe_gdn_core_decode).
+        return gdn_core_verify(conv_pool, ssm_pool, _owned(mixed_qkv), _owned(z.reshape(num_tokens, -1)),
+                               _owned(a), _owned(b), self.A_log.float(), self.dt_bias.float(), conv_weight_t,
+                               self.norm.weight, _owned(row_indices), _owned(ssm_store.to(torch.int32)),
                                self.head_k_dim**-0.5, self.norm.eps, int(self._gdn_core_gate))
 
     def rearrange_mixed_qkv(self, mixed_qkv):

@@ -92,36 +92,48 @@ def _hc_combine_norm_fake(residual, block_output, injection, norm_weight, eps, h
     return residual.new_empty(residual.shape), residual.new_empty(residual.shape)
 
 
+def _owned(x: torch.Tensor) -> torch.Tensor:
+    """``x`` as a contiguous tensor that is not a view.
+
+    The Habana lazy bridge cannot hand a view to a custom op: the first servers that called custom ops
+    on views died with "ValidateSyncInputTensors tensor_data is empty ... Strided Params Has Value: 1"
+    (rental 2026-11-20). The activations a layer passes are often views (a reshape of the block output,
+    the model's first hidden state), so each one is copied; the weights are parameters and are not.
+    """
+    return x.clone(memory_format=torch.contiguous_format)
+
+
 def hc_norm(x: torch.Tensor, norm_weight: torch.Tensor, eps: float, hc_count: int) -> torch.Tensor:
     """Grouped Gemma RMSNorm of the multi-stream residual ``[T, hc_count * H]``."""
-    return torch.ops.flashinfer_gaudi.hc_norm(x, norm_weight, float(eps), int(hc_count))
+    return torch.ops.flashinfer_gaudi.hc_norm(_owned(x), norm_weight, float(eps), int(hc_count))
 
 
 def hc_silu(down: torch.Tensor, hc_count: int) -> torch.Tensor:
     """``silu(down / hc_count)`` of the down GEMM output ``[T, R]`` (final mixer)."""
-    return torch.ops.flashinfer_gaudi.hc_silu(down, int(hc_count))
+    return torch.ops.flashinfer_gaudi.hc_silu(_owned(down), int(hc_count))
 
 
 def hc_silu_split(down: torch.Tensor, hc_count: int, lora_rank: int) -> tuple[torch.Tensor, torch.Tensor]:
     """``(silu(down[:, :R] / hc_count), down[:, R:R + hc_count])`` of the merged down+inject GEMM output."""
-    return torch.ops.flashinfer_gaudi.hc_silu_split(down, int(hc_count), int(lora_rank))
+    return torch.ops.flashinfer_gaudi.hc_silu_split(_owned(down), int(hc_count), int(lora_rank))
 
 
 def hc_gate_mix(xn: torch.Tensor, gate: torch.Tensor, hc_count: int) -> torch.Tensor:
     """Sigmoid gate and gated mean over the streams: the block input ``[T, H]``."""
-    return torch.ops.flashinfer_gaudi.hc_gate_mix(xn, gate, int(hc_count))
+    return torch.ops.flashinfer_gaudi.hc_gate_mix(_owned(xn), _owned(gate), int(hc_count))
 
 
 def hc_combine(residual: torch.Tensor, block_output: torch.Tensor, injection: torch.Tensor,
                hc_count: int) -> torch.Tensor:
     """``residual + block_output * 2 * sigmoid(injection / hc_count)`` per stream."""
-    return torch.ops.flashinfer_gaudi.hc_combine(residual, block_output, injection, int(hc_count))
+    return torch.ops.flashinfer_gaudi.hc_combine(_owned(residual), _owned(block_output), _owned(injection), int(hc_count))
 
 
 def hc_combine_norm(residual: torch.Tensor, block_output: torch.Tensor, injection: torch.Tensor,
                     norm_weight: torch.Tensor, eps: float, hc_count: int) -> tuple[torch.Tensor, torch.Tensor]:
     """The combine, rounded to the input dtype, and the grouped Gemma RMSNorm of the rounded result."""
-    return torch.ops.flashinfer_gaudi.hc_combine_norm(residual, block_output, injection, norm_weight, float(eps),
+    return torch.ops.flashinfer_gaudi.hc_combine_norm(_owned(residual), _owned(block_output), _owned(injection),
+                                                      norm_weight, float(eps),
                                                       int(hc_count))
 
 

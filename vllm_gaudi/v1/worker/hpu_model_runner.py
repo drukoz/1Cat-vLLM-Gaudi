@@ -9213,12 +9213,15 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
                 if not _needs_raw_buffer(kv_cache_tensor):
                     continue
-                # Pad by one dummy block sized to THIS tensor's spec. Its
-                # coalesced layers share one (standard Mamba2) spec; group 0 may
-                # be a smaller attention spec in hybrid models and under-pad the
-                # buffer, letting the last as_strided view run past the end.
+                # One page of THIS tensor's spec per block, plus one dummy block:
+                # exactly what the as_strided views below address (num_blocks + 1
+                # blocks, strided by the spec's page). KVCacheTensor.size is the
+                # engine's whole backing allocation (num_blocks * bytes_per_block,
+                # PR #51718): with a wider group next to it (Flash-Next: 12
+                # attention layers per block, one PLE layer) it is that many
+                # times what this buffer needs.
                 raw_spec = _layer_spec[kv_cache_tensor.layers[0]]
-                size = kv_cache_tensor.size + raw_spec.page_size_bytes
+                size = (kv_cache_config.num_blocks + 1) * raw_spec.page_size_bytes
                 tensor = torch.zeros(size // 2, dtype=torch.bfloat16, device=self.device)
                 for layer_name in kv_cache_tensor.layers:
                     kv_caches[layer_name] = tensor
@@ -9528,10 +9531,12 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         shapes = None
         for module in qsa_layers:
             kc = kv_caches[module.attn.layer_name][0]
+            # The ring is the flat table [slots * rows, D]: the layer writes it with index_copy_ on the
+            # tensor itself (a write through a view of a three-axis ring does not compile on a card).
             comp, ring = allocate_side_caches(kc.shape[0], gdn_rows, int(config.indexer_compress_ratio),
-                                              int(config.indexer_head_dim), spec_tokens, kc.device)
+                                              int(config.indexer_head_dim), spec_tokens, kc.device, flat_ring=True)
             module.indexer.compressed_key_cache = comp
-            module.indexer.key_ring = ring
+            module.indexer.bind_key_ring(ring, ring.shape[0] // gdn_rows)
             total_bytes += comp.numel() * comp.element_size() + ring.numel() * ring.element_size()
             shapes = (tuple(comp.shape), tuple(ring.shape))
         if qsa_layers:

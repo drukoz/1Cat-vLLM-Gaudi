@@ -103,15 +103,22 @@ def _build_shared_message(count_tokens: Callable[[list[dict]], int], root: Path,
     """The system message trimmed to ``[shared_tokens - 64, shared_tokens]`` tokens."""
     corpus = _shared_corpus(root)
     text = corpus
+
+    def count_system(content: str) -> int:
+        # With an (empty) user turn: the model's chat template refuses messages without one
+        # ("No user query found in messages", HTTP 400 from /tokenize on the first real server,
+        # 2026-11-20). The few tokens of the empty turn are inside the 64-token tolerance.
+        return count_tokens([{"role": "system", "content": content}, {"role": "user", "content": ""}])
+
     for _ in range(CORPUS_REPEAT_GUARD):  # repeated from the start while still short
-        if count_tokens([{"role": "system", "content": text}]) >= shared_tokens:
+        if count_system(text) >= shared_tokens:
             break
         text += corpus
     else:
         raise ValueError(f"cannot reach {shared_tokens} tokens by repeating the shared corpus ({len(text)} chars)")
 
     def count_chars(n: int) -> int:
-        return count_tokens([{"role": "system", "content": text[:n]}])
+        return count_system(text[:n])
 
     lo, hi = 0, len(text)  # count(0) <= shared_tokens <= count(len(text))
     while lo < hi:

@@ -184,9 +184,10 @@ def run_mode(mode: str, ckpt: Path, out_dir: Path, port: int, health_timeout_s: 
             if healthy:
                 status, details = gates.tiny_compare("http://127.0.0.1:%d" % port, ckpt / "reference.json")
                 entry["reason"] = details.get("reason") or details.get("error")
-                if status is GateStatus.PASSED:  # recorded only, while the server is still up
-                    entry["decode_ms_per_token"] = decode_ms_per_token("http://127.0.0.1:%d" % port,
-                                                                       ckpt / "reference.json")
+                # Recorded only, while the server is still up. Also after a failed comparison: a server
+                # that decodes the wrong tokens still shows what a decode step costs (None when it died).
+                entry["decode_ms_per_token"] = decode_ms_per_token("http://127.0.0.1:%d" % port,
+                                                                   ckpt / "reference.json")
             else:
                 status, entry["reason"] = serve.unhealthy_reason(popen, entry["startup_seconds"], health_timeout_s)
         finally:
@@ -235,6 +236,10 @@ def report_mode(entry: dict) -> None:
         return
     word = "TIMED OUT" if entry["status"] == "timed_out" else "FAILED"
     print("tiny smoke [%s]: %s (%s)" % (mode, word, entry["reason"]), flush=True)
+    decode = entry.get("decode_ms_per_token")
+    if decode is not None:  # the server answered: its decode step is worth knowing even with wrong tokens
+        print("tiny smoke [%s]: decode %.1f ms/token (the shortest prompt, %d tokens against 1, best of %d)" %
+              (mode, decode, gates.TINY_MAX_TOKENS, DECODE_TIMING_REPEATS), flush=True)
     for line in entry["errors"] + entry["fallback_lines"]:
         print("    %s" % line, flush=True)
     print("    log: %s" % entry["log"], flush=True)
