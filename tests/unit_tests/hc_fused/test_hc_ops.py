@@ -15,9 +15,9 @@ from pathlib import Path
 import pytest
 import torch
 
-from tests.unit_tests.hc_fused import hc_ops
-from tests.unit_tests.hc_fused.hc_case import (BF16, INPUT_ORDER, OP_NAME, OUTPUT_ORDER, SIM_CASES, expected,
-                                               make_inputs, output_shapes, scalars)
+from tests.unit_tests.hc_fused import hc_ops, hc_stress
+from tests.unit_tests.hc_fused.hc_case import (BF16, INPUT_ORDER, OP_NAME, OUTPUT_ORDER, SIM_CASES, case_by_name,
+                                               expected, make_inputs, output_shapes, scalars)
 
 SMALL = [case for case in SIM_CASES if case.rows <= 32]
 IDS = [case.name for case in SMALL]
@@ -56,6 +56,28 @@ def test_fake_kernel_shapes(case):
     shapes = output_shapes(case)
     assert [tuple(t.shape) for t in got] == [shapes[name] for name in OUTPUT_ORDER[case.kind]]
     assert all(t.dtype == BF16 and t.device.type == "meta" for t in got)
+
+
+@pytest.mark.parametrize("name", hc_stress.STRESS_CASES)
+def test_the_queue_stress_of_the_card_test_runs_on_cpu(name):
+    """The body of test_hpu_op.py::test_hpu_op_behind_a_queue_of_lazy_ops, here with the oracle as the kernel:
+    it checks that body (the calls, the comparison, the queued ops' own result), which no card ran yet."""
+    assert hc_stress.run_behind_a_queue(case_by_name(name), "cpu", rounds=2) == []
+
+
+def test_the_queue_stress_reports_a_wrong_result(monkeypatch):
+    case = case_by_name("norm_real_r16")
+    monkeypatch.setattr(hc_ops, "hc_norm", lambda x, weight, eps, hc: torch.zeros_like(x))
+
+    messages = hc_stress.run_behind_a_queue(case, "cpu", rounds=2)
+
+    assert len(messages) >= 2 and messages[0].startswith("round 0: ") and any(m.startswith("round 1: ") for m in messages)
+
+
+def test_the_queue_stress_covers_the_five_kernels_of_the_decode_loop():
+    assert [case_by_name(name).kind for name in hc_stress.STRESS_CASES] == ["norm", "silu_split", "gate_mix",
+                                                                           "combine", "combine_norm"]
+    assert hc_stress.QUEUED_PAIRS == 48 and hc_stress.ROUNDS == 8
 
 
 def test_silu_split_injection_is_a_copy_not_a_view():
