@@ -13,6 +13,7 @@ import os
 os.environ.setdefault("VLLM_PLUGINS", "")
 os.environ["TMPDIR"] = "/tmp"
 
+import pytest  # noqa: E402
 import torch  # noqa: E402
 from vllm.forward_context import set_forward_context  # noqa: E402
 
@@ -94,14 +95,19 @@ def _gdn_states(slots, state_len, dim, extra):
     return narrow, wide
 
 
-def test_gdn_conv_prefill_writes_whole_rows_of_a_widened_state():
+# The engine hands the state indices over as int32; index_copy_ on CPU takes only int64 (index_select takes both).
+INDEX_DTYPES = pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64], ids=["int32", "int64"])
+
+
+@INDEX_DTYPES
+def test_gdn_conv_prefill_writes_whole_rows_of_a_widened_state(index_dtype):
     dim, width, batch, seq, slots = 6, 4, 3, 5, 7
     state_len = width - 1
     torch.manual_seed(1)
     x = torch.randn(dim, batch * seq)
     weight = torch.randn(dim, width)
     qsl = torch.tensor([0, 5, 8, 8], dtype=torch.int32)  # 5 and 3 real tokens, one padding row
-    cache = torch.tensor([4, 1, -1])  # the padding row writes the last (garbage) slot
+    cache = torch.tensor([4, 1, -1], dtype=index_dtype)  # the padding row writes the last (garbage) slot
     has_initial = torch.tensor([1, 0, 0])
     narrow, wide = _gdn_states(slots, state_len, dim, extra=3)
 
@@ -120,15 +126,16 @@ def test_gdn_conv_prefill_writes_whole_rows_of_a_widened_state():
     assert not torch.equal(plain_state[4], narrow[4])  # the step did write
 
 
-def test_gdn_conv_plain_decode_writes_whole_rows_of_a_widened_state():
+@INDEX_DTYPES
+def test_gdn_conv_plain_decode_writes_whole_rows_of_a_widened_state(index_dtype):
     dim, width, batch, slots = 6, 4, 3, 7
     state_len = width - 1
     torch.manual_seed(2)
     x = torch.randn(batch, dim)  # token-major, one token per request, as the GDN layer hands it over
     qsl = torch.arange(batch + 1, dtype=torch.int32)
     weight = torch.randn(dim, width)
-    load = torch.tensor([4, 1, -1])
-    store = torch.tensor([5, 1, -1])  # prefix caching: one request stores to another slot
+    load = torch.tensor([4, 1, -1], dtype=index_dtype)
+    store = torch.tensor([5, 1, -1], dtype=index_dtype)  # prefix caching: one request stores to another slot
     narrow, wide = _gdn_states(slots, state_len, dim, extra=3)
 
     plain_state = narrow.clone()

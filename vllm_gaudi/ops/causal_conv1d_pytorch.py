@@ -495,7 +495,8 @@ def hpu_causal_conv1d_fn(
                 # assignment below is an in-place write through a slice view of the state tensor there
                 # (hpu::slice_insert), whose output an HPU graph cannot bind (card job 00021, the PLE state:
                 # "Neither storage attached to input tensor, not its view").
-                conv_states.index_copy_(0, safe_cache_idx_prefill,
+                # index_copy_ takes an int64 index on CPU (index_select takes the int32 one the engine hands over).
+                conv_states.index_copy_(0, safe_cache_idx_prefill.to(torch.long),
                                         torch.cat((updated_states, existing_rows[:, state_len:, :]), dim=1))
             else:
                 conv_states[safe_cache_idx_prefill, state_start:state_start + state_len, :] = updated_states
@@ -915,7 +916,7 @@ def hpu_causal_conv1d_fn_update(
             # An expanded speculative state: whole rows with one index_copy_, no in-place write through a slice
             # view of the state tensor (see hpu_causal_conv1d_fn).
             store_rows = conv_states.index_select(0, safe_store_idx)
-            conv_states.index_copy_(0, safe_store_idx,
+            conv_states.index_copy_(0, safe_store_idx.to(torch.long),
                                     torch.cat((new_state.transpose(-1, -2), store_rows[:, state_len:, :]), dim=1))
         else:
             conv_states[safe_store_idx, state_start:state_start + state_len, :] = new_state.transpose(-1, -2)
