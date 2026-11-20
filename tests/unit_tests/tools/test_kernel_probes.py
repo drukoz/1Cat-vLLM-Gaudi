@@ -9,8 +9,14 @@
 * ``probe_moe_expert_bytes.py`` (idea G2-1: does the vendor MoE op read every local expert): every routing arm
   runs and the verdict line is printed (times on a CPU mean nothing).
 * ``probe_view_inputs.py`` (can a custom op take a view at accumulation mode 0): its own self-test.
+* ``probe_index_narrowing.py`` (ids narrowed to int32 in the graph that makes them: the sparse-QSA selection,
+  argmax, replacements): on a CPU every case is RIGHT.
+* ``probe_hc_copies.py`` (the owned copies in front of the fused hyper-connection ops): every copy mode returns
+  the bits of mode 0.
+* ``decode_ab_client.py --compare``: the 1-stream rounds are the test of two arms' texts.
 """
 
+import json
 import os
 import subprocess
 import sys
@@ -58,3 +64,44 @@ def test_view_probe_selftest(tmp_path):
     proc, out = _run([PROBES / "probe_view_inputs.py", "--selftest"], tmp_path)
     assert proc.returncode == 0, out[-3000:]
     assert "VERDICT: VIEWS WORK" in out
+    assert "IDENTITY VIEWS: 5 of 5 cases give the op the right rows" in out
+    assert "OP OUTPUTS: 4 of 4 cases need no copy" in out
+
+
+def test_index_narrowing_probe_is_right_on_cpu(tmp_path):
+    proc, out = _run([PROBES / "probe_index_narrowing.py", "--out", tmp_path / "narrow"], tmp_path)
+    assert proc.returncode == 0, out[-3000:]
+    states = ("RIGHT", "WRONG", "ERROR")
+    cases = [line for line in out.splitlines()
+             if line.startswith("PROBE narrow") and any(f": {state} (" in line for state in states)]
+    assert len(cases) == 32, cases  # 8 served, 12 pattern, 12 fix
+    assert all(": RIGHT (" in line for line in cases), [line for line in cases if ": RIGHT (" not in line]
+    assert "VERDICT select_blocks: select_blocks on the card: RIGHT in every case" in out
+    result = json.loads((tmp_path / "narrow" / "index_narrowing.json").read_text())
+    assert len(result["results"]) == 32 and len(result["verdicts"]) == 3
+
+
+def test_hc_copies_probe_modes_are_bit_identical_on_cpu(tmp_path):
+    proc, out = _run([PROBES / "probe_hc_copies.py", "--out", tmp_path / "hc", "--calls", "2", "--iters", "1"],
+                     tmp_path)
+    assert proc.returncode == 0, out[-3000:]
+    rows = [line for line in out.splitlines() if line.startswith("PROBE hc-copies rows")]
+    assert len(rows) == 9, rows  # copy modes 0, 1, 2 at 1, 32 and 128 rows
+    assert all("bit-identical to mode 0: True" in line for line in rows), rows
+    assert "VERDICT hc-copies:" in out and "RAISED" not in out
+
+
+def test_decode_ab_client_compares_the_one_stream_rounds(tmp_path):
+    a = [{"round": "meas N=1 rep=0", "tokens": 4, "ctx_tokens": 0, "texts": ["one two three four"]},
+         {"round": "meas N=2 rep=0", "tokens": 4, "ctx_tokens": 0, "texts": ["a b c d", "e f g h"]}]
+    b = [dict(a[0]), dict(a[1], texts=["a b X d", "e f g h"])]
+    (tmp_path / "a.json").write_text(json.dumps(a))
+    (tmp_path / "b.json").write_text(json.dumps(b))
+    client = PROBES / "decode_ab_client.py"
+    proc, out = _run([client, "--compare", tmp_path / "a.json", tmp_path / "b.json"], tmp_path)
+    assert proc.returncode == 0, out
+    assert "COMPARE meas N=1 rep=0         1 of 1 streams returned the same text" in out
+    assert "COMPARE meas N=2 rep=0         1 of 2 streams returned the same text; shortest common prefix 4" in out
+    assert "1-stream rounds (the test): the same text in 1 of 1" in out
+    source = client.read_text()
+    assert '"min_tokens"] =' not in source and "min_tokens\": ntok" not in source  # no request carries it
