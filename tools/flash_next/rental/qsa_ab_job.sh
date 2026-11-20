@@ -239,9 +239,9 @@ RC=$?
 # The request-sharded indexer on its first run in a served model: when its server dies or a round loses streams,
 # the arm runs once more without it (mode 1 replicated), so the arm still gives the request-major and grouped
 # attention numbers.
-if [ "$RUN_OK" != 1 ] && [ "${VLLM_HPU_QSA_INDEXER_SHARD:-0}" = 1 ] && [ "${QSA_AB_NO_RETRY:-0}" != 1 ]; then
+if [ "$RUN_OK" != 1 ] && [ "${VLLM_HPU_QSA_INDEXER_SHARD:-0}" != 0 ] && [ "${QSA_AB_NO_RETRY:-0}" != 1 ]; then
     if [ "$(left)" -ge 1080 ]; then
-        say "FALLBACK: the run with VLLM_HPU_QSA_INDEXER_SHARD=1 did not complete (exit $RC): once more with it at 0"
+        say "FALLBACK: the run with VLLM_HPU_QSA_INDEXER_SHARD=$VLLM_HPU_QSA_INDEXER_SHARD did not complete (exit $RC): once more with it at 0"
         export VLLM_HPU_QSA_INDEXER_SHARD=0
         sleep 10
         serve_and_probe "_noshard"
