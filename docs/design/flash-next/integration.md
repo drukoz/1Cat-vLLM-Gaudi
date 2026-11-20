@@ -9,10 +9,10 @@ Labels: MEASURED (card, with its file), VERIFIED (CPU test or code line), INFERR
 
 ## Handoff (if this agent stops)
 
-Updated 2026-11-20 23:37 UTC (fourth agent of the track, Opus 5.5, started 23:12 UTC).
+Updated 2026-11-20 23:40 UTC (fourth agent of the track, Opus 5.5, started 23:12 UTC).
 
-**Now:** job **00121** `tiny8-build` (commit `b54ca4fd`) is at the front of the queue (starts when coord's 00025 ends,
-by 23:57 UTC); job **00128** `real8-headline` (commit `fbb685ac`) is placed right behind it by the coordinator. Both
+**Now:** job **00121** `tiny8-build` PASSED (23:36 UTC, below). Job **00128** `real8-headline` (commit `fbb685ac`)
+runs since 23:36:27 UTC (SIGTERM at 00:16:27 UTC). Both
 `farm job` commands wait in background shells of the agent's session and copy the results to
 `reports/integration/card/` when the jobs end. **Do not run `farm sync`, `farm job` or `farm serve` for this track
 while 00121 or 00128 waits**: the node keeps three images per track, a fourth build prunes the oldest (00121's).
@@ -100,4 +100,14 @@ shape [4, 248320]`) and `test_sh_run_sheet.py` (`tiny_smoke.sh --spec` is not na
 
 ## Card results
 
-(none yet)
+### 00121 `tiny8-build`, 23:32:52-23:36:27 UTC (commit `b54ca4fd`, TP8, every build flag): PASSED
+
+MEASURED (`reports/integration/card/00121-tiny8-build/build/summary.json`, job log `00121-tiny8-build.log`):
+- mode `hc` (fused GDN decode + fused hyper-connections + all build flags, no speculation): tokens equal the CPU
+  reference; decode 9.9 ms per token (shortest prompt, 16 tokens).
+- mode `hc+mtp3` (k = 3, fused GDN verification, draft loop, chunk KV): PASSED on the first rung (`verify`): tokens
+  equal the CPU reference and the server without speculation; 0 of 270 drafts accepted (random weights: only the
+  all-rejected verification path is proven); decode 24.3 ms per token.
+- Kernel lines: only "killed while waiting" (servers stopped), not a card fault.
+- Not covered: the tiny server serves at most 4 requests and the smoke sends one at a time, so the request-sharded
+  QSA indexer (8 or more rows at TP8) did not run here; 00128 runs it at 8 and 32 streams.
