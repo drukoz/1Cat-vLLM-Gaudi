@@ -21,9 +21,13 @@ from vllm_gaudi.models.qwen4_exp.ple_layer import (  # must follow the upstream 
     HpuQwen4ExpNGramEmbedding,
     HpuQwen4ExpPLELayer,
 )
-from vllm.config import VllmConfig
+from vllm.config import VllmConfig, get_current_vllm_config
+from vllm.logger import init_logger
+from vllm.model_executor.layers.linear import ColumnParallelLinear
+from vllm.model_executor.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from vllm.model_executor.models.registry import ModelRegistry
 from vllm.sequence import IntermediateTensors
+from vllm_gaudi import envs
 from vllm_gaudi.models.qwen4_exp.hyperconnection import HpuGatedResidual
 from vllm_gaudi.models.qwen4_exp.mtp import mtp_aux_hidden
 from vllm_gaudi.models.qwen4_exp.ple_ops import HOST_NGRAM_IDS_KWARG
@@ -32,6 +36,38 @@ from vllm_gaudi.models.qwen4_exp.qsa import HpuQwen4ExpQSAAttention
 FLASH_NEXT_ARCHS = ("Qwen4ExpForConditionalGeneration", "Qwen4ExpForCausalLM")
 
 MTP_ARCHS = ("Qwen4ExpMTP",)
+
+logger = init_logger(__name__)
+
+
+def _token_embedding(*args, **kwargs):
+    """The token embedding of a Flash-Next model: vocabulary-sharded, or one full copy per rank.
+
+    ``VLLM_HPU_REPLICATED_EMBEDDING=1`` builds it with ``disable_tp=True``: every rank loads all the rows and
+    looks its tokens up alone, so the all-reduce that follows a sharded lookup (one rank holds the row, the
+    others send zeros) does not exist. A model with tied embeddings keeps the sharded table: its LM head is
+    this module, and the head must stay sharded over the vocabulary.
+    """
+    if int(envs.VLLM_HPU_REPLICATED_EMBEDDING) == 1 and "disable_tp" not in kwargs:
+        text_config = get_current_vllm_config().model_config.hf_text_config
+        if getattr(text_config, "tie_word_embeddings", False):
+            logger.warning("VLLM_HPU_REPLICATED_EMBEDDING=1 is off: the model ties the LM head to the embedding")
+        else:
+            kwargs["disable_tp"] = True
+    return VocabParallelEmbedding(*args, **kwargs)
+
+
+def _mtp_column_linear(*args, **kwargs):
+    """The MTP draft's ``fc_embedding`` / ``fc_hidden`` (hidden x hidden, ``gather_output=True``).
+
+    Upstream shards their output columns and all-gathers them again on every draft step: two collectives per
+    drafted token for two small GEMMs whose input and output are replicated anyway.
+    ``VLLM_HPU_MTP_REPLICATED_FC=1`` builds them unsharded (``disable_tp=True``), so each rank computes the
+    whole product and no collective follows. Only the linears built with ``gather_output=True`` change.
+    """
+    if int(envs.VLLM_HPU_MTP_REPLICATED_FC) == 1 and kwargs.get("gather_output") and "disable_tp" not in kwargs:
+        kwargs["disable_tp"] = True
+    return ColumnParallelLinear(*args, **kwargs)
 
 
 class _MtpTargetOutputs:
@@ -108,6 +144,12 @@ def apply_flash_next_patches() -> None:
     _upstream_ple.Qwen4ExpNGramEmbedding = HpuQwen4ExpNGramEmbedding
     # The MTP draft's final mixer is built in nvidia/mtp.py through its own GatedResidual import.
     _upstream_mtp.GatedResidual = HpuGatedResidual
+    # Collective cuts (docs/design/flash-next/collectives.md): the constructors read their flag when a model is
+    # built. The draft's own embedding is replaced by the target's when the engine shares it; when it is not
+    # shared it follows the same flag.
+    _upstream_model.VocabParallelEmbedding = _token_embedding
+    _upstream_mtp.VocabParallelEmbedding = _token_embedding
+    _upstream_mtp.ColumnParallelLinear = _mtp_column_linear
 
 
 def register() -> None:
