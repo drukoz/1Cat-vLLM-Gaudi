@@ -214,10 +214,14 @@ def test_a_failed_measurement_never_fails_the_mode(smoke, monkeypatch, capsys):
     assert "tiny smoke [pytorch]: PASSED" in printed and "ms/token" not in printed
 
 
-def test_a_failed_mode_is_not_measured(smoke, monkeypatch):
+def test_a_mode_with_wrong_tokens_is_still_measured(smoke, monkeypatch, capsys):
+    """A server that answers with the wrong tokens still shows what a decode step costs: the first
+    card session that got answers (2026-11-20) needed the timing of exactly such runs."""
     out, port = smoke
     monkeypatch.setenv("FAKE_SERVER_WRONG", "1")
-    monkeypatch.setattr(tiny_smoke, "decode_ms_per_token", lambda *args, **kwargs: pytest.fail("not measured"))
+    monkeypatch.setattr(tiny_smoke, "decode_ms_per_token", lambda *args, **kwargs: 12.5)
     code, summary = run(out, port, "--gdn", "pytorch")
     assert code == 1
-    assert by_mode(summary)["pytorch"]["decode_ms_per_token"] is None
+    assert by_mode(summary)["pytorch"]["decode_ms_per_token"] == 12.5
+    printed = capsys.readouterr().out
+    assert "tiny smoke [pytorch]: FAILED" in printed and "decode 12.5 ms/token" in printed
