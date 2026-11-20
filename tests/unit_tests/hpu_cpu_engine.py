@@ -366,6 +366,7 @@ def runner_facts(runner) -> dict:
             "mamba_cache_mode": getattr(cache_config, "mamba_cache_mode", None),
             "prefix_caching": bool(cache_config.enable_prefix_caching),
             "recurrent_pool_slots": int(runner._recurrent_pool_slots),
+            "candidate_verify_steps": int(getattr(runner, "_candidate_verify_steps", 0)),
             "attention_group": runner._get_attention_group_id_for_hybrid(),
             "num_blocks": int(runner.kv_cache_config.num_blocks),
             "groups": groups}
@@ -515,6 +516,8 @@ def main(argv: list[str] | None = None) -> int:
                         "drafts become the reference stream with the token after a_n accepted ones changed "
                         "(install_oracle_drafts)")
     parser.add_argument("--temperature", type=float, default=0.0)
+    parser.add_argument("--top-k", type=int, default=0, help="top_k of a sampled run (0: none)")
+    parser.add_argument("--top-p", type=float, default=1.0, help="top_p of a sampled run")
     parser.add_argument("--seed", type=int, default=None, help="per-request seed of a sampled run")
     parser.add_argument("--logprobs", type=int, default=None, help="record the top-N logprobs of every generated token")
     parser.add_argument("--op-audit", action="store_true",
@@ -550,7 +553,7 @@ def main(argv: list[str] | None = None) -> int:
     source = json.loads(Path(args.prompts or Path(args.ckpt) / "reference.json").read_text(encoding="utf-8"))
     prompts = sorted((list(p["prompt_ids"]) for p in source["prompts"]), key=len)
     params = SamplingParams(temperature=args.temperature, max_tokens=args.max_tokens, detokenize=False,
-                            seed=args.seed, logprobs=args.logprobs)
+                            seed=args.seed, logprobs=args.logprobs, top_k=args.top_k, top_p=args.top_p)
     guard = make_index_guard()
     audit = make_op_audit() if args.op_audit else None
     streams = []

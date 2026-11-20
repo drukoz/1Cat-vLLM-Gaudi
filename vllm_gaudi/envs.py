@@ -535,7 +535,7 @@ if TYPE_CHECKING:
     VLLM_HPU_GDN_CORE_DECODE: int = 1  # GdnCoreDecodeMode: 1 fused (default), 0 off, 2 recurrence
     VLLM_HPU_GDN_CORE_DECODE_DEBUG: int = 0  # GdnCoreDecodeDebug: 0 off, 1 check slot indices every step (host sync)
     VLLM_HPU_GDN_CORE_VERIFY: int = 0  # GdnCoreVerifyMode: 0 off (default), 1 fused verification steps
-    VLLM_HPU_SPEC_SAMPLED_VERIFY: int = 0  # 0 speculation serves greedy requests only (default), 1 also sampled
+    VLLM_HPU_SPEC_SAMPLED_VERIFY: int = 0  # 0 greedy requests only (default), 1 also sampled, 2 sampled over candidates
     VLLM_HPU_MTP_DRAFT_LOOP: int = 0  # 0 draft positions read back from the device (default), 1 host books
     VLLM_HPU_MTP_DRAFT_IDS: int = 0  # 0 draft ids by argmax, int64 narrowed in the graph (default), 1 int32 ids
     VLLM_HPU_MTP_TIMING: int = 0  # 0 off (default), 1 time the verification part and the draft of every step
@@ -1962,6 +1962,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # MTP server refuses a sampled request with an error naming this flag (the HPU rejection sampler verified
     # greedy requests only, and a sampled one stopped the worker). 1 = the drafts of sampled requests are verified
     # by speculative sampling in torch, exact in distribution (hpu_rejection_sampler.sampled_rejection_sample).
+    # 2 = the same over the 64 largest logits of every row (hpu_candidate_verify.py: no pass over the vocabulary
+    # beyond one top-k) for a step whose requests all have top_k 1..64, no seed and no logprobs; other steps as 1.
     "VLLM_HPU_SPEC_SAMPLED_VERIFY":
     lambda: int(os.environ.get("VLLM_HPU_SPEC_SAMPLED_VERIFY", "0")),
 
