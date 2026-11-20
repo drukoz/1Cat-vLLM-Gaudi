@@ -481,7 +481,7 @@ test it on the real model.
 
 ## Handoff (if this agent stops)
 
-State at 2026-11-20 23:50 UTC (fourth agent of this track, Opus 5.5, started 23:15 UTC). Branch
+State at 2026-11-20 23:50 UTC by the real clock (fourth agent of this track, Opus 5.5, started 23:15 UTC). Branch
 `feat/flash-next-gaudi-native-replay` (worktree `/Volumes/Storage/Claude/gaudi-work/wt/native-replay`), pushed; the
 program head `938dada4` is merged in (`09d72dc9`); nothing of this track is on `feat/flash-next-gaudi` yet. **No pull
 request before the node is gone** (coordinator, BRIEF.md 23:45 UTC): the integration track builds from this branch
@@ -522,41 +522,98 @@ directly. This harness keeps the handoff here (earlier harnesses refused report 
   one-at-a-time gate has five tracks queued for hours, and the coordinator said to leave the queue unless one's gate
   already runs.
 
-### The card job in the queue: 00122 `real4-cut-pin-ab`
+### The card job in the queue: 00134 `real4-cut-pin-hash-ab`
 
-`any:4`, 45 min, replaces 00084 and keeps the coordinator's bump (after the prefill pair 00079/00080; starts by 00:37
-UTC at the latest on cards 3,4,5,6). Stub: `reports/native-replay/late/stub_real4_cut_pin.sh`. It runs
-`~/farm/native-replay/late/real_ab.sh real4 1,32 128` with three arms on the track's synced commit (`~/farm/native-replay/current`,
-`6884fc07` once its sync has ended): `base`, `cut` (`VLLM_HPU_DECODE_CUT_INTERVAL=1000`) and `cutpin` (also
-`VLLM_HPU_WORKER_CPU_PIN=1`), each with `VLLM_GRAPH_RESERVED_MEM=0.5` (BRIEF.md 23:50 UTC), one server start per arm.
-Per arm: `real4-<arm>/scaling.json`, `server0.log`, `probe.log`, `hostwatch/` (rank 0's threads every 2 s, stacks after
-the second 32-stream round), `cpuwatch/cpus_series.txt` and `.jsonl` (`late/cpu_watch.py`: per rank every 5 s the
-main thread and the two busiest other threads, their CPU share, the CPUs they ran on and their CPU changes; asked for
-by the coordinator: whether a worker needs about 3 CPUs of its own), `hlsmi.txt` (device memory every 15 s).
-When it ends: `bin/farm fetch native-replay 00122 real4-base real4-cut real4-cutpin`, then read:
-1. Steady ms per step (the probe's median gap) at 1 and 32 streams per arm, and the `TEXT` lines (coherent text in
-   every arm; at 1 stream the three texts should be the same).
-2. `cutpin/server0.log`: one line per worker `VLLM_HPU_WORKER_CPU_PIN=1: rank r module m: share i of 4, CPUs a-b (18 of
-   the 72 ...)`; `cpuwatch`: every busy thread of rank r inside its slice.
-3. The per-rank main-thread CPU share at 1 stream in `cpuwatch` (a fast rank waits blocked at the read, so its share
-   is lower): unequal in `base`/`cut`, more equal in `cutpin` if the pin closes the spread.
-Decisions: `cut` against `base` is the flag's real-model gain (expected 1.5-4 ms per step). `cutpin` against `cut`: if
-the 1-stream step falls by more than about 2 ms and the ranks' shares even out, the pin pays: tell the coordinator
-(`SendMessage` to `main`: branch, commit, `VLLM_HPU_WORKER_CPU_PIN=1`), then try mode 2 or a share of 3 CPUs of their
-own per worker if `cpuwatch` shows the main thread sharing CPUs with the two busy bridge threads. If it does not fall,
-keep the flag at 0 and write why.
+`any:4`, 58 min, replaces 00122 (which replaced 00084) and keeps the coordinator's bump; starts by 01:55 UTC at the
+latest, on cards 0,1,2,7 (modules 0-3). Stub: `reports/native-replay/late/stub_real4_cut_pin_hash.sh`. First the tiny
+model at TP4 with `PT_HPU_DISABLE_HPUGRAPH_REPLAY_HASHCHECK=1` (`replay_job.sh real4-hashtiny tinyenv`, log
+`results/real4-hashtiny/tiny-hash.log`; token parity), then `~/farm/native-replay/late/real_ab.sh real4 1,32 128` on the
+track's synced commit (`~/farm/native-replay/current` = `0835754e8c3e`), arms in the coordinator's order (the last is
+lost if the hold runs short): `base`, `cutpin` (`VLLM_HPU_DECODE_CUT_INTERVAL=1000 VLLM_HPU_WORKER_CPU_PIN=1`),
+`cuthash` (`VLLM_HPU_DECODE_CUT_INTERVAL=1000 PT_HPU_DISABLE_HPUGRAPH_REPLAY_HASHCHECK=1`, only if the tiny check
+passed), `cut` (`VLLM_HPU_DECODE_CUT_INTERVAL=1000`); each with `VLLM_GRAPH_RESERVED_MEM=0.5` (BRIEF.md 23:50 UTC), one
+server start per arm. Per arm: `real4-<arm>/scaling.json`, `server0.log`, `probe.log`, `hostwatch/` (rank 0's threads
+every 2 s, stacks after the second 32-stream round), `cpuwatch/cpus_series.txt` and `.jsonl` (`late/cpu_watch.py` on
+CPU 151: per rank every 5 s the main thread and the two busiest other threads, their CPU share, the CPUs they ran on
+and their CPU changes; asked for by the coordinator: whether a worker needs about 3 CPUs of its own), `hlsmi.txt`
+(device memory every 15 s). When it ends: `bin/farm fetch native-replay 00134 real4-hashtiny real4-hashtiny-hash
+real4-base real4-cutpin real4-cuthash real4-cut`, then report to the coordinator per arm (as asked): ms per step at
+1 and 32 streams (the probe's median gap), the 1-stream text against `base`, the per-rank spread (`cpuwatch`: the
+main thread's CPU share per rank at 1 stream; a fast rank waits blocked at the read). Read also: `cutpin/server0.log`
+has one line per worker `VLLM_HPU_WORKER_CPU_PIN=1: rank r module m: share i of 4, CPUs a-b (18 of the 72 ...)`.
+Decisions: the pin pays if the 1-stream step falls by more than about 2 ms against `base` and the ranks' shares even
+out (then tell the coordinator `VLLM_HPU_WORKER_CPU_PIN=1` for the integration build, and try mode 2 or 3 CPUs per
+worker from `cpuwatch`); the hash switch pays if `cuthash` beats `cut` (or `base`, if `cut` did not run) by more than
+noise with the same text; `cut` against `base` is the cut flag's real-model gain (step-anatomy expects none: the
+all-reduces already split every layer).
 
 ### Pending, in order
 
-1. 00122 as above; write its numbers into a section 7.9 and sections 0 and 5; tell the coordinator.
-2. After the node is gone (after 04:00 UTC): a snapshot of HEAD (`git archive HEAD | tar -x -C
+1. 00134 as above; write its numbers into a section 7.9 and sections 0 and 5; tell the coordinator.
+2. The coordinator's bridge build (23:43 UTC): the UNPATCHED bridge at `5176b1b2` (head of `v1.24.1`, the node's
+   version) builds in container `nr-bridge-build` from `farm-base:latest` on the node, `--cpuset-cpus 18,37,56,75`, nice
+   19, no card, without the C++ tests (`.devops/build.py -c -r -l -j 4 --no-iwyu --no-swig`); script
+   `reports/native-replay/late/bridge-build/build_bridge.sh` (on the node `~/farm/native-replay/bridge-build/`, log
+   `build.log`; at its end the wheels in `wheels/`, the libraries it wrote in `lib/`). 215 of 840 build steps at 23:47
+   UTC. If it ends before about 03:00 UTC: one 1-card job that installs those wheels in the job's container
+   (`pip install --no-deps --force-reinstall`) and serves the tiny model (`python /farm/farm_tiny.py --gdn hc`, TP1):
+   PASSED with the same tokens as every tiny run proves we can build and load our own bridge on this stack (the
+   precondition of item 3). Skip it if the build is not done by about 02:30 UTC. Tell the coordinator either way.
+3. **Next week, item 1 (the coordinator's choice of the program's best fixed-cost plan): a bridge-only lean replay
+   path.** Read from the bridge source at `5176b1b2`. What a replayed launch does on the main thread today, per
+   captured segment (step-anatomy: 148 per step at 1 stream, 209 at 32; about 150 us of bridge work each under the
+   profiler, of which the Synapse enqueue `enqueueWithExternalEventsExt` is 37 us; the all-reduces go out on a
+   separate Synapse thread):
+   a) `habana_lazy/hpu_lazy_tensors.cpp:1504` `HbLazyTensor::ExecuteCachedGraph`: copies the input and output
+      `HbLazyTensor` vectors by value, builds the stack, copies scalars;
+   b) `habana_lazy/hlexec.cpp:132-188` `HlExec::Launch`: `ComputeSymSizeHashCode` + `ComputePermutationHashCode` over
+      every input, `GetGraphIndex`, then `CreateLauncher`, a new `HabanaLaunchOpPT` for every launch;
+   c) `backend/kernel/hpu_habana_launch_op_pt.cpp:5128` `HabanaLaunchOpPT::run`: `ProcessInputStack`, a new
+      `RecipeArgumentSpec` that hashes every input and the graph (`:5199-5221`);
+   d) `GetCachedRecipe` -> `backend/kernel/hpu_recipe_cache.cpp:101` `RecipeCacheLRU::get`: two hash-map lookups
+      under a mutex, each with a deep `RecipeArgumentSpec::operator==` (no pointer short-circuit; the memcmp of the
+      1-card sampler, section 7.5);
+   e) `:5082` `UpdatePatchingInformation`: rebuilds the whole patching table (input refs, intermediates, DMA inputs,
+      outputs, new output allocations), then `RecipeValueSpec::patch_launch_info` (also in the sampler);
+   f) `:4879` `ExecuteSynapseCache`: an inference-mode scan of every constant input per launch, then the enqueue.
+   The lean path: at the first replay of a captured graph keep each segment's `HabanaLaunchOpPT` (or its
+   `RecipeLauncher` and `syn_launch_info_` as a patch template) with the entries that change per replay marked (the
+   user inputs; the intermediates when the tensor cache is off); every later replay re-patches only those entries and
+   enqueues: a) to e) and the constant scan of f) go. Files: `backend/habana_device/HPUGraph.cpp`
+   (`SingleHPUGraph::replayGraph`), `habana_lazy/hpu_lazy_tensors.cpp`, `habana_lazy/hlexec.cpp`,
+   `backend/kernel/hpu_habana_launch_op_pt.cpp` and `.h` (a "prepared replay" entry). No Synapse or HCL change. Estimate
+   (INFERRED): a launch's main-thread cost from about 130 us to about 35-45 us (basis: TP8's fastest rank issues 148
+   launches in about 20 ms; the enqueue is 37 us under the profiler); **at 1 stream 148 x about 90 us = about 13 ms
+   less host time per step** (the 1-stream TP8 step from about 36 to about 23 ms, plus what the pin closes); **at 32
+   streams 209 x about 90 us = about 19 ms less host issue**, and the step becomes device-bound (about 84 to about
+   60 ms today, lower with the QSA change). Work: 2-3 days of bridge C++, our own bridge wheel in the farm image,
+   qualification on the tiny model (token parity) and `bench_replay.py` (per launch, `replay_seg`), then the real
+   model at 1 and 32 streams. Precondition: item 2 (we can build and load our own bridge on this stack).
+   The existing switch `PT_HPU_DISABLE_HPUGRAPH_REPLAY_HASHCHECK=1` (`HPUGraph.cpp:535-561`) removes c) only; 00134's
+   `cuthash` arm measures it.
+4. Next rental, the fork's full native runtime (coordinator, 23:46 UTC; lower than item 3 since the bridge-only path
+   needs no Synapse snapshot): (a) checked: farm-base has the SDK's public headers (`synapse_api.h`, `hccl.h`,
+   `hlthunk.h`, ...; no `scal.h`), the runtime libraries (`libSynapse.so`, `libhcl.so`, `libscal.so`,
+   `libSynapseMme.so`, ...), cmake, g++ 13, build-essential, protobuf-compiler (the distro's) and pybind11, no `-dev`
+   package; the three pins are public (`git ls-remote`): the bridge pin is the head of `v1.24.1`, HCL's and the
+   Synapse snapshot's are the heads of their `main` (the snapshot is the whole stack, 2024-06, older than 1.24.1;
+   the fork's 347 KB patch carries the backports); (b) the unattended build recipe is drafted, never run:
+   `tools/flash_next/native_runtime/build_native_runtime.sh` (stages: versions, sources at the pins, the fork's patches
+   through `apply_native_runtime.py`, HCL, Synapse through the snapshot's own environment and build order, the bridge,
+   the plugin's adapter, a tarball with a manifest); (c) not drafted yet: `tools/flash_next/replay/bench_native_tp4.py`,
+   the same TP4 body (2 plans of 48 x (x + c; `tp2_allreduce_plain`) on `[rows, 2560]` bf16, rows 1 and 32) under stock
+   lazy HPU-graph replay and under the fork's native joint replay, written on the pattern of
+   `tools/communication/check_dsv4_native_allreduce.py` (load the patched bridge, `set_prepared_communication(True)`,
+   `register_tp2_prepared_group_pass()`, `torch.compile(..., backend="hpu_backend")` in eager mode, capture under
+   `collect_prepared_group_replays`, then `replay_native_decoder` per step), plus a 30-minute `any:4` stub.
+5. After the node is gone (after 04:00 UTC): a snapshot of HEAD (`git archive HEAD | tar -x -C
    reports/native-replay/trees/gate-<sha>`), `bin/gate <snapshot> --tools`, the three worker test files and
    `tests/unit_tests/tools/test_bench_replay.py`, then `gh pr create --base feat/flash-next-gaudi --title "Replay
    benchmark, decode graphs without per-layer cuts, worker CPU placement, and the native-replay design" --body-file
    <body>` (draft: `reports/native-replay/probes/pr_body_1.txt`; add the pin flag; no absolute performance numbers in
    pull request text, AGENTS.md), `gh pr merge --merge`.
-3. What is left of the fixed cost (INFERRED, TP8, 1 stream, about 36 ms per step): about 16 ms of host-issued
-   collectives (98 x 165 us; they are a floor in count at TP8 + EP8, so only a cheaper host path per collective helps:
-   the fork's native plan, not portable in this rental), 2-4 ms of per-layer cuts (the cut flag), about 10 ms of
-   per-rank spread (the pin, if 00122 shows it), about 3.5 ms of Python around the forward (engine-step), and the
-   device time of the ops.
+6. What is left of the fixed cost (INFERRED, TP8, 1 stream, about 36 ms per step): the replay's launches on the main
+   thread (148 x about 130 us, about 20 ms on the fastest rank: item 3 takes about 13 ms of it), about 10 ms of
+   per-rank spread (the pin, if 00134 shows it), about 3.5 ms of Python around the forward (engine-step), and the
+   device time of the ops behind it. The collectives' count is a floor at TP8 + EP8 and they leave on a separate
+   Synapse thread.
