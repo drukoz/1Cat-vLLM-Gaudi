@@ -545,6 +545,7 @@ if TYPE_CHECKING:
     VLLM_HPU_PREFILL_PACING_SLICE_TOKENS: int = 2048  # prompt tokens of one step while streams decode, 0 no cap
     VLLM_HPU_SCHED_KNOBS_FILE: str = ""  # JSON file of scheduler knobs re-read at run time (experiments)
     VLLM_HPU_PROMPT_GRAPH_MAX_TOKENS: int = 0  # 0 upstream; >0 prompt forwards up to this size replay HPU graphs
+    VLLM_HPU_QSA_PREFILL_INDEXER_SPLIT: int = 0  # 0 every rank scores all prompt rows; 1 rows split over TP ranks
 
 
 def _optional_bool_env(name: str) -> Optional[bool]:
@@ -1971,6 +1972,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # tokens instead, so long-context prompt chunks replay graphs too. Decode is unchanged.
     "VLLM_HPU_PROMPT_GRAPH_MAX_TOKENS":
     lambda: int(os.environ.get("VLLM_HPU_PROMPT_GRAPH_MAX_TOKENS", "0")),
+
+    # QSA prompt indexer (HpuQsaIndexer.select, prompt branch). 0 (default): every TP rank scores every query row
+    # of a prompt chunk against all block keys (the projection and the compressed key cache are replicated, so
+    # all ranks compute the same selection). 1: rank r scores rows [r*T/tp, (r+1)*T/tp) and one all-gather per
+    # prompt row collects the block ids (fp32, exact); buckets that do not split evenly keep the default.
+    "VLLM_HPU_QSA_PREFILL_INDEXER_SPLIT":
+    lambda: int(os.environ.get("VLLM_HPU_QSA_PREFILL_INDEXER_SPLIT", "0")),
 }
 
 # end-env-vars-definition

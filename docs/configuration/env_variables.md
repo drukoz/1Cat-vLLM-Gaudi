@@ -192,6 +192,15 @@ positive value (for example `140000`) replays every chunk of a 128K prompt from
 graphs; each new (query, context) bucket is captured on first use. Decode is
 unchanged.
 
+`VLLM_HPU_QSA_PREFILL_INDEXER_SPLIT=1` splits the QSA indexer's prompt scoring
+over the tensor-parallel ranks. The indexer projection and the compressed key
+cache are replicated, so by default every rank scores every query row of a
+prompt chunk against all block keys (fp32 tiles of `[512, heads, context / 4]`
+and a top-k over `context / 4` blocks) and gets the same selection. With `1`,
+rank `r` scores rows `[r * T / tp, (r + 1) * T / tp)` and one all-gather per
+prompt row collects the selected block ids (sent as fp32, exact). A bucket that
+does not split evenly keeps the default. Default `0`.
+
 `VLLM_COMPACT_GDN` selects the compact-GDN fast path with per-token state
 checkpoints for GDN hybrids. Under prefix caching the platform hook defaults
 it to `0`, and starting with `VLLM_COMPACT_GDN=1` and prefix caching enabled is
