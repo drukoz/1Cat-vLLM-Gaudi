@@ -266,7 +266,8 @@ plan_r() {
     MODEL_ARGS=(--max-model-len "${len:-512}" --max-num-seqs 4 --language-model-only --trust-remote-code)
     say "tiny model $MODEL, model length ${len:-512}"
     export ANATOMY_PROBE_ARGS="--prompt-ids 8"
-    ANATOMY_S_PHASES="${ANATOMY_S_PHASES:-warm:1,4:24;1:1,4:24;1:4:24:min;1:4,1:24:tag=perf;3:4,1:16;2:4:8}" plan_s
+    # 400-token rounds: a tiny step takes milliseconds, and the node's sampler needs seconds of steady decode.
+    ANATOMY_S_PHASES="${ANATOMY_S_PHASES:-warm:1,4:400;1:1,4:400;1:4:24:min;1:4,1:400:tag=perf;1:1:400:tag=strace;3:4,1:16;2:4:8}" plan_s
     ANATOMY_E_PHASES="${ANATOMY_E_PHASES:-warm:1,4:12;3:1,4:16}" eager_server
 }
 
