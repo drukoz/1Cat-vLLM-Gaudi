@@ -50,16 +50,18 @@ def _uses_lmcache_connector() -> bool:
 
 _LAZY_ACC_PAR_ENV = "PT_HPU_LAZY_ACC_PAR_MODE"  # flashinfer_gaudi._native.LAZY_ACC_PAR_ENV
 _FUSED_CUSTOM_OP_FLAGS = ("VLLM_HPU_HC_FUSED", "VLLM_HPU_MOE_GLUE")  # both load the hc_fused_ops extension
+_QSA_FUSED_FLAG = "VLLM_HPU_QSA_FUSED"  # 2 and 3 load the qsa_fused_ops extension (0 and 1 are torch only)
 
 
 def _default_serial_lazy_accumulation(environ=None) -> str | None:
-    """With the fused hyper-connection or MoE glue kernels requested, default PT_HPU_LAZY_ACC_PAR_MODE to 0.
+    """With the fused hyper-connection, MoE glue or QSA kernels requested, default PT_HPU_LAZY_ACC_PAR_MODE to 0.
 
     A custom HPU op is not safe next to the lazy bridge's accumulation thread
     (``flashinfer_gaudi._native.lazy_accumulation_reason``), and the bridge may read the variable as soon as
     it is imported. So this runs first in ``register``, before the platform module imports the bridge, in the
     process that starts the workers; they inherit the value. Returns "0" when it set the variable and None
-    when it did nothing: neither flag is exactly 1, the process is eager (``PT_HPU_LAZY_MODE=0``), or the
+    when it did nothing: no kernel flag asks for a custom op (``VLLM_HPU_HC_FUSED`` or ``VLLM_HPU_MOE_GLUE``
+    exactly 1, ``VLLM_HPU_QSA_FUSED`` 2 or 3), the process is eager (``PT_HPU_LAZY_MODE=0``), or the
     variable is already set. A value the user set is never replaced; a lazy process that keeps the thread on
     gets no fused kernels from the loader.
     """
@@ -70,6 +72,10 @@ def _default_serial_lazy_accumulation(environ=None) -> str | None:
             requested = requested or int(environ.get(flag, "0")) == 1
         except ValueError:
             pass
+    try:
+        requested = requested or int(environ.get(_QSA_FUSED_FLAG, "0")) in (2, 3)
+    except ValueError:
+        pass
     if not requested or environ.get("PT_HPU_LAZY_MODE", "1").strip() == "0" or _LAZY_ACC_PAR_ENV in environ:
         return None
     environ[_LAZY_ACC_PAR_ENV] = "0"

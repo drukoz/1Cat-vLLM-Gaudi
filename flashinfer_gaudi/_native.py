@@ -774,7 +774,8 @@ def combined_db_serves_qsa_fused(combined: Path | str, kernel_db: str) -> bool:
 
 
 def _load_qsa_fused_locked() -> bool:
-    """The one attempt of ``load_qsa_fused_extension``: files, kernel database, schemas, then the extension."""
+    """The one attempt of ``load_qsa_fused_extension``: files, the bridge's accumulation mode
+    (``lazy_accumulation_reason``, as the hyper-connection loader), kernel database, schemas, then the extension."""
     package_lib = Path(__file__).resolve().parent / "lib"
     kernel_db = os.environ.get(QSA_FUSED_KERNEL_LIBRARY_ENV, "") or str(package_lib / QSA_FUSED_KERNEL_DB)
     extension = os.environ.get(QSA_FUSED_NATIVE_LIBRARY_ENV, "")
@@ -787,6 +788,12 @@ def _load_qsa_fused_locked() -> bool:
             _qsa_fused_error(f"{path}: file does not exist")
             missing = True
     if missing:
+        return False
+    # Before anything is registered: a lazy bridge with its accumulation thread on cannot run a custom op
+    # reliably (card rule 4); a process without the kernels runs the mode-1 torch data flow.
+    reason = lazy_accumulation_reason()
+    if reason:
+        _qsa_fused_error(reason)
         return False
     combined = _combined_kernel_db_path()
     serves = combined is not None and combined_db_serves_qsa_fused(combined, kernel_db)
