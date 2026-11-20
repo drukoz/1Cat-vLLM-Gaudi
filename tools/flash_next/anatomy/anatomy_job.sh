@@ -10,11 +10,21 @@
 # the coordinator's scale-base job), each with the step timer on and anatomy_probe.py against it, and the
 # one-card benchmarks the plan names.
 #
-# Plans: A = timer anatomy (modes 1, 4, 2, 3 at 1, 8, 32 streams), then a second server with the torch profiler
-# (HPU activities) and one capture of steady decode steps at 32 and at 1 stream. B = the one-card MME row sweep
-# (G1-1) and the small lazy-op cases side by side, then VLLM_CONFIG_HIDDEN_LAYERS 4 (and 12 with time left) at
-# 1 and 32 streams (I10 / G4-2). Q = one server, one short phase (a check of this script's plumbing). T = the
-# profiler capture with the Habana SDK in API-controlled mode (HABANA_PROFILE=1 and a profiler configuration file).
+# Plans: S = one server with the timer: spans without and with min_tokens at 1, 8, 32 streams, device waits (mode 3),
+# host sync points (mode 2). M = S plus decode rounds at longer contexts, then a second server with the torch
+# profiler (HPU activities) and one capture of steady decode steps at 32 and at 1 stream. T8 = S, then the capture
+# server when the hold allows (the 8-card form). L = VLLM_CONFIG_HIDDEN_LAYERS=4 against the default 1 (I10 / G4-2),
+# then a server without HPU graphs (--enforce-eager) in mode 3: the device time of every segment between two
+# collectives, so of every mixer and MoE block (4 ranks only: a mark_step before every collective stalled at 8
+# ranks in job 00012). A = S with the capture server and the one-card benches (job 00013's plan). B = the one-card
+# MME row sweep (G1-1) and the small lazy-op cases, then VLLM_CONFIG_HIDDEN_LAYERS 4 (and 12 with time left).
+# Q = one server, one short phase (a check of this script's plumbing). T = the profiler capture with the Habana
+# SDK in API-controlled mode (HABANA_PROFILE=1 and a profiler configuration file).
+#
+# A stage-2 job reads the file anatomy_late.sh next to its results folder (on the node:
+# ~/farm/<track>/results/anatomy_late.sh) before its plan starts: it may set ANATOMY_S_PHASES, ANATOMY_C_PHASES,
+# ANATOMY_TRACE_PHASES, ANATOMY_TRACE_LEVELS, ANATOMY_L_PHASES, ANATOMY_E_PHASES, ANATOMY_LAYERS, ANATOMY_ONE_SERVER,
+# so a job that waits in the queue can still be given what an earlier job taught.
 #
 # Every server: $RESULTS/<label>/{server0.log, probe.json, timing/step_timing_*.jsonl, versions.txt}.
 set -u
@@ -70,9 +80,15 @@ SP=""
 stop_server() {
     [ -n "$SP" ] || return 0
     kill -INT "$SP" 2>/dev/null
-    for _ in $(seq 1 36); do kill -0 "$SP" 2>/dev/null || break; sleep 5; done
+    for _ in $(seq 1 24); do kill -0 "$SP" 2>/dev/null || break; sleep 5; done
     kill -9 "$SP" 2>/dev/null
     pkill -9 -f "vllm serve" 2>/dev/null
+    # A worker that hangs in a step outlives its server and keeps its card: its process title is VLLM::Worker_TP<n>,
+    # which "vllm serve" does not match (job 00013: the next server and the one-card benches failed with "Device
+    # acquire failed"). Kill engine and workers by title and wait until none is left.
+    pkill -9 -f "VLLM::" 2>/dev/null
+    for _ in $(seq 1 30); do pgrep -f "VLLM::|vllm serve" > /dev/null 2>&1 || break; sleep 1; done
+    if pgrep -f "VLLM::|vllm serve" > /dev/null 2>&1; then say "processes of the stopped server are still alive:"; pgrep -af "VLLM::|vllm serve" | cut -c1-120; fi
     sleep 5
     SP=""
 }
@@ -139,28 +155,94 @@ plan_q() {
     serve q-smoke "warm:1:16;1:1:16" ""
 }
 
+# The timer rounds of one server. Mode 4 (dispatched ops) is not among them: in job 00013 its 23rd one-stream step
+# never returned (sample_tokens RPC timeout after 300 s, the engine died) and took the rest of the job along.
+S_PHASES="warm:1,8,32:128;1:1,8,32:128;1:1,8,32:128:min;1:32,1:128;3:32,1:64;3:32:64:min;2:32:24"
+# Decode at longer contexts (target-model prediction 1): 8 streams with about 4,000- and 16,000-token prompts; the
+# warm round fills the prefix cache, so the measured round decodes almost at once.
+C_PHASES="warm:8:64:ctx=4000;1:8:64:ctx=4000;warm:8:64:ctx=16000;1:8:64:ctx=16000"
+
+plan_s() {
+    base_env
+    serve s-timer "${ANATOMY_S_PHASES:-$S_PHASES}" ""
+}
+
+# trace_server LABEL: the torch profiler with HPU activities; mode 1 again (does the profiler setting cost time
+# when it is not capturing?), then one capture in the middle of a 32-stream and a 1-stream decode round. The
+# capture rounds are as long as the warm rounds (160 tokens): no bucket compiles inside a capture, and every
+# stream still decodes for seconds after the capture starts.
+trace_server() {
+    local label="$1"
+    base_env
+    export HABANA_PROFILE="${ANATOMY_HABANA_PROFILE:-profile_api_light}"
+    PROBE_EXTRA="--trace-tokens 160" serve "$label" "${ANATOMY_TRACE_PHASES:-warm:32,1:160;1:32,1:128}" \
+        "${ANATOMY_TRACE_LEVELS:-32,1}" \
+        --profiler-config '{"profiler": "torch", "torch_profiler_dir": "'"$RESULTS/$label"'/trace", "torch_profiler_with_stack": false, "torch_profiler_use_gzip": true, "torch_profiler_record_shapes": false}'
+    local rc=$?
+    ls -la "$RESULTS/$label/trace" 2>/dev/null | head -n 20
+    return "$rc"
+}
+
+plan_m() {
+    base_env
+    if [ "${ANATOMY_ONE_SERVER:-0}" = "1" ]; then
+        # One server for the timer rounds and the capture (when an earlier job showed that the profiler setting
+        # costs nothing while it is not capturing).
+        ANATOMY_TRACE_PHASES="${ANATOMY_S_PHASES:-$S_PHASES};${ANATOMY_C_PHASES-$C_PHASES}" trace_server m-timer-trace
+        return
+    fi
+    serve s-timer "${ANATOMY_S_PHASES:-$S_PHASES};${ANATOMY_C_PHASES-$C_PHASES}" ""
+    trace_server m-trace
+}
+
+plan_t8() {
+    # The 8-card form: the timer rounds first (the decisive part), then the capture server when the hold leaves
+    # the ten minutes it needs.
+    if [ "${ANATOMY_ONE_SERVER:-0}" = "1" ]; then
+        ANATOMY_TRACE_PHASES="${ANATOMY_S_PHASES:-$S_PHASES}" trace_server s-timer-trace
+        return
+    fi
+    plan_s
+    if [ $(( ${ANATOMY_HOLD_S:-1500} - SECONDS )) -ge 600 ]; then
+        ANATOMY_TRACE_PHASES="${ANATOMY_TRACE_PHASES:-warm:32,1:160}" trace_server m-trace
+    else
+        say "no time left for the capture server ($SECONDS s used of ${ANATOMY_HOLD_S:-1500})"
+    fi
+}
+
+plan_l() {
+    # I10 / G4-2: the per-decoder-layer mark_step every 4 layers (default: every layer). Compare with plan S's
+    # s-timer of the same commit on the same card count.
+    base_env
+    export VLLM_CONFIG_HIDDEN_LAYERS="${ANATOMY_LAYERS:-4}"
+    serve "l-layers$VLLM_CONFIG_HIDDEN_LAYERS" "${ANATOMY_L_PHASES:-warm:1,8,32:128;1:1,8,32:128;1:32,1:128;3:32,1:64}" ""
+    # The device time of every segment between two collectives: no HPU graphs (--enforce-eager: the forward runs
+    # in Python every step), timer mode 3 (mark_step and synchronize before and after every collective, warm
+    # rounds too, so the measured rounds compile nothing). Per layer: the segment in front of the first all-reduce
+    # is hyper-connection + mixer (GDN, or QSA in every fourth layer), in front of the second hyper-connection +
+    # MoE; the segment after the last collective is logits and sampler (with the min_tokens mask in the :min round).
+    if [ "$TP" -gt 4 ]; then
+        say "no eager mode-3 server on $TP ranks (job 00012: a mark_step before every collective stalled at 8 ranks)"
+        return
+    fi
+    if [ $(( ${ANATOMY_HOLD_S:-2400} - SECONDS )) -lt 840 ]; then
+        say "no time left for the eager mode-3 server ($SECONDS s used of ${ANATOMY_HOLD_S:-2400})"
+        return
+    fi
+    base_env
+    PROBE_EXTRA="--warm-mode 3" serve e-eager "${ANATOMY_E_PHASES:-warm:1,32:32;3:1,32:48;3:32:48:min}" "" --enforce-eager
+}
+
 plan_a() {
-    # A1: the timer modes on one server. Warm every level at the measured length first, then mode 1 (spans),
-    # 4 (dispatched ops), 2 (host sync points), 3 (device waits around the forward, the sampler and, when the
-    # forward runs in Python, every collective). Riskiest last.
-    base_env
-    serve a1-timer "warm:1,8,32:128;1:1,8,32:128;4:1,32:24;2:32:24;3:1,32:64" ""
+    # Job 00013's plan with what it taught: the timer server, the capture server, then the one-card benches.
+    plan_s
     local a1=$?
-    # A2: the torch profiler with HPU activities; mode 1 again (does the profiler setting cost time when it is
-    # not capturing?), then one capture in the middle of a 32-stream and a 1-stream decode round. When the
-    # timed server did not come up, the capture runs without the timer.
-    base_env
     if [ "$a1" -eq 3 ] || [ "$a1" -eq 4 ]; then
-        say "a1-timer did not serve (rc $a1): the profiler server runs with VLLM_HPU_STEP_TIMING=0"
+        say "s-timer did not serve (rc $a1): the profiler server runs with VLLM_HPU_STEP_TIMING=0"
         export VLLM_HPU_STEP_TIMING=0
     fi
-    export HABANA_PROFILE=profile_api_light
-    # The capture rounds are as long as the warm rounds (160 tokens): no bucket compiles inside a capture, and
-    # every stream still decodes for seconds after the capture starts.
-    PROBE_EXTRA="--trace-tokens 160" serve a2-trace "warm:32,1:160;1:32,1:96" "32,1" \
-        --profiler-config '{"profiler": "torch", "torch_profiler_dir": "'"$RESULTS"'/a2-trace/trace", "torch_profiler_with_stack": false, "torch_profiler_use_gzip": true, "torch_profiler_record_shapes": false}'
-    ls -la $RESULTS/a2-trace/trace 2>/dev/null | head -n 20
-    # A3: the one-card benches with what is left of the job's 50-minute hold (SIGTERM at 3,000 s), 2 minutes spare.
+    trace_server a2-trace
+    # The one-card benches with what is left of the job's 50-minute hold (SIGTERM at 3,000 s), 2 minutes spare.
     local left=$(( ${ANATOMY_HOLD_S:-3000} - SECONDS - 120 ))
     if [ "$left" -ge 240 ]; then
         run_benches $(( left > 600 ? 600 : left ))
@@ -226,7 +308,7 @@ plan_b() {
     if [ "$SECONDS" -lt 1800 ]; then
         base_env
         export VLLM_HPU_FUSED_GREEDY_LOGITS=1
-        serve b-fused-greedy "warm:1,32:128;warm:1,32:128:nomin;1:1,32:128;1:1,32:128:nomin" ""
+        serve b-fused-greedy "warm:1,32:128:min;warm:1,32:128;1:1,32:128:min;1:1,32:128" ""
         unset VLLM_HPU_FUSED_GREEDY_LOGITS
     else
         say "no time left for the fused greedy rider ($SECONDS s used)"
@@ -240,10 +322,21 @@ plan_b() {
     fi
 }
 
-say "plan $PLAN, bundle $(sed -n 's/^plugin sha: //p' /bundle/BUNDLE.txt 2>/dev/null)"
+say "plan $PLAN, stage $STAGE, $TP cards, bundle $(sed -n 's/^plugin sha: //p' /bundle/BUNDLE.txt 2>/dev/null)"
 install_stack
+LATE="$(dirname "$RESULTS")/anatomy_late.sh"
+if [ "$STAGE" -eq 2 ] && [ -f "$LATE" ]; then
+    say "late settings from $LATE:"
+    cat "$LATE"
+    # shellcheck disable=SC1090  # the track's own file on the node
+    . "$LATE"
+fi
 case "$PLAN" in
     A) plan_a ;;
+    S) plan_s ;;
+    M) plan_m ;;
+    T8) plan_t8 ;;
+    L) plan_l ;;
     B) plan_b ;;
     Q) plan_q ;;
     T) plan_t ;;

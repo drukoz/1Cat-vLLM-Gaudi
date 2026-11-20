@@ -90,7 +90,7 @@ WARM_PASS_FILE = "warm-pass.json"
 # on (tools/flash_next/anatomy). Every level is warmed at the measured length, so no measured round compiles.
 ANATOMY_PROBE = "tools/flash_next/anatomy/anatomy_probe.py"
 ANATOMY_SUMMARY = "tools/flash_next/anatomy/summarize_timing.py"
-ANATOMY_PHASES = "warm:1,8,32:128;1:1,8,32:128;4:1,32:24;3:1,32:64"
+ANATOMY_PHASES = "warm:1,8,32:128;1:1,8,32:128;3:1,32:64"
 ANATOMY_TIMEOUT_S = 2400.0
 ANATOMY_IDLE_S = 3.0  # seconds between the probe's rounds: the timer writes a round's steps after 2 idle s
 ANATOMY_STATUS_FILE = "anatomy.json"
