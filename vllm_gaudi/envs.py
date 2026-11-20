@@ -538,6 +538,11 @@ if TYPE_CHECKING:
     VLLM_HPU_COLLECTIVE_MARK_STEP: int = 1  # 1 (default) mark_step() before every HPU collective, 0 none
     VLLM_HPU_DECODE_CUT_INTERVAL: int = 0  # 0 (default) decode keeps the per-layer cuts, N cut every N-th layer
     VLLM_HPU_GRAPH_ASYNC_REPLAY: int = 0  # 0 (default) the model's HPU graph replays synchronously, 1 asynchronously
+    VLLM_HPU_VOCAB_PARALLEL_LOGITS: int = 0  # VocabParallelMode: 0 logits all-gather (default), 1 greedy, 2 candidates
+    VLLM_HPU_REPLICATED_EMBEDDING: int = 0  # 0 vocabulary-sharded token embedding (default), 1 one full copy per rank
+    VLLM_HPU_MTP_REPLICATED_FC: int = 0  # 0 the MTP fc linears shard and all-gather (default), 1 unsharded
+    VLLM_HPU_PLE_TABLE_RIDER: int = 0  # 0 the PLE table rows get their own all-reduce (default), 1 on the embedding's
+    VLLM_HPU_ALL_REDUCE_AS_GATHER_ROWS: int = 0  # all-reduces of at most N rows run as all-gather + local sum; 0 never
     VLLM_HPU_RECURRENT_STATE_POOL: int = 0  # RecurrentStatePoolMode: 0 off, 1 pool
     VLLM_HPU_RECURRENT_STATE_POOL_SLOTS: int = 0  # resolved by the hook; positive overrides the formula
     VLLM_HPU_RECURRENT_STATE_POOL_CACHE_SLOTS: int = 512  # retained prefix states added to the live need
@@ -1939,6 +1944,37 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # docs/design/flash-next/native-replay.md.
     "VLLM_HPU_GRAPH_ASYNC_REPLAY":
     lambda: int(os.environ.get("VLLM_HPU_GRAPH_ASYNC_REPLAY", "0")),
+
+    # Collective cuts of a tensor-parallel Flash-Next step (docs/design/flash-next/collectives.md). All default 0.
+    # VLLM_HPU_VOCAB_PARALLEL_LOGITS: 0 = every consumer gets the all-gathered logits; 1 = arg-max consumers
+    # (plain greedy decode, MTP drafts, greedy MTP verification) reduce each rank's vocabulary shard first and
+    # gather [rows, 2] fp32 per rank; 2 = 1, and callers of vocab_parallel.top_k get the per-rank top
+    # candidates gathered instead of the logits (no serving path calls it yet: the building block of sampled
+    # verification). Any other value is 0. Not yet run on a card.
+    "VLLM_HPU_VOCAB_PARALLEL_LOGITS":
+    lambda: int(os.environ.get("VLLM_HPU_VOCAB_PARALLEL_LOGITS", "0")),
+    # VLLM_HPU_REPLICATED_EMBEDDING=1: every rank holds the whole token embedding of a Flash-Next model
+    # (about 1.1 GiB more per card at TP8) and looks its rows up alone, so the embedding all-reduce is gone,
+    # in the target and in the MTP draft. Read when the model is built. Not yet run on a card.
+    "VLLM_HPU_REPLICATED_EMBEDDING":
+    lambda: int(os.environ.get("VLLM_HPU_REPLICATED_EMBEDDING", "0")),
+    # VLLM_HPU_MTP_REPLICATED_FC=1: the two hidden x hidden linears at the entry of the Flash-Next MTP draft
+    # (fc_embedding, fc_hidden) are built unsharded, so the two all-gathers of every draft step are gone
+    # (about 11 MiB more per card for each). Read when the draft is built. Not yet run on a card.
+    "VLLM_HPU_MTP_REPLICATED_FC":
+    lambda: int(os.environ.get("VLLM_HPU_MTP_REPLICATED_FC", "0")),
+    # VLLM_HPU_PLE_TABLE_RIDER=1: the Flash-Next target looks its PLE n-gram table rows up before the token
+    # embedding and sums both over the ranks in one all-reduce (extra columns), so the table's own all-reduce
+    # is gone. Needs the vocabulary-sharded embedding (no effect with VLLM_HPU_REPLICATED_EMBEDDING=1).
+    # Not yet run on a card.
+    "VLLM_HPU_PLE_TABLE_RIDER":
+    lambda: int(os.environ.get("VLLM_HPU_PLE_TABLE_RIDER", "0")),
+    # VLLM_HPU_ALL_REDUCE_AS_GATHER_ROWS=N > 0: an HPU tensor-parallel all-reduce of at most N rows (first dim)
+    # runs as an all-gather of every rank's partial and a local fp32 sum (the same bits on every rank); larger
+    # ones stay all-reduces. 0 (default) = never. For the small decode buckets, where one gather phase may cost
+    # less than the two phases of an all-reduce (C4 without the kernel). Not yet run on a card.
+    "VLLM_HPU_ALL_REDUCE_AS_GATHER_ROWS":
+    lambda: int(os.environ.get("VLLM_HPU_ALL_REDUCE_AS_GATHER_ROWS", "0")),
 
     # Recurrent (GDN / short-conv) state pool: 0 (default) keeps today's
     # one-recurrent-slot-per-attention-block-id allocation, 1 gives the

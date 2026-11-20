@@ -46,6 +46,10 @@ class HpuCommunicator(DeviceCommunicatorBase):
         if (gaudi_envs.VLLM_HPU_DSV4_NATIVE_DECODE_GRAPH and torch.compiler.is_compiling()
                 and input_.shape == (1, 4096) and input_.dtype == torch.bfloat16):
             return torch.ops.vllm_gaudi.tp2_allreduce_plain(input_)
+        gather_rows = int(gaudi_envs.VLLM_HPU_ALL_REDUCE_AS_GATHER_ROWS)
+        if (gather_rows > 0 and input_.dim() >= 1 and input_.is_floating_point() and input_.shape[-1] > 0
+                and 0 < input_.numel() // input_.shape[-1] <= gather_rows):  # rows: every dim but the last
+            return self._all_reduce_as_gather(input_)
         # FIXME(kzawora): this is a workaround for a bug in Habana PT bridge
         # occurring when PT_HPU_ENABLE_LAZY_COLLECTIVES=true env var is used
         # (which is required for tensor parallel HPUGraph inference)
@@ -54,6 +58,24 @@ class HpuCommunicator(DeviceCommunicatorBase):
             htorch.core.mark_step()
         dist.all_reduce(input_, group=self.device_group)
         return input_
+
+    def _all_reduce_as_gather(self, input_: torch.Tensor) -> torch.Tensor:
+        """``VLLM_HPU_ALL_REDUCE_AS_GATHER_ROWS``: the sum of every rank's ``input_`` as an all-gather and a local sum.
+
+        Every rank gathers all ``world`` partial tensors (7 times the payload on the wire against about 1.75 times
+        for a ring all-reduce, one collective phase instead of two) and sums them itself in fp32, in the same op
+        on every rank, so every rank holds the same bits. Out of place: ``input_`` is not written.
+        """
+        from vllm_gaudi import envs as gaudi_envs
+        rows = input_.shape[0]
+        gathered = torch.empty((self.world_size * rows, ) + tuple(input_.shape[1:]),
+                               dtype=input_.dtype,
+                               device=input_.device)
+        if gaudi_envs.VLLM_HPU_COLLECTIVE_MARK_STEP:
+            htorch.core.mark_step()
+        dist.all_gather_into_tensor(gathered, input_.contiguous(), group=self.device_group)
+        summed = gathered.view((self.world_size, ) + tuple(input_.shape)).sum(dim=0, dtype=torch.float32)
+        return summed.to(input_.dtype)
 
     def all_gather(self, input_: torch.Tensor, dim: int = -1) -> torch.Tensor:
         world_size = self.world_size
