@@ -10,7 +10,7 @@ repository is under `/Volumes/Storage/Claude/gaudi-work/reports/spec-lookup/` (`
 
 ## Handoff (if this agent stops)
 
-State at **2026-11-20 23:45 UTC** (fourth agent, Opus 5.5). Branch head: the commit that holds this text, pushed.
+State at **2026-11-20 23:50 UTC** (fourth agent, Opus 5.5). Branch head: the commit that holds this text, pushed.
 It contains the program head `938dada4` (merged as `49eb18cb`: PR #14 collectives), mtp-card-ready through
 `f1aa2292` and every commit of this track. The node ends about 04:00 UTC on 2026-11-21: everything on it is lost.
 
@@ -21,14 +21,14 @@ It contains the program head `938dada4` (merged as `49eb18cb`: PR #14 collective
 |---|---|---|
 | 00086, 00087, 00107, 00114 | tiny-model rehearsals (n-gram k = 3 and 8, vLLM's search, the hybrid with the torch and the fused GDN verification) | ended ok 20:33 to 20:38 UTC; read, reported to the coordinator; numbers in section 7 |
 | 00095 `real4-nospec-edit-prose` | real model, no speculation, TP4 + EP4: the reference and the token ids for the replay | ended ok 23:22 UTC; numbers and the replay in section 7 |
-| **00129 `real4-ngram5-edit2`** (any:4, 45 min; replaced 00120 with `--replaces`, keeping its place and the coordinator's bump) | real model, n-gram k = 5 with prefix caching and the fused GDN verification op (`--env VLLM_HPU_GDN_CORE_VERIFY=1`), rounds `edit:1:384`, `edit:32:384`, `prose:32:256`, `prose:1:256` (the same rounds and prompts as 00095); if that server dies, is not healthy or its probe fails (rc 3, 4, 5), the same job reruns n-gram k = 5 with the torch verification into `torch-verify/` (rounds `edit:1`, `edit:32`); commit `54990f1f` | **waiting** (submitted 23:36 UTC; "starts by 02:09 UTC at the latest", behind the integration and MTP jobs). Its local waiter writes `reports/spec-lookup/card/submit-real4-ngram5-edit2.log`; if that waiter is gone: `bin/farm fetch spec-lookup 00129 00129-real4-ngram5-edit2` |
+| **00133 `real4-ngram5-edit3`** (any:4, 45 min; replaced 00120 and then 00129 with `--replaces`, keeping the place and the coordinator's bump) | real model, n-gram k = 5 with prefix caching and the fused GDN verification op (`--env VLLM_HPU_GDN_CORE_VERIFY=1`), `--env VLLM_GRAPH_RESERVED_MEM=0.5` (BRIEF 23:22 UTC: graphs made at run time), `hlsmi.log` every 15 s, rounds `edit:1:384`, `edit:32:384`, `prose:32:256`, `prose:1:256` (the same rounds and prompts as 00095); if that server dies, is not healthy or its probe fails (rc 3, 4, 5), the same job reruns n-gram k = 5 with the torch verification into `torch-verify/` (rounds `edit:1`, `edit:32`); commit `f2b86e91` | **waiting** (submitted 23:46 UTC; "starts by 01:55 UTC at the latest", behind the integration and MTP jobs). Its local waiter writes `reports/spec-lookup/card/submit-real4-ngram5-edit3.log`; if that waiter is gone: `bin/farm fetch spec-lookup 00133 00133-real4-ngram5-edit3` |
 
-When 00129 ends:
+When 00133 ends:
 ```bash
 cd /Volumes/Storage/Claude/gaudi-work/wt/spec-lookup
 C=/Volumes/Storage/Claude/gaudi-work/reports/spec-lookup/card
-python3 tools/flash_next/lookup_summary.py $C/00095-real4-nospec-edit-prose $C/00129-real4-ngram5-edit2
-grep -E "MEAS|fallback|DONE|ERROR|^job:" $C/00129-real4-ngram5-edit2/probe.log $C/00129-real4-ngram5-edit2.log
+python3 tools/flash_next/lookup_summary.py $C/00095-real4-nospec-edit-prose $C/00133-real4-ngram5-edit3
+grep -E "MEAS|fallback|DONE|ERROR|^job:" $C/00133-real4-ngram5-edit3/probe.log $C/00133-real4-ngram5-edit3.log
 ```
 and report to the coordinator (SendMessage `main`) and in section 7: measured tokens per step against the replay
 (edit k = 5: 4.72), ms per step at 1 stream and at 32 streams (192 rows), ms per token against 00095 (29.9 and
@@ -36,32 +36,34 @@ and report to the coordinator (SendMessage `main`) and in section 7: measured to
 the prose round at 32 streams (the ragged-width penalty), and whether the 1-stream edit stream equals 00095's
 token for token (`lookup_summary.py` prints it; a difference is a defect unless it is a near-tie).
 
-**The gate.** A gate of this worktree (`bin/gate .../wt/spec-lookup --tools`, pid 29898, started by the third
-agent about 20:10 UTC) waits for the shared lock behind other tracks' gates (one gate at a time on the Mac); it
-tests the worktree as it is when it starts and writes `reports/spec-lookup/logs/gate_8dfb638a.log` (the name is
-the old head; the tree is the current one). Do not start a second one; check that log.
+**The gate and pull requests.** BRIEF 23:21 UTC: card evidence first, pull requests only after the node is gone
+(after 04:00 UTC, when the Mac's CPUs are free); a gate that was only waiting leaves the queue. This track's
+waiting gate (pid 29898) was stopped at 23:41 UTC (`reports/spec-lookup/logs/gate_8dfb638a.log`, rc 143; it
+never held the lock). Run `bin/gate <worktree> --tools` after 04:00 UTC.
 
 **Pending, in order**
 
-1. 00129's numbers (above); the coordinator asked for (a) the 1-stream edit ms per token and tok/s per stream,
+1. 00133's numbers (above); the coordinator asked for (a) the 1-stream edit ms per token and tok/s per stream,
    (b) `c` at 32 streams on the head's path, (c) the hybrid on the mixed load from the same numbers (7.4). If the
    fused-verification server failed, the job's own fallback ran the torch verification (`torch-verify/`); the
-   first server's traceback is in `00129-real4-ngram5-edit2/server0.log`.
-2. **Merge** per the protocol once the gate is green and 00129 has run: `git fetch origin && git merge
-   origin/feat/flash-next-gaudi`, `bin/gate <worktree> --tools`, push, `gh pr create --base feat/flash-next-gaudi`,
-   `gh pr merge --merge`. Card-proven so far: n-gram with prefix caching (tiny model: 00086 k = 3, 00087 k = 8 and
-   vLLM's search; real model: 00129), the hybrid (tiny model, 00107 torch and 00114 fused verification). All flags
-   of this track default off (`VLLM_HPU_FLASH_NEXT_SPEC_LOOKUP`, `..._LOOKUP_MIN_NGRAM`, `..._LOOKUP_MAX_NGRAM`,
-   `..._LOOKUP_ORACLE`); n-gram itself is chosen by `--speculative-config`. This branch contains mtp-card-ready's
-   commits through `f1aa2292` (not yet on the program head). **Blocked on mtp-card-ready (23:45 UTC):** on the
-   merged head `tests/unit_tests/models/flash_next/test_engine_mtp.py` fails one test, run alone
+   first server's traceback is in `00133-real4-ngram5-edit3/server0.log`.
+2. **Merge after 04:00 UTC** (BRIEF 23:21), after mtp-card-ready's own pull request: their sampled-verification
+   fix `0d1be6fc` is on origin since about 23:40 UTC (`origin/feat/flash-next-gaudi-mtp-card-ready` at `fb3c2fb3`),
+   but their branch also carries merges of qsa-fused and kernel-fixes, so do not merge their branch here: wait for
+   their pull request to land on the program head, then `git fetch origin && git merge origin/feat/flash-next-gaudi`,
+   `bin/gate <worktree> --tools`, push, `gh pr create --base feat/flash-next-gaudi`, `gh pr merge --merge`.
+   Until then the gate is red on their test: on this branch's merged head
+   `tests/unit_tests/models/flash_next/test_engine_mtp.py` fails one test, run alone
    (`test_sampled_requests_through_the_speculative_engine`: "output with shape [1, 248320] doesn't match the
-   broadcast shape [4, 248320]"; 13 passed; `reports/spec-lookup/logs/m8_test_engine_mtp_54990f1f.log`). It is
-   their sampled-verification path, red since the program head's merge; their fix `0d1be6fc` exists only in
-   their local worktree (origin still at `f1aa2292`). Do not cherry-pick it: wait until it is on origin or on
-   the program head (their pull request), merge the program head again, rerun the gate, then this pull request.
-   The coordinator knows (23:45 UTC). Their commit also says every speculative step on `f1aa2292` + head runs
-   one discarded sampler pass over the `1 + k` padded rows: a small extra cost inside 00129's numbers.
+   broadcast shape [4, 248320]"; 13 passed; `reports/spec-lookup/logs/m8_test_engine_mtp_54990f1f.log`), red since
+   the program head's merge into `f1aa2292`, fixed by `0d1be6fc`. Their commit also says every speculative step on
+   `f1aa2292` + head runs one discarded sampler pass over the `1 + k` padded rows: a small extra cost inside
+   00133's numbers. Card-proven so far: n-gram with prefix caching (tiny model: 00086 k = 3, 00087 k = 8 and
+   vLLM's search; real model: 00133), the hybrid (tiny model, 00107 torch and 00114 fused verification). All flags
+   of this track default off (`VLLM_HPU_FLASH_NEXT_SPEC_LOOKUP`, `..._LOOKUP_MIN_NGRAM`, `..._LOOKUP_MAX_NGRAM`,
+   `..._LOOKUP_ORACLE`); n-gram itself is chosen by `--speculative-config`. Tonight the integration track builds
+   from pushed branches directly: tell the coordinator the commit and the proven flags (done at 23:47 UTC for
+   `ff3fbbc9`).
 3. **Rows at 32 streams** (section 7): an n-gram step is as wide as its longest draft, an empty draft is the
    2-row placeholder, so 32 streams carry `32 (1 + k)` rows as soon as one stream drafts. Two code steps would
    fix the economics of a mixed load: per-request (ragged) verification rows (rows `sum(1 + d_i)`, not
@@ -274,7 +276,7 @@ accepted per row; MTP rows 0 accepted, a random model.)
   a random model with flat logits (INFERRED). Two (prompt, position) pairs differ only with accepted drafts
   (the 100-token prompt at token 28 in three jobs, the second turn at token 14 in two): **not classified**,
   because the baseline's log-probability request crashed the server (below). The real-model run at one stream
-  (00129 against 00095) is the check.
+  (00133 against 00095) is the check.
 - Defect found on the way (reported to the coordinator, owner engine-step / the sampler): a `/v1/completions`
   request with `logprobs: 5` killed the HPU server's output handler: `OverflowError: out of range integral type
   conversion attempted` in the detokenizer of the top-logprob ids (`00086-.../baseline/server0.log`, about line
@@ -342,7 +344,7 @@ per step (7.3). With `rho = c / T32` the speed-up on edits is `a / (1 + 32 k rho
 - Break-even `rho*` = `(a - 1) / (32 k)`: 0.026 (k = 3), 0.024 (k = 5), 0.021 (k = 8), 0.017 (k = 16).
 - The optimum is flat: k = 3 to 6 lie within 3 % of each other for rho 0.01 to 0.017.
 - One stream (T1 = 30 ms at TP4, a host-bound step): every depth pays; with an assumed 0.5 ms per extra row,
-  k = 5 gives about 6.7 ms per token (x4.5) and k = 8 about 5.2 (x5.8). 00129 measures it.
+  k = 5 gives about 6.7 ms per token (x4.5) and k = 8 about 5.2 (x5.8). 00133 measures it.
 - Prose at 32 streams: the n-gram server loses at every depth (x0.58 at rho 0.017, k = 3; x0.67 at rho 0.011).
 - Mixed load at 32 streams, a share `f` of the streams in an edit span: the n-gram server runs
   `(T32 + c (R - 32)) / (f a_L + (1 - f))` (R = `32 (1 + k)` once any stream drafts; 76 rows at k = 3 when all
@@ -367,7 +369,7 @@ per step (7.3). With `rho = c / T32` the speed-up on edits is `a / (1 + 32 k rho
   a pure copy load, until its rows become per-request (Handoff, pending 3). At one stream both pay (the step is
   host-bound): MTP alone 1.69x at TP4 (00099 / 00104), n-gram on edits x4 to x6 by 7.4.
 
-### 7.5 n-gram on the real model (job 00129): pending
+### 7.5 n-gram on the real model (job 00133): pending
 
 ## 8. Notes for other tracks
 
