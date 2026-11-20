@@ -345,15 +345,27 @@ per step (7.3). With `rho = c / T32` the speed-up on edits is `a / (1 + 32 k rho
   k = 5 gives about 6.7 ms per token (x4.5) and k = 8 about 5.2 (x5.8). 00129 measures it.
 - Prose at 32 streams: the n-gram server loses at every depth (x0.58 at rho 0.017, k = 3; x0.67 at rho 0.011).
 - Mixed load at 32 streams, a share `f` of the streams in an edit span: the n-gram server runs
-  `(T32 + 32 k c) / (f a_L + (1 - f))`; the hybrid (MTP rows on prose, lookup rows on edits, always 1 + k wide,
-  plus the MTP draft passes `D` per step) runs `(T32 + 32 k c + D) / (f a_H + (1 - f) a_M)`, with `a_L` the
-  lookup tokens per step (3.48 at k = 3), `a_M` MTP's (2.6 to 2.8) and `a_H` the hybrid's on edits (about
-  `0.87 x 3.86 + 0.13 x a_M` = 3.7 at k = 3: lookup on the 87 % of steps with a match, MTP on the rest). On the
-  head's path at TP4 (T32 = 108, c = 1.8, so `D` = 338 - 281 = about 57 ms for three draft passes, INFERRED):
-  f = 0: n-gram x0.58 (76 rows), hybrid x0.86; f = 0.5: n-gram x0.86, hybrid x1.02; f = 1: n-gram x1.34,
-  hybrid x1.18 (a_M = 2.7).
-  The hybrid is the safer server for a mixed load; the n-gram server only for a pure copy load, until the rows
-  become per-request (Handoff, pending 3).
+  `(T32 + c (R - 32)) / (f a_L + (1 - f))` (R = `32 (1 + k)` once any stream drafts; 76 rows at k = 3 when all
+  write prose); the hybrid (MTP rows on prose, lookup rows on edits, always `1 + k` wide, plus the MTP draft
+  passes and the rest of a speculative step, `D`) runs `(T32 + 32 k c + D) / (f a_H + (1 - f) a_M)`, with
+  `a_L` the lookup tokens per step (3.48 at k = 3), `a_M` MTP's (about 2.5 at 32 streams, coordinator 23:19
+  UTC) and `a_H` the hybrid's on edits (about `0.87 x 3.86 + 0.13 x a_M` = 3.68 at k = 3: lookup on the 87 % of
+  steps with a match, MTP on the rest; INFERRED, the step boundaries move with the acceptance). Inputs at TP4,
+  k = 3: on the head's QSA path `c` = (303 - 109) / 96 = 2.0 ms per verification row and `D` = 338 - 303 =
+  about 35 ms (00104's step timer: forward 109 / 303 ms at 32 / 128 rows, an MTP step 338 ms, a draft pass 4 to
+  11 ms); with the QSA data-flow change `T32` = 73.4 and `c` about 0.84 (decode rows, 00063; for verification
+  rows not yet measured), `D` assumed unchanged. Speed-up against no speculation (INFERRED):
+
+  | Path (TP4, k = 3) | Server | f = 0 (all prose) | f = 0.5 | f = 1 (all edits) |
+  |---|---|---|---|---|
+  | head's QSA path | n-gram | x0.55 | x0.80 | x1.24 |
+  | head's QSA path | hybrid | x0.80 | x0.99 | x1.18 |
+  | QSA data-flow change | n-gram | x0.66 | x1.07 | x1.66 (k = 4 to 5: x1.69) |
+  | QSA data-flow change | hybrid | x0.97 | x1.20 | x1.43 |
+
+  The hybrid is the server for a mixed load once the verification rows are cheap; the n-gram server wins only on
+  a pure copy load, until its rows become per-request (Handoff, pending 3). At one stream both pay (the step is
+  host-bound): MTP alone 1.69x at TP4 (00099 / 00104), n-gram on edits x4 to x6 by 7.4.
 
 ### 7.5 n-gram on the real model (job 00129): pending
 
