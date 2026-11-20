@@ -546,12 +546,13 @@ fault of a kernel. The items are kept as they were written.
 
 # MoE glue kernels (`VLLM_HPU_MOE_GLUE`)
 
-Version 1, 2026-11-19. Four more Gaudi2 TPC kernels in the same library (`libhc_fused_gaudi2.so`) and the same op
+Version 2, 2026-11-20. Four more Gaudi2 TPC kernels in the same library (`libhc_fused_gaudi2.so`) and the same op
 extension (`hc_fused_ops*.so`). They replace the element-wise torch code of one Flash-Next MoE block: the routing
 (softmax, top-k, renormalization, casts), the shared expert's SiLU-multiply, the per-row FP8 quantization of the routed
 experts' input, and the shared-gate multiply with the final add. The GEMMs stay on the matrix engine and the routed
 experts stay the vendor op `torch.ops.hpu.mixture_of_experts`. The kernels pass on the Gaudi2 instruction simulator
-against the torch oracle; nothing here has run on a card ("Unproven without a card" below).
+against the torch oracle. Their card test ran on a Gaudi2 card for the first time on 2026-11-20 ("First card run"
+below): 82 of 84 tests passed; one of the two failures is fixed here and not yet rerun on a card, the other is open.
 
 Everything is behind the flag `VLLM_HPU_MOE_GLUE`, **default 0**. With 0 no state is attached to a MoE block, no weight
 is built, nothing is loaded, registered or logged, and the block dispatches the ops it dispatched before (pinned by an
@@ -700,19 +701,25 @@ instruction (`#pragma clang fp contract(off)`).
 - **`moe_silu_mul`** rounds the SiLU to bf16 before the multiplication, as `F.silu(x[..., :d]) * x[..., d:]` does on
   bf16 tensors. The product of two bf16 values is exact in fp32.
 - **`moe_combine`** rounds the gate weight, the gated shared output and the sum, each to bf16.
-- **`moe_row_quant`**: `scale = bf16(bf16(max|x| + bf16(1e-8)) / 240)`, `inverse = bf16(1 / scale)`,
+- **`moe_row_quant`**: `scale = bf16(bf16(max|x| + bf16(1e-8)) * bf16(1/240))`, `inverse = bf16(1 / scale)`,
   `x_fp8 = fp8(bf16(x * inverse))`, the default branch of `dynamic_quant` (`vllm_gaudi/extension/ops.py`) around
-  the vendor cast, which multiplies in the input dtype before it casts. The division is a multiplication by
-  `fp32(1/240)`: rounded to bf16 it is the quotient for every one of the 32,639 possible row maxima (simulator case
-  `row_quant_every_amax`). The cast is round-to-nearest-even with the result clipped to 240, the conversion and
-  packing sequence of the card-proven `csrc/deepseek_v4/kernels/deepseek_v41_dynamic_quant_bf16_gaudi2.c`.
+  the vendor cast, which multiplies in the input dtype before it casts, **as a Gaudi2 card computes it**. The
+  torch code divides by `FP8_MAX`; the card makes a product with the reciprocal rounded to bf16 of that division
+  (`bf16(1/240)` is `0x1.12p-8`, 0.34 % above 1/240), and CPU torch a quotient. The two scales are equal for 8,018
+  of the 32,639 possible row maxima and one bf16 step apart for the other 24,621 ("First card run"). This is the
+  one place where the definition is not what CPU torch returns: `moe_reference.moe_row_quant_reference` is the
+  copied code with the card's division, and `moe_row_quant_cpu_reference`, the op's CPU stand-in, is the copied
+  code as CPU torch runs it. The cast is round-to-nearest-even with the result clipped to 240, the conversion and
+  packing sequence of `csrc/deepseek_v4/kernels/deepseek_v41_dynamic_quant_bf16_gaudi2.c`, which multiplies its row
+  maximum by the same `bf16(1/240)`.
 - `sigmoid` is `hc_sigmoid` of `hc_fused_common.h` (`1 / (1 + exp(-x))`). The TPC `exp` returns 0 below -87.3 and
   fp32 denormals are flushed, where CPU torch keeps them: a SiLU or gate weight below 1.2e-38 is 0 in the kernels.
 
 ## Kernel layout
 
 Scalar arguments of every MoE kernel's `main`, in this order: `int experts, int top_k, int gate_column, float
-inv_fp8_max` (`MoeGlueKernelArgs`, 16 bytes; the glue derives `inv_fp8_max = 1/fp8_max`). Node parameters (op ->
+inv_fp8_max` (`MoeGlueKernelArgs`, 16 bytes; the glue derives `inv_fp8_max = bf16(1/fp8_max)`, the reciprocal
+rounded to bf16 on the host, `0x1.12p-8` for 240). Node parameters (op ->
 glue): `struct MoeGlueParams { int32_t experts; int32_t top_k; int32_t gate_column; float fp8_max; }`, 16 bytes
 (unused fields are 0). The size tells the two families apart when shape inference is called without a GUID name (12
 bytes for the hyper-connection kernels); `top_k > 0` tells `moe_route` from `moe_row_quant`.
@@ -799,12 +806,13 @@ output may differ at all; differences below the fp32 normal range do not count.
 |---|---|
 | `tests/unit_tests/hc_fused/test_moe_reference_copy.py` | every line of the copied oracle is in the plugin's (or the engine's) source, in order, and the copies return the plugin's bits |
 | `.../hc_fused/test_moe_case.py` | a correct kernel passes every case; `compare` has teeth (wrong, doubled, out-of-range and misordered ids, the tie rule, one step allowed and two not, the propagation rules, exactness) |
-| `.../hc_fused/test_moe_ops.py` | schemas, fake kernels, the stand-in equals the oracle, the package registers no CPU kernel and is not imported by default |
+| `.../hc_fused/test_moe_ops.py` | schemas, fake kernels, the stand-in is the torch path as CPU torch runs it (the kernel's oracle for three ops, `moe_row_quant_cpu_reference` for the fourth), the package registers no CPU kernel and is not imported by default |
+| `.../hc_fused/test_moe_card_arithmetic.py`, `hpu_arithmetic.py` | the card's scalar division as a CPU emulation (a `TorchDispatchMode`); the card log of 2026-11-20 reproduced with it (22 scales, 3,378 fp8 values, largest difference 16) and not with a neighbouring constant; the kernel's oracle is the copied code under that division; the CPU stand-in keeps the CPU's |
 | `.../hc_fused/test_moe_sources.py` | GUIDs, ABI, scalar order, limits and build switches agree across the C++, TPC-C, CMake and Python sources |
 | `.../hc_fused/test_moe_op_callbacks_host.py` | the real `hpu_hc_fused.cpp` under ASan + UBSan: output metadata (int32 ids, fp8 values), GUID and the 16 parameter bytes of all 72 HPU cases, 14 rejections |
 | `.../hc_fused/test_moe_glue_loader.py` | the loader and the startup call |
 | `tests/unit_tests/ops/test_hpu_moe_glue_cpu.py` | the helpers without a model: one log line per block, the input check, the merged weight on a bare runner, the wrapper that reads the flag, and that the FP8 branch calls the vendor op with the keywords of the plugin's op wrapper |
-| `.../hc_fused/test_moe_hpu_op.py`, `test_moe_hpu_op_dry_run.py` | the card test, and a CPU dry run of it (the file runs, no test skips) |
+| `.../hc_fused/test_moe_hpu_op.py`, `test_moe_hpu_op_dry_run.py` | the card test, and a CPU dry run of it run the way the gate runs it (the file runs, no test skips, the `MOEHPU` lines of passed tests are in the output). In the dry run `dynamic_quant` runs with the card's scalar division and Gaudi2's fp8 range, so it fails with the card's own line for a kernel that has CPU torch's scale |
 | `tests/unit_tests/models/flash_next/test_moe_glue_layer.py` | the flag; the flag-off op-sequence digest; flag 1 equals flag 0 bit for bit on all four blocks at 1, 2, 32 and 300 rows, BF16 and FP8 experts; op counts; the merged weight; what every op and the vendor op are given; every fallback with its one line |
 | `.../flash_next/test_moe_glue_whole_model.py` | the whole tiny model on the plugin's path: it reproduces the Hugging Face reference (fp32 with the flag at 0 within 1e-5, bf16 with the flag at 1 within 1e-2, every block fused); prefill hidden states and 16 greedy tokens of every reference prompt unchanged by the flag; the same with `VLLM_HPU_HC_FUSED=1` as well; what the kernel's tie rule does to those tokens |
 | `.../flash_next/test_moe_glue_tp.py` | eight gloo ranks, TP8 with expert parallelism: flag 1 equals flag 0 bit for bit on every rank, the collectives are the same |
@@ -817,7 +825,46 @@ gives a SiLU one bf16 step from CPU torch and 511 differ only below 1.2e-38; ran
 bit-exact, the rest one step (two where a one-step SiLU is multiplied). `moe_combine`: bit-exact on every random
 case up to 2048 rows; the gate weight is CPU torch's for all 65,280 logits but 3 in the denormal range.
 `moe_row_quant`: scale and values bit-exact in every case, all 32,639 row maxima included; the sign of an fp8 zero
-can differ from CPU torch's cast.
+can differ from CPU torch's cast. Since 2026-11-20 that oracle is the copied code with the card's division; with
+the kernel of version 1 (the reciprocal not rounded) the simulator differs from it in 22 of the 32 scales of
+`row_quant_real_r32`, the number the card reported.
+
+## First card run (Gaudi2, lazy mode, 2026-11-20)
+
+`test_moe_hpu_op.py` ran three times that day. With the bridge's parallel graph accumulation on
+(`PT_HPU_LAZY_ACC_PAR_MODE=1`, the default) 80 of 84 passed, twice; with it off 82 of 84. The two that went away
+were `Empty tensor optional` errors: custom ops raced with the bridge's accumulation thread, and card runs set the
+mode to 0 since. The two that stayed printed the same lines every time:
+
+1. **`MOEHPU row_quant_real_r32 against dynamic_quant on the card: 22 of 32 scales and 3378 of 81920 fp8 values
+   differ (max abs diff 1.600e+01)`.** The kernel returned the CPU oracle's bits in the same run (its 15 cases
+   passed), so the card's `dynamic_quant` is not CPU torch's. Cause: on the card `bf16_tensor / 240.0` is
+   `bf16(x * bf16(1/240))`, on CPU `bf16(x / 240)`. Evidence: the plugin's formula run on CPU with that one rule
+   differs from the CPU formula in exactly 22 scales and 3,378 values with a largest difference of 16 (one fp8 step
+   between 128 and 240); the constant one bf16 step lower gives 19 and 3,336, one step higher 32 and 10,988, a
+   truncated product 6, an unrounded quotient 31; and `deepseek_v41_dynamic_quant_bf16_gaudi2.c` already carries
+   the same constant. The kernel was built to an oracle that did not describe the card. Fixed in the host glue
+   (`inv_fp8_max = bf16(1/fp8_max)`); the test's expectation of 0 differences stands. Shown by the card for 32
+   rows of ordinary size only: zero rows, rows of 1e-20 and 1e30, exact fp8 ties and the other row maxima are the
+   model's prediction until a card runs the three cases of the test.
+2. **`MOEHPU route_real_r16 ids: 0 of 16 rows select the card's torch.topk set (15 rows do not tie at the cut)`**
+   (`test_hpu_op_matches_the_torch_path_on_hpu[route_real_r16]`). Open. What is known: in the same runs the kernel
+   alone returned exactly its rule for this case (`test_hpu_op_matches_reference[route_real_r16]`), and with the
+   accumulation off the vendor op gave the same output for the kernel's routing and for the card's torch routing on
+   a 16-expert block, in two tests. It is not a tie effect and not arithmetic: the tie mask is computed on CPU from
+   the fp32 softmax and marks one row (row 0); on the other 15 rows the 10th and 11th logits are 0.016 to 1.5
+   apart, a probability ratio of 1.016 to 4.5, which no rounding of a monotonic softmax turns into a tie. So one
+   construct of that test changes ids on the card, and its reference differs from the production routing in three
+   of them: it routes on a view `gates[:, :experts]` of the tensor the kernel reads (production routes on a GEMM
+   output of its own), it narrows `torch.topk`'s int64 ids to int32 on the device (production never does), and it
+   shares one graph with the kernel. The log of that run could not tell the two sides apart. The test now prints
+   each side against CPU torch and asserts that the kernel keeps its rule in the shared graph, and
+   `test_route_selects_the_experts_of_the_production_routing_on_the_card` compares the kernel with the routing as
+   a block runs it (own tensor, int64 ids, own graph) at both geometries. The failing comparison is unchanged.
+
+The log of that run held the `MOEHPU` lines of the failed tests only: the gate runs `pytest -q -rs`, which drops
+the output of passed tests (the tie rule of the card's `torch.topk` among them). The card test now prints every
+measurement once more after its last test, outside pytest's capture.
 
 ## What is wired
 
@@ -850,11 +897,13 @@ can differ from CPU torch's cast.
    code on the same inputs (no op writes an input). A failed layer check or a raising op turns the block's fused
    path off for good; a call the kernels do not take costs that call only.
 6. **Rental gate** (`tools/flash_next/rental/gates.py::moe_glue`): `tests/unit_tests/hc_fused/test_moe_hpu_op.py`
-   on the card in lazy mode, recorded as G1b's `details["moe_glue"]`. 84 tests: every op has a kernel and the
+   on the card in lazy mode, recorded as G1b's `details["moe_glue"]`. 86 tests: every op has a kernel and the
    library serves it; 72 cases against the CPU oracle; the routing op's outputs through the vendor op against the
    torch routing through the vendor op; the vendor op with the slots reversed; the card's own tie rule, printed;
    `moe_row_quant` against the plugin's `dynamic_quant` on the card, bit for bit; five cases against the torch path
-   on the card; repeat calls; one whole block chain. Lines starting with `MOEHPU` are the measurements.
+   on the card; the routing op against the production routing at both geometries; repeat calls; one whole block
+   chain. Lines starting with `MOEHPU` are the measurements; they are all printed again after the last test, so
+   the log has them whether a test passed or failed.
 7. **Operator switch and smoke mode.** `run_rental.sh --moe-glue` (through `container_entry.sh` to
    `main.py --moe-glue`): a server gets `VLLM_HPU_MOE_GLUE=1` only when the operator asked and the card test
    passed, otherwise an explicit 0; the manifest's `moe_glue` and the summary line `MoE glue:` record the outcome;
@@ -875,6 +924,10 @@ annotation and no kernel writes an input (checked by the simulator host and by t
 
 ## Unproven without a card: what to look for
 
+After the first card run (above), items 1 to 4 and 7 held at the tiny geometry or for the cases of the test: the
+test was not skipped, both output pairs came through the bridge, the vendor op took the routing op's outputs, and
+the SiLU and sigmoid comparisons passed. Items 5 and 6 are the two open ones, 8 and 9 have not been tried.
+
 1. **The build.** `hc_fused_ops` with the four new registrations against the real bridge (the callbacks run under
    ASan against the stub header only). Look for: `test_moe_hpu_op.py` not skipped; `MoE glue kernels in
    libhc_fused_gaudi2.so: ...` naming all four in the install log.
@@ -886,16 +939,27 @@ annotation and no kernel writes an input (checked by the simulator host and by t
    same ids and weights; max abs diff ...`: the same-row outputs must be bit-identical.
 4. **Slot order.** `MOEHPU vendor op with the routing slots reversed: bit-identical ...`. `False` would mean the
    vendor op's sum depends on the slot order, which matters only on rows with equal logits.
-5. **The tie rule of the card's `torch.topk`.** `MOEHPU all-equal logits: torch.topk on the card selects [...]`. If
+5. **The routing against the torch path, and the tie rule of the card's `torch.topk`.** `MOEHPU route_real_r16
+   ids: moe_route returns the kernel's rule (CPU) on 16 of 16 rows; the card's torch path returns CPU torch.topk's
+   set on N of the 15 rows that do not tie at the cut`, and `MOEHPU route_* production routing on the card ...: CPU
+   torch.topk's set on N of M rows`, `MOEHPU route_* moe_route against the production routing on the card: the same
+   experts on N of M rows`. The first run failed the shared-graph comparison on all 16 rows without saying which
+   side had moved. If the production lines are full and only the shared-graph reference is off, that test's
+   reference (a view, an int32 cast on the device) is what the card does differently, and the kernel routes as
+   production does. If `moe_route returns the kernel's rule` is not 16 of 16, the kernel changes inside a shared
+   graph. If the production routing is not CPU torch's, flag 0 itself does not route as the CPU does.
+   Then the tie rule: `MOEHPU all-equal logits: torch.topk on the card selects [...]`. If
    it is not the lowest ids, flag 1 and flag 0 route differently on rows that tie at the cut (about 1 row in 8 at
    512 experts). On CPU the tiny model's 80 reference tokens survive the kernel's rule although 34 of 7,048 routed
    rows (of 70 that tie at the cut) get another expert and three of five prefills end in other hidden states
    (`test_what_the_kernels_tie_rule_does_to_the_tokens`); a token mismatch in the smoke mode `moe` with no fallback
    line and a passing card test would point at ties first.
 6. **FP8 numerics against the vendor cast.** `MOEHPU row_quant_* against dynamic_quant on the card: 0 of ... scales
-   and 0 of ... fp8 values differ`. The test requires 0. A non-zero count of scales means the card rounds the bf16
-   divide or reciprocal differently from CPU torch; of values, that the vendor cast rounds or clips differently
-   from `v_convert_bf16_to_f8_b` with `SW_CLIP_FP`.
+   and 0 of ... fp8 values differ`. The test requires 0. The first run had 22 of 32 scales: the card divides by 240
+   as a product with `bf16(1/240)` and the kernel now does the same. A count of scales that is still not 0 means the
+   card's sum, product or reciprocal is not the model's for some row (the stress case has zero rows and rows of
+   1e-20 and 1e30); of values with 0 scales, that the vendor cast rounds or clips differently from
+   `v_convert_bf16_to_f8_b` with `SW_CLIP_FP` (the edge case has an exact tie at every exponent).
 7. **bf16 SiLU and sigmoid of the card's torch path** against the kernels: `MOEHPU ... max abs diff against the HPU
    torch path`, bounded at atol 5e-2, rtol 1e-2 like the hyper-connection ops.
 8. **Speed.** No step time and no node count of a real recipe. Whether the remaining int32 to int64 cast is a node,
@@ -915,4 +979,10 @@ annotation and no kernel writes an input (checked by the simulator host and by t
 - The merged gate weight is built at load only; a block whose weights are post-processed by another expert method
   has none and logs its line.
 - `moe_row_quant` is Gaudi2 only (fp8 range 240).
+- The MoE op wrappers (`flashinfer_gaudi/moe_glue.py`) hand their tensors to the ops as they are; the
+  hyper-connection and GDN wrappers clone every activation first, because a custom op that was given a view stopped
+  a server (`flashinfer_gaudi/hc_fused.py`, `_owned`). In a block three of the four MoE ops get GEMM or vendor-op
+  outputs, but `moe_row_quant` gets `x.view(-1, x.shape[-1])` (`HPUFp8MoEMethod.apply_monolithic`), a view object on
+  every call, and the card test only hands the ops tensors of their own. Whether the op takes a view with the
+  parallel graph accumulation off has not been tried; if it raises, the FP8 block logs its line and runs torch.
 - No case has NaN router logits. `-inf` logits are covered (they are selected last, lowest id first, with weight 0).
