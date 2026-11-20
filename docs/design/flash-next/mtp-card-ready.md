@@ -6,7 +6,7 @@ This file is the track's report. The harness of the track's agents does not writ
 
 ## Handoff (if this agent stops)
 
-Last update: 2026-11-20 23:50 UTC (fourth agent of the track, Opus 5.5, started 23:15 UTC). Coordinator's rule
+Last update: 2026-11-20 23:56 UTC (fourth agent of the track, Opus 5.5, started 23:15 UTC). Coordinator's rule
 for tonight (BRIEF 23:21): card evidence first, no pull request before 04:00 UTC; push the branch after each green
 step and tell the coordinator the commit and the flags (the integration track builds from this branch).
 
@@ -17,7 +17,9 @@ rows) while a draft pass Fd is small (4.4 / 6.0 / 10.7 ms). Acceptance holds at 
 per position). The open questions are what the QSA data-flow change and the kernel-fixes flags do to Ft at 128
 rows, whether k = 1 beats k = 3 at 32 streams, and what sampled verification (I07) costs: jobs 00126 / 00127.
 
-**Branch** (pushed: `origin/feat/flash-next-gaudi-mtp-card-ready` = `1f2dc38e` and this handoff):
+**Branch** (pushed: `origin/feat/flash-next-gaudi-mtp-card-ready` = `fb4f4d50` and this handoff):
+- `fb4f4d50` spec_scaling.py: the long prompts of the warm and the measured round start with different text (no
+  round reads another's prefix cache: a TP4 prefix-cache hit can read another position's GDN state, BRIEF 23:46).
 - `1f2dc38e` I07 fast path: `VLLM_HPU_SPEC_SAMPLED_VERIFY=2`, sampled verification over the top-64 candidates of
   every verification and bonus row (`vllm_gaudi/v1/sample/hpu_candidate_verify.py`, hook
   `HPUModelRunner._candidate_verify`); steps with a seeded request, logprobs or top_k outside 1..64 take the exact
@@ -49,6 +51,14 @@ rows, whether k = 1 beats k = 3 at 32 streams, and what sampled verification (I0
   VLLM_HPU_MTP_TIMING=1 VLLM_HPU_SPEC_SAMPLED_VERIFY=1 VLLM_HPU_MTP_DRAFT_LOOP=1 VLLM_HPU_MTP_CHUNK_KV=1`.
 - **00127 `real4-qsa-ref-nospec`** (any:4, 25 min): the same server without speculation, `'k0|0||--levels 1,8,32
   --tokens 256 --sampled-levels 1,32'`, the first six flags.
+- **00135 `cand-verify-bench`** (any:1, 15 min, `1f2dc38e`, bumped into the 1-card wave after 00126):
+  `python tools/flash_next/candidate_verify_bench.py --device hpu --requests 1,8,32 --out "$FARM_OUT/bench.json"`:
+  the exact sampled verification (`=1`) against the candidate path (`=2`) per call on one card, the candidate ids
+  against the CPU's topk, valid tokens, first-draft acceptance of both, greedy = arg max.
+- **00136 `real4-qsa-mtp3-cand-ctx`** (any:4, 30 min, `fb4f4d50`, bump asked after 00135): 00126's flags with
+  `VLLM_HPU_SPEC_SAMPLED_VERIFY=2`, `mtp_arms.sh 'cand|3||--levels 32 --tokens 256 --repeat-top 1 --sampled-levels
+  1,32 --ctx 8:16000'` (greedy 32 in the same server, sampled 1 and 32 over candidates, 8 x 16K-token prompts with
+  CHUNK_KV). If 00135 shows the candidate path wrong on the card: `--replaces 00136` with `=1`.
 - Local waiters write `reports/mtp-card-ready/card/submit-*.log` and copy the results to
   `reports/mtp-card-ready/card/<id>-<name>/`; if they are gone: `bin/farm fetch mtp-card-ready 00126
   00126-real4-qsa-mtp-k3-k1` (and 00127). What to read per arm folder (`k3/`, `k1/`, `k0/`, `*-fallback/`):
