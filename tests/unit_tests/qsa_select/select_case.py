@@ -155,6 +155,9 @@ def host_scores(case: SimpleNamespace) -> tuple[torch.Tensor, torch.Tensor]:
 def consumer(selected: torch.Tensor, block_table: torch.Tensor, slot_values: torch.Tensor) -> torch.Tensor:
     """What the decode attention does with a selection, ending in fp32: ``[T, W]`` slot numbers, -1 where masked."""
     from vllm_gaudi.models.qwen4_exp.qsa_hpu_attention import decode_selected_slots, rows_without_selection
+    # A wrong selection may hold any value: keep every gather of this check inside its table (a position past
+    # the table then reads the last column, which is not the right slot either, so it still shows).
+    selected = selected.clamp(min=-1, max=MB * BLOCK - 1)
     slots = decode_selected_slots(selected, block_table, BLOCK)
     valid = (selected >= 0) | rows_without_selection(selected)
     got = slot_values.index_select(0, slots.reshape(-1)).view(slots.shape)

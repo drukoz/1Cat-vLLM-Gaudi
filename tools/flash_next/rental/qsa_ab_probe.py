@@ -207,12 +207,12 @@ def line(res: dict) -> str:
                 int(res["prompt_tokens_p50"]), int(res["cached_tokens_p50"]), res["wall_s"]))
 
 
-def document(args) -> tuple[str, int]:
-    """About ``--ctx`` tokens of the repository's design documents with the needle sentence at 30 %: (text, tokens)."""
+def document(args, ctx: int) -> tuple[str, int]:
+    """About ``ctx`` tokens of the repository's design documents with the needle sentence at 30 %: (text, tokens)."""
     root = Path(args.docs)
     files = sorted(root.rglob("*.md")) if root.is_dir() else []
     parts, size = [], 0
-    want_chars = args.ctx * 8  # more than enough text for the cut below
+    want_chars = ctx * 8  # more than enough text for the cut below
     for f in files:
         try:
             text = f.read_text(encoding="utf-8", errors="replace")
@@ -226,12 +226,12 @@ def document(args) -> tuple[str, int]:
             break
     corpus = "\n\n".join(parts)
     if len(corpus) < 2000:  # no documents here: filler words
-        corpus = "\n".join(" ".join(WORDS[(i + k * 11) % len(WORDS)] for k in range(12)) for i in range(args.ctx))
+        corpus = "\n".join(" ".join(WORDS[(i + k * 11) % len(WORDS)] for k in range(12)) for i in range(ctx))
     while len(corpus) < want_chars:  # a small tree: the same text again (the needle stays unique)
         corpus = corpus + "\n\n" + corpus
     sample = corpus[:200000]
     count = post_json(args, "/tokenize", {"model": args.model, "prompt": sample}, 600.0)["count"]
-    chars = int(args.ctx * len(sample) / max(1, count))
+    chars = int(ctx * len(sample) / max(1, count))
     cut = corpus.rfind("\n", 0, chars)
     text = insert_needle(corpus[:cut if cut > 0 else chars])
     tokens = post_json(args, "/tokenize", {"model": args.model, "prompt": text}, 600.0)["count"]
@@ -247,7 +247,7 @@ def main() -> int:
     ap.add_argument("--tokens", type=int, default=128)
     ap.add_argument("--warm-tokens", type=int, default=48)
     ap.add_argument("--repeat-top", type=int, default=2, help="measured rounds at the largest level")
-    ap.add_argument("--ctx", type=int, default=32000, help="tokens of the long-context document (0: no long rounds)")
+    ap.add_argument("--ctx", default="32000", help="tokens of the long-context documents, in order (0: no long rounds)")
     ap.add_argument("--long-streams", type=int, default=0, help="streams of the long round (default: the top level)")
     ap.add_argument("--docs", default="docs/design/flash-next", help="folder of the documents of the long prompt")
     ap.add_argument("--deadline", type=float, default=0.0, help="epoch seconds by which the probe must have ended")
@@ -255,7 +255,8 @@ def main() -> int:
     ap.add_argument("--out", default="qsa_ab.json")
     args = ap.parse_args()
     levels = [int(x) for x in args.levels.split(",") if x]
-    results = {"args": {k: v for k, v in vars(args).items()}, "levels": [], "needle": None, "long": [], "skipped": []}
+    contexts = [int(x) for x in str(args.ctx).split(",") if x and int(x) > 0]
+    results = {"args": {k: v for k, v in vars(args).items()}, "levels": [], "needle": [], "long": [], "skipped": []}
 
     def save():
         tmp = args.out + ".tmp"
@@ -293,87 +294,98 @@ def main() -> int:
             results["levels"].append(res)
             save()
             say("MEAS  " + line(res))
-    # ---- 2. the needle, which also prefills the shared prefix
-    if args.ctx <= 0 or skip("needle and long context", 420):
-        save()
-        return 0
-    try:
-        doc, doc_tokens = document(args)
-    except Exception as e:  # noqa: BLE001
-        say("NEEDLE FAILED: the document could not be built: %r" % (e, ))
-        results["needle"] = {"error": repr(e)}
-        save()
-        return 0
-    say("long prompt: %d characters, %d tokens, needle sentence at 30 %% of its length" % (len(doc), doc_tokens))
-    t = time.time()
-    needle = {"doc_chars": len(doc), "doc_tokens": doc_tokens}
-    try:
-        resp = post_json(args, "/v1/chat/completions", {
-            "model": args.model, "messages": [{"role": "user", "content": doc + NEEDLE_QUESTION}], "max_tokens": 32,
-            "temperature": 0, "chat_template_kwargs": {"enable_thinking": False}}, args.timeout)
-        answer = ((resp.get("choices") or [{}])[0].get("message") or {}).get("content") or ""
-        needle.update({"answer": answer[:500], "hit": NEEDLE_CODE in answer, "seconds": time.time() - t,
-                       "usage": resp.get("usage")})
-    except Exception as e:  # noqa: BLE001
-        needle.update({"error": repr(e), "hit": False, "seconds": time.time() - t})
-    results["needle"] = needle
     save()
-    say("NEEDLE at %d prompt tokens: hit=%s, answer=%r, %.1f s (prefill of the whole prompt, graphs compiled)" % (
-        ((needle.get("usage") or {}).get("prompt_tokens") or doc_tokens), needle.get("hit"),
-        needle.get("answer", needle.get("error")), needle["seconds"]))
-    if "error" in needle:
-        return 0
-
-    def long_requests(n: int, ntok: int) -> list:
-        # The same prompt for stream i in every round: a round after the first finds its own prompts in the cache
-        # even on a server that reuses a prefix only for a prompt it has seen whole.
-        return [chat(args, doc + NEEDLE_QUESTION + "\nRequest %d." % i, ntok) for i in range(n)]
 
     def hits(res: dict) -> int:
         return sum(1 for text in res.get("texts", []) if text and NEEDLE_CODE in text)
 
-    # ---- 3. long context: a trial stream says whether the prefix is served from the cache
-    if skip("long trial", 240):
-        return 0
-    trial = run_round(args, "long-trial", long_requests(1, 16), 16)
-    trial["needle_hits"] = hits(trial)
-    results["long"].append(trial)
-    save()
-    say("TRIAL " + line(trial))
-    if not trial.get("ok"):
-        return 0
-    one_doc_s = trial["ttft_p50_s"]  # without reuse: the warm prefill of one whole document
-    reuse = (trial.get("cached_tokens_p50") or 0) >= 0.5 * doc_tokens
-    n_long = args.long_streams or levels[-1]
-    if not reuse:  # every stream prefills its document once: as many streams as the time covers
-        while n_long > 1 and 180 + 1.3 * n_long * one_doc_s > left() - 120:
-            n_long //= 2
-    say("prefix reuse: %s (cached tokens %s of %d; the trial's first token after %.1f s, the first prefill took "
-        "%.1f s): the long round runs %d streams" % (reuse, trial.get("cached_tokens_p50"), doc_tokens, one_doc_s,
-                                                     needle["seconds"], n_long))
-    results["prefix_reuse"] = reuse
-    per_round = 60
-    if not skip("long N=1", per_round):
-        res = run_round(args, "long", long_requests(1, args.tokens), args.tokens)
-        res["needle_hits"] = hits(res)
-        results["long"].append(res)
+    def long_stage(ctx: int, first_s: float) -> float | None:
+        """The needle and the long rounds at ``ctx`` tokens; returns the seconds its first prefill took."""
+        tag = "ctx %d" % ctx
+        # ---- 2. the needle, which also prefills the shared prefix
+        if skip("needle and long rounds, " + tag, max(420.0, 1.5 * first_s * ctx / max(1, contexts[0]))):
+            return None
+        try:
+            doc, doc_tokens = document(args, ctx)
+        except Exception as e:  # noqa: BLE001
+            say("NEEDLE FAILED (%s): the document could not be built: %r" % (tag, e))
+            results["needle"].append({"ctx": ctx, "error": repr(e)})
+            save()
+            return None
+        say("long prompt (%s): %d characters, %d tokens, needle sentence at 30 %% of its length" % (
+            tag, len(doc), doc_tokens))
+        t = time.time()
+        needle = {"ctx": ctx, "doc_chars": len(doc), "doc_tokens": doc_tokens}
+        try:
+            resp = post_json(args, "/v1/chat/completions", {
+                "model": args.model, "messages": [{"role": "user", "content": doc + NEEDLE_QUESTION}],
+                "max_tokens": 32, "temperature": 0, "chat_template_kwargs": {"enable_thinking": False}}, args.timeout)
+            answer = ((resp.get("choices") or [{}])[0].get("message") or {}).get("content") or ""
+            needle.update({"answer": answer[:500], "hit": NEEDLE_CODE in answer, "seconds": time.time() - t,
+                           "usage": resp.get("usage")})
+        except Exception as e:  # noqa: BLE001
+            needle.update({"error": repr(e), "hit": False, "seconds": time.time() - t})
+        results["needle"].append(needle)
         save()
-        say("MEAS  " + line(res) + ", needle in %d of %d texts" % (res["needle_hits"], res["streams"]))
-    if n_long > 1 and not skip("long N=%d warm" % n_long, per_round + 60):
-        warm = run_round(args, "warm-long", long_requests(n_long, 16), 16)
-        warm["needle_hits"] = hits(warm)
-        results["long"].append(warm)
-        save()
-        say("warm  " + line(warm))
-        for rep in range(args.repeat_top):
-            if skip("long N=%d rep %d" % (n_long, rep), per_round):
-                break
-            res = run_round(args, "long", long_requests(n_long, args.tokens), args.tokens)
-            res["rep"] = rep
+        say("NEEDLE at %d prompt tokens: hit=%s, answer=%r, %.1f s (the first prefill of this prompt)" % (
+            ((needle.get("usage") or {}).get("prompt_tokens") or doc_tokens), needle.get("hit"),
+            needle.get("answer", needle.get("error")), needle["seconds"]))
+        if "error" in needle:
+            return None
+
+        def long_requests(n: int, ntok: int) -> list:
+            # The same prompt for stream i in every round: a round after the first finds its own prompts in the
+            # cache even on a server that reuses a prefix only for a prompt it has seen whole.
+            return [chat(args, doc + NEEDLE_QUESTION + "\nRequest %d." % i, ntok) for i in range(n)]
+
+        def measured(label: str, n: int, ntok: int, rep=None) -> dict:
+            res = run_round(args, label, long_requests(n, ntok), ntok)
+            res["ctx"] = ctx
             res["needle_hits"] = hits(res)
+            if rep is not None:
+                res["rep"] = rep
             results["long"].append(res)
             save()
-            say("MEAS  " + line(res) + ", needle in %d of %d texts" % (res["needle_hits"], res["streams"]))
+            return res
+
+        # ---- 3. long context: a trial stream says whether the prefix is served from the cache
+        if skip("long trial, " + tag, 240):
+            return needle["seconds"]
+        trial = measured("long-trial", 1, 16)
+        say("TRIAL " + line(trial))
+        if not trial.get("ok"):
+            return needle["seconds"]
+        one_doc_s = trial["ttft_p50_s"]  # without reuse: the warm prefill of one whole document
+        reuse = (trial.get("cached_tokens_p50") or 0) >= 0.5 * doc_tokens
+        n_long = args.long_streams or levels[-1]
+        if not reuse:  # every stream prefills its document once: as many streams as the time covers
+            while n_long > 1 and 180 + 1.3 * n_long * one_doc_s > left() - 120:
+                n_long //= 2
+        say("prefix reuse (%s): %s (cached tokens %s of %d; the trial's first token after %.1f s, the first prefill "
+            "took %.1f s): the long round runs %d streams" % (tag, reuse, trial.get("cached_tokens_p50"), doc_tokens,
+                                                              one_doc_s, needle["seconds"], n_long))
+        results.setdefault("prefix_reuse", {})[str(ctx)] = reuse
+        if not skip("long N=1, " + tag, 60):
+            res = measured("long", 1, args.tokens)
+            say("MEAS  " + line(res) + ", needle in %d of %d texts, context %d" % (res["needle_hits"], res["streams"],
+                                                                                 ctx))
+        if n_long > 1 and not skip("long N=%d warm, %s" % (n_long, tag), 120):
+            warm = measured("warm-long", n_long, 16)
+            say("warm  " + line(warm))
+            for rep in range(args.repeat_top):
+                if skip("long N=%d rep %d, %s" % (n_long, rep, tag), 60):
+                    break
+                res = measured("long", n_long, args.tokens, rep)
+                say("MEAS  " + line(res) + ", needle in %d of %d texts, context %d" % (
+                    res["needle_hits"], res["streams"], ctx))
+        return needle["seconds"]
+
+    first_s = 0.0
+    for ctx in contexts:
+        took = long_stage(ctx, first_s)
+        if took is None:
+            break
+        first_s = first_s or took
     save()
     return 0
 

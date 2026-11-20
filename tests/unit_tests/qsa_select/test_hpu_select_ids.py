@@ -82,7 +82,7 @@ def variant_selection(name: str, scores, visible, positions):
     return expand_selection(picked, positions, sc.RATIO)
 
 
-VARIANTS = ("gather_arange", "gather_2d", "via_fp32", "int64", "where_then_cast", "clone_then_cast", "cast")
+VARIANTS = ("cast", "gather_arange", "via_fp32", "int64", "where_then_cast", "clone_then_cast", "gather_2d")
 
 
 @pytest.fixture(scope="module")

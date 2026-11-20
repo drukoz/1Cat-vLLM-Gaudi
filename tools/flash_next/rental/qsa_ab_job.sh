@@ -10,7 +10,7 @@
 #      on one of the job's cards: QSAIDS lines, then one "RULE9 VERDICT" line. The server then runs the
 #      narrowing form the check found right (VLLM_HPU_QSA_TOPK_IDS; 0, the default, unless only another is).
 #   2. The real-model server on the job's cards: the farm's serve command and preset (serve_probe.sh).
-#   3. qsa_ab_probe.py: decode at 1, 16 and 32 streams with short prompts; the needle at about 32,000 tokens;
+#   3. qsa_ab_probe.py: decode at 1, 16 and 32 streams with short prompts; the needle at about 32,000 tokens (then 64,000);
 #      32 streams at that context (the prefix served from the cache); every stream's text saved.
 #   4. Arm mode1 only, after its server stopped: the card test of the four QSA TPC kernels
 #      (tests/unit_tests/qsa_fused/test_hpu_op.py) with the installed libraries given by path.
@@ -32,7 +32,7 @@ TREE="$PWD"
 NOW="$(date -u +%s)"
 DEADLINE="${QSA_AB_DEADLINE:-$((NOW + 2400))}"
 LEVELS="${QSA_AB_LEVELS:-1,16,32}"
-CTX="${QSA_AB_CTX:-32000}"
+CTX="${QSA_AB_CTX:-32000,64000}"
 TOKENS="${QSA_AB_TOKENS:-128}"
 
 mkdir -p "$OUT" || exit 2
@@ -54,7 +54,7 @@ if [ "${QSA_AB_SKIP_IDS:-0}" != 1 ]; then
         unset PT_HPU_RECIPE_CACHE_CONFIG VLLM_HPU_QSA_FUSED VLLM_HPU_QSA_INDEXER_SHARD VLLM_HPU_QSA_TOPK_IDS
         export PYTHONPATH="$TREE${PYTHONPATH:+:$PYTHONPATH}" PT_HPU_LAZY_MODE=1 FARM_OUT="$OUT"
         rm -f "$OUT/select_ids.json"
-        timeout 600 "$PY" -m pytest -q -s -rs -p no:cacheprovider tests/unit_tests/qsa_select/test_hpu_select_ids.py 2>&1 \
+        timeout 360 "$PY" -m pytest -q -s -rs -p no:cacheprovider tests/unit_tests/qsa_select/test_hpu_select_ids.py 2>&1 \
             | tee "$OUT/select_ids.log" | grep --line-buffered -E "QSAIDS|passed|failed|skipped|rror" \
             | awk '{ print substr($0, 1, 600); fflush() }'
     )
@@ -65,19 +65,23 @@ try:
 except Exception as e:
     print("0|RULE9 VERDICT: no result file (%r): the check did not run; the server runs the default form" % (e,))
     sys.exit(0)
-ans = d.get("rule9/answer", {})
 def right(name):
     return d.get("variant/" + name, {}).get("in_graph_consumer_wrong_rows") == 0
-plugin = {k: v.get("ok") for k, v in d.items() if k.startswith("plugin/")}
+names = [k[len("variant/"):] for k in d if k.startswith("variant/") and "in_graph_consumer_wrong_rows" in d[k]]
+cast = d.get("variant/cast", {})
+plugin = {k[len("plugin/"):]: ("ok" if v.get("ok") else "WRONG") for k, v in d.items() if k.startswith("plugin/")}
 mode = 0
 if not (d.get("plugin/select_blocks", {}).get("ok") or right("gather_arange")):
     mode = 1 if right("cast") else (2 if right("via_fp32") else 0)
-rows = ans.get("rows")
+rows = cast.get("rows")
 print("%d|RULE9 VERDICT: the cast topk(...).indices.to(int32) in one graph: host read wrong on %s of %s rows, "
-      "in-graph consumer wrong on %s of %s rows; forms right in the graph: %s; the plugin as it is (gather from an "
-      "int32 arange): %s; the server runs VLLM_HPU_QSA_TOPK_IDS=%d" % (
-          mode, ans.get("cast_host_read_wrong_rows"), rows, ans.get("cast_in_graph_consumer_wrong_rows"), rows,
-          ",".join(ans.get("forms_right_in_graph", [])) or "none", json.dumps(plugin, sort_keys=True), mode))
+      "in-graph consumer wrong on %s of %s rows%s; forms right in the graph: %s; forms wrong in the graph: %s; the "
+      "plugin as it is (a gather from an int32 arange): %s; the server runs VLLM_HPU_QSA_TOPK_IDS=%d" % (
+          mode, cast.get("host_read_wrong_rows", cast.get("host_read_raised")), rows,
+          cast.get("in_graph_consumer_wrong_rows", cast.get("in_graph_consumer_raised")), rows,
+          (" (" + cast["host_read_detail"] + ")") if cast.get("host_read_detail") else "",
+          ",".join(n for n in names if right(n)) or "none", ",".join(n for n in names if not right(n)) or "none",
+          json.dumps(plugin, sort_keys=True), mode))
 PY
 )"
     TOPK_IDS="${VERDICT%%|*}"
