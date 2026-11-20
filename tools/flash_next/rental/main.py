@@ -470,6 +470,10 @@ class Runner:
         self.gdn_reason = None
         # The fused hyper-connection kernels: the operator's request (--hc-fused), the card test's result
         # in G1b (None before G1b ran), and who took the kernels out of this run's servers ("tiny").
+        # The fused QSA decode path (--qsa-fused): VLLM_HPU_QSA_FUSED=2 when its kernels' card test passed, else
+        # 1 (the torch data flow, no kernels); without the request 0. Sharded by request whenever it is on.
+        self.qsa_fused_requested = bool(getattr(args, "qsa_fused", False))
+        self.qsa_fused_status = None
         self.hc_fused_requested = bool(args.hc_fused)
         self.hc_fused_status = None
         self.hc_fused_reason = None
@@ -712,6 +716,14 @@ class Runner:
                 }
             hc_fused = self.check_hc_fused(phase_dir, details)
             moe_glue = self.check_moe_glue(phase_dir, details)
+            if self.qsa_fused_requested:
+                qsa = self.kernel_card_test(gates.qsa_fused, phase_dir, details, None)
+                qsa["requested"] = True
+                details["qsa_fused"] = qsa
+                self.qsa_fused_status = qsa.get("status")
+                print("  QSA fused kernels: card test %s%s -> servers get %s" % (
+                    self.qsa_fused_status, " (%s)" % qsa.get("reason") if qsa.get("reason") else "",
+                    self.qsa_fused_env()), flush=True)
         # The hyper-connection kernels' card test and the MoE glue kernels' are recorded next to G1b's own
         # result; `status`, the GDN mode and the GDN flags above are final and nothing below changes them.
         hc_fused["requested"] = self.hc_fused_requested
@@ -726,6 +738,8 @@ class Runner:
             details["env"] = dict(details.get("env") or {})
             details["env"][gates.HC_FUSED_ENV] = "1" if self.hc_fused_on() else "0"
             details["env"][gates.MOE_GLUE_ENV] = "1" if self.moe_glue_on() else "0"
+            if self.qsa_fused_requested:
+                details["env"].update(self.qsa_fused_env())
         self.gdn_env = dict(details.get("env") or {})
         self.gdn_mode = details.get("mode")
         self.gdn_reason = details.get("reason")
@@ -759,6 +773,14 @@ class Runner:
                                   combined_db_off=combined_db_off))
         except Exception as exc:  # noqa: BLE001 - recorded only
             return {"status": gates.HC_NOT_RUN, "reason": "%s: %s" % (type(exc).__name__, exc), "hpu_op": None}
+
+    def qsa_fused_env(self) -> dict:
+        """The QSA flags of this run's servers: 2 + shard when asked and the card test passed, 1 + shard when asked
+        and it did not (the torch data flow needs no kernel), 0 without the request."""
+        if not self.qsa_fused_requested:
+            return {gates.QSA_FUSED_ENV: "0", gates.QSA_SHARD_ENV: "0"}
+        mode = "2" if self.qsa_fused_status == gates.HC_PASSED else "1"
+        return {gates.QSA_FUSED_ENV: mode, gates.QSA_SHARD_ENV: "1"}
 
     def hc_fused_on(self) -> bool:
         """True when this run's servers get VLLM_HPU_HC_FUSED=1: the operator asked (--hc-fused), the card
@@ -1451,6 +1473,8 @@ class Runner:
         env = server_env(variant_env, self.gdn_env)
         env[gates.HC_FUSED_ENV] = "1" if self.hc_fused_on() else "0"
         env[gates.MOE_GLUE_ENV] = "1" if self.moe_glue_on() else "0"
+        if self.qsa_fused_requested:  # without the switch the plugin default (0) holds
+            env.update(self.qsa_fused_env())
         if self.skip_warmup:
             env["VLLM_SKIP_WARMUP"] = "true"
         combined = self.combined_db_active()
@@ -1530,6 +1554,10 @@ def _parse_args(argv):
                         help="ask for the fused hyper-connection kernels: the servers get VLLM_HPU_HC_FUSED=1 "
                         "when the kernels' card test in G1b passed (default: off, every server gets "
                         "VLLM_HPU_HC_FUSED=0); a tiny gate that fails with them runs once more without")
+    parser.add_argument("--qsa-fused", action="store_true",
+                        help="ask for the fused QSA decode path: the servers get VLLM_HPU_QSA_FUSED=2 and "
+                        "VLLM_HPU_QSA_INDEXER_SHARD=1 when the QSA kernels' card test in G1b passed, else "
+                        "VLLM_HPU_QSA_FUSED=1 (the torch data flow) (default: off, VLLM_HPU_QSA_FUSED=0)")
     parser.add_argument("--moe-glue", action="store_true",
                         help="ask for the MoE glue kernels: the servers get VLLM_HPU_MOE_GLUE=1 when the "
                         "kernels' card test in G1b passed (default: off, every server gets "
