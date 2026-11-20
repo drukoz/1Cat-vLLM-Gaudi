@@ -100,6 +100,29 @@ shape [4, 248320]`) and `test_sh_run_sheet.py` (`tiny_smoke.sh --spec` is not na
 
 ## Card results
 
+### 00128 `real8-headline`, server 1 (no speculation), 23:36:27-23:46:27 UTC (commit `fbb685ac`, plugin `b691faa8`)
+
+TP8 + EP8, the build's flags (handoff table), 128 tokens per stream, about 25-token prompts, a warm round (48 tokens)
+before every level. MEASURED (`reports/integration/card/partial-00128/nospec/scaling.json`, copied from the node while
+the job ran; the job's own copy lands in `reports/integration/card/00128-real8-headline/nospec/`). Steady ms per step =
+the median gap between a stream's streamed tokens, medianed over the streams.
+
+| streams | greedy ms per step | greedy tok/s per stream | sampled ms per step | sampled tok/s per stream | reference (00021, greedy) |
+|---|---|---|---|---|---|
+| 1 | 43.6 | 22.9 | 39.5 | 25.3 | 41.6 |
+| 8 | 58.7 | 17.0 | 57.4 | 17.4 | 45.9 |
+| 32 | **51.1** (second round; 463 tok/s aggregate); first round 67.3 with compile pauses up to 4.6 s | **19.6** | 68.4 (one round; 376 tok/s aggregate) | 14.6 | 84.1 |
+
+- 32 streams greedy: 84.1 -> 51.1 ms per step (-39 %). The target is 10 ms per token.
+- 8 streams is slower than the reference (58.7 against 45.9) and than 32 streams: one measured round only; the
+  32-stream level shows how much a first round after the warm round can be off (67.3 against 51.1). Unexplained.
+- Sampled at 32 streams costs 17 ms more than the best greedy round, in one first round; at 1 and 8 streams sampled
+  equals greedy. Whether `VLLM_HPU_CANDIDATE_SAMPLING=1` took the sampled rows is not visible in the log (the path
+  logs nothing when it acts).
+- Texts: every stream at 8 and 32 streams, greedy and sampled, writes a coherent text about its own prompt.
+- Server: healthy after 476 s; 26.2 GiB per card reserved for graphs, KV cache 2.79M tokens (maximum concurrency 21x
+  at 131K); the cut-interval line is in the log; no fallback line; no traceback.
+
 ### 00121 `tiny8-build`, 23:32:52-23:36:27 UTC (commit `b54ca4fd`, TP8, every build flag): PASSED
 
 MEASURED (`reports/integration/card/00121-tiny8-build/build/summary.json`, job log `00121-tiny8-build.log`):
