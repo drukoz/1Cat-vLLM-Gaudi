@@ -152,3 +152,87 @@ def test_merge_takes_the_slowest_rank():
 def test_parse_args_lists():
     args = bench.parse_args(["--rows", "1,32", "--regimes", "replay,compile_layer", "--processes", "lazy"])
     assert args.rows == [1, 32] and args.regimes == ["replay", "compile_layer"] and args.processes == ["lazy"]
+
+
+def test_segment_cut_marks_every_collective_position_without_a_collective():
+    body = bench.Body(torch, "cpu", layers=3, world=8)
+    calls = {"seg": 0}
+
+    def cut_seg():
+        calls["seg"] += 1
+
+    x = torch.randn(2, bench.HIDDEN).to(torch.bfloat16)
+    out = body.forward(x, None, cut_seg=cut_seg)
+    assert calls["seg"] == 6  # two per layer, where the all-reduces would be
+    assert torch.equal(out, body.forward(x, None))  # the cut changes no value
+
+
+def test_derive_splits_a_collective_into_its_launch_and_the_collective_alone():
+    # 96 collective positions: the uncut body 2.0 ms, the launches alone add 96 x 0.08, the collectives 96 x 0.07.
+    merged = [
+        _entry("replay", 1, False, 2.0),
+        _entry("replay", 1, True, 2.0 + 96 * 0.15),
+        _entry("replay_seg", 1, False, 2.0 + 96 * 0.08, call=9.0),
+    ]
+    lines = {(line["case"], line["rows"]): line for line in bench.derive(merged)}
+    seg = lines[("replay_seg", 1)]
+    assert seg["launch_ms_each"] == pytest.approx(0.08)
+    assert seg["collective_alone_ms_each"] == pytest.approx(0.07)
+    assert seg["host_call_share"] == pytest.approx(9.0 / (2.0 + 96 * 0.08))
+    assert lines[("replay", 1)]["all_reduce_ms_each"] == pytest.approx(0.15)
+
+
+def test_derive_uses_the_cached_uncut_body_for_cached_regimes():
+    merged = [
+        _entry("replay_cache", 32, False, 1.0),
+        _entry("replay_cache", 32, True, 1.0 + 96 * 0.10),
+        _entry("replay_seg_cache", 32, False, 1.0 + 96 * 0.03),
+        _entry("replay_layer_cache", 32, False, 1.0 + 47 * 0.02),
+        _entry("replay", 32, False, 2.0),
+        _entry("replay", 32, True, 2.0 + 96 * 0.15),
+    ]
+    lines = {(line["case"], line["rows"]): line for line in bench.derive(merged)}
+    assert lines[("replay_seg_cache", 32)]["launch_ms_each"] == pytest.approx(0.03)
+    assert lines[("replay_seg_cache", 32)]["collective_alone_ms_each"] == pytest.approx(0.07)
+    assert lines[("replay_layer_cache", 32)]["cut_ms_each_without_collectives"] == pytest.approx(0.02)
+    assert lines[("replay_cache", 32)]["vs"] == "replay"
+    assert lines[("replay_cache", 32)]["vs_total_ms"] == pytest.approx(1.0 + 96 * 0.10 - (2.0 + 96 * 0.15))
+    assert lines[("replay_cache", 32)]["vs_total_without_ms"] == pytest.approx(-1.0)
+
+
+def test_parse_env_sets_and_derive_against_the_baseline():
+    sets = bench.parse_env_sets("weak:HABANA_WEAK_ORDER=1; "
+                                "skip:ENABLE_EXPERIMENTAL_FLAGS=true,RUNTIME_SKIP_RECIPE_VALIDATION=1;")
+    assert sets == [("weak", {"HABANA_WEAK_ORDER": "1"}),
+                    ("skip", {"ENABLE_EXPERIMENTAL_FLAGS": "true", "RUNTIME_SKIP_RECIPE_VALIDATION": "1"})]
+    assert bench.parse_env_sets("") == []
+    with pytest.raises(ValueError):
+        bench.parse_env_sets("bad:NOVALUE")
+    baseline = [_entry("replay", 1, False, 2.0), _entry("replay", 1, True, 16.0, call=15.0)]
+    env_run = [_entry("replay@weak", 1, False, 2.1), _entry("replay@weak", 1, True, 10.1, call=9.0)]
+    lines = {(line["case"], line["rows"]): line for line in bench.derive(env_run, reference=baseline)}
+    line = lines[("replay@weak", 1)]
+    assert line["vs"] == "replay"
+    assert line["vs_total_ms"] == pytest.approx(-5.9)
+    assert line["vs_call_ms"] == pytest.approx(-6.0)
+    assert line["vs_total_without_ms"] == pytest.approx(0.1)
+    assert line["all_reduce_ms_each"] == pytest.approx(8.0 / 96)
+
+
+def test_cpu_reference_tells_a_reduction_from_none():
+    rank = bench.Rank.__new__(bench.Rank)
+    rank.torch, rank.device, rank.world = torch, "cpu", 4
+    rank.body = bench.Body(torch, "cpu", layers=2, world=4)
+    x = torch.randn(1, bench.HIDDEN).to(torch.bfloat16)
+    reduced = rank.body.forward(x, lambda t: t * 4).float()
+    record = rank.cpu_reference(x, reduced)
+    assert record["replay_vs_cpu_reduced_max_abs"] == 0.0
+    assert record["replay_vs_cpu_unreduced_max_abs"] > 0.0
+
+
+def test_parse_args_environment_sets_and_hold_options():
+    args = bench.parse_args(["--rows", "1,32", "--env-sets", "a:K=1", "--env-regimes", "replay,replay_seg",
+                             "--hold-file", "/tmp/h", "--hold-calls", "7", "--collectives", "off"])
+    assert args.env_sets == [("a", {"K": "1"})] and args.env_rows == [1, 32]
+    assert args.env_regimes == ["replay", "replay_seg"]
+    assert args.hold_calls == 7 and args.hold_regime == "replay" and args.collectives == "off"

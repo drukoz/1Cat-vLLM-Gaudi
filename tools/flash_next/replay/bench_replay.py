@@ -19,6 +19,11 @@ lazy process (``PT_HPU_LAZY_MODE=1``, ``PT_HPU_ENABLE_LAZY_COLLECTIVES=true``, `
                     program's default)
 * ``replay``, ``replay_layer``, ``replay_coll``  the same three bodies captured once with ``wrap_in_hpu_graph``
                     and replayed, with a new input tensor every call (as the runner hands new inputs each step)
+* ``replay_seg``    the replayed body cut where each all-reduce would be, without the all-reduces: the recipe
+                    launches of a step with collectives, alone (one launch = (replay_seg - replay) / 2L without
+                    collectives; one collective alone = (replay with - replay_seg) / 2L)
+* ``*_cache``       the same regime wrapped with ``disable_tensor_cache=False`` (the runner passes True): the
+                    captured tensors keep their device memory between replays
 
 eager process (``PT_HPU_LAZY_MODE=0``):
 
@@ -45,6 +50,7 @@ import collections
 import inspect
 import json
 import os
+import resource
 import subprocess
 import sys
 import tempfile
@@ -62,14 +68,20 @@ COMPILE_FULL_ROWS = (1, 32)
 EXIT_GRACE_S = 20.0
 LAZY_REGIMES = ("lazy", "lazy_layer", "lazy_coll", "replay", "replay_layer", "replay_coll", "graph_raw",
                 "replay_async", "replay_meta", "replay_tail", "replay_async_tail", "replay_par2", "replay_fused2",
-                "replay_coalesce")
+                "replay_coalesce", "replay_seg", "replay_cache", "replay_seg_cache", "replay_layer_cache")
+# Regimes that only exist without the collectives (a cut at every collective position and no collective).
+NO_COLLECTIVE_REGIMES = ("replay_seg", "replay_seg_cache")
+CACHE_SUFFIX = "_cache"
 # The pair regimes: both sub-blocks of a layer from the same input, so the layer's two all-reduces are independent
 # (par2: two calls; fused2: one call over the stacked pair, the same bytes; coalesce: the two calls in a coalescing
 # context). Layer.layer_pair. They have the compute of a pair layer, so they compare with each other, not with replay.
 PAIR_REGIMES = {"replay_par2": "par2", "replay_fused2": "fused2", "replay_coalesce": "coalesce"}
 # derive(): each of these against its reference regime, with the collectives.
 COMPARE_WITH = {"graph_raw": "replay", "replay_async": "replay", "replay_meta": "replay",
-                "replay_async_tail": "replay_tail", "replay_fused2": "replay_par2", "replay_coalesce": "replay_par2"}
+                "replay_async_tail": "replay_tail", "replay_fused2": "replay_par2", "replay_coalesce": "replay_par2",
+                "replay_cache": "replay", "replay_layer_cache": "replay_layer"}
+# An environment set's run of a regime is recorded as "<regime>@<set name>" and compared with the regime itself.
+ENV_SEPARATOR = "@"
 # The sampler stand-in after a replay in the *_tail regimes: lazy ops on [rows, TAIL_COLS] of the output.
 TAIL_OPS = 24
 TAIL_COLS = 256
@@ -101,6 +113,19 @@ def stats_ms(seconds):
     ms = sorted(1e3 * s for s in seconds)
     rank = min(max(-(-9 * len(ms) // 10), 1), len(ms))
     return {"p50": _median(ms), "p90": ms[rank - 1], "min": ms[0], "n": len(ms)}
+
+
+def thread_usage():
+    """(CPU seconds of the calling thread, its system seconds, its voluntary context switches).
+
+    The switches and the system time need RUSAGE_THREAD (Linux); elsewhere they are None.
+    """
+    cpu = time.thread_time()
+    who = getattr(resource, "RUSAGE_THREAD", None)
+    if who is None:
+        return cpu, None, None
+    usage = resource.getrusage(who)
+    return cpu, usage.ru_stime, usage.ru_nvcsw
 
 
 def emit(record: dict) -> None:
@@ -170,21 +195,23 @@ class Body:
             x = self.layer_pair(x, reduce, mode, coalesce)
         return x
 
-    def sub_block(self, x, k: int, reduce, cut_coll):
+    def sub_block(self, x, k: int, reduce, cut_coll, cut_seg=None):
         h = self.branch(x, k)
+        if cut_seg is not None:
+            cut_seg()  # a cut where the all-reduce is (or would be), whether or not there is one
         if reduce is not None:
             if cut_coll is not None:
                 cut_coll()
             h = reduce(h)
         return x + h
 
-    def layer(self, x, reduce, cut_coll=None):
-        x = self.sub_block(x, 0, reduce, cut_coll)
-        return self.sub_block(x, 1, reduce, cut_coll)
+    def layer(self, x, reduce, cut_coll=None, cut_seg=None):
+        x = self.sub_block(x, 0, reduce, cut_coll, cut_seg)
+        return self.sub_block(x, 1, reduce, cut_coll, cut_seg)
 
-    def forward(self, x, reduce, cut=None, cut_coll=None):
+    def forward(self, x, reduce, cut=None, cut_coll=None, cut_seg=None):
         for _ in range(self.layers):
-            x = self.layer(x, reduce, cut_coll)
+            x = self.layer(x, reduce, cut_coll, cut_seg)
             if cut is not None:
                 cut()
         return x
@@ -240,14 +267,17 @@ class Rank:
             self.htorch = htorch
             torch.hpu.set_device(self.rank)
             self.device, backend = "hpu", "hccl"
-        dist.init_process_group(backend=backend, init_method=args.init_method, world_size=self.world,
-                                rank=self.rank, timeout=timedelta(seconds=args.timeout))
-        self.group = dist.new_group(list(range(self.world)), backend=backend)
-        probe = torch.ones(1).to(self.device)
-        dist.all_reduce(probe, group=self.group)
-        if probe.item() != self.world:
-            raise RuntimeError("all-reduce of ones gave %s on rank %d, expected %d" %
-                               (probe.item(), self.rank, self.world))
+        # One rank alone (a one-card run of the launch path): no process group, the reduction is the identity.
+        self.group = None
+        if self.world > 1:
+            dist.init_process_group(backend=backend, init_method=args.init_method, world_size=self.world,
+                                    rank=self.rank, timeout=timedelta(seconds=args.timeout))
+            self.group = dist.new_group(list(range(self.world)), backend=backend)
+            probe = torch.ones(1).to(self.device)
+            dist.all_reduce(probe, group=self.group)
+            if probe.item() != self.world:
+                raise RuntimeError("all-reduce of ones gave %s on rank %d, expected %d" %
+                                   (probe.item(), self.rank, self.world))
         self.barrier_probe = torch.zeros(1).to(self.device)
         self.body = Body(torch, self.device, args.layers, self.world)
 
@@ -261,11 +291,14 @@ class Rank:
             self.torch.hpu.synchronize()
 
     def barrier(self) -> None:
+        if self.group is None:
+            return
         self.dist.all_reduce(self.barrier_probe, group=self.group)
         self.barrier_probe.item()
 
     def inplace_reduce(self, tensor):
-        self.dist.all_reduce(tensor, group=self.group)
+        if self.group is not None:
+            self.dist.all_reduce(tensor, group=self.group)
         return tensor
 
     def functional_reduce(self):
@@ -348,38 +381,62 @@ class Rank:
         self.barrier()
         first = None
         calls, totals = [], []
+        # Where the host's time goes: CPU seconds of the calling thread during the call and during call plus
+        # synchronize, CPU seconds of the whole process (every thread) during both, the calling thread's system
+        # time and its voluntary context switches (a thread that waits sleeps; one that issues or polls burns CPU).
+        cpu_calls, cpu_totals, cpu_procs, sys_totals, switches = [], [], [], [], []
         out = None
         for i in range(warmup + repeats):
             x = inputs[i % len(inputs)]
+            p0 = time.process_time()
+            c0, s0, v0 = thread_usage()
             t0 = _now()
             out = call(x)
             t1 = _now()
+            c1 = time.thread_time()
             self.synchronize()
             t2 = _now()
+            c2, s2, v2 = thread_usage()
+            p2 = time.process_time()
             if i == 0:
                 first = t2 - t0
             elif i >= warmup:
                 calls.append(t1 - t0)
                 totals.append(t2 - t0)
+                cpu_calls.append(c1 - c0)
+                cpu_totals.append(c2 - c0)
+                cpu_procs.append(p2 - p0)
+                if s0 is not None:
+                    sys_totals.append(s2 - s0)
+                    switches.append(v2 - v0)
         finite = None
         if out is not None:
             finite = bool(self.torch.isfinite(out.float()).all().item())
         return {"first_ms": None if first is None else 1e3 * first, "call_ms": stats_ms(calls),
-                "total_ms": stats_ms(totals), "finite": finite}
+                "total_ms": stats_ms(totals), "finite": finite,
+                "cpu": {"call_ms": _median([1e3 * v for v in cpu_calls]),
+                        "total_ms": _median([1e3 * v for v in cpu_totals]),
+                        "process_ms": _median([1e3 * v for v in cpu_procs]),
+                        "thread_sys_ms": _median([1e3 * v for v in sys_totals]),
+                        "thread_voluntary_switches": _median(switches)}}
 
     # ------------------------------------------------------------------------------- lazy process
     def lazy_case(self, regime: str, rows: int, collectives: bool, repeats: int) -> dict:
         body = self.body
         reduce = self.inplace_reduce if collectives else None
-        cut = self.mark_step if regime.endswith(("_layer", "_coll")) else None
-        cut_coll = self.mark_step if regime.endswith("_coll") else None
+        # "<regime>_cache": the same regime with the wrapper's tensor cache on (disable_tensor_cache=False).
+        tensor_cache = regime.endswith(CACHE_SUFFIX)
+        shape = regime[:-len(CACHE_SUFFIX)] if tensor_cache else regime
+        cut = self.mark_step if shape.endswith(("_layer", "_coll")) else None
+        cut_coll = self.mark_step if shape.endswith("_coll") else None
+        cut_seg = self.mark_step if shape.endswith("_seg") else None
 
         pair_mode = PAIR_REGIMES.get(regime)
 
         def step(x):
             if pair_mode is not None:
                 return body.forward_pair(x, reduce, pair_mode, self.coalescing_context)
-            return body.forward(x, reduce, cut, cut_coll)
+            return body.forward(x, reduce, cut, cut_coll, cut_seg)
 
         inputs = self.inputs(rows)
         torch = self.torch
@@ -434,7 +491,7 @@ class Rank:
             module = Step()
             if self.htorch is not None:
                 module = self.htorch.hpu.wrap_in_hpu_graph(module, asynchronous=(regime == "replay_async"),
-                                                           disable_tensor_cache=True)
+                                                           disable_tensor_cache=not tensor_cache)
             call = module
         record = self.timed(call, inputs, repeats, warmup=3)
         record.update({"case": regime, "rows": rows, "collectives": collectives, "layers": body.layers,
@@ -545,6 +602,84 @@ class Rank:
         async_tokens = self.sampler_tail(module_async(x)).cpu()
         record["async_tokens_equal_sync"] = bool(torch.equal(sync_tokens, async_tokens))
         record["async_replay_vs_lazy_max_abs"] = float((lazy - module_async(x).float().cpu()).abs().max())
+        record.update(self.cpu_reference(x, replay))
+        return record
+
+    def cpu_reference(self, x, replay) -> dict:
+        """The replayed output against the same body on the CPU, with and without the reductions.
+
+        Every rank holds the same weights and the same input, so an all-reduce multiplies by the world size. The
+        CPU body with that factor is what the card must give; the CPU body with factor 1 is what it gives when a
+        collective did nothing (a setting that skips the hardware). bf16 GEMMs differ a little between CPU and
+        card, so the two distances are reported and the smaller one names the case.
+        """
+        torch = self.torch
+        try:
+            cpu_body = Body(torch, "cpu", self.body.layers, self.world)
+            x_cpu = x.detach().to("cpu")
+            world = self.world
+            reduced = cpu_body.forward(x_cpu, lambda t: t * world).float()
+            unreduced = cpu_body.forward(x_cpu, lambda t: t).float()
+            scale = float(reduced.abs().max()) or 1.0
+            return {"cpu_reference_max_abs": scale,
+                    "replay_vs_cpu_reduced_max_abs": float((replay - reduced).abs().max()),
+                    "replay_vs_cpu_unreduced_max_abs": float((replay - unreduced).abs().max())}
+        except Exception as exc:  # noqa: BLE001 - informative only
+            return {"cpu_reference_error": "%s: %s" % (type(exc).__name__, str(exc)[:300])}
+
+    def hold_loop(self, path: str, rows: int, calls: int, regime: str = "replay") -> dict:
+        """calls replays of the body, back to back, while an outside sampler looks.
+
+        regime ``replay``: the body with its all-reduces; ``replay_seg``: cut at every collective position, no
+        collective (the launches alone; the form for one rank).
+
+        Rank 0 writes ``path`` (its pid and the start time) before the loop and ``path + ".done"`` after it, so
+        a script outside the process (thread CPU times from /proc, native stacks, a syscall count) knows when the
+        process is inside replays and nothing else. Every rank runs the same number of calls: the collectives
+        keep the ranks in step.
+        """
+        torch = self.torch
+        body = self.body
+
+        segments = regime == "replay_seg"
+
+        class Step(torch.nn.Module):
+
+            def forward(inner, x):  # noqa: N805 - the body, not the module, holds the state
+                if segments:
+                    return body.forward(x, None, cut_seg=self.mark_step)
+                return body.forward(x, self.inplace_reduce)
+
+        module = Step()
+        if self.htorch is not None:
+            module = self.htorch.hpu.wrap_in_hpu_graph(module, disable_tensor_cache=True)
+        inputs = self.inputs(rows)
+        for i in range(3):
+            module(inputs[i % len(inputs)])
+        self.synchronize()
+        self.barrier()
+        if self.rank == 0:
+            with open(path, "w", encoding="utf-8") as fh:
+                json.dump({"pid": os.getpid(), "start": time.time(), "calls": calls, "rows": rows,
+                           "regime": regime}, fh)
+        started = _now()
+        cpu0, sys0, switches0 = thread_usage()
+        process0 = time.process_time()
+        for i in range(calls):
+            module(inputs[i % len(inputs)])
+            self.synchronize()
+        seconds = _now() - started
+        cpu1, sys1, switches1 = thread_usage()
+        record = {"case": "hold", "regime": regime, "rows": rows, "calls": calls, "seconds": seconds,
+                  "ms_per_call": 1e3 * seconds / max(calls, 1),
+                  "thread_cpu_ms_per_call": 1e3 * (cpu1 - cpu0) / max(calls, 1),
+                  "process_cpu_ms_per_call": 1e3 * (time.process_time() - process0) / max(calls, 1)}
+        if sys0 is not None:
+            record["thread_sys_ms_per_call"] = 1e3 * (sys1 - sys0) / max(calls, 1)
+            record["thread_voluntary_switches_per_call"] = (switches1 - switches0) / max(calls, 1)
+        if self.rank == 0:
+            with open(path + ".done", "w", encoding="utf-8") as fh:
+                json.dump({"end": time.time(), "seconds": seconds}, fh)
         return record
 
 
@@ -602,6 +737,10 @@ def rank_main(args) -> int:
                 if regime == "compile_full" and rows not in args.compile_full_rows:
                     continue
                 for collectives in (False, True):
+                    if collectives and (regime in NO_COLLECTIVE_REGIMES or args.collectives == "off"):
+                        continue
+                    if not collectives and args.collectives == "on":
+                        continue
                     try:
                         if args.process == "lazy":
                             record = rank.lazy_case(regime, rows, collectives, repeats)
@@ -618,6 +757,13 @@ def rank_main(args) -> int:
                             pass
                     record["rank"] = args.rank
                     emit(record)
+        if args.hold_file and args.hold_calls > 0 and args.process == "lazy":
+            try:
+                record = rank.hold_loop(args.hold_file, args.hold_rows, args.hold_calls, args.hold_regime)
+            except Exception as exc:  # noqa: BLE001 - the timings still stand
+                record = {"case": "hold", "error": "%s: %s" % (type(exc).__name__, str(exc)[:500])}
+            record["rank"] = args.rank
+            emit(record)
         if args.trace_dir and args.process == "lazy":
             try:
                 record = rank.trace_replay(args.trace_dir, args.trace_rows, args.trace_calls)
@@ -638,7 +784,7 @@ def rank_main(args) -> int:
 # ---------------------------------------------------------------------------------------------
 # Parent: start the ranks per process kind, gather their lines, derive, print.
 # ---------------------------------------------------------------------------------------------
-def rank_environment(args, process: str) -> dict:
+def rank_environment(args, process: str, extra_env=None) -> dict:
     env = dict(os.environ)
     env["PYTHONUNBUFFERED"] = "1"
     if not args.selftest:
@@ -648,7 +794,30 @@ def rank_environment(args, process: str) -> dict:
             env.setdefault("PT_HPU_ENABLE_LAZY_COLLECTIVES", "true")
         if args.cards:
             env["HABANA_VISIBLE_MODULES"] = args.cards
+    env.update(extra_env or {})
     return env
+
+
+def parse_env_sets(text: str) -> list:
+    """``name:KEY=VALUE,KEY=VALUE;name2:KEY=VALUE`` -> [(name, {KEY: VALUE})]: runs of the lazy process under
+    another environment (bridge, Synapse or HCL settings), each recorded as ``<regime>@<name>``."""
+    sets = []
+    for chunk in (text or "").split(";"):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        name, _, pairs = chunk.partition(":")
+        name = name.strip()
+        env = {}
+        for pair in pairs.split(","):
+            key, sep, value = pair.strip().partition("=")
+            if not sep or not key:
+                raise ValueError("environment set %r: %r is not KEY=VALUE" % (name, pair))
+            env[key] = value
+        if not name or not env or ENV_SEPARATOR in name:
+            raise ValueError("environment set %r needs a name and at least one KEY=VALUE" % chunk)
+        sets.append((name, env))
+    return sets
 
 
 def case_key(record: dict) -> tuple:
@@ -659,7 +828,8 @@ def merge(per_rank: dict) -> list:
     """One entry per case: rank 0's fields plus the slowest rank's and the median rank's p50 of each timing."""
     merged = []
     for record in per_rank.get(0, []):
-        if record.get("case") in ("env", "done", "error", "bridge_sources", "check") or "error" in record:
+        if record.get("case") in ("env", "done", "error", "bridge_sources", "check", "hold", "trace") \
+                or "error" in record:
             continue
         entry = dict(record)
         key = case_key(record)
@@ -673,11 +843,15 @@ def merge(per_rank: dict) -> list:
     return merged
 
 
-def derive(merged: list) -> list:
-    """Per regime and rows: one all-reduce, one cut, and the host share of a call."""
+def derive(merged: list, reference: list | None = None) -> list:
+    """Per regime and rows: one all-reduce, one cut, one launch, and the host share of a call.
+
+    reference: entries of other runs to compare with (the baseline, for an environment set's entries).
+    """
+    lookup = list(merged) + list(reference or [])
 
     def total(case, rows, collectives):
-        for entry in merged:
+        for entry in lookup:
             if case_key(entry) == (case, rows, collectives):
                 return entry.get("total_p50_max_rank_ms"), entry.get("call_p50_max_rank_ms"), entry.get("layers")
         return None, None, None
@@ -695,17 +869,37 @@ def derive(merged: list) -> list:
             line["all_reduce_ms_each"] = (with_c - without) / (calls or 2 * layers)
         if with_c and call_with is not None:
             line["host_call_share"] = call_with / with_c
+        name, _, env_name = case.partition(ENV_SEPARATOR)
+        suffix = (ENV_SEPARATOR + env_name) if env_name else ""
+        cache = CACHE_SUFFIX if name.endswith(CACHE_SUFFIX) else ""
+        shape = name[:-len(CACHE_SUFFIX)] if cache else name
+        if shape == "replay_seg" and layers:
+            # A cut at each of the 2L collective positions and no collective: the launches of a step with
+            # collectives. One launch = (this - the uncut body) / 2L; one collective alone = (the body with
+            # its collectives - this) / 2L, both without the launch the collective forces.
+            uncut_without, _, _ = total("replay" + cache + suffix, rows, False)
+            uncut_with, _, _ = total("replay" + cache + suffix, rows, True)
+            _, call_without, _ = total(case, rows, False)
+            if None not in (uncut_without, without):
+                line["launch_ms_each"] = (without - uncut_without) / (2 * layers)
+            if None not in (uncut_with, without):
+                line["collective_alone_ms_each"] = (uncut_with - without) / (2 * layers)
+            if without and call_without is not None:
+                line["host_call_share"] = call_without / without
         base = {"lazy_layer": "lazy", "lazy_coll": "lazy_layer", "replay_layer": "replay",
-                "replay_coll": "replay_layer"}.get(case)
+                "replay_coll": "replay_layer"}.get(shape)
         if base and layers:
+            base = base + cache + suffix
             base_with, _, _ = total(base, rows, True)
             base_without, _, _ = total(base, rows, False)
-            cuts = (layers - 1) if case.endswith("_layer") else 2 * layers
+            cuts = (layers - 1) if shape.endswith("_layer") else 2 * layers
             if None not in (base_with, with_c):
                 line["cut_ms_each_with_collectives"] = (with_c - base_with) / cuts
-            if None not in (base_without, without) and case.endswith("_layer"):
+            if None not in (base_without, without) and shape.endswith("_layer"):
                 line["cut_ms_each_without_collectives"] = (without - base_without) / cuts
         ref = COMPARE_WITH.get(case)
+        if env_name:
+            ref = name  # an environment set's run of a regime against the baseline's run of it
         if ref is not None:
             # Against its reference on the same body, with the collectives: the wrapper's own per-call cost
             # (graph_raw), an asynchronous replay (replay_async, replay_async_tail), hashing and copying a
@@ -716,6 +910,9 @@ def derive(merged: list) -> list:
                 line["vs_total_ms"] = with_c - ref_with
             if None not in (ref_call, call_with):
                 line["vs_call_ms"] = call_with - ref_call
+            ref_without, _, _ = total(ref, rows, False)
+            if None not in (ref_without, without):
+                line["vs_total_without_ms"] = without - ref_without
         lines.append(line)
     return lines
 
@@ -726,24 +923,42 @@ def _fmt(value, digits=3):
 
 def print_summary(merged: list, derived: list, ranks: int, echo=print) -> None:
     echo("== %d ranks; the slowest rank's median per call, ms (call = until the call returns on the host)" % ranks)
+    echo("   (cpu, rank 0: CPU ms of the calling thread in the call / in call + synchronize, of the whole process,"
+         " the thread's system ms, its voluntary context switches)")
     for entry in merged:
-        echo("   %-14s rows %3d coll %-5s: total %s  call %s  first %s" %
+        cpu = entry.get("cpu") or {}
+        echo("   %-22s rows %3d coll %-5s: total %s  call %s  first %s  cpu %s / %s  proc %s  sys %s  sw %s" %
              (entry["case"], entry["rows"], entry["collectives"], _fmt(entry.get("total_p50_max_rank_ms")),
-              _fmt(entry.get("call_p50_max_rank_ms")), _fmt(entry.get("first_ms"), 1)))
+              _fmt(entry.get("call_p50_max_rank_ms")), _fmt(entry.get("first_ms"), 1), _fmt(cpu.get("call_ms")),
+              _fmt(cpu.get("total_ms")), _fmt(cpu.get("process_ms")), _fmt(cpu.get("thread_sys_ms")),
+              _fmt(cpu.get("thread_voluntary_switches"), 0)))
     for line in derived:
-        echo("   %-14s rows %3d: one all-reduce %s ms; one cut %s ms (with coll) / %s ms (without); host share %s%s" %
+        echo("   %-22s rows %3d: one all-reduce %s ms; one cut %s ms (with coll) / %s ms (without); host share %s%s%s" %
              (line["case"], line["rows"], _fmt(line.get("all_reduce_ms_each"), 4),
               _fmt(line.get("cut_ms_each_with_collectives"), 4), _fmt(line.get("cut_ms_each_without_collectives"), 4),
               _fmt(line.get("host_call_share"), 2),
-              ("; against %s: total %s ms, call %s ms" %
-               (line["vs"], _fmt(line.get("vs_total_ms"), 4), _fmt(line.get("vs_call_ms"), 4)))
+              ("; one launch %s ms, one collective alone %s ms" %
+               (_fmt(line.get("launch_ms_each"), 4), _fmt(line.get("collective_alone_ms_each"), 4)))
+              if "launch_ms_each" in line or "collective_alone_ms_each" in line else "",
+              ("; against %s: total %s ms (without coll %s), call %s ms" %
+               (line["vs"], _fmt(line.get("vs_total_ms"), 4), _fmt(line.get("vs_total_without_ms"), 4),
+                _fmt(line.get("vs_call_ms"), 4)))
               if "vs" in line else ""))
 
 
-def run_ranks(args, process: str, echo=print) -> dict:
+def run_ranks(args, process: str, echo=print, env_set=None) -> dict:
+    """Start the ranks of one process kind and gather their records.
+
+    env_set ``(name, env)``: the lazy process under that environment, only ``--env-regimes`` at ``--env-rows``,
+    without the hold loop and the trace, within ``--env-timeout`` seconds.
+    """
     workdir = tempfile.mkdtemp(prefix="replay-bench-")
     init_method = "file://" + os.path.join(workdir, "dist_init")
-    env = rank_environment(args, process)
+    env = rank_environment(args, process, env_set[1] if env_set else None)
+    regimes = args.env_regimes if env_set else args.regimes
+    rows = args.env_rows if env_set else args.rows
+    timeout = args.env_timeout if env_set else args.timeout
+    label = process if not env_set else "%s%s%s" % (process, ENV_SEPARATOR, env_set[0])
     procs, per_rank, tails = [], {}, {}
     started = time.monotonic()
 
@@ -757,7 +972,7 @@ def run_ranks(args, process: str, echo=print) -> dict:
                 except ValueError:
                     continue
                 if rank == 0 and records[-1].get("case") not in ("env", "done"):
-                    echo("  [%s rank 0] %s" % (process, json.dumps(records[-1])[:260]))
+                    echo("  [%s rank 0] %s" % (label, json.dumps(records[-1])[:260]))
             else:
                 tail.append(line)
                 del tail[:-40]
@@ -766,14 +981,18 @@ def run_ranks(args, process: str, echo=print) -> dict:
     for rank in range(args.ranks):
         cmd = [sys.executable, os.path.abspath(__file__), "--child", "--process", process, "--rank", str(rank),
                "--ranks", str(args.ranks), "--init-method", init_method, "--rows",
-               ",".join(str(r) for r in args.rows), "--layers", str(args.layers), "--repeats", str(args.repeats),
-               "--timeout", str(int(args.timeout)), "--regimes", ",".join(args.regimes),
-               "--compile-full-rows", ",".join(str(r) for r in args.compile_full_rows)]
-        if args.dump_dir:
+               ",".join(str(r) for r in rows), "--layers", str(args.layers), "--repeats", str(args.repeats),
+               "--timeout", str(int(timeout)), "--regimes", ",".join(regimes),
+               "--compile-full-rows", ",".join(str(r) for r in args.compile_full_rows),
+               "--collectives", args.collectives]
+        if args.dump_dir and not env_set:
             cmd += ["--dump-dir", os.path.abspath(args.dump_dir)]
-        if args.trace_dir:
+        if args.trace_dir and not env_set:
             cmd += ["--trace-dir", os.path.abspath(args.trace_dir), "--trace-rows", str(args.trace_rows),
                     "--trace-calls", str(args.trace_calls)]
+        if args.hold_file and args.hold_calls > 0 and not env_set:
+            cmd += ["--hold-file", os.path.abspath(args.hold_file), "--hold-calls", str(args.hold_calls),
+                    "--hold-rows", str(args.hold_rows), "--hold-regime", args.hold_regime]
         if args.selftest:
             cmd.append("--selftest")
         if args.quick:
@@ -784,7 +1003,7 @@ def run_ranks(args, process: str, echo=print) -> dict:
         thread = threading.Thread(target=reader, args=(rank, proc), daemon=True)
         thread.start()
         threads.append(thread)
-    deadline = started + args.timeout
+    deadline = started + timeout
     timed_out = False
     all_done_at = None
     while any(proc.poll() is None for proc in procs):
@@ -809,7 +1028,15 @@ def run_ranks(args, process: str, echo=print) -> dict:
         thread.join(timeout=10)
     done = sorted(rank for rank, records in per_rank.items() if any(r.get("case") == "done" for r in records))
     errors = {rank: r["error"] for rank, records in per_rank.items() for r in records if r.get("case") == "error"}
-    return {"process": process, "ranks": args.ranks, "seconds": round(time.monotonic() - started, 1),
+    if env_set:
+        # The records of an environment set carry its name, so they stand next to the baseline's.
+        for records in per_rank.values():
+            for record in records:
+                if record.get("case") not in ("env", "done", "error", "bridge_sources", "check", None):
+                    record["case"] = "%s%s%s" % (record["case"], ENV_SEPARATOR, env_set[0])
+                record["env_set"] = env_set[0]
+    return {"process": label, "env": env_set[1] if env_set else None,
+            "ranks": args.ranks, "seconds": round(time.monotonic() - started, 1),
             "timed_out": timed_out, "exit_codes": [proc.returncode for proc in procs], "ranks_done": done,
             "errors": errors, "per_rank": {str(rank): records for rank, records in sorted(per_rank.items())},
             "output_tails": {str(rank): tail[-20:] for rank, tail in sorted(tails.items())}}
@@ -830,6 +1057,22 @@ def build_parser() -> argparse.ArgumentParser:
                         help="ranks 0 and 1 write a torch.profiler trace of a few replays (with collectives) here")
     parser.add_argument("--trace-rows", type=int, default=1)
     parser.add_argument("--trace-calls", type=int, default=5)
+    parser.add_argument("--collectives", default="both", choices=("both", "off", "on"),
+                        help="time each regime without and with its all-reduces (both), or only one of them")
+    parser.add_argument("--hold-file", default=None,
+                        help="after the regimes, every rank replays --hold-calls times back to back; rank 0 writes "
+                        "this file (its pid) before and FILE.done after, for a sampler outside the process")
+    parser.add_argument("--hold-calls", type=int, default=0)
+    parser.add_argument("--hold-rows", type=int, default=1)
+    parser.add_argument("--hold-regime", default="replay", choices=("replay", "replay_seg"))
+    parser.add_argument("--env-sets", default="",
+                        help="more runs of the lazy process under other settings: name:KEY=VALUE,KEY=VALUE;name2:...")
+    parser.add_argument("--env-regimes", default="replay", help="the regimes of the --env-sets runs")
+    parser.add_argument("--env-rows", default=None, help="their rows (default: --rows)")
+    parser.add_argument("--env-timeout", type=float, default=240.0, metavar="S",
+                        help="per --env-sets run (default 240)")
+    parser.add_argument("--env-pause", type=float, default=15.0, metavar="S",
+                        help="wait after an --env-sets run that did not end cleanly (the cards must be released)")
     parser.add_argument("--out", default=None, help="write every result to this JSON file")
     parser.add_argument("--timeout", type=float, default=900.0, metavar="S", help="per process kind (default 900)")
     parser.add_argument("--quick", action="store_true", help="few repeats (a smoke run)")
@@ -847,6 +1090,10 @@ def parse_args(argv=None):
     args.compile_full_rows = [int(token) for token in str(args.compile_full_rows).split(",") if token.strip()]
     args.regimes = [token.strip() for token in str(args.regimes).split(",") if token.strip()]
     args.processes = [token.strip() for token in str(args.processes).split(",") if token.strip()]
+    args.env_regimes = [token.strip() for token in str(args.env_regimes).split(",") if token.strip()]
+    args.env_rows = ([int(token) for token in str(args.env_rows).split(",") if token.strip()]
+                     if args.env_rows else list(args.rows))
+    args.env_sets = parse_env_sets(args.env_sets)
     return args
 
 
@@ -858,22 +1105,40 @@ def main(argv=None) -> int:
         args.ranks = 2
     runs, merged, derived = [], [], []
     complete = True
-    for process in args.processes:
-        run = run_ranks(args, process)
+
+    def write_out():
+        if args.out:
+            with open(args.out, "w", encoding="utf-8") as fh:
+                json.dump({"tool": "bench_replay", "selftest": args.selftest, "runs": runs, "merged": merged,
+                           "derived": derived}, fh, indent=1)
+
+    plan = [(process, None) for process in args.processes]
+    if "lazy" in args.processes:
+        plan += [("lazy", env_set) for env_set in args.env_sets]
+    for process, env_set in plan:
+        if env_set:
+            print("== environment set %s: %s" % (env_set[0], " ".join("%s=%s" % kv for kv in env_set[1].items())),
+                  flush=True)
+        run = run_ranks(args, process, env_set=env_set)
         runs.append(run)
         per_rank = {int(rank): records for rank, records in run["per_rank"].items()}
         merged_p = merge(per_rank)
+        derived += derive(merged_p, reference=merged)
         merged += merged_p
-        derived += derive(merged_p)
-        if run["ranks_done"] != list(range(args.ranks)):
-            complete = False
+        clean = run["ranks_done"] == list(range(args.ranks))
+        if not clean:
+            # An environment set that fails is a result (that setting does not work), not a failed benchmark.
+            complete = complete and bool(env_set)
             print("INCOMPLETE %s: ranks done %s of %d, timed out %s, errors %s" %
-                  (process, run["ranks_done"], args.ranks, run["timed_out"], run["errors"]))
+                  (run["process"], run["ranks_done"], args.ranks, run["timed_out"], run["errors"]))
             for rank, tail in run["output_tails"].items():
                 if int(rank) not in run["ranks_done"]:
                     print("  rank %s last output:" % rank)
                     for line in tail[-10:]:
                         print("     " + line)
+        write_out()  # after every run: a later run that hangs or is cut off loses nothing
+        if not clean and not args.selftest and (process, env_set) != plan[-1]:
+            time.sleep(args.env_pause)
     print()
     if args.selftest:
         print("SELFTEST ONLY (gloo on the CPU): the lines below check this script, they are not results.")
@@ -881,14 +1146,14 @@ def main(argv=None) -> int:
     for run in runs:
         for record in run["per_rank"].get("0", []):
             if record.get("case") == "check":
-                print("   check (%s): %s" % (run["process"], json.dumps(record)[:300]))
+                print("   check (%s): %s" % (run["process"], json.dumps(record)[:600]))
+            if record.get("case") == "hold":
+                print("   hold (%s): %s" % (run["process"], json.dumps(record)[:600]))
             if "error" in record and record.get("case") not in ("error",):
                 print("   failed %s rows %s coll %s: %s" % (record.get("case"), record.get("rows"),
                                                            record.get("collectives"), record["error"][:300]))
     if args.out:
-        with open(args.out, "w", encoding="utf-8") as fh:
-            json.dump({"tool": "bench_replay", "selftest": args.selftest, "runs": runs, "merged": merged,
-                       "derived": derived}, fh, indent=1)
+        write_out()
         print("wrote %s" % args.out)
     return 0 if complete else 2
 
