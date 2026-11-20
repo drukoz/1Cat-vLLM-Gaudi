@@ -292,14 +292,14 @@ Every job runs the committed tree in the farm's per-commit image (`CARD.md`); sc
 | 00073 `c4-bench-r8-r4`, 8 cards, image 684b54ad, 21:24-21:29 UTC | `bench_job.sh`: the id check through the all-gather on 8 ranks; `bench_c4.py` on 8 ranks, on the module group 0-3, and on both groups at once | alpha per rank count, regime and form (section 5) | **Exit 2 from the first stage**: the 8 id-check ranks hit the stage's 150 s limit and the script killed them (the "killed while waiting" kernel lines on cards 0, 4, 5, 6, 7; not a card fault; load average up to 414). Before that `vp_argmax` through the 8-rank all-gather equalled the CPU at every row, regime and data set, and `vp_topk` (the earlier form) in every case that ran. The bench stages ran to the end: section 5 |
 | 00112 `cuts-cardproof-tp4`, 4 cards (modules 0-3), commit d1cbe91d (the head of PR #14), 23:08-23:12 UTC | `cardproof_job.sh`: `id_check.py` on 4 hccl ranks; the tiny model at TP4 with fused hyper-connections, arm `logits-rider` (`VLLM_HPU_VOCAB_PARALLEL_LOGITS=1 VLLM_HPU_PLE_TABLE_RIDER=1`) and arm `logits2-embed` (`VLLM_HPU_VOCAB_PARALLEL_LOGITS=2 VLLM_HPU_REPLICATED_EMBEDDING=1`) | the serving id cases equal the CPU; every arm's tokens equal the reference | **Ids PASS at 4 ranks**: `vp_argmax` and `vp_topk@20/@64` (the merged top-k head through the 4-rank all-gather) equal at rows 1, 2, 32, 128, both regimes, untied and tied. **Tiny: exit 1.** Both arms give identical tokens: prompts of 7, 33, 2,600 tokens 16/16; 1 and 100 tokens near ties at token 0 (excused, as in every baseline); the 700-token prompt 4/16, first difference at token 4. The same 700-token answer, token for token, comes from engine-step's 00093 `tiny-flags` at TP1 (`VLLM_HPU_FUSED_GREEDY_LOGITS=1`, none of this track's flags) and from mtp-card-ready's 00105 fused-verify arms at TP2, while every baseline tiny run matches 16/16. So it comes with the in-graph greedy region (or any small numerical change), not with the cuts: a near tie of the reference at token 4 (coordinator, 2026-11-20; the tiny model's logits are near-flat: top-2 margins of 0.0005 to 0.02 at values near 0.27, where one bf16 step is 0.002, on a same-recipe checkpoint built on the Mac) |
 | 00082 `real4-ab2-off`, 00083 `real4-ab2-logits-rider` (commit d158c6d5) | the real-model A/B against the plugin's default path | | replaced by the pair below: against the default path the lone texts can part at a bf16 tie that the greedy region itself moves, which says nothing about the cuts |
-| the pair `real4-ab3-region` / `real4-ab3-cuts`, 4 cards each, 25 min, ids in the handoff | `ab_job.sh` on this branch's head: the real model at TP4 + EP4, 1 and 32 streams, 256 tokens, no `min_tokens`, every stream's text kept; 6 lone requests; one 32-stream round with the server's default sampling. Arm `region`: `VLLM_HPU_FUSED_GREEDY_LOGITS=1` (the greedy region over the gathered logits); arm `cuts`: `VLLM_HPU_VOCAB_PARALLEL_LOGITS=1 VLLM_HPU_PLE_TABLE_RIDER=1` (the same region, the vocabulary-parallel arg max, the PLE rows on the embedding all-reduce); both `VLLM_GRAPH_RESERVED_MEM=0.5` | `compare_arms.py <region> <cuts>`: the 6 lone requests' texts must be equal token for token (both arms compute the same bf16 logits; the cuts are exact); the ms per step at 1 and 32 streams is the cuts' own effect (expected under 1 ms: one all-gather of `[rows, 62,080]` bf16 per rank and one all-reduce fewer) | pending |
+| **00124** `real4-ab3-region` (cards 0,1,2,7) / **00125** `real4-ab3-cuts` (cards 3,4,5,6), 4 cards each, 25 min, commit 0a66722b, side by side, in the places of 00082 / 00083 | `ab_job.sh` on this branch's head: the real model at TP4 + EP4, 1 and 32 streams, 256 tokens, no `min_tokens`, every stream's text kept; 6 lone requests; one 32-stream round with the server's default sampling. Arm `region`: `VLLM_HPU_FUSED_GREEDY_LOGITS=1` (the greedy region over the gathered logits); arm `cuts`: `VLLM_HPU_VOCAB_PARALLEL_LOGITS=1 VLLM_HPU_PLE_TABLE_RIDER=1` (the same region, the vocabulary-parallel arg max, the PLE rows on the embedding all-reduce); both `VLLM_GRAPH_RESERVED_MEM=0.5` | `compare_arms.py <region> <cuts>`: the 6 lone requests' texts must be equal token for token (both arms compute the same bf16 logits; the cuts are exact); the ms per step at 1 and 32 streams is the cuts' own effect (expected under 1 ms: one all-gather of `[rows, 62,080]` bf16 per rank and one all-reduce fewer) | pending |
 
 A probe that sends `min_tokens` measures none of this: a request with `min_tokens` is kept out of the greedy region
 (`_can_fuse_plain_greedy_sampling`, `hpu_model_runner.py`), so the logits are gathered and sampled as before.
 
 ## Handoff (if this agent stops)
 
-State at 23:50 UTC on 2026-11-20 (fourth agent of this track, from 23:15 UTC, Opus 5.5). Branch
+State at 23:35 UTC on 2026-11-20 (fourth agent of this track, from 23:15 UTC, Opus 5.5). Branch
 `feat/flash-next-gaudi-collectives`, worktree `/Volumes/Storage/Claude/gaudi-work/wt/collectives`; scratch, logs
 and card results in `/Volumes/Storage/Claude/gaudi-work/reports/collectives/` (`card/<id>-<name>/`, `logs/`,
 `probes/`). This section is the track's report: the harness refuses a REPORT.md.
@@ -313,8 +313,9 @@ Where things are:
   `reports/collectives/dev-wt` (branch `feat/flash-next-gaudi-collectives-dev`) is an ancestor of the branch head
   and has nothing of its own.
 - Card results, all read and fetched (section 6): 00064, 00108, 00112 (ids), 00073 (collective cost, section 5).
-  Sent to the coordinator at about 23:30 UTC: the id verdicts, why 00073 failed and what it measured, the cuts'
-  card state; at about 23:40 UTC the bench comparison with native-replay's 00065 (also sent to native-replay).
+  Sent to the coordinator (23:25 to 23:35 UTC): the id verdicts, why 00073 failed and what it measured, the cuts'
+  card state, the bench comparison with native-replay's 00065 (native-replay agrees: a served TP8 step pays about
+  150 to 170 us per collective), the pair 00124 / 00125 and the flag state below.
 
 What is proven on the card (VERIFIED by the jobs named):
 - `vocab_parallel_argmax` (mode 1's arg max): equal to the CPU at 1 rank (00064, 00108), through the 4-rank
@@ -330,8 +331,11 @@ What is proven on the card (VERIFIED by the jobs named):
   integration tree).
 - Not worth it (00073): `VLLM_HPU_ALL_REDUCE_AS_GATHER_ROWS` (keep 0) and its fused form.
 
-Card jobs: the real-model pair `real4-ab3-region` / `real4-ab3-cuts` replaced 00082 / 00083 (their ids, the
-commit and the waiters are in the line below once submitted). When both have ended:
+Card jobs: the real-model pair **00124** `real4-ab3-region` / **00125** `real4-ab3-cuts` (commit 0a66722b, any:4,
+25 min each, side by side on the two halves, in the places of 00082 / 00083; at 23:33 UTC both "start by 02:50
+UTC at the latest"). Waiters: this agent's two background `bin/farm job` commands (logs
+`reports/collectives/logs/farm_real4_ab3_{region,cuts}.log`) copy each job's log and results to
+`reports/collectives/card/<id>-<name>/` when it ends. When both have ended:
 `python3 -I tools/flash_next/collectives/compare_arms.py <region folder> <cuts folder>` (folders under
 `reports/collectives/card/`): the 6 lone texts must be equal; the ms per step at 1 and 32 streams is the cuts'
 own effect. If no waiter of this agent is alive: `bin/farm ledger | grep -w collectives`, then
