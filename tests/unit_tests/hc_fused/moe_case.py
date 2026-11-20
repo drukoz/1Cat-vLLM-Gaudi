@@ -79,6 +79,7 @@ class MoeCase:
     top_k: int = 10  # route: K
     columns: int = 513  # route, combine: C, the columns of gates (E, or E + 1 with the shared-gate logit)
     hidden: int = 2560  # combine, row_quant: H.  silu_mul: D, the output width (the input has 2 * D columns)
+    first_column: int = 0  # silu_mul: the column the gate_up block starts at (the input has first_column + 2 * D)
     flavor: str = "random"
     seed: int = 0
     exact: bool = False  # every element must be bit-exact (bf16 / fp8 rounding-edge cases)
@@ -89,6 +90,8 @@ def _c(name, kind, rows, **kw) -> MoeCase:
 
 
 _TINY = dict(experts=16, top_k=2, columns=17)  # tests/unit_tests/models/flash_next/tiny_config.json
+# The rows of a speculative verification step of 32 streams: 32 * (1 + k) for k = 3, 4 and 5 drafted tokens.
+VERIFY_ROWS = (128, 160, 192)
 # Geometries: the real model (512 experts, top 10, hidden 2560, shared expert 640 wide: 80 per rank at
 # TP8) and the tiny test model (16 experts, top 2, hidden 128, shared expert 64 wide: 8 per rank at TP8).
 SIM_CASES = (
@@ -125,6 +128,16 @@ SIM_CASES = (
     _c("silu_mul_real_edge", "silu_mul", 64, hidden=80, flavor="edge", seed=30, exact=True),
     _c("silu_mul_d130_r3", "silu_mul", 3, hidden=130, seed=31),
     _c("silu_mul_every_gate", "silu_mul", 816, hidden=80, flavor="every_gate", seed=32),
+    # The gate_up GEMM merged into the gate GEMM: the block starts after the router and shared-gate columns.
+    _c("silu_mul_merged_tiny_r1", "silu_mul", 1, hidden=64, first_column=17, seed=33),
+    _c("silu_mul_merged_tiny_tp8_r3", "silu_mul", 3, hidden=8, first_column=17, seed=34),
+    _c("silu_mul_merged_real_tp8_r1", "silu_mul", 1, hidden=80, first_column=513, seed=35),
+    _c("silu_mul_merged_real_tp8_r32", "silu_mul", 32, hidden=80, first_column=513, seed=36),
+    _c("silu_mul_merged_real_tp1_r2", "silu_mul", 2, hidden=640, first_column=513, seed=37),
+    _c("silu_mul_merged_real_tp8_r160", "silu_mul", 160, hidden=80, first_column=513, seed=38),
+    _c("silu_mul_merged_real_stress", "silu_mul", 8, hidden=80, first_column=513, flavor="stress", seed=39),
+    _c("silu_mul_merged_real_edge", "silu_mul", 64, hidden=80, first_column=513, flavor="edge", seed=40, exact=True),
+    _c("silu_mul_merged_d130_c5_r3", "silu_mul", 3, hidden=130, first_column=5, seed=20),
     # ---- moe_combine: gate * shared + routed -----------------------------------------------------
     _c("combine_tiny_r1", "combine", 1, hidden=128, seed=41, **_TINY),
     _c("combine_tiny_r3", "combine", 3, hidden=128, seed=42, **_TINY),
@@ -149,6 +162,10 @@ SIM_CASES = (
     _c("row_quant_real_edge", "row_quant", 8, flavor="edge", seed=69),
     _c("row_quant_every_amax", "row_quant", 32639, hidden=128, flavor="every_amax", seed=70),
 )
+# The verification step of 32 streams, per kernel: simulator and card.
+SIM_CASES += tuple(
+    _c(f"{kind}_real_r{rows}", kind, rows, hidden=80 if kind == "silu_mul" else 2560, seed=200 + 10 * i + j)
+    for i, kind in enumerate(KINDS) for j, rows in enumerate(VERIFY_ROWS))
 # HPU only: every decode batch bucket and the largest prefill, per kernel.
 HPU_CASES = SIM_CASES + tuple(
     _c(f"{kind}_real_r{rows}", kind, rows, hidden=80 if kind == "silu_mul" else 2560, seed=100 + 10 * i + j)
@@ -250,6 +267,11 @@ def make_inputs(case: MoeCase) -> dict[str, torch.Tensor]:
             # Every finite bf16 gate once, times 1: the output is the rounded silu of every possible input.
             gate = every_finite_bf16().reshape(T, H)
             return {"gate_up": torch.cat([gate, torch.ones(T, H, dtype=BF16)], dim=1)}
+        if case.first_column:
+            # The columns in front of the block (router logits, the shared-gate logit) are never read: large
+            # values there, of another sign pattern than the block, would show in every output element.
+            front = 50.0 + 30.0 * torch.rand(T, case.first_column, generator=g)
+            gate_up = torch.cat([front, gate_up], dim=1)
         return {"gate_up": gate_up.to(BF16)}
 
     if case.kind == "combine":
@@ -316,7 +338,7 @@ def scalars(case: MoeCase) -> tuple:
     """The op's scalar arguments, in schema order, after the tensors."""
     return {
         "route": (case.experts, case.top_k),
-        "silu_mul": (),
+        "silu_mul": (case.first_column, ),
         "combine": (gate_column(case), ),
         "row_quant": (GAUDI2_FP8_MAX, ),
     }[case.kind]
@@ -330,7 +352,7 @@ def kernel_params(case: MoeCase) -> tuple[int, int, int, float]:
         return 0, 0, gate_column(case), 0.0
     if case.kind == "row_quant":
         return 0, 0, 0, GAUDI2_FP8_MAX
-    return 0, 0, 0, 0.0
+    return 0, 0, case.first_column, 0.0  # silu_mul: the first column of its gate_up block
 
 
 def expected(case: MoeCase, inputs: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
@@ -352,7 +374,7 @@ def input_shapes(case: MoeCase) -> dict[str, tuple[int, ...]]:
     T, H, C = case.rows, case.hidden, case.columns
     return {
         "route": {"gates": (T, C)},
-        "silu_mul": {"gate_up": (T, 2 * H)},
+        "silu_mul": {"gate_up": (T, case.first_column + 2 * H)},
         "combine": {"shared": (T, H), "gates": (T, C), "routed": (T, H)},
         "row_quant": {"x": (T, H)},
     }[case.kind]
@@ -493,10 +515,10 @@ def _route_verdict(case: MoeCase, inputs: dict[str, torch.Tensor], got: dict[str
     return msgs, want_weights
 
 
-def _silu_mul_passes(inputs: dict[str, torch.Tensor], have: torch.Tensor,
+def _silu_mul_passes(case: MoeCase, inputs: dict[str, torch.Tensor], have: torch.Tensor,
                      want: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """(mask of the elements that pass, mask of those that differ only by the UNDERFLOW rule)."""
-    gate_up = inputs["gate_up"]
+    gate_up = inputs["gate_up"][..., case.first_column:]
     d = gate_up.shape[-1] // 2
     silu = F.silu(gate_up[..., :d])
     below, above = bf16_neighbours(silu)
@@ -553,7 +575,7 @@ def compare(case: MoeCase, inputs: dict[str, torch.Tensor], got: dict[str, torch
         return msgs
 
     if case.kind == "silu_mul":
-        passes, flushed = _silu_mul_passes(inputs, got["act"], exp["act"])
+        passes, flushed = _silu_mul_passes(case, inputs, got["act"], exp["act"])
         return _bf16_messages(case, "act", got["act"], exp["act"], passes, flushed)
 
     if case.kind == "combine":
@@ -591,7 +613,7 @@ def summary(case: MoeCase, inputs: dict[str, torch.Tensor], got: dict[str, torch
         name = OUTPUT_ORDER[case.kind][0]
         have, want = got[name], exp[name]
         if case.kind == "silu_mul":
-            passes, flushed = _silu_mul_passes(inputs, have, want)
+            passes, flushed = _silu_mul_passes(case, inputs, have, want)
         else:
             passes, flushed = _combine_passes(case, inputs, have)
         steps = bf16_steps(have, want)

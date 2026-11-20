@@ -628,7 +628,7 @@ experts stay expert-parallel, exactly as on the torch path. The all-reduce after
 
 ```
 moe_route(Tensor gates, int experts, int top_k) -> (Tensor, Tensor)
-moe_silu_mul(Tensor gate_up) -> Tensor
+moe_silu_mul(Tensor gate_up, int first_column=0) -> Tensor
 moe_combine(Tensor shared, Tensor gates, Tensor routed, int gate_column) -> Tensor
 moe_row_quant(Tensor x, float fp8_max) -> (Tensor, Tensor)
 ```
@@ -640,7 +640,7 @@ TP1; 8 and 64 on the tiny model). No op writes an input; every output is a new t
 | Arg | Torch shape, dtype (HPU) | TPC dims | Meaning |
 |---|---|---|---|
 | `gates` | `[T, C]`, bf16 | `{C, T}` | merged gate GEMM output: router logits in columns `[0, E)`, the shared-gate logit in column `gate_column` |
-| `gate_up` | `[T, 2D]`, bf16 | `{2D, T}` | the shared expert's gate_up GEMM output: gate columns, then up columns |
+| `gate_up` | `[T, F + 2D]`, bf16 | `{F + 2D, T}` | the shared expert's gate_up columns from column `F = first_column` on: gate columns, then up columns. `F` is 0 for the gate_up GEMM output itself and `E + 1` when that GEMM is merged into the gate GEMM (the router and shared-gate columns come first and are not read) |
 | `shared`, `routed`, `x` | `[T, H]`, bf16 | `{H, T}` | the shared expert's down GEMM output; the vendor op's output; the block input |
 | `moe_route` -> | `([T, K] int32, [T, K] bf16)` | | expert ids, largest logit first, and their renormalized softmax weights |
 | `moe_silu_mul` -> | `[T, D]` bf16 | | `bf16(bf16(silu(gate)) * up)` |
@@ -649,7 +649,7 @@ TP1; 8 and 64 on the tiny model). No op writes an input; every output is a new t
 
 HPU gates, checked by the op's validation callback and again by the glue: rank-2 contiguous bf16 inputs with
 `T > 0`; `1 <= K <= 64` (one int32 vector holds a row's ids), `K <= E <= 32767` (int16 lane ids), `E <= C`; an even
-number of `gate_up` columns; `H % 128 == 0` for `moe_combine` and `moe_row_quant`; `0 <= gate_column < C`;
+number of `gate_up` columns from `first_column` on, `0 <= first_column <` the columns of `gate_up`; `H % 128 == 0` for `moe_combine` and `moe_row_quant`; `0 <= gate_column < C`;
 `fp8_max == 240` (Gaudi2's fp8 range; the kernel takes no other). `D` need not be a multiple of 128.
 
 ## What `mixture_of_experts` takes (the contract the routing op must meet)
@@ -775,15 +775,15 @@ The rules of the table above ("TPC rules this relies on") hold here too. In addi
 tools/flash_next/tpcsim.sh 'python3 -m pytest -q -p no:cacheprovider --noconftest tests/standalone/hc_fused'
 ```
 
-`test_moe_simulation.py` runs the 52 cases of `moe_case.SIM_CASES` through the library's entry points and the
+`test_moe_simulation.py` runs the 73 cases of `moe_case.SIM_CASES` through the library's entry points and the
 simulator (mapping test and partition shuffle on), compiles each kernel alone with `-reg-mem-count`, and checks the
 CMake build log for the flags. `test_moe_library.py` runs `moe_lib_check.cpp` (every entry point and every
 rejection for the four GUIDs, directly and through the real combined kernel database) and the build guard: every
 kernel of the library compiled with the one flag list and no local-memory override, a routing kernel that does not
 compile costs only its own GUID, and `-DHC_FUSED_MOE_GLUE=OFF` leaves the six hyper-connection kernels. It also
 runs the Python loader's `kernel_library_guids` on the real library (the ten GUIDs, and the six of a build without
-the MoE kernels): the fakes of the CPU loader test cannot show that the ctypes call is right. 136 tests in the folder,
-65 of them in the two MoE files.
+the MoE kernels): the fakes of the CPU loader test cannot show that the ctypes call is right. 157 tests in the folder
+(2026-11-20, with the merged-block and verify-row cases).
 
 Cases (`tests/unit_tests/hc_fused/moe_case.py`): per kernel, the tiny geometry, the real geometry at 1, 2, 16 and 32
 rows and at 2048 rows; for the routing: ties at the cut by construction, all-equal logits, one to three huge logits
@@ -809,7 +809,7 @@ output may differ at all; differences below the fp32 normal range do not count.
 | `.../hc_fused/test_moe_ops.py` | schemas, fake kernels, the stand-in is the torch path as CPU torch runs it (the kernel's oracle for three ops, `moe_row_quant_cpu_reference` for the fourth), the package registers no CPU kernel and is not imported by default |
 | `.../hc_fused/test_moe_card_arithmetic.py`, `hpu_arithmetic.py` | the card's scalar division as a CPU emulation (a `TorchDispatchMode`); the card log of 2026-11-20 reproduced with it (22 scales, 3,378 fp8 values, largest difference 16) and not with a neighbouring constant; the kernel's oracle is the copied code under that division; the CPU stand-in keeps the CPU's |
 | `.../hc_fused/test_moe_sources.py` | GUIDs, ABI, scalar order, limits and build switches agree across the C++, TPC-C, CMake and Python sources |
-| `.../hc_fused/test_moe_op_callbacks_host.py` | the real `hpu_hc_fused.cpp` under ASan + UBSan: output metadata (int32 ids, fp8 values), GUID and the 16 parameter bytes of all 72 HPU cases, 14 rejections |
+| `.../hc_fused/test_moe_op_callbacks_host.py` | the real `hpu_hc_fused.cpp` under ASan + UBSan: output metadata (int32 ids, fp8 values), GUID and the 16 parameter bytes of all 93 HPU cases, 18 rejections |
 | `.../hc_fused/test_moe_glue_loader.py` | the loader and the startup call |
 | `tests/unit_tests/ops/test_hpu_moe_glue_cpu.py` | the helpers without a model: one log line per block, the input check, the merged weight on a bare runner, the wrapper that reads the flag, and that the FP8 branch calls the vendor op with the keywords of the plugin's op wrapper |
 | `.../hc_fused/test_moe_hpu_op.py`, `test_moe_hpu_op_dry_run.py` | the card test, and a CPU dry run of it run the way the gate runs it (the file runs, no test skips, the `MOEHPU` lines of passed tests are in the output). In the dry run `dynamic_quant` runs with the card's scalar division and Gaudi2's fp8 range, so it fails with the card's own line for a kernel that has CPU torch's scale |
@@ -898,7 +898,7 @@ measurement once more after its last test, outside pytest's capture.
    path off for good; a call the kernels do not take costs that call only.
 6. **Rental gate** (`tools/flash_next/rental/gates.py::moe_glue`): `tests/unit_tests/hc_fused/test_moe_hpu_op.py`
    on the card in lazy mode, recorded as G1b's `details["moe_glue"]`. 86 tests: every op has a kernel and the
-   library serves it; 72 cases against the CPU oracle; the routing op's outputs through the vendor op against the
+   library serves it; 93 cases against the CPU oracle; the routing op's outputs through the vendor op against the
    torch routing through the vendor op; the vendor op with the slots reversed; the card's own tie rule, printed;
    `moe_row_quant` against the plugin's `dynamic_quant` on the card, bit for bit; five cases against the torch path
    on the card; the routing op against the production routing at both geometries; repeat calls; one whole block
@@ -973,7 +973,8 @@ the SiLU and sigmoid comparisons passed. Items 5 and 6 are the two open ones, 8 
 - The ids stay int32 from the kernel and are widened by one cast; an int64 output was not tried.
 - `moe_route`, `moe_combine` and the merged gate GEMM are only used together; a block that fails one check runs
   the whole torch path.
-- The gate_up GEMM of the shared expert is not merged into the gate GEMM (it could be: both are bf16 and read `x`).
+- The gate_up GEMM of the shared expert is not merged into the gate GEMM in the model yet. The kernel can read its block
+  inside the merged output (`first_column`, simulator cases `silu_mul_merged_*`); the block wiring is the next step.
 - 3-D inputs, non-bf16 dtypes, `gpt_oss`, grouped top-k, sequence-parallel and data-parallel MoE, block-FP8 experts
   (`VLLM_HPU_FORCE_CHANNEL_FP8=0`) and static input scales are left to the torch path.
 - The merged gate weight is built at load only; a block whose weights are post-processed by another expert method

@@ -31,7 +31,7 @@ constexpr int64_t kMaxStreams = 64;
 // The MoE glue ops of the same extension (schemas and fake kernels: flashinfer_gaudi/moe_glue.py,
 // imported by the same loader before this library is loaded). Schemas, in argument order:
 //   moe_route(Tensor gates, int experts, int top_k) -> (Tensor, Tensor)       int32 ids, bf16 weights
-//   moe_silu_mul(Tensor gate_up) -> Tensor
+//   moe_silu_mul(Tensor gate_up, int first_column=0) -> Tensor
 //   moe_combine(Tensor shared, Tensor gates, Tensor routed, int gate_column) -> Tensor
 //   moe_row_quant(Tensor x, float fp8_max) -> (Tensor, Tensor)                fp8 values, fp32 scale
 constexpr auto kMoeRouteSchema = "flashinfer_gaudi::moe_route";
@@ -235,9 +235,14 @@ void validate_moe_route(const at::Tensor& gates, int64_t experts, int64_t top_k)
                 " and at most the columns of gates");
 }
 
-void validate_moe_silu_mul(const at::Tensor& gate_up) {
+// first_column: where the gate_up block starts in the input (0: the input is the gate_up GEMM output;
+// experts + 1: the gate_up GEMM is merged into the gate GEMM). The block is the rest of the row.
+void validate_moe_silu_mul(const at::Tensor& gate_up, int64_t first_column) {
     check_matrix(gate_up, "gate_up");
-    TORCH_CHECK(gate_up.size(1) % 2 == 0, "MoE glue gate_up must have an even number of columns");
+    TORCH_CHECK(first_column >= 0 && first_column < gate_up.size(1),
+                "MoE glue first_column must be a column of gate_up");
+    TORCH_CHECK((gate_up.size(1) - first_column) % 2 == 0,
+                "MoE glue gate_up must have an even number of columns from first_column on");
 }
 
 void validate_moe_combine(const at::Tensor& shared, const at::Tensor& gates, const at::Tensor& routed,
@@ -291,10 +296,14 @@ const bool moe_silu_mul_registered = [] {
         kMoeSiluMulSchema, kMoeGlueSiluMulGuid,
         [](const at::Stack& stack) {
             const auto& gate_up = stack.at(0).toTensor();
-            validate_moe_silu_mul(gate_up);
-            return habana::PartialOutputMetaDataVector{bf16_output({gate_up.size(0), gate_up.size(1) / 2})};
+            const int64_t first_column = stack.at(1).toInt();
+            validate_moe_silu_mul(gate_up, first_column);
+            return habana::PartialOutputMetaDataVector{
+                bf16_output({gate_up.size(0), (gate_up.size(1) - first_column) / 2})};
         },
-        [](const at::Stack&, size_t& size) -> std::shared_ptr<void> { return moe_node_params(size, 0, 0, 0, 0.0); });
+        [](const at::Stack& stack, size_t& size) -> std::shared_ptr<void> {
+            return moe_node_params(size, 0, 0, stack.at(1).toInt(), 0.0);
+        });
     return true;
 }();
 
@@ -387,10 +396,10 @@ std::tuple<at::Tensor, at::Tensor> run_moe_route(const at::Tensor& gates, int64_
     return std::make_tuple(outputs.at(0), outputs.at(1));
 }
 
-at::Tensor run_moe_silu_mul(const at::Tensor& gate_up) {
-    validate_moe_silu_mul(gate_up);
+at::Tensor run_moe_silu_mul(const at::Tensor& gate_up, int64_t first_column) {
+    validate_moe_silu_mul(gate_up, first_column);
     TORCH_CHECK(moe_silu_mul_registered);
-    return execute(kMoeSiluMulSchema, gate_up, {gate_up}, 1).at(0);
+    return execute(kMoeSiluMulSchema, gate_up, {gate_up, first_column}, 1).at(0);
 }
 
 at::Tensor run_moe_combine(const at::Tensor& shared, const at::Tensor& gates, const at::Tensor& routed,
