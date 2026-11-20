@@ -8,6 +8,8 @@
   gate_up GEMM): with the tests' CPU stand-ins every variant returns the torch path's bits.
 * ``probe_moe_expert_bytes.py`` (idea G2-1: does the vendor MoE op read every local expert): every routing arm
   runs and the verdict line is printed (times on a CPU mean nothing).
+* ``probe_moe_layers.py`` (G2-1 again: a distinct weight set per call, TP4 and TP8 geometry, chunk_size): every
+  arm runs and the three verdict lines are printed.
 * ``probe_view_inputs.py`` (can a custom op take a view at accumulation mode 0): its own self-test.
 * ``probe_index_narrowing.py`` (ids narrowed to int32 in the graph that makes them: the sampler's top logprobs,
   the sparse-QSA selection, argmax, replacements): on a CPU every case is RIGHT.
@@ -58,6 +60,23 @@ def test_expert_bytes_probe_runs_every_arm(tmp_path):
     assert len(arms) == 15, arms  # 3 arms at 1 row, 4 at 4, 32 and 128 rows
     assert "routing one  ( 1 local experts hit)" in out and "(64 local experts hit)" in out
     assert "VERDICT expert-bytes:" in out
+
+
+def test_moe_layers_probe_runs_every_arm(tmp_path):
+    proc, out = _run([PROBES / "probe_moe_layers.py", "--out", tmp_path / "ml", "--layers", "2", "--iters", "1",
+                      "--rows", "1,32", "--chunks", "64"], tmp_path)
+    assert proc.returncode == 0, out[-3000:]
+    arms = [line for line in out.splitlines() if line.startswith("PROBE moe-layers local")]
+    # TP4 and TP8 at 1 and 32 rows, none and dense at 32, one chunk_size, 2 and 4 slices at 32 rows
+    assert len(arms) == 9, arms
+    assert not any(" ERROR " in line for line in arms), arms
+    assert "routing none    chunk  None" in out and "routing dense   chunk  None" in out and "chunk    64:" in out
+    assert "chunk  None slices 2:" in out and "chunk  None slices 4:" in out
+    assert "  0 local experts hit" in out and "128 local experts hit" in out
+    for name in ("served", "routing", "chunk", "slices"):
+        assert f"VERDICT moe-layers {name}:" in out
+    result = json.loads((tmp_path / "ml" / "moe_layers.json").read_text())
+    assert len(result["verdicts"]) == 4 and len([k for k in result if k.startswith("local")]) == 9
 
 
 def test_view_probe_selftest(tmp_path):
