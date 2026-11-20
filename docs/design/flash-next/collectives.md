@@ -52,7 +52,7 @@ What the runner does with flag 1 (`hpu_model_runner.py`): `_can_fuse_plain_greed
 fused greedy region (`select_compute_logits_and_greedy`) for plain greedy requests, and also under a Flash-Next
 MTP speculative config; the decode branch then verifies the drafts with
 `vllm_gaudi/v1/sample/hpu_greedy_verify.py` from the arg max of every row, with no sampler pass over logits. A
-batch with one sampled request, logprobs, penalties, logit bias, token masks, structured output or any other
+batch with one sampled request, logprobs, `min_tokens`, penalties, logit bias, token masks, structured output or any other
 speculative method keeps today's path. `hpu_rejection_sampler.py` is not changed (the mtp-card-ready track builds
 sampled verification there). The MTP proposer takes its drafts through `HpuFlashNextMtpProposer._draft_tokens`
 (the draft-rank log keeps the gathered logits, it needs their top 4).
@@ -108,18 +108,48 @@ The decoder layer (`vllm/models/qwen4_exp/nvidia/model.py` `Qwen4ExpDecoderLayer
 - **Overlap a collective with independent compute:** within a layer there is none (each op needs the previous
   collective's result); two half-batches would read every weight twice.
 
-So a decode step keeps 96 layer all-reduces. With the three cuts: 98 per target step (97 with the PLE table on
-another collective, section 4), the logits payload goes from 497 KB per row to 8 B per row, and a k = 3 draft
-pass from 6 to 3 collectives per token. What is left is the cost of each collective: section 5.
+So a decode step keeps 96 layer all-reduces. With the cuts: 98 per target step (the embedding replicated, or the
+PLE table rows on the embedding all-reduce, section 4), the logits payload goes from 497 KB per row to 8 B per row,
+and a k = 3 draft pass from 6 to 3 collectives per token. What is left is the cost of each collective: section 5.
 
-## 4. The PLE table all-reduce
+## 4. The PLE table all-reduce (`VLLM_HPU_PLE_TABLE_RIDER=1`)
 
-The n-gram table is vocabulary-parallel and far too large to replicate (about 12.8 GB per card at TP4). Its
-lookup needs only the token ids, so its rank-local rows could ride, as extra columns, on the embedding all-reduce
-(or, with the replicated embedding, on the next all-reduce of layer 0): one collective fewer, same result bit for
-bit (one rank holds each row; the FP8 rows widened to bf16 before the sum are exact). Not built yet.
+The n-gram table is vocabulary-parallel and far too large to replicate (about 12.8 GB per card at TP4). Its lookup
+needs only the ids, so with the flag the target's forward (`_MtpTargetOutputs._ple_table_rider` in
+`vllm_gaudi/models/qwen4_exp/__init__.py`) looks up, before the embedding, the rows each rank's shards own for the
+tokens and for the n-gram ids (`HpuQwen4ExpPLELayer.ngram_ids`, `local_table_rows`), all-reduces both as the columns
+of one `[rows, 2560 + 16 x 160]` tensor, and leaves the two sums for the embedding's and the PLE layer's next call.
+Every id has one owner, so each sum is the owner's row: the result is the same bit for bit (an FP8 table's rows are
+widened to bf16 before the sum, which is exact, and its scale is applied after, as `_dequantize_embeddings` does).
+One collective fewer per target step at no memory cost, the same count as `VLLM_HPU_REPLICATED_EMBEDDING=1`; with
+the replicated embedding there is no embedding all-reduce to ride on and nothing changes. The draft has no PLE
+layer. Riding on layer 0's first all-reduce instead (97 with the replicated embedding) would need the rider inside
+`RowParallelLinear`; not built.
+
+A cut that is not built: the arg-max gather of a draft step could carry, next to `(value, id)`, the embedding row of
+each rank's candidate (`[rows, 2 + 2560]` per rank); the winner's row is then the next draft step's input
+embedding, so the draft's embedding all-reduce of steps 1 to k - 1 goes without the 1.11 GB replicated table.
 
 ## 5. Cost per collective (C4, C6, the two-server layout)
 
-To be decided with the coordinator's microbenchmark (job 00009, `bench_collectives.py`: all-reduce and
-all-gather latency at 1, 8 and 32 rows on 8 and 4 ranks): see the track report.
+`VLLM_HPU_ALL_REDUCE_AS_GATHER_ROWS=N` (`HpuCommunicator._all_reduce_as_gather`) is C4 without the fused kernel:
+an all-reduce of at most `N` rows becomes an all-gather of the `world` partials and one local fp32 sum, the same
+op on every rank, so every rank holds the same bits; an all-reduce with one owner per element (embedding, PLE
+table) stays exact. It moves 7 times the payload per rank at 8 ranks against about 1.75 times for a ring
+all-reduce, and adds the sum (one reduction over `[8, rows, 2560]`, about one graph op). It can pay only where an
+all-gather is faster than an all-reduce by more than that op; the row gate is the I34 crossover. The fused form
+(the sum inside `hc_combine_norm`, which would also take the sum op away) is worth building only after the card
+shows the torch form pays. Tests: `tests/unit_tests/distributed/test_all_reduce_as_gather.py` (form, gate, exact
+one-owner sums), `test_collective_cuts.py::test_small_all_reduces_as_gather` (fp32 tiny model on 2 and 8 ranks:
+same tokens, hidden states within fp32 rounding, the same bits on every rank).
+
+Measured so far (MEASURED, job 00009, `bench_collectives.py`, lazy mode, 4 ranks on cards 0-3; its 8-rank run
+failed at device acquire, card 0 still held by the step before it): 98 all-reduces of `[rows, 2560]` bf16 in one
+lazy graph cost, on the device (wait after `mark_step`, minus the same graph without them), 43 us each at 1 and 8
+rows and 62 us at 32 rows, that is 4.2 to 6.0 ms per 98; one all-reduce as its own launch (with its `mark_step`
+and sync) 0.16 to 0.24 ms at 8 to 32 rows, an all-gather of the same rows 0.19 to 0.21 ms. A `mark_step` before
+every collective (`VLLM_HPU_COLLECTIVE_MARK_STEP=1`, the plugin's default) added 2.1 to 11 ms per 98.
+
+The decision between C4, C6 and the two-server layout (G4-1) comes from the collectives track's job 00019, which
+opens with the same payloads on 8 and then 4 ranks, lazy and HPU-graph replay, all-reduce against all-gather plus
+local sum (`reports/collectives/job/bench_c4.py`), and from the track report.

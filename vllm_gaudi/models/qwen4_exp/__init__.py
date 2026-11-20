@@ -105,10 +105,54 @@ class _MtpTargetOutputs:
         ple_ngram_ids = kwargs.pop(HOST_NGRAM_IDS_KWARG, None)
         if ple_ngram_ids is not None:
             kwargs["ngram_context"] = ple_ngram_ids
-        hidden = super().forward(input_ids, positions, intermediate_tensors, inputs_embeds, **kwargs)
+        riders = []
+        if inputs_embeds is None and intermediate_tensors is None and int(envs.VLLM_HPU_PLE_TABLE_RIDER) == 1:
+            riders = self._ple_table_rider(input_ids, kwargs)
+        try:
+            hidden = super().forward(input_ids, positions, intermediate_tensors, inputs_embeds, **kwargs)
+        finally:
+            for module, name in riders:  # nothing a forward did not consume may reach the next one
+                module.__dict__.pop(name, None)
         if self._hpu_mtp_outputs and isinstance(hidden, torch.Tensor):
             return hidden, [mtp_aux_hidden(hidden, self.get_mtp_target_hidden_states())]
         return hidden
+
+    def _ple_table_rider(self, input_ids: torch.Tensor | None, kwargs: dict) -> list:
+        """``VLLM_HPU_PLE_TABLE_RIDER=1``: the token embedding and the PLE n-gram table rows in one all-reduce.
+
+        Both lookups are vocabulary-parallel and need only the ids: each rank looks up the rows its shards own
+        (zeros for the others), the two partial tensors travel as the columns of one all-reduce, and the summed
+        parts are left for the embedding's and the PLE layer's next call (they return them instead of looking
+        up and reducing). Every id has one owner, so each sum is that owner's row, bit for bit, and the step
+        has one collective fewer. Needs the vocabulary-sharded token embedding (with
+        ``VLLM_HPU_REPLICATED_EMBEDDING=1`` there is no embedding all-reduce to ride on: nothing changes).
+        Returns the ``(module, attribute)`` pairs it set.
+        """
+        language_model = getattr(self, "language_model", None)
+        text_model = getattr(language_model if language_model is not None else self, "model", None)
+        embed = getattr(text_model, "embed_tokens", None)
+        if input_ids is None or embed is None or not hasattr(embed, "local_rows") or int(embed.tp_size) <= 1:
+            return []
+        ple_layers = [layer.ple for layer in getattr(text_model, "layers", [])
+                      if isinstance(getattr(layer, "ple", None), HpuQwen4ExpPLELayer)]
+        query_start_loc, ngram_context = kwargs.get("query_start_loc"), kwargs.get("ngram_context")
+        if not ple_layers or query_start_loc is None or ngram_context is None:
+            return []
+        from vllm.distributed import tensor_model_parallel_all_reduce
+
+        token_rows = embed.local_rows(input_ids)
+        tables = [ple.local_table_rows(ple.ngram_ids(input_ids, query_start_loc, ngram_context), token_rows.dtype)
+                  for ple in ple_layers]
+        summed = tensor_model_parallel_all_reduce(
+            torch.cat([token_rows] + [rows.flatten(1) for rows, _ in tables], dim=-1))
+        widths = [token_rows.shape[-1]] + [rows[0].numel() for rows, _ in tables]
+        parts = [part.contiguous() for part in summed.split(widths, dim=-1)]
+        embed._hpu_reduced_rows = parts[0]
+        riders = [(embed, "_hpu_reduced_rows")]
+        for ple, (rows, lookup_was_fp8), part in zip(ple_layers, tables, parts[1:]):
+            ple._rider_rows = (part.view(rows.shape), lookup_was_fp8)
+            riders.append((ple, "_rider_rows"))
+        return riders
 
 
 class HpuQwen4ExpForConditionalGeneration(_MtpTargetOutputs, _upstream_model.Qwen4ExpForConditionalGeneration):

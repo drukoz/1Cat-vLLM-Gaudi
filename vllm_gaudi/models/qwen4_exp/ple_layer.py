@@ -314,16 +314,19 @@ class HpuQwen4ExpPLELayer(Qwen4ExpPLELayer):
                 f"token length, got {input_ids.shape[0]} and "
                 f"{hidden_states.shape[0]}"
             )
-        if ngram_context.dim() == 3:
-            # VLLM_HPU_PLE_HOST_NGRAM_IDS=1: the runner computed the ids on the host and they arrive in the
-            # ``ngram_context`` slot (see ``_host_ngram_ids``); none of the id computation ops run.
-            ngram_ids = self._host_ngram_ids(ngram_context, input_ids.shape[0])
+        rider = self.__dict__.pop("_rider_rows", None)
+        if rider is not None:
+            # VLLM_HPU_PLE_TABLE_RIDER=1: the model forward looked this call's table rows up and summed them over
+            # the ranks inside the token embedding's all-reduce (vllm_gaudi/models/qwen4_exp/__init__.py).
+            rider_rows, lookup_was_fp8 = rider
+            if rider_rows.shape[0] != input_ids.shape[0] or rider_rows.dtype != hidden_states.dtype:
+                raise RuntimeError(f"PLE rider rows {tuple(rider_rows.shape)} {rider_rows.dtype} do not fit this "
+                                   f"call ({input_ids.shape[0]} tokens, {hidden_states.dtype})")
+            embeddings = self._scale_table_rows(rider_rows.flatten(-2), lookup_was_fp8)
         else:
-            # The custom op's torch branch returns the ids and never fills the
-            # preallocated buffer, so call the pure-torch path and use its return.
-            ngram_ids = self.ple_embedding.compute_ngram_ids(input_ids, query_start_loc, ngram_context)
-        embeddings = self.ple_embedding.ngram_embedding(ngram_ids).flatten(-2)
-        embeddings = self._dequantize_embeddings(embeddings, hidden_states.dtype)
+            ngram_ids = self.ngram_ids(input_ids, query_start_loc, ngram_context)
+            embeddings = self.ple_embedding.ngram_embedding(ngram_ids).flatten(-2)
+            embeddings = self._dequantize_embeddings(embeddings, hidden_states.dtype)
         kv, _ = self.kv_proj(embeddings)
         key, value = kv.split(self.kv_proj.output_sizes, dim=-1)
         gated, normed = ple_gate_torch(
@@ -337,6 +340,58 @@ class HpuQwen4ExpPLELayer(Qwen4ExpPLELayer):
         )
         out = self._hpu_short_conv(gated, normed)
         return out.view(orig_shape)
+
+    def ngram_ids(self, input_ids: torch.Tensor, query_start_loc: torch.Tensor,
+                  ngram_context: torch.Tensor) -> torch.Tensor:
+        """The n-gram ids of this call, ``[num_tokens, heads]``, from the arguments ``forward`` gets."""
+        input_ids = input_ids.reshape(-1)
+        if ngram_context.dim() == 3:
+            # VLLM_HPU_PLE_HOST_NGRAM_IDS=1: the runner computed the ids on the host and they arrive in the
+            # ``ngram_context`` slot (see ``_host_ngram_ids``); none of the id computation ops run.
+            return self._host_ngram_ids(ngram_context, input_ids.shape[0])
+        # The custom op's torch branch returns the ids and never fills the
+        # preallocated buffer, so call the pure-torch path and use its return.
+        return self.ple_embedding.compute_ngram_ids(input_ids, query_start_loc, ngram_context)
+
+    def local_table_rows(self, ngram_ids: torch.Tensor, dtype: torch.dtype) -> tuple[torch.Tensor, bool]:
+        """This rank's rows of the n-gram table for ``ngram_ids``: ``([num_tokens, heads, head_dim] in dtype,
+        whether the lookup returned FP8)``.
+
+        What the table's vocabulary-parallel lookup puts into its all-reduce: the rows of the ids this rank's
+        shard owns, zeros for every other id (each id has one owner, so the sum over the ranks is that row
+        exactly). FP8 rows are widened to ``dtype`` here, which is exact; ``_scale_table_rows`` applies the
+        table's scale after the sum, as ``_dequantize_embeddings`` does after the FP8 all-reduce.
+        """
+        from vllm.model_executor.layers.quantization.utils.fp8_utils import is_fp8
+        from vllm.model_executor.layers.vocab_parallel_embedding import get_masked_input_and_mask
+
+        table = self.ple_embedding.ngram_embedding
+        if int(table.tp_size) > 1:
+            indices = table.shard_indices
+            masked, mask = get_masked_input_and_mask(ngram_ids, indices.org_vocab_start_index,
+                                                     indices.org_vocab_end_index, indices.num_org_vocab_padding,
+                                                     indices.added_vocab_start_index,
+                                                     indices.added_vocab_end_index)
+        else:
+            masked, mask = ngram_ids, None
+        rows = table.quant_method.embedding(table, masked.long())
+        lookup_was_fp8 = bool(is_fp8(rows))
+        rows = rows.to(dtype)
+        if mask is not None:
+            rows = rows.masked_fill(mask.unsqueeze(-1), 0)
+        return rows, lookup_was_fp8
+
+    def _scale_table_rows(self, rows: torch.Tensor, lookup_was_fp8: bool) -> torch.Tensor:
+        """Summed, widened table rows as ``_dequantize_embeddings`` returns them: FP8 lookups times the table's
+        global scale, any other lookup unchanged."""
+        if not lookup_was_fp8:
+            return rows
+        weight_scale = self._get_embedding_weight_scale()
+        if weight_scale is None:
+            raise RuntimeError("FP8 PLE embedding is missing its global scale")
+        if weight_scale.device != rows.device:
+            raise RuntimeError("FP8 PLE embedding scale must be on the output device")
+        return rows * weight_scale.to(rows.dtype)
 
     def _host_ngram_ids(self, ready_ids: torch.Tensor, num_tokens: int) -> torch.Tensor:
         """This layer's row of the n-gram ids the runner computed on the host: ``[num_tokens, heads]``.

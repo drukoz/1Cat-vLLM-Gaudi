@@ -36,6 +36,7 @@ LOGITS = {"VLLM_HPU_VOCAB_PARALLEL_LOGITS": "1"}
 CANDIDATES = {"VLLM_HPU_VOCAB_PARALLEL_LOGITS": "2"}
 EMBEDDING = {"VLLM_HPU_REPLICATED_EMBEDDING": "1"}
 MTP_FC = {"VLLM_HPU_MTP_REPLICATED_FC": "1"}
+RIDER = {"VLLM_HPU_PLE_TABLE_RIDER": "1"}
 _RUN_CACHE: dict[tuple, list] = {}
 
 
@@ -187,6 +188,65 @@ def test_replicated_mtp_fc_drafts_the_same_tokens(tp, tiny_tp8_checkpoint):
         assert len(_kinds(cut[0], "draft")) == len(_kinds(plain[0], "draft")) - 2 * K
         for phase in ("prefill", "decode", "verify"):  # the target is untouched
             assert _kinds(cut[0], phase) == _kinds(plain[0], phase)
+
+
+# -- cut: the PLE table rows ride on the embedding all-reduce ----------------------------------------------------
+@pytest.mark.parametrize("tp", [1, 2, 8])
+def test_ple_table_rider_keeps_every_bit(tp, tiny_tp8_checkpoint):
+    plain = _ranks(tiny_tp8_checkpoint, tp, {})
+    cut = _ranks(tiny_tp8_checkpoint, tp, RIDER)
+    for rank in range(tp):
+        _same_stream(plain[rank], cut[rank], tp, f"rank {rank} PLE table rider")
+    if tp == 1:
+        assert cut[0]["entries"] == []
+        return
+    first = [(e["phase"], e["method"], e["shape"], e["site"]) for e in cut[0]["entries"]]
+    for rank, result in enumerate(cut):
+        assert [(e["phase"], e["method"], e["shape"], e["site"]) for e in result["entries"]] == first, rank
+    for phase in ("prefill", "decode", "verify"):
+        kinds = _kinds(cut[0], phase)
+        assert kinds[0] == "embedding_ple" and "embedding" not in kinds and "ple_table" not in kinds, phase
+        assert kinds[1:] == [k for k in _kinds(plain[0], phase) if k not in ("embedding", "ple_table")], phase
+        rider = _entries(cut[0], phase, "embedding_ple")[0]
+        assert rider["method"] == "all_reduce" and rider["shape"][-1] == 128 + 16 * 8  # token row + 16 table rows
+    assert _kinds(cut[0], "draft") == _kinds(plain[0], "draft")  # the draft has no PLE layer
+    if tp == 8:
+        summary = summarize(cut, real_layers=48, k=K)
+        assert summary["phases"]["decode"]["real_counts"] == {"embedding_ple": 1, "mixer": 48, "moe": 48,
+                                                              "logits": 1}
+        decode = {row["kind"]: row for row in summary["phases"]["decode"]["collectives"]}
+        assert decode["embedding_ple"]["sent_bytes_per_row"] == 2 * 5120  # 2560 + 16 x 160 bf16 values
+
+
+def test_ple_table_rider_needs_the_sharded_embedding(tiny_tp8_checkpoint):
+    """With the replicated embedding there is no all-reduce to ride on: the PLE table keeps its own."""
+    both = _ranks(tiny_tp8_checkpoint, 8, {**RIDER, **EMBEDDING})
+    replicated = _ranks(tiny_tp8_checkpoint, 8, EMBEDDING)
+    for phase in ("prefill", "decode", "verify"):
+        assert _kinds(both[0], phase) == _kinds(replicated[0], phase), phase
+    _same_stream(replicated[0], both[0], 8, "rider with the replicated embedding")
+
+
+# -- all-reduce as all-gather + local sum below a row count (C4 without the kernel) ------------------------------
+@pytest.mark.parametrize("tp", [2, 8])
+def test_small_all_reduces_as_gather(tp, tiny_tp8_checkpoint):
+    """VLLM_HPU_ALL_REDUCE_AS_GATHER_ROWS=32: decode (1 row) and verification (1 + k rows) all-reduces gather the
+    partials and sum them in fp32; the 48-row prefill keeps the all-reduce. Not the same summation order as the
+    all-reduce, so the check runs the fp32 model: the same tokens, hidden states within fp32 rounding, and the
+    same bits on every rank."""
+    plain = _ranks(tiny_tp8_checkpoint, tp, {}, fp32=True)
+    cut = _ranks(tiny_tp8_checkpoint, tp, {"VLLM_HPU_ALL_REDUCE_AS_GATHER_ROWS": "32"}, fp32=True)
+    for rank in range(tp):
+        for field in ("tokens", "drafts", "verified"):
+            assert cut[rank]["chain"][field] == plain[rank]["chain"][field], f"TP{tp} rank {rank} {field}"
+        for field in ("hidden", "verify_hidden"):
+            np.testing.assert_allclose(cut[rank]["chain"][field], plain[rank]["chain"][field], rtol=1e-4, atol=1e-5,
+                                       err_msg=f"TP{tp} rank {rank} {field}")
+            np.testing.assert_array_equal(cut[rank]["chain"][field], cut[0]["chain"][field],
+                                          err_msg=f"TP{tp} rank {rank} {field}: ranks differ")
+    # the same collectives are issued (the communicator's all_reduce changes its form inside)
+    for phase in ("prefill", "decode", "verify", "draft"):
+        assert _kinds(cut[0], phase) == _kinds(plain[0], phase), phase
 
 
 # -- the cuts together -------------------------------------------------------------------------------------------

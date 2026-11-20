@@ -539,6 +539,8 @@ if TYPE_CHECKING:
     VLLM_HPU_VOCAB_PARALLEL_LOGITS: int = 0  # VocabParallelMode: 0 logits all-gather (default), 1 greedy, 2 candidates
     VLLM_HPU_REPLICATED_EMBEDDING: int = 0  # 0 vocabulary-sharded token embedding (default), 1 one full copy per rank
     VLLM_HPU_MTP_REPLICATED_FC: int = 0  # 0 the MTP fc linears shard and all-gather (default), 1 unsharded
+    VLLM_HPU_PLE_TABLE_RIDER: int = 0  # 0 the PLE table rows get their own all-reduce (default), 1 on the embedding's
+    VLLM_HPU_ALL_REDUCE_AS_GATHER_ROWS: int = 0  # all-reduces of at most N rows run as all-gather + local sum; 0 never
     VLLM_HPU_RECURRENT_STATE_POOL: int = 0  # RecurrentStatePoolMode: 0 off, 1 pool
     VLLM_HPU_RECURRENT_STATE_POOL_SLOTS: int = 0  # resolved by the hook; positive overrides the formula
     VLLM_HPU_RECURRENT_STATE_POOL_CACHE_SLOTS: int = 512  # retained prefix states added to the live need
@@ -1944,6 +1946,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # (about 11 MiB more per card for each). Read when the draft is built. Not yet run on a card.
     "VLLM_HPU_MTP_REPLICATED_FC":
     lambda: int(os.environ.get("VLLM_HPU_MTP_REPLICATED_FC", "0")),
+    # VLLM_HPU_PLE_TABLE_RIDER=1: the Flash-Next target looks its PLE n-gram table rows up before the token
+    # embedding and sums both over the ranks in one all-reduce (extra columns), so the table's own all-reduce
+    # is gone. Needs the vocabulary-sharded embedding (no effect with VLLM_HPU_REPLICATED_EMBEDDING=1).
+    # Not yet run on a card.
+    "VLLM_HPU_PLE_TABLE_RIDER":
+    lambda: int(os.environ.get("VLLM_HPU_PLE_TABLE_RIDER", "0")),
+    # VLLM_HPU_ALL_REDUCE_AS_GATHER_ROWS=N > 0: an HPU tensor-parallel all-reduce of at most N rows (first dim)
+    # runs as an all-gather of every rank's partial and a local fp32 sum (the same bits on every rank); larger
+    # ones stay all-reduces. 0 (default) = never. For the small decode buckets, where one gather phase may cost
+    # less than the two phases of an all-reduce (C4 without the kernel). Not yet run on a card.
+    "VLLM_HPU_ALL_REDUCE_AS_GATHER_ROWS":
+    lambda: int(os.environ.get("VLLM_HPU_ALL_REDUCE_AS_GATHER_ROWS", "0")),
 
     # Recurrent (GDN / short-conv) state pool: 0 (default) keeps today's
     # one-recurrent-slot-per-attention-block-id allocation, 1 gives the

@@ -238,6 +238,12 @@ def collective_rank(rank: int, ckpt_dir: str, tp: int, opts: dict) -> dict:
         model = get_model(vllm_config=vc)
         if fp32:
             cm.to_fp32(model)
+            # The MTP multi-stream buffer is a plain tensor attribute (model dtype), which to_fp32 does not reach;
+            # the draft reads it on its first step.
+            for module in model.modules():
+                buffer = getattr(module, "_mtp_hidden_buffer", None)
+                if isinstance(buffer, torch.Tensor):
+                    module._mtp_hidden_buffer = buffer.float()
         cm.bind_cpu_states(model, num_slots, fp32, 512, k)
         stateless(model)
         set_group_idx(model)

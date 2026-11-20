@@ -45,12 +45,15 @@ PER_LAYER_KINDS = ("mixer", "moe", "hc_gather")
 def classify(entry: dict) -> str:
     """What a recorded collective carries.
 
-    ``embedding`` (token rows), ``ple_table`` (n-gram table rows), ``mixer`` (GDN / attention output), ``moe``
+    ``embedding`` (token rows), ``ple_table`` (n-gram table rows), ``embedding_ple`` (both in one all-reduce,
+    ``VLLM_HPU_PLE_TABLE_RIDER``), ``mixer`` (GDN / attention output), ``moe``
     (MoE block output), ``hc_gather`` (a block output gathered for the fused combine), ``mtp_fc`` (the draft's
     entry linears), ``logits`` (full vocabulary shards), ``top`` (reduced logits), ``other``.
     """
     module, site, caller = entry["module"], entry["site"], entry["caller"]
     where = site + " " + caller
+    if "_ple_table_rider" in where:
+        return "embedding_ple"
     if "vocab_parallel.py" in where and "_gathered_logits" not in where:
         return "top"
     if entry["method"].startswith("all_gather") and ("logits_processor" in where or "_gathered_logits" in where):
