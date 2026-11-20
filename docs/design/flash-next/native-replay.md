@@ -481,7 +481,7 @@ test it on the real model.
 
 ## Handoff (if this agent stops)
 
-State at 2026-11-20 23:45 UTC (fourth agent of this track, Opus 5.5, started 23:15 UTC). Branch
+State at 2026-11-20 23:50 UTC (fourth agent of this track, Opus 5.5, started 23:15 UTC). Branch
 `feat/flash-next-gaudi-native-replay` (worktree `/Volumes/Storage/Claude/gaudi-work/wt/native-replay`), pushed; the
 program head `938dada4` is merged in (`09d72dc9`); nothing of this track is on `feat/flash-next-gaudi` yet. **No pull
 request before the node is gone** (coordinator, BRIEF.md 23:45 UTC): the integration track builds from this branch
@@ -505,6 +505,17 @@ directly. This harness keeps the handoff here (earlier harnesses refused report 
   hooks in `HPUWorker.init_device` (after `torch.hpu.set_device`, before the communicators) and at the end of
   `compile_or_warm_up_model` (mode 2), the flag in `envs.py`, its row in `docs/configuration/env_variables.md`.
   Rank r uses the r-th visible module, ascending (VERIFIED in the server logs of 00113, 00065, 00066).
+  Commit `0835754e`: a placement the kernel refuses never stops a worker (each hook falls back to unpinned with
+  one warning line). The node runs `0835754e` (`~/farm/native-replay/current`, synced 23:50 UTC).
+- The coordinator asked (23:33 UTC) whether the fork's native joint replay can be measured tonight on 4 cards. Answer
+  sent: no number by 03:00 UTC (three patched source builds never done here, among them Synapse from a third-party
+  snapshot of the whole stack; the snapshot's match with the node's SDK 1.24.1 driver and firmware is known only
+  after the build; a harness through the static group plan in eager mode; 3.5-5 h in the best case, and an hour of
+  compiling on the node's CPUs under host-bound measurements). Recommended: build the three libraries before the
+  next rental, then one 30-minute 4-card job, stock against native replay on the same TP4 body.
+- The coordinator also asked for the launch count per step in each arm of 00122: the server has no counter and the
+  farm's probe no profiler hook, so 00122 measures the cut flag as step time only; a tiny-model TP4 job with the
+  vLLM profiler window (ExecuteCachedGraph events per decode step, base against cut) is offered, not built.
 - CPU tests: `tests/unit_tests/worker/test_worker_cpu_pin.py`, `test_decode_cut_interval.py`,
   `test_hpu_graph_async_replay.py`: 46 passed on the merged tree; `test_bench_replay.py` with the first two: 43 passed
   on the merge commit's snapshot. **The common gate (`bin/gate --tools`) has not run on this branch**: tonight the
