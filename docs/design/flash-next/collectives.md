@@ -59,22 +59,44 @@ sampled verification there). The MTP proposer takes its drafts through `HpuFlash
 sampler in the runner, so a prefill step keeps its logits all-gather (one row per prompt chunk, 497 KB); the gloo
 harness's prefill phase picks its token through `top_tokens`, so its "prefill" count shows the reduced gather.
 
-Mode 2 (`VLLM_HPU_VOCAB_PARALLEL_LOGITS=2`, `vocab_parallel.top_k`) gathers the per-rank top `K` instead of the
-logits. No serving path calls it yet. When it is exact for sampling:
+Mode 2 (`VLLM_HPU_VOCAB_PARALLEL_LOGITS=2`) is the head's side of a sampled step. Real agents sample: the
+checkpoint's generation_config (temperature 1.0, top_k 20, top_p 0.95) applies to every request that sets no
+temperature, and such a request gets nothing from the arg max region. Today its step gathers `[rows, 248,320]`
+logits on every rank and runs vLLM's sampler on them (a sort of the whole row, about fourteen passes over it; the
+engine-step track's design note, section 7). The engine-step track builds the sampler stage that draws from
+candidates instead (`vllm_gaudi/v1/sample/candidate_sampling.py`, `VLLM_HPU_CANDIDATE_SAMPLING`); this track gives
+it the candidates without the logits all-gather:
 
-- the `k` largest logits of the vocabulary are among the `k` largest of each rank's shard, so for `k <= K` the
-  returned values are exactly the gathered top-`k` values. Among tokens tied at the `k`-th value which ones are
-  returned is not defined (it is not for `torch.topk` either).
-- top-k sampling with `1 <= top_k <= K`, any temperature above 0 and top-p applied after top-k (vLLM's order) is
-  exact in distribution over the candidates: top-p and the softmax only see the top-k set.
-- it is not exact without a top-k (`top_k` unset or above `K`), with min-p (the kept set can exceed `K`), with
-  logprobs (they need the full-vocabulary normalizer; a log-sum-exp all-reduce of per-rank `(max, sum exp)` pairs
-  would give it), or with penalties, logit bias, allowed or bad words applied to the full logits first (each
-  could be applied per shard first, not done).
-- realized tokens equal the gathered path's only in distribution: a sampler that draws one exponential per
-  candidate draws different random numbers than one that draws per vocabulary entry. Every rank must draw the
-  same numbers (a shared seed), because speculative bookkeeping (accepted counts, recurrent state slots) is
-  computed on every rank.
+- `vocab_parallel.top_k(model, hidden_states, k)`: `(values fp32 [rows, k] largest first, global ids int32
+  [rows, k])`. With the flag at 2: each rank takes `torch.topk` of its shard, one all-gather of `[rows, 2k]` fp32 per
+  rank (values, then ids; 512 B per row per rank at `k` = 64 against 62 KB of logits), and `topk` over the
+  `ranks x k` candidates restores the order. With the flag at 0 or 1: `compute_logits` and `topk`. One call for the
+  consumer, the same result (`test_vocab_parallel_candidates.py`, 1, 2, 4 and 8 ranks).
+- `vocab_parallel.first_maximum(values, ids)`: a greedy row's token from the same candidates (the lowest id among
+  the largest values, what the arg max region gives), so a mixed batch needs no second pass over the head.
+- Card rule 9: no int64 id is cast. The local ids are read out of an fp32 id table with the `topk` indices as they
+  are, ids cross the ranks as fp32, and the last cast is fp32 to int32 (a test watches every dispatched op for a
+  cast of an int64 tensor; job 00064 runs the same ops on a card).
+
+When the candidates are enough for sampling (VERIFIED by the tests for the value and id claims, INFERRED for the
+rest):
+
+- the `k` largest logits of the vocabulary are among the `k` largest of each rank's shard, so the returned values
+  are exactly the gathered top-`k` values. Among tokens tied at the `k`-th value which ones are returned is not
+  defined (it is not for `torch.topk` either);
+- top-k keeps every token at or above the `top_k`-th largest value. For `top_k <= k` all of them are candidates
+  unless more than `k` of them lie in one rank's shard, which needs a tie group at the boundary that reaches past
+  column `k` (the sampler stage checks `values[:, k - 1] < kth` in the graph and such a batch keeps the gathered
+  path);
+- top-p (applied after top-k, vLLM's order), the softmax and the draw only see the kept logits, so their result is
+  the same in distribution; the realized token differs, the noise being drawn per candidate;
+- not enough: a request without a top-k or with one above `k`, min-p (its kept set is not bounded), logprobs (they
+  need the full-vocabulary normalizer; a log-sum-exp all-reduce of per-rank `(max, sum exp)` pairs would give it),
+  penalties, a logit bias, allowed or bad words (applied to the full logits first).
+
+Sampled verification of an MTP step (mtp-card-ready, idea I07) needs the same candidates for every verification
+row: `[32 x (1 + k), 128]` fp32 per rank instead of a 64 MB logits gather per step at k = 3. There every rank must
+draw the same noise, because the accepted counts and the recurrent state slots are computed on every rank.
 
 ## 3. The structural question: two all-reduces per layer is the floor of this layout
 
