@@ -626,8 +626,13 @@ class HPUWorker(WorkerBase):
         from vllm_gaudi import envs as gaudi_envs
         from vllm_gaudi.v1.worker.hpu_worker_cpus import pin_from_env
 
-        self._cpu_share = pin_from_env(self.rank, self.parallel_config.world_size, gaudi_envs.VLLM_HPU_WORKER_CPU_PIN,
-                                       logger)
+        try:
+            self._cpu_share = pin_from_env(self.rank, self.parallel_config.world_size,
+                                           gaudi_envs.VLLM_HPU_WORKER_CPU_PIN, logger)
+        except Exception as exc:  # noqa: BLE001 - placement is an optimisation: never stop a worker for it
+            logger.warning("VLLM_HPU_WORKER_CPU_PIN=%d is off for this worker: %s", gaudi_envs.VLLM_HPU_WORKER_CPU_PIN,
+                           exc)
+            self._cpu_share = []
         self.device = torch.device("hpu")
         # Initialize the distributed environment.
         init_worker_distributed_environment(self.vllm_config, self.rank, self.distributed_init_method, self.local_rank)
@@ -1312,7 +1317,11 @@ class HPUWorker(WorkerBase):
         from vllm_gaudi import envs as gaudi_envs
         from vllm_gaudi.v1.worker.hpu_worker_cpus import give_calling_thread_its_own_cpu
 
-        give_calling_thread_its_own_cpu(getattr(self, "_cpu_share", []), gaudi_envs.VLLM_HPU_WORKER_CPU_PIN, logger)
+        try:
+            give_calling_thread_its_own_cpu(getattr(self, "_cpu_share", []), gaudi_envs.VLLM_HPU_WORKER_CPU_PIN, logger)
+        except Exception as exc:  # noqa: BLE001 - placement is an optimisation: never stop a worker for it
+            logger.warning("VLLM_HPU_WORKER_CPU_PIN=%d: the calling thread keeps its share: %s",
+                           gaudi_envs.VLLM_HPU_WORKER_CPU_PIN, exc)
 
         return CompilationTimes(
             language_model=self.vllm_config.compilation_config.compilation_time,

@@ -181,7 +181,8 @@ def _method_source(name):
 def test_init_device_pins_after_set_device_and_before_the_communicators():
     source = _method_source("init_device")
     set_device = source.index("torch.hpu.set_device(device_index)")
-    pin = source.index("pin_from_env(self.rank, self.parallel_config.world_size, gaudi_envs.VLLM_HPU_WORKER_CPU_PIN")
+    pin = source.index("pin_from_env(self.rank, self.parallel_config.world_size,")
+    assert "VLLM_HPU_WORKER_CPU_PIN=%d is off for this worker" in source  # the fallback when pinning fails
     distributed = source.index("init_worker_distributed_environment(")
     runner = source.index("self._create_model_runner()")
     assert set_device < pin < distributed < runner
@@ -201,3 +202,29 @@ def test_flag_defaults_to_zero(monkeypatch):
     assert gaudi_envs.VLLM_HPU_WORKER_CPU_PIN == 0
     monkeypatch.setenv("VLLM_HPU_WORKER_CPU_PIN", "2")
     assert gaudi_envs.VLLM_HPU_WORKER_CPU_PIN == 2
+
+
+def test_a_thread_the_kernel_will_not_move_stays_and_the_rest_move():
+    import errno
+
+    def setaffinity(tid, mask):
+        if tid == 2:
+            raise OSError(errno.EINVAL, "Invalid argument")
+
+    log = Log()
+    assert cpus.pin_worker(0, 2, cpus.PIN_SHARE, log, getaffinity=lambda pid: set(range(4)), setaffinity=setaffinity,
+                           thread_ids=lambda: [1, 2, 3]) == [0, 1]
+    assert "2 threads moved" in log.lines[0][1]
+
+
+def test_the_calling_thread_keeps_its_share_when_the_kernel_refuses():
+    import errno
+
+    def setaffinity(tid, mask):
+        if tid == 0:
+            raise OSError(errno.EINVAL, "Invalid argument")
+
+    log = Log()
+    assert cpus.give_calling_thread_its_own_cpu([4, 5, 6], cpus.PIN_SHARE_AND_OWN_CPU, log, setaffinity=setaffinity,
+                                                thread_ids=lambda: [7, 8], calling_thread=7) is None
+    assert log.lines[-1][0] == "warning" and "keeps the whole share" in log.lines[-1][1]

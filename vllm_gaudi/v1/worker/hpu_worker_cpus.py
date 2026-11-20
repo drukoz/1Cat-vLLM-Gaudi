@@ -114,7 +114,7 @@ def pin_worker(index: int, count: int, mode: int, log=None, *, label: str = "", 
         try:
             setaffinity(tid, share)
             moved += 1
-        except (ProcessLookupError, PermissionError):  # a thread that ended meanwhile, or one we may not move
+        except OSError:  # a thread that ended meanwhile, or one the kernel will not move: it stays where it is
             pass
     if log is not None:
         log.info("VLLM_HPU_WORKER_CPU_PIN=%d: %sshare %d of %d, CPUs %s (%d of the %d this server may use; "
@@ -145,7 +145,7 @@ def rehome_new_threads(own: int, rest, me: int, *, getaffinity, setaffinity, thr
             if set(getaffinity(tid)) == {own}:
                 setaffinity(tid, rest)
                 moved += 1
-        except (ProcessLookupError, PermissionError):
+        except OSError:
             pass
     return moved
 
@@ -185,9 +185,14 @@ def give_calling_thread_its_own_cpu(share, mode: int, log=None, *, setaffinity=N
         try:
             setaffinity(tid, rest)
             moved += 1
-        except (ProcessLookupError, PermissionError):
+        except OSError:
             pass
-    setaffinity(0, [own])
+    try:
+        setaffinity(0, [own])
+    except OSError as exc:
+        if log is not None:
+            log.warning("VLLM_HPU_WORKER_CPU_PIN=2: the calling thread keeps the whole share (%s)", exc)
+        return None
     if log is not None:
         log.info("VLLM_HPU_WORKER_CPU_PIN=2: the calling thread has CPU %d for itself, %d other threads keep to "
                  "CPUs %s", own, moved, format_cpus(rest))
