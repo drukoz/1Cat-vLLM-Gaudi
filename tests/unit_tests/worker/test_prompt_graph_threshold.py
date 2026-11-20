@@ -99,7 +99,7 @@ def test_execute_model_takes_the_threshold_from_the_runtime_knob_at_every_step()
     values = iter([0, 140000, 4096])
     runner = SimpleNamespace(model_config=SimpleNamespace(enforce_eager=False), max_cudagraph_capture_size=8192,
                              prompt_graph_max_tokens=140000, _prompt_graph_knob=lambda: next(values),
-                             run_defragmenter=_stop)
+                             run_defragmenter=_stop, _poll_runtime_switches=lambda: None)
     long_chunk = _meta(True, 2048, 960)
     for expected_value, expected_graphs in ((0, False), (140000, True), (4096, False)):
         with pytest.raises(_Stop):
@@ -109,8 +109,11 @@ def test_execute_model_takes_the_threshold_from_the_runtime_knob_at_every_step()
 
 
 def test_execute_model_without_a_knobs_file_keeps_the_servers_threshold():
-    for runner in (SimpleNamespace(prompt_graph_max_tokens=140000, _prompt_graph_knob=None, run_defragmenter=_stop),
-                   SimpleNamespace(prompt_graph_max_tokens=140000, run_defragmenter=_stop)):
+    # integration build: execute_model first polls engine-step's runtime switches (stubbed here)
+    for runner in (SimpleNamespace(prompt_graph_max_tokens=140000, _prompt_graph_knob=None, run_defragmenter=_stop,
+                                   _poll_runtime_switches=lambda: None),
+                   SimpleNamespace(prompt_graph_max_tokens=140000, run_defragmenter=_stop,
+                                   _poll_runtime_switches=lambda: None)):
         with pytest.raises(_Stop):
             HPUModelRunner.execute_model(runner, None)
         assert runner.prompt_graph_max_tokens == 140000
