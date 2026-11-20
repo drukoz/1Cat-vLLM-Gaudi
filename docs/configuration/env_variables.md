@@ -96,6 +96,19 @@ step, and the plain step after one, through
 (`GDN core verify ... is off for <layer>: <reason>`) and runs the torch path.
 It stays off until the rental's gate G1b has checked the op on a card.
 
+`VLLM_HPU_GDN_KERNEL_INTERLEAVE` (integer, default `0`) selects the TPC kernels
+behind `gdn_core_decode` and `gdn_core_verify`. `1` hands the graph compiler
+their interleaved builds (`kernels/gdn_core_decode_interleaved_gaudi2.c`,
+`kernels/gdn_core_verify_interleaved_gaudi2.c`), which carry four value rows
+per iteration of the recurrence instead of one: every row's operations and
+their order are unchanged, so outputs and states are bit-identical, and the
+Gaudi2 simulator executes 2.91x (decode) and 2.7x (verify) fewer instructions.
+The kernel library's host glue reads the variable when the graph compiler
+instantiates a kernel, so it must be set in the serving process's environment;
+a recipe compiled before the change keeps its kernel. A library built without
+the interleaved kernels (one that did not compile, or
+`-DGDN_FUSED_INTERLEAVE=OFF`) serves today's kernels. Any other value is `0`.
+
 `VLLM_HPU_HC_FUSED` selects the path of the Flash-Next hyper-connections as an
 integer. `0` (default) keeps the torch path. `1` runs the element-wise parts of
 every hyper-connection (the grouped norm, the silu with the injection split, the

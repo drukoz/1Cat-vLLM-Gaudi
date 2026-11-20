@@ -67,6 +67,15 @@ VERIFY_KERNEL_SOURCE = REPO_ROOT / "csrc" / "gdn_fused" / "kernels" / "gdn_core_
 VERIFY_GLUE_SOURCE = REPO_ROOT / "csrc" / "gdn_fused" / "host" / "gdn_core_verify_gaudi2.cpp"
 VERIFY_HOST_SOURCE = Path(__file__).resolve().parent / "verify_sim_host.cpp"
 VERIFY_KERNEL_OBJECT = "gdn_core_verify_gaudi2.o"
+# The interleaved builds (VLLM_HPU_GDN_KERNEL_INTERLEAVE=1, idea I27): the same kernels with four value rows per
+# iteration of the recurrence. A host linked with both ELFs serves either, chosen by the glue from the variable.
+INTERLEAVED_DECODE_SOURCE = REPO_ROOT / "csrc" / "gdn_fused" / "kernels" / "gdn_core_decode_interleaved_gaudi2.c"
+INTERLEAVED_VERIFY_SOURCE = REPO_ROOT / "csrc" / "gdn_fused" / "kernels" / "gdn_core_verify_interleaved_gaudi2.c"
+INTERLEAVE_ENV = "VLLM_HPU_GDN_KERNEL_INTERLEAVE"
+# Instructions of the interleaved kernel over today's, at most (measured 2026-11-20, tpc-clang 2.7.33: decode
+# 0.344 on every case, verify 0.369 to 0.378).
+INTERLEAVED_DECODE_RATIO = 0.40
+INTERLEAVED_VERIFY_RATIO = 0.42
 
 # The flags of every kernel, as GDN_TPC_FLAGS in csrc/gdn_fused/CMakeLists.txt.  No -vlm, -slm or -spill-vlm.
 TPC_FLAGS = ("-Wall", "-Werror", "-O2", "-march=gaudi2")
@@ -196,6 +205,120 @@ def _link_verify_host(build: Path, output: Path, first_include: Path | None = No
          timeout=1800)
 
 
+def _embed(build: Path, source: Path) -> Path:
+    """Compile one kernel with TPC_FLAGS and embed its ELF as CMakeLists.txt does; the embedded object."""
+    obj = build / (source.stem + ".o")
+    _run(["tpc-clang", *TPC_FLAGS, f"-I{TOOLS_INCLUDE}", source, "-c", "-o", obj], timeout=1800)
+    embedded = source.stem + "_embedded.o"
+    _run(["objcopy", "-I", "binary", "-O", "elf64-x86-64", "-B", "i386:x86-64", obj.name, embedded], cwd=build,
+         timeout=600)
+    return build / embedded
+
+
+@pytest.fixture(scope="module")
+def interleaved_sim_binary(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    """sim_host linked with today's decode ELF and the interleaved one (the glue picks by INTERLEAVE_ENV)."""
+    build = tmp_path_factory.mktemp("gdn_core_decode_interleaved_sim")
+    objects = [_embed(build, KERNEL_SOURCE), _embed(build, INTERLEAVED_DECODE_SOURCE)]
+    _run([
+        "g++", "-std=c++17", "-O2", "-Wall", HOST_SOURCE, GLUE_SOURCE, *objects,
+        f"-I{REPO_ROOT / 'csrc' / 'gdn_fused'}", f"-I{REPO_ROOT / 'csrc' / 'gdn_fused' / 'host'}",
+        f"-I{REPO_ROOT / 'tools'}", f"-I{TOOLS_INCLUDE}", f"-I{DRIVER_INCLUDE}", "-L/usr/lib/habanatools",
+        "-Wl,-rpath,/usr/lib/habanatools", "-ltpc_tests_core_ext", "-o", build / "sim_host"
+    ],
+         timeout=1800)
+    return build
+
+
+@pytest.fixture(scope="module")
+def interleaved_verify_sim_binary(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    """verify_sim_host linked with today's verify ELF and the interleaved one."""
+    build = tmp_path_factory.mktemp("gdn_core_verify_interleaved_sim")
+    for source in (VERIFY_KERNEL_SOURCE, INTERLEAVED_VERIFY_SOURCE):
+        _embed(build, source)
+    extra = build / "gdn_core_verify_interleaved_gaudi2_embedded.o"
+    _run([
+        "g++", "-std=c++17", "-O2", "-Wall", VERIFY_HOST_SOURCE, VERIFY_GLUE_SOURCE,
+        build / "gdn_core_verify_gaudi2_embedded.o", extra, f"-I{REPO_ROOT / 'csrc' / 'gdn_fused'}",
+        f"-I{REPO_ROOT / 'csrc' / 'gdn_fused' / 'host'}", f"-I{REPO_ROOT / 'tools'}", f"-I{TOOLS_INCLUDE}",
+        f"-I{DRIVER_INCLUDE}", "-L/usr/lib/habanatools", "-Wl,-rpath,/usr/lib/habanatools", "-ltpc_tests_core_ext",
+        "-o", build / "verify_sim_host"
+    ],
+         timeout=1800)
+    return build
+
+
+def _run_both(binary: Path, write, case_dir: Path, files) -> tuple[int, int]:
+    """Run one case with today's kernel and with the interleaved one; (instructions today, interleaved).
+
+    The outputs of both runs must be the same bytes, file by file."""
+    counts, outputs = [], []
+    for interleave in (None, "1"):
+        run_dir = case_dir / ("interleaved" if interleave else "today")
+        write(run_dir)
+        env = {key: value for key, value in os.environ.items() if key != INTERLEAVE_ENV}
+        if interleave:
+            env[INTERLEAVE_ENV] = interleave
+        proc = subprocess.run([str(binary), str(run_dir)], capture_output=True, text=True, timeout=3600, env=env)
+        assert proc.returncode == 0, f"rc={proc.returncode}\nstdout:\n{proc.stdout}\nstderr:\n{proc.stderr}"
+        match = re.search(r"instructions executed: (\d+)", proc.stdout)
+        assert match, proc.stdout
+        counts.append(int(match.group(1)))
+        outputs.append({name: (run_dir / name).read_bytes() for name in files})
+    for name in files:
+        assert outputs[0][name] == outputs[1][name], f"{name}: the interleaved kernel's bytes differ"
+    return counts[0], counts[1]
+
+
+@pytest.mark.parametrize("case", CASES, ids=[case.name for case in CASES])
+def test_interleaved_decode_kernel_is_bit_identical_and_shorter(interleaved_sim_binary: Path, case,
+                                                                 tmp_path: Path) -> None:
+    from tests.unit_tests.gdn_core_decode.sim_case import OUTPUT_FILES
+
+    inputs = make_inputs(case)
+    today, interleaved = _run_both(interleaved_sim_binary / "sim_host",
+                                   lambda d: write_inputs(case, inputs, d), tmp_path / case.name,
+                                   list(OUTPUT_FILES.values()))
+    print(f"{case.name}: instructions today {today}, interleaved {interleaved} ({interleaved / today:.3f})")
+    assert compare(case, inputs, read_outputs(case, tmp_path / case.name / "interleaved")) == []
+    assert interleaved <= INTERLEAVED_DECODE_RATIO * today
+
+
+@pytest.mark.parametrize("case", VERIFY_CASES, ids=[case.name for case in VERIFY_CASES])
+def test_interleaved_verify_kernel_is_bit_identical_and_shorter(interleaved_verify_sim_binary: Path, case,
+                                                                 tmp_path: Path) -> None:
+    inputs = make_verify_inputs(case)
+    case_dir = tmp_path / case.name
+    files = ["out.bin", "conv_state.out.bin", "ssm_state.out.bin"]
+    today, interleaved = _run_both(interleaved_verify_sim_binary / "verify_sim_host",
+                                   lambda d: write_verify_inputs(case, inputs, d), case_dir, files)
+    print(f"{case.name}: instructions today {today}, interleaved {interleaved} ({interleaved / today:.3f})")
+    assert compare_verify(case, inputs, read_verify_outputs(case, case_dir / "interleaved")) == []
+    assert interleaved <= INTERLEAVED_VERIFY_RATIO * today
+
+
+def test_without_the_variable_a_host_with_both_elfs_runs_todays_kernel(interleaved_sim_binary: Path,
+                                                                        sim_binary: Path, tmp_path: Path) -> None:
+    """The glue picks the interleaved ELF only for exactly "1": unset, "0" and "2" run today's kernel."""
+    case = CASES[0]
+    inputs = make_inputs(case)
+    counts = {}
+    for label, binary, value in (("today", sim_binary, None), ("unset", interleaved_sim_binary, None),
+                                 ("0", interleaved_sim_binary, "0"), ("2", interleaved_sim_binary, "2"),
+                                 ("1", interleaved_sim_binary, "1")):
+        run_dir = tmp_path / label
+        write_inputs(case, inputs, run_dir)
+        env = {key: v for key, v in os.environ.items() if key != INTERLEAVE_ENV}
+        if value is not None:
+            env[INTERLEAVE_ENV] = value
+        proc = subprocess.run([str(binary / "sim_host"), str(run_dir)], capture_output=True, text=True, timeout=900,
+                              env=env)
+        assert proc.returncode == 0, proc.stderr
+        counts[label] = int(re.search(r"instructions executed: (\d+)", proc.stdout).group(1))
+    assert counts["unset"] == counts["0"] == counts["2"] == counts["today"]
+    assert counts["1"] < counts["today"]
+
+
 def test_kernel_disassembles_for_gaudi2(sim_binary: Path) -> None:
     listing = _run(["tpc-llvm-objdump", "--triple=tpc", "--mcpu=gaudi2", "-d", sim_binary / KERNEL_OBJECT]).stdout
     assert "TPC architecture: gaudi2" in listing
@@ -219,14 +342,16 @@ def test_no_kernel_is_compiled_with_a_local_memory_override() -> None:
     assert not [flag for flag in TPC_FLAGS if flag.lstrip("-") in ("vlm", "slm", "spill-vlm")]
     source = Path(__file__).read_text()
     compiles = re.findall('"tpc-' + r'clang",([^\]]*)\]', source)  # every tpc-clang argument list of this file
-    assert len(compiles) == 4, compiles  # the three fixtures and test_vector_local_memory
+    assert len(compiles) == 5, compiles  # the three fixtures, _embed and test_vector_local_memory
     for arguments in compiles:
         assert "*TPC_FLAGS" in arguments, arguments
         assert not re.search(r'"-(vlm|slm|spill-vlm)"', arguments), arguments
 
 
-@pytest.mark.parametrize("source", [KERNEL_SOURCE, RECURRENT_KERNEL_SOURCE, VERIFY_KERNEL_SOURCE],
-                         ids=["decode", "recurrent", "verify"])
+@pytest.mark.parametrize("source", [
+    KERNEL_SOURCE, RECURRENT_KERNEL_SOURCE, VERIFY_KERNEL_SOURCE, INTERLEAVED_DECODE_SOURCE, INTERLEAVED_VERIFY_SOURCE
+],
+                         ids=["decode", "recurrent", "verify", "decode_interleaved", "verify_interleaved"])
 def test_vector_local_memory(source: Path, tmp_path: Path) -> None:
     """tpc-clang's own count of vector local memory (statics plus spills), compiled with the default flags.
 

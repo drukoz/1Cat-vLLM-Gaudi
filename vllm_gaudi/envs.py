@@ -532,6 +532,7 @@ if TYPE_CHECKING:
     VLLM_HPU_GDN_CORE_DECODE: int = 1  # GdnCoreDecodeMode: 1 fused (default), 0 off, 2 recurrence
     VLLM_HPU_GDN_CORE_DECODE_DEBUG: int = 0  # GdnCoreDecodeDebug: 0 off, 1 check slot indices every step (host sync)
     VLLM_HPU_GDN_CORE_VERIFY: int = 0  # GdnCoreVerifyMode: 0 off (default), 1 fused verification steps
+    VLLM_HPU_GDN_KERNEL_INTERLEAVE: int = 0  # 0 today's GDN decode/verify kernels, 1 four value rows per iteration
     VLLM_HPU_PLE_HOST_NGRAM_IDS: int = 0  # 0 PLE n-gram ids computed in the graph (default), 1 on the host
     VLLM_HPU_HC_FUSED: int = 0  # 0 torch hyper-connections (default), 1 the fused hyper-connection kernels
     VLLM_HPU_MOE_GLUE: int = 0  # 0 torch MoE glue (default), 1 the fused MoE glue kernels
@@ -1881,6 +1882,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # 0 (default) = off, 1 = check the load/store indices before every core decode step.
     "VLLM_HPU_GDN_CORE_DECODE_DEBUG":
     lambda: int(os.environ.get("VLLM_HPU_GDN_CORE_DECODE_DEBUG", "0")),
+
+    # The kernels behind the fused GDN decode and verification ops (libgdn_fused_gaudi2.so). 0 (default) =
+    # today's kernels; 1 = their interleaved builds, which carry four value rows per iteration of the
+    # recurrence instead of one: the same operations in the same order for every row, so outputs and states
+    # are bit-identical, with 2.91x (decode) and 2.7x (verify) fewer TPC instructions in the Gaudi2 simulator
+    # (idea I27). Read by the kernel library's host glue (csrc/gdn_fused/host/gdn_kernel_variant.hpp) each
+    # time the graph compiler instantiates the kernel, so it must be in the environment of the serving
+    # process; a library built without the interleaved kernels serves today's. Any other value is 0.
+    "VLLM_HPU_GDN_KERNEL_INTERLEAVE":
+    lambda: int(os.environ.get("VLLM_HPU_GDN_KERNEL_INTERLEAVE", "0")),
 
     # Flash-Next GDN speculative verification steps (MTP) through the fused verify op
     # (flashinfer_gaudi.gdn_core_verify). 0 (default) = off (the torch path), 1 = fused.
