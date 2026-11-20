@@ -125,7 +125,10 @@ def test_route_copy_returns_the_plugin_bits(method_class, rows, experts, top_k):
 
 
 def test_dynamic_quant_takes_the_copied_branch_by_default_and_returns_its_bits(monkeypatch):
-    """With the default flags dynamic_quant is the copied formula around the vendor cast."""
+    """With the default flags dynamic_quant is the copied formula around the vendor cast.
+
+    On CPU, so with CPU torch's division: ``moe_row_quant_cpu_reference``, what the op's CPU stand-in returns.
+    """
     assert plugin_ops.gaudi_envs.VLLM_HPU_TP2_NATIVE_DYNAMIC_QUANT is False
     assert plugin_ops.gaudi_envs.VLLM_HPU_FP8_JIT_DYNAMIC_QUANT is False
     assert plugin_ops.gaudi_envs.VLLM_HPU_DYNAMIC_QUANT_CGUID is False
@@ -142,7 +145,7 @@ def test_dynamic_quant_takes_the_copied_branch_by_default_and_returns_its_bits(m
         data = (torch.randn(rows, hidden, generator=g) * torch.exp(torch.randn(rows, 1, generator=g))).to(BF16)
         data[0] = 0  # a zero row
         got_fp8, got_scale = plugin_ops.dynamic_quant(data)
-        want_fp8, want_scale = moe_reference.moe_row_quant_reference(data, plugin_ops.FP8_MAX)
+        want_fp8, want_scale = moe_reference.moe_row_quant_cpu_reference(data, plugin_ops.FP8_MAX)
         assert got_scale.dtype == torch.float32 and torch.equal(got_scale, want_scale)
         assert got_fp8.dtype == torch.float8_e4m3fn
         assert torch.equal(got_fp8.view(torch.uint8), want_fp8.view(torch.uint8))

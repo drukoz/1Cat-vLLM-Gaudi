@@ -13,6 +13,9 @@ card's own numbers, and pin what follows from it: the kernel replaces the torch 
 oracle is the torch code with the card's division, while the op's CPU stand-in keeps the CPU's.
 """
 
+import inspect
+import textwrap
+
 import pytest
 import torch
 
@@ -130,6 +133,30 @@ def test_the_kernel_oracle_is_the_torch_path_with_the_cards_division(case):
     differs = int((exp["scale"] != want_scale).sum())
     assert differs == 0, f"{differs} of {case.rows} scales of the oracle are not the card's"
     assert torch.equal(_bits(exp["x_fp8"]), _bits(want_fp8))
+
+
+def _statements(function) -> list[str]:
+    body = textwrap.dedent(inspect.getsource(function)).split('"""', 2)[2]
+    return [line.strip() for line in body.splitlines() if line.strip()]
+
+
+def test_the_cards_version_of_the_copy_differs_in_the_one_division():
+    """moe_row_quant_hpu is moe_row_quant_torch with ``... / FP8_MAX`` written as the card computes it."""
+    copy, card = _statements(moe_reference.moe_row_quant_torch), _statements(moe_reference.moe_row_quant_hpu)
+    changed = [(a, b) for a, b in zip(copy, card) if a != b]
+    assert len(copy) == len(card) and len(changed) == 1
+    cpu_line, card_line = changed[0]
+    numerator = cpu_line.removeprefix("scale = ").removesuffix(" / FP8_MAX")
+    assert cpu_line == f"scale = {numerator} / FP8_MAX"
+    assert card_line == f"scale = hpu_div_by_scalar({numerator.removeprefix('(').removesuffix(')')}, FP8_MAX)"
+
+
+@pytest.mark.parametrize("case", ROW_QUANT, ids=[case.name for case in ROW_QUANT])
+def test_the_cards_version_of_the_copy_is_the_copy_under_the_emulation(case):
+    x = make_inputs(case)["x"]
+    want_fp8, want_scale = _torch_path_on_card(x)
+    got_fp8, got_scale = moe_reference.moe_row_quant_hpu(x, FP8_MAX, _cast)
+    assert torch.equal(got_scale, want_scale) and torch.equal(_bits(got_fp8), _bits(want_fp8))
 
 
 @pytest.mark.parametrize("case", [case for case in ROW_QUANT if case.rows <= 2048],
