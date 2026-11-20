@@ -113,8 +113,14 @@ kernels are not loaded, or whose input they do not take (not 2-D bfloat16 and
 contiguous, a hidden size that is not a multiple of 128), logs one warning
 (`HC fused (VLLM_HPU_HC_FUSED=1) is off for <layer>: <reason>; using the torch
 path`) and runs the torch path. With `0` the kernels are not loaded and their
-ops are not registered. The kernels pass the Gaudi2 instruction simulator and
-have not run on a card; see `docs/design/flash-next/hc-fused.md`.
+ops are not registered. In lazy mode the kernels need the bridge's accumulation
+thread off: with the flag at `1` the plugin sets `PT_HPU_LAZY_ACC_PAR_MODE=0`
+at start when the variable is unset, and a lazy process that has it at another
+value gets no kernels (the startup warning says so) and runs the torch path.
+`VLLM_HPU_MOE_GLUE=1` follows the same rule. The kernels pass the Gaudi2
+instruction simulator and their card test (90 of 90 on 2026-11-20 with the
+thread off); see `docs/design/flash-next/hc-fused.md` and
+`docs/design/flash-next/native-extensions.md`.
 
 `VLLM_HPU_MOE_GLUE` selects the path of the element-wise ops of the Flash-Next
 MoE block as an integer. `0` (default) keeps the torch path. `1` computes the

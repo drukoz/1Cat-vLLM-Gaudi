@@ -5,9 +5,10 @@ Runs each op (HPU kernels from the ``hc_fused_ops`` extension, TPC kernels from
 ``libhc_fused_gaudi2.so``) on every case of ``hc_case.HPU_CASES`` and checks the outputs against
 the torch oracle with ``compare``: the simulator cases plus every decode batch bucket
 (1, 2, 4, 8, 12, 16, 20, 32 rows) and the largest prefill (8192 rows) at the real geometry.
-The whole module skips without a Gaudi card (no ``habana_frameworks``) or without the built
-extension.  This file is the rental gate of the track; ``docs/design/flash-next/hc-fused.md``
-("Rental gate") says what a pass means.
+The whole module skips without a Gaudi card (no ``habana_frameworks``), without the built
+extension, or in a lazy process whose accumulation thread is on (``PT_HPU_LAZY_ACC_PAR_MODE`` not 0:
+the loader refuses the kernels there, and the skip line says so).  This file is the rental gate of
+the track; ``docs/design/flash-next/hc-fused.md`` ("Rental gate") says what a pass means.
 """
 
 import pytest
@@ -15,13 +16,13 @@ import torch
 
 pytest.importorskip("habana_frameworks.torch")
 
-from tests.unit_tests.hc_fused import hc_ops  # noqa: E402
+from tests.unit_tests.hc_fused import hc_ops, hc_stress  # noqa: E402
 from tests.unit_tests.hc_fused.hc_case import (BF16, HPU_CASES, INPUT_ORDER, OP_NAME, OUTPUT_ORDER,  # noqa: E402
                                                case_by_name, compare, expected, make_inputs, scalars, summary)
 from tests.unit_tests.hc_fused.hpu_loader import hc_fused_extension_errors, load_hc_fused_extension  # noqa: E402
 
 if not load_hc_fused_extension():
-    pytest.skip("hc_fused_ops extension is not built: " + "; ".join(hc_fused_extension_errors()),
+    pytest.skip("the fused hyper-connection kernels did not load: " + "; ".join(hc_fused_extension_errors()),
                 allow_module_level=True)
 
 # docs/design/flash-next/gdn-core-decode.md, "Measured tolerances": bf16 against the composed HPU torch path.
@@ -85,6 +86,21 @@ def test_hpu_ops_run_twice_with_the_same_result():
     for name in first:
         assert first[name].dtype == BF16
         assert torch.equal(first[name].view(torch.int16), second[name].view(torch.int16))
+
+
+@pytest.mark.parametrize("name", hc_stress.STRESS_CASES)
+def test_hpu_op_behind_a_queue_of_lazy_ops(name):
+    """The op is called right after 96 lazy ops were queued, eight rounds, as a layer calls it in a model.
+
+    The cases above call an op with one clone queued in front of it. With the bridge's accumulation thread
+    on they failed at random, because the op was built before the producer of its input (2026-11-20). The
+    loader requires that thread off; this is the check that the op then gets its inputs under a queue too.
+    The body is ``hc_stress.run_behind_a_queue``, which ``test_hc_ops.py`` runs on CPU.
+    """
+    messages = hc_stress.run_behind_a_queue(case_by_name(name), "hpu")
+    if messages:
+        print("\n".join(messages))
+    assert messages == []
 
 
 def test_hpu_chain_of_one_hyper_connection():
