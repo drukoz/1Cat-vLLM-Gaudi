@@ -18,7 +18,7 @@ from pathlib import Path
 
 import pytest
 
-from tests.unit_tests.hc_fused import sim_build
+from tests.unit_tests.hc_fused import moe_case, sim_build
 from tests.unit_tests.hc_fused.hc_case import GUIDS, KINDS
 
 _MISSING = sim_build.missing_sdk_parts()
@@ -49,8 +49,10 @@ def test_every_entry_point_check_passes(check_lines: list[str]) -> None:
 
 
 def test_guid_list_is_the_six_kernels_in_order(check_lines: list[str]) -> None:
+    """The six hyper-connection GUIDs keep their places; the MoE glue GUIDs of the same library follow them."""
     guids = [line.split(" ")[2] for line in check_lines if line.startswith("GUID ")]
-    assert guids == [GUIDS[kind] for kind in KINDS]
+    assert guids[:len(KINDS)] == [GUIDS[kind] for kind in KINDS]
+    assert guids[len(KINDS):] == [moe_case.GUIDS[kind] for kind in moe_case.KINDS]
     assert all(len(guid) < 64 for guid in guids)
 
 
@@ -154,7 +156,7 @@ def test_build_script_accepts_the_library_and_refuses_a_broken_one(build: Path, 
     """``tools/build_flashinfer_gaudi.py`` checks the built library the way the combined database uses it."""
     from tools.build_flashinfer_gaudi import check_kernel_library
 
-    assert check_kernel_library(build / "lib" / sim_build.LIBRARY) == len(KINDS)
+    assert check_kernel_library(build / "lib" / sim_build.LIBRARY) == len(KINDS) + len(moe_case.KINDS)
     broken = tmp_path / sim_build.LIBRARY
     broken.write_text("not a shared object\n", encoding="utf-8")
     with pytest.raises(RuntimeError, match="does not load"):

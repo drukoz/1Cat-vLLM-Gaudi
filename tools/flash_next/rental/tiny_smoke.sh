@@ -18,6 +18,11 @@
 # server log says a hyper-connection ran the torch path. The kernels are built by the install of
 # this bundle: in a container an older bundle installed, pass --reinstall first.
 #
+# A fourth mode, moe, is the fused mode plus the MoE glue kernels (VLLM_HPU_MOE_GLUE=1), which are in
+# the library of the hyper-connection kernels. It is not in the default list either: --gdn moe (or
+# --gdn pytorch,fused,hc,moe) selects it. It fails when the server log says a MoE block ran the torch
+# path.
+#
 # By default the servers skip the bucket warmup (VLLM_SKIP_WARMUP=true): the graphs compile on first
 # use and a run takes about 4-6 minutes per mode. --full-warmup keeps the real warmup, about 15 minutes
 # per mode on the tiny model. The servers get a compiled-recipe cache under /results/recipe-cache,
@@ -48,7 +53,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 usage() {
     echo "usage: $(basename "${BASH_SOURCE[0]}") [options]"
-    echo "  --gdn LIST      GDN modes to serve, in order (default: pytorch,fused); the third mode, hc, is fused plus the fused hyper-connection kernels (VLLM_HPU_HC_FUSED=1) and runs only when named: --gdn hc"
+    echo "  --gdn LIST      GDN modes to serve, in order (default: pytorch,fused); the third mode, hc, is fused plus the fused hyper-connection kernels (VLLM_HPU_HC_FUSED=1) and runs only when named: --gdn hc; the fourth, moe, is fused plus the MoE glue kernels (VLLM_HPU_MOE_GLUE=1) and runs only when named: --gdn moe"
     echo "  --results DIR   results directory on the host (default: ./results); fixed once the container exists"
     echo "  --run-id ID     folder name under the results directory (default: smoke-<UTC timestamp>)"
     echo "  --image IMG     container image (default: $DEFAULT_IMAGE)"

@@ -9,7 +9,9 @@ which ``flashinfer_gaudi._native.load_hc_fused_extension`` loads after the kerne
 ``libhc_fused_gaudi2.so`` is registered.  A process without that extension has no kernel for any
 device, ``hc_fused_missing_ops`` names all six ops, and the layer runs its torch path.
 
-Nothing imports this module unless ``VLLM_HPU_HC_FUSED=1``: importing it defines the six schemas.
+Nothing imports this module unless ``VLLM_HPU_HC_FUSED=1`` or ``VLLM_HPU_MOE_GLUE=1``: importing it defines
+the six schemas, and the four of the MoE glue ops (``flashinfer_gaudi/moe_glue.py``), because the one
+extension implements the HPU kernels of both families and every schema must exist before it is loaded.
 
 Schemas (all tensors bf16, ``[tokens, columns]``):
 
@@ -139,3 +141,7 @@ def hc_fused_missing_ops(device: torch.device | str) -> tuple[str, ...]:
 def hc_fused_available(device: torch.device | str) -> bool:
     """True when every fused hyper-connection op has a kernel for the device's type."""
     return not hc_fused_missing_ops(device)
+
+
+# hc_fused_ops*.so implements the HPU kernels of the MoE glue ops too: their schemas are defined with these.
+from flashinfer_gaudi import moe_glue as _moe_glue  # noqa: E402,F401

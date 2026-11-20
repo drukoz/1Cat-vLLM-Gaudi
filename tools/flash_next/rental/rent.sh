@@ -74,15 +74,16 @@ stage 3, host
 stages 4 and 6, download
   --no-download      the checkpoint is in place: start no download and wait for none
 stage 5, smoke
-  --smoke-modes LIST modes of tiny_smoke.sh, one call each: pytorch, fused, hc (default: pytorch,fused)
+  --smoke-modes LIST modes of tiny_smoke.sh, one call each: pytorch, fused, hc, moe (default: pytorch,fused)
   --skip-smoke       no smoke test
   --smoke-arg ARG    extra argument for tiny_smoke.sh (repeatable)
   --continue-after-smoke-failure LIST
-                     start the run although these modes failed: fused, hc (never pytorch)
+                     start the run although these modes failed: fused, hc, moe (never pytorch)
 stage 7, run
   --variants LIST    variants of the run (default: A,C)
   --no-quick-gates   run without --quick-gates
   --hc-fused         pass --hc-fused to run_rental.sh
+  --moe-glue         pass --moe-glue to run_rental.sh
   --run-arg ARG      extra argument for run_rental.sh (repeatable)
   --from PHASE       resume this session's last run from PHASE (same run id)
   --new-run          start another run although this session's run has ended
@@ -481,7 +482,7 @@ echo "cpus=$(nproc 2>/dev/null || echo unknown)"
 echo "mem_gb=$(free -g 2>/dev/null | awk '/^Mem:/ {print $2}')"
 if command -v hl-smi >/dev/null 2>&1; then echo "cards=$(hl-smi -Q index,name -f csv,noheader 2>/dev/null | grep -c .)"; else echo "cards=none"; fi
 echo "bundle=$(sed -n 's/^plugin sha: //p' "$R/BUNDLE.txt" 2>/dev/null | head -n 1)"
-for n in host smoke-pytorch smoke-fused smoke-hc run; do echo "job.$n=$(fn_job_state "$n")"; done
+for n in host smoke-pytorch smoke-fused smoke-hc smoke-moe run; do echo "job.$n=$(fn_job_state "$n")"; done
 echo "--- disks"
 lsblk -o NAME,SIZE,TYPE,FSTYPE,MOUNTPOINT 2>&1
 EOF
@@ -771,6 +772,7 @@ SMOKE_OVERRIDE=""
 VARIANTS="A,C"
 QUICK_GATES=1
 HC_FUSED=0
+MOE_GLUE=0
 RUN_ARGS=()
 FROM_PHASE=""
 NEW_RUN=0
@@ -857,6 +859,10 @@ while [ $# -gt 0 ]; do
             HC_FUSED=1
             shift
             ;;
+        --moe-glue)
+            MOE_GLUE=1
+            shift
+            ;;
         --run-arg)
             need_value "$1" $#
             RUN_ARGS+=("$2")
@@ -915,10 +921,10 @@ OLD_IFS="$IFS"
 IFS=','
 for word in $SMOKE_MODES; do
     case "$word" in
-        pytorch | fused | hc) SMOKE_MODE_WORDS="$SMOKE_MODE_WORDS${SMOKE_MODE_WORDS:+ }$word" ;;
+        pytorch | fused | hc | moe) SMOKE_MODE_WORDS="$SMOKE_MODE_WORDS${SMOKE_MODE_WORDS:+ }$word" ;;
         *)
             IFS="$OLD_IFS"
-            usage_error "--smoke-modes: unknown mode '$word' (the modes: pytorch, fused, hc)"
+            usage_error "--smoke-modes: unknown mode '$word' (the modes: pytorch, fused, hc, moe)"
             ;;
     esac
 done
@@ -928,10 +934,10 @@ SMOKE_OVERRIDE_WORDS=""
 IFS=','
 for word in $SMOKE_OVERRIDE; do
     case "$word" in
-        fused | hc) SMOKE_OVERRIDE_WORDS="$SMOKE_OVERRIDE_WORDS${SMOKE_OVERRIDE_WORDS:+ }$word" ;;
+        fused | hc | moe) SMOKE_OVERRIDE_WORDS="$SMOKE_OVERRIDE_WORDS${SMOKE_OVERRIDE_WORDS:+ }$word" ;;
         *)
             IFS="$OLD_IFS"
-            usage_error "--continue-after-smoke-failure takes fused and hc only: a failed pytorch mode means no variant can start, and nothing overrides it (got '$SMOKE_OVERRIDE')"
+            usage_error "--continue-after-smoke-failure takes fused, hc and moe only: a failed pytorch mode means no variant can start, and nothing overrides it (got '$SMOKE_OVERRIDE')"
             ;;
     esac
 done
@@ -1070,7 +1076,7 @@ stage_connect() {
     say "node: $(fact user)@$IP: $(fact os), kernel $(fact kernel), $(fact cpus) CPUs, $(fact mem_gb) GB RAM, $cards"
     NODE_BUNDLE="$(fact bundle)"
     say "bundle on the node: ${NODE_BUNDLE:-none}"
-    for name in host smoke-pytorch smoke-fused smoke-hc run; do
+    for name in host smoke-pytorch smoke-fused smoke-hc smoke-moe run; do
         st="$(fact "job.$name")"
         case "$st" in
             none | '') ;;
@@ -1727,7 +1733,7 @@ stage_smoke() {
         for mode in $SMOKE_MODE_WORDS; do
             job_start "smoke-$mode" "$(cmd_smoke "$mode" "smoke-UTC-$mode" 0)"
         done
-        say "[dry-run] a failed mode stops the command here, before the run (the fused and hc modes can be overridden, the pytorch mode never)"
+        say "[dry-run] a failed mode stops the command here, before the run (the fused, hc and moe modes can be overridden, the pytorch mode never)"
         return 0
     fi
     stamp="$(date -u +%Y%m%dT%H%M%SZ)"
@@ -1806,11 +1812,15 @@ stage_smoke() {
                 say "a failed hc mode means the run would go on with the torch hyper-connections; to start the run all the same:"
                 say "  $RERUN --continue-after-smoke-failure hc"
                 ;;
+            moe)
+                say "a failed moe mode means the run would go on with the torch path of the MoE blocks; to start the run all the same:"
+                say "  $RERUN --continue-after-smoke-failure moe"
+                ;;
         esac
         exit 1
     done
     if [ -n "$over" ]; then
-        note="FAILED and overridden: $over. The run goes on without what failed there: the PyTorch GDN path for fused, the torch hyper-connections for hc (its own gates decide)"
+        note="FAILED and overridden: $over. The run goes on without what failed there: the PyTorch GDN path for fused, the torch hyper-connections for hc, the torch path of the MoE blocks for moe (its own gates decide)"
     fi
     stage_ok "$note"
 }
@@ -1826,6 +1836,7 @@ cmd_run() {
     if [ "$QUICK_GATES" -eq 1 ]; then args+=(--quick-gates); fi
     args+=(--variants "$VARIANTS")
     if [ "$HC_FUSED" -eq 1 ]; then args+=(--hc-fused); fi
+    if [ "$MOE_GLUE" -eq 1 ]; then args+=(--moe-glue); fi
     if [ "${#RUN_ARGS[@]}" -gt 0 ]; then args+=("${RUN_ARGS[@]}"); fi
     if [ -n "$FROM_PHASE" ]; then args+=(--from "$FROM_PHASE"); fi
     printf '%s\n' "cd \"\$HOME/rental\" && exec sudo -n bash run_rental.sh $(rq "${args[@]}")"
@@ -1844,11 +1855,23 @@ run_ended() {
     fi
 }
 
+# need_run_option OPTION — stage 7 stops here when the run_rental.sh of the bundle on the node does
+# not know OPTION, one of the switches this command passes on to it (--hc-fused, --moe-glue).
+need_run_option() {
+    remote "grep -q -e $1 \"\$R/run_rental.sh\""
+    if [ "$REMOTE_RC" -ne 0 ]; then
+        stage_failed "$1: the run_rental.sh of the bundle on the node does not know this option"
+        say "send a bundle that has it (a commit with $1 in run_rental.sh), or run the same command without $1."
+        exit 1
+    fi
+}
+
 stage_run() {
     local st="" prev="" id="" node_id="" rc=""
     stage_start 7 run
     if [ "$DRY_RUN" -eq 1 ]; then
         if [ "$HC_FUSED" -eq 1 ]; then remote "grep -q -e --hc-fused \"\$R/run_rental.sh\"   # the bundle must know the option"; fi
+        if [ "$MOE_GLUE" -eq 1 ]; then remote "grep -q -e --moe-glue \"\$R/run_rental.sh\"   # the bundle must know the option"; fi
         job_start run "$(cmd_run "UTC-TIMESTAMP")"
         say "[dry-run] the run takes hours; it goes on when this command or the connection ends, and the same command attaches to it again"
         return 0
@@ -1908,14 +1931,8 @@ stage_run() {
             else
                 id="$(date -u +%Y%m%dT%H%M%SZ)"
             fi
-            if [ "$HC_FUSED" -eq 1 ]; then
-                remote "grep -q -e --hc-fused \"\$R/run_rental.sh\""
-                if [ "$REMOTE_RC" -ne 0 ]; then
-                    stage_failed "--hc-fused: the run_rental.sh of the bundle on the node does not know this option"
-                    say "send a bundle that has it (a commit with --hc-fused in run_rental.sh), or run the same command without --hc-fused."
-                    exit 1
-                fi
-            fi
+            if [ "$HC_FUSED" -eq 1 ]; then need_run_option --hc-fused; fi
+            if [ "$MOE_GLUE" -eq 1 ]; then need_run_option --moe-glue; fi
             job_start run "$(cmd_run "$id")" "$id"
             ;;
     esac
@@ -2019,7 +2036,7 @@ stage_fetch() {
 
 do_status() {
     local line=""
-    remote "for n in host smoke-pytorch smoke-fused smoke-hc run; do
+    remote "for n in host smoke-pytorch smoke-fused smoke-hc smoke-moe run; do
     echo \"job \$n: \$(fn_job_state \"\$n\")\"
     if [ -f \"\$J/\$n.log\" ]; then tail -n 5 \"\$J/\$n.log\" | sed 's/^/    /'; fi
 done

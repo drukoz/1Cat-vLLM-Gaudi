@@ -1,12 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
-// Simulator host program for the fused hyper-connection kernels (csrc/hc_fused).
+// Simulator host program for the kernels of csrc/hc_fused: the fused hyper-connection kernels and
+// the fused MoE glue kernels.
 //
-// argv[1] is one case folder written by tests/unit_tests/hc_fused/hc_case.py: case.txt plus one raw
-// little-endian <name>.bin per input tensor.  case.txt lines:
+// argv[1] is one case folder written by tests/unit_tests/hc_fused/hc_case.py or moe_case.py:
+// case.txt plus one raw little-endian <name>.bin per input tensor.  case.txt lines:
 //   guid <kernel guid>
 //   eps <float> / hc_count <int> / lora_rank <int>          the HcFusedParams node parameters
+//   experts <int> / top_k <int> / gate_column <int> / fp8_max <float>
+//                                                           the MoeGlueParams node parameters; a case
+//                                                           with any of these keys passes that struct
 //   in  <name> <dtype> <dim0> <dim1> ...                    TPC dims, fastest first
-//   out <name> <dtype> <dim0> <dim1> ...
+//   out <name> <dtype> <dim0> <dim1> ...                    dtype: bf16, f32, i32 or f8 (1-4-3)
 // The program links libhc_fused_gaudi2.so and goes through its exported entry points only
 // (InstantiateTpcKernel with the two-call ELF handshake, GetShapeInference), exactly as the graph
 // compiler does, drives the Gaudi2 instruction simulator and writes <name>.out.bin per output.
@@ -61,7 +65,12 @@ struct TensorSpec {
         for (uint64_t dim : dims) count *= dim;
         return count;
     }
-    uint64_t bytes() const { return elements() * (type == tpc_lib_api::DATA_F32 ? 4 : 2); }
+    uint64_t elementSize() const
+    {
+        if (type == tpc_lib_api::DATA_F32 || type == tpc_lib_api::DATA_I32) return 4;
+        return type == tpc_lib_api::DATA_F8_143 ? 1 : 2;
+    }
+    uint64_t bytes() const { return elements() * elementSize(); }
 };
 
 bool ParseType(const std::string& text, tpc_lib_api::TensorDataType& type)
@@ -70,6 +79,10 @@ bool ParseType(const std::string& text, tpc_lib_api::TensorDataType& type)
         type = tpc_lib_api::DATA_BF16;
     } else if (text == "f32") {
         type = tpc_lib_api::DATA_F32;
+    } else if (text == "i32") {
+        type = tpc_lib_api::DATA_I32;
+    } else if (text == "f8") {
+        type = tpc_lib_api::DATA_F8_143;
     } else {
         return false;
     }
@@ -113,6 +126,8 @@ int main(int argc, char** argv)
 
     std::string guid;
     HcFusedParams scalar{};
+    MoeGlueParams moeScalar{};
+    bool moe = false;
     std::vector<TensorSpec> inputs;
     std::vector<TensorSpec> outputs;
     {
@@ -136,6 +151,20 @@ int main(int argc, char** argv)
                 line >> scalar.hc_count;
             } else if (key == "lora_rank") {
                 line >> scalar.lora_rank;
+            } else if (key == "experts") {
+                line >> moeScalar.experts;
+                moe = true;
+            } else if (key == "top_k") {
+                line >> moeScalar.top_k;
+                moe = true;
+            } else if (key == "gate_column") {
+                line >> moeScalar.gate_column;
+                moe = true;
+            } else if (key == "fp8_max") {
+                double value = 0;
+                line >> value;
+                moeScalar.fp8_max = static_cast<float>(value);
+                moe = true;
             } else if (key == "in" || key == "out") {
                 TensorSpec spec;
                 std::string type;
@@ -191,8 +220,13 @@ int main(int argc, char** argv)
     p.outputTensorNr = static_cast<uint32_t>(out.size());
     p.inputTensors = in.data();
     p.outputTensors = out.data();
-    p.nodeParams.nodeParams = &scalar;
-    p.nodeParams.nodeParamsSize = sizeof(HcFusedParams);
+    if (moe) {
+        p.nodeParams.nodeParams = &moeScalar;
+        p.nodeParams.nodeParamsSize = sizeof(MoeGlueParams);
+    } else {
+        p.nodeParams.nodeParams = &scalar;
+        p.nodeParams.nodeParamsSize = sizeof(HcFusedParams);
+    }
     std::strcpy(p.guid.name, guid.c_str());
 
     // Shape inference first: it must give the manifest's output shapes from the inputs alone.

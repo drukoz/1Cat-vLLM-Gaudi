@@ -57,6 +57,11 @@ usage() {
     echo "                    the kernels in gate fused_gdn passed, otherwise VLLM_HPU_HC_FUSED=0 and the run"
     echo "                    goes on with the torch hyper-connections; a tiny gate that fails with the"
     echo "                    kernels runs once more without them"
+    echo "  --moe-glue        ask for the MoE glue kernels (off by default; passed to the orchestrator):"
+    echo "                    the servers get VLLM_HPU_MOE_GLUE=1 only when the card test of the kernels in"
+    echo "                    gate fused_gdn passed, otherwise VLLM_HPU_MOE_GLUE=0 and the run goes on with"
+    echo "                    the torch MoE glue; a tiny gate that fails with the kernels runs once more"
+    echo "                    without them (one retry for --hc-fused and --moe-glue together)"
     echo "  --load-read-timeout S     measured load: seconds a request may go without receiving data"
     echo "                    (passed to the orchestrator; its default: 1800)"
     echo "  --warm-request-timeout S  warm pass: seconds a request may go without receiving data, first"
@@ -181,6 +186,7 @@ NO_VERIFY_PROBE=0
 LOAD_READ_TIMEOUT=""
 WARM_REQUEST_TIMEOUT=""
 HC_FUSED=0
+MOE_GLUE=0
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -275,6 +281,10 @@ while [ $# -gt 0 ]; do
             ;;
         --hc-fused)
             HC_FUSED=1
+            shift
+            ;;
+        --moe-glue)
+            MOE_GLUE=1
             shift
             ;;
         --load-read-timeout)
@@ -487,6 +497,8 @@ if [ -n "$LOAD_READ_TIMEOUT" ]; then ENTRY_ARGS+=(--load-read-timeout "$LOAD_REA
 if [ -n "$WARM_REQUEST_TIMEOUT" ]; then ENTRY_ARGS+=(--warm-request-timeout "$WARM_REQUEST_TIMEOUT"); fi
 # The operator's request only: the orchestrator sets VLLM_HPU_HC_FUSED per server, after the card test.
 if [ "$HC_FUSED" -eq 1 ]; then ENTRY_ARGS+=(--hc-fused); fi
+# The same for the MoE glue kernels: the request only, VLLM_HPU_MOE_GLUE is the orchestrator's to set.
+if [ "$MOE_GLUE" -eq 1 ]; then ENTRY_ARGS+=(--moe-glue); fi
 # Appended last so the --dry-run line ends with --no-warm-pass.
 if [ "$NO_WARM_PASS" -eq 1 ]; then ENTRY_ARGS+=(--no-warm-pass); fi
 
