@@ -133,6 +133,10 @@ def moe_route_reference(gates: torch.Tensor, experts: int, top_k: int) -> tuple[
     path's, as int32: the caller widens them for the vendor op.  Which expert wins among equal
     probabilities at the cut is whatever ``torch.topk`` does here; ``moe_case.compare`` accepts
     every valid choice and pins the kernel's own rule (the lowest expert id).
+
+    A CPU oracle.  Do not issue it on a card: there the ``.to(torch.int32)`` below, in the lazy graph that
+    holds the top-k, returns every second id of the table (card probe ``probe_moe_route.py``, 2026-11-20).  On a
+    card read the int64 ids of ``moe_route_torch`` and narrow them on the host (``test_moe_hpu_op.py``).
     """
     ids, weights = moe_route_torch(gates, gates[:, :experts], _TopK(top_k))
     return ids.to(torch.int32), weights

@@ -250,7 +250,15 @@ CHILD_TIMEOUT_S = 100.0
 REPEATS = 5
 VIEW_CASES = ("row_slice_offset_0", "row_slice_offset_2", "reshape_of_1d", "one_row_column_slice",
               "row_slice_of_pending_op", "reshape_of_pending_op", "one_row_column_slice_of_pending_op")
+# Views that change nothing (the same shape, strides and offset): what a model block's
+# hidden_states.view(-1, hidden_dim) and a quant method's output.view(*input_shape) are for a [tokens, H] tensor.
+# Reported in a line of their own (IDENTITY VIEWS ...); the verdict of the seven real views does not count them.
+IDENTITY_CASES = ("identity_view", "identity_view_of_pending_op", "identity_reshape_of_pending_op",
+                  "contiguous_of_identity_view", "unsqueeze_squeeze_of_pending_op")
 CONTROL_CASES = ("fresh_tensor", "clone_of_row_slice")
+# Tensors that are no views but have not run yet: what the fused ops get from the layers without a copy if the
+# copies of flashinfer_gaudi.hc_fused._owned are kept for views only (line OP OUTPUTS ...).
+OWNED_CASES = ("pending_op_output", "gemm_output", "custom_op_output", "clone_of_identity_view")
 
 
 def views_child():
@@ -262,6 +270,7 @@ def views_child():
     host[0] = -host[0].abs() - 1.0
     matrix = host.to(device)
     flat = host.reshape(-1).contiguous().to(device)
+    eye = torch.eye(columns, dtype=torch.bfloat16).to(device)  # a GEMM that returns its input's values
 
     def build(case):
         """(the op's input on the device, the same rows on the host)."""
@@ -283,10 +292,28 @@ def views_child():
             return (matrix * 1.0)[2:3, 64:192], host[2:3, 64:192]
         if case == "reshape_of_pending_op":
             return (flat * 1.0).view(rows, columns), host
+        if case == "pending_op_output":  # an element-wise op's output: no view, not yet run
+            return matrix * 1.0, host
+        if case == "gemm_output":  # what a layer's GEMM hands a fused op
+            return torch.nn.functional.linear(matrix, eye), host
+        if case == "custom_op_output":  # a fused op's output as the next fused op's input
+            return torch.ops.flashinfer_gaudi.hc_silu(matrix, hc), ref_silu(host, hc)
+        if case == "clone_of_identity_view":
+            return (matrix * 1.0).view(-1, columns).clone(), host
+        if case == "identity_view":
+            return matrix.view(-1, columns), host
+        if case == "identity_view_of_pending_op":
+            return (matrix * 1.0).view(-1, columns), host
+        if case == "identity_reshape_of_pending_op":
+            return (matrix * 1.0).reshape(rows, columns), host
+        if case == "contiguous_of_identity_view":  # .contiguous() of a contiguous view returns the view itself
+            return (matrix * 1.0).view(-1, columns).contiguous(), host
+        if case == "unsqueeze_squeeze_of_pending_op":
+            return (matrix * 1.0).unsqueeze(0).squeeze(0), host
         raise KeyError(case)
 
     results = {}
-    for case in CONTROL_CASES + VIEW_CASES:
+    for case in CONTROL_CASES + VIEW_CASES + IDENTITY_CASES + OWNED_CASES:
         tally = {"ok": 0, "error": 0, "wrong_values": 0, "first_error": None, "strided_params": None}
         for _ in range(REPEATS):
             try:
@@ -344,6 +371,18 @@ def main():
     word, sentence = verdict(run)
     if SELFTEST:
         print("SELFTEST ONLY (CPU, no bridge): the line below checks this script, it is not a result.")
+    if not child_failure(run):
+        cases = run["result"]["cases"]
+        fine = [name for name in IDENTITY_CASES if cases[name]["ok"] == REPEATS]
+        bad = ["%s (%s)" % (name, "raises" if cases[name]["error"] else "other values")
+               for name in IDENTITY_CASES if cases[name]["ok"] != REPEATS]
+        print("IDENTITY VIEWS: %d of %d cases give the op the right rows at mode 0 (%s); not: %s" %
+              (len(fine), len(IDENTITY_CASES), ", ".join(fine) or "none", ", ".join(bad) or "none"))
+        fine = [name for name in OWNED_CASES if cases[name]["ok"] == REPEATS]
+        bad = ["%s (%s)" % (name, "raises" if cases[name]["error"] else "other values")
+               for name in OWNED_CASES if cases[name]["ok"] != REPEATS]
+        print("OP OUTPUTS: %d of %d cases need no copy at mode 0 (%s); not: %s" %
+              (len(fine), len(OWNED_CASES), ", ".join(fine) or "none", ", ".join(bad) or "none"))
     print("VERDICT: %s - %s" % (word, sentence))
     return 2 if word == "NOT RUN" else 0
 
