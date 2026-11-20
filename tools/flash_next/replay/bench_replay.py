@@ -880,6 +880,7 @@ def rank_main(args) -> int:
             "selftest": args.selftest, "pin": pin_mode or None, "pin_cpus": pinned, "pin_own_cpu": own_cpu,
             "allowed_cpus": len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else None,
             "visible_modules": os.environ.get("HABANA_VISIBLE_MODULES"),
+            "module": os.environ.get("HLS_MODULE_ID"),  # set_device writes the rank's module id there
         })
         if args.rank == 0 and args.dump_dir and not args.selftest and args.process == "lazy":
             emit({"case": "bridge_sources", "rank": 0, "found": dump_bridge_sources(args.dump_dir)})
