@@ -14,7 +14,7 @@ CPU states; only the first GDN layer runs, called directly under ``set_forward_c
 
 ``gdn_decode_rank`` drives the decode path (a prefill and 6 plain decode steps per mode),
 ``gdn_verify_rank`` the speculative verification path (a prefill, two verification steps on a
-lattice of length 4 and one plain step per mode).
+lattice of length ``1 + k`` and one plain step per mode, for each requested ``k``).
 """
 
 import os
@@ -35,11 +35,18 @@ OP_OF_MODE = {1: "gdn_core_decode", 2: "gdn_recurrent_decode"}  # GdnCoreDecodeM
 PREFILL_LEN = 12
 DECODE_STEPS = 6  # steps 0..4 load and store slot 1; step 5 loads slot 1 and stores slot 2
 
-VERIFY_K = 3  # draft tokens per verification step, so the lattice has T = 1 + VERIFY_K = 4 rows
-VERIFY_LATTICE = [1, 2, 3, 4]  # the 3-D load/store lattice of the verification steps (slots 1..4)
-VERIFY_ACCEPTED = (1, 3)  # num_accepted_tokens of verification steps A and B
-VERIFY_PLAIN = (3, 2)  # plain-step slot, accepted count
-VERIFY_SLOTS = 8
+VERIFY_K = 3  # the recipe's draft tokens per verification step: a lattice of T = 1 + VERIFY_K = 4 rows
+
+
+def verify_layout(k: int) -> dict:
+    """The verification sequence of ``gdn_verify_rank`` for ``k`` draft tokens per step.
+
+    ``lattice``: the 3-D load/store lattice of the verification steps (slots ``1 .. 1 + k``); ``accepted``:
+    ``num_accepted_tokens`` of verification steps A and B (B loads the last but one checkpoint, ``k``);
+    ``plain``: the plain step's slot and accepted count; ``slots``: rows of the state pools. ``k = 3``:
+    lattice ``[1, 2, 3, 4]``, accepted ``(1, 3)``, plain ``(3, 2)``, 8 slots.
+    """
+    return {"lattice": list(range(1, 2 + k)), "accepted": (1, k), "plain": (k, k - 1), "slots": k + 5}
 
 
 def gdn_decode_rank(rank: int, ckpt_dir: str, tp: int, modes: tuple[int, ...]) -> dict:
@@ -117,20 +124,21 @@ def gdn_decode_rank(rank: int, ckpt_dir: str, tp: int, modes: tuple[int, ...]) -
     return results
 
 
-def gdn_verify_rank(rank: int, ckpt_dir: str, tp: int, modes: tuple[int, ...]) -> dict:
+def gdn_verify_rank(rank: int, ckpt_dir: str, tp: int, modes: tuple[int, ...], ks: tuple[int, ...] = (VERIFY_K, )
+                    ) -> dict:
     """Run the first GDN layer of the tiny model sharded at ``tp`` through a prefill, two verification
-    steps and one plain step per mode.
+    steps and one plain step per mode, for each number of draft tokens in ``ks``.
 
-    For each mode (an int ``GdnCoreVerifyMode`` value): zero the layer's states (the conv pool is
-    rebound to ``3 + VERIFY_K`` rows, as an MTP pool is; ``bind_cpu_states`` without a speculative
-    config binds 3, which turns the op off), prefill rows 0..11 of the fixed hidden input into slot 1,
-    run verification step A on lattice ``VERIFY_LATTICE`` with ``num_accepted = VERIFY_ACCEPTED[0]``
-    (rows 12..15) and step B on the same lattice with ``num_accepted = VERIFY_ACCEPTED[1]``
-    (rows 16..19), then a plain step on slot ``VERIFY_PLAIN[0]`` with ``num_accepted =
-    VERIFY_PLAIN[1]`` (row 20). Returns ``{mode: {"rows": (9, 128) float32, "ssm": (4, 48 // tp, 16,
-    16) float32 for slots 1..4, "conv": (4, 6, C) float32 for slots 1..4, "calls": int, "ts":
-    list[int], "ok": bool | None}}``, where ``calls``/``ts`` count ``qwen3_5.gdn_core_verify`` calls
-    and their T values per mode; the op is restored before returning.
+    For each ``k`` (``layout = verify_layout(k)``, ``T = 1 + k``) and each mode (an int ``GdnCoreVerifyMode``
+    value): zero the layer's states (the conv pool is rebound to ``3 + k`` rows, as an MTP pool is;
+    ``bind_cpu_states`` without a speculative config binds 3, which turns the op off), prefill rows 0..11 of
+    the fixed hidden input into slot 1, run verification step A on ``layout["lattice"]`` with ``num_accepted
+    = layout["accepted"][0]`` (rows ``12 .. 12 + T``) and step B on the same lattice with ``num_accepted =
+    layout["accepted"][1]`` (the next ``T`` rows), then a plain step on slot ``layout["plain"][0]`` with
+    ``num_accepted = layout["plain"][1]`` (the row after them). Returns ``{k: {mode: {"rows": (2 T + 1, 128)
+    float32, "ssm": (T, 48 // tp, 16, 16) float32 for the lattice slots, "conv": (T, 3 + k, C) float32 for
+    the lattice slots, "calls": int, "ts": list[int], "ok": bool | None}}}``, where ``calls``/``ts`` count
+    ``qwen3_5.gdn_core_verify`` calls and their T values per mode; the op is restored before returning.
     """
     import numpy as np
     import torch
@@ -160,48 +168,53 @@ def gdn_verify_rank(rank: int, ckpt_dir: str, tp: int, modes: tuple[int, ...]) -
 
     qwen3_5.gdn_core_verify = counting
     out = {}
-    T = 1 + VERIFY_K
     with set_current_vllm_config(vc):
         model = get_model(vllm_config=vc)
         cm.to_fp32(model)
-        cm.bind_cpu_states(model, VERIFY_SLOTS, True)
+        cm.bind_cpu_states(model, max(verify_layout(k)["slots"] for k in ks), True)
         layer = [m for m in model.modules() if isinstance(m, HPUGatedDeltaNetAttention)][0]
         layer.cache_group_idx = torch.tensor(0, dtype=torch.long)  # the runner sets it for a 3-D lattice
         conv, ssm = layer.kv_cache
-        layer.kv_cache = (torch.zeros(VERIFY_SLOTS, 3 + VERIFY_K, conv.shape[-1]), ssm)
-        hidden = torch.randn(PREFILL_LEN + 2 * T + 1, 128, generator=torch.Generator().manual_seed(0))
-        lattice = torch.tensor([[VERIFY_LATTICE]], dtype=torch.int64)
-        for mode in modes:
-            for state in layer.kv_cache:
-                state.zero_()
-            layer.gdn_core_verify_mode = GdnCoreVerifyMode(mode)
-            layer._gdn_core_verify_ok = None
-            calls["n"], calls["ts"] = 0, []
-            rows = []
-            with torch.no_grad():
-                with set_forward_context(cm.prefill_metadata(PREFILL_LEN, 1), vc):
-                    layer(hidden[:PREFILL_LEN])
-                pos = PREFILL_LEN
-                for acc in VERIFY_ACCEPTED:
-                    md = cm.decode_metadata(VERIFY_LATTICE[0], pos, num_tokens=T)
-                    md.load_indices_tensor = lattice
-                    md.store_indices_tensor = lattice.clone()
-                    md.lattice_store_differs = False
-                    md.num_accepted_tokens = torch.tensor([acc], dtype=torch.int32)
+        for k in ks:
+            layout = verify_layout(k)
+            T = 1 + k
+            first, last = layout["lattice"][0], layout["lattice"][-1]
+            layer.kv_cache = (torch.zeros(ssm.shape[0], 3 + k, conv.shape[-1]), ssm)
+            hidden = torch.randn(PREFILL_LEN + 2 * T + 1, 128, generator=torch.Generator().manual_seed(0))
+            lattice = torch.tensor([[layout["lattice"]]], dtype=torch.int64)
+            out[int(k)] = {}
+            for mode in modes:
+                for state in layer.kv_cache:
+                    state.zero_()
+                layer.gdn_core_verify_mode = GdnCoreVerifyMode(mode)
+                layer._gdn_core_verify_ok = None
+                calls["n"], calls["ts"] = 0, []
+                rows = []
+                with torch.no_grad():
+                    with set_forward_context(cm.prefill_metadata(PREFILL_LEN, 1), vc):
+                        layer(hidden[:PREFILL_LEN])
+                    pos = PREFILL_LEN
+                    for acc in layout["accepted"]:
+                        md = cm.decode_metadata(first, pos, num_tokens=T)
+                        md.load_indices_tensor = lattice
+                        md.store_indices_tensor = lattice.clone()
+                        md.lattice_store_differs = False
+                        md.num_accepted_tokens = torch.tensor([acc], dtype=torch.int32)
+                        with set_forward_context(md, vc):
+                            rows.append(layer(hidden[pos:pos + T]).float().numpy())
+                        pos += T
+                    md = cm.decode_metadata(layout["plain"][0], pos)
+                    md.num_accepted_tokens = torch.tensor([layout["plain"][1]], dtype=torch.int32)
                     with set_forward_context(md, vc):
-                        rows.append(layer(hidden[pos:pos + T]).float().numpy())
-                    pos += T
-                md = cm.decode_metadata(VERIFY_PLAIN[0], pos)
-                md.num_accepted_tokens = torch.tensor([VERIFY_PLAIN[1]], dtype=torch.int32)
-                with set_forward_context(md, vc):
-                    rows.append(layer(hidden[pos:pos + 1]).float().numpy())
-            out[int(mode)] = {
-                "rows": np.concatenate(rows).astype(np.float32),
-                "ssm": layer.kv_cache[1][1:5].float().numpy().copy(),  # .numpy() of an fp32 pool is a view
-                "conv": layer.kv_cache[0][1:5].float().numpy().copy(),
-                "calls": calls["n"],
-                "ts": list(calls["ts"]),
-                "ok": layer._gdn_core_verify_ok,
-            }
+                        rows.append(layer(hidden[pos:pos + 1]).float().numpy())
+                out[int(k)][int(mode)] = {
+                    "rows": np.concatenate(rows).astype(np.float32),
+                    # .numpy() of an fp32 pool is a view
+                    "ssm": layer.kv_cache[1][first:last + 1].float().numpy().copy(),
+                    "conv": layer.kv_cache[0][first:last + 1].float().numpy().copy(),
+                    "calls": calls["n"],
+                    "ts": list(calls["ts"]),
+                    "ok": layer._gdn_core_verify_ok,
+                }
     qwen3_5.gdn_core_verify = real
     return out

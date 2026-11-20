@@ -245,6 +245,44 @@ def test_spec_rollback_matches_straight(ple):
 
 
 @torch.no_grad()
+def test_spec_every_accepted_count_at_every_size(ple, spec_k):
+    """Steps of ``1 + k`` rows on a state of ``state_len + k`` rows: every accepted count ``1 .. 1 + k``.
+
+    For each ``n``: step A runs ``n`` rows of the sequence followed by ``1 + k - n`` rejected rows, step B
+    reads the window ``n`` rows selects (``num_accepted = n``) and runs the next ``1 + k`` rows of the
+    sequence, a single-row step then reads the last window (``num_accepted = 1 + k``). Outputs and the
+    committed window equal the straight path over the sequence, which never saw the rejected rows.
+    """
+    t = 1 + spec_k
+    capacity = ple.state_len + spec_k
+    _, hidden, key, value = make_inputs(ple, 2 * t + 1 + t, seed=21)
+    _, normed = ple_gate_torch(**ple.gate_args(key[0], value[0], hidden[0]))
+    sequence, rejected = normed[:2 * t + 1], normed[2 * t + 1:]
+    conv_weight = ple.layer.conv1d.weight
+    torch.manual_seed(22)
+    init_state = torch.randn(ple.state_len, ple.channels)
+
+    for n in range(1, t + 1):
+        straight = sequence[:n + t + 1]
+        reference, reference_state = ple_short_conv_torch(straight, conv_weight, init_state, ple.dilation)
+        state = torch.zeros(1, capacity, ple.channels)
+        state[0, :ple.state_len] = init_state
+        step_a = torch.cat([sequence[:n], rejected[n:]], dim=0)
+        out_a, state = ple_short_conv_spec_torch(step_a.view(1, t, ple.channels), conv_weight, state,
+                                                 torch.tensor([1]), torch.tensor([t]), ple.dilation)
+        out_b, state = ple_short_conv_spec_torch(sequence[n:n + t].view(1, t, ple.channels), conv_weight, state,
+                                                 torch.tensor([n]), torch.tensor([t]), ple.dilation)
+        out_c, state = ple_short_conv_spec_torch(sequence[n + t:n + t + 1].view(1, 1, ple.channels), conv_weight,
+                                                 state, torch.tensor([t]), torch.tensor([1]), ple.dilation)
+        assert state.shape == (1, capacity, ple.channels)
+        torch.testing.assert_close(out_a[0, :n], reference[:n], **TOL, msg=f"k={spec_k} n={n}: accepted rows")
+        torch.testing.assert_close(out_b[0], reference[n:n + t], **TOL, msg=f"k={spec_k} n={n}: the next step")
+        torch.testing.assert_close(out_c[0], reference[n + t:], **TOL, msg=f"k={spec_k} n={n}: the single row")
+        torch.testing.assert_close(state[0, :ple.state_len], reference_state, **TOL,
+                                   msg=f"k={spec_k} n={n}: committed window")
+
+
+@torch.no_grad()
 def test_spec_ragged_rows(ple):
     """Per-request query_lens mask padded columns; an all-zero row keeps its state and outputs zeros."""
     rows, capacity = 3, 12

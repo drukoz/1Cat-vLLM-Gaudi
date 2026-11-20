@@ -12,8 +12,9 @@
    attention matters for): every row of every call is equal bit for bit between the two values of the flag,
    and the generated tokens are HF's;
 3. speculative decoding: the committed MTP and n-gram end-to-end flows (``test_mtp_end_to_end.py``,
-   ``test_ngram_end_to_end.py``: verification steps of ``1 + 3`` tokens, ragged rows, the ``-1`` placeholder of
-   an empty draft, a forced rejection) pass unchanged when every target forward gets its ids from the host.
+   ``test_ngram_end_to_end.py``: verification steps of ``1 + k`` tokens for k = 3, 4 and 5, every accepted
+   count, ragged rows, the ``-1`` placeholder of an empty draft, a forced rejection) pass unchanged when every
+   target forward gets its ids from the host. The same flows run with the flag 0 in their own files.
 
 With the flag 1 the model receives the ready ids as the ``ple_ngram_ids`` input (``hpu_bucket.runner_ple_kwargs``
 does what the runner does) and the device id computation, ``compute_ngram_ids``, must not run at all.
@@ -267,7 +268,8 @@ def runner_feeds_host_ids(monkeypatch):
 
 
 SPECULATIVE_FLOWS = [
-    mtp_flows.test_dense_fp32_greedy_stream_equals_reference,  # the drafter, 6 verification steps of 1 + 3 tokens
+    mtp_flows.test_dense_fp32_greedy_stream_equals_reference,  # the drafter, 6 verification steps of 1 + k tokens
+    mtp_flows.test_every_accepted_count_matches_the_plain_path,  # a rejection at each draft position, state parity
     mtp_flows.test_forced_rejection_rolls_back,
     ngram_flows.test_ngram_ragged_chain_dense,  # ragged rows and an empty draft
     ngram_flows.test_placeholder_draft_does_not_crash,
@@ -277,7 +279,8 @@ SPECULATIVE_FLOWS = [
 
 @pytest.mark.parametrize("flow", SPECULATIVE_FLOWS, ids=lambda flow: flow.__name__)
 def test_speculative_flows_pass_with_the_ids_from_the_host(tiny_checkpoint, runner_feeds_host_ids, device_id_calls,
-                                                           flow):
-    flow(tiny_checkpoint)
+                                                           flow, spec_k):
+    """Each flow at each speculative size (the flows take ``spec_k`` themselves; here the fixture supplies it)."""
+    flow(tiny_checkpoint, spec_k)
     assert len(runner_feeds_host_ids) >= 3, "the flow ran fewer target forwards than a prefill and two steps"
     assert not device_id_calls, f"the device id computation ran {len(device_id_calls)} times with the flag 1"

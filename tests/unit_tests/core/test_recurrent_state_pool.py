@@ -15,25 +15,34 @@ from vllm_gaudi.v1.core.recurrent_state_pool import (  # noqa: E402
     pool_mode_from_env, pool_pad_block_id, pool_slot_bytes, pool_slots_from_env, pool_tensor_slots,
     recurrent_positions, resolve_pool_slots)
 
+from tests.unit_tests.flash_next_spec_sizes import SPEC_SIZES, require_startup, size_id  # noqa: E402
+
 GDN_PAGE_BYTES = 3 * 1280 * 2 + 6 * 128 * 128 * 4  # bf16 state + fp32 state = 400896
 PLE_PAGE_BYTES = 9 * 10240 * 2  # bf16 short-conv state = 184320
+ATTN_PAGE_BYTES = 524288  # 512 tokens of one KV head pair at TP8 in bf16: the page every group is padded to
 
 
-def _flash_next_specs() -> dict[str, object]:
-    """The Flash-Next shape: 12 attention layers, 36 GDN layers, 1 PLE short-conv layer."""
+def _flash_next_specs(k: int = 0) -> dict[str, object]:
+    """The Flash-Next shape at TP8: 12 attention layers, 36 GDN layers, 1 PLE short-conv layer.
+
+    ``k`` speculative tokens add ``k`` rows to both conv states (upstream's ``conv_kernel - 1 + num_spec``) and
+    ``k`` scratch blocks per request to both recurrent specs.
+    """
     attn = FullAttentionSpec(block_size=512, num_kv_heads=1, head_size=256, dtype=torch.bfloat16)
     gdn = MambaSpec(block_size=512,
-                    shapes=((3, 1280), (6, 128, 128)),
+                    shapes=((3 + k, 1280), (6, 128, 128)),
                     dtypes=(torch.bfloat16, torch.float32),
                     mamba_type=MambaAttentionBackendEnum.GDN_ATTN,
                     mamba_cache_mode="align",
-                    page_size_padded=524288)
+                    page_size_padded=ATTN_PAGE_BYTES,
+                    num_speculative_blocks=k)
     ple = MambaSpec(block_size=512,
-                    shapes=((9, 10240), ),
+                    shapes=((9 + k, 10240), ),
                     dtypes=(torch.bfloat16, ),
                     mamba_type=MambaAttentionBackendEnum.SHORT_CONV,
                     mamba_cache_mode="align",
-                    page_size_padded=524288)
+                    page_size_padded=ATTN_PAGE_BYTES,
+                    num_speculative_blocks=k)
     specs: dict[str, object] = {}
     for i in range(48):
         specs[f"layers.{i}.attn"] = attn if i % 4 == 3 else gdn
@@ -100,6 +109,36 @@ def test_resolve_pool_slots_with_speculation():
     assert resolve_pool_slots(32, 4, 512, 3) == 32 * 4 * 6 + 512
     assert resolve_pool_slots(32, 4, 512, 3) == 1280
     assert resolve_pool_slots(1, 1, 0, 4) == LIVE_SLOTS_PER_REQUEST + 4
+
+
+@pytest.fixture(params=SPEC_SIZES, ids=size_id)
+def spec_k(request) -> int:
+    """Each speculative size k the Flash-Next tests run at, after flash_next_spec_sizes' startup check."""
+    require_startup(request.param, prefix_caching=True)
+    return request.param
+
+
+def test_pool_grows_with_the_speculative_size(spec_k):
+    """Slots and bytes per slot of the pool for 32 and 16 sequences with k speculative tokens (Flash-Next, TP8).
+
+    Slots: ``max_num_seqs * 4 groups * (3 + k) + 512``. Bytes per slot: 12 GDN positions of
+    ``(3 + k) * 1280 * 2 + 393216`` plus the PLE state ``(9 + k) * 10240 * 2``; both states still fit the
+    524288-byte page the attention block sets, so the scheduler block stays 512 tokens.
+    """
+    specs = _flash_next_specs(spec_k)
+    assert num_recurrent_groups(specs) == 4
+    gdn_bytes = (3 + spec_k) * 1280 * 2 + 6 * 128 * 128 * 4
+    ple_bytes = (9 + spec_k) * 10240 * 2
+    assert pool_slot_bytes(specs) == 12 * gdn_bytes + ple_bytes
+    assert max(gdn_bytes, ple_bytes) <= ATTN_PAGE_BYTES
+    expected = {3: (1280, 896, 5148672), 4: (1408, 960, 5199872), 5: (1536, 1024, 5251072)}[spec_k]
+    assert resolve_pool_slots(32, 4, 512, spec_k) == 32 * 4 * (LIVE_SLOTS_PER_REQUEST + spec_k) + 512 == expected[0]
+    assert resolve_pool_slots(16, 4, 512, spec_k) == expected[1]
+    assert pool_slot_bytes(specs) == expected[2]
+    assert pool_tensor_slots(expected[0]) == expected[0] + 2
+    # The k scratch blocks are per request and per group: every live request can hold its lattice at once.
+    live = (resolve_pool_slots(32, 4, 512, spec_k) - 512) // (32 * 4)
+    assert live - LIVE_SLOTS_PER_REQUEST == spec_k
 
 
 def test_is_recurrent_spec():

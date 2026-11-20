@@ -19,6 +19,13 @@ ring's scratch row and write no compressed row. ``test_write_before_score_mutati
 monkeypatches ``_select_decode`` with a copy that scores before writing and expects the chain
 parity of the first test to fail exactly on the row that completes a block inside the step.
 
+The tests above run the recipe's step (``T = 4``) on the 4-row ring of a model built without
+speculation. The ``*_at_every_size`` tests run ``T = 1 + k`` for every ``k`` of
+``flash_next_spec_sizes.SPEC_SIZES`` (3, 4, 5) on the ring the runner allocates for that ``k``
+(``ring_rows(4, k)``: 8, 8, 12 rows per slot), with a step whose FIRST row completes a block from
+ring rows written by earlier steps: write-then-score writes the step's last row ``k`` ring rows
+ahead before the first row reads three rows back, so the ring must hold ``k + 4`` positions.
+
 The end-to-end version (the model forward of a 4-token decode step, its logits against the chain)
 is here as ``test_whole_model_multi_token_step`` and is xfail: a whole-model lattice forward needs
 the PLE speculative path (``ple_layer.py`` raises ``NotImplementedError("PLE speculative decode
@@ -37,6 +44,7 @@ import torch  # noqa: E402
 from vllm.forward_context import set_forward_context  # noqa: E402
 
 from vllm_gaudi.models.qwen4_exp.qsa import HpuQsaIndexer, HpuQwen4ExpQSAAttention, QsaMode  # noqa: E402
+from vllm_gaudi.models.qwen4_exp.qsa_side_caches import allocate_side_caches  # noqa: E402
 from vllm_gaudi.models.qwen4_exp.qsa_sparse_ops import (  # noqa: E402
     compress_block_keys, compressed_row_slots, expand_selection, ring_block_rows, ring_write, select_blocks,
     visible_blocks)
@@ -101,20 +109,20 @@ def select_multi(layer, hidden, md) -> torch.Tensor:
     return layer.indexer.select(hidden, md.positions, cos_sin_at(layer), md)
 
 
-def select_chain(layer, hidden, slot: int, n: int) -> torch.Tensor:
-    """``n`` single-token decode selections over ``hidden[0:n]`` at positions ``POS0 .. POS0 + n``."""
+def select_chain(layer, hidden, slot: int, n: int, pos0: int = POS0) -> torch.Tensor:
+    """``n`` single-token decode selections over ``hidden[0:n]`` at positions ``pos0 .. pos0 + n``."""
     csa = cos_sin_at(layer)
     out = [
-        layer.indexer.select(hidden[j:j + 1], torch.tensor([POS0 + j]), csa,
-                             decode_metadata(slot, POS0 + j, load_slot=slot, store_slot=slot)) for j in range(n)
+        layer.indexer.select(hidden[j:j + 1], torch.tensor([pos0 + j]), csa,
+                             decode_metadata(slot, pos0 + j, load_slot=slot, store_slot=slot)) for j in range(n)
     ]
     return torch.cat(out)
 
 
-def lattice_md(slot: int, *, query_lens=None, slots=None, num_tokens: int = T):
+def lattice_md(slot: int, *, query_lens=None, slots=None, num_tokens: int = T, pos0: int = POS0):
     """The runner's padded multi-token decode metadata for ``slot`` (the lattice state indices)."""
     return decode_metadata(slot,
-                           POS0,
+                           pos0,
                            num_tokens=num_tokens,
                            query_lens=query_lens,
                            slots=slots,
@@ -406,6 +414,122 @@ def test_decode_write_has_fixed_shape(tiny_checkpoint):
         assert torch.equal(mid, mid_before), (
             "a compressed row of the prefill changed: the decode write must move the completing row's row "
             f"({COMP_SELF}) and the scratch row only")
+
+
+def bind_sized_ring(layer, k: int) -> int:
+    """Rebind the layer's key ring to the one the runner allocates for ``k`` speculative tokens; its rows per slot.
+
+    ``cpu_model`` without a speculative config binds the 4-row ring of a server without speculation; the runner
+    sizes it with ``allocate_side_caches(..., num_speculative_tokens)`` (``_allocate_flash_next_side_caches``).
+    """
+    comp, ring = side_caches(layer)
+    _, sized = allocate_side_caches(key_cache_rows=comp.shape[0] * RATIO,
+                                    gdn_state_rows=ring.shape[0],
+                                    compress_ratio=RATIO,
+                                    index_head_dim=ring.shape[2],
+                                    num_speculative_tokens=k,
+                                    device=ring.device,
+                                    dtype=ring.dtype)
+    layer.indexer.key_ring = sized
+    return int(sized.shape[1])
+
+
+LEAD = RATIO - 1  # single-token steps before the sized step: it then starts on the last position of block 16
+
+
+def test_block_completed_from_earlier_rows_at_every_size(tiny_checkpoint, monkeypatch, spec_k):
+    """A ``1 + k``-token step whose row 0 completes a block equals the single-token chain, on the ring sized for k.
+
+    After the 64-token prefill, three single-token steps write the raw keys of positions 64..66 into the
+    ring. The step then runs rows ``67 .. 67 + k``: its row 0 completes block 16 from those three ring rows,
+    and its other rows have already written ``k`` ring rows ahead (write-then-score). With ``block_topk``
+    16 the 17 blocks visible from position 67 are one over budget, so the selection of every row depends
+    on the scores of block 16's compressed key. Selection, ring and compressed rows must equal the chain of
+    ``3 + 1 + k`` single-token steps; the ring holds ``ring_rows(4, k) >= k + 4`` rows per slot.
+    """
+    t = 1 + spec_k
+    with cpu_model(tiny_checkpoint,
+                   fp32=True,
+                   max_model_len=SPARSE_MAX_MODEL_LEN,
+                   qsa_mode=QsaMode.SPARSE) as (vllm_config, model):
+        eos = eos_token_id(vllm_config)
+        layer = qsa_layer(model)
+        layer.indexer.ring_group_idx = torch.tensor(0, dtype=torch.long)
+        rows_per_slot = bind_sized_ring(layer, spec_k)
+        assert rows_per_slot >= spec_k + RATIO, f"ring of {rows_per_slot} rows for k = {spec_k}"
+        hidden = hidden_rows(layer, LEAD + t)
+        prefill_layer_64(model, vllm_config, eos)
+        monkeypatch.setattr(layer.indexer, "block_topk", SELF_BLOCK)  # after the prefill: it pads to output_width
+
+        snap = snapshot_state(model)
+        sel_chain = select_chain(layer, hidden, SLOT_A, LEAD + t)[LEAD:]
+        comp, ring = side_caches(layer)
+        chain_comp, chain_ring = comp.clone(), ring.clone()
+
+        restore_state(model, snap)
+        select_chain(layer, hidden, SLOT_A, LEAD)
+        sel_step = select_multi(layer, hidden[LEAD:], lattice_md(SLOT_A, num_tokens=t, pos0=POS0 + LEAD))
+        comp, ring = side_caches(layer)
+
+        assert sel_step.shape == sel_chain.shape and sel_step.shape[0] == t
+        differing = [row for row in range(t) if not torch.equal(sel_step[row], sel_chain[row])]
+        assert not differing, (f"rows {differing} of the {t}-token step at positions {POS0 + LEAD}.. select "
+                               f"differently from the single-token chain (ring of {rows_per_slot} rows)")
+        ring_gap = (ring[SLOT_A] - chain_ring[SLOT_A]).abs().max().item()
+        assert ring_gap <= ROW_TOL, f"key_ring after the {t}-token step vs the chain: max |delta| = {ring_gap:.3e}"
+        completed = range(SELF_BLOCK, (POS0 + LEAD + t) // RATIO)  # blocks 16 .. the last one the step completes
+        assert len(completed) == (LEAD + t) // RATIO
+        for block in completed:
+            gap = (comp[block] - chain_comp[block]).abs().max().item()
+            assert bool(comp[block].any()), f"the step left the compressed row of block {block} at zero"
+            assert gap <= ROW_TOL, (f"compressed row of block {block} after the {t}-token step vs the chain: "
+                                    f"max |delta| = {gap:.3e} (ring of {rows_per_slot} rows)")
+        untouched = (comp[:SELF_BLOCK] - chain_comp[:SELF_BLOCK]).abs().max().item()
+        assert untouched == 0.0, f"the step changed a compressed row of the prefill by {untouched:.3e}"
+
+
+def test_ragged_padding_rows_touch_no_state_at_every_size(tiny_checkpoint, spec_k):
+    """Two requests of ``1 + k`` and 2 real tokens in one padded step of ``2 (1 + k)`` rows, on the ring sized for k.
+
+    As ``test_ragged_padding_rows_touch_no_state``: both requests' rows select as their solo chains do, their
+    ring slots equal the chains', every block the long request completes has the chain's compressed row, the
+    ``k - 1`` padding rows of the short request are parked on the ring's scratch slot and the null slot stays zero.
+    """
+    t = 1 + spec_k
+    with cpu_model(tiny_checkpoint,
+                   fp32=True,
+                   max_model_len=SPARSE_MAX_MODEL_LEN,
+                   qsa_mode=QsaMode.SPARSE) as (vllm_config, model):
+        eos = eos_token_id(vllm_config)
+        layer = qsa_layer(model)
+        layer.indexer.ring_group_idx = torch.tensor(0, dtype=torch.long)
+        bind_sized_ring(layer, spec_k)
+        hidden = hidden_rows(layer, 2 * t)
+        prefill_layer_64(model, vllm_config, eos)
+
+        snap = snapshot_state(model)
+        sel_a = select_chain(layer, hidden, SLOT_A, t)
+        chain_comp_a = side_caches(layer)[0].clone()
+        chain_ring_a = side_caches(layer)[1].clone()
+        sel_b = select_chain(layer, hidden[t:], SLOT_B, 2)
+        chain_ring_b = side_caches(layer)[1].clone()
+
+        restore_state(model, snap)
+        md = lattice_md(SLOT_A, query_lens=[t, 2], slots=[SLOT_A, SLOT_B], num_tokens=t)
+        sel_pad = select_multi(layer, hidden, md)
+        pad_comp, pad_ring = side_caches(layer)
+
+        assert torch.equal(sel_pad[:t], sel_a), "the padded step's rows for request A differ from its solo chain"
+        assert torch.equal(sel_pad[t:t + 2], sel_b), "the padded step's rows for request B differ from its solo chain"
+        for slot, chain_ring in ((SLOT_A, chain_ring_a), (SLOT_B, chain_ring_b)):
+            gap = (pad_ring[slot] - chain_ring[slot]).abs().max().item()
+            assert bool(chain_ring[slot].any())
+            assert gap <= ROW_TOL, f"ring slot {slot} after the padded ragged step vs its solo chain: {gap:.3e}"
+        for block in range(SELF_BLOCK, (POS0 + t) // RATIO):
+            gap = (pad_comp[block] - chain_comp_a[block]).abs().max().item()
+            assert gap <= ROW_TOL, f"compressed row {block} after the padded ragged step vs A's chain: {gap:.3e}"
+        assert bool(pad_ring[SCRATCH_SLOT].any()), "the padding rows were not parked on the ring's scratch slot"
+        assert not bool(pad_ring[NULL_SLOT].any()), "a padding row wrote the null slot 0 of the ring"
 
 
 def test_single_token_decode_metadata_is_unchanged(tiny_checkpoint):

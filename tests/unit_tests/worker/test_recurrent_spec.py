@@ -12,6 +12,7 @@ import pytest
 import torch
 
 import vllm_gaudi.models.qwen4_exp.qsa as qsa_module
+from tests.unit_tests.flash_next_spec_sizes import SPEC_SIZES, require_startup, size_id
 from vllm_gaudi.v1.worker.recurrent_spec import (
     accepted_counts,
     load_checkpoint_offsets,
@@ -53,6 +54,28 @@ def test_state_slots_per_request(method_config):
     assert state_slots_per_request(_spec(0, method_config)) == 1
     assert state_slots_per_request(None) == 1
     assert state_slots_per_request(_MethodAgnosticConfig(3)) == 4
+
+
+@pytest.fixture(params=SPEC_SIZES, ids=size_id)
+def spec_k(request) -> int:
+    """Each speculative size k the Flash-Next tests run at, after flash_next_spec_sizes' startup check."""
+    require_startup(request.param)
+    return request.param
+
+
+def test_one_checkpoint_per_token_at_every_size(spec_k):
+    """k drafted tokens: 1 + k state slots per request, a lattice 1 + k wide, checkpoint offsets 0 .. k."""
+    t = 1 + spec_k
+    assert recurrent_spec_enabled(_MethodAgnosticConfig(spec_k))
+    assert state_slots_per_request(_MethodAgnosticConfig(spec_k)) == t
+    assert verification_state_width(t, True) == t
+    assert verification_state_width(t, False) == 1
+    full = {f"r{n}": n for n in range(1, t + 1)}  # every accepted count a step of k drafts can leave
+    counts = accepted_counts(list(full), full, t + 2)
+    assert counts == list(range(1, t + 1)) + [1, 1]
+    assert load_checkpoint_offsets(counts, False) == list(range(t)) + [0, 0]
+    assert max(load_checkpoint_offsets(counts, False)) == state_slots_per_request(_MethodAgnosticConfig(spec_k)) - 1
+    assert load_checkpoint_offsets(counts, True) is None
 
 
 def test_verification_state_width():

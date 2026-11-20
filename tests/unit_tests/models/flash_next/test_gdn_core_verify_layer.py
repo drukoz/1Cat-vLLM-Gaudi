@@ -12,6 +12,10 @@ and zeroing the op's output must break the row-0 logits parity. A layer whose op
 logs exactly one warning per GDN layer and runs the torch path; with the flag off the op is
 never called.
 
+Every test runs at each size of ``flash_next_spec_sizes.SPEC_SIZES`` (k = 3, 4, 5): the op must
+take the ``1 + k``-row lattice of each (``T`` = 4, 5 and 6, the op's maximum), not fall back to
+the torch path above the recipe's size.
+
 One ``cpu_model`` per test function, never nested; logits only from ``fp32_logits``.
 """
 
@@ -24,10 +28,12 @@ import torch  # noqa: E402
 
 import vllm_gaudi.models.qwen3_5 as qwen3_5  # noqa: E402
 
+from flashinfer_gaudi.gdn_core_verify import GDN_CORE_VERIFY_MAX_NODES  # noqa: E402
+from tests.unit_tests.flash_next_spec_sizes import SPEC_SIZES, require_startup  # noqa: E402
 from tests.unit_tests.models.flash_next.test_mtp_end_to_end import (  # noqa: E402
-    FP32_TOL, MUT_TOL, TAMPER, _chain, _dense_context, _load_prompt)
+    FP32_TOL, K, MUT_TOL, TAMPER, StepLayout, _chain, _dense_context, _load_prompt)
 from tests.unit_tests.models.flash_next.test_mtp_align_continuity import (  # noqa: E402
-    _SCENARIOS, _chain as _align_chain, _check)
+    _SCENARIOS, _chain as _align_chain, _check, _check_sized, _sized_chain)
 
 SSM_STORE_INDEX_ARG = 11  # gdn_core_verify(conv, ssm, qkv, z, a, b, A_log, dt_bias, weight, norm_w,
                           # row_indices, ssm_store_indices, ...)
@@ -71,38 +77,45 @@ class RecordingLogger:
         self.debugs.append(args)
 
 
-def _accept_path_step(tiny_checkpoint, steps: int, **chain_kwargs):
+def test_the_sizes_reach_the_largest_lattice_the_op_takes():
+    """The largest size the tests run is the op's limit: ``1 + k = GDN_CORE_VERIFY_MAX_NODES``."""
+    assert 1 + max(SPEC_SIZES) == GDN_CORE_VERIFY_MAX_NODES
+
+
+def _accept_path_step(tiny_checkpoint, steps: int, k: int = K, **chain_kwargs):
     """One dense M3 accept-path chain with the flag-independent plumbing; ``(chain result, gdn)``."""
+    lay = StepLayout(k)
     prompt = _load_prompt(tiny_checkpoint, 33)
     ids, gen = list(prompt["prompt_ids"]), list(prompt["generated_ids"])
-    ctx, *rest = _dense_context(tiny_checkpoint)
+    ctx, *rest = _dense_context(tiny_checkpoint, lay)
     try:
         args = (rest[0], rest[1], rest[2], rest[3], rest[4], rest[5], rest[6], rest[7])
-        out = _chain(*args, ids, gen, steps, **chain_kwargs)
+        out = _chain(*args, ids, gen, steps, lay=lay, **chain_kwargs)
     finally:
         ctx.__exit__(None, None, None)
     return out, len(rest[6])
 
 
-def test_accept_paths_run_the_verify_op(tiny_checkpoint, monkeypatch):
-    """The M3 accept-path chain with the flag on: parity, and every step ran the op with T = 4.
+def test_accept_paths_run_the_verify_op(tiny_checkpoint, monkeypatch, spec_k):
+    """The M3 accept-path chain with the flag on: parity, and every step ran the op with T = 1 + k.
 
     Same chain, acceptance and parity asserts as ``test_mtp_end_to_end.test_accept_paths_state_parity``
-    (a = 3, 1, 0, 2 with the tampered drafts); added here, the counting wrapper must have seen
-    ``gdn_core_verify`` calls, every one of them on the 4-row lattice, a whole number of layers.
+    (a = k, 1, 0, 2 with the tampered drafts); added here, the counting wrapper must have seen
+    ``gdn_core_verify`` calls, every one of them on the ``1 + k``-row lattice, a whole number of layers.
     """
     monkeypatch.setenv("VLLM_HPU_GDN_CORE_VERIFY", "1")
     spy = VerifyOpSpy(qwen3_5.gdn_core_verify)
     monkeypatch.setattr(qwen3_5, "gdn_core_verify", spy)
     (seq, accepts, gaps, log0, bonus), num_gdn = _accept_path_step(tiny_checkpoint,
                                                                    4,
+                                                                   spec_k,
                                                                    oracle_steps={0, 1, 3},
                                                                    tamper_steps={1: (1, TAMPER),
                                                                                  3: (2, TAMPER)})
     state_worst = [max(g) for g in gaps]
     print(f"MTP accept-path acceptance counts: {accepts}, state gaps {[f'{g:.3e}' for g in state_worst]}, "
           f"row-0 logits gaps {[f'{g:.3e}' for g in log0]}, bonus gaps {[f'{g:.3e}' for g in bonus]}")
-    assert accepts[0] == 3, f"the oracle step did not commit K drafts: {accepts}"
+    assert accepts[0] == spec_k, f"the oracle step did not commit K drafts: {accepts}"
     assert accepts[1] == 1, f"the tampered step did not commit exactly one draft: {accepts}"
     assert accepts[3] == 2, f"the second tampered step did not commit two drafts: {accepts}"
     stream = seq[len(_load_prompt(tiny_checkpoint, 33)["prompt_ids"]):]
@@ -114,8 +127,8 @@ def test_accept_paths_run_the_verify_op(tiny_checkpoint, monkeypatch):
         assert bonus[i] <= FP32_TOL, f"step {i} bonus logits diverge from the straight chain: {bonus[i]:.3e}"
     spy.log("accept-path chain")
     assert spy.calls > 0, "the verification steps never called gdn_core_verify"
-    assert all(t == 4 for t in spy.ts), f"a verification step ran the op with T != 4: {spy.ts}"
-    assert spy.calls % num_gdn == 0, f"{spy.calls} calls are not a multiple of the {num_gdn} GDN layers"
+    assert all(t == 1 + spec_k for t in spy.ts), f"a verification step ran the op with T != {1 + spec_k}: {spy.ts}"
+    assert spy.calls == 4 * num_gdn, f"{spy.calls} calls, expected one per step and GDN layer (4 x {num_gdn})"
 
 
 def test_align_plain_steps_run_the_verify_op(tiny_checkpoint, monkeypatch):
@@ -135,7 +148,25 @@ def test_align_plain_steps_run_the_verify_op(tiny_checkpoint, monkeypatch):
     assert 1 in spy.ts, f"no plain step after a verification (T = 1) ran the op: {spy.ts}"
 
 
-def test_zero_output_breaks_parity(tiny_checkpoint, monkeypatch):
+def test_align_plain_steps_run_the_verify_op_at_every_size(tiny_checkpoint, monkeypatch, spec_k):
+    """The verify, plain, verify, plain, verify align chain at each size: ``[1, 1 + k]`` and ``[1, 1]`` calls only.
+
+    Three verification steps and two plain steps, each through every GDN layer, and none of them on the
+    torch path: ``T = 6`` (k = 5) is the op's largest lattice.
+    """
+    require_startup(spec_k, prefix_caching=True)
+    monkeypatch.setenv("VLLM_HPU_GDN_CORE_VERIFY", "1")
+    spy = VerifyOpSpy(qwen3_5.gdn_core_verify)
+    monkeypatch.setattr(qwen3_5, "gdn_core_verify", spy)
+    scenario, label, records, final, reference = _sized_chain(tiny_checkpoint, "plain_between", spec_k, 4)
+    _check_sized(scenario, label, records, final, reference, 4)
+    spy.log(label)
+    assert set(spy.ts) == {1, 1 + spec_k}, f"the op ran lattices other than T = 1 and T = {1 + spec_k}: {spy.ts}"
+    # The plain reference stream and the straight chain decode without num_accepted: they never reach the op.
+    assert spy.ts.count(1 + spec_k) * 2 == spy.ts.count(1) * 3, f"not three verification steps per two plain: {spy.ts}"
+
+
+def test_zero_output_breaks_parity(tiny_checkpoint, monkeypatch, spec_k):
     """Negative control: zeroing the op's output moves the row-0 logits, so the chain uses its result.
 
     The states still update (the wrapper calls the real op and zeroes only the returned rows); with
@@ -149,7 +180,7 @@ def test_zero_output_breaks_parity(tiny_checkpoint, monkeypatch):
         return torch.zeros_like(real(*args, **kwargs))
 
     monkeypatch.setattr(qwen3_5, "gdn_core_verify", zeroing_op)
-    (seq, accepts, gaps, log0, bonus), _ = _accept_path_step(tiny_checkpoint, 1, oracle_steps={0})
+    (seq, accepts, gaps, log0, bonus), _ = _accept_path_step(tiny_checkpoint, 1, spec_k, oracle_steps={0})
     state_worst = [max(g) for g in gaps]
     print(f"zeroed verify output: accepts {accepts}, row-0 logits gap {log0[0]:.3e}, state gaps "
           f"{[f'{g:.3e}' for g in state_worst]}")
@@ -157,7 +188,7 @@ def test_zero_output_breaks_parity(tiny_checkpoint, monkeypatch):
                                "the layer ignores the op's output")
 
 
-def test_unavailable_op_falls_back_once(tiny_checkpoint, monkeypatch):
+def test_unavailable_op_falls_back_once(tiny_checkpoint, monkeypatch, spec_k):
     """``gdn_core_verify_available`` False: one warning per GDN layer, the torch path, parity intact."""
     monkeypatch.setenv("VLLM_HPU_GDN_CORE_VERIFY", "1")
     spy = VerifyOpSpy(qwen3_5.gdn_core_verify)
@@ -165,7 +196,7 @@ def test_unavailable_op_falls_back_once(tiny_checkpoint, monkeypatch):
     monkeypatch.setattr(qwen3_5, "gdn_core_verify_available", lambda device: False)
     log = RecordingLogger()
     monkeypatch.setattr(qwen3_5, "logger", log)
-    (seq, accepts, gaps, log0, bonus), num_gdn = _accept_path_step(tiny_checkpoint, 1, oracle_steps={0})
+    (seq, accepts, gaps, log0, bonus), num_gdn = _accept_path_step(tiny_checkpoint, 1, spec_k, oracle_steps={0})
     assert spy.calls == 0, "the fallback path called the verification op"
     # Only the verify hook's lines: the phase-1 decode hook logs its own (mode 1 on a 2-D lattice step).
     verify_warnings = [args for args in log.warnings if "GDN core verify" in args[0]]
@@ -180,11 +211,11 @@ def test_unavailable_op_falls_back_once(tiny_checkpoint, monkeypatch):
     assert worst <= FP32_TOL, f"the fallback step diverges from the straight chain: {worst:.3e}"
 
 
-def test_flag_off_keeps_the_torch_path(tiny_checkpoint, monkeypatch):
+def test_flag_off_keeps_the_torch_path(tiny_checkpoint, monkeypatch, spec_k):
     """With ``VLLM_HPU_GDN_CORE_VERIFY`` unset the layer never reaches the op: the M3 path is untouched."""
     monkeypatch.delenv("VLLM_HPU_GDN_CORE_VERIFY", raising=False)
     spy = VerifyOpSpy(qwen3_5.gdn_core_verify)
     monkeypatch.setattr(qwen3_5, "gdn_core_verify", spy)
-    (seq, accepts, gaps, log0, bonus), _ = _accept_path_step(tiny_checkpoint, 1, oracle_steps={0})
+    (seq, accepts, gaps, log0, bonus), _ = _accept_path_step(tiny_checkpoint, 1, spec_k, oracle_steps={0})
     print(f"flag off: accepts {accepts}, gdn_core_verify calls {spy.calls}")
     assert spy.calls == 0, f"the torch path called the verification op {spy.calls} times"

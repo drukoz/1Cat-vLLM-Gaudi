@@ -14,6 +14,7 @@ import math
 import pytest
 import torch
 
+import vllm_gaudi.models.qwen4_exp.qsa_sparse_ops as qsa_sparse_ops
 from vllm_gaudi.models.qwen4_exp.qsa_side_caches import (
     allocate_side_caches,
     attention_budget_fraction,
@@ -31,6 +32,25 @@ def test_ring_rows_tiny_and_real():
     for ratio in (2, 4, 8):
         for spec in (0, 1, 3, 5, 8):
             assert ring_rows(ratio, spec) == ratio * math.ceil((ratio + spec) / ratio)
+
+
+def test_ring_holds_a_whole_step_at_every_size(spec_k):
+    """k speculative tokens: the ring has 8, 8, 12 rows per slot for k = 3, 4, 5, and no two positions a step
+    holds at once share a row.
+
+    A verification step at position p writes the rows of p .. p + k and then reads those of p - 3 .. p - 1 (the
+    block its first token may complete), so k + 4 consecutive positions must map to distinct ``pos % rows``.
+    """
+    rows = ring_rows(4, spec_k)
+    assert rows == {3: 8, 4: 8, 5: 12}[spec_k]
+    assert rows == qsa_sparse_ops.ring_rows(4, spec_k), "the two copies of the formula disagree"
+    assert rows % 4 == 0 and rows >= spec_k + 4
+    for first in range(61, 61 + rows):
+        held = range(first, first + spec_k + 4)
+        assert len({position % rows for position in held}) == spec_k + 4
+    _, ring = allocate_side_caches(512, 8, 4, 128, spec_k, "cpu")
+    assert ring.shape == (8, rows, 128)
+    assert ring_bytes(13, 1538, rows, 128) == 13 * 1538 * rows * 128 * 2  # 12 target layers and the draft's
 
 
 def test_compressed_cache_shape_tiny_and_real():
