@@ -534,6 +534,7 @@ if TYPE_CHECKING:
     VLLM_HPU_GDN_CORE_VERIFY: int = 0  # GdnCoreVerifyMode: 0 off (default), 1 fused verification steps
     VLLM_HPU_SPEC_SAMPLED_VERIFY: int = 0  # 0 speculation serves greedy requests only (default), 1 also sampled
     VLLM_HPU_MTP_DRAFT_LOOP: int = 0  # 0 draft positions read back from the device (default), 1 host books
+    VLLM_HPU_MTP_DRAFT_IDS: int = 0  # 0 draft ids by argmax, int64 narrowed in the graph (default), 1 int32 ids
     VLLM_HPU_MTP_CHUNK_KV: int = 0  # 1 the MTP draft also runs over prefill chunks that complete no prompt
     VLLM_HPU_PLE_HOST_NGRAM_IDS: int = 0  # 0 PLE n-gram ids computed in the graph (default), 1 on the host
     VLLM_HPU_HC_FUSED: int = 0  # 0 torch hyper-connections (default), 1 the fused hyper-connection kernels
@@ -1905,6 +1906,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # metadata while the device runs draft step 0.
     "VLLM_HPU_MTP_DRAFT_LOOP":
     lambda: int(os.environ.get("VLLM_HPU_MTP_DRAFT_LOOP", "0")),
+
+    # The Flash-Next MTP draft's token ids. 0 (default) = ``logits.argmax`` (int64 ids), narrowed with ``.int()`` in
+    # the same lazy graph before they feed the next draft pass. 1 = int32 ids from an fp32 id table (the first index
+    # of the row maximum): no int64 id is made on the device. Card rule 9 (job 00038): ``torch.topk`` ids narrowed
+    # to int32 in the same lazy graph came back as every second id of the true table; whether ``argmax`` ids do the
+    # same is not measured yet (with it, draft positions 2 to k of every row but the first would be wrong).
+    "VLLM_HPU_MTP_DRAFT_IDS":
+    lambda: int(os.environ.get("VLLM_HPU_MTP_DRAFT_IDS", "0")),
 
     # The Flash-Next MTP draft over chunked prompts. 0 (default) = the draft runs only over the prefill chunk that
     # completes a prompt, so its attention layer holds no KV for the earlier chunks of a prompt above the chunk

@@ -433,6 +433,19 @@ class HpuQwen4ExpPLELayer(Qwen4ExpPLELayer):
         view.index_copy_(0, torch.where(valid, store, pad_row), new_state.to(device=view.device, dtype=view.dtype))
         return result
 
+    @staticmethod
+    def _widen_conv_state(new_state: torch.Tensor, view: torch.Tensor, store: torch.Tensor,
+                          state_len: int) -> torch.Tensor:
+        """Full-width rows for an expanded speculative state: ``new_state`` in rows ``[0, state_len)``, the
+        rest of every row as its store slot holds it now, so ``_save_conv_state`` writes whole rows of the
+        state tensor (no slice of it is written in place). A row with an invalid index reads the padding
+        row, which is the row it writes."""
+        store = store.reshape(-1).to(device=view.device, dtype=torch.long)
+        valid = (store >= 0) & (store < view.shape[0])
+        pad_row = torch.full_like(store, view.shape[0] - 1)
+        current = view.index_select(0, torch.where(valid, store, pad_row))
+        return torch.cat((new_state.to(device=view.device, dtype=view.dtype), current[:, state_len:, :]), dim=1)
+
     def _hpu_short_conv(self, gated: torch.Tensor, normed: torch.Tensor) -> torch.Tensor:
         """Add the dilated short convolution and persist the new state into the cache slots.
 
@@ -466,11 +479,14 @@ class HpuQwen4ExpPLELayer(Qwen4ExpPLELayer):
             return self._hpu_short_conv_spec(md, num_accepted, gated, normed, view)
 
         state_len = self.conv_state_len
-        if view.shape[1] > state_len:
-            # The fork's conv convention (hpu_causal_conv1d_fn): an expanded speculative
-            # state keeps its committed history in rows [0, state_len), so prefill and
-            # plain decode under a speculative config read and write the first rows.
-            view = view[:, :state_len, :]
+        # The fork's conv convention (hpu_causal_conv1d_fn): an expanded speculative state keeps its
+        # committed history in rows [0, state_len), so prefill and plain decode under a speculative
+        # config read and write the first rows. The state tensor itself is never sliced: an in-place
+        # write through a slice view of it (``view[:, :state_len].index_copy_``) is ``hpu::slice_insert``
+        # in the lazy graph, and an HPU graph cannot bind its output (card job 00021: "Neither storage
+        # attached to input tensor, not its view" at the first prompt of a speculative server). Rows are
+        # read whole and written whole (``_widen_conv_state``).
+        expanded = view.shape[1] > state_len
         num_slots = view.shape[0]
 
         load = self._state_indices(md, "load_indices_tensor")
@@ -488,6 +504,8 @@ class HpuQwen4ExpPLELayer(Qwen4ExpPLELayer):
 
         valid = (load >= 0) & (load < num_slots)
         init = view.index_select(0, torch.where(valid, load, torch.zeros_like(load)))
+        if expanded:
+            init = init[:, :state_len, :]
         init = torch.where(valid.view(rows, 1, 1), init, torch.zeros_like(init))
         if is_prompt:
             has_initial = getattr(md, "has_initial_states_p", None)
@@ -512,6 +530,8 @@ class HpuQwen4ExpPLELayer(Qwen4ExpPLELayer):
             lengths,
         )
         result = gated + out.reshape(tokens, self.hc_hidden_size)
+        if expanded:
+            new_state = self._widen_conv_state(new_state, view, store, state_len)
         # One fixed-shape in-place write; the helper returns ``result`` so the caller's graph
         # consumes the call (the convention of the GDN layer's ``_save_ssm_state``).
         return self._save_conv_state(result, new_state, view, store)

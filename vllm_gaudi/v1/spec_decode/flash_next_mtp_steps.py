@@ -206,3 +206,21 @@ class DraftRankStats:
                 f"rank1={self.counts[0]} rank2={self.counts[1]} rank3={self.counts[2]} "
                 f"rank4={self.counts[3]} beyond4={self.counts[4]} all_accepted={self.all_accepted}")
 
+def draft_argmax(logits: torch.Tensor) -> torch.Tensor:
+    """The draft's token ids ``[rows]`` from its logits ``[rows, vocab]``.
+
+    VLLM_HPU_MTP_DRAFT_IDS=0 (default): ``argmax`` (int64 ids; the draft loop narrows them with ``.int()`` in the
+    same lazy graph). 1: int32 ids from an fp32 id table, the first index of the row maximum as ``argmax`` gives it,
+    with no int64 id made on the device (card rule 9: ``torch.topk`` ids narrowed to int32 in the same lazy graph
+    came back as every second id; for ``argmax`` that is not measured). A row without a maximum (NaN) gets the last
+    id, never an id outside the vocabulary.
+    """
+    from vllm_gaudi import envs as gaudi_envs
+
+    if int(gaudi_envs.VLLM_HPU_MTP_DRAFT_IDS) != 1:
+        return logits.argmax(dim=-1)
+    vocab = logits.shape[-1]
+    ids = torch.arange(vocab, device=logits.device, dtype=torch.float32)
+    is_max = logits == logits.amax(dim=-1, keepdim=True)
+    first = torch.where(is_max, ids, torch.full_like(ids, float(vocab - 1))).amin(dim=-1)
+    return first.to(torch.int32)

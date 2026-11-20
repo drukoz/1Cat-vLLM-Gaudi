@@ -31,6 +31,7 @@ from vllm_gaudi.utils import async_h2d_copy
 from vllm_gaudi.v1.attention.backends.hpu_attn import HPUAttentionMetadataV1
 from vllm.model_executor.models.llama_eagle3 import Eagle3LlamaForCausalLM
 
+from vllm_gaudi.v1.spec_decode.flash_next_mtp_steps import draft_argmax
 from vllm_gaudi.v1.spec_decode.flash_next_mtp_steps import (DRAFT_RANK_TOP, DraftRankStats,
                                                              align_draft_rope_with_target, draft_rank_log_enabled,
                                                              flash_next_target_model_name, flat_token_rows,
@@ -128,7 +129,7 @@ class HpuFlashNextMtpProposer(HpuEagleProposer):
 
         # Early exit if there is only one draft token to be generated.
         if self.num_speculative_tokens == 1:
-            draft_token_ids = logits.argmax(dim=-1)
+            draft_token_ids = draft_argmax(logits)
             if self.draft_rank_stats is not None:
                 self.last_draft_top_ids = logits.topk(DRAFT_RANK_TOP, dim=-1).indices.unsqueeze(1)
             return draft_token_ids.view(-1, 1)
@@ -141,7 +142,7 @@ class HpuFlashNextMtpProposer(HpuEagleProposer):
         hidden_states = next_step_hidden(hidden_states, last_token_indices)
 
         # The first draft tokens
-        draft_token_ids = logits.argmax(dim=-1)
+        draft_token_ids = draft_argmax(logits)
         if self.draft_rank_stats is not None:
             draft_top_ids.append(logits.topk(DRAFT_RANK_TOP, dim=-1).indices)
         # Generate the remaining draft tokens.
@@ -199,7 +200,7 @@ class HpuFlashNextMtpProposer(HpuEagleProposer):
 
             hidden_states = hidden_states[:batch_size]
             logits = self.model.compute_logits(last_hidden_states[:batch_size])
-            draft_token_ids = logits.argmax(dim=-1)
+            draft_token_ids = draft_argmax(logits)
             if self.draft_rank_stats is not None:
                 draft_top_ids.append(logits.topk(DRAFT_RANK_TOP, dim=-1).indices)
             draft_token_ids_list.append(draft_token_ids)
