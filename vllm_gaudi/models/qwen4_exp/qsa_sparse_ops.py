@@ -149,9 +149,11 @@ def selection_mask(selected: torch.Tensor, num_columns: int) -> torch.Tensor:
     Scatters True into a ``[T, num_columns + 1]`` buffer with -1 entries
     redirected to the extra column, then drops it (HF's trick).
     """
-    buf = torch.zeros(selected.shape[0], num_columns + 1, dtype=torch.bool, device=selected.device)
+    # A float buffer and a numeric value: the Habana graph has no scatter overload for a bool value
+    # (see prefill_selection_bias in qsa_hpu_attention).
+    buf = torch.zeros(selected.shape[0], num_columns + 1, dtype=torch.float32, device=selected.device)
     idx = torch.where(selected >= 0, selected, torch.tensor(num_columns, dtype=torch.int32, device=selected.device))
-    return buf.scatter(-1, idx.to(torch.int64), True)[..., :num_columns]
+    return buf.scatter(-1, idx.to(torch.int64), 1.0)[..., :num_columns] > 0.5
 
 
 def compressed_row_slots(slot_mapping: torch.Tensor, compress_ratio: int) -> torch.Tensor:
