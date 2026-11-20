@@ -536,6 +536,7 @@ if TYPE_CHECKING:
     VLLM_HPU_PLE_HOST_NGRAM_IDS: int = 0  # 0 PLE n-gram ids computed in the graph (default), 1 on the host
     VLLM_HPU_HC_FUSED: int = 0  # 0 torch hyper-connections (default), 1 the fused hyper-connection kernels
     VLLM_HPU_MOE_GLUE: int = 0  # 0 torch MoE glue (default), 1 the fused MoE glue kernels
+    VLLM_HPU_MOE_GLUE_MERGE_GATE_UP: int = 0  # with VLLM_HPU_MOE_GLUE=1: 1 merges the shared gate_up GEMM into the gate GEMM
     VLLM_HPU_COLLECTIVE_MARK_STEP: int = 1  # 1 (default) mark_step() before every HPU collective, 0 none
     VLLM_HPU_RECURRENT_STATE_POOL: int = 0  # RecurrentStatePoolMode: 0 off, 1 pool
     VLLM_HPU_RECURRENT_STATE_POOL_SLOTS: int = 0  # resolved by the hook; positive overrides the formula
@@ -1926,6 +1927,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # docs/design/flash-next/hc-fused.md ("MoE glue kernels").
     "VLLM_HPU_MOE_GLUE":
     lambda: int(os.environ.get("VLLM_HPU_MOE_GLUE", "0")),
+
+    # With VLLM_HPU_MOE_GLUE=1 only: 1 adds the shared expert's gate_up rows to the block's merged gate
+    # weight (router rows, shared-gate row, then this rank's gate_up rows), so one GEMM gives the router
+    # logits, the shared-gate logit and the shared expert's gate_up output, and moe_silu_mul reads its block
+    # where it is (first_column = experts + 1). 0 (default) keeps the separate gate_up GEMM; any other value
+    # is 0. Read once per MoE block at construction. A block whose gate_up projection is not a plain bf16
+    # linear without bias logs one line and keeps the separate GEMM; the rest of the glue is unchanged.
+    "VLLM_HPU_MOE_GLUE_MERGE_GATE_UP":
+    lambda: int(os.environ.get("VLLM_HPU_MOE_GLUE_MERGE_GATE_UP", "0")),
 
     # The htorch.core.mark_step() that HpuCommunicator issues before every all-reduce and all-gather
     # (a workaround for a Habana bridge bug with PT_HPU_ENABLE_LAZY_COLLECTIVES). 1 (default) keeps it.

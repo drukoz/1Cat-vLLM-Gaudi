@@ -314,6 +314,8 @@ def _swigluoai_moe(
 #   gates  = linear(x, [router rows; shared-gate row])     one GEMM, the weight built at load
 #   ids, w = moe_route(gates)                              softmax, top-k, renormalization, casts
 #   act    = moe_silu_mul(gate_up(x))                      the shared expert's SiLU-multiply
+#            (VLLM_HPU_MOE_GLUE_MERGE_GATE_UP=1: gate_up's rows are in the merged weight too, and
+#             act = moe_silu_mul(gates, experts + 1) reads its block in the one GEMM output)
 #   x8, s  = moe_row_quant(x)                              FP8 experts: the per-row quantization
 #   routed = hpu.mixture_of_experts(...)                   unchanged
 #   out    = moe_combine(down(act), gates, routed)         sigmoid(gate) * shared + routed
@@ -321,7 +323,11 @@ def _swigluoai_moe(
 # With the flag at 0 (the default) none of this exists: no state object, no
 # merged weight, and patched_fused_moe_forward dispatches the ops it always did.
 _MOE_GLUE_BUFFER = "_hpu_moe_glue_gate_weight"
+# VLLM_HPU_MOE_GLUE_MERGE_GATE_UP=1: the router rows, the shared-gate row, then this rank's gate_up rows.
+_MOE_GLUE_GATE_UP_BUFFER = "_hpu_moe_glue_gate_up_weight"
 _MOE_GLUE_OFF_LINE = "MoE glue (VLLM_HPU_MOE_GLUE=1) is off for %s: %s; using the torch path"
+_MOE_GLUE_MERGE_OFF_LINE = ("MoE glue (VLLM_HPU_MOE_GLUE_MERGE_GATE_UP=1) keeps the separate gate_up GEMM for %s: "
+                            "%s")
 # The flags that send dynamic_quant (vllm_gaudi/extension/ops.py) down another branch than the one
 # moe_row_quant replaces.
 _MOE_GLUE_QUANT_FLAGS = ("VLLM_HPU_TP2_NATIVE_DYNAMIC_QUANT", "VLLM_HPU_FP8_JIT_DYNAMIC_QUANT",
@@ -346,6 +352,11 @@ class _MoeGlueState:
         self.top_k = 0
         self.fp8 = False
         self.fp8_max = 0.0
+        # The shared expert's gate_up GEMM merged into the gate GEMM: asked for once per block, here; the first
+        # column of the gate_up block in the merged output once the layer check accepted it (0: not merged).
+        self.merge_gate_up = gaudi_envs.VLLM_HPU_MOE_GLUE_MERGE_GATE_UP == 1
+        self.gate_up_first_column = 0
+        self.merge_prepare_error: str | None = None
 
     def runner(self):
         return self._runner()
@@ -401,6 +412,17 @@ def _moe_glue_prepare(layer) -> None:
         runner.register_buffer(_MOE_GLUE_BUFFER, merged, persistent=False)
     except Exception as exc:  # noqa: BLE001 - an optional fast path never stops a load
         state.prepare_error = f"{type(exc).__name__}: {exc}"
+        return
+    if state.merge_gate_up:
+        # The same rows, then the shared expert's gate_up rows of this rank (TP-sharded: each rank its own).
+        try:
+            gate_up = _moe_glue_shared_layer(runner).gate_up_proj
+            if not _moe_glue_plain_linear(gate_up):
+                raise ValueError("the shared expert's gate_up_proj is not a plain linear without bias")
+            merged_gate_up = torch.cat([merged, gate_up.weight.detach()], dim=0).contiguous()
+            runner.register_buffer(_MOE_GLUE_GATE_UP_BUFFER, merged_gate_up, persistent=False)
+        except Exception as exc:  # noqa: BLE001
+            state.merge_prepare_error = f"{type(exc).__name__}: {exc}"
 
 
 def _moe_glue_library_checked_device(device: torch.device) -> bool:
@@ -512,6 +534,27 @@ def _moe_glue_layer_reason(runner, device_type: str | None = None) -> str | None
     return None
 
 
+def _moe_glue_merge_reason(runner, ops) -> str | None:
+    """Why this block keeps the separate gate_up GEMM under VLLM_HPU_MOE_GLUE_MERGE_GATE_UP=1, or None.
+
+    Runs after the layer check passed. Reads the block and the schema, never a tensor's data."""
+    state = runner._hpu_moe_glue
+    merged = getattr(runner, _MOE_GLUE_GATE_UP_BUFFER, None)
+    if merged is None:
+        return "the merged gate_up weight was not built at load" + (
+            f" ({state.merge_prepare_error})" if state.merge_prepare_error else "")
+    experts, hidden = runner.gate.weight.shape
+    gate_up = _moe_glue_shared_layer(runner).gate_up_proj.weight
+    block = merged.shape[0] - (experts + 1)
+    if (merged.dtype != torch.bfloat16 or merged.dim() != 2 or merged.shape[1] != hidden or block < 2 or block % 2
+            or tuple(gate_up.shape) != (block, hidden)):
+        return (f"the merged gate_up weight is {merged.dtype} {tuple(merged.shape)}, not bfloat16 "
+                f"({experts + 1} + an even number of gate_up rows, {hidden})")
+    if "first_column" not in str(getattr(ops, "SCHEMAS", {}).get("moe_silu_mul", "")):
+        return "moe_silu_mul of this build has no first_column"
+    return None
+
+
 def _moe_glue_accept(state: _MoeGlueState, runner) -> None:
     """The layer check passed: keep what the calls need."""
     from flashinfer_gaudi import moe_glue as ops
@@ -521,6 +564,13 @@ def _moe_glue_accept(state: _MoeGlueState, runner) -> None:
     state.top_k = int(runner.routed_experts.top_k)
     state.fp8 = type(runner.routed_experts.quant_method).__dict__.get("_hpu_moe_glue_kind") == "fp8"
     state.fp8_max = float(hpu_ops.FP8_MAX)
+    state.gate_up_first_column = 0
+    if state.merge_gate_up:
+        reason = _moe_glue_merge_reason(runner, ops)
+        if reason is None:
+            state.gate_up_first_column = state.experts + 1
+        else:
+            logger.warning(_MOE_GLUE_MERGE_OFF_LINE, state.layer_name, reason)
     state.ok = True
 
 
@@ -581,15 +631,24 @@ def _moe_glue_forward(runner, state: _MoeGlueState, hidden_states, shared_expert
     merged = getattr(runner, _MOE_GLUE_BUFFER)
     hidden = merged.shape[1]
     try:
-        # One GEMM for the router logits (columns [0, experts)) and the shared-gate logit (column experts).
-        gates = torch.nn.functional.linear(hidden_states, merged)
-        _moe_glue_require(gates, "the merged gate output", state.experts + 1, merged.device)
         shared = _moe_glue_shared_layer(runner)
-        gate_up, _ = shared.gate_up_proj(shared_experts_input)
-        _moe_glue_require(gate_up, "the shared expert's gate_up output", None, merged.device)
-        if gate_up.shape[1] % 2 != 0:
-            raise _MoeGlueFallback("the shared expert's gate_up output has an odd number of columns")
-        shared_output, _ = shared.down_proj(ops.moe_silu_mul(gate_up))
+        if state.gate_up_first_column and shared_experts_input is hidden_states:
+            # One GEMM for the router logits (columns [0, experts)), the shared-gate logit (column experts) and
+            # the shared expert's gate_up output (the columns from experts + 1 on): moe_silu_mul reads it there.
+            merged_gate_up = getattr(runner, _MOE_GLUE_GATE_UP_BUFFER)
+            gates = torch.nn.functional.linear(hidden_states, merged_gate_up)
+            _moe_glue_require(gates, "the merged gate output", merged_gate_up.shape[0], merged.device)
+            act = ops.moe_silu_mul(gates, state.gate_up_first_column)
+        else:
+            # One GEMM for the router logits (columns [0, experts)) and the shared-gate logit (column experts).
+            gates = torch.nn.functional.linear(hidden_states, merged)
+            _moe_glue_require(gates, "the merged gate output", state.experts + 1, merged.device)
+            gate_up, _ = shared.gate_up_proj(shared_experts_input)
+            _moe_glue_require(gate_up, "the shared expert's gate_up output", None, merged.device)
+            if gate_up.shape[1] % 2 != 0:
+                raise _MoeGlueFallback("the shared expert's gate_up output has an odd number of columns")
+            act = ops.moe_silu_mul(gate_up)
+        shared_output, _ = shared.down_proj(act)
         _moe_glue_require(shared_output, "the shared expert's output", hidden, merged.device)
         routed = runner.routed_experts
         routed_output = routed.quant_method.apply_monolithic(layer=routed, x=hidden_states, router_logits=gates,

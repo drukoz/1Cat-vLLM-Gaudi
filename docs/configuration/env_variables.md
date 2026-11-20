@@ -159,6 +159,18 @@ leaves the choice open. With `0` nothing is loaded, registered or logged. The
 kernels pass the Gaudi2 instruction simulator and have not run on a card; see
 `docs/design/flash-next/hc-fused.md` ("MoE glue kernels").
 
+`VLLM_HPU_MOE_GLUE_MERGE_GATE_UP` (integer, default `0`) applies only with
+`VLLM_HPU_MOE_GLUE=1`. `1` appends the shared expert's gate_up rows of this
+rank to the block's merged gate weight (built once at load, a second
+non-persistent buffer), so one GEMM gives the router logits, the shared-gate
+logit and the shared expert's gate_up output, and `moe_silu_mul` reads the
+gate_up block in that output from column `experts + 1` on: one GEMM per MoE
+block less (48 per decode step on Flash-Next). `0` keeps the separate gate_up
+GEMM; any other value is `0`. A block whose gate_up projection is not a plain
+bfloat16 linear without bias logs one warning (`MoE glue
+(VLLM_HPU_MOE_GLUE_MERGE_GATE_UP=1) keeps the separate gate_up GEMM for
+<layer>: <reason>`) and runs the rest of the glue unchanged.
+
 `VLLM_HPU_RECURRENT_STATE_POOL` selects the allocation mode for the recurrent
 (GDN / short-conv) state slots as an integer. `0` (default) keeps today's
 allocation, one recurrent state slot per attention block id. `1` gives the

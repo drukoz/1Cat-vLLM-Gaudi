@@ -913,6 +913,30 @@ measurement once more after its last test, outside pytest's capture.
    `rent.sh --moe-glue` and `rent.sh --smoke-modes pytorch,fused,moe`.
    The tiny checkpoint has bf16 experts, so the smoke mode does not run `moe_row_quant`: the card test does.
 
+## Merged gate_up GEMM (`VLLM_HPU_MOE_GLUE_MERGE_GATE_UP`, 2026-11-20)
+
+With the glue on, a block's GEMMs are the merged gate GEMM, the shared expert's gate_up GEMM and its down GEMM. All
+three read `x` or its product, and the first two read the same `x`: with `VLLM_HPU_MOE_GLUE_MERGE_GATE_UP=1` the
+merged gate weight also carries this rank's gate_up rows (`[E + 1 + 2D, H]`: router rows, the shared-gate row, the
+gate rows, the up rows; at TP8 513 + 160 rows), built at load as a second non-persistent buffer
+(`_hpu_moe_glue_gate_up_weight`) next to the `[E + 1, H]` one. One GEMM then gives the router logits, the shared-gate
+logit and the gate_up output; `moe_route` reads columns `[0, E)`, `moe_combine` column `E`, and
+`moe_silu_mul(gates, E + 1)` its block from column `E + 1` on (the kernel's `first_column`, the `gate_column`
+scalar of the node parameters; simulator cases `silu_mul_merged_*`). One GEMM and its transposed-weight view per
+block less: 48 GEMMs per decode step on Flash-Next. The router and shared-gate rows are replicated, the gate_up rows
+are TP-sharded, so each rank's buffer differs in its last `2D` rows only and every rank still routes identically.
+
+A block whose gate_up projection is not a plain bf16 linear without bias, whose buffer is missing or of another
+shape, or whose op build has no `first_column`, logs once `MoE glue (VLLM_HPU_MOE_GLUE_MERGE_GATE_UP=1) keeps the
+separate gate_up GEMM for <layer>: <reason>` and runs the glue as without the flag. A call whose shared expert input
+is not the hidden states (a routed input transform) takes the separate GEMM too. Without `VLLM_HPU_MOE_GLUE=1` the
+flag does nothing. Memory: the second buffer, (E + 1 + 2D) x H bf16 per block (3.4 MB at TP8, 165 MB per card
+for 48 blocks), next to the first one.
+Tests (CPU, tiny model): `tests/unit_tests/models/flash_next/test_moe_glue_merge_gate_up.py` (bit-identical to
+the torch path at 1, 2, 32, 300 rows, bf16 and FP8 experts, two ops per block less, the buffer, what the ops get,
+every fallback with its line) and `test_moe_glue_tp.py::test_merged_gate_up_equals_flag_off_bit_for_bit_on_every_rank`
+(eight gloo ranks, TP8 with expert parallelism).
+
 ## Graph safety of the fused path
 
 No host read and no data-dependent shape: the ops take tensors and Python ints and floats from the configuration;
@@ -973,8 +997,8 @@ the SiLU and sigmoid comparisons passed. Items 5 and 6 are the two open ones, 8 
 - The ids stay int32 from the kernel and are widened by one cast; an int64 output was not tried.
 - `moe_route`, `moe_combine` and the merged gate GEMM are only used together; a block that fails one check runs
   the whole torch path.
-- The gate_up GEMM of the shared expert is not merged into the gate GEMM in the model yet. The kernel can read its block
-  inside the merged output (`first_column`, simulator cases `silu_mul_merged_*`); the block wiring is the next step.
+- The gate_up GEMM of the shared expert is merged into the gate GEMM only with `VLLM_HPU_MOE_GLUE_MERGE_GATE_UP=1`
+  (below, "Merged gate_up GEMM"); by default it stays its own GEMM.
 - 3-D inputs, non-bf16 dtypes, `gpt_oss`, grouped top-k, sequence-parallel and data-parallel MoE, block-FP8 experts
   (`VLLM_HPU_FORCE_CHANNEL_FP8=0`) and static input scales are left to the torch path.
 - The merged gate weight is built at load only; a block whose weights are post-processed by another expert method
