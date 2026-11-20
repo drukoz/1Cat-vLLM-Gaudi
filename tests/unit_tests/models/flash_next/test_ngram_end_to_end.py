@@ -15,8 +15,9 @@ model, which starts with the reference's ``generated_ids``) make acceptance dete
 every step's committed stream, logits and GDN/PLE state are compared with an interleaved
 single-token chain, as in ``test_accept_paths_state_parity``.
 
-Every test runs at each size of ``flash_next_spec_sizes.SPEC_SIZES`` (k = 3, 4, 5; the
-``spec_k`` fixture asks the platform's startup validator for the n-gram method first).
+Every test runs at each size of ``flash_next_spec_sizes.NGRAM_SPEC_SIZES`` (k = 3, 4, 5 and 8: n-gram lookup has no
+draft layer, so its server takes deeper drafts; ``_layout`` asks the platform's startup validator for the n-gram
+method first).
 
 The slot layout, tolerance and helpers are imported from ``test_mtp_end_to_end`` (see its
 module docstring for the lattice/window arithmetic); the sparse ring test additionally
@@ -37,14 +38,23 @@ from vllm.forward_context import set_forward_context  # noqa: E402
 
 from vllm_gaudi.models.qwen4_exp.qsa import QsaMode  # noqa: E402
 
-from tests.unit_tests.flash_next_spec_sizes import require_startup  # noqa: E402
+import pytest  # noqa: E402
+
+from tests.unit_tests.flash_next_spec_sizes import NGRAM_SPEC_SIZES, require_startup, size_id  # noqa: E402
 from tests.unit_tests.models.flash_next.cpu_model import (  # noqa: E402
     cpu_model, decode_metadata, eos_token_id, fp32_logits, ple_kwargs)
 from tests.unit_tests.models.flash_next.test_mtp_end_to_end import (  # noqa: E402
-    FP32_TOL, LONG_PROMPT, RECIPE, SPARSE_MAX_MODEL_LEN, SPEC_SLOT, TAMPER, StepLayout, _dense_context, _load_prompt,
-    _model_attns, _plain_reference, _set_group_idx, _spec_state_modules, _state_gaps, _straight_decode,
-    _target_prefill)
+    FP32_TOL, LONG_PROMPT, RECIPE, REFERENCE_TOKENS, SPARSE_MAX_MODEL_LEN, SPEC_SLOT, TAMPER, StepLayout,
+    _dense_context, _load_prompt, _model_attns, _plain_reference, _set_group_idx, _spec_state_modules, _state_gaps,
+    _straight_decode, _target_prefill)
 from tests.unit_tests.models.flash_next.test_mtp_parity import fp32_mtp_buffer  # noqa: E402
+
+
+@pytest.fixture(params=NGRAM_SPEC_SIZES, ids=size_id)
+def spec_k(request) -> int:
+    """The n-gram sizes (``NGRAM_SPEC_SIZES``: the MTP sizes and k = 8, a 9-row verification on the torch GDN path);
+    overrides the package's MTP-sized ``spec_k``. ``_layout`` asks the startup validator for the n-gram method."""
+    return request.param
 
 
 def _layout(k: int) -> StepLayout:
@@ -112,7 +122,9 @@ def _dense_ngram_chain(tiny_checkpoint, lengths, placeholder_steps=(), tamper_st
     ids, gen = list(prompt["prompt_ids"]), list(prompt["generated_ids"])
     ctx, model, _, vllm_config, eos, atts, _, gdn, ple = _dense_context(tiny_checkpoint, lay)
     try:
-        reference = _plain_reference(model, vllm_config, eos, ids, gen, atts, lay.straight_slot)
+        # long enough for every step's drafts plus its bonus token (k = 8 commits up to 46 tokens)
+        count = max(REFERENCE_TOKENS, sum(lengths) + len(lengths) + 1)
+        reference = _plain_reference(model, vllm_config, eos, ids, gen, atts, lay.straight_slot, count=count)
         out = _target_prefill(model, vllm_config, eos, ids, SPEC_SLOT, atts)
         seq = list(ids) + [int(fp32_logits(model, out[0])[-1].argmax())]
         p_last = len(seq) - 1

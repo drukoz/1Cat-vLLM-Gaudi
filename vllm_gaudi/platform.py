@@ -258,6 +258,15 @@ def _validate_hpu_dflash2_config(vllm_config: VllmConfig) -> None:
         raise ValueError("HPU DFlash2 requires prefix caching to be disabled")
 
 
+# The largest draft per step a Flash-Next server takes, by method. MTP: 4. k = 5 runs on CPU, but one 8-card server
+# of 32 sequences of 131072 tokens has no room for its recurrent state pool next to the draft layer's KV cache
+# (docs/design/flash-next/gdn-core-decode.md, "Sizes above the recipe"). n-gram lookup has no draft layer: k = 8 fits
+# that server by the same formulas (55.2 GiB of KV budget without speculation, plus 128 state slots of about 5.2 MB
+# per drafted token: 60.7 GiB of the 61.7 available), and the GDN verification of more than 6 rows runs the torch
+# recurrence (the fused verify op takes up to 6).
+FLASH_NEXT_MAX_SPECULATIVE_TOKENS = {"mtp": 4, "ngram": 8}
+
+
 def _validate_flash_next_speculative_config(vllm_config: VllmConfig) -> None:
     """Refuse the Flash-Next speculative configurations M3 cannot run correctly yet."""
     speculative_config = vllm_config.speculative_config
@@ -279,8 +288,10 @@ def _validate_flash_next_speculative_config(vllm_config: VllmConfig) -> None:
     if not prefix_caching and os.environ.get("VLLM_COMPACT_GDN", "1").strip().lower() not in ("1", "true"):
         raise ValueError("Flash-Next MTP needs compact GDN state for the per-token verification checkpoints: "
                          "unset VLLM_COMPACT_GDN or set it to 1")
-    if not 1 <= speculative_config.num_speculative_tokens <= 4:
-        raise ValueError("Flash-Next MTP on HPU runs 1 to 4 speculative tokens (the recipe is 3)")
+    limit = FLASH_NEXT_MAX_SPECULATIVE_TOKENS["ngram" if speculative_config.method == "ngram" else "mtp"]
+    if not 1 <= speculative_config.num_speculative_tokens <= limit:
+        what = "n-gram lookup" if speculative_config.method == "ngram" else "MTP"
+        raise ValueError(f"Flash-Next {what} on HPU runs 1 to {limit} speculative tokens (the recipe is 3)")
 
 
 class HpuPlatform(Platform):

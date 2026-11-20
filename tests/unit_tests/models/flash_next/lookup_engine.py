@@ -397,7 +397,8 @@ def run_config(LLM, SamplingParams, plan: dict, config: dict, base: dict) -> dic
         lookup_module.find_lookup_draft = oracle_find
         real_spec_merge = runner._spec_lookup.merge if runner._spec_lookup is not None else None
         if real_spec_merge is None:
-            raise RuntimeError("the lookup hook is not installed: VLLM_HPU_FLASH_NEXT_SPEC_LOOKUP did not reach the runner")
+            raise RuntimeError("the lookup hook is not installed: VLLM_HPU_FLASH_NEXT_SPEC_LOOKUP did not reach the "
+                               "runner")
 
         def merge_spy(mtp_drafts, req_ids, *args, **kwargs):
             drafts = real_spec_merge(mtp_drafts, req_ids, *args, **kwargs)

@@ -34,6 +34,7 @@ import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[4]
 K = 3
+DEEP_K = 8  # the n-gram server's largest draft (platform.FLASH_NEXT_MAX_SPECULATIVE_TOKENS)
 TIE = 0.0045  # nats: two bf16 steps of a logit near 0.3; a smaller top-2 gap can flip between batch shapes
 MIN_MATCHED = 200  # tokens over all requests of a configuration (13 requests of up to 48 tokens)
 MAX_TOKENS = 48
@@ -67,6 +68,10 @@ def _plan(ckpt: Path) -> dict:
         {"name": "ragged-nopc", "speculative_config": NGRAM, "prefix_caching": False, "oracle": oracle},
         {"name": "no-widen-pc", "speculative_config": NGRAM, "prefix_caching": True, "oracle": oracle,
          "mutations": ["no_widen"], "scenarios": ["solo-solo-1", "solo-solo-7", "solo-solo-33"]},
+        # depth: k = 8, a 9-row verification (the GDN verify past 6 rows is the torch recurrence)
+        {"name": "ragged-pc-k8", "speculative_config": dict(NGRAM, num_speculative_tokens=DEEP_K),
+         "prefix_caching": True, "oracle": {"schedule": [DEEP_K, 4, 0, 6, DEEP_K, 3, 7, 1, 5, 2], "tamper_every": 5},
+         "scenarios": ["solo-solo-1", "solo-solo-7", "solo-solo-33", "near-256", "batch", "turn-2"]},
     ]
     return {"ckpt": str(ckpt), "tie": TIE, "max_model_len": 4096, "max_num_seqs": 4, "scenarios": scenarios,
             "configs": configs}
@@ -176,6 +181,19 @@ def test_ragged_oracle_drafts_without_prefix_caching(engine_run):
     assert not record["prefix_caching"]
     compared = _compare(engine_run, "ragged-nopc")
     print(f"ragged-nopc: {compared} tokens compared")
+
+
+def test_deep_ngram_drafts_with_prefix_caching(engine_run):
+    """k = 8: every accepted count 0..8 runs, steps are widened, and the streams stay lossless (9-row verifications
+    through the torch GDN recurrence, the 12-row QSA key ring, the 17-row PLE short-conv state)."""
+    record = engine_run["configs"]["ragged-pc-k8"]
+    accepted = {len(s["sampled"]) - 1 for s in record["steps"] if s["step"] > 0}
+    assert set(range(DEEP_K + 1)) <= accepted, f"not every accepted count 0..{DEEP_K} ran: {sorted(accepted)}"
+    widened = [w for w in record["widths"] if w["width"] > max(w["scheduled"])]
+    assert widened and max(w["width"] for w in record["widths"]) == 1 + DEEP_K
+    matched, ties, breaks = _divergences(engine_run, "ragged-pc-k8")
+    assert not breaks, f"ragged-pc-k8 breaks away from a near-tie: {breaks}"
+    print(f"ragged-pc-k8: {matched} tokens matched, {len(widened)} widened steps, ties {ties}")
 
 
 def test_tampered_drafts_were_rejected(engine_run):
