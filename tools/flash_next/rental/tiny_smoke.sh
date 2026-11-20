@@ -53,7 +53,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 usage() {
     echo "usage: $(basename "${BASH_SOURCE[0]}") [options]"
-    echo "  --gdn LIST      GDN modes to serve, in order (default: pytorch,fused); the third mode, hc, is fused plus the fused hyper-connection kernels (VLLM_HPU_HC_FUSED=1) and runs only when named: --gdn hc; the fourth, moe, is fused plus the MoE glue kernels (VLLM_HPU_MOE_GLUE=1) and runs only when named: --gdn moe"
+    echo "  --gdn LIST      GDN modes to serve, in order (default: pytorch,fused); the third mode, hc, is fused plus the fused hyper-connection kernels (VLLM_HPU_HC_FUSED=1) and runs only when named: --gdn hc; the fourth, moe, is fused plus the MoE glue kernels (VLLM_HPU_MOE_GLUE=1) and runs only when named: --gdn moe; the fifth, qsa, is fused plus the fused QSA decode kernels (VLLM_HPU_QSA_FUSED=2, sharded indexer): --gdn qsa"
     echo "  --results DIR   results directory on the host (default: ./results); fixed once the container exists"
     echo "  --run-id ID     folder name under the results directory (default: smoke-<UTC timestamp>)"
     echo "  --image IMG     container image (default: $DEFAULT_IMAGE)"

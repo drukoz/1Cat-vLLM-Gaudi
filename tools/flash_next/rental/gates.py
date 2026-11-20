@@ -807,11 +807,42 @@ def moe_glue(plugin_root: Path, out_dir: Path, python: str = sys.executable, ski
                              MOE_OP_TIMEOUT_S, MOE_NOT_INSTALLED)
 
 
+# The fused QSA decode kernels (docs/design/flash-next/qsa-fused.md): their own library and op extension, the
+# same card-test step as the hyper-connection kernels'. `run_rental.sh --qsa-fused` asks for them.
+QSA_FUSED_ENV = "VLLM_HPU_QSA_FUSED"
+QSA_SHARD_ENV = "VLLM_HPU_QSA_INDEXER_SHARD"
+QSA_OP_TEST = "tests/unit_tests/qsa_fused/test_hpu_op.py"
+QSA_OP_LOG = "qsa_hpu_op.log"
+QSA_OP_TIMEOUT_S = 900.0
+QSA_KERNEL_LIB = "libqsa_fused_gaudi2.so"
+QSA_OPS_GLOB = "qsa_fused_ops*.so"
+QSA_KERNEL_LIBRARY_ENV = "QSA_FUSED_GAUDI_KERNEL_LIBRARY"
+QSA_NATIVE_LIBRARY_ENV = "QSA_FUSED_GAUDI_NATIVE_LIBRARY"
+QSA_NOT_INSTALLED = "the fused QSA library is not installed: "
+
+
+def qsa_fused(plugin_root: Path, out_dir: Path, python: str = sys.executable, skip: str = None,
+              combined_db_off: bool = False) -> dict:
+    """The fused QSA kernels' card test (QSA_OP_TEST), run by the orchestrator after the hyper-connection and
+    MoE glue tests and recorded as G1b's details["qsa_fused"]. The step, the statuses and the keys of
+    `hc_fused`, with the QSA library and extension (QSA_KERNEL_LIB, QSA_OPS_GLOB, found through
+    QSA_FUSED_GAUDI_KERNEL_LIBRARY and QSA_FUSED_GAUDI_NATIVE_LIBRARY). Recorded only: the orchestrator gives the
+    servers VLLM_HPU_QSA_FUSED=2 only when the operator asked and this passed. Never raises."""
+    return _kernel_card_test(plugin_root, out_dir, python, skip, combined_db_off, QSA_OP_TEST, QSA_OP_LOG,
+                             QSA_OP_TIMEOUT_S, QSA_NOT_INSTALLED, kernel_lib=QSA_KERNEL_LIB, ops_glob=QSA_OPS_GLOB,
+                             kernel_env=QSA_KERNEL_LIBRARY_ENV, native_env=QSA_NATIVE_LIBRARY_ENV,
+                             flags=(QSA_FUSED_ENV, QSA_SHARD_ENV))
+
+
 def _kernel_card_test(plugin_root: Path, out_dir: Path, python: str, skip: str, combined_db_off: bool, op_test: str,
-                      op_log: str, timeout_s: float, not_installed: str) -> dict:
-    """One card test of the kernels in the fused hyper-connection library: what `hc_fused` and `moe_glue`
+                      op_log: str, timeout_s: float, not_installed: str, kernel_lib: str = HC_KERNEL_LIB,
+                      ops_glob: str = HC_OPS_GLOB, kernel_env: str = HC_KERNEL_LIBRARY_ENV,
+                      native_env: str = HC_NATIVE_LIBRARY_ENV, flags: tuple = (HC_FUSED_ENV, MOE_GLUE_ENV)) -> dict:
+    """One card test of the kernels in a fused kernel library: what `hc_fused`, `moe_glue` and `qsa_fused`
     do, for the test file `op_test`, the log `op_log`, the limit `timeout_s` and the words `not_installed`
-    that open the reason when the library is missing. Neither plugin flag reaches the test. Never raises."""
+    that open the reason when the library is missing; `kernel_lib`, `ops_glob`, `kernel_env` and `native_env`
+    name the library (the hyper-connection one by default) and `flags` the plugin flags kept from the test.
+    Never raises."""
     started = time.monotonic()
     test_name = Path(op_test).name
     result: dict = {"status": HC_NOT_RUN, "reason": "", "hpu_op": None}
@@ -833,24 +864,24 @@ def _kernel_card_test(plugin_root: Path, out_dir: Path, python: str, skip: str, 
                           (lookup.returncode, (lookup.stderr or "").strip()[:200]))
             return result
         lib_dir = Path(_last_line(lookup.stdout))
-        kernel = lib_dir / HC_KERNEL_LIB
-        ops_files = sorted(lib_dir.glob(HC_OPS_GLOB))
+        kernel = lib_dir / kernel_lib
+        ops_files = sorted(lib_dir.glob(ops_glob))
         if not kernel.is_file():
-            result.update(status=HC_SKIPPED, reason=not_installed + "%s missing in %s" % (HC_KERNEL_LIB, lib_dir))
+            result.update(status=HC_SKIPPED, reason=not_installed + "%s missing in %s" % (kernel_lib, lib_dir))
             return result
         if len(ops_files) != 1:
             result.update(status=HC_SKIPPED, reason=not_installed + "%d %s files in %s, expected 1" %
-                          (len(ops_files), HC_OPS_GLOB, lib_dir))
+                          (len(ops_files), ops_glob, lib_dir))
             return result
 
         env = dict(os.environ)
         env["PYTHONPATH"] = str(plugin_root)
-        env[HC_KERNEL_LIBRARY_ENV] = str(kernel)
-        env[HC_NATIVE_LIBRARY_ENV] = str(ops_files[0])
+        env[kernel_env] = str(kernel)
+        env[native_env] = str(ops_files[0])
         if (lib_dir / GDN_KERNEL_LIB).is_file():
             env["GDN_FUSED_GAUDI_KERNEL_LIBRARY"] = str(lib_dir / GDN_KERNEL_LIB)
         env[GDN_LAZY_ENV] = "1"  # the bridge mode of every server
-        for flag in (HC_FUSED_ENV, MOE_GLUE_ENV):  # the test loads the kernels itself
+        for flag in flags:  # the test loads the kernels itself
             env.pop(flag, None)
         env.pop(serve.RECIPE_CACHE_ENV, None)  # a recipe cache would block the colon-list registration
         if combined_db_off:

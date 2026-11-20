@@ -235,9 +235,10 @@ def _load_qsa_fused_if_requested(flag: int, warn=None) -> bool | None:
     loaded = load_qsa_fused_extension()
     if not loaded and _hpu_visible():
         reason = "; ".join(qsa_fused_extension_errors()) or "no error recorded"
-        message = (f"QSA fused (VLLM_HPU_QSA_FUSED={int(flag)}) has no HPU kernel: the qsa_fused_ops extension did "
-                   f"not load ({reason}); the QSA layers run the torch data flow of mode 1. Build it with "
-                   "tools/build_flashinfer_gaudi.py --qsa-fused-only, or set VLLM_HPU_QSA_FUSED=1.")
+        # Not "has no HPU kernel": the rental's GDN fallback scan (gates.GDN_FALLBACK_RE) counts those lines.
+        message = (f"QSA fused (VLLM_HPU_QSA_FUSED={int(flag)}): the kernels are not loaded, the qsa_fused_ops "
+                   f"extension did not load ({reason}); the QSA layers run the torch data flow of mode 1. Build "
+                   "it with tools/build_flashinfer_gaudi.py --qsa-fused-only, or set VLLM_HPU_QSA_FUSED=1.")
         if warn is None:
             from vllm.logger import init_logger
 

@@ -68,8 +68,14 @@ GDN_MODES["hc"] = dict(GDN_MODES["fused"], **{gates.HC_FUSED_ENV: "1"})
 # `moe`: the fused mode plus the MoE glue kernels (the same library as the hyper-connection kernels, its
 # own flag). Not a default mode either: the two default modes are the ones the run's gates depend on.
 GDN_MODES["moe"] = dict(GDN_MODES["fused"], **{gates.MOE_GLUE_ENV: "1"})
+# `qsa`: the fused mode plus the fused QSA decode path with its kernels and the request-sharded indexer
+# (VLLM_HPU_QSA_FUSED=2, VLLM_HPU_QSA_INDEXER_SHARD=1). Not a default mode.
+GDN_MODES["qsa"] = dict(GDN_MODES["fused"], **{gates.QSA_FUSED_ENV: "2", gates.QSA_SHARD_ENV: "1"})
 DEFAULT_MODES = "pytorch,fused"
-DECODE_KERNEL_MODES = ("fused", "hc", "moe")  # fail when a GDN layer ran the torch decode path
+QSA_KERNEL_MODES = ("qsa", )  # fail when a QSA layer ran without the kernels
+QSA_FALLBACK_MARKERS = ("QSA fused (VLLM_HPU_QSA_FUSED=2) is off for",
+                        "QSA fused (VLLM_HPU_QSA_FUSED=2): the kernels are not loaded")
+DECODE_KERNEL_MODES = ("fused", "hc", "moe", "qsa")  # fail when a GDN layer ran the torch decode path
 HC_KERNEL_MODES = ("hc", )  # fail when a hyper-connection ran the torch path
 MOE_KERNEL_MODES = ("moe", )  # fail when a MoE block ran the torch path
 HEALTH_TIMEOUT_S = 1800.0
@@ -214,6 +220,13 @@ def run_mode(mode: str, ckpt: Path, out_dir: Path, port: int, health_timeout_s: 
                 entry["reason"] = ("the MoE glue kernels did not run: %d log line(s) say a layer used the torch "
                                    "path" % len(fallback))
                 entry["fallback_lines"] = fallback[:MAX_LINES]
+        if status is GateStatus.PASSED and mode in QSA_KERNEL_MODES:
+            fallback = [ln for ln in log_text.splitlines() if any(m in ln for m in QSA_FALLBACK_MARKERS)]
+            if fallback:
+                status = GateStatus.FAILED
+                entry["reason"] = ("the fused QSA kernels did not run: %d log line(s) say a layer used the torch "
+                                   "data flow" % len(fallback))
+                entry["fallback_lines"] = fallback[:MAX_LINES]
         if status is not GateStatus.PASSED:
             entry["errors"] = error_lines(log_text)
     entry["status"] = status.name.lower()
@@ -254,7 +267,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--gdn", default=DEFAULT_MODES,
                         help="comma-separated modes: pytorch, fused, hc, moe (default: %(default)s; hc is fused "
                         "plus the fused hyper-connection kernels, VLLM_HPU_HC_FUSED=1; moe is fused plus the MoE "
-                        "glue kernels, VLLM_HPU_MOE_GLUE=1)")
+                        "glue kernels, VLLM_HPU_MOE_GLUE=1; qsa is fused plus the fused QSA decode kernels, "
+                        "VLLM_HPU_QSA_FUSED=2 with the request-sharded indexer)")
     parser.add_argument("--port", type=int, default=orchestrator.TINY_PORT)
     parser.add_argument("--health-timeout", type=float, default=HEALTH_TIMEOUT_S, metavar="S")
     parser.add_argument("--full-warmup", action="store_true",
