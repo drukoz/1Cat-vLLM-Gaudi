@@ -166,6 +166,109 @@ def test_failures_are_recorded(tmp_path, monkeypatch):
     assert len(result["failed_tests"]) == 2 and result["failed_tests"][0].startswith("FAILED ")
 
 
+# What `pytest -q -rs` printed on the card on 2026-11-20 (cut to two of the six failures, lines unchanged): no
+# "FAILED ..." line anywhere, and a bridge banner in the captured stderr that looks like a pytest section header.
+CARD_FAILURE_OUT = r"""
+.F...................................................................... [ 80%]
+..........F.FFF..F                                                       [100%]
+=================================== FAILURES ===================================
+_________________ test_hpu_op_matches_reference[norm_tiny_r1] __________________
+
+case = HcCase(name='norm_tiny_r1', kind='norm', hidden=128, rows=1, hc=4, lora=16, pad=12, shared_weight=False, flavor='random', seed=1, eps=1e-06, exact=False)
+
+>       got = {name: tensor.cpu() for name, tensor in _run(case, hpu).items()}
+
+tests/unit_tests/hc_fused/test_hpu_op.py:47: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+>   got = {name: tensor.cpu() for name, tensor in _run(case, hpu).items()}
+E   RuntimeError: Empty tensor optional Uniqueid: 3 Strided Params Has Value: 0 Failing Graph: IR {
+E      %id_24_prim__constant Unique ID:0 = n6_prim::constant{} , value=4
+E      %id_22_prim__constant Unique ID:0 = n5_prim::constant{} , value=9.9999999999999995e-07
+E      %id_12_hpu__input Unique ID:2 = n3_hpu::input{} 
+E      %id_20_hpu__input Unique ID:3 = n4_hpu::input{} 
+E      %id_17_flashinfer_gaudi__hc_norm Unique ID:4 = n7_flashinfer_gaudi::hc_norm{id_20_hpu__input Uniqueid: 3 id_12_hpu__input Uniqueid: 2 id_22_prim__constant id_24_prim__constant } , ROOT=0
+E      %id_27_prim__constant Unique ID:0 = n8_prim::constant{} , value=0
+E      %id_5_hpu__input Unique ID:1 = n1_hpu::input{} 
+E      %id_20_aten__clone Unique ID:3 = n9_aten::clone{id_5_hpu__input Uniqueid: 1 id_27_prim__constant } , ROOT=1
+E   }
+
+tests/unit_tests/hc_fused/test_hpu_op.py:47: RuntimeError
+----------------------------- Captured stderr call -----------------------------
+============================= HPU PT BRIDGE CONFIGURATION ON RANK = 0 ============= 
+ PT_HPU_LAZY_MODE = 1
+ PT_HPU_LAZY_ACC_PAR_MODE = 1
+---------------------------: System Configuration :---------------------------
+Num CPU Cores : 152
+------------------------------------------------------------------------------
+____________________ test_hpu_chain_of_one_hyper_connection ____________________
+
+    def test_hpu_chain_of_one_hyper_connection():
+>       fused_hpu = chain("hpu", True)
+
+tests/unit_tests/hc_fused/test_hpu_op.py:127: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/unit_tests/hc_fused/test_hpu_op.py:124: in chain
+    return [t.cpu().float() for t in (out, block_input, inj_out, out2)]
+E   AssertionError: something else
+
+tests/unit_tests/hc_fused/test_hpu_op.py:124: AssertionError
+=============================== warnings summary ===============================
+../../usr/local/lib/python3.10/dist-packages/torch/jit/_script.py:365: 14 warnings
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+2 failed, 88 passed, 14 warnings in 120.42s (0:02:00)"""
+
+
+def test_failed_tests_are_named_from_the_failure_headers(tmp_path, monkeypatch):
+    """`pytest -q -rs` prints no "FAILED ..." line, so the card run of 2026-11-20 recorded `failed_tests: []`
+    next to `failed: 6`. The names are in the headers of the FAILURES section."""
+    lib = make_lib(tmp_path)
+    fake, plugin, _ = setup(tmp_path, monkeypatch, lib=lib, pytest_out=CARD_FAILURE_OUT, pytest_exit=1)
+
+    result = gates.hc_fused(plugin, tmp_path / "g1b", python=fake)
+
+    assert result["hpu_op"]["failed"] == 2
+    assert result["failed_tests"] == ["FAILED test_hpu_op_matches_reference[norm_tiny_r1]",
+                                      "FAILED test_hpu_chain_of_one_hyper_connection"]
+
+
+def test_failed_test_names_from_either_form_of_pytest_output():
+    """The helper the GDN op tests of G1b use too."""
+    summary_lines = "x\nFAILED tests/a.py::test_one - boom\n____ test_one ____\n1 failed in 1s"
+    assert gates._pytest_failed_tests(summary_lines) == ["FAILED tests/a.py::test_one - boom"]
+
+    headers_only = ("____ not_a_failure_header_before_the_section ____\n"
+                    "==================== ERRORS ====================\n"
+                    "____ ERROR at setup of test_two ____\n"
+                    "=================== FAILURES ===================\n"
+                    "____ test_one[a b] ____\n"
+                    "_ _ _ _ _ _ _ _\n"
+                    "____ test_one[a b] ____\n"
+                    "1 failed, 1 error in 1s")
+    assert gates._pytest_failed_tests(headers_only) == ["FAILED ERROR at setup of test_two", "FAILED test_one[a b]"]
+    assert gates._pytest_failed_tests("90 passed in 41.20s") == []
+
+
+def test_the_failing_graphs_of_the_lazy_bridge_are_classified(tmp_path, monkeypatch):
+    """One of the two failures is the bridge's empty graph input with its producer in the same graph."""
+    lib = make_lib(tmp_path)
+    fake, plugin, _ = setup(tmp_path, monkeypatch, lib=lib, pytest_out=CARD_FAILURE_OUT, pytest_exit=1)
+
+    result = gates.hc_fused(plugin, tmp_path / "g1b", python=fake)
+
+    assert result["empty_inputs"] == {"dumps": 1, "queued_producer": 1, "ops": ["flashinfer_gaudi::hc_norm"]}
+
+
+def test_a_pass_has_no_failing_graph(tmp_path, monkeypatch):
+    lib = make_lib(tmp_path)
+    fake, plugin, _ = setup(tmp_path, monkeypatch, lib=lib)
+
+    result = gates.hc_fused(plugin, tmp_path / "g1b", python=fake)
+
+    assert result["empty_inputs"] == {"dumps": 0, "queued_producer": 0, "ops": []}
+
+
 def test_a_crash_is_a_failure(tmp_path, monkeypatch):
     lib = make_lib(tmp_path)
     fake, plugin, _ = setup(tmp_path, monkeypatch, lib=lib, pytest_out="Fatal Python error: Aborted", pytest_exit=134)
