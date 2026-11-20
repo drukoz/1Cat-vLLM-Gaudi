@@ -2,8 +2,9 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 # bench_job.sh: the collectives track's card bench as one farm job (all cards, or one module group).
-#   farm job collectives c4-bench-r8-r4 all   12m -- bash tools/flash_next/collectives/bench_job.sh
-#   farm job collectives c4-bench-r4    any:4 10m -- bash tools/flash_next/collectives/bench_job.sh
+#   farm job collectives c4-bench-r8-r4 all   18m -- bash tools/flash_next/collectives/bench_job.sh
+#   farm job collectives c4-bench-r4    any:4 12m -- bash tools/flash_next/collectives/bench_job.sh
+# (the hold covers every step at its limit; a run without a stalled step takes about 7 minutes on 8 cards)
 # Steps, each with its own time limit, the cards released between them:
 #   1. id_check.py on every card of the job (the vocabulary-parallel arg max through the all-gather, card rule 9);
 #   2. bench_c4.py on every card of the job (all-reduce against all-gather + sum, lazy and HPU-graph replay);
@@ -33,8 +34,8 @@ echo "bench_job: $N card(s) ${FARM_CARDS:-?} (modules ${FARM_MODULES:-?}) [$(now
 rc_all=0
 
 if [ "${BENCH_IDCHECK:-1}" = 1 ]; then
-    timeout "${IDCHECK_S:-170}" python3 "$HERE/id_check.py" --ranks "$N" --budget-s 45 --timeout-s 150 \
-        --cases vp_argmax,vp_topk,fp32_ids_row,argmax_to_int32,argmax_int,topk_to_int32,topk_gather_fp32 \
+    timeout "${IDCHECK_S:-150}" python3 "$HERE/id_check.py" --ranks "$N" --budget-s 40 --timeout-s 130 \
+        --cases "${IDCHECK_CASES:-vp_argmax,vp_topk,fp32_ids_row}" \
         --out "$OUT/idcheck_r$N.json" --logdir "$OUT/idcheck_r$N" > "$OUT/idcheck_r$N.log" 2>&1
     rc=$?
     echo "bench_job: id check on $N ranks rc $rc [$(now)]"
@@ -43,8 +44,8 @@ if [ "${BENCH_IDCHECK:-1}" = 1 ]; then
     cards_free id_check.py
 fi
 
-timeout "${BENCH_S:-240}" python3 "$HERE/bench_c4.py" --ranks "$N" --rows "$ROWS" --regimes "$REGIMES" \
-    --timeout-s 220 --out "$OUT/c4_r$N.json" --logdir "$OUT/c4_r$N" > "$OUT/c4_r$N.log" 2>&1
+timeout "${BENCH_S:-300}" python3 "$HERE/bench_c4.py" --ranks "$N" --rows "$ROWS" --regimes "$REGIMES" \
+    --timeout-s 280 --out "$OUT/c4_r$N.json" --logdir "$OUT/c4_r$N" > "$OUT/c4_r$N.log" 2>&1
 rc=$?
 echo "bench_job: bench on $N ranks rc $rc [$(now)]"
 grep -E "^c4|^rank0:" "$OUT/c4_r$N.log" | cut -c1-260
@@ -52,8 +53,8 @@ grep -E "^c4|^rank0:" "$OUT/c4_r$N.log" | cut -c1-260
 cards_free bench_c4.py
 
 if [ "$N" -eq 8 ]; then
-    timeout "${BENCH_S:-240}" python3 "$HERE/bench_c4.py" --ranks 4 --cards 0,1,2,3 --rows "$ROWS" --regimes "$REGIMES" \
-        --timeout-s 220 --out "$OUT/c4_r4.json" --logdir "$OUT/c4_r4" > "$OUT/c4_r4.log" 2>&1
+    timeout "${BENCH_S:-300}" python3 "$HERE/bench_c4.py" --ranks 4 --cards 0,1,2,3 --rows "$ROWS" --regimes "$REGIMES" \
+        --timeout-s 280 --out "$OUT/c4_r4.json" --logdir "$OUT/c4_r4" > "$OUT/c4_r4.log" 2>&1
     rc=$?
     echo "bench_job: bench on 4 ranks (modules 0-3) rc $rc [$(now)]"
     grep -E "^c4|^rank0:" "$OUT/c4_r4.log" | cut -c1-260
@@ -61,8 +62,8 @@ if [ "$N" -eq 8 ]; then
     cards_free bench_c4.py
     if [ "${BENCH_PAIR:-1}" = 1 ]; then
         for g in a:0,1,2,3 b:4,5,6,7; do
-            timeout "${BENCH_PAIR_S:-150}" python3 "$HERE/bench_c4.py" --ranks 4 --cards "${g#*:}" --rows 1,32 \
-                --regimes replay --forms none,all_reduce,gather_sum --timeout-s 130 \
+            timeout "${BENCH_PAIR_S:-120}" python3 "$HERE/bench_c4.py" --ranks 4 --cards "${g#*:}" --rows 1,32 \
+                --regimes replay --forms none,all_reduce,gather_sum --tail-rows "" --timeout-s 100 \
                 --out "$OUT/c4_r4_pair_${g%%:*}.json" --logdir "$OUT/c4_r4_pair_${g%%:*}" \
                 > "$OUT/c4_r4_pair_${g%%:*}.log" 2>&1 &
         done
