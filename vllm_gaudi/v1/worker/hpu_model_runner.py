@@ -43,6 +43,8 @@ from vllm_gaudi.v1.worker.flash_next_inputs import (build_block_table, build_ple
 from vllm_gaudi.v1.worker.flash_next_decode_metadata import (compact_state_indices, fill_pad_slots,
                                                              request_block_table, sparse_decode_metadata_refusal)
 from vllm_gaudi.v1.sample.fused_greedy import STOP_ID_WIDTH, mask_stop_tokens, min_tokens_stop_ids
+from vllm_gaudi.v1.sample.candidate_sampling import (candidate_parameters, candidate_refusal, sample_candidates,
+                                                     take_candidates)
 from vllm_gaudi.v1.worker.runtime_switches import RuntimeSwitchFile
 from vllm_gaudi.v1.worker.recurrent_commit import (apply_align_precopy, boundary_commits, commit_conv, commit_ssm,
                                                    self_commit_requests)
@@ -1795,6 +1797,31 @@ class HpuModelAdapter(torch.nn.Module, HpuKVConnectorModelRunnerMixin):
         if narrow_ids:
             sampled_token_ids = sampled_token_ids.to(torch.int32)
         return hidden_states, sampled_token_ids.unsqueeze(-1)
+
+    def select_compute_logits_and_sample(self,
+                                         hidden_states,
+                                         logits_indices,
+                                         params,
+                                         top_k_index,
+                                         mixed,
+                                         stop_ids=None,
+                                         stop_rows=None):
+        """The LM head and the sampled draw in one compiled region (``v1/sample/candidate_sampling.py``).
+
+        The candidates are the largest logits of every row; temperature, top-k, top-p and the draw run on them
+        with the host's ``params`` (temperature, top_p, greedy flag, noise) and ``top_k_index``. ``mixed``: the
+        batch has greedy rows, which take the arg max over the whole row as in vLLM's sampler. ``stop_ids`` /
+        ``stop_rows``: the min_tokens mask of ``fused_greedy.py``, applied before the candidates are taken.
+        Returns the selected hidden states and the token ids, int64 ``[rows, 1]`` as the ops make them (no
+        integer cast in the graph: card rule 9)."""
+        hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
+        hidden_states = hidden_states[logits_indices]
+        logits = self.model.compute_logits(hidden_states).to(torch.float32)
+        if stop_ids is not None:
+            logits = mask_stop_tokens(logits, stop_ids, stop_rows)
+        greedy_ids = logits.argmax(dim=-1, keepdim=True) if mixed else None
+        values, ids = take_candidates(logits)
+        return hidden_states, sample_candidates(values, ids, params, top_k_index, greedy_ids)
 
     def combine_hidden_states(self, *args, **kwargs):
         return self.model.combine_hidden_states(*args, **kwargs)
@@ -5770,7 +5797,8 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                                model_mm_kwargs=None,
                                fuse_greedy_sampling=False,
                                ple_inputs=None,
-                               greedy_stop_ids=None):
+                               greedy_stop_ids=None,
+                               candidate_sampling=None):
         # FORWARD.
         batch_size = token_ids.size(0)
         framework_attn_metadata = isinstance(attn_metadata, Mapping)
@@ -5872,6 +5900,17 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                 # there. Async scheduling keeps them on the device as int32 for the next step's inputs.
                 hidden_states, fused_sampled_token_ids = self.model.select_compute_logits_and_greedy(
                     hidden_states, logits_indices, narrow_ids=bool(self.use_async_scheduling), **stop_kwargs)
+                logits = None
+            elif candidate_sampling is not None:
+                # The sampled step over candidates (candidate_sampling.py): two small copies to the device.
+                params, top_k_index, mixed, stops = candidate_sampling
+                stop_kwargs = {}
+                if stops is not None:
+                    stop_kwargs = dict(stop_ids=async_h2d_copy(stops[0], device=self.device),
+                                       stop_rows=async_h2d_copy(stops[1].to(torch.int32), device=self.device))
+                hidden_states, fused_sampled_token_ids = self.model.select_compute_logits_and_sample(
+                    hidden_states, logits_indices, async_h2d_copy(params, device=self.device),
+                    async_h2d_copy(top_k_index, device=self.device), mixed, **stop_kwargs)
                 logits = None
             else:
                 hidden_states, logits = self.model.select_and_compute_logits(hidden_states, logits_indices)
@@ -6223,6 +6262,68 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             below = params.min_tokens and len(state.output_token_ids) < params.min_tokens
             stops.append(params.all_stop_token_ids if below else None)
         return min_tokens_stop_ids(stops, rows)
+
+    def _candidate_sampling_inputs(self, request_ids: list[str], rows: int):
+        """VLLM_HPU_CANDIDATE_SAMPLING=1: this step's host tensors for the sampled region, or ``None`` when the
+        step keeps the general sampler (the flag is off, a request is outside the conditions of
+        ``candidate_sampling.candidate_refusal``, or every request is greedy).
+
+        Returns ``(params, top_k_index, mixed, stops)``: the two tensors of ``candidate_parameters`` (the noise
+        of a seeded request from its own host generator), whether the batch has greedy rows, and the
+        min_tokens mask of ``fused_greedy.min_tokens_stop_ids`` (or ``None``)."""
+        if int(gaudi_envs.VLLM_HPU_CANDIDATE_SAMPLING) != 1:
+            return None
+        if (not request_ids or self.speculative_config is not None or self.use_structured_output
+                or self.use_async_scheduling):
+            return None
+        builtin_processors = (LogitBiasLogitsProcessor, MinTokensLogitsProcessor)
+        if any(not isinstance(processor, builtin_processors)
+               for processor in self.input_batch.logitsprocs.non_argmax_invariant):
+            return None
+        temperatures, top_ks, top_ps, stops = [], [], [], []
+        generators = {}
+        host_generators = self.__dict__.setdefault('_candidate_generators', {})
+        mixed = False
+        for row, request_id in enumerate(request_ids):
+            state = self.requests[request_id]
+            params = state.sampling_params
+            if params is None:
+                return None
+            greedy = params.sampling_type == SamplingType.GREEDY
+            if candidate_refusal(greedy=greedy,
+                                 top_k=params.top_k,
+                                 logprobs=params.logprobs,
+                                 logprob_token_ids=params.logprob_token_ids,
+                                 logit_bias=params.logit_bias,
+                                 allowed_token_ids=params.allowed_token_ids,
+                                 bad_words_token_ids=params.bad_words_token_ids,
+                                 presence_penalty=params.presence_penalty,
+                                 frequency_penalty=params.frequency_penalty,
+                                 repetition_penalty=params.repetition_penalty,
+                                 min_p=params.min_p,
+                                 thinking_token_budget=params.thinking_token_budget,
+                                 extra_args=params.extra_args,
+                                 trace_decode_token_ids=params.trace_decode_token_ids,
+                                 stop_ids=len(params.all_stop_token_ids) if params.min_tokens else 0) is not None:
+                return None
+            mixed = mixed or greedy
+            temperatures.append(0.0 if greedy else params.temperature)
+            top_ks.append(params.top_k)
+            top_ps.append(params.top_p)
+            below = params.min_tokens and len(state.output_token_ids) < params.min_tokens
+            stops.append(params.all_stop_token_ids if below else None)
+            if not greedy and params.seed is not None:
+                # A seeded request draws its noise from a host generator of its own, kept for its lifetime.
+                if request_id not in host_generators:
+                    host_generators[request_id] = torch.Generator().manual_seed(params.seed)
+                generators[row] = host_generators[request_id]
+        if all(temperature == 0.0 for temperature in temperatures):
+            return None  # an all-greedy batch: the greedy region or the general sampler, as before
+        if len(host_generators) > len(generators):
+            for request_id in [r for r in host_generators if r not in self.requests]:
+                del host_generators[request_id]
+        params, top_k_index = candidate_parameters(temperatures, top_ks, top_ps, rows, generators=generators)
+        return params, top_k_index, mixed, min_tokens_stop_ids(stops, rows)
 
     def _run_sampling(self,
                       batch_changed: bool,
@@ -6769,6 +6870,8 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             greedy_stop_ids = (self._fused_greedy_stop_ids(pd_info.decode_req_ids,
                                                            int(decode_data.logits_indices.shape[0]))
                                if fuse_greedy_sampling else None)
+            candidate_sampling = (None if fuse_greedy_sampling else self._candidate_sampling_inputs(
+                pd_info.decode_req_ids, int(decode_data.logits_indices.shape[0])))
             htorch.core.mark_step()
             non_flattened_hidden_states, aux_hidden_states, \
                 sample_hidden_states, logits_device, fused_sampled_token_ids = \
@@ -6783,7 +6886,8 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                 warmup_mode=warmup_mode,
                 fuse_greedy_sampling=fuse_greedy_sampling,
                 ple_inputs=decode_data.ple_inputs,
-                greedy_stop_ids=greedy_stop_ids)
+                greedy_stop_ids=greedy_stop_ids,
+                candidate_sampling=candidate_sampling)
             htorch.core.mark_step()
 
             if self.use_structured_output:
@@ -7368,6 +7472,7 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             'compute_logits',
             'select_and_compute_logits',
             'select_compute_logits_and_greedy',
+            'select_compute_logits_and_sample',
         ]
         if self.speculative_config is not None and self.speculative_config.use_dflash():
             target_methods.append('sample_dflash2_greedy')

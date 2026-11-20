@@ -531,6 +531,7 @@ if TYPE_CHECKING:
     VLLM_HPU_FLASH_NEXT_QSA_PREFILL_TILE: int = 2048
     VLLM_HPU_FLASH_NEXT_DECODE_METADATA: int = 0  # 0 dense paged-attention buffers (default), 1 sparse-QSA only
     VLLM_HPU_RUNTIME_SWITCH_FILE: str = ""  # a file of per-step flags a running server rereads (an A/B on one server)
+    VLLM_HPU_CANDIDATE_SAMPLING: int = 0  # 0 vLLM's sampler over the vocabulary (default), 1 sampling over candidates
     VLLM_HPU_GDN_CORE_DECODE: int = 1  # GdnCoreDecodeMode: 1 fused (default), 0 off, 2 recurrence
     VLLM_HPU_GDN_CORE_DECODE_DEBUG: int = 0  # GdnCoreDecodeDebug: 0 off, 1 check slot indices every step (host sync)
     VLLM_HPU_GDN_CORE_VERIFY: int = 0  # GdnCoreVerifyMode: 0 off (default), 1 fused verification steps
@@ -1884,10 +1885,22 @@ environment_variables: dict[str, Callable[[], Any]] = {
 
     # An operator's A/B on one server (v1/worker/runtime_switches.py). Unset (default): nothing. A path: every
     # worker looks at that file before each step and, when it changed, takes the flags it lists (NAME=VALUE lines).
-    # Only flags the runner reads at every step can be switched: VLLM_HPU_FLASH_NEXT_DECODE_METADATA and
-    # VLLM_HPU_FUSED_GREEDY_LOGITS. Replace the file with a rename while no request runs.
+    # Only flags the runner reads at every step can be switched: VLLM_HPU_FLASH_NEXT_DECODE_METADATA,
+    # VLLM_HPU_FUSED_GREEDY_LOGITS and VLLM_HPU_CANDIDATE_SAMPLING. Replace the file with a rename while no
+    # request runs.
     "VLLM_HPU_RUNTIME_SWITCH_FILE":
     lambda: os.environ.get("VLLM_HPU_RUNTIME_SWITCH_FILE", "").strip(),
+
+    # The sampled decode step (requests with a temperature above zero: the checkpoint's default sampling is
+    # temperature 1.0, top_k 20, top_p 0.95). 0 (default) = vLLM's sampler: a full sort of [rows, vocabulary],
+    # a scatter back and noise over the vocabulary on every step. 1 = sampling over candidates
+    # (v1/sample/candidate_sampling.py): the 64 largest logits per row are taken in the LM-head region and
+    # temperature, top-k, top-p and the draw run on [rows, 64] with noise made on the host; no sampler graph. A
+    # step whose requests are outside its conditions (top_k unset or above 64, min_p, penalties, logit_bias,
+    # logprobs, a custom logits processor, speculation, structured output) keeps vLLM's sampler. Same
+    # distribution as vLLM's; the random stream differs. Any other value is 0.
+    "VLLM_HPU_CANDIDATE_SAMPLING":
+    lambda: int(os.environ.get("VLLM_HPU_CANDIDATE_SAMPLING", "0")),
 
     # Flash-Next GDN decode through the fused core op (flashinfer_gaudi.gdn_core_decode).
     # 1 (default) = fused, 0 = off (the torch path), 2 = recurrence only (a bisect tool).

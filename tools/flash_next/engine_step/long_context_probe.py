@@ -6,8 +6,8 @@ The server starts with ``VLLM_HPU_RUNTIME_SWITCH_FILE`` pointing at ``--switch-f
 replaces that file with the flags of the round's arm, so the same server and cards decode the same prompts with
 a path off and on, in turn (base, arm, base, arm: the second pair bounds the drift). Arms:
 
-    base  VLLM_HPU_FLASH_NEXT_DECODE_METADATA=0  VLLM_HPU_FUSED_GREEDY_LOGITS=0
-    both  1 1          i01  1 0          i05  0 1
+    base  VLLM_HPU_FLASH_NEXT_DECODE_METADATA=0  VLLM_HPU_FUSED_GREEDY_LOGITS=0  VLLM_HPU_CANDIDATE_SAMPLING=0
+    both  1 1 0        i01  1 0 0        i05  0 1 0        cand  0 0 1
 
 Rounds (``N`` = ``--streams``, every stream exactly ``--tokens`` tokens: ``max_tokens`` with ``ignore_eos``, no
 ``min_tokens``, temperature 0):
@@ -28,6 +28,12 @@ Rounds (``N`` = ``--streams``, every stream exactly ``--tokens`` tokens: ``max_t
   whole prefix is reused; ``cached`` in the output says what the server reused.
 * ``mintok`` one more round with ``min_tokens`` (the first arm only): the cost of the mask in the in-graph
   greedy region.
+* ``sampled`` the short prompts WITHOUT a temperature in the request, as the owner's agents send them: the
+  server then samples with the checkpoint's defaults (temperature 1.0, top_k 20, top_p 0.95). Arms ``base``
+  (vLLM's sampler: a full sort of the vocabulary per row and step) and ``cand`` (sampling over candidates), in
+  turn; the ``text`` prompts sampled too, scored by the same task; a seeded request sent twice under ``cand``
+  must repeat itself. Last of all a seeded request under ``base``: whether vLLM's sampler takes a seed on a
+  card at all is not known, and nothing is lost if that request ends the server.
 
 Per round: per stream the median gap between streamed chunks (steady ms per token: a decode step, compile pauses
 excluded), the span per token (pauses included), pauses over 0.5 s, TTFT; the round's medians and total tokens
@@ -45,19 +51,20 @@ import sys
 import threading
 import time
 
-ARMS = {
-    "base": {"VLLM_HPU_FLASH_NEXT_DECODE_METADATA": 0, "VLLM_HPU_FUSED_GREEDY_LOGITS": 0},
-    "both": {"VLLM_HPU_FLASH_NEXT_DECODE_METADATA": 1, "VLLM_HPU_FUSED_GREEDY_LOGITS": 1},
-    "i01": {"VLLM_HPU_FLASH_NEXT_DECODE_METADATA": 1, "VLLM_HPU_FUSED_GREEDY_LOGITS": 0},
-    "i05": {"VLLM_HPU_FLASH_NEXT_DECODE_METADATA": 0, "VLLM_HPU_FUSED_GREEDY_LOGITS": 1},
-}
+FLAGS = ("VLLM_HPU_FLASH_NEXT_DECODE_METADATA", "VLLM_HPU_FUSED_GREEDY_LOGITS", "VLLM_HPU_CANDIDATE_SAMPLING")
+ARMS = {name: dict(zip(FLAGS, values)) for name, values in (
+    ("base", (0, 0, 0)), ("both", (1, 1, 0)), ("i01", (1, 0, 0)), ("i05", (0, 1, 0)), ("cand", (0, 0, 1)))}
 SWITCH_LINE = "Runtime switches from"
 REFUSAL_LINE = "is off for this server"
 
 
-def one_stream(host, port, model, prompt, ntok, out, idx, barrier, timeout_s, min_tokens):
-    request = {"model": model, "prompt": prompt, "max_tokens": ntok, "ignore_eos": True, "temperature": 0,
-               "stream": True, "stream_options": {"include_usage": True}}
+def one_stream(host, port, model, prompt, ntok, out, idx, barrier, timeout_s, min_tokens, sampling):
+    request = {"model": model, "prompt": prompt, "max_tokens": ntok, "ignore_eos": True, "stream": True,
+               "stream_options": {"include_usage": True}}
+    if sampling is None:
+        request["temperature"] = 0
+    else:  # no temperature: the server's default sampling; {"seed": N} makes the request seeded
+        request.update(sampling)
     if min_tokens:
         request["min_tokens"] = ntok
     body = json.dumps(request)
@@ -98,12 +105,12 @@ def one_stream(host, port, model, prompt, ntok, out, idx, barrier, timeout_s, mi
     out[idx] = rec
 
 
-def run_round(args, label, prompts, ntok, min_tokens=False):
+def run_round(args, label, prompts, ntok, min_tokens=False, sampling=None):
     n = len(prompts)
     out = [None] * n
     barrier = threading.Barrier(n)
     threads = [threading.Thread(target=one_stream, args=(args.host, args.port, args.model, prompts[i], ntok, out, i,
-                                                         barrier, args.timeout, min_tokens), daemon=True)
+                                                         barrier, args.timeout, min_tokens, sampling), daemon=True)
                for i in range(n)]
     t_start = time.perf_counter()
     for t in threads:
@@ -263,10 +270,10 @@ class Probe:
             self.note("the server log has %d '%s' line(s): an arm with that flag ran the old path" %
                       (refused, REFUSAL_LINE))
 
-    def run(self, kind, arm, prompts, ntok, tag="", min_tokens=False):
+    def run(self, kind, arm, prompts, ntok, tag="", min_tokens=False, sampling=None):
         self.set_arm(arm)
         label = "%s-%d%s:%s" % (kind, len(prompts), tag, arm)
-        res = run_round(self.args, label, prompts, ntok, min_tokens)
+        res = run_round(self.args, label, prompts, ntok, min_tokens, sampling)
         res.update(kind=kind, arm=arm, tag=tag, at_s=round(self.elapsed(), 1))
         self.results["rounds"].append(res)
         self.check_switch()
@@ -290,7 +297,7 @@ def summary(probe):
     for res in probe.results["rounds"]:
         if res.get("tag") != "" or res.get("steady_ms_p50") is None or res.get("min_tokens"):
             continue
-        if res["kind"] not in ("short", "long"):
+        if res["kind"] not in ("short", "long", "sampled"):
             continue
         rows.setdefault((res["kind"], res["arm"]), []).append(res)
     print("\nSUMMARY steady ms per token (median gap between chunks), measured rounds only")
@@ -334,10 +341,11 @@ def main():
     ap.add_argument("--arms", default="both,i01,i05", help="arms measured against base; the first one twice")
     ap.add_argument("--budget", type=float, default=1200.0, help="seconds after which optional rounds are left out")
     ap.add_argument("--no-long", action="store_true")
+    ap.add_argument("--no-sampled", action="store_true", help="leave out the rounds without a temperature")
     args = ap.parse_args()
     arms = [a for a in args.arms.split(",") if a]
     for arm in arms:
-        if arm not in ARMS or arm == "base":
+        if arm not in ("both", "i01", "i05"):
             raise SystemExit("unknown arm %r (one of both, i01, i05)" % arm)
     main_arm, other_arms = arms[0], arms[1:]
     rng = random.Random(20261120)
@@ -346,10 +354,10 @@ def main():
     probe = Probe(args)
     measured = {}  # (kind, arm) -> the measured rounds
 
-    def measure(kind, arm, prompts, warm=None):
+    def measure(kind, arm, prompts, warm=None, sampling=None):
         if warm:
-            probe.run(kind, arm, prompts, warm, tag="-warm")
-        res = probe.run(kind, arm, prompts, ntok)
+            probe.run(kind, arm, prompts, warm, tag="-warm", sampling=sampling)
+        res = probe.run(kind, arm, prompts, ntok, sampling=sampling)
         measured.setdefault((kind, arm), []).append(res)
         return res
 
@@ -397,6 +405,22 @@ def main():
     probe.compare("short", measured[("short", "base")][0], measured[("short", main_arm)][0])
     probe.compare("short", measured[("short", "base")][1], measured[("short", main_arm)][1])
 
+    # --- sampled steps (no temperature in the request): vLLM's sampler against sampling over candidates
+    def sampled_words(arm):
+        many = probe.run("text", arm, text_prompts, 24, tag="-sampled", sampling={})
+        for i in shown:
+            print("TEXT %-5s sampled stream %2d of %d: %r" % (arm, i, n, (many["texts"][i] or "")[:70]), flush=True)
+        on_task = sum(1 for a, text in zip(starts, many["texts"])
+                      if text is not None and text.replace(" ", "").startswith("%d,%d," % (a + 3, a + 4)))
+        many["on_task"] = on_task
+        print("TASK %-5s sampled: %d of %d streams go on with their own numbers" % (arm, on_task, n), flush=True)
+        probe.save()
+
+    # vLLM's sampler first (it runs on a card today): what a sampled step of real traffic costs.
+    if not args.no_sampled:
+        measure("sampled", "base", short_prompts, warm=24, sampling={})
+        sampled_words("base")
+
     # --- long context over the shared prefix
     long_ok = not args.no_long
     if long_ok:
@@ -422,6 +446,18 @@ def main():
         probe.compare("long", measured[("long", "base")][0], measured[("long", main_arm)][0])
         probe.compare("long", measured[("long", "base")][1], measured[("long", main_arm)][1])
 
+    # --- sampling over candidates: its first run on a card comes after the long rounds, so a failure of the
+    # new region costs none of them. cand, base, cand: with the base round above that is two of each, in turn.
+    if not args.no_sampled:
+        measure("sampled", "cand", short_prompts, warm=24, sampling={})
+        sampled_words("cand")
+        measure("sampled", "base", short_prompts, sampling={})
+        measure("sampled", "cand", short_prompts, sampling={})
+        seeded = [probe.run("text1", "cand", [one_prompt], 48, tag="-seeded%d" % i, sampling={"seed": 20261120})
+                  for i in (1, 2)]
+        probe.compare("seeded", seeded[0], seeded[1])
+        print("SEED cand: %r" % ((seeded[0]["texts"][0] or "")[:120], ), flush=True)
+
     # --- the other arms (which flag carries the effect), then the min_tokens mask; left out when time is short
     for arm in other_arms:
         if long_ok and not probe.over_budget("long rounds of arm " + arm):
@@ -439,6 +475,15 @@ def main():
                 kind, main_arm, mintok["steady_ms_p50"], last["steady_ms_p50"]), flush=True)
     probe.set_arm("base")
     summary(probe)
+    if not args.no_sampled:
+        # Last: a seeded request through vLLM's sampler (a generator on the device). It may end the server.
+        seeded = [probe.run("text1", "base", [one_prompt], 48, tag="-seeded%d" % i, sampling={"seed": 20261120})
+                  for i in (1, 2)]
+        probe.compare("seeded", seeded[0], seeded[1])
+        if any(r["errors"] for r in seeded):
+            probe.note("a seeded request through vLLM's sampler failed: %s" % (
+                seeded[0].get("error_samples") or seeded[1].get("error_samples")))
+            return 0 if probe.switch_ok else 1
     bad = sum(1 for r in probe.results["rounds"] if r["errors"])
     if bad or not probe.switch_ok:
         print("PROBE: %d round(s) with errors, switches ok: %s" % (bad, probe.switch_ok), flush=True)

@@ -72,11 +72,26 @@ dense QSA, the defragmenter on, a draft method other than MTP or n-gram) logs th
 keeps the dense buffers. CPU-checked (bit-identical tokens and logits on the whole serving loop,
 decode and k = 3 verification); not yet checked on a card.
 
+`VLLM_HPU_CANDIDATE_SAMPLING` (integer, default `0`) selects how a sampled decode step draws its tokens
+(requests with a temperature above zero; a request without a temperature gets the checkpoint's default
+sampling, temperature 1.0, top_k 20, top_p 0.95). `0` is vLLM's sampler: on every step a full sort of
+`[rows, vocabulary]`, a scatter back and exponential noise over the vocabulary. `1` samples over
+candidates (`vllm_gaudi/v1/sample/candidate_sampling.py`): the 64 largest logits of every row are taken in
+the LM-head region, and temperature, top-k, top-p and the draw run on `[rows, 64]` with noise made on the
+host (one small copy to the device, a seeded request's row from its own generator); there is no sampler
+graph, and rows x 8 bytes of token ids come back. It is vLLM's distribution whenever `0 < top_k <= 64`
+(a tie group at the k-th value that reaches past 64 candidates is cut there); the random stream differs,
+so a seeded request is reproducible but not equal to its output with `0`. A step with a request outside
+the conditions (`top_k` unset or above 64, `min_p`, penalties, `logit_bias`, `allowed_token_ids`,
+`bad_words`, logprobs, a custom logits processor, speculative decoding, structured output, async
+scheduling) keeps vLLM's sampler; an all-greedy step is not affected. CPU-checked against vLLM's
+`apply_top_k_top_p_pytorch`; not yet checked on a card.
+
 `VLLM_HPU_RUNTIME_SWITCH_FILE` (a path, default unset) is an operator's tool for an A/B on one server.
 When set, every worker looks at that file before each step (one `stat`) and, when the file changed, takes
 the flags it lists, one `NAME=VALUE` per line. Only flags the runner reads at every step can be switched:
-`VLLM_HPU_FLASH_NEXT_DECODE_METADATA` and `VLLM_HPU_FUSED_GREEDY_LOGITS`; any other name is reported and
-the file is ignored. Replace the file with a rename while no request runs, so every worker sees the change
+`VLLM_HPU_FLASH_NEXT_DECODE_METADATA`, `VLLM_HPU_FUSED_GREEDY_LOGITS` and `VLLM_HPU_CANDIDATE_SAMPLING`;
+any other name is reported and the file is ignored. Replace the file with a rename while no request runs, so every worker sees the change
 at the same step. `tools/flash_next/engine_step/long_context_probe.py` measures two arms of one server
 this way.
 

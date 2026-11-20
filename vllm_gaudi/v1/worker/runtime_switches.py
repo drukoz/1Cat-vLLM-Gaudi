@@ -17,7 +17,7 @@ This module imports nothing of the plugin (the runner cannot be imported on a ma
 import os
 from typing import Optional
 
-SWITCHABLE = ("VLLM_HPU_FLASH_NEXT_DECODE_METADATA", "VLLM_HPU_FUSED_GREEDY_LOGITS")
+SWITCHABLE = ("VLLM_HPU_FLASH_NEXT_DECODE_METADATA", "VLLM_HPU_FUSED_GREEDY_LOGITS", "VLLM_HPU_CANDIDATE_SAMPLING")
 
 
 def parse_switches(text: str) -> dict[str, str]:

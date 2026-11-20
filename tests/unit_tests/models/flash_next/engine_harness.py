@@ -84,7 +84,8 @@ ENV_VARS = ("VLLM_HPU_RECURRENT_STATE_POOL", "VLLM_HPU_RECURRENT_STATE_POOL_SLOT
             "VLLM_HPU_RECURRENT_STATE_POOL_CACHE_SLOTS", "VLLM_COMPACT_GDN", "VLLM_HPU_FLASH_NEXT_QSA_MODE",
             "VLLM_USE_HYBRID_CACHE", "VLLM_USE_NAIVE_MAMBA_CACHE_SHARING", "VLLM_SKIP_WARMUP",
             "VLLM_HPU_PLE_HOST_NGRAM_IDS", "VLLM_HPU_FUSED_GREEDY_LOGITS", "VLLM_DISABLE_SHARED_EXPERTS_STREAM",
-            "VLLM_DEFRAG_WITH_GRAPHS", "VLLM_HPU_FLASH_NEXT_DECODE_METADATA", "VLLM_HPU_RUNTIME_SWITCH_FILE")
+            "VLLM_DEFRAG_WITH_GRAPHS", "VLLM_HPU_FLASH_NEXT_DECODE_METADATA", "VLLM_HPU_RUNTIME_SWITCH_FILE",
+            "VLLM_HPU_CANDIDATE_SAMPLING")
 
 DEVICE = torch.device("cpu")
 _OPEN = False
@@ -435,6 +436,11 @@ class StubModel(torch.nn.Module):
                                          narrow_ids=True):
         ids = self._logits(logits_indices).argmax(dim=-1)
         return hidden_states[logits_indices], (ids.to(torch.int32) if narrow_ids else ids).unsqueeze(-1)
+
+    def select_compute_logits_and_sample(self, hidden_states, logits_indices, params, top_k_index, mixed,
+                                         stop_ids=None, stop_rows=None):
+        # The stub's logits are one-hot: every draw is the arg max.
+        return hidden_states[logits_indices], self._logits(logits_indices).argmax(dim=-1, keepdim=True)
 
     def compute_logits(self, hidden_states):
         return torch.zeros((hidden_states.shape[0], self.VOCAB), dtype=torch.float32)
