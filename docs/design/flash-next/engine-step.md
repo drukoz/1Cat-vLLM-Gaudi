@@ -11,8 +11,8 @@ This track's harness refuses report files outside the repository, so the handoff
 
 ## Handoff (if this agent stops)
 
-Last update: **2026-11-20 23:40 UTC** (fourth agent, Opus 5.5). Branch `feat/flash-next-gaudi-engine-step`,
-head `0cb55ebb` (program head `938dada4` merged in, `eaf2131f`). Scratch files, probes and card results:
+Last update: **2026-11-20 23:55 UTC** (fourth agent, Opus 5.5). Branch `feat/flash-next-gaudi-engine-step`,
+head `ddc6bbbf` (code: `21d9eace`; program head `938dada4` merged in, `eaf2131f`). Scratch files, probes and card results:
 `/Volumes/Storage/Claude/gaudi-work/reports/engine-step/` (`card_job/` = submit logs, `card/` = fetched results,
 `logs/` = CPU test logs). Node mirror of this track's results: `node-mirror/farm/engine-step/results/`.
 
@@ -29,8 +29,11 @@ saw the same token stream; INFERRED until job 00130 shows it with I05 alone). Ne
 the host reads (logprobs, prompt logprobs, the sampled region) now come out of an fp32 id table
 (`v1/sample/topk_ids.py`): the `logprobs=5` crash of spec-lookup's 00086 (OverflowError in the detokenizer, the
 server died) is fixed on the CPU model of the card rule; the sampled region now takes `vocab_parallel.top_k`, so
-with `VLLM_HPU_VOCAB_PARALLEL_LOGITS=2` it gathers each rank's top 64 instead of the logits (job 00131 measures it).
+with `VLLM_HPU_VOCAB_PARALLEL_LOGITS=2` it gathers each rank's top 64 instead of the logits (job 00137 measures it).
 No pull request tonight (BRIEF.md 23:45): push and tell the coordinator the commit and the proven flags.
+`21d9eace` (asked by the coordinator for the integration build): TP rank 0 logs once "Candidate sampling
+(VLLM_HPU_CANDIDATE_SAMPLING=1): a sampled decode step drew in the logits region ..." and once "... took vLLM's
+sampler instead: <reason>" (integration was told at 23:55 UTC).
 
 ### If you take over, in this order
 
@@ -52,7 +55,7 @@ No pull request tonight (BRIEF.md 23:45): push and tell the coordinator the comm
 | 00093 `hpu-ids-sampler-tiny-flags` (1 card) | id verdicts, sampler-stage times, tiny model with I01 + I05 | ended 20:29 UTC, exit 1 (the tiny 700-token prompt, a near tie) | done: section 9 |
 | 00110 `real4-ab3-greedy-sampled-long` (TP4) | greedy base / I01 / I05 / both, sampled base / cand, long prefix | ended 22:29 UTC, exit 5 (probe counting artifact; no prefix-cache hit) | done: section 9 |
 | **00130** `tiny-i01-i05-logprobs` (any:1, 15m, commit `0cb55ebb`) | `tools/flash_next/engine_step/tiny_checks.py --arms i01,i05`: the tiny smoke with I01 alone and I05 alone; while each server is up, every reference prompt with `logprobs=5` and one with `prompt_logprobs=2`, then `/health` | queued 23:39 UTC; placed by the coordinator beside kernel-fixes' 00123, about 01:00 UTC | `TOKENS` lines (I05 alone should show the 700-token near tie, I01 alone should pass: then record the near tie, no more card time on it) and `LOGPROBS` lines (must be `ok` with `/health after: 200` in both arms: the crash fix is card-proven) |
-| **00131** `real4-ab4-short-candvp` (any:4, 28m, commit `0cb55ebb`, `VLLM_GRAPH_RESERVED_MEM=0.5`) | `serve_long_probe.sh --arms both --no-long --candvp --logprobs-check`: 32 greedy streams base / both (twice, in turn), text1 compared at 1 stream, 32 sampled streams base / cand / candvp (`VLLM_HPU_VOCAB_PARALLEL_LOGITS=2`), seeded requests, min_tokens round, the logprobs check last; hl-smi memory in `hlsmi.log` | queued 23:39 UTC; placed after step-anatomy's 00119, about 02:00 to 02:30 UTC | `probe.log`: `SUMMARY` (sampled cand and candvp against base, candvp against cand), `TASK` for candvp (must be 32 of 32), `TEXTS text1`, `LOGPROBS ok`; then tell the coordinator whether `VLLM_HPU_VOCAB_PARALLEL_LOGITS=2` with candidates is proven |
+| **00137** `real4-ab5-short-candvp` (any:4, 28m, commit `ddc6bbbf`, `VLLM_GRAPH_RESERVED_MEM=0.5`; replaced 00131 at 23:55 UTC to carry the candidate path's log lines, kept its place) | `serve_long_probe.sh --arms both --no-long --candvp --logprobs-check`: 32 greedy streams base / both (twice, in turn), text1 compared at 1 stream, 32 sampled streams base / cand / candvp (`VLLM_HPU_VOCAB_PARALLEL_LOGITS=2`), seeded requests, min_tokens round, the logprobs check last; hl-smi memory in `hlsmi.log` | queued 23:39 UTC; placed after step-anatomy's 00119, about 02:00 to 02:30 UTC | `probe.log`: `SUMMARY` (sampled cand and candvp against base, candvp against cand), `TASK` for candvp (must be 32 of 32), `TEXTS text1`, `LOGPROBS ok`; the job log's `Candidate sampling` lines ("drew in the logits region ... from the gathered logits" for cand, "... from each rank's vocabulary shard" for candvp); then tell the coordinator whether `VLLM_HPU_VOCAB_PARALLEL_LOGITS=2` with candidates is proven |
 
 ### Pending subtasks after those steps, in order
 
@@ -279,7 +282,7 @@ reaches past 64 candidates is cut at 64. The design:
   rows of a mixed batch; a step with a row below its `min_tokens` masks the gathered logits and takes
   `topk_ids.topk_with_ids`. The drawn ids are int32 out of an fp32 id table: no top-k index is cast or read back
   as data (the card evidence is in `v1/sample/topk_ids.py`). `VLLM_HPU_VOCAB_PARALLEL_LOGITS=2` turns the logits
-  all-gather of a sampled step into one `[rows, 128]` fp32 all-gather per rank (job 00131 measures it).
+  all-gather of a sampled step into one `[rows, 128]` fp32 all-gather per rank (job 00137 measures it).
 - mtp-card-ready (sampled verification, idea I07): one function `candidate_probs(values, temperature, top_k,
   top_p) -> probs [rows, C]` (zero outside the kept set) serves both the pick (`argmax(probs / noise)`) and the
   rejection sampler (`p(draft token)` = the probability at the column whose id equals the draft id, zero when
