@@ -83,7 +83,9 @@ def test_shared_system_message_identical_and_in_window(workload):
     sys_msgs = {json.dumps(entry["messages"][0], sort_keys=True) for entry in workload["agents"]}
     assert len(sys_msgs) == 1
     sys_msg = workload["agents"][0]["messages"][0]
-    count = estimate_counter([sys_msg])
+    # Counted the way the workload counts it, with an empty user turn: the model's chat template
+    # refuses messages without one, so a server cannot count the system message alone.
+    count = estimate_counter([sys_msg, {"role": "user", "content": ""}])
     assert SMALL["shared_tokens"] - 64 <= count <= SMALL["shared_tokens"]
     assert workload["shared_prefix_tokens"] == count
     assert sys_msg["content"].startswith(
