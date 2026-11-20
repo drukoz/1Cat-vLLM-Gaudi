@@ -52,7 +52,22 @@ sample() {  # sample SERVER N: perf record of every worker of the job's containe
     [ -n "$pids" ] || { log "$server N=$n: no worker processes"; return; }
     f="$OUT/$server-N$n"
     log "$server N=$n: perf record $dur s of pids $pids"
+    # Next to the samples: per thread the CPU time, the context switches and the CPU migrations of the same seconds
+    # (a worker whose main thread is switched out or moved issues its launches later than the other ranks), and on
+    # which CPU every thread runs.
+    local side=()
+    sudo -n "$P" stat -e task-clock,context-switches,cpu-migrations --per-thread -p "$pids" -o "$f.stat.txt" -- sleep "$dur" > /dev/null 2>&1 &
+    side+=($!)
+    # thread_stat.py (next to this script): CPU time, run-queue wait, voluntary and involuntary switches and the
+    # CPUs of every busy thread, from /proc.
+    if [ -f "$T/perf/thread_stat.py" ]; then
+        python3 "$T/perf/thread_stat.py" --pids "$pids" --seconds "$dur" --out "$f.threadstat.json" > "$f.threadstat.txt" 2>&1 &
+        side+=($!)
+    fi
     sudo -n "$P" --buildid-dir "$BD" record -F 999 -g -p "$pids" -o "$f.data" -- sleep "$dur" > "$f.record.log" 2>&1
+    wait "${side[@]}" 2>/dev/null
+    ps -L -o pid,tid,psr,pcpu,stat,comm -p "$pids" 2>/dev/null | awk 'NR==1 || $4 >= 1.0' > "$f.threads.txt"
+    for pid in ${pids//,/ }; do taskset -cp "$pid" 2>/dev/null; done > "$f.affinity.txt"
     sudo -n docker top "farm-$JOB" -eo pid,tid,pcpu,comm,args 2>/dev/null | cut -c1-150 > "$f.procs.txt"
     reports "$f" "$server N=$n" &
 }
