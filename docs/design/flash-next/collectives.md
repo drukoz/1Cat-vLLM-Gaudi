@@ -292,7 +292,7 @@ Every job runs the committed tree in the farm's per-commit image (`CARD.md`); sc
 | 00073 `c4-bench-r8-r4`, 8 cards, image 684b54ad, 21:24-21:29 UTC | `bench_job.sh`: the id check through the all-gather on 8 ranks; `bench_c4.py` on 8 ranks, on the module group 0-3, and on both groups at once | alpha per rank count, regime and form (section 5) | **Exit 2 from the first stage**: the 8 id-check ranks hit the stage's 150 s limit and the script killed them (the "killed while waiting" kernel lines on cards 0, 4, 5, 6, 7; not a card fault; load average up to 414). Before that `vp_argmax` through the 8-rank all-gather equalled the CPU at every row, regime and data set, and `vp_topk` (the earlier form) in every case that ran. The bench stages ran to the end: section 5 |
 | 00112 `cuts-cardproof-tp4`, 4 cards (modules 0-3), commit d1cbe91d (the head of PR #14), 23:08-23:12 UTC | `cardproof_job.sh`: `id_check.py` on 4 hccl ranks; the tiny model at TP4 with fused hyper-connections, arm `logits-rider` (`VLLM_HPU_VOCAB_PARALLEL_LOGITS=1 VLLM_HPU_PLE_TABLE_RIDER=1`) and arm `logits2-embed` (`VLLM_HPU_VOCAB_PARALLEL_LOGITS=2 VLLM_HPU_REPLICATED_EMBEDDING=1`) | the serving id cases equal the CPU; every arm's tokens equal the reference | **Ids PASS at 4 ranks**: `vp_argmax` and `vp_topk@20/@64` (the merged top-k head through the 4-rank all-gather) equal at rows 1, 2, 32, 128, both regimes, untied and tied. **Tiny: exit 1.** Both arms give identical tokens: prompts of 7, 33, 2,600 tokens 16/16; 1 and 100 tokens near ties at token 0 (excused, as in every baseline); the 700-token prompt 4/16, first difference at token 4. The same 700-token answer, token for token, comes from engine-step's 00093 `tiny-flags` at TP1 (`VLLM_HPU_FUSED_GREEDY_LOGITS=1`, none of this track's flags) and from mtp-card-ready's 00105 fused-verify arms at TP2, while every baseline tiny run matches 16/16. So it comes with the in-graph greedy region (or any small numerical change), not with the cuts: a near tie of the reference at token 4 (coordinator, 2026-11-20; the tiny model's logits are near-flat: top-2 margins of 0.0005 to 0.02 at values near 0.27, where one bf16 step is 0.002, on a same-recipe checkpoint built on the Mac) |
 | 00082 `real4-ab2-off`, 00083 `real4-ab2-logits-rider` (commit d158c6d5) | the real-model A/B against the plugin's default path | | replaced by the pair below: against the default path the lone texts can part at a bf16 tie that the greedy region itself moves, which says nothing about the cuts |
-| **00124** `real4-ab3-region` (cards 0,1,2,7) / **00125** `real4-ab3-cuts` (cards 3,4,5,6), 4 cards each, 25 min, commit 0a66722b, side by side, in the places of 00082 / 00083 | `ab_job.sh` on this branch's head: the real model at TP4 + EP4, 1 and 32 streams, 256 tokens, no `min_tokens`, every stream's text kept; 6 lone requests; one 32-stream round with the server's default sampling. Arm `region`: `VLLM_HPU_FUSED_GREEDY_LOGITS=1` (the greedy region over the gathered logits); arm `cuts`: `VLLM_HPU_VOCAB_PARALLEL_LOGITS=1 VLLM_HPU_PLE_TABLE_RIDER=1` (the same region, the vocabulary-parallel arg max, the PLE rows on the embedding all-reduce); both `VLLM_GRAPH_RESERVED_MEM=0.5` | `compare_arms.py <region> <cuts>`: the 6 lone requests' texts must be equal token for token (both arms compute the same bf16 logits; the cuts are exact); the ms per step at 1 and 32 streams is the cuts' own effect (expected under 1 ms: one all-gather of `[rows, 62,080]` bf16 per rank and one all-reduce fewer) | pending |
+| **00124** `real4-ab3-region` / **00125** `real4-ab3-cuts`, 4 cards each, 25 min, commit 0a66722b, in the places of 00082 / 00083; **cancelled at 23:44 UTC before running** (coordinator: 00109 first); commands for the next rental in the handoff | `ab_job.sh` on this branch's head: the real model at TP4 + EP4, 1 and 32 streams, 256 tokens, no `min_tokens`, every stream's text kept; 6 lone requests; one 32-stream round with the server's default sampling. Arm `region`: `VLLM_HPU_FUSED_GREEDY_LOGITS=1` (the greedy region over the gathered logits); arm `cuts`: `VLLM_HPU_VOCAB_PARALLEL_LOGITS=1 VLLM_HPU_PLE_TABLE_RIDER=1` (the same region, the vocabulary-parallel arg max, the PLE rows on the embedding all-reduce); both `VLLM_GRAPH_RESERVED_MEM=0.5` | `compare_arms.py <region> <cuts>`: the 6 lone requests' texts must be equal token for token (both arms compute the same bf16 logits; the cuts are exact); the ms per step at 1 and 32 streams is the cuts' own effect (expected under 1 ms: one all-gather of `[rows, 62,080]` bf16 per rank and one all-reduce fewer) | pending |
 
 A probe that sends `min_tokens` measures none of this: a request with `min_tokens` is kept out of the greedy region
 (`_can_fuse_plain_greedy_sampling`, `hpu_model_runner.py`), so the logits are gathered and sampled as before.
@@ -331,7 +331,7 @@ What is proven on the card (VERIFIED by the jobs named):
   integration tree).
 - Not worth it (00073): `VLLM_HPU_ALL_REDUCE_AS_GATHER_ROWS` (keep 0) and its fused form.
 
-Card jobs: the real-model pair **00124** `real4-ab3-region` / **00125** `real4-ab3-cuts` (commit 0a66722b, any:4,
+Card jobs: none waiting (the pair below was cancelled). The real-model pair **00124** `real4-ab3-region` / **00125** `real4-ab3-cuts` (commit 0a66722b, any:4,
 25 min each, side by side on the two halves, in the places of 00082 / 00083; at 23:33 UTC both "start by 02:50
 UTC at the latest"). This agent handed back at about 23:45 UTC, before the pair started: its two background
 `bin/farm job` commands (logs `reports/collectives/logs/farm_real4_ab3_{region,cuts}.log`) copy each job's log and
@@ -350,17 +350,26 @@ rider's one all-reduce). Cancel the pair if it has not started by about 03:00 UT
 
 At 23:43 UTC the queue had moved: the pair "starts by 03:45 / 03:52 UTC at the latest" (after the integration
 headline 00128 and new jobs), i.e. in the worst case after the coordinator's 03:30 harvest; prefill's 00109
-(all cards) waits behind it. The coordinator was asked at 23:45 UTC whether to cancel the pair in favour of 00109
-(this track's recommendation: cancel; its question moves to the first job of the next rental). Engine-step's
+(all cards) waits behind it. **The pair was cancelled at 23:44 UTC on the coordinator's word, before it ran**, so
+that 00109 starts earlier; its question moves to the first jobs of the next rental. The commands (from the
+worktree's committed head, the two halves at once):
+
+    F=/Volumes/Storage/Claude/gaudi-work/bin/farm
+    $F job collectives real4-ab3-region any:4 25m --env VLLM_HPU_FUSED_GREEDY_LOGITS=1 --env VLLM_GRAPH_RESERVED_MEM=0.5 \
+        -- bash tools/flash_next/collectives/ab_job.sh --levels 1,32 --tokens 256 --warm-tokens 320 --repeat-top 2
+    $F job collectives real4-ab3-cuts any:4 25m --env VLLM_HPU_VOCAB_PARALLEL_LOGITS=1 --env VLLM_HPU_PLE_TABLE_RIDER=1 \
+        --env VLLM_GRAPH_RESERVED_MEM=0.5 \
+        -- bash tools/flash_next/collectives/ab_job.sh --levels 1,32 --tokens 256 --warm-tokens 320 --repeat-top 2
+
+Submit the second only after the first prints its job id (the first syncs the commit). Read them as above. Engine-step's
 **00131** `real4-ab4-short-candvp` (ahead of the pair) runs `VLLM_HPU_CANDIDATE_SAMPLING=1` with
 `VLLM_HPU_VOCAB_PARALLEL_LOGITS=2` on the real model at TP4 (its `candvp` arm against `cand`): the served test of
 this track's top-k head and of the logits all-gather it removes from a sampled step. Read its result when it ends.
 
 Pending, in order:
 
-1. When the pair ends: compare the arms (above), write the result into section 6, tell the coordinator (`main`)
-   whether mode 1 + rider are proven (the integration build keeps every flag of this track off tonight; the
-   verdict is for the next run and the pull request), push.
+1. Next rental: the pair above first (mode 1 + rider for plain greedy); read engine-step's 00131 `candvp` arm
+   tonight if it runs (the served top-k head). Write both into section 6, tell the coordinator, push.
 2. Pull requests after 04:00 UTC: this note (sections 5 and 6, the handoff); nothing else is unmerged.
 3. Count work left, small (0.15 to 0.19 ms each at TP8, coordinator: not worth card time tonight): the PLE rows on
    layer 0's mixer all-reduce when the embedding is replicated; the draft's arg-max gather carrying the winner's
