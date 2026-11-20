@@ -52,7 +52,8 @@ regime without cuts, over L - 1), and the host share of a replay.
 ``BENCH_PIN`` in a rank's environment (for example through ``--env-sets pin:BENCH_PIN=core``) places the rank's
 threads: ``module`` keeps the whole process on the CPUs of its card's module (module m of 8: the m-th eighth of the
 host's CPUs, the slices the card farm gives its containers); ``core`` does the same and then gives the calling
-thread the slice's first CPU for itself. The step ends when the slowest rank has issued, so a rank whose calling
+thread the slice's first CPU for itself; ``far`` is ``core`` on the slice of the module four further (the other
+half of the host's CPUs: the other NUMA node on a two-node host), which tells whether the node matters. The step ends when the slowest rank has issued, so a rank whose calling
 thread is moved or shares its CPU sets the time of all of them.
 
 Run on a Gaudi2 node, inside the container with ``habana_frameworks``, with ``--ranks`` free cards::
@@ -184,13 +185,15 @@ def pin_cpus(rank: int, mode: str, allowed=None, total=None, modules=None) -> tu
         text = os.environ.get("HABANA_VISIBLE_MODULES", "")
         modules = sorted(int(m) for m in text.split(",") if m.strip().isdigit())
     module = modules[rank] if rank < len(modules) else rank
+    if mode == "far":
+        module = (module + TOTAL_MODULES // 2) % TOTAL_MODULES
     per = max(total // TOTAL_MODULES, 1)
     cpus = [c for c in allowed if c // per == module]
     if not cpus:
         count = max(len(modules), rank + 1)
         share = max(len(allowed) // count, 1)
         cpus = allowed[rank * share:(rank + 1) * share] or list(allowed)
-    if mode == "core" and len(cpus) > 1:
+    if mode in ("core", "far") and len(cpus) > 1:
         return cpus[1:], cpus[0]
     return cpus, None
 
@@ -861,7 +864,7 @@ def rank_main(args) -> int:
     try:
         pin_mode = os.environ.get("BENCH_PIN", "")
         pinned, own_cpu = None, None
-        if pin_mode in ("module", "core") and hasattr(os, "sched_setaffinity"):
+        if pin_mode in ("module", "core", "far") and hasattr(os, "sched_setaffinity"):
             # Before torch and the bridge start their threads: they inherit the calling thread's CPUs.
             pinned, own_cpu = pin_cpus(args.rank, pin_mode)
             os.sched_setaffinity(0, pinned)

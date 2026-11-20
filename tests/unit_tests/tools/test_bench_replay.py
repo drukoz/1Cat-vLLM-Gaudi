@@ -342,3 +342,8 @@ def test_pin_cpus_gives_each_rank_its_modules_slice():
     assert cpus == [1] and own is None
     cpus, own = bench.pin_cpus(1, "module", allowed=list(range(4, 12)), total=152, modules=[0, 1])
     assert cpus == [8, 9, 10, 11]
+    # far: the calling thread's own CPU on the slice of the module four further (the other half of the host)
+    cpus, own = bench.pin_cpus(2, "far", allowed=allowed, total=152, modules=[0, 1, 2, 3, 4, 5, 6, 7])
+    assert own == 6 * 19 and cpus == list(range(6 * 19 + 1, 7 * 19))
+    cpus, own = bench.pin_cpus(7, "far", allowed=allowed, total=152, modules=[0, 1, 2, 3, 4, 5, 6, 7])
+    assert own == 3 * 19
