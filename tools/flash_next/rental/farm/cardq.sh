@@ -22,6 +22,8 @@
 #   cardq.sh health                  the habanalabs kernel lines since boot per card and class, and the
 #                                    jobs that had some
 #   cardq.sh bump --by coord ID [WHY]  (the coordinator only) move a waiting job to the front
+#   cardq.sh bump --by coord ID --before OTHER [WHY]   ... or right before the waiting job OTHER
+#   cardq.sh bump --by coord ID --after OTHER [WHY]    ... or right behind it (the same wave, when cards allow)
 #   cardq.sh place --by coord NEW OLD  (the coordinator only) the waiting job NEW takes the place of
 #                                    the job OLD its track cancelled (as submit --replaces would have)
 #   cardq.sh adopt                   (after an update of this file) the waiting jobs get supervisors
@@ -35,7 +37,8 @@
 # Two exceptions. Fairness: a job that wants all cards for more than 45 minutes (CARDQ_LONG_HOLD_S)
 # counts as submitted 10 minutes (CARDQ_LONG_DELAY_S) later, so shorter jobs submitted in those 10
 # minutes start before it (for jobs submitted from 2026-11-20 17:55 UTC on). Bump: a job the
-# coordinator bumped starts before every other waiting job.
+# coordinator bumped starts before every other waiting job, or, with --before/--after, next to the job
+# named; a job that replaces a bumped job (submit --replaces, place) inherits its bump.
 #
 # Cards and modules. A card number is the card's index (hl-smi's, the one HABANA_VISIBLE_DEVICES and
 # /dev/accel/accel<N> take). Its module id can differ (on the 2026-11-20 node index 0..7 is module
@@ -457,46 +460,81 @@ plan_block() {
     BLOCK="${BLOCK# }"
 }
 
-# start_order: one "KEY ID" line per waiting job, in the order the jobs may start: by submission time,
-# except that a job that wants every card for more than LONG_HOLD_S counts as submitted LONG_DELAY_S
-# later, so shorter jobs submitted within that time go before it (and nothing waits more than that
-# on its account).
+# order_of DIR: the place of a waiting job in the start order, as two numbers in OKEY and OTIE (sorted by
+# OKEY, then OTIE, then the job id). OKEY is the submission time, except: a job that wants every card for
+# more than LONG_HOLD_S counts as submitted LONG_DELAY_S later, so shorter jobs submitted within that time go
+# before it (and nothing waits more than that on its account); a job that replaces another has that job's
+# time ("place"); a bumped job has its bump time minus 10^10 (before every job that is not bumped, the
+# first bump first); and an "order" file (bump --before/--after) names both numbers outright.
+OKEY=0
+OTIE=0
+order_of() {
+    local d="$1" sub spec hold
+    rd "$d/submitted"
+    sub="$R"
+    case "$sub" in '' | *[!0-9]*) sub=0 ;; esac
+    rd "$d/spec"
+    spec="$R"
+    rd "$d/maxhold"
+    hold="${R:-$DEFAULT_HOLD_S}"
+    OKEY="$sub"
+    # the rule holds for jobs submitted under it (a "rules" file), not for jobs queued before it
+    if [ "$spec" = all ] && [ "$hold" -gt "$LONG_HOLD_S" ] && [ -f "$d/rules" ]; then
+        OKEY=$((sub + LONG_DELAY_S))
+    fi
+    OTIE="${d##*/}"
+    rd "$d/place" # the place of the job this one replaces (submit --replaces), its id breaking ties
+    case "$R" in
+        '' | *[!0-9]*) ;;
+        *)
+            OKEY="$R"
+            rd "$d/replaces"
+            case "$R" in [0-9]*) OTIE="$R" ;; esac
+            ;;
+    esac
+    rd "$d/bump"
+    case "${R%% *}" in
+        '' | *[!0-9]*) ;;
+        *) OKEY=$((${R%% *} - 10000000000)) ;; # bumped: before every other job, the first bump first
+    esac
+    rd "$d/order" # "KEY TIE": next to another job (bump --before/--after)
+    case "$R" in
+        *' '*)
+            case "${R%% *}${R##* }" in
+                *[!0-9.-]* | '') ;;
+                *)
+                    OKEY="${R%% *}"
+                    OTIE="${R##* }"
+                    ;;
+            esac
+            ;;
+    esac
+}
+
+# start_order: one "KEY TIE ID" line per waiting job, in the order the jobs may start (order_of).
 start_order() {
-    local d id sub spec hold key tie
+    local d
     for d in "$Q"/jobs/*/; do
         d="${d%/}"
         rd "$d/state"
         [ "$R" = waiting ] || continue
-        id="${d##*/}"
-        rd "$d/submitted"
-        sub="$R"
-        case "$sub" in '' | *[!0-9]*) sub=0 ;; esac
-        rd "$d/spec"
-        spec="$R"
-        rd "$d/maxhold"
-        hold="${R:-$DEFAULT_HOLD_S}"
-        key="$sub"
-        # the rule holds for jobs submitted under it (a "rules" file), not for jobs queued before it
-        if [ "$spec" = all ] && [ "$hold" -gt "$LONG_HOLD_S" ] && [ -f "$d/rules" ]; then
-            key=$((sub + LONG_DELAY_S))
-        fi
-        tie="$id"
-        rd "$d/place" # the place of the job this one replaces (submit --replaces), its id breaking ties
-        case "$R" in
-            '' | *[!0-9]*) ;;
-            *)
-                key="$R"
-                rd "$d/replaces"
-                case "$R" in [0-9]*) tie="$R" ;; esac
-                ;;
-        esac
-        rd "$d/bump"
-        case "${R%% *}" in
-            '' | *[!0-9]*) ;;
-            *) key=$((${R%% *} - 10000000000)) ;; # bumped: before every other job, the first bump first
-        esac
-        printf '%s %s %s\n' "$key" "$tie" "$id"
+        order_of "$d"
+        printf '%s %s %s\n' "$OKEY" "$OTIE" "${d##*/}"
     done | sort -n -k1,1 -k2,2 -k3,3
+}
+
+# inherit_bump NEW_DIR OLD_ID: a job that takes the place of a bumped job keeps its bump (and its place next
+# to another job), with a line in its log. With the queue lock held.
+inherit_bump() {
+    local nd="$1" od="$Q/jobs/$2" got=0
+    if [ -f "$od/bump" ] && [ ! -f "$nd/bump" ]; then
+        cp "$od/bump" "$nd/bump" && got=1
+    fi
+    if [ -f "$od/order" ] && [ ! -f "$nd/order" ]; then
+        cp "$od/order" "$nd/order" && got=1
+    fi
+    if [ "$got" -eq 1 ]; then echo "cardq: inherits the bump of job $2 ($(cut -d' ' -f2- "$nd/bump" 2>/dev/null))" >>"$nd/log"; fi
+    return 0
 }
 
 # plan MYID: with the queue lock held and FREE[] filled, decide whether job MYID may start now.
@@ -785,6 +823,7 @@ cmd_submit() {
     put "$d/rules" "fair-long-all-card-jobs"
     printf '%s\n' "$body" >"$d/cmd.sh"
     : >"$d/log"
+    if [ -n "$REPLACES_ID" ]; then inherit_bump "$d" "$REPLACES_ID"; fi
     put "$d/state" waiting
     qunlock
 
@@ -1319,11 +1358,14 @@ cmd_cancel() {
 
 # ------------------------------------------------------------------ bump, adopt
 
-# bump --by coord ID [WHY]: the waiting job ID goes before every other waiting job (bumped jobs among
-# themselves in bump order). Only the coordinator decides a bump; each one is a line in the ledger
-# (end column: the bump time, reason: "bump by WHO: WHY") and in the job's log.
+# bump --by coord ID [--before OTHER | --after OTHER] [WHY]: the waiting job ID goes before every other
+# waiting job (bumped jobs among themselves in bump order), or right before or right behind the waiting job
+# OTHER: its order key is OTHER's, half a step to that side, so the jobs between which it lands keep their
+# order (a wave of small jobs ahead of an all-card job is built this way). Only the coordinator decides a
+# bump; each one is a line in the ledger (end column: the bump time, reason: "bump by WHO: WHY") and in the
+# job's log.
 cmd_bump() {
-    local by="" why d now
+    local by="" why d now side="" other="" od tie
     while [ $# -gt 0 ]; do
         case "$1" in
             --by)
@@ -1335,12 +1377,28 @@ cmd_bump() {
             *) break ;;
         esac
     done
-    [ "$by" = coord ] || DIE_RC=4 die "bump: only the coordinator moves jobs: cardq.sh bump --by coord ID [WHY]"
-    [ $# -ge 1 ] || die "usage: cardq.sh bump --by coord ID [WHY]"
+    [ "$by" = coord ] || DIE_RC=4 die "bump: only the coordinator moves jobs: cardq.sh bump --by coord ID [--before OTHER | --after OTHER] [WHY]"
+    [ $# -ge 1 ] || die "usage: cardq.sh bump --by coord ID [--before OTHER | --after OTHER] [WHY]"
     norm_id "$1"
     shift
+    case "${1:-}" in
+        --before | --after)
+            side="${1#--}"
+            [ $# -ge 2 ] || die "bump: $1 needs a job id"
+            other="$2"
+            shift 2
+            ;;
+    esac
     why="${*:-no reason given}"
     d="$Q/jobs/$ID"
+    if [ -n "$side" ]; then
+        tie="$ID"
+        norm_id "$other"
+        other="$ID"
+        ID="$tie"
+        [ "$other" != "$ID" ] || die "bump: a job cannot stand $side itself"
+        why="$why ($side $other)"
+    fi
     qlock
     rd "$d/state"
     if [ "$R" != waiting ]; then
@@ -1348,13 +1406,31 @@ cmd_bump() {
         die "job $ID is $R, not waiting: nothing to bump"
     fi
     now="$(date -u +%s)"
+    if [ -n "$side" ]; then
+        od="$Q/jobs/$other"
+        rd "$od/state"
+        if [ "$R" != waiting ]; then
+            qunlock
+            die "job $other is $R, not waiting: no place next to it"
+        fi
+        order_of "$od"
+        tie="$(awk -v t="$OTIE" -v s="$side" 'BEGIN { printf "%.6f", t + (s == "before" ? -0.5 : 0.5) }')"
+        put "$d/order" "$OKEY $tie"
+    else
+        rm -f "$d/order"
+    fi
     put "$d/bump" "$now $by: $why"
     rd "$d/submitted"
     ledger "$ID" "$(cat "$d/track")" "$(cat "$d/name")" "$(cat "$d/spec")" - "$(iso "$R")" - "$(iso "$now")" 0 - \
         "bump by $by: $why"
     qunlock
-    echo "cardq: bumped to the front of the queue at $(iso "$now") by $by: $why" >>"$d/log"
-    note "job $ID: bumped to the front by $by ($why)"
+    if [ -n "$side" ]; then
+        echo "cardq: placed $side job $other in the queue at $(iso "$now") by $by: $why" >>"$d/log"
+        note "job $ID: placed $side job $other by $by (${why% ("$side $other")})"
+    else
+        echo "cardq: bumped to the front of the queue at $(iso "$now") by $by: $why" >>"$d/log"
+        note "job $ID: bumped to the front by $by ($why)"
+    fi
 }
 
 # place --by coord NEW OLD: what submit --replaces OLD would have done for the waiting job NEW, for a job
@@ -1392,6 +1468,7 @@ cmd_place() {
     put "$nd/place" "$PLACE_AT"
     put "$nd/replaces" "$REPLACES_ID"
     printf '%s %s\n' "$new" "$REPLACES_CARDS" >>"$Q/jobs/$REPLACES_ID/replaced_by"
+    inherit_bump "$nd" "$REPLACES_ID"
     ledger "$new" "$track" "$(cat "$nd/name")" "$spec" - "$(iso "$(cat "$nd/submitted")")" - "$(iso "$(date -u +%s)")" 0 - \
         "place of $old by $by"
     qunlock
@@ -1518,7 +1595,7 @@ cmd_ledger() {
 }
 
 usage() {
-    sed -n '3,29p' "$SELF" | sed 's/^# \{0,1\}//'
+    sed -n '3,31p' "$SELF" | sed 's/^# \{0,1\}//'
 }
 
 if [ "$(id -u)" -eq 0 ] && [ "${CARDQ_ALLOW_ROOT:-0}" != 1 ]; then

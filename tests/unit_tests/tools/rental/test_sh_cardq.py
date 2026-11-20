@@ -645,6 +645,80 @@ def test_the_coordinator_bumps_a_waiting_job_to_the_front(farm):
     assert "bumped to the front of the queue" in farm.cq("log", c).stdout
 
 
+def _waiting_order(farm):
+    waiting = farm.cq("status").stdout.split("waiting (in the order they start):")[1].split("ended (the last 8):")[0]
+    return [ln.split()[0] for ln in waiting.splitlines() if ln.startswith("  0")]
+
+
+def test_the_coordinator_places_a_waiting_job_before_or_after_another(farm):
+    # A bump moves a job to the very front. Packing a wave (nine 1-card jobs ahead of the next all-card job)
+    # needs a place next to a given job; the coordinator did it by editing order keys by hand.
+    busy = farm.block("all")
+    assert farm.until(lambda: farm.file(busy, "state") == "running")
+    a = farm.hold("all", 0.2, name="a")
+    b = farm.hold("all", 0.2, name="b")
+    c = farm.hold("all", 0.2, name="c")
+    d = farm.hold("all", 0.2, name="d")
+    assert _waiting_order(farm) == [a, b, c, d]
+    proc = farm.cq("bump", "--by", "coord", d, "--before", b, "one", "wave")
+    assert proc.returncode == 0, proc.stderr
+    assert "job %s: placed before job %s by coord (one wave)" % (d, b) in proc.stderr
+    assert _waiting_order(farm) == [a, d, b, c]
+    proc = farm.cq("bump", "--by", "coord", a, "--after", c)
+    assert proc.returncode == 0, proc.stderr
+    assert _waiting_order(farm) == [d, b, c, a]
+    line = [ln for ln in farm.cq("status").stdout.splitlines() if ln.startswith("  %s " % d)][0]
+    assert "[bumped: coord: one wave (before %s)]" % b in line
+    # a job placed next to a placed job lands next to it
+    e = farm.hold("all", 0.2, name="e")
+    assert farm.cq("bump", "--by", "coord", e, "--before", d).returncode == 0
+    assert _waiting_order(farm) == [e, d, b, c, a]
+    for args, rc, text in (
+        (["--by", "coord", a, "--before", busy], 1, "is running, not waiting"),
+        (["--by", "coord", a, "--before", a], 1, "itself"),
+        (["--by", "prefill", a, "--before", b], 4, "only the coordinator"),
+        (["--by", "coord", a, "--before"], 1, "needs a job id"),
+        (["--by", "coord", a, "--before", "777"], 1, "no job 00777"),
+    ):
+        proc = farm.cq("bump", *args)
+        assert proc.returncode == rc and text in proc.stderr, (args, proc.returncode, proc.stderr)
+    farm.release(busy)
+    for job in (busy, a, b, c, d, e):
+        assert farm.wait(job).returncode == 0
+    iv = farm.intervals()
+    assert iv[e][1] < iv[d][1] < iv[b][1] < iv[c][1] < iv[a][1], iv
+    rows = [ln.split("\t") for ln in farm.cq("ledger").stdout.splitlines() if ln.startswith(d)]
+    assert rows[0][10] == "bump by coord: one wave (before %s)" % b
+    assert "placed before job %s" % b in farm.cq("log", d).stdout
+
+
+def test_a_replacement_inherits_the_bump_of_the_job_it_replaces(farm):
+    # Four tracks lost a bump on 2026-11-20 when they replaced the bumped job by a smaller or corrected one.
+    busy = farm.block("all")
+    assert farm.until(lambda: farm.file(busy, "state") == "running")
+    first = farm.hold("all", 0.2, track="beta", name="first")
+    old = farm.hold("all", 0.2, track="alpha", name="old-all")
+    assert farm.cq("bump", "--by", "coord", old, "decisive").returncode == 0
+    proc = _replace(farm, "any:4", old)
+    assert proc.returncode == 0, proc.stderr
+    new = proc.stdout.strip()
+    assert farm.until(lambda: farm.file(old, "state") == "cancelled")
+    assert "inherits the bump of job %s" % old in farm.cq("log", new).stdout
+    line = [ln for ln in farm.cq("status").stdout.splitlines() if ln.startswith("  %s " % new)][0]
+    assert "[bumped: coord: decisive]" in line
+    assert _waiting_order(farm) == [new, first]  # with only the old job's place it would stand behind `first`
+    # the same through the coordinator's place, for a job the track cancelled itself and submitted again
+    again = farm.hold("all", 0.2, track="beta", name="again")
+    assert farm.cq("bump", "--by", "coord", again, "--before", new, "first of the wave").returncode == 0
+    assert farm.cq("cancel", "--track", "beta", again).returncode == 0
+    conv = farm.hold("any:4", 0.2, track="beta", name="converted")
+    assert farm.cq("place", "--by", "coord", conv, again).returncode == 0
+    assert _waiting_order(farm) == [conv, new, first]
+    farm.release(busy)
+    for job in (busy, first, new, conv):
+        assert farm.wait(job).returncode == 0
+
+
 def test_adopt_gives_a_waiting_job_a_new_supervisor_and_keeps_it(farm):
     busy = farm.block("0")
     assert farm.until(lambda: farm.file(busy, "state") == "running")
