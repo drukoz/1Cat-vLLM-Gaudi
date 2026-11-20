@@ -85,8 +85,9 @@ it is intermittent, and no op is immune: it hit `hc_*`, `moe_route`, `moe_combin
 `gdn_recurrent_decode`.
 
 **Evidence (Gaudi2 node, bridge 1.24.1, 2026-11-20).** Read from the logs: all 21 failing-graph dumps of the day
-have this shape (two hyper-connection card tests, two MoE glue card tests, the GDN replay tool, one GDN server,
-two hyper-connection servers), and the node numbers of the op and of the producers interleave one by one. On the
+have this shape (two runs of the hyper-connection card test, two of the MoE glue card test, the GDN replay tool,
+one GDN server, two hyper-connection servers), and the node numbers of the op and of the producers interleave
+one by one. On the
 card: the hyper-connection card test failed 6 of 90 at 06:05 UTC and 7 of 90 at 06:45 UTC at mode 1, with only
 the first test of the process in both sets, and passed 90 of 90 at mode 0 in between; the MoE glue card test lost
 its two bridge errors at mode 0 and kept its two numeric failures. That the second builder is the accumulation
@@ -104,8 +105,8 @@ thread is an inference from those two facts: the bridge is not open source.
 **Not covered.** `load_gdn_fused_extension` is unchanged: the fused GDN kernel is on by default, so a refusal or a
 default there changes servers that never asked for the kernels above. It is exposed to the same race (the GDN
 server of 06:19 UTC failed with it, and so did the `recurrent` replay of G1b's attempt through the combined
-kernel database, which G1b read as a fault of that database and switched off). Until that loader gets the same rule, a lazy
-process that runs the fused GDN kernel needs `PT_HPU_LAZY_ACC_PAR_MODE=0` in its environment.
+kernel database, which G1b read as a fault of that database and switched off). Until that loader gets the same
+rule, a lazy process that runs the fused GDN kernel needs `PT_HPU_LAZY_ACC_PAR_MODE=0` in its environment.
 
 **Reading a failure.** `python -m tools.flash_next.rental.lazy_graph <log>...` prints one sentence per dump: the
 empty tensor, the op that took it as a graph input, and the node of the same graph that produces it. A dump
