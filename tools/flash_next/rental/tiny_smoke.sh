@@ -39,6 +39,14 @@
 # Ctrl-C, SIGTERM and a dropped SSH session (SIGHUP) stop the check inside the container, so its
 # server releases the cards; the exit code is then 130, 143 or 129. The Habana runtime logs of a
 # call go to <results>/<run-id>/habana_logs.
+#
+# Part of the cards (a job of the card queue that holds 1, 2 or 4 cards): --cards LIST mounts only
+# those cards (HABANA_VISIBLE_DEVICES, card indices) and serves at TP = their number (--tp N sets it),
+# --name-suffix S names the container fn-smoke-S, --port N gives the tiny server its port (with host
+# networking two servers on one port collide), --job ID labels the container cardq.job=ID so the queue
+# removes it when the job ends. In a queue job:
+#     sudo -n bash tiny_smoke.sh --fresh --cards "$CARDQ_CARDS" --name-suffix "$CARDQ_JOB" \
+#         --port "$((CARDQ_PORT_BASE + 10))" --job "$CARDQ_JOB" --results ... --run-id ...
 
 set -euo pipefail
 
@@ -64,6 +72,11 @@ usage() {
     echo "  --env KEY=VALUE extra server environment variable, repeatable; applied after the mode's own flags"
     echo "  --no-recipe-cache   give no server the compiled-recipe cache under /results/recipe-cache (by default the pytorch mode's server gets it, and the fused mode's with the combined kernel database)"
     echo "  --no-combined-kernel-db  keep the combined kernel database out of the smoke servers (FLASHINFER_GAUDI_COMBINED_KERNEL_DB=0 for the check and its servers); the fused mode's server then runs the colon-list GC_KERNEL_PATH without a recipe cache"
+    echo "  --cards LIST    mount only these cards (card indices, as the card queue grants them; default: all)"
+    echo "  --tp N          tensor parallel size of the tiny server (default: the number of --cards, else 8)"
+    echo "  --name-suffix S name the container fn-smoke-S (default: fn-smoke)"
+    echo "  --port N        port of the tiny server (default in the check: 8010)"
+    echo "  --job ID        label the container cardq.job=ID: the card queue removes it when its job ends"
     echo "  --dry-run       print the docker commands and exit 0"
 }
 
@@ -79,6 +92,11 @@ HEALTH_TIMEOUT=""
 NO_RECIPE_CACHE=0
 NO_COMBINED_DB=0
 EXTRA_ENV=()
+CARDS="all"
+TP=""
+NAME_SUFFIX=""
+PORT=""
+JOB_LABEL=""
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -126,6 +144,32 @@ while [ $# -gt 0 ]; do
             NO_COMBINED_DB=1
             shift
             ;;
+        --cards)
+            CARDS="$2"
+            case "$CARDS" in all | [0-9]*) ;; *) echo "error: --cards takes card numbers such as 3,4,5,6, got '$CARDS'" >&2; exit 2 ;; esac
+            case "$CARDS" in *[!0-9,]*) if [ "$CARDS" != all ]; then echo "error: --cards takes card numbers such as 3,4,5,6, got '$CARDS'" >&2; exit 2; fi ;; esac
+            shift 2
+            ;;
+        --tp)
+            TP="$2"
+            case "$TP" in '' | *[!0-9]*) echo "error: --tp takes a number, got '$TP'" >&2; exit 2 ;; esac
+            shift 2
+            ;;
+        --name-suffix)
+            NAME_SUFFIX="$2"
+            case "$NAME_SUFFIX" in '' | *[!A-Za-z0-9_.-]*) echo "error: --name-suffix: letters, digits, '.', '_' and '-' only" >&2; exit 2 ;; esac
+            shift 2
+            ;;
+        --port)
+            PORT="$2"
+            case "$PORT" in '' | *[!0-9]*) echo "error: --port takes a number, got '$PORT'" >&2; exit 2 ;; esac
+            shift 2
+            ;;
+        --job)
+            JOB_LABEL="$2"
+            case "$JOB_LABEL" in '' | *[!0-9]*) echo "error: --job takes the queue's job id, got '$JOB_LABEL'" >&2; exit 2 ;; esac
+            shift 2
+            ;;
         --dry-run)
             DRY_RUN=1
             shift
@@ -143,6 +187,11 @@ while [ $# -gt 0 ]; do
 done
 
 RUN_ID="${RUN_ID:-smoke-$(date -u +%Y%m%dT%H%M%SZ)}"
+NAME="$NAME${NAME_SUFFIX:+-$NAME_SUFFIX}"
+if [ -z "$TP" ] && [ "$CARDS" != all ]; then
+    TP=0
+    for _card in ${CARDS//,/ }; do TP=$((TP + 1)); done
+fi
 RESULTS="${RESULTS:-$PWD/results}"
 case "$RESULTS" in
     /*) ;;
@@ -169,7 +218,7 @@ build_commands() {
         docker run -d --name "$NAME"
         --init
         --runtime=habana
-        -e HABANA_VISIBLE_DEVICES=all
+        -e "HABANA_VISIBLE_DEVICES=$CARDS"
         -e OMPI_MCA_btl_vader_single_copy_mechanism=none
         -e PYTHONUNBUFFERED=1
         -e PYTHONFAULTHANDLER=1
@@ -182,6 +231,10 @@ build_commands() {
         "$IMAGE"
         sleep infinity
     )
+    if [ -n "$JOB_LABEL" ]; then
+        # before the image: the label of the queue job, by which the queue removes the container
+        RUN_CMD=("${RUN_CMD[@]:0:5}" --label "cardq.job=$JOB_LABEL" "${RUN_CMD[@]:5}")
+    fi
     INSTALL_CMD=(docker exec "$NAME" bash "/bundle/$ENTRY" --install-only --results /results --run-id "$RUN_ID")
     # The container outlives one call, so what belongs to this call travels with the docker exec:
     # the Habana logs of the check and its servers go to the call's run folder. The fault handler is
@@ -212,6 +265,12 @@ build_commands() {
     fi
     if [ -n "$HEALTH_TIMEOUT" ]; then
         SMOKE_CMD+=(--health-timeout "$HEALTH_TIMEOUT")
+    fi
+    if [ -n "$PORT" ]; then
+        SMOKE_CMD+=(--port "$PORT")
+    fi
+    if [ -n "$TP" ]; then
+        SMOKE_CMD+=(--tp "$TP")
     fi
     if [ "${#EXTRA_ENV[@]}" -gt 0 ]; then
         local kv
@@ -271,6 +330,14 @@ if command -v hl-smi >/dev/null 2>&1; then
 fi
 
 NEW=0
+if [ "$FRESH" -eq 0 ] && [ "$CARDS" != all ] && has_name "$RUNNING" "$NAME"; then
+    # a container of other cards cannot serve these: start a new one
+    HAD="$(docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$NAME" 2>/dev/null | sed -n 's/^HABANA_VISIBLE_DEVICES=//p')"
+    if [ "$HAD" != "$CARDS" ]; then
+        echo "container $NAME holds cards ${HAD:-?}, not $CARDS: starting a new one"
+        FRESH=1
+    fi
+fi
 if [ "$FRESH" -eq 1 ] || ! has_name "$RUNNING" "$NAME"; then
     if has_name "$EXISTING" "$NAME"; then
         docker rm -f "$NAME" >/dev/null

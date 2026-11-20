@@ -172,3 +172,30 @@ def test_a_check_that_does_not_stop_costs_the_container_after_a_bounded_wait(tmp
         "stop -t 10 fn-smoke")
     assert not (tmp_path / "state" / "check-alive").exists()
     assert "new container" in out + err  # the next call starts over: said, not silent
+
+
+def test_part_of_the_cards_gets_its_own_container_port_tp_and_queue_label(tmp_path):
+    start, install, smoke = _dry_run(tmp_path, "--cards", "3,4,5,6", "--name-suffix", "00042", "--port", "8410",
+                                     "--job", "00042")
+    assert start[:7] == ["docker", "run", "-d", "--name", "fn-smoke-00042", "--label", "cardq.job=00042"]
+    assert "HABANA_VISIBLE_DEVICES=3,4,5,6" in start and "HABANA_VISIBLE_DEVICES=all" not in start
+    assert install[:3] == ["docker", "exec", "fn-smoke-00042"]
+    assert smoke[smoke.index("fn-smoke-00042") + 1:smoke.index("fn-smoke-00042") + 4] == [
+        "python", "-m", "tools.flash_next.rental.tiny_smoke"]
+    assert smoke[-4:] == ["--port", "8410", "--tp", "4"]
+    _start, _install, smoke = _dry_run(tmp_path, "--cards", "5,6", "--tp", "1")
+    assert smoke[-2:] == ["--tp", "1"]
+
+
+def test_by_default_all_cards_and_no_tp_port_or_label(tmp_path):
+    start, _install, smoke = _dry_run(tmp_path)
+    assert "--label" not in start and "--tp" not in smoke and "--port" not in smoke
+    assert start[4] == "fn-smoke"
+
+
+@pytest.mark.parametrize("args", [["--cards", "x"], ["--cards", "1;2"], ["--tp", "a"], ["--port", "p"], ["--job", "j"],
+                                  ["--name-suffix", "a b"]])
+def test_bad_partial_card_options_are_refused(tmp_path, args):
+    proc = subprocess.run(["bash", str(SCRIPTS_DIR / "tiny_smoke.sh"), "--dry-run", *args], capture_output=True,
+                          text=True, cwd=tmp_path, timeout=60)
+    assert proc.returncode == 2, proc.stdout

@@ -475,3 +475,28 @@ def test_error_lines_keeps_the_last_distinct_errors():
         "RuntimeError: Engine core initialization failed. See root cause above.",
     ]
     assert tiny_smoke.error_lines("all fine\n") == []
+
+
+def test_tp_command_sets_or_adds_the_tensor_parallel_size():
+    cmd = ["vllm", "serve", "/c", "--tensor-parallel-size", "8", "--port", "1"]
+    assert tiny_smoke.tp_command(cmd, 4) == ["vllm", "serve", "/c", "--tensor-parallel-size", "4", "--port", "1"]
+    assert tiny_smoke.tp_command(["vllm"], 2) == ["vllm", "--tensor-parallel-size", "2"]
+    assert tiny_smoke.tp_command(cmd, None) is cmd  # the default: the gate's own command, unchanged
+
+
+def test_tp_reaches_every_mode_and_its_default_is_none(fakes, monkeypatch):
+    out, port = fakes
+    seen = []
+
+    def fake_run_mode(mode, ckpt, out_dir, port, health_timeout_s, **kwargs):
+        seen.append(kwargs.get("tp"))
+        return {"mode": mode, "status": "passed", "reason": None, "startup_seconds": 1.0, "errors": [],
+                "fallback_lines": [], "log": str(out_dir / "server0.log"), "warmup": "warmup skipped",
+                "decode_ms_per_token": None}
+
+    monkeypatch.setattr(tiny_smoke, "run_mode", fake_run_mode)
+    code, _ = run(out, port, "--tp", "4")
+    assert code == 0 and seen == [4, 4]
+    seen.clear()
+    code, _ = run(out, port)
+    assert code == 0 and seen == [None, None]

@@ -81,6 +81,20 @@ DECODE_FALLBACK = "GDN core decode"
 # The two commands are the tiny gate's own, so the smoke test starts what the run will start.
 checkpoint_command = orchestrator.tiny_checkpoint_command
 serve_command = orchestrator.tiny_serve_command
+TP_FLAG = "--tensor-parallel-size"
+
+
+def tp_command(cmd: list, tp: int | None) -> list:
+    """`cmd` with its --tensor-parallel-size set to `tp` (added when it has none); unchanged for None. The
+    smoke test of a queue job on part of the cards (tiny_smoke.sh --cards) serves at TP = its card count."""
+    if tp is None:
+        return cmd
+    cmd = list(cmd)
+    if TP_FLAG in cmd:
+        cmd[cmd.index(TP_FLAG) + 1] = str(tp)
+    else:
+        cmd += [TP_FLAG, str(tp)]
+    return cmd
 
 
 # One definition for the smoke test, the tiny gate and the variants (the orchestrator reports a server
@@ -140,7 +154,7 @@ def decode_ms_per_token(base_url: str, reference_path: Path, post=None, clock=ti
 
 def run_mode(mode: str, ckpt: Path, out_dir: Path, port: int, health_timeout_s: float, skip_warmup: bool = True,
              extra_env: dict | None = None, recipe_cache: str | None = None, recipe_cache_mb: int = 8192,
-             combined_db: bool = False) -> dict:
+             combined_db: bool = False, tp: int | None = None) -> dict:
     """Serve the tiny checkpoint in one GDN mode, compare it with the reference, stop the server.
 
     The overrides are the mode's GDN flags, then `VLLM_SKIP_WARMUP=true` when `skip_warmup`, then the
@@ -176,7 +190,7 @@ def run_mode(mode: str, ckpt: Path, out_dir: Path, port: int, health_timeout_s: 
         cache_word = "on" if cache_env else "off"
         print("tiny smoke [%s]: starting the server (recipe cache %s; log: %s)" % (mode, cache_word, log_path),
               flush=True)
-        popen = serve.start_server(serve_command(ckpt, port), env, log_path, out_dir)
+        popen = serve.start_server(tp_command(serve_command(ckpt, port), tp), env, log_path, out_dir)
         try:
             started = time.monotonic()
             healthy = serve.wait_healthy(port, health_timeout_s, popen)
@@ -256,6 +270,9 @@ def main(argv: list[str] | None = None) -> int:
                         "plus the fused hyper-connection kernels, VLLM_HPU_HC_FUSED=1; moe is fused plus the MoE "
                         "glue kernels, VLLM_HPU_MOE_GLUE=1)")
     parser.add_argument("--port", type=int, default=orchestrator.TINY_PORT)
+    parser.add_argument("--tp", type=int, default=None, metavar="N",
+                        help="tensor parallel size of the tiny server (default: the gate's, 8); a queue job on part "
+                        "of the cards gives its card count")
     parser.add_argument("--health-timeout", type=float, default=HEALTH_TIMEOUT_S, metavar="S")
     parser.add_argument("--full-warmup", action="store_true",
                         help="run the real bucket warmup (about 15 minutes per mode): by default the servers "
@@ -295,7 +312,7 @@ def main(argv: list[str] | None = None) -> int:
             entry = run_mode(mode, ckpt, out / mode, args.port, args.health_timeout,
                              skip_warmup=not args.full_warmup, extra_env=extra_env,
                              recipe_cache=recipe_cache, recipe_cache_mb=args.recipe_cache_mb,
-                             combined_db=combined_db)
+                             combined_db=combined_db, tp=args.tp)
             summary["modes"].append(entry)
             report_mode(entry)
         summary["passed"] = all(entry["status"] == "passed" for entry in summary["modes"])
