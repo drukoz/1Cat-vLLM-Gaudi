@@ -7,7 +7,12 @@ replaces that file with the flags of the round's arm, so the same server and car
 a path off and on, in turn (base, arm, base, arm: the second pair bounds the drift). Arms:
 
     base  VLLM_HPU_FLASH_NEXT_DECODE_METADATA=0  VLLM_HPU_FUSED_GREEDY_LOGITS=0  VLLM_HPU_CANDIDATE_SAMPLING=0
-    both  1 1 0        i01  1 0 0        i05  0 1 0        cand  0 0 1
+          VLLM_HPU_VOCAB_PARALLEL_LOGITS=0
+    both  1 1 0 0      i01  1 0 0 0      i05  0 1 0 0      cand  0 0 1 0      candvp  0 0 1 2
+
+``candvp`` is sampling over candidates with the vocabulary-parallel head (``vocab_parallel.top_k``: each rank's
+top 64 and one ``[rows, 128]`` fp32 all-gather per rank instead of the logits all-gather); ``--candvp`` adds its
+rounds after the ``cand`` ones (candvp, cand, candvp in turn).
 
 Rounds (``N`` = ``--streams``, every stream exactly ``--tokens`` tokens: ``max_tokens`` with ``ignore_eos``, no
 ``min_tokens``, temperature 0):
@@ -51,9 +56,11 @@ import sys
 import threading
 import time
 
-FLAGS = ("VLLM_HPU_FLASH_NEXT_DECODE_METADATA", "VLLM_HPU_FUSED_GREEDY_LOGITS", "VLLM_HPU_CANDIDATE_SAMPLING")
+FLAGS = ("VLLM_HPU_FLASH_NEXT_DECODE_METADATA", "VLLM_HPU_FUSED_GREEDY_LOGITS", "VLLM_HPU_CANDIDATE_SAMPLING",
+         "VLLM_HPU_VOCAB_PARALLEL_LOGITS")
 ARMS = {name: dict(zip(FLAGS, values)) for name, values in (
-    ("base", (0, 0, 0)), ("both", (1, 1, 0)), ("i01", (1, 0, 0)), ("i05", (0, 1, 0)), ("cand", (0, 0, 1)))}
+    ("base", (0, 0, 0, 0)), ("both", (1, 1, 0, 0)), ("i01", (1, 0, 0, 0)), ("i05", (0, 1, 0, 0)),
+    ("cand", (0, 0, 1, 0)), ("candvp", (0, 0, 1, 2)))}
 SWITCH_LINE = "Runtime switches from"
 REFUSAL_LINE = "is off for this server"
 
@@ -96,9 +103,9 @@ def one_stream(host, port, model, prompt, ntok, out, idx, barrier, timeout_s, mi
                 if obj.get("usage"):
                     rec["usage"] = obj["usage"]
                 ch = obj.get("choices") or []
-                if ch and ch[0].get("text"):
+                if ch:  # one chunk per decode step; its text may be empty (special tokens, held-back bytes)
                     rec["times"].append(time.perf_counter())
-                    rec["text"].append(ch[0]["text"])
+                    rec["text"].append(ch[0].get("text") or "")
         conn.close()
     except Exception as e:  # noqa: BLE001 - a probe records every failure
         rec["err"] = repr(e)
@@ -118,13 +125,18 @@ def run_round(args, label, prompts, ntok, min_tokens=False, sampling=None):
     for t in threads:
         t.join(args.timeout + 60)
     wall = time.perf_counter() - t_start
-    per, errors, texts = [], 0, []
+    per, errors, texts, untimed = [], 0, [], 0
     for r in out:
-        if not r or r["err"] or r["status"] != 200 or len(r["times"]) < 2:
+        # An error is a failed request (an exception, an HTTP status, no chunk at all). A stream that came back
+        # in fewer than two chunks (a 2-token request) has no gap to time: counted as untimed, not as an error.
+        if not r or r["err"] or r["status"] != 200 or not r["times"]:
             errors += 1
             texts.append(None)
             continue
         texts.append("".join(r["text"]))
+        if len(r["times"]) < 2:
+            untimed += 1
+            continue
         usage = r["usage"] or {}
         comp = usage.get("completion_tokens") or len(r["times"])
         gaps = [b - a for a, b in zip(r["times"], r["times"][1:])]
@@ -138,7 +150,7 @@ def run_round(args, label, prompts, ntok, min_tokens=False, sampling=None):
                     "first": r["times"][0], "last": r["times"][-1],
                     "gaps_ms": [round(1000.0 * g, 2) for g in gaps]})
     res = {"label": label, "streams": n, "tokens": ntok, "min_tokens": bool(min_tokens), "ok": len(per),
-           "errors": errors, "wall_s": wall, "texts": texts}
+           "errors": errors, "untimed": untimed, "wall_s": wall, "texts": texts}
     if per:
         res["steady_ms_p50"] = statistics.median(p["steady_ms"] for p in per)
         res["steady_ms_min"] = min(p["steady_ms"] for p in per)
@@ -291,6 +303,78 @@ class Probe:
         self.save()
 
 
+def _request(args, path, payload=None, timeout=120.0):
+    """(status, parsed JSON or text) of one plain request; (None, the exception's text) when it failed."""
+    try:
+        conn = http.client.HTTPConnection(args.host, args.port, timeout=timeout)
+        if payload is None:
+            conn.request("GET", path)
+        else:
+            conn.request("POST", path, body=json.dumps(payload), headers={"Content-Type": "application/json"})
+        resp = conn.getresponse()
+        body = resp.read().decode("utf-8", "replace")
+        conn.close()
+        try:
+            return resp.status, json.loads(body)
+        except ValueError:
+            return resp.status, body[:500]
+    except Exception as e:  # noqa: BLE001 - a probe records every failure
+        return None, repr(e)
+
+
+def _token_id(key):
+    """The id of a ``return_tokens_as_token_ids`` key (``token_id:123``), or None."""
+    if isinstance(key, str) and key.startswith("token_id:"):
+        try:
+            return int(key.split(":", 1)[1])
+        except ValueError:
+            return None
+    return None
+
+
+def logprobs_check(args, prompt):
+    """logprobs=5 and prompt_logprobs=2 on a greedy request: HTTP 200, every top-logprob id an id of the
+    vocabulary (int, 0 <= id < 2**31; a garbled id is out of that range or the server dies on it), the generated
+    token is the first of its position's top logprobs, and /health answers after both."""
+    result = {"ok": False}
+    status, body = _request(args, "/v1/completions", {
+        "model": args.model, "prompt": prompt, "max_tokens": 8, "temperature": 0, "logprobs": 5,
+        "return_tokens_as_token_ids": True})
+    entry = {"status": status}
+    if status == 200 and isinstance(body, dict):
+        lp = ((body.get("choices") or [{}])[0].get("logprobs") or {})
+        tokens, tops = lp.get("tokens") or [], lp.get("top_logprobs") or []
+        ids = [[_token_id(k) for k in (top or {})] for top in tops]
+        entry.update(positions=len(tops), top_ids=ids[:3], tokens=tokens[:3])
+        entry["ids_valid"] = bool(ids) and all(i is not None and 0 <= i < 2**31 for row in ids for i in row)
+        firsts = []
+        for token, top in zip(tokens, tops):
+            best = max(top.items(), key=lambda kv: kv[1])[0] if top else None
+            firsts.append(token == best or (top and top.get(token) == top.get(best)))
+        entry["sampled_is_top"] = bool(firsts) and all(firsts)
+    else:
+        entry["error"] = str(body)[:300]
+    result["logprobs"] = entry
+    status, body = _request(args, "/v1/completions", {
+        "model": args.model, "prompt": prompt, "max_tokens": 2, "temperature": 0, "prompt_logprobs": 2})
+    entry = {"status": status}
+    if status == 200 and isinstance(body, dict):
+        plp = (body.get("choices") or [{}])[0].get("prompt_logprobs") or []
+        keys = [int(k) for pos in plp if pos for k in pos if str(k).lstrip("-").isdigit()]
+        entry.update(positions=len(plp), ids=len(keys), ids_valid=bool(keys) and all(0 <= k < 2**31 for k in keys))
+    else:
+        entry["error"] = str(body)[:300]
+    result["prompt_logprobs"] = entry
+    health, _ = _request(args, "/health", timeout=30.0)
+    result["health_after"] = health
+    result["ok"] = bool(health == 200 and result["logprobs"].get("ids_valid") and
+                        result["logprobs"].get("sampled_is_top") and result["prompt_logprobs"].get("ids_valid"))
+    print("LOGPROBS %s: logprobs %s, prompt_logprobs %s, /health after: %s" % (
+        "ok" if result["ok"] else "FAILED", json.dumps(result["logprobs"])[:400],
+        json.dumps(result["prompt_logprobs"])[:200], health), flush=True)
+    return result
+
+
 def summary(probe):
     """Per kind and arm: the measured rounds' steady ms per token, and each arm against base."""
     rows = {}
@@ -319,6 +403,12 @@ def summary(probe):
         out.append(line)
         print("  %-6s %-5s against base: %.2f -> %.2f ms per token (%+.2f ms, %+.1f %%)" % (
             kind, arm, base, value, value - base, line["delta_pct"]))
+        cand = table.get((kind, "cand"))
+        if arm == "candvp" and cand is not None:
+            out.append({"kind": kind, "arm": arm, "against": "cand", "base_ms": cand, "arm_ms": value,
+                        "delta_ms": value - cand, "delta_pct": 100.0 * (value - cand) / cand})
+            print("  %-6s %-5s against cand: %.2f -> %.2f ms per token (%+.2f ms, %+.1f %%)" % (
+                kind, arm, cand, value, value - cand, 100.0 * (value - cand) / cand))
     probe.results["summary"] = out
     probe.save()
 
@@ -342,6 +432,10 @@ def main():
     ap.add_argument("--budget", type=float, default=1200.0, help="seconds after which optional rounds are left out")
     ap.add_argument("--no-long", action="store_true")
     ap.add_argument("--no-sampled", action="store_true", help="leave out the rounds without a temperature")
+    ap.add_argument("--candvp", action="store_true", help="add the candvp arm (candidates on the vocabulary-"
+                    "parallel head) to the sampled rounds")
+    ap.add_argument("--logprobs-check", action="store_true", help="last: a request with logprobs=5 and one with "
+                    "prompt_logprobs=2, the ids checked, then /health (a server that dies there loses nothing)")
     args = ap.parse_args()
     arms = [a for a in args.arms.split(",") if a]
     for arm in arms:
@@ -457,6 +551,11 @@ def main():
                   for i in (1, 2)]
         probe.compare("seeded", seeded[0], seeded[1])
         print("SEED cand: %r" % ((seeded[0]["texts"][0] or "")[:120], ), flush=True)
+        if args.candvp:
+            measure("sampled", "candvp", short_prompts, warm=24, sampling={})
+            sampled_words("candvp")
+            measure("sampled", "cand", short_prompts, sampling={})
+            measure("sampled", "candvp", short_prompts, sampling={})
 
     # --- the other arms (which flag carries the effect), then the min_tokens mask; left out when time is short
     for arm in other_arms:
@@ -484,6 +583,13 @@ def main():
             probe.note("a seeded request through vLLM's sampler failed: %s" % (
                 seeded[0].get("error_samples") or seeded[1].get("error_samples")))
             return 0 if probe.switch_ok else 1
+    if args.logprobs_check:
+        probe.set_arm("base")
+        check = logprobs_check(args, one_prompt)
+        probe.results["logprobs_check"] = check
+        probe.save()
+        if not check.get("ok"):
+            return 1
     bad = sum(1 for r in probe.results["rounds"] if r["errors"])
     if bad or not probe.switch_ok:
         print("PROBE: %d round(s) with errors, switches ok: %s" % (bad, probe.switch_ok), flush=True)

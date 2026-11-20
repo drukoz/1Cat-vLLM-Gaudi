@@ -17,7 +17,10 @@ This module imports nothing of the plugin (the runner cannot be imported on a ma
 import os
 from typing import Optional
 
-SWITCHABLE = ("VLLM_HPU_FLASH_NEXT_DECODE_METADATA", "VLLM_HPU_FUSED_GREEDY_LOGITS", "VLLM_HPU_CANDIDATE_SAMPLING")
+# VLLM_HPU_VOCAB_PARALLEL_LOGITS is read at every call of the logits region (distributed/vocab_parallel.mode()),
+# which runs as lazy ops after the replayed decode graph: switching it changes the region's graph, not a captured one.
+SWITCHABLE = ("VLLM_HPU_FLASH_NEXT_DECODE_METADATA", "VLLM_HPU_FUSED_GREEDY_LOGITS", "VLLM_HPU_CANDIDATE_SAMPLING",
+              "VLLM_HPU_VOCAB_PARALLEL_LOGITS")
 
 
 def parse_switches(text: str) -> dict[str, str]:
