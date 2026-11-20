@@ -52,6 +52,21 @@ flag equal the task trace, the committed stream equals ``gen`` over the overlapp
 and that the step's ``read``/``log0``/``ckpt`` gaps plus the final read gap are <= FP32_TOL.
 Plain asserts: a divergence fails the run, the harness skips and weakens nothing.
 
+S0 - S7 are the recipe's (k = 3) and pin their traces. The same harness runs five more chains at
+every size of ``flash_next_spec_sizes.SPEC_SIZES`` (k = 3, 4, 5), each with block size 4 (from k = 4
+a step is longer than a block and can complete two) and 8 (a step fits in a block):
+
+* every accepted count ``0, 1, .. k`` in turn, then ``k, .. 1, 0``: a rejection forced at every draft
+  position, every pre-step bias and every lattice column as the next step's load;
+* all drafts accepted four steps running;
+* verification and plain steps interleaved (the ``vpvpv`` and ``vppvv`` patterns of S6 and S7).
+
+Their expected traces are not written out: the accepted count of each step follows from the tampered
+draft, the boundary pairs are derived from the context length (token ``t`` commits when
+``(ctx + t + 1) % block_size == 0``, from lattice column ``t`` into the slot of the block it completes),
+the stream is the non-speculative stream of the same model (the HF reference continued on the plain
+path), and the parity and checkpoint audits are S0 - S7's.
+
 Every test runs twice: on the torch GDN verification path (``VLLM_HPU_GDN_CORE_VERIFY=0``) and through
 the fused verify op (``1``), and asserts which path ran.
 """
@@ -72,24 +87,28 @@ from vllm_gaudi.v1.worker.recurrent_commit import (  # noqa: E402
     align_precopy_plan, boundary_commits, commit_conv, commit_ssm, precopy_slot_pairs, self_commit_requests)
 from vllm_gaudi.v1.worker.recurrent_lattice import align_lattice  # noqa: E402
 
+from tests.unit_tests.flash_next_spec_sizes import require_startup  # noqa: E402
 from tests.unit_tests.models.flash_next.cpu_model import (  # noqa: E402
     cpu_draft_model, cpu_model, decode_metadata, eos_token_id, fp32_logits, ple_kwargs)
 from tests.unit_tests.models.flash_next.test_mtp_end_to_end import (  # noqa: E402
-    FP32_TOL, GDN_WINDOW, K, MTP, PLE_WINDOW, SPEC_SLOT, STRAIGHT_SLOT, TAMPER, _draft_tokens,
-    _install_cached_attention, _load_prompt, _model_attns, _set_group_idx, _spec_metadata, _spec_state_modules,
-    _straight_decode, _target_prefill)
+    FP32_TOL, GDN_WINDOW, K, PLE_WINDOW, SPEC_SLOT, STRAIGHT_SLOT, TAMPER, StepLayout, _draft_tokens,
+    _install_cached_attention, _load_prompt, _model_attns, _plain_reference, _set_group_idx, _spec_metadata,
+    _spec_state_modules, _straight_decode, _target_prefill)
 from tests.unit_tests.models.flash_next.test_mtp_parity import fp32_mtp_buffer  # noqa: E402
 
 BS = 4  # the synthetic block size: 4 positions per recurrent state slot
+BLOCK_SIZES = (4, 8)  # of the chains that run at every size: shorter and longer than the longest step (6 tokens)
 PROMPT_LEN = 33
 BLOCK_SLOT0 = 8  # position block i is recurrent state slot BLOCK_SLOT0 + i
-NUM_SLOTS = 40  # block slots 8..22 + the straight/spec slots
+NUM_SLOTS = 40  # block slots 8..32 + the straight/spec slots
 
 
 @pytest.fixture(autouse=True, params=[GdnCoreVerifyMode.OFF, GdnCoreVerifyMode.FUSED], ids=["verify_off", "verify_fused"])
 def gdn_verify_path(request, monkeypatch):
     """Run each test on the torch GDN verification path and on gdn_core_verify, and check which one ran."""
     mode = request.param
+    if "spec_k" in request.fixturenames:  # a failed startup check fails once, in spec_k, not again below
+        request.getfixturevalue("spec_k")
     monkeypatch.setenv("VLLM_HPU_GDN_CORE_VERIFY", str(int(mode)))
     real = qwen3_5.gdn_core_verify
     calls = []
@@ -168,9 +187,9 @@ _SCENARIOS = {
 }
 
 
-def _row(ctx: int) -> list[int]:
+def _row(ctx: int, k: int = K, bs: int = BS) -> list[int]:
     """Rule 4: the index-stable block row of a step with ``ctx`` computed tokens."""
-    row = [BLOCK_SLOT0 + i for i in range(-(-(ctx + 1 + K) // BS) + K)]
+    row = [BLOCK_SLOT0 + i for i in range(-(-(ctx + 1 + k) // bs) + k)]
     assert max(row) < NUM_SLOTS, f"block row {row} needs slots beyond {NUM_SLOTS}"
     return row
 
@@ -186,8 +205,13 @@ def _gap(a, b) -> float:
     return max(float((x - y).abs().max()) for xs, ys in zip(a, b) for x, y in zip(xs, ys))
 
 
-def _chain(tiny_checkpoint, name: str, tampers, steps: int, modes: str | None = None):
-    """``steps`` align-mode MTP steps; the per-step records, the final read gap and ``gen``.
+def _chain(tiny_checkpoint, name: str, tampers, steps: int, modes: str | None = None, k: int = K, bs: int = BS,
+           plain_reference: bool = False):
+    """``steps`` align-mode MTP steps of ``k`` drafts on blocks of ``bs`` positions; the per-step records,
+    the final read gap and ``gen``.
+
+    ``plain_reference`` replaces the 16-token HF reference by the non-speculative stream of the same model
+    (``_plain_reference``, which starts with the HF tokens), for chains that commit more than 16 tokens.
 
     ``modes`` is one char per step: "v" = verification step, "p" = plain decode step (rule 5);
     default all verification. Each record: ``step``, ``ctx``, ``plan`` (the pre-step plan, block
@@ -197,9 +221,10 @@ def _chain(tiny_checkpoint, name: str, tampers, steps: int, modes: str | None = 
     """
     modes = modes or "v" * steps
     assert len(modes) == steps
+    K, BS, lay = k, bs, StepLayout(k)  # the names the rules above use
     ids = list(_load_prompt(tiny_checkpoint, PROMPT_LEN)["prompt_ids"])
     gen = list(_load_prompt(tiny_checkpoint, PROMPT_LEN)["generated_ids"])
-    cm = cpu_model(tiny_checkpoint, fp32=True, num_slots=NUM_SLOTS, speculative_config=MTP)
+    cm = cpu_model(tiny_checkpoint, fp32=True, num_slots=NUM_SLOTS, speculative_config=lay.mtp)
     vllm_config, model = cm.__enter__()
     try:
         eos = eos_token_id(vllm_config)
@@ -214,6 +239,8 @@ def _chain(tiny_checkpoint, name: str, tampers, steps: int, modes: str | None = 
         _install_cached_attention(draft)
         _set_group_idx(draft)
         datts = _model_attns(draft)
+        if plain_reference:
+            gen = _plain_reference(model, vllm_config, eos, ids, gen, atts, STRAIGHT_SLOT)
         block_slot = BLOCK_SLOT0 + (len(ids) - 1) // BS  # the block of the last prompt token
         out = _target_prefill(model, vllm_config, eos, ids, block_slot, atts)
         seq = list(ids) + [int(fp32_logits(model, out[0])[-1].argmax())]
@@ -224,7 +251,7 @@ def _chain(tiny_checkpoint, name: str, tampers, steps: int, modes: str | None = 
         ckpt, records = {}, []
         n, ctx, prev = 1, len(seq) - 1, None
         for step in range(steps):
-            row = _row(ctx)  # rules 1, 2 and 4 through the T10c-1 helpers
+            row = _row(ctx, K, BS)  # rules 1, 2 and 4 through the T10c-1 helpers
             if modes[step] == "p":  # plain decode step: sched 1, normalize, load == store == row[ctx // BS]
                 plan, new_prev, acc = align_precopy_plan([prev], [ctx], [1], [n], BS, normalize=True)
                 conv_pairs, ssm_pairs, ts = precopy_slot_pairs(plan, [row])
@@ -282,7 +309,7 @@ def _chain(tiny_checkpoint, name: str, tampers, steps: int, modes: str | None = 
             drafts = (list(gen[len(seq) - len(ids):]) + drafts)[:K]  # the drafter runs, verify gets the reference
             if step in tampers:
                 drafts[tampers[step][0]] = tampers[step][1]
-            md = _spec_metadata(p_last, n)
+            md = _spec_metadata(p_last, n, lay)
             md.load_indices_tensor = lat[None, None]  # [groups=1, batch=1, 1 + k]
             md.store_indices_tensor = lat[None, None].clone()
             md.lattice_store_differs = False
@@ -327,11 +354,11 @@ def _chain(tiny_checkpoint, name: str, tampers, steps: int, modes: str | None = 
                   f"gen_left {len(gen) - len(stream)}")
             records.append({"step": step, "ctx": ctx, "plan": plan, "a": a, "pairs": pairs,
                             "self_commit": self_commit, "read": read, "log0": log0, "ckpt": ck,
-                            "stream": stream})
+                            "stream": stream, "lattice": lat.tolist(), "row": list(row)})
             ctx += n
             if self_commit:
                 n = 1
-        row = _row(ctx)  # what the NEXT step reads, measured before its pre-step copy
+        row = _row(ctx, K, BS)  # what the NEXT step reads, measured before its pre-step copy
         plan, _, _ = align_precopy_plan([prev], [ctx], [1 + K], [n], BS)
         if plan:
             conv_pairs, ssm_pairs, ts = precopy_slot_pairs(plan, [row])
@@ -429,3 +456,66 @@ def test_s7_backward_copy_with_bias_and_an_aligned_plain_step(tiny_checkpoint):
     exp = _SCENARIOS["S7"]
     records, final, gen = _chain(tiny_checkpoint, "S7", exp["tampers"], len(exp["a"]), exp["modes"])
     _check("S7", records, final, gen)
+
+
+def _sized_scenarios(k: int) -> dict[str, dict]:
+    """The chains that run at every size ``k``: per step the mode and the accepted count (``None`` on a plain step)."""
+    up = list(range(k + 1))
+    return {
+        "every_count_up": {"modes": "v" * (k + 1), "a": up},
+        "every_count_down": {"modes": "v" * (k + 1), "a": up[::-1]},
+        "all_accepted": {"modes": "vvvv", "a": [k] * 4},
+        "plain_between": {"modes": "vpvpv", "a": [0, None, k, None, k]},
+        "two_plain_steps": {"modes": "vppvv", "a": [1, None, None, k, k]},
+    }
+
+
+SIZED_SCENARIOS = tuple(_sized_scenarios(K))
+
+
+def _sized_chain(tiny_checkpoint, name: str, k: int, bs: int):
+    """Run one chain of ``_sized_scenarios(k)``; a step that must accept ``a < k`` drafts has draft ``a + 1`` wrong."""
+    scenario = _sized_scenarios(k)[name]
+    tampers = {step: (a, TAMPER) for step, a in enumerate(scenario["a"]) if a is not None and a < k}
+    label = f"{name}[k{k},bs{bs}]"
+    records, final, reference = _chain(tiny_checkpoint, label, tampers, len(scenario["a"]), scenario["modes"], k=k,
+                                       bs=bs, plain_reference=True)
+    return scenario, label, records, final, reference
+
+
+def _check_sized(scenario: dict, label: str, records: list[dict], final: float, reference: list[int], bs: int) -> None:
+    """Accepted counts, derived boundary pairs, the non-speculative stream and all gaps of a sized chain."""
+    assert len(records) == len(scenario["a"]), f"{label}: {len(records)} steps, expected {len(scenario['a'])}"
+    for r in records:
+        step = r["step"]
+        assert r["a"] == scenario["a"][step], f"{label} step {step}: a {r['a']} != {scenario['a'][step]}"
+        if r["a"] is not None:
+            # An accepted token t (0 <= t <= a) that ends a block commits from lattice column t into that block's slot.
+            want = [(0, t, r["lattice"][t], r["row"][(r["ctx"] + t) // bs]) for t in range(r["a"] + 1)
+                    if (r["ctx"] + t + 1) % bs == 0]
+            assert r["pairs"] == want, f"{label} step {step}: pairs {r['pairs']} != {want}"
+        assert len(r["stream"]) <= len(reference), f"{label} step {step}: the reference stream is too short"
+        assert r["stream"] == reference[:len(r["stream"])], (f"{label} step {step}: stream {r['stream']} is not "
+                                                             "the non-speculative stream")
+    worst = max([r["read"] for r in records] + [r["log0"] for r in records] + [r["ckpt"] for r in records]
+                + [final])
+    print(f"{label}: worst gap {worst:.2e} (tol {FP32_TOL:.0e})")
+    assert worst <= FP32_TOL, f"{label}: worst gap {worst:.2e} > FP32_TOL {FP32_TOL:.0e}"
+
+
+@pytest.mark.parametrize("bs", BLOCK_SIZES, ids=lambda bs: f"bs{bs}")
+@pytest.mark.parametrize("name", SIZED_SCENARIOS)
+def test_align_chain_at_every_size(tiny_checkpoint, spec_k, name, bs):
+    """Prefix caching on (the align lattice) at k = 3, 4, 5: the chains of ``_sized_scenarios`` keep parity."""
+    require_startup(spec_k, prefix_caching=True)
+    scenario, label, records, final, reference = _sized_chain(tiny_checkpoint, name, spec_k, bs)
+    _check_sized(scenario, label, records, final, reference, bs)
+    pairs = [pair for r in records for pair in r["pairs"]]
+    plans = [entry for r in records for entry in r["plan"]]
+    if name == "every_count_up":
+        # Every lattice column was a load (num_accepted - 1 = 0..k) or was moved by a pre-step copy of that bias.
+        assert sorted(r["a"] for r in records) == list(range(spec_k + 1))
+    if name == "all_accepted":
+        assert pairs, f"{label}: four full steps completed no block"
+        assert any(bias == spec_k for (_i, bias, _src, _dst) in plans) or any(r["self_commit"] for r in records), (
+            f"{label}: no step started from the last lattice column (plans {plans})")

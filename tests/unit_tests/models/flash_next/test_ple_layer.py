@@ -9,7 +9,8 @@ the T4a torch oracle (``ple_forward_torch`` / ``ple_gate_torch``) across
 2. a single-row prefill (output and slot state),
 3. a padded two-row prefill (padding ignored, per-row state),
 4. a chunked prefill followed by decode (state carried in the slot),
-5. a decode batch whose padding row (index ``-1``) is neither read nor written,
+5. a decode batch whose padding row (index ``-1``) is not read and writes only the state tensor's last row
+   (the padding row; one fixed-shape write, see ``test_ple_padded_bucket.py``),
 6. a profile run (no metadata: gated output, cache untouched),
 7. the ``Qwen4ExpPLELayer`` and ``Qwen4ExpNGramEmbedding`` seam rebinding in
    ``apply_flash_next_patches``, and the host-multiplier n-gram embedding
@@ -253,7 +254,9 @@ def test_padding_row_not_written(ple_layer):
         layer(hidden, ids, qsl, ctx)
 
     assert not torch.equal(layer.kv_cache[0][1], before[1])
-    for slot in (0, 2, 3, 4):
+    # The write is one fixed-shape index_copy_ (HPU graphs): the invalid row goes to the state tensor's
+    # last row, the padding row of every runner layout (slot 4 here), and to no request's slot.
+    for slot in (0, 2, 3):
         assert torch.equal(layer.kv_cache[0][slot], before[slot])
 
 
@@ -449,6 +452,60 @@ def test_spec_rollback_layer(ple_layer):
     torch.testing.assert_close(trans_b, chain_outs[3], **TOL)
     ref_full = _oracle(layer, ids, hidden, eos=eos)[1]
     torch.testing.assert_close(layer.kv_cache[0][2, 0:STATE_LEN], ref_full, **TOL)
+
+
+def test_spec_every_accepted_count_at_every_size(ple_layer, spec_k):
+    """Verification steps of ``1 + k`` rows on the ``9 + k``-row state: every accepted count ``1 .. 1 + k``.
+
+    For each ``n``: verification A runs ``n`` tokens of the sequence followed by ``1 + k - n`` rejected rows
+    (other ids, other hidden rows); verification B starts ``n`` tokens later with ``num_accepted = n`` and
+    runs the next ``1 + k`` tokens; a transition step with ``num_accepted = 1 + k`` runs the token after
+    them. The accepted rows of A, all rows of B and the transition equal the single-token chain over the
+    sequence, and the committed windows equal the oracle's state and the chain's.
+    """
+    vllm_config, layer = ple_layer
+    eos = _eos(vllm_config)
+    t = 1 + spec_k
+    capacity = STATE_LEN + spec_k
+    torch.manual_seed(12)
+    total = 10 + 2 * t + 1
+    ids = torch.randint(0, 1000, (total,), dtype=torch.int64)
+    hidden = torch.randn(total, CHANNELS)
+    rejected_ids = torch.randint(0, 1000, (t,), dtype=torch.int64)
+    rejected_hidden = torch.randn(t, CHANNELS)
+
+    def run(step_ids, step_hidden, qsl, ctx, md):
+        with torch.no_grad(), set_forward_context(md, vllm_config):
+            return layer(step_hidden, step_ids, qsl, ctx)
+
+    one, rows = torch.tensor([0, 1], dtype=torch.int32), torch.tensor([0, t], dtype=torch.int32)
+    for n in range(1, t + 1):
+        layer.kv_cache = (torch.zeros(SLOTS, capacity, CHANNELS),)
+        for slot in (1, 2):
+            run(ids[:10], hidden[:10], torch.tensor([0, 10], dtype=torch.int32),
+                torch.full((1, 2), eos, dtype=torch.int32), _md(True, [slot], has_initial=[0]))
+        end = 10 + n + t + 1
+        chain = [run(ids[pos:pos + 1], hidden[pos:pos + 1], one, ids[pos - 2:pos].unsqueeze(0).to(torch.int32),
+                     _md(False, [1])) for pos in range(10, end)]
+
+        out_a = run(torch.cat([ids[10:10 + n], rejected_ids[n:]]), torch.cat([hidden[10:10 + n], rejected_hidden[n:]]),
+                    rows, ids[8:10].unsqueeze(0).to(torch.int32), _spec_md([2], [1], [0, t]))
+        torch.testing.assert_close(out_a[:n], torch.cat(chain[:n]), **TOL, msg=f"k={spec_k} n={n}: accepted rows")
+
+        p = 10 + n
+        out_b = run(ids[p:p + t], hidden[p:p + t], rows, ids[p - 2:p].unsqueeze(0).to(torch.int32),
+                    _spec_md([2], [n], [0, t]))
+        torch.testing.assert_close(out_b, torch.cat(chain[n:n + t]), **TOL, msg=f"k={spec_k} n={n}: the next step")
+        ref_state = _oracle(layer, ids[:p + t], hidden[:p + t], eos=eos)[1]
+        torch.testing.assert_close(layer.kv_cache[0][2, t - 1:t - 1 + STATE_LEN], ref_state, **TOL,
+                                   msg=f"k={spec_k} n={n}: window after {t} accepted rows")
+
+        q = p + t
+        trans = run(ids[q:q + 1], hidden[q:q + 1], one, ids[q - 2:q].unsqueeze(0).to(torch.int32),
+                    _spec_md([2], [t], [0, 1]))
+        torch.testing.assert_close(trans, chain[n + t], **TOL, msg=f"k={spec_k} n={n}: the transition")
+        torch.testing.assert_close(layer.kv_cache[0][2, 0:STATE_LEN], layer.kv_cache[0][1, 0:STATE_LEN], **TOL,
+                                   msg=f"k={spec_k} n={n}: window after the transition")
 
 
 def _mutated_spec_kernel(normed, conv_weight, state, num_accepted, query_lens, dilation):

@@ -13,9 +13,16 @@ names. Python 3.10 standard library only.
 ``manifest.json`` (written by main.py, M4-H6) is read for these keys; unknown
 keys are ignored and missing ones become null: ``run_id``, ``bundle_commit``,
 ``workload_sha``, ``mode``, ``created``, ``skip_warmup``, ``server_timeout_s``,
-``recipe_cache`` (the RUK-3242 cache folder, size, combined-kernel-database flag
-and per-variant notes), ``workload`` (the workload.json header, for ``turns``)
-and ``variants`` (the variants.json entries that ran).
+``load_read_timeout_s``, ``warm_request_timeout_s``, ``skipped_steps`` (the
+recorded-only steps left out by ``--quick-gates`` or ``--no-verify-probe``),
+``recipe_cache`` (the RUK-3242 cache folder, size, combined-kernel-database flag,
+who switched that database off, and per-variant notes), ``hc_fused`` (the
+operator's request for the fused hyper-connection kernels and its outcome),
+``moe_glue`` (the same for the MoE glue kernels), ``workload`` (the
+workload.json header, for ``turns``) and ``variants`` (the variants.json entries
+that ran). A gate's or a variant's ``status.json`` may carry ``errors``, the last
+error lines of its server log: they are printed under the gate table and in the
+variant's section.
 """
 
 from __future__ import annotations
@@ -228,6 +235,12 @@ def _status_from_file(status_obj: Any) -> tuple[Optional[int], Optional[str], Op
     return (None if status is None else int(status)), reason, _as_float(seconds)
 
 
+def _status_errors(status_obj: Any) -> list:
+    """The `errors` list of a parsed status.json (the last error lines of a server log); [] when absent."""
+    errors = status_obj.get("errors") if isinstance(status_obj, dict) else None
+    return [str(e) for e in errors] if isinstance(errors, list) else []
+
+
 def summarize_variant(variant_dir: Path, agents: int, turns: Optional[int] = None) -> dict:
     """Summarize one variant folder of a run.
 
@@ -336,6 +349,7 @@ def summarize_variant(variant_dir: Path, agents: int, turns: Optional[int] = Non
     return {
         "status": status,
         "reason": reason,
+        "errors": _status_errors(status_obj),
         "seconds": seconds,
         "startup": startup,
         "warm_pass": warm_pass,
@@ -382,7 +396,12 @@ def summarize_run(run_dir: Path) -> dict:
         "created": manifest.get("created"),
         "skip_warmup": manifest.get("skip_warmup"),
         "server_timeout_s": manifest.get("server_timeout_s"),
+        "load_read_timeout_s": manifest.get("load_read_timeout_s"),
+        "warm_request_timeout_s": manifest.get("warm_request_timeout_s"),
+        "skipped_steps": manifest.get("skipped_steps"),
         "recipe_cache": manifest.get("recipe_cache"),
+        "hc_fused": manifest.get("hc_fused"),
+        "moe_glue": manifest.get("moe_glue"),
         "workload": {
             "version": workload.get("version"),
             "shared_prefix_tokens": workload.get("shared_prefix_tokens"),
@@ -401,7 +420,7 @@ def summarize_run(run_dir: Path) -> dict:
         if status is None:
             status = int(GateStatus.NOT_RUN)
             reason = reason or "gate not run"
-        gates[gate] = {"status": status, "reason": reason, "seconds": seconds}
+        gates[gate] = {"status": status, "reason": reason, "seconds": seconds, "errors": _status_errors(status_obj)}
 
     variants: dict = {}
     entries: list = []
@@ -476,6 +495,39 @@ def _recipe_cache_text(recipe: Any) -> str:
     return "off for all variants: %s" % reason
 
 
+def _seconds_text(value: Any) -> str:
+    return "%s s" % value if value is not None else "n/a"
+
+
+def _skipped_steps_text(skipped: Any) -> Optional[str]:
+    """`step, step (reason); step (reason)` for the manifest's skipped_steps; None when nothing was skipped."""
+    if not isinstance(skipped, dict) or not skipped:
+        return None
+    by_reason: dict = {}
+    for step, reason in skipped.items():
+        by_reason.setdefault(str(reason), []).append(str(step))
+    return "; ".join("%s (%s)" % (", ".join(steps), reason) for reason, steps in by_reason.items())
+
+
+def _combined_db_text(recipe: Any) -> Optional[str]:
+    """Who switched the combined kernel database off for this run's servers; None when nobody did."""
+    by = recipe.get("combined_kernel_db_disabled_by") if isinstance(recipe, dict) else None
+    if not by:
+        return None
+    who = {"operator": "switched off by the operator",
+           "g1b": "switched off by gate G1b (its decode checks failed with it and passed without)",
+           "tiny": "switched off by the tiny gate (it failed with it and was run once more without)"}
+    return "%s; every server runs with %s=0, a fused server without the recipe cache" % (
+        who.get(str(by), "switched off by %s" % by), serve.COMBINED_KERNEL_DB_ENV)
+
+
+def _hc_fused_text(hc_fused: Any) -> Optional[str]:
+    """`on` or `off (<why>)` from the manifest's hc_fused; None for a manifest without it (an older run).
+    The manifest's moe_glue has the same form and is read with this too."""
+    outcome = hc_fused.get("outcome") if isinstance(hc_fused, dict) else None
+    return str(outcome) if outcome else None
+
+
 def render_markdown(summary: dict) -> str:
     """The human-readable report: header, gate table, one comparison table,
     then one section per variant. Statuses appear as names here, never ints."""
@@ -488,8 +540,21 @@ def render_markdown(summary: dict) -> str:
     lines.append("- Workload sha: %s" % (run.get("workload_sha") or "n/a"))
     lines.append("- Warmup: %s" % ("skipped (graphs compiled on first use)" if run.get("skip_warmup") else "full"))
     lines.append("- Recipe cache: %s" % _recipe_cache_text(run.get("recipe_cache")))
-    server_timeout = run.get("server_timeout_s")
-    lines.append("- Server health timeout: %s" % ("%s s" % server_timeout if server_timeout is not None else "n/a"))
+    combined_db = _combined_db_text(run.get("recipe_cache"))
+    if combined_db is not None:
+        lines.append("- Combined kernel database: %s" % combined_db)
+    hc_fused = _hc_fused_text(run.get("hc_fused"))
+    if hc_fused is not None:
+        lines.append("- HC fused: %s" % hc_fused)
+    moe_glue = _hc_fused_text(run.get("moe_glue"))
+    if moe_glue is not None:
+        lines.append("- MoE glue: %s" % moe_glue)
+    lines.append("- Server health timeout: %s" % _seconds_text(run.get("server_timeout_s")))
+    lines.append("- Load read timeout: %s" % _seconds_text(run.get("load_read_timeout_s")))
+    lines.append("- Warm request timeout: %s" % _seconds_text(run.get("warm_request_timeout_s")))
+    skipped = _skipped_steps_text(run.get("skipped_steps"))
+    if skipped is not None:
+        lines.append("- Skipped steps: %s" % skipped)
     lines.append("")
 
     lines.append("## Gates")
@@ -504,6 +569,12 @@ def render_markdown(summary: dict) -> str:
             _fmt(gate_summary.get("seconds"), ".1f"),
         ))
     lines.append("")
+    gate_errors = ["- %s, last error line: %s" % (gate, text)
+                   for gate, gate_summary in summary.get("gates", {}).items()
+                   for text in gate_summary.get("errors") or []]
+    if gate_errors:
+        lines.extend(gate_errors)
+        lines.append("")
 
     lines.append("## Variants")
     lines.append("")
@@ -546,6 +617,8 @@ def render_markdown(summary: dict) -> str:
         lines.append("- title: %s" % (v.get("title") or "-"))
         lines.append("- status: %s" % _status_name(v.get("status")))
         lines.append("- reason: %s" % (v.get("reason") or "-"))
+        for text in v.get("errors") or []:
+            lines.append("- last error line: %s" % text)
         lines.append("- seconds: %s" % _fmt(v.get("seconds"), ".1f"))
         lines.append("- startup: %s" % _format_startup(v.get("startup")))
         lines.append("- Warm pass: %s" % _format_warm_pass(v.get("warm_pass")))

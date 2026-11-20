@@ -2,20 +2,36 @@
 #include <cstdint>
 #include <cstring>
 #include "gdn_core_decode_gaudi2.hpp"
+#ifndef GDN_FUSED_NO_VERIFY
 #include "gdn_core_verify_gaudi2.hpp"
+#endif
 #include "gdn_recurrent_decode_gaudi2.hpp"
 namespace tpc_lib_api { struct _TensorManipulationSuggestion; }
+
+namespace {
+
+// GDN_FUSED_NO_VERIFY is defined by CMakeLists.txt when the verify kernel is left out of the
+// library (it did not compile, or -DGDN_FUSED_VERIFY=OFF): the verify GUID is then not listed
+// and not instantiated, and the decode and recurrent kernels are served as usual.
+constexpr const char* const kGuidNames[] = {
+    GdnCoreDecodeGaudi2::name,
+    GdnRecurrentDecodeGaudi2::name,
+#ifndef GDN_FUSED_NO_VERIFY
+    GdnCoreVerifyGaudi2::name,
+#endif
+};
+constexpr uint32_t kGuidCount = sizeof(kGuidNames) / sizeof(kGuidNames[0]);
+
+}  // namespace
 
 extern "C" tpc_lib_api::GlueCodeReturn GetKernelGuids(
     tpc_lib_api::DeviceId device, uint32_t* count, tpc_lib_api::GuidInfo* guids) {
     using namespace tpc_lib_api;
     if (!count) return GLUE_FAILED;
     const auto capacity = *count;
-    *count = device == DEVICE_ID_GAUDI2 ? 3 : 0;
+    *count = device == DEVICE_ID_GAUDI2 ? kGuidCount : 0;
     if (!*count || !guids || !capacity) return GLUE_SUCCESS;
-    static constexpr const char* const kGuidNames[3] = {
-        GdnCoreDecodeGaudi2::name, GdnRecurrentDecodeGaudi2::name, GdnCoreVerifyGaudi2::name};
-    const uint32_t filled = capacity < 3 ? capacity : 3;
+    const uint32_t filled = capacity < kGuidCount ? capacity : kGuidCount;
     std::memset(guids, 0, filled * sizeof(*guids));
     for (uint32_t i = 0; i < filled; ++i) {
         std::strcpy(guids[i].name, kGuidNames[i]);
@@ -34,9 +50,11 @@ extern "C" tpc_lib_api::GlueCodeReturn InstantiateTpcKernel(
     if (!std::strcmp(params->guid.name, GdnRecurrentDecodeGaudi2::name)) {
         return GdnRecurrentDecodeGaudi2{}.GetGcDefinitions(params, instance);
     }
+#ifndef GDN_FUSED_NO_VERIFY
     if (!std::strcmp(params->guid.name, GdnCoreVerifyGaudi2::name)) {
         return GdnCoreVerifyGaudi2{}.GetGcDefinitions(params, instance);
     }
+#endif
     return GLUE_NODE_NOT_FOUND;
 }
 

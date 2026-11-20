@@ -4,7 +4,9 @@
 `build_command` turns one variant and one server entry of `variants.json` into
 the exact `vllm serve` command and environment; `start_server` launches it with
 its log in a file in its own process group; `wait_healthy` polls `/health` and
-`/v1/models`; `wait_port_file` reads the port a server wrote to a file once
+`/v1/models`; `unhealthy_reason` says whether a server that did not become
+healthy exited or ran out of time, and `error_lines` gives the last error texts
+of its log; `wait_port_file` reads the port a server wrote to a file once
 listening; `port_in_use` reports whether something already accepts TCP
 connections on a port; `parse_startup` reads the startup lines into the `startup.json`
 record of `schema.STARTUP_KEYS`; `stop_server` ends the whole process group.
@@ -47,13 +49,19 @@ RENTAL_ENV_DEFAULTS = {
     "VLLM_HPU_FLASH_NEXT_QSA_MODE": "1",
     "VLLM_HPU_RECURRENT_STATE_POOL": "1",
     "PT_HPU_LAZY_MODE": "1",
+    "PYTHONFAULTHANDLER": "1",  # a worker that dies on a signal leaves its Python stack in the server log
 }
+
+MAX_ERROR_LINES = 5
+# "TypeError: ...", "torch._dynamo.exc.TorchRuntimeError: ..." up to the end of the line
+_ERROR_RE = re.compile(r"[A-Za-z_][\w.]*(?:Error|Exception): .*")
 
 RECIPE_CACHE_ENV = "PT_HPU_RECIPE_CACHE_CONFIG"
 COMBINED_KERNEL_DB = "libflashinfer_gaudi_combined_gaudi2.so"
 COMBINED_KERNEL_DB_ENV = "FLASHINFER_GAUDI_COMBINED_KERNEL_DB"
 RECIPE_CACHE_NONE = "none"
-RECIPE_CACHE_OFF_REASON = ("off: this server registers the fused GDN kernel's database in GC_KERNEL_PATH, and the "
+RECIPE_CACHE_OFF_REASON = ("off: this server registers a fused kernel's database (the fused GDN kernel's, or the "
+                           "library of the fused hyper-connection and MoE glue kernels) in GC_KERNEL_PATH, and the "
                            "Habana bridge accepts only one kernel library next to a recipe cache")
 
 
@@ -62,15 +70,20 @@ def recipe_cache_env(cache_dir: str | None, size_mb: int, server_env: dict,
     """The recipe-cache variable for one server and a note for the manifest.
 
     Returns ({RECIPE_CACHE_ENV: f"{cache_dir},false,{size_mb}"}, cache_dir) when `cache_dir` is set and
-    either `combined_db` is True or `server_env` has VLLM_HPU_GDN_CORE_DECODE and VLLM_HPU_GDN_CORE_VERIFY
-    both equal to "0" (a missing key counts as "1", the plugin default). Returns ({}, RECIPE_CACHE_NONE)
-    when `cache_dir` is None or empty, and ({}, RECIPE_CACHE_OFF_REASON) otherwise.
+    either `combined_db` is True or the server registers no kernel database of its own: `server_env` has
+    VLLM_HPU_GDN_CORE_DECODE and VLLM_HPU_GDN_CORE_VERIFY both equal to "0" (a missing key counts as "1",
+    the plugin default) and neither VLLM_HPU_HC_FUSED nor VLLM_HPU_MOE_GLUE is "1" (a missing key counts
+    as "0", the plugin default; either flag loads the one library that holds the fused hyper-connection
+    and the MoE glue kernels). Returns ({}, RECIPE_CACHE_NONE) when `cache_dir` is None or empty, and
+    ({}, RECIPE_CACHE_OFF_REASON) otherwise.
     """
     if not cache_dir:
         return {}, RECIPE_CACHE_NONE
     if not combined_db:
         if server_env.get("VLLM_HPU_GDN_CORE_DECODE", "1") != "0" or \
-                server_env.get("VLLM_HPU_GDN_CORE_VERIFY", "1") != "0":
+                server_env.get("VLLM_HPU_GDN_CORE_VERIFY", "1") != "0" or \
+                server_env.get("VLLM_HPU_HC_FUSED", "0") == "1" or \
+                server_env.get("VLLM_HPU_MOE_GLUE", "0") == "1":
             return {}, RECIPE_CACHE_OFF_REASON
     return {RECIPE_CACHE_ENV: "%s,false,%s" % (cache_dir, size_mb)}, cache_dir
 
@@ -195,6 +208,29 @@ def wait_healthy(port: int, timeout_s: float, proc: subprocess.Popen) -> bool:
     return False
 
 
+def unhealthy_reason(proc: subprocess.Popen, seconds: float, timeout_s: float,
+                     name: str = "server") -> tuple[schema.GateStatus, str]:
+    """Why `wait_healthy` returned False after `seconds`: the process is gone (FAILED, "<name> exited with
+    code X after N s") or it is still there and the time ran out (TIMED_OUT, "<name> not healthy within
+    N s"). `wait_healthy` returns as soon as the process exits, so the two must not share one text."""
+    code = proc.poll()
+    if code is None:
+        return schema.GateStatus.TIMED_OUT, "%s not healthy within %d s" % (name, int(timeout_s))
+    return schema.GateStatus.FAILED, "%s exited with code %d after %d s" % (name, code, int(seconds))
+
+
+def error_lines(log_text: str | None, limit: int = MAX_ERROR_LINES) -> list[str]:
+    """The last `limit` distinct `SomeError: message` texts of a server log, in order of first appearance."""
+    seen: list[str] = []
+    for line in (log_text or "").splitlines():
+        match = _ERROR_RE.search(line)
+        if match is not None:
+            text = match.group(0).strip()
+            if text not in seen:
+                seen.append(text)
+    return seen[-limit:]
+
+
 def wait_port_file(path: Path, timeout_s: float, proc: subprocess.Popen) -> int | None:
     """The port a server wrote to `path` (one decimal line).
 
@@ -280,19 +316,22 @@ def stop_server(proc: subprocess.Popen, timeout_s: float = 60.0) -> None:
     The group covers the server and all of its TP workers (one session, see
     `start_server`, so the group id is the server's pid). It waits for the whole
     group, not just the server: a server that exited (or crashed) can leave
-    workers behind that still hold the cards the next variant needs.
+    workers behind that still hold the cards the next variant needs. When the
+    server itself is already gone there is nobody to run a clean shutdown, so
+    what is left of the group gets SIGKILL at once, without the SIGINT wait.
     """
     pgid = proc.pid
-    proc.poll()  # reap an exited server so its zombie does not count as alive
+    lead_exited = proc.poll() is not None  # also reaps an exited server: its zombie must not count as alive
     if not _group_alive(pgid):
         return
-    _killpg_safe(pgid, signal.SIGINT)
-    deadline = time.monotonic() + timeout_s
-    while time.monotonic() < deadline:
-        proc.poll()
-        if not _group_alive(pgid):
-            return
-        time.sleep(0.2)
+    if not lead_exited:
+        _killpg_safe(pgid, signal.SIGINT)
+        deadline = time.monotonic() + timeout_s
+        while time.monotonic() < deadline:
+            proc.poll()
+            if not _group_alive(pgid):
+                return
+            time.sleep(0.2)
     _killpg_safe(pgid, signal.SIGKILL)
     deadline = time.monotonic() + 5.0
     while time.monotonic() < deadline and (proc.poll() is None or _group_alive(pgid)):

@@ -19,7 +19,8 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parents[4]
 SCRIPTS_DIR = REPO_ROOT / "tools" / "flash_next" / "rental"
 SCRIPTS = ["make_rental_bundle.sh", "run_rental.sh", "container_entry.sh", "prepare_host.sh", "tiny_smoke.sh"]
-VLLM_SRC = Path("/Volumes/Storage/paperclip/tmp/vllm-cpu-dev/vllm-src")
+# The vLLM checkout the bundle test archives; FN_TEST_VLLM_SRC points it at another checkout that has the pin.
+VLLM_SRC = Path(os.environ.get("FN_TEST_VLLM_SRC", "/Volumes/Storage/paperclip/tmp/vllm-cpu-dev/vllm-src"))
 
 
 @pytest.mark.parametrize("name", SCRIPTS)
@@ -51,8 +52,9 @@ def test_container_entry_toolchain():
 
 def test_container_entry_installs_pytest():
     # Gate G1b runs the fused GDN card checks with `python -m pytest`; the image ships no pytest (RUK-3100).
+    # Pinned to the version the 2026-11-18 rental resolved, so a pytest release cannot change a run.
     text = (SCRIPTS_DIR / "container_entry.sh").read_text()
-    assert 'install_step 3b "test tools" pip install pytest' in text
+    assert 'install_step 3b "test tools" pip install pytest==9.2.0' in text
 
 
 def test_container_entry_forwards_recipe_cache():
@@ -354,7 +356,8 @@ def test_run_rental_docker_root_stops_on_low_disk(tmp_path):
 @pytest.mark.skipif(not (VLLM_SRC / ".git").is_dir(), reason="vLLM checkout not present")
 def test_make_rental_bundle(tmp_path):
     proc = subprocess.run(
-        ["bash", str(SCRIPTS_DIR / "make_rental_bundle.sh"), "--allow-dirty", "--out", str(tmp_path)],
+        ["bash", str(SCRIPTS_DIR / "make_rental_bundle.sh"), "--allow-dirty", "--out", str(tmp_path), "--vllm-src",
+         str(VLLM_SRC)],
         capture_output=True,
         text=True,
         cwd=tmp_path,
@@ -365,12 +368,22 @@ def test_make_rental_bundle(tmp_path):
     assert len(tarballs) == 1, proc.stdout
     with tarfile.open(tarballs[0], "r:gz") as tar:
         names = set(tar.getnames())
+        bundle_txt = tar.extractfile("BUNDLE.txt").read().decode()
     assert "run_rental.sh" in names
     assert "prepare_host.sh" in names
     assert "tiny_smoke.sh" in names
     assert "BUNDLE.txt" in names
     assert "vllm/setup.py" in names
     assert any(name.startswith("plugin/tools/flash_next/rental/") for name in names)
+    # What the node reads and runs from the bundle: the commit line at the root (the orchestrator and the
+    # stale-build check of container_entry.sh read it), the entry script and the crash probe.
+    head = subprocess.run(["git", "-C", str(REPO_ROOT), "rev-parse", "HEAD"], capture_output=True, text=True)
+    assert bundle_txt.splitlines()[0] == "plugin sha: %s" % head.stdout.strip()
+    assert "plugin/tools/flash_next/rental/container_entry.sh" in names
+    assert "plugin/tools/flash_next/gdn_verify_crash_probe.sh" in names
+    # Nothing of a native build: on the node plugin/build belongs to the install, which removes it when the
+    # bundle changes.
+    assert not [name for name in names if name == "plugin/build" or name.startswith("plugin/build/")]
 
 
 def test_prepare_host_dry_run(tmp_path):
@@ -544,6 +557,14 @@ def test_bundle_carries_tiny_smoke_at_the_top_level():
     assert "BUNDLE.txt run_rental.sh prepare_host.sh tiny_smoke.sh plugin vllm" in text
 
 
+def test_bundle_script_guards_what_the_node_relies_on():
+    text = (SCRIPTS_DIR / "make_rental_bundle.sh").read_text()
+    assert 'echo "plugin sha: $PLUGIN_SHA"' in text  # the first line of BUNDLE.txt
+    assert text.index('echo "plugin sha: $PLUGIN_SHA"') < text.index('echo "branch: $PLUGIN_BRANCH"')
+    assert 'if [ -e "$STAGE/plugin/build" ]; then' in text  # a tracked build/ would be removed on the node
+    assert 'cmp -s "$STAGE/$name" "$STAGE/plugin/tools/flash_next/rental/$name"' in text  # --allow-dirty warning
+
+
 def test_tiny_smoke_dry_run(tmp_path):
     results = tmp_path / "results"
     proc = subprocess.run(
@@ -566,7 +587,10 @@ def test_tiny_smoke_dry_run(tmp_path):
     assert install == ["docker", "exec", "fn-smoke", "bash",
                        "/bundle/plugin/tools/flash_next/rental/container_entry.sh", "--install-only", "--results",
                        "/results", "--run-id", "t1"]
-    assert smoke == ["docker", "exec", "-w", "/bundle/plugin", "fn-smoke", "python", "-m",
+    # The call's Habana log folder and the fault handler travel with the docker exec (the container
+    # outlives one call).
+    assert smoke == ["docker", "exec", "-w", "/bundle/plugin", "-e", "HABANA_LOGS=/results/t1/habana_logs", "-e",
+                     "PYTHONFAULTHANDLER=1", "fn-smoke", "python", "-m",
                      "tools.flash_next.rental.tiny_smoke", "--out", "/results/t1", "--ckpt", "/tmp/fn-smoke-ckpt",
                      "--gdn", "pytorch,fused", "--recipe-cache", "/results/recipe-cache"]
     assert not any("PT_HPU_" in word for word in smoke)  # the cache moves to the check, not to the docker exec
@@ -587,7 +611,8 @@ def test_tiny_smoke_dry_run_options(tmp_path):
     lines = [shlex.split(ln) for ln in proc.stdout.splitlines() if ln.startswith("docker ")]
     assert len(lines) == 3, proc.stdout
     smoke = lines[2]
-    assert smoke == ["docker", "exec", "-w", "/bundle/plugin", "fn-smoke", "python", "-m",
+    assert smoke == ["docker", "exec", "-w", "/bundle/plugin", "-e", "HABANA_LOGS=/results/t1/habana_logs", "-e",
+                     "PYTHONFAULTHANDLER=1", "fn-smoke", "python", "-m",
                      "tools.flash_next.rental.tiny_smoke", "--out", "/results/t1", "--ckpt", "/tmp/fn-smoke-ckpt",
                      "--gdn", "pytorch,fused", "--full-warmup", "--health-timeout", "2400", "--env", "X=1",
                      "--env", "Y=2"]
@@ -630,7 +655,8 @@ case "$*" in
   "exec fn-smoke test -f /tmp/fn-smoke.installed") exit ${FAKE_MARKER_EXIT:-1} ;;
   inspect*) echo "$FAKE_RESULTS_MOUNT" ;;
   *container_entry.sh*) echo "install only: done"; exit ${FAKE_INSTALL_EXIT:-0} ;;
-  *pkill*) ;;
+  *pkill*) : > "$FAKE_DOCKER_LOG.stopped" ;;
+  *pgrep*) exit 1 ;;
   *tools.flash_next.rental.tiny_smoke*) echo "tiny smoke [pytorch]: PASSED"; exit ${FAKE_SMOKE_EXIT:-0} ;;
 esac
 exit 0
@@ -758,8 +784,11 @@ def test_tiny_smoke_interrupt_stops_the_check_inside_the_container(tmp_path):
     bin_dir = tmp_path / "fakebin"
     bin_dir.mkdir()
     docker = bin_dir / "docker"
+    # The stand-in check runs until the pkill reaches it, as the real one does (its docker exec
+    # client stays until the check in the container has stopped its server).
     docker.write_text("#!/bin/sh\n" + FAKE_SMOKE_DOCKER.replace(
-        'echo "tiny smoke [pytorch]: PASSED"; exit ${FAKE_SMOKE_EXIT:-0}', "sleep 30"))
+        'echo "tiny smoke [pytorch]: PASSED"; exit ${FAKE_SMOKE_EXIT:-0}',
+        'while [ ! -f "$FAKE_DOCKER_LOG.stopped" ]; do sleep 0.1; done; exit 1'))
     docker.chmod(0o755)
     log = tmp_path / "docker.log"
     env = {k: v for k, v in os.environ.items() if k != "BASH_ENV"}

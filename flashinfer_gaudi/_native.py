@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import ctypes
 import glob
 import importlib
 import os
@@ -24,11 +25,27 @@ _BLOCK_FP8_LINEAR_OP: Callable | None = None
 _ADD_RMSNORM_QUANT_OP: Callable | None = None
 _GDN_FUSED_LOADED: bool | None = None  # None = not attempted
 _GDN_FUSED_ERRORS: list[str] = []  # the fused GDN loader's own errors
+_HC_FUSED_LOADED: bool | None = None  # None = not attempted (the flag VLLM_HPU_HC_FUSED is not 1)
+_HC_FUSED_ERRORS: list[str] = []  # the fused hyper-connection loader's own errors
+_MOE_GLUE_LOADED: bool | None = None  # None = not attempted (the flag VLLM_HPU_MOE_GLUE is not 1)
+_MOE_GLUE_ERRORS: list[str] = []  # the MoE glue loader's own errors (the library's are the hyper-connection loader's)
+_MOE_GLUE_MISSING: tuple[str, ...] = ()  # the MoE glue ops whose kernel the library does not serve
 _COMBINED_DB_ACTIVE: str | None = None  # the combined kernel database this process activated (its path)
 
 RECIPE_CACHE_ENV = "PT_HPU_RECIPE_CACHE_CONFIG"
 COMBINED_KERNEL_DB = "libflashinfer_gaudi_combined_gaudi2.so"  # built by RUK-3243; one file carrying every GUID
 COMBINED_KERNEL_DB_ENV = "FLASHINFER_GAUDI_COMBINED_KERNEL_DB"  # kill switch: "0" ignores the combined database
+FLASHINFER_KERNEL_DB = "libflashinfer_gaudi_kernels.so"  # the FlashInfer kernel database; a member of the combined one
+GDN_FUSED_KERNEL_DB = "libgdn_fused_gaudi2.so"  # the fused GDN kernel database; a member of the combined one
+GDN_FUSED_KERNEL_LIBRARY_ENV = "GDN_FUSED_GAUDI_KERNEL_LIBRARY"  # its path, when it is not in the package's lib/
+HC_FUSED_KERNEL_DB = "libhc_fused_gaudi2.so"  # the fused hyper-connection kernel database; an optional member
+HC_FUSED_KERNEL_LIBRARY_ENV = "HC_FUSED_GAUDI_KERNEL_LIBRARY"  # its path, when it is not in the package's lib/
+HC_FUSED_NATIVE_LIBRARY_ENV = "HC_FUSED_GAUDI_NATIVE_LIBRARY"  # the path of hc_fused_ops*.so, same rule
+HC_FUSED_EXTENSION_GLOB = "hc_fused_ops*.so"
+HC_FUSED_SCHEMA_MODULE = "flashinfer_gaudi.hc_fused"  # defines the six op schemas; imported only with the flag at 1
+# The MoE glue ops are implemented by the same extension, so importing the module above imports this one too.
+MOE_GLUE_SCHEMA_MODULE = "flashinfer_gaudi.moe_glue"
+COMBINED_MEMBERS_ENV = "FLASHINFER_GAUDI_COMBINED_MEMBERS"  # csrc/kernel_db_adapter/adapter.cpp (host tests)
 
 
 class KernelDbState(IntEnum):
@@ -97,12 +114,30 @@ def _prepend_kernel_database(path: str) -> str | None:
 
 
 def _combined_kernel_db_path() -> Path | None:
-    """The combined kernel database next to this module, or None when absent or switched off."""
-    path = Path(__file__).resolve().parent / "lib" / COMBINED_KERNEL_DB
-    if not path.is_file():
+    """The combined kernel database this process may use, or None when absent or switched off.
+
+    It is looked for in this package's ``lib`` folder first. When it is not there, it is looked for next to the
+    library named by ``GDN_FUSED_GAUDI_KERNEL_LIBRARY``: a process that imports this package from a source tree
+    (an empty ``lib``) and takes the installed libraries by path, as the rental's kernel gate does, must load the
+    same single file the servers load. The combined database serves only the libraries next to itself, so that
+    second location counts only when it serves what this process would otherwise register one by one: the
+    variable names an existing file called ``libgdn_fused_gaudi2.so``, and this package's ``lib`` holds no
+    ``libflashinfer_gaudi_kernels.so`` of its own (which the other folder's combined file would leave out).
+    ``FLASHINFER_GAUDI_COMBINED_KERNEL_DB=0`` switches every location off.
+    """
+    if os.environ.get(COMBINED_KERNEL_DB_ENV, "1").strip() == "0":
         return None
-    if os.environ.get(COMBINED_KERNEL_DB_ENV, "1").strip() != "0":
+    package_lib = Path(__file__).resolve().parent / "lib"
+    path = package_lib / COMBINED_KERNEL_DB
+    if path.is_file():
         return path
+    if (package_lib / FLASHINFER_KERNEL_DB).is_file():
+        return None
+    configured = os.environ.get(GDN_FUSED_KERNEL_LIBRARY_ENV, "")
+    if configured and os.path.isfile(configured) and os.path.basename(configured) == GDN_FUSED_KERNEL_DB:
+        path = Path(os.path.abspath(configured)).parent / COMBINED_KERNEL_DB
+        if path.is_file():
+            return path
     return None
 
 
@@ -133,7 +168,7 @@ def _configure_kernel_database_path() -> KernelDbState:
         _FLASHINFER_DB_STATE = KernelDbState.COMBINED
         return KernelDbState.COMBINED
     package_lib = Path(__file__).resolve().parent / "lib"
-    kernel_db = package_lib / "libflashinfer_gaudi_kernels.so"
+    kernel_db = package_lib / FLASHINFER_KERNEL_DB
     if not kernel_db.is_file():
         _FLASHINFER_DB_STATE = KernelDbState.MISSING
         return KernelDbState.MISSING
@@ -183,9 +218,9 @@ def load_gdn_fused_extension() -> bool:
         if _GDN_FUSED_LOADED is not None:
             return _GDN_FUSED_LOADED
         package_lib = Path(__file__).resolve().parent / "lib"
-        kernel_db = os.environ.get("GDN_FUSED_GAUDI_KERNEL_LIBRARY", "")
+        kernel_db = os.environ.get(GDN_FUSED_KERNEL_LIBRARY_ENV, "")
         if not kernel_db:
-            kernel_db = str(package_lib / "libgdn_fused_gaudi2.so")
+            kernel_db = str(package_lib / GDN_FUSED_KERNEL_DB)
         extension = os.environ.get("GDN_FUSED_GAUDI_NATIVE_LIBRARY", "")
         if not extension:
             matches = sorted(glob.glob(str(package_lib / "gdn_fused_ops*.so")))
@@ -224,6 +259,225 @@ def load_gdn_fused_extension() -> bool:
         _LOADED_PATHS.append(extension)
         _GDN_FUSED_LOADED = True
         return True
+
+
+def _hc_fused_error(message: str) -> None:
+    """Record one fused hyper-connection loader failure in the shared list and in the HC-only list."""
+    _LOAD_ERRORS.append(message)
+    _HC_FUSED_ERRORS.append(message)
+
+
+def hc_fused_extension_errors() -> tuple[str, ...]:
+    """Why ``load_hc_fused_extension`` failed (empty when it loaded or was never called)."""
+    return tuple(_HC_FUSED_ERRORS)
+
+
+def hc_fused_extension_loaded() -> bool | None:
+    """The result of ``load_hc_fused_extension``; None when it was never called (``VLLM_HPU_HC_FUSED`` is not 1)."""
+    return _HC_FUSED_LOADED
+
+
+def combined_db_serves_hc_fused(combined: Path | str, kernel_db: str) -> bool:
+    """True when the combined kernel database `combined` forwards the GUIDs of the library `kernel_db`.
+
+    The adapter serves the libraries of a fixed name list that sit next to it. The list is compiled in, so
+    an adapter built before ``libhc_fused_gaudi2.so`` was added to it does not serve the file even when it is
+    there; the name is then absent from the adapter's bytes. With the members override set (host tests) the
+    adapter serves exactly the paths of the override. A combined file that cannot be read serves nothing.
+    """
+    override = os.environ.get(COMBINED_MEMBERS_ENV, "")
+    if override:
+        return os.path.abspath(kernel_db) in [os.path.abspath(entry) for entry in override.split(":") if entry]
+    path = Path(os.path.abspath(kernel_db))
+    if path.name != HC_FUSED_KERNEL_DB or path.parent != Path(os.path.abspath(combined)).parent:
+        return False
+    try:
+        return HC_FUSED_KERNEL_DB.encode() in Path(combined).read_bytes()
+    except OSError:
+        return False
+
+
+def _load_hc_fused_locked() -> bool:
+    """The one attempt of ``load_hc_fused_extension`` (the caller holds ``_LOAD_LOCK``).
+
+    The order is what makes the fallback safe: both files exist; then the kernel database is registered for
+    the graph compiler; only then the schemas are imported and the extension, which registers the HPU kernels,
+    is loaded. A failure at any step leaves the ops without an HPU kernel, and the layers then run torch.
+    """
+    package_lib = Path(__file__).resolve().parent / "lib"
+    kernel_db = os.environ.get(HC_FUSED_KERNEL_LIBRARY_ENV, "") or str(package_lib / HC_FUSED_KERNEL_DB)
+    extension = os.environ.get(HC_FUSED_NATIVE_LIBRARY_ENV, "")
+    if not extension:
+        matches = sorted(glob.glob(str(package_lib / HC_FUSED_EXTENSION_GLOB)))
+        extension = matches[0] if matches else str(package_lib / HC_FUSED_EXTENSION_GLOB)
+    missing = False
+    for path in (kernel_db, extension):
+        if not os.path.isfile(path):
+            _hc_fused_error(f"{path}: file does not exist")
+            missing = True
+    if missing:
+        return False
+    # The rules of the fused GDN library: the combined database when it can be the single
+    # GC_KERNEL_PATH file, otherwise first in the colon list, which is refused next to a recipe
+    # cache. One more condition here: the combined file must serve this library (an adapter
+    # built before the library was a member does not, and would leave its GUIDs unserved).
+    combined = _combined_kernel_db_path()
+    serves = combined is not None and combined_db_serves_hc_fused(combined, kernel_db)
+    if not (serves and _activate_combined_kernel_db()):
+        reason = _prepend_kernel_database(kernel_db)
+        if reason:
+            if combined is not None and not serves:
+                reason += (f" The combined kernel database {combined} does not serve {HC_FUSED_KERNEL_DB}: rebuild "
+                           f"it with tools/build_flashinfer_gaudi.py --combined-only after building the library.")
+            _hc_fused_error(reason)
+            return False
+    # The schemas must exist before the extension is loaded: the C++ side only implements the HPU kernels.
+    try:
+        importlib.import_module(HC_FUSED_SCHEMA_MODULE)
+    except Exception as exc:  # pragma: no cover - the schema module is part of this package
+        _hc_fused_error(f"{HC_FUSED_SCHEMA_MODULE}: {type(exc).__name__}: {exc}")
+        return False
+    try:
+        torch.ops.load_library(extension)
+    except Exception as exc:
+        _hc_fused_error(f"{extension}: {_exception_text(exc)}")
+        return False
+    _LOADED_PATHS.append(extension)
+    return True
+
+
+def load_hc_fused_extension() -> bool:
+    """Register libhc_fused_gaudi2.so (kernel database) and load hc_fused_ops*.so (HPU ops) once; True when loaded.
+
+    Called only with ``VLLM_HPU_HC_FUSED=1``, before the first HPU op of the process: SynapseAI reads
+    ``GC_KERNEL_PATH`` when its graph compiler starts. It never raises; ``hc_fused_extension_errors`` says why
+    it returned False.
+    """
+    global _HC_FUSED_LOADED
+    if _HC_FUSED_LOADED is not None:
+        return _HC_FUSED_LOADED
+    with _LOAD_LOCK:
+        if _HC_FUSED_LOADED is None:
+            try:
+                _HC_FUSED_LOADED = _load_hc_fused_locked()
+            except Exception as exc:  # noqa: BLE001 - an optional kernel never stops a process
+                _hc_fused_error(f"load_hc_fused_extension: {_exception_text(exc)}")
+                _HC_FUSED_LOADED = False
+        return _HC_FUSED_LOADED
+
+
+class _GuidInfo(ctypes.Structure):
+    """``tpc_lib_api::GuidInfo`` (tpc_kernel_lib_interface.h): the name, the name hash, the property bits."""
+
+    _fields_ = [("name", ctypes.c_char * 64), ("name_hash", ctypes.c_uint64), ("kernel_properties", ctypes.c_uint32)]
+
+
+def kernel_library_guids(path: Path | str) -> tuple[str, ...]:
+    """The Gaudi2 kernel GUIDs the kernel library `path` lists, in its order.
+
+    The library is opened the way the graph compiler opens it and asked through its ``GetKernelGuids`` entry
+    point (the two-call protocol). Raises ``OSError`` when it does not load and ``RuntimeError`` when the entry
+    point is missing or fails. A kernel library links nothing from the Gaudi runtime.
+    """
+    library = ctypes.CDLL(str(path))
+    if not hasattr(library, "GetKernelGuids"):
+        raise RuntimeError(f"{path} does not export GetKernelGuids")
+    library.GetKernelGuids.restype = ctypes.c_int
+    library.GetKernelGuids.argtypes = [ctypes.c_int, ctypes.POINTER(ctypes.c_uint32), ctypes.c_void_p]
+    gaudi2 = 3  # tpc_lib_api::DEVICE_ID_GAUDI2 (tpc_kernel_lib_interface.h)
+    count = ctypes.c_uint32(0)
+    status = library.GetKernelGuids(gaudi2, ctypes.byref(count), None)
+    if status != 0:
+        raise RuntimeError(f"{path}: GetKernelGuids returned {status}")
+    guids = (_GuidInfo * max(count.value, 1))()
+    status = library.GetKernelGuids(gaudi2, ctypes.byref(count), ctypes.cast(guids, ctypes.c_void_p))
+    if status != 0:
+        raise RuntimeError(f"{path}: GetKernelGuids returned {status}")
+    return tuple(guids[index].name.decode("ascii", "replace") for index in range(count.value))
+
+
+def moe_glue_extension_errors() -> tuple[str, ...]:
+    """Why ``load_moe_glue_extension`` failed (empty when it loaded or was never called).
+
+    The MoE glue kernels are in the fused hyper-connection library, so a failure to load that library is
+    reported with that loader's own words.
+    """
+    return tuple(_HC_FUSED_ERRORS) + tuple(_MOE_GLUE_ERRORS) if _MOE_GLUE_LOADED is not None else ()
+
+
+def moe_glue_extension_loaded() -> bool | None:
+    """The result of ``load_moe_glue_extension``; None when it was never called (``VLLM_HPU_MOE_GLUE`` is not 1)."""
+    return _MOE_GLUE_LOADED
+
+
+def moe_glue_missing_kernels() -> tuple[str, ...]:
+    """The MoE glue ops whose kernel is not served, as the last ``load_moe_glue_extension`` found it.
+
+    Empty when every kernel is served and before the loader was called; every op when the library did not load.
+    """
+    return _MOE_GLUE_MISSING
+
+
+MOE_GLUE_OPS = ("moe_route", "moe_silu_mul", "moe_combine", "moe_row_quant")  # flashinfer_gaudi.moe_glue.OP_NAMES
+
+
+def _load_moe_glue_locked() -> bool:
+    """The one attempt of ``load_moe_glue_extension`` (the caller holds ``_MOE_GLUE_LOCK``)."""
+    global _MOE_GLUE_MISSING
+    _MOE_GLUE_MISSING = MOE_GLUE_OPS
+    if not load_hc_fused_extension():
+        return False
+    # Imported by the hyper-connection schema module before the extension was loaded.
+    from flashinfer_gaudi import moe_glue
+
+    package_lib = Path(__file__).resolve().parent / "lib"
+    kernel_db = os.environ.get(HC_FUSED_KERNEL_LIBRARY_ENV, "") or str(package_lib / HC_FUSED_KERNEL_DB)
+    try:
+        served = kernel_library_guids(kernel_db)
+    except Exception as exc:  # noqa: BLE001 - a library that cannot be asked serves nothing
+        message = f"{kernel_db}: cannot list its kernels ({_exception_text(exc)})"
+        _LOAD_ERRORS.append(message)
+        _MOE_GLUE_ERRORS.append(message)
+        return False
+    missing = tuple(name for name in MOE_GLUE_OPS if moe_glue.GUIDS[name] not in served)
+    _MOE_GLUE_MISSING = missing
+    if missing:
+        named = ", ".join(f"{name} ({moe_glue.GUIDS[name]})" for name in missing)
+        message = (f"{kernel_db} has no kernel for {named}: a kernel that does not compile is left out when the "
+                   f"library is built (csrc/hc_fused/CMakeLists.txt)")
+        _LOAD_ERRORS.append(message)
+        _MOE_GLUE_ERRORS.append(message)
+        return False
+    return True
+
+
+_MOE_GLUE_LOCK = threading.Lock()
+
+
+def load_moe_glue_extension() -> bool:
+    """Make the fused MoE glue ops usable on HPU, once; True when all four have a kernel.
+
+    The kernels are in ``libhc_fused_gaudi2.so`` and the ops in ``hc_fused_ops*.so``, so this is
+    ``load_hc_fused_extension`` (which registers the library and loads the extension, whichever of the two
+    flags asks first) followed by one question to the library: which of the four MoE kernels it serves, each
+    being optional at build time. Called only with ``VLLM_HPU_MOE_GLUE=1``, before the first HPU op of the
+    process. It never raises; ``moe_glue_extension_errors`` says why it returned False and
+    ``moe_glue_missing_kernels`` which ops have no kernel.
+    """
+    global _MOE_GLUE_LOADED, _MOE_GLUE_MISSING
+    if _MOE_GLUE_LOADED is not None:
+        return _MOE_GLUE_LOADED
+    with _MOE_GLUE_LOCK:
+        if _MOE_GLUE_LOADED is None:
+            try:
+                _MOE_GLUE_LOADED = _load_moe_glue_locked()
+            except Exception as exc:  # noqa: BLE001 - an optional kernel never stops a process
+                message = f"load_moe_glue_extension: {_exception_text(exc)}"
+                _LOAD_ERRORS.append(message)
+                _MOE_GLUE_ERRORS.append(message)
+                _MOE_GLUE_MISSING = MOE_GLUE_OPS
+                _MOE_GLUE_LOADED = False
+        return _MOE_GLUE_LOADED
 
 
 def load_native_extensions() -> tuple[str, ...]:
@@ -321,6 +575,43 @@ def native_dflash2_top_k_op() -> Callable | None:
     return _resolve_op("flashinfer_gaudi", "dflash2_top_k")
 
 
+def kernel_database_status() -> dict[str, object]:
+    """What the loader decided about ``GC_KERNEL_PATH`` in this process, as plain (JSON-serializable) data.
+
+    It only reports: it loads nothing and changes nothing, so it can be called at any point and logged.
+
+    - ``state``: the name of the ``KernelDbState`` of the FlashInfer kernel database (``MISSING``, ``REGISTERED``,
+      ``BLOCKED`` or ``COMBINED``).
+    - ``gc_kernel_path``: the value of ``GC_KERNEL_PATH`` now, the one SynapseAI reads (``""`` when unset).
+    - ``combined_active``: True only when this loader activated the combined kernel database and
+      ``GC_KERNEL_PATH`` is still exactly that one file.
+    - ``combined_kernel_db``: the combined kernel database this loader activated, or None.
+    - ``gdn_fused_loaded``: the result of ``load_gdn_fused_extension`` (None when it was never called).
+    - ``hc_fused_loaded``: the result of ``load_hc_fused_extension`` (None when it was never called, which is
+      every process without ``VLLM_HPU_HC_FUSED=1``).
+    - ``moe_glue_loaded``: the result of ``load_moe_glue_extension``. The key exists only when that loader was
+      called (``VLLM_HPU_MOE_GLUE=1``); such a process also has a result under ``hc_fused_loaded``, because
+      the MoE glue kernels are in the hyper-connection library.
+    - ``load_errors``: every recorded loader error, in order.
+
+    The member libraries are opened by the combined database itself, inside SynapseAI: a member it cannot
+    use is reported on stderr by that file and makes its ``GetKernelGuids`` fail; it is not visible here.
+    """
+    gc_kernel_path = os.environ.get("GC_KERNEL_PATH", "")
+    status: dict[str, object] = {
+        "state": _FLASHINFER_DB_STATE.name,
+        "gc_kernel_path": gc_kernel_path,
+        "combined_active": _COMBINED_DB_ACTIVE is not None and gc_kernel_path == _COMBINED_DB_ACTIVE,
+        "combined_kernel_db": _COMBINED_DB_ACTIVE,
+        "gdn_fused_loaded": _GDN_FUSED_LOADED,
+        "hc_fused_loaded": _HC_FUSED_LOADED,
+        "load_errors": list(_LOAD_ERRORS),
+    }
+    if _MOE_GLUE_LOADED is not None:
+        status["moe_glue_loaded"] = _MOE_GLUE_LOADED
+    return status
+
+
 def native_diagnostics() -> dict[str, object]:
     load_native_extensions()
     return {
@@ -346,7 +637,8 @@ def native_diagnostics() -> dict[str, object]:
 def _reset_native_state_for_tests() -> None:
     global _LOAD_ATTEMPTED, _SILU_AND_MUL_OP, _SILU_MUL_QUANT_OP
     global _BLOCK_FP8_DEQUANT_OP, _BLOCK_FP8_LINEAR_OP
-    global _ADD_RMSNORM_QUANT_OP, _FLASHINFER_DB_STATE, _COMBINED_DB_ACTIVE
+    global _ADD_RMSNORM_QUANT_OP, _FLASHINFER_DB_STATE, _COMBINED_DB_ACTIVE, _HC_FUSED_LOADED
+    global _MOE_GLUE_LOADED, _MOE_GLUE_MISSING
     with _LOAD_LOCK:
         _LOAD_ATTEMPTED = False
         _SILU_AND_MUL_OP = None
@@ -356,6 +648,11 @@ def _reset_native_state_for_tests() -> None:
         _ADD_RMSNORM_QUANT_OP = None
         _FLASHINFER_DB_STATE = KernelDbState.MISSING
         _COMBINED_DB_ACTIVE = None
+        _HC_FUSED_LOADED = None
+        _HC_FUSED_ERRORS.clear()
+        _MOE_GLUE_LOADED = None
+        _MOE_GLUE_MISSING = ()
+        _MOE_GLUE_ERRORS.clear()
         _LOADED_PATHS.clear()
         _LOAD_ERRORS.clear()
 

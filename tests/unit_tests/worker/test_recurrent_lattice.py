@@ -10,8 +10,17 @@ import torch  # noqa: E402
 
 from vllm_gaudi.v1.worker.recurrent_lattice import align_lattice, align_lattices, align_running_block  # noqa: E402
 
+from tests.unit_tests.flash_next_spec_sizes import SPEC_SIZES, require_startup, size_id  # noqa: E402
+
 # Row of the CPU trace of the design (bs = 4, k = 3): slots 8..23, one per block index.
 R = list(range(8, 24))
+
+
+@pytest.fixture(params=SPEC_SIZES, ids=size_id)
+def spec_k(request) -> int:
+    """Each speculative size k the Flash-Next tests run at, after flash_next_spec_sizes' startup check."""
+    require_startup(request.param, prefix_caching=True)
+    return request.param
 
 
 def test_align_running_block_matches_the_cpu_trace():
@@ -49,6 +58,35 @@ def test_align_lattice_is_the_running_block_window():
     assert align_lattice(R, 37, 4, 4, 3) == ([18, 19, 20, 21], [18, 19, 20, 21])
     load, store = align_lattice(R, 36, 4, 4, 3)
     assert load == store == [17, 18, 19, 20]
+
+
+def test_lattice_is_one_slot_per_token_at_every_size(spec_k):
+    """A verification step of 1 + k tokens: load == store == the 1 + k distinct slots from the running block on."""
+    t = 1 + spec_k
+    row = list(range(8, 40))
+    for bs, ctx in ((4, 33), (4, 36), (4, 37), (8, 33), (8, 39), (512, 510), (512, 1018), (512, 1023 - spec_k)):
+        curr = (ctx + t - 1) // bs  # the block of the last of the 1 + k scheduled tokens
+        assert align_running_block(ctx, t, bs) == curr
+        load, store = align_lattice(row, ctx, t, bs, spec_k)
+        assert load == store == row[curr:curr + t], f"bs {bs} ctx {ctx}: {load}"
+        assert len(set(load)) == t
+        # The window ends on the last scratch slot: a row one entry shorter is refused.
+        with pytest.raises(ValueError, match=f"needs at least {curr + t} "):
+            align_lattice(row[:curr + t - 1], ctx, t, bs, spec_k)
+    # The last token of the step is the first of a new block: the window has moved by one block.
+    assert align_lattice(row, 1024 - spec_k, t, 512, spec_k)[0] == row[2:2 + t]
+
+
+def test_lattices_are_one_column_per_token_at_every_size(spec_k):
+    t = 1 + spec_k
+    table = torch.arange(100, 124, dtype=torch.int64).view(2, 12)
+    load, store = align_lattices(table, req_indices=[1, 0], context_lens=[5, 0], num_scheduled=[t, t], block_size=4,
+                                 k=spec_k, padded_batch_size=3, pad_block_id=97)
+    assert load.shape == store.shape == (3, t)
+    first, second = (5 + spec_k) // 4, spec_k // 4  # the blocks of the last scheduled tokens (positions 5 + k and k)
+    assert load[0].tolist() == store[0].tolist() == table[1, first:first + t].tolist()
+    assert load[1].tolist() == store[1].tolist() == table[0, second:second + t].tolist()
+    assert torch.all(load[2] == 97) and torch.all(store[2] == 97)
 
 
 def test_align_lattice_fresh_request_starts_at_block_zero():

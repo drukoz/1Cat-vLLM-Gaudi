@@ -107,6 +107,8 @@ tpc_lib_api::GlueCodeReturn GdnCoreVerifyGaudi2::GetGcDefinitions(
     const uint64_t batchSize = rowIndices.geometry.maxSizes[1];
     const uint64_t nodes = ssmStoreIndices.geometry.maxSizes[0];
     const uint64_t keyHeads = (channels - valueHeads * 128) / 256;
+    // nodes <= kGdnCoreVerifyMaxNodes is what keeps a larger T away from the kernel: its per-node
+    // arrays in vector local memory hold exactly that many nodes.
     const bool shapesMatch =
         ssmState.geometry.maxSizes[0] == 128 && ssmState.geometry.maxSizes[1] == 128 &&
         valueHeads > 0 && keyHeads > 0 && valueHeads % keyHeads == 0 &&

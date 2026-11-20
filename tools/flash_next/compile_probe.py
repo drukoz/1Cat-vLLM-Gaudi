@@ -30,6 +30,12 @@ indexer's ``select`` (wrapped in a ``SelectModule``). The GDN/QSA/PLE layers rea
 ``get_forward_context()``, so every timed call runs under ``set_forward_context``. Between
 shapes the states and the attention stand-ins are reset; one component whose first call exceeds
 120 s gets its replay skipped (``replay_s: null`` and a note).
+
+The PLE layer and the whole model are timed twice (unless ``--skip-host-ngram-ids``): as above,
+computing the PLE n-gram ids in the graph, and in rows named ``<component>+host_ngram_ids`` fed the
+ids computed on the host (``ple_ops.host_ngram_ids``, what ``VLLM_HPU_PLE_HOST_NGRAM_IDS=1`` makes the
+runner send as ``ple_ngram_ids``). The difference between the two ``compile_s`` of a row pair is what
+the token packing, ``searchsorted``, the shift scan and the int32 hash cost a prompt graph.
 """
 
 import argparse
@@ -56,6 +62,10 @@ COMPONENT_CLASSES = (
     "HpuQwen4ExpNGramEmbedding",
     "HpuGatedResidual",
 )
+# Timed a second time with the PLE n-gram ids computed on the host (VLLM_HPU_PLE_HOST_NGRAM_IDS=1).
+HOST_NGRAM_IDS_COMPONENTS = (MODEL_CLASS, "HpuQwen4ExpPLELayer")
+HOST_NGRAM_IDS_SUFFIX = "+host_ngram_ids"
+HOST_NGRAM_IDS_NOTE = "PLE n-gram ids from the host"
 # Classes whose forward the HPU model never calls: they are captured through their entry-point
 # methods (the spec's monkeypatch-and-wrap pattern, as used for HpuQsaIndexer.select).
 METHOD_CLASSES = {
@@ -75,6 +85,9 @@ def parse_args(argv):
     parser.add_argument("--tokens", default="128,512,2048", help="comma-separated prefill token counts")
     parser.add_argument("--out", required=True, help="output directory for probe.json")
     parser.add_argument("--skip-whole-model", action="store_true", help="do not time the whole model")
+    parser.add_argument("--skip-host-ngram-ids", action="store_true",
+                        help="do not time the PLE layer and the whole model a second time with the PLE n-gram ids "
+                        "computed on the host (the +host_ngram_ids rows)")
     return parser.parse_args(argv)
 
 
@@ -168,6 +181,12 @@ def build_targets(model, include_whole_model):
         seen.add(component)
         targets.append({"component": component, "module_name": name, "module": module, "kind": kind})
     return targets
+
+
+def host_ngram_targets(targets):
+    """The targets timed a second time with ready n-gram ids: same module, ``+host_ngram_ids`` component name."""
+    return [{**target, "component": target["component"] + HOST_NGRAM_IDS_SUFFIX, "host_ngram_ids": True}
+            for target in targets if target["component"] in HOST_NGRAM_IDS_COMPONENTS and target["kind"] == "forward"]
 
 
 def capture_inputs(model, targets, names, model_args, model_kwargs, vllm_config, md, patches):
@@ -280,6 +299,7 @@ def run(args, token_counts):
         cpu_model, eos_token_id, ple_kwargs, prefill_metadata, reset_cpu_states)
     from vllm_gaudi.models.qwen4_exp.hyperconnection import HpuGatedResidual
     from vllm_gaudi.models.qwen4_exp.ple_layer import HpuQwen4ExpNGramEmbedding
+    from vllm_gaudi.models.qwen4_exp.ple_ops import HOST_NGRAM_IDS_KWARG, collect_ngram_host_tables, host_ngram_ids
     from vllm_gaudi.models.qwen4_exp.qsa import HpuQsaIndexer, HpuQwen4ExpQSAAttention, QsaMode
 
     htorch = None
@@ -301,6 +321,8 @@ def run(args, token_counts):
         eos = eos_token_id(vllm_config)
         names = {id(module): (name or MODEL_CLASS) for name, module in model.named_modules()}
         targets = build_targets(model, include_whole_model=not args.skip_whole_model)
+        host_tables = None if args.skip_host_ngram_ids else collect_ngram_host_tables(model)
+        host_targets = host_ngram_targets(targets) if host_tables is not None else []
         sparse_attns = [m.sparse_attn for m in model.modules() if isinstance(m, HpuQwen4ExpQSAAttention)]
 
         for tokens in token_counts:
@@ -309,7 +331,8 @@ def run(args, token_counts):
                 att.reset()
                 att.slot = 1
             md = tensors_to_device(prefill_metadata(tokens, 1), device)
-            pkw = tensors_to_device(ple_kwargs(tokens, eos), device)
+            ple_cpu = ple_kwargs(tokens, eos)
+            pkw = tensors_to_device(dict(ple_cpu), device)
             ids = torch.randint(5, 1000, (tokens,), device=device)
             print(f"compile_probe: capturing {tokens} tokens ...", flush=True)
             captured = capture_inputs(
@@ -326,7 +349,31 @@ def run(args, token_counts):
                 md,
                 patches,
             )
-            for target in targets:
+            if host_targets:
+                # The same prefill as the runner sends it with VLLM_HPU_PLE_HOST_NGRAM_IDS=1: the ids hashed on
+                # the host go in as ple_ngram_ids and no ngram_context is sent. The states are reset first, so
+                # this forward starts where the one above started and leaves the same states behind.
+                reset_cpu_states(model)
+                for att in sparse_attns:
+                    att.reset()
+                ready = host_ngram_ids(host_tables, ids.cpu(), ple_cpu["query_start_loc"], ple_cpu["ngram_context"])
+                captured.update(
+                    capture_inputs(
+                        model,
+                        host_targets,
+                        names,
+                        (),
+                        {
+                            "input_ids": ids,
+                            "positions": torch.arange(tokens, device=device),
+                            "query_start_loc": pkw["query_start_loc"],
+                            HOST_NGRAM_IDS_KWARG: ready.to(device),
+                        },
+                        vllm_config,
+                        md,
+                        [],
+                    ))
+            for target in targets + host_targets:
                 key = (target["component"], target["module_name"])
                 if key not in captured:
                     print(f"compile_probe: WARNING {key} captured no inputs at {tokens} tokens, skipped", flush=True)
@@ -343,6 +390,8 @@ def run(args, token_counts):
                     component = htorch.hpu.wrap_in_hpu_graph(component, disable_tensor_cache=True)
                 run_callable = functools.partial(component, *cap["args"], **cap["kwargs"])
                 note = cap["method"] + "()" if target["kind"] == "method" else None
+                if target.get("host_ngram_ids"):
+                    note = HOST_NGRAM_IDS_NOTE
                 try:
                     for att in sparse_attns:  # the stand-in appends K/V per call: keep the captured length
                         att.reset()
@@ -356,7 +405,8 @@ def run(args, token_counts):
                 replay_s = None
                 if compile_s > FIRST_CALL_BUDGET_S:
                     note = f"first call took {compile_s:.1f} s (> {FIRST_CALL_BUDGET_S:.0f} s); replay skipped" + (
-                        f" [{cap['method']}()]" if target["kind"] == "method" else "")
+                        f" [{cap['method']}()]" if target["kind"] == "method" else "") + (
+                            f" [{HOST_NGRAM_IDS_NOTE}]" if target.get("host_ngram_ids") else "")
                 else:
                     for att in sparse_attns:
                         att.reset()

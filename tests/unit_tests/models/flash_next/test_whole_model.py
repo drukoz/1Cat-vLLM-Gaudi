@@ -66,6 +66,12 @@ def test_checkpoint_reference_is_committed_one(tiny_checkpoint):
     """The session checkpoint's reference.json is the committed HF oracle."""
     generated = json.loads((tiny_checkpoint / "reference.json").read_text(encoding="utf-8"))
     committed = json.loads(COMMITTED_REFERENCE.read_text(encoding="utf-8"))
+    # "build" is provenance the generator adds (fixture and generator hashes, GDN head dim), used to
+    # decide whether a checkpoint folder can be reused; it changes with every edit of the generator.
+    # The oracle is everything else.
+    build = generated.pop("build", None)
+    committed.pop("build", None)
+    assert build is None or build["gdn_head_dim"] == 16  # the session checkpoint is the committed fixture's
     assert generated == committed
 
 

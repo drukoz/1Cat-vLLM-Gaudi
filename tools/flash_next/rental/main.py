@@ -1,5 +1,28 @@
 # SPDX-License-Identifier: Apache-2.0
-"""The rental test orchestrator: gates, variants A/B/C(/P), the report."""
+"""The rental test orchestrator: gates, variants A/B/C(/P), the report.
+
+What the operator sees on the console: one line per finished gate and variant (a failure with the last
+error lines of its server log and the log to read), one `first token` line per variant server, and the
+final `RUN <id>: PASSED|FAILED at <phase>`. A server that exits before it is healthy is FAILED with its
+exit code, never a timeout. A failed gate or variant leaves pip-freeze.txt and hl-smi.txt in the run
+folder. `--from PHASE` resumes a run that has a manifest.json; `--quick-gates` and `--no-verify-probe`
+leave out steps that are recorded only; `--load-read-timeout` and `--warm-request-timeout` replace two
+request timeouts. The combined kernel database has an automatic fallback at gate G1b and at the tiny
+gate (`gate_tiny`), and the operator's FLASHINFER_GAUDI_COMBINED_KERNEL_DB=0 switches it off.
+
+`--hc-fused` asks for the fused hyper-connection kernels (VLLM_HPU_HC_FUSED=1, off by default). Their card
+test runs right after G1b's own steps and is recorded in G1b's details; it never changes G1b's status or
+the GDN flags. The servers get the kernels only when the operator asked and the card test passed, every
+other server gets an explicit VLLM_HPU_HC_FUSED=0, and a tiny gate that fails with the kernels runs once
+more without them. The manifest's `hc_fused` and the summary's `HC fused:` line record the outcome.
+
+`--moe-glue` asks for the MoE glue kernels (VLLM_HPU_MOE_GLUE=1, off by default; they live in the
+hyper-connection library) in the same way: their card test runs right after the hyper-connection one and
+is recorded in G1b's details, the servers get them only when the operator asked and that test passed, and
+every other server gets an explicit VLLM_HPU_MOE_GLUE=0. The tiny gate's retry is one for both: a gate
+that fails with either kind of kernels runs once more without both. The manifest's `moe_glue` and the
+summary's `MoE glue:` line record the outcome.
+"""
 
 from __future__ import annotations
 
@@ -8,6 +31,7 @@ import asyncio
 import hashlib
 import json
 import os
+import re
 import shlex
 import subprocess
 import sys
@@ -18,6 +42,7 @@ from pathlib import Path
 
 from tools.flash_next.rental import agent_load, gates, report, schema, serve, workload
 from tools.flash_next.rental.schema import (
+    FIRST_TOKEN_FILE,
     METRICS_FILE,
     REQUESTS_FILE,
     STARTUP_FILE,
@@ -28,7 +53,11 @@ from tools.flash_next.rental.schema import (
 
 VARIANTS_FILE = Path(__file__).resolve().parent / "variants.json"
 GATE_PHASES = ("preflight", "build", "fused_gdn", "tiny", "card_tests")
-ENV_PREFIXES = ("VLLM_", "HABANA_", "PT_", "HF_")
+# What a manifest and a status file keep of an environment: the plugin, bridge, kernel-loader and Hub
+# variables, plus the names of ENV_KEYS; a value whose name looks like a secret is never written.
+ENV_PREFIXES = ("VLLM_", "HABANA_", "PT_", "HF_", "FLASHINFER_", "GC_", "GDN_", "HC_")
+ENV_KEYS = ("PYTHONFAULTHANDLER",)
+ENV_SECRET_SUFFIXES = ("_TOKEN", "_SECRET", "_PASSWORD", "_API_KEY")  # HF_TOKEN, VLLM_API_KEY
 HLSMI_Q_LIMIT = 200 * 1024
 SERVER_HEALTH_TIMEOUT_S = 1800.0
 COHERENCE_REQUEST_TIMEOUT_SKIP_WARMUP_S = 3600.0
@@ -36,6 +65,17 @@ TINY_HEALTH_TIMEOUT_S = 1200.0
 TINY_CHECKPOINT_TIMEOUT_S = 900.0
 TINY_PORT = 8010
 TINY_FIXTURE = "tests/unit_tests/models/flash_next/tiny_tp8_config.json"
+TINY_GENERATOR = "tools/flash_next/make_tiny_checkpoint.py"
+TINY_BUILD_THREAD_ENV = ("OMP_NUM_THREADS", "MKL_NUM_THREADS")
+TINY_GDN_HEAD_DIM = 128  # the head dim of the real model's GDN layers and the only one the HPU kernel accepts
+TINY_MIN_MODEL_LEN = 512
+TINY_DEFAULT_MODEL_LEN = 4096
+TINY_ATTEMPT_COMBINED = "attempt-combined"
+TINY_ATTEMPT_HC_FUSED = "attempt-hc-fused"
+TINY_ATTEMPT_MOE_GLUE = "attempt-moe-glue"
+TINY_ATTEMPT_GDN_FUSED = "attempt-gdn-fused"
+HC_QUICK_SKIP_REASON = "--quick-gates without --hc-fused"
+MOE_QUICK_SKIP_REASON = "--quick-gates without --moe-glue"
 LOAD_TIMEOUT_S = 5400.0
 LOAD_REQUEST_TIMEOUT_S = 1800.0
 LOAD_STAGGER_S = 60.0
@@ -52,6 +92,16 @@ STUB_STAGGER_S = 0.0
 STUB_MONITOR_INTERVAL_S = 0.05
 STUB_TOKENS_PER_SECOND = "400"
 STUB_PORT_TIMEOUT_S = 30.0
+QUICK_GATES_REASON = "--quick-gates"
+NO_VERIFY_PROBE_REASON = "--no-verify-probe"
+BUNDLE_SHA_RE = re.compile(r"^plugin sha:\s*([0-9a-f]{40})\s*$", re.MULTILINE)
+GIT_SHA_RE = re.compile(r"[0-9a-f]{40}")
+# What a failed gate or variant leaves in the run folder: (file, command, timeout in s, open mode).
+# pip freeze is the same at every failure and is rewritten; every failure adds its own hl-smi snapshot.
+FAILURE_EVIDENCE = (
+    ("pip-freeze.txt", [sys.executable, "-m", "pip", "freeze"], 120.0, "w"),
+    ("hl-smi.txt", ["hl-smi"], 60.0, "a"),
+)
 
 
 def repo_root() -> Path:
@@ -64,12 +114,110 @@ def load_variants(path: Path = VARIANTS_FILE) -> list:
 
 
 def tiny_checkpoint_command(ckpt: Path) -> list:
-    """The command that builds the tiny checkpoint and its CPU reference in `ckpt` (run from the repo root)."""
-    return [sys.executable, "tools/flash_next/make_tiny_checkpoint.py", "--out", str(ckpt), "--fixture", TINY_FIXTURE]
+    """The command that builds the tiny checkpoint and its CPU reference in `ckpt` (run from the repo root).
+
+    The GDN layers are built at head dim TINY_GDN_HEAD_DIM, the only one the HPU fused kernel accepts:
+    with the fixture's own 16 every layer logs "GDN core decode ... is off" and runs the torch path."""
+    return [sys.executable, TINY_GENERATOR, "--out", str(ckpt), "--fixture", TINY_FIXTURE,
+            "--gdn-head-dim", str(TINY_GDN_HEAD_DIM)]
+
+
+def _sha256(path: Path) -> str:
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
+def tiny_build_settings() -> dict:
+    """What the `build` block of a tiny checkpoint's reference.json must say for the folder to be reused:
+    the settings of `tiny_checkpoint_command` and the generator and fixture of this bundle."""
+    root = repo_root()
+    return {
+        "seed": 0,
+        "gdn_head_dim": TINY_GDN_HEAD_DIM,
+        "fixture_sha256": _sha256(root / TINY_FIXTURE),
+        "generator_sha256": _sha256(root / TINY_GENERATOR),
+    }
+
+
+def tiny_checkpoint_stale_reason(ckpt: Path):
+    """None when the tiny checkpoint in `ckpt` was built with `tiny_build_settings`; else why it is rebuilt.
+
+    The prompt lengths and the schema version are pinned by the generator's sha256; the reference must
+    also agree with itself on them (a file edited by hand or cut short is not reused)."""
+    reference = read_json(Path(ckpt) / "reference.json")
+    if not isinstance(reference, dict):
+        return "no reference.json"
+    build = reference.get("build")
+    if not isinstance(build, dict):
+        return "no build settings in reference.json (an older generator)"
+    for key, wanted in tiny_build_settings().items():
+        if build.get(key) != wanted:
+            return "%s is %r, wanted %r" % (key, build.get(key), wanted)
+    try:
+        lengths = [len(p["prompt_ids"]) for p in reference["prompts"]]
+    except (KeyError, TypeError):
+        return "no prompts in reference.json"
+    if build.get("prompt_lengths") != lengths:
+        return "prompt_lengths %r do not match the prompts in the file %r" % (build.get("prompt_lengths"), lengths)
+    if build.get("schema") != reference.get("schema"):
+        return "schema %r does not match the file's %r" % (build.get("schema"), reference.get("schema"))
+    return None
+
+
+def tiny_build_env() -> dict:
+    """The environment of the tiny checkpoint build: one CPU thread unless the operator set a count.
+    The tiny model's tensors are too small for threads to pay off, and with the GDN layers at head dim
+    128 the default count made the build 13 times slower on the CPU venv (172 s against 13 s, the
+    same weights and the same reference: generated ids, top-5 logits, draft ids)."""
+    env = dict(os.environ)
+    for name in TINY_BUILD_THREAD_ENV:
+        env.setdefault(name, "1")
+    return env
+
+
+def ensure_tiny_checkpoint(ckpt: Path, command: list = None, say=print):
+    """Build the tiny checkpoint in `ckpt` unless it is there with the wanted build settings
+    (`tiny_checkpoint_stale_reason`); the failure reason, or None. The tiny gate and the smoke test share it."""
+    ckpt = Path(ckpt)
+    stale = tiny_checkpoint_stale_reason(ckpt)
+    if stale is None:
+        say("reusing the tiny checkpoint in %s" % ckpt)
+        return None
+    had_reference = (ckpt / "reference.json").is_file()
+    say("building the tiny checkpoint in %s (about a minute)%s" %
+        (ckpt, ": the one there is not reused, %s" % stale if had_reference else ""))
+    try:
+        (ckpt / "reference.json").unlink(missing_ok=True)  # a failed build must not leave the old reference
+        proc = gates.run_step(command or tiny_checkpoint_command(ckpt), repo_root(), TINY_CHECKPOINT_TIMEOUT_S,
+                              tiny_build_env())
+    except subprocess.TimeoutExpired:
+        return "tiny checkpoint did not finish in %d s" % int(TINY_CHECKPOINT_TIMEOUT_S)
+    except OSError as e:
+        return "tiny checkpoint could not start: %s" % e
+    if proc.returncode != 0:
+        tail = (proc.stderr or proc.stdout or "")[-400:]
+        return "tiny checkpoint failed (exit %d): %s" % (proc.returncode, tail.strip())
+    return None
+
+
+def tiny_model_len(ckpt: Path) -> int:
+    """`--max-model-len` of the tiny server: the longest prompt of `ckpt`/reference.json plus the tokens
+    the gate generates, rounded up to a power of two and at least TINY_MIN_MODEL_LEN. With no readable
+    reference it is TINY_DEFAULT_MODEL_LEN, the tiny fixtures' max_position_embeddings."""
+    reference = read_json(Path(ckpt) / "reference.json")
+    try:
+        longest = max(len(p["prompt_ids"]) for p in reference["prompts"])
+        new_tokens = max(int(reference.get("max_new_tokens") or 0), gates.TINY_MAX_TOKENS)
+    except (KeyError, TypeError, ValueError):
+        return TINY_DEFAULT_MODEL_LEN
+    length = TINY_MIN_MODEL_LEN
+    while length < longest + new_tokens:
+        length *= 2
+    return length
 
 
 def tiny_serve_command(ckpt: Path, port: int = TINY_PORT) -> list:
-    """The `vllm serve` command of the tiny gate; tiny_smoke.py starts the same one."""
+    """The `vllm serve` command of the tiny gate; tiny_smoke.py starts the same one. Build it after the
+    checkpoint: the model length comes from its reference (`tiny_model_len`)."""
     return [
         "vllm",
         "serve",
@@ -79,7 +227,7 @@ def tiny_serve_command(ckpt: Path, port: int = TINY_PORT) -> list:
         "--tensor-parallel-size",
         "8",
         "--max-model-len",
-        "512",
+        str(tiny_model_len(ckpt)),
         "--max-num-seqs",
         "4",
         "--language-model-only",
@@ -97,10 +245,20 @@ def server_env(variant_env: dict, gdn_env: dict) -> dict:
     return env
 
 
+def combined_kernel_db_switched_off() -> bool:
+    """True when the operator's kill switch is set: FLASHINFER_GAUDI_COMBINED_KERNEL_DB=0."""
+    return os.environ.get(serve.COMBINED_KERNEL_DB_ENV, "1").strip() == "0"
+
+
 def combined_kernel_db_installed(python: str = sys.executable) -> bool:
     """True when the installed flashinfer_gaudi `lib` folder holds the combined kernel database (RUK-3242):
     one file with Intel's kernels and ours, the only kernel library the bridge accepts next to a recipe cache.
-    Never import it here: the lookup is a subprocess, as in the G1b gate."""
+    False when the operator switched it off (FLASHINFER_GAUDI_COMBINED_KERNEL_DB=0 in this process's
+    environment, which every server inherits): the loader then registers the libraries as a list, and a
+    fused server must not get a recipe cache. Never import it here: the lookup is a subprocess, as in the
+    G1b gate."""
+    if combined_kernel_db_switched_off():
+        return False
     try:
         lookup = gates.run_step([python, "-c", gates.GDN_LIB_LOOKUP_CODE], tempfile.gettempdir(), 120)
         if lookup.returncode != 0:
@@ -135,6 +293,82 @@ def write_status(phase_dir: Path,
     if extra:
         obj.update(extra)
     write_json(phase_dir / STATUS_FILE, obj)
+
+
+def recorded_env(env: dict) -> dict:
+    """The variables of `env` that go into the manifest and the status files (ENV_PREFIXES, ENV_KEYS)."""
+    out = {}
+    for key, value in env.items():
+        if key.startswith(ENV_PREFIXES) or key in ENV_KEYS:
+            out[key] = "<redacted>" if key.upper().endswith(ENV_SECRET_SUFFIXES) else value
+    return out
+
+
+def git_commit(root: Path = None):
+    """HEAD of the git checkout whose top level is `root` (default: the plugin root), 40 hex characters;
+    None when `root` is not one (a bundle has no .git) or git is missing."""
+    root = Path(root) if root is not None else repo_root()
+    try:
+        out = subprocess.run(["git", "rev-parse", "--show-toplevel", "HEAD"], cwd=str(root), capture_output=True,
+                             text=True, timeout=30)
+        lines = out.stdout.split("\n")
+        if out.returncode != 0 or len(lines) < 2 or not GIT_SHA_RE.fullmatch(lines[1].strip()):
+            return None
+        if os.path.realpath(lines[0]) != os.path.realpath(root):
+            return None  # some other checkout around the folder: not this code's commit
+        return lines[1].strip()
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def bundle_text(root: Path = None):
+    """BUNDLE.txt of the rental bundle, which sits next to the plugin folder (/bundle/BUNDLE.txt on the
+    node); None outside a bundle."""
+    root = Path(root) if root is not None else repo_root()
+    try:
+        return (root.parent / "BUNDLE.txt").read_text(encoding="utf-8")
+    except OSError:
+        return None
+
+
+def bundle_commit():
+    """The plugin commit this code is: git's HEAD in a checkout, else the `plugin sha:` line of the
+    bundle's BUNDLE.txt, else None."""
+    commit = git_commit()
+    if commit:
+        return commit
+    match = BUNDLE_SHA_RE.search(bundle_text() or "")
+    return match.group(1) if match else None
+
+
+def keyed_recipe_cache_dir(base, commit):
+    """The recipe cache folder of one bundle: `base`/<first 12 characters of the plugin commit> (`unknown`
+    when the commit is not known), so a new bundle gets a fresh folder: the bridge keys cached recipes
+    by the GC_KERNEL_PATH file, not by the kernels that file forwards to (RUK-3242). None without `base`."""
+    if not base:
+        return None
+    return "%s/%s" % (str(base).rstrip("/"), (commit or "unknown")[:12])
+
+
+def write_failure_evidence(run_dir: Path, phase: str, commands=None) -> None:
+    """After a failed gate or variant: the installed packages and the cards as they are now, into the run
+    folder (FAILURE_EVIDENCE). Best effort: a command that cannot run leaves its error in its file, and
+    nothing here ever raises."""
+    for name, cmd, timeout_s, mode in (FAILURE_EVIDENCE if commands is None else commands):
+        try:
+            try:
+                out = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_s)
+                text = out.stdout or ""
+                if out.returncode != 0 or (out.stderr or "").strip():
+                    text += "[exit %d] %s\n" % (out.returncode, (out.stderr or "").strip())
+            except (OSError, subprocess.SubprocessError) as e:
+                text = "%s: %s\n" % (type(e).__name__, e)
+            stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+            with open(Path(run_dir) / name, mode, encoding="utf-8") as fh:
+                fh.write("# %s at the failure of %s, %s\n%s%s" % (" ".join(str(c) for c in cmd), phase, stamp, text,
+                                                                 "" if text.endswith("\n") else "\n"))
+        except Exception:  # noqa: BLE001 - evidence only
+            pass
 
 
 def max_running_sum(path: Path) -> float:
@@ -172,9 +406,19 @@ def gdn_summary_lines(run_dir, variant_ids) -> list:
         path = run_dir / vid / "gdn_fallback.txt"
         if not path.is_file():
             continue
-        count = sum(1 for ln in path.read_text(encoding="utf-8").splitlines() if ln.strip())
+        found = [ln for ln in path.read_text(encoding="utf-8").splitlines() if ln.strip()]
+        families = [gates.fallback_family(ln) for ln in found]  # each line counts once, for one family
+        hc_count = families.count(gates.FALLBACK_HC)
+        moe_count = families.count(gates.FALLBACK_MOE)
+        count = len(found) - hc_count - moe_count
         if count:
             lines.append("GDN fallback lines in %s: %d (the kernel did not run on every layer)" % (vid, count))
+        if hc_count:
+            lines.append("HC fused fallback lines in %s: %d (the hyper-connection kernels did not run on every "
+                         "layer)" % (vid, hc_count))
+        if moe_count:
+            lines.append("MoE glue fallback lines in %s: %d (the MoE glue kernels did not run on every layer)" %
+                         (vid, moe_count))
     toolchain = read_json(run_dir / "toolchain.json")  # written by container_entry.sh before the build
     if isinstance(toolchain, dict):
         lines.append("Native kernels: %s (tpc-clang: %s; habanalabs-tools: %s)" % (
@@ -205,11 +449,37 @@ class Runner:
             raise ValueError("unknown variant ids: %s" % ", ".join(unknown))
         self.selected = [by_id[t] for t in ids]
         self.from_phase = args.from_phase
-        if self.from_phase and not args.run_id:
-            raise ValueError("--from requires --run-id")
+        if self.from_phase:  # before anything else: a wrong name or run must not cost a lookup or a folder
+            names = [n for _, n in self.phases()]
+            if self.from_phase not in names:
+                raise ValueError("--from %s is not a phase of this run (phases: %s)" %
+                                 (self.from_phase, ", ".join(names)))
+            if not args.run_id:
+                raise ValueError("--from requires --run-id")
+            if not args.dry_run and not isinstance(read_json(self.run_dir / "manifest.json"), dict):
+                raise ValueError(
+                    "--from %s resumes a run that already has results, and %s has no manifest.json from an "
+                    "earlier start (the gates would be skipped and the GDN flags unknown): start this run "
+                    "without --from" % (self.from_phase, self.run_dir))
+        self.quick_gates = bool(args.quick_gates)
+        self.verify_probe = not (args.quick_gates or args.no_verify_probe)
+        self.load_read_timeout_s = float(args.load_read_timeout)
+        self.warm_request_timeout_s = float(args.warm_request_timeout)
         self.gdn_env = {}
         self.gdn_mode = None
         self.gdn_reason = None
+        # The fused hyper-connection kernels: the operator's request (--hc-fused), the card test's result
+        # in G1b (None before G1b ran), and who took the kernels out of this run's servers ("tiny").
+        self.hc_fused_requested = bool(args.hc_fused)
+        self.hc_fused_status = None
+        self.hc_fused_reason = None
+        self.hc_fused_disabled_by = None
+        # The MoE glue kernels, the same three things: --moe-glue, their card test in G1b, and "tiny".
+        self.moe_glue_requested = bool(args.moe_glue)
+        self.moe_glue_status = None
+        self.moe_glue_reason = None
+        self.moe_glue_disabled_by = None
+        self.gdn_fused_disabled_by = None  # "tiny" when the tiny gate only passed on the PyTorch GDN path
         self.skip_warmup = not args.full_warmup
         self.warm_pass = not args.no_warm_pass
         self.server_timeout_s = float(args.server_timeout)
@@ -224,18 +494,13 @@ class Runner:
         self.bundle_commit = None
         self.workload_info = None
         self.recipe_cache_mb = int(args.recipe_cache_mb)
-        self.recipe_cache_dir = self._keyed_recipe_cache_dir()
+        self.recipe_cache_dir = keyed_recipe_cache_dir(args.recipe_cache, self.bundle_commit)
         self.recipe_cache_notes = {}
         self.recipe_cache_note = serve.RECIPE_CACHE_NONE
+        # The combined kernel database: installed and not switched off by the operator; and who took it
+        # out of this run's servers, if anyone ("operator", "g1b" or "tiny").
         self.combined_db_installed = False if self.stub else combined_kernel_db_installed()
-
-    def _keyed_recipe_cache_dir(self):
-        """--recipe-cache with the bundle commit key (first 12 chars, `unknown` while the commit is not
-        known yet) so a new bundle gets a fresh cache folder: the bridge keys cached recipes by the
-        GC_KERNEL_PATH file, not by the kernels that file forwards to (RUK-3242)."""
-        if not self.args.recipe_cache:
-            return None
-        return "%s/%s" % (self.args.recipe_cache.rstrip("/"), (self.bundle_commit or "unknown")[:12])
+        self.combined_db_disabled_by = "operator" if not self.stub and combined_kernel_db_switched_off() else None
 
     def variant_by_id(self, vid: str):
         for v in self.variants:
@@ -251,21 +516,22 @@ class Runner:
 
     def run(self) -> int:
         names = [n for _, n in self.phases()]
-        if self.from_phase:
-            if self.from_phase not in names:
-                raise ValueError("--from %s is not a phase of this run" % self.from_phase)
+        if self.from_phase:  # the name and the earlier manifest were checked in __init__
             self.start_index = names.index(self.from_phase)
-            if not self.run_dir.is_dir():
-                raise ValueError("run folder %s does not exist" % self.run_dir)
             manifest = read_json(self.run_dir / "manifest.json") or {}
-            self.bundle_commit = manifest.get("bundle_commit")
+            # the commit of the bundle that runs now (a newer one may have been extracted over the old):
+            # the recipe cache key must follow the code, not the run
+            self.bundle_commit = bundle_commit() or manifest.get("bundle_commit")
             self.hl_smi_q = manifest.get("hl_smi_q", "")
             self.restore_gdn()
+            self.restore_combined_db(manifest)
+            self.restore_hc_fused(manifest)
+            self.restore_moe_glue(manifest)
         else:
             self.run_dir.mkdir(parents=True, exist_ok=True)
-            self.bundle_commit = self._git_commit()
+            self.bundle_commit = bundle_commit()
             self.hl_smi_q = self._hl_smi_q()
-        self.recipe_cache_dir = self._keyed_recipe_cache_dir()
+        self.recipe_cache_dir = keyed_recipe_cache_dir(self.args.recipe_cache, self.bundle_commit)
         self.write_manifest()
         for kind, name in self.phases()[self.start_index:]:
             self.current_phase = name
@@ -340,15 +606,73 @@ class Runner:
             details = {"reason": "%s: %s" % (type(exc).__name__, exc)}
         seconds = time.time() - t0
         reason = details.get("reason") or details.get("error")
-        write_status(phase_dir, name, status, reason, seconds)
+        errors = list(details.get("errors") or [])
+        write_status(phase_dir, name, status, reason, seconds, extra={"errors": errors} if errors else None)
         write_json(phase_dir / "details.json", details)
+        self.announce(name, status, reason, seconds, errors, details.get("log") or [])
+        if name == "fused_gdn" and not self.stub:
+            self.announce_hc_fused(phase_dir, details.get("hc_fused"))
+            self.announce_moe_glue(phase_dir, details.get("moe_glue"))
+        if status in (GateStatus.FAILED, GateStatus.TIMED_OUT):
+            self.failure_evidence(name)
         if name in ("fused_gdn", "card_tests"):
             return True  # recorded-only phases: their result never stops the run
         return status in (GateStatus.PASSED, GateStatus.SKIPPED)
 
+    def announce(self, label: str, status, reason, seconds: float, errors=(), logs=()) -> None:
+        """One console line per finished gate or variant; a failure also gets the last error lines of
+        its server log and the log to read."""
+        line = "%s: %s after %.0f s" % (label, GateStatus(status).name, seconds)
+        print(line + (" (%s)" % reason if reason else ""), flush=True)
+        if status in (GateStatus.FAILED, GateStatus.TIMED_OUT):
+            for text in errors:
+                print("    %s" % text, flush=True)
+            for log in logs:
+                print("    log: %s" % log, flush=True)
+
+    def announce_hc_fused(self, phase_dir: Path, hc_fused) -> None:
+        """One console line after G1b's own: the hyper-connection kernels' card test and what the servers get."""
+        hc_fused = hc_fused if isinstance(hc_fused, dict) else {}
+        status = hc_fused.get("status") or gates.HC_NOT_RUN
+        reason = hc_fused.get("reason")
+        line = "fused_gdn: hyper-connection kernels' card test %s%s; HC fused: %s" % (
+            status, " (%s)" % reason if reason else "", self.hc_fused_outcome())
+        print(line, flush=True)
+        if status == gates.HC_FAILED and hc_fused.get("log"):
+            print("    log: %s" % (phase_dir / hc_fused["log"]), flush=True)
+
+    def announce_moe_glue(self, phase_dir: Path, moe_glue) -> None:
+        """One more console line after the hyper-connection one: the MoE glue kernels' card test and what
+        the servers get."""
+        moe_glue = moe_glue if isinstance(moe_glue, dict) else {}
+        status = moe_glue.get("status") or gates.HC_NOT_RUN
+        reason = moe_glue.get("reason")
+        line = "fused_gdn: MoE glue kernels' card test %s%s; MoE glue: %s" % (
+            status, " (%s)" % reason if reason else "", self.moe_glue_outcome())
+        print(line, flush=True)
+        if status == gates.HC_FAILED and moe_glue.get("log"):
+            print("    log: %s" % (phase_dir / moe_glue["log"]), flush=True)
+
+    def failure_evidence(self, phase: str) -> None:
+        """pip-freeze.txt and a fresh hl-smi.txt in the run folder (not in stub mode: no card, no stack)."""
+        if not self.stub:
+            write_failure_evidence(self.run_dir, phase)
+
+    def skipped_steps(self) -> dict:
+        """The recorded-only steps this run leaves out, by flag: {step: reason} for the manifest."""
+        if self.quick_gates:
+            steps = {"fused_gdn.%s" % step: QUICK_GATES_REASON for step in gates.GDN_RECORDED_ONLY_STEPS}
+            steps["card_tests"] = QUICK_GATES_REASON
+            return steps
+        if not self.verify_probe:
+            return {"fused_gdn.%s" % gates.GDN_STEP_CRASH_PROBE: NO_VERIFY_PROBE_REASON}
+        return {}
+
     def gate_card_tests(self, phase_dir: Path):
         if self.stub:
             return GateStatus.SKIPPED, {"reason": "stub mode"}
+        if self.quick_gates:  # recorded only: it never decides anything a server runs with
+            return GateStatus.SKIPPED, {"reason": QUICK_GATES_REASON}
         return gates.card_tests(repo_root(), phase_dir, sys.executable)
 
     def gate_preflight(self):
@@ -364,12 +688,21 @@ class Runner:
         return gates.preflight(model_dir, layouts, self.results_dir)
 
     def gate_fused_gdn(self, phase_dir: Path):
+        self.hc_fused_disabled_by = None  # a rerun of the gates decides again
+        self.moe_glue_disabled_by = None
         if self.stub:
             status = GateStatus.SKIPPED
             details = {"mode": None, "env": {}, "reason": "stub mode"}
+            hc_fused = {"status": gates.HC_NOT_RUN, "reason": "stub mode", "hpu_op": None}
+            moe_glue = {"status": gates.HC_NOT_RUN, "reason": "stub mode", "hpu_op": None}
         else:
+            if self.combined_db_disabled_by in ("g1b", "tiny"):
+                self.combined_db_disabled_by = None  # a rerun of the gates decides again
+            skip_reason = QUICK_GATES_REASON if self.quick_gates else None
+            probe_reason = None if self.verify_probe else (skip_reason or NO_VERIFY_PROBE_REASON)
             try:
-                status, details = gates.fused_gdn(repo_root(), phase_dir, sys.executable)
+                status, details = gates.fused_gdn(repo_root(), phase_dir, sys.executable,
+                                                  skip_recorded_only=skip_reason, skip_verify_probe=probe_reason)
             except Exception as exc:  # noqa: BLE001
                 status = GateStatus.FAILED
                 details = {
@@ -377,34 +710,254 @@ class Runner:
                     "env": {"VLLM_HPU_GDN_CORE_DECODE": "0"},
                     "reason": "%s: %s" % (type(exc).__name__, exc),
                 }
+            hc_fused = self.check_hc_fused(phase_dir, details)
+            moe_glue = self.check_moe_glue(phase_dir, details)
+        # The hyper-connection kernels' card test and the MoE glue kernels' are recorded next to G1b's own
+        # result; `status`, the GDN mode and the GDN flags above are final and nothing below changes them.
+        hc_fused["requested"] = self.hc_fused_requested
+        details["hc_fused"] = hc_fused
+        self.hc_fused_status = hc_fused.get("status")
+        self.hc_fused_reason = hc_fused.get("reason")
+        moe_glue["requested"] = self.moe_glue_requested
+        details["moe_glue"] = moe_glue
+        self.moe_glue_status = moe_glue.get("status")
+        self.moe_glue_reason = moe_glue.get("reason")
+        if not self.stub:
+            details["env"] = dict(details.get("env") or {})
+            details["env"][gates.HC_FUSED_ENV] = "1" if self.hc_fused_on() else "0"
+            details["env"][gates.MOE_GLUE_ENV] = "1" if self.moe_glue_on() else "0"
         self.gdn_env = dict(details.get("env") or {})
         self.gdn_mode = details.get("mode")
         self.gdn_reason = details.get("reason")
+        if details.get("combined_kernel_db") == gates.COMBINED_DB_DISABLED_BY_G1B and \
+                self.combined_db_disabled_by is None:
+            self.combined_db_disabled_by = "g1b"  # the kill switch itself is in details["env"]
         return status, details
 
+    def check_hc_fused(self, phase_dir: Path, gdn_details: dict) -> dict:
+        """The fused hyper-connection kernels' card test, right after G1b's own steps (gates.hc_fused).
+
+        It runs unless --quick-gates is set and the operator did not ask for the kernels: without the
+        request its result is recorded only, with it the result decides a kernel. It runs without the
+        combined kernel database when this run's servers will not load that database either. Never raises."""
+        skip = HC_QUICK_SKIP_REASON if self.quick_gates and not self.hc_fused_requested else None
+        return self.kernel_card_test(gates.hc_fused, phase_dir, gdn_details, skip)
+
+    def check_moe_glue(self, phase_dir: Path, gdn_details: dict) -> dict:
+        """The MoE glue kernels' card test, right after the hyper-connection one (gates.moe_glue), under
+        the same rules: skipped only with --quick-gates and without --moe-glue. Never raises."""
+        skip = MOE_QUICK_SKIP_REASON if self.quick_gates and not self.moe_glue_requested else None
+        return self.kernel_card_test(gates.moe_glue, phase_dir, gdn_details, skip)
+
+    def kernel_card_test(self, card_test, phase_dir: Path, gdn_details: dict, skip) -> dict:
+        """One card test of G1b's recorded-only kernels (`card_test` is gates.hc_fused or gates.moe_glue):
+        without the combined kernel database when this run's servers will not load it. Never raises."""
+        combined_db_off = not (gdn_details.get("combined_kernel_db") == gates.COMBINED_DB_ACTIVE and
+                               gdn_details.get("mode") == gates.GDN_MODE_FUSED)
+        try:
+            return dict(card_test(repo_root(), phase_dir, sys.executable, skip=skip,
+                                  combined_db_off=combined_db_off))
+        except Exception as exc:  # noqa: BLE001 - recorded only
+            return {"status": gates.HC_NOT_RUN, "reason": "%s: %s" % (type(exc).__name__, exc), "hpu_op": None}
+
+    def hc_fused_on(self) -> bool:
+        """True when this run's servers get VLLM_HPU_HC_FUSED=1: the operator asked (--hc-fused), the card
+        test in G1b passed, and the tiny gate did not fail with the kernels."""
+        return (self.hc_fused_requested and self.hc_fused_status == gates.HC_PASSED and
+                self.hc_fused_disabled_by is None)
+
+    def moe_glue_on(self) -> bool:
+        """True when this run's servers get VLLM_HPU_MOE_GLUE=1: the operator asked (--moe-glue), the card
+        test in G1b passed, and the tiny gate did not fail with the kernels."""
+        return (self.moe_glue_requested and self.moe_glue_status == gates.HC_PASSED and
+                self.moe_glue_disabled_by is None)
+
+    def hc_fused_outcome(self) -> str:
+        """"on", or "off (<why>)": the manifest's hc_fused.outcome and the summary's `HC fused:` line."""
+        return self.kernel_outcome(self.hc_fused_requested, self.hc_fused_status, self.hc_fused_reason,
+                                   self.hc_fused_disabled_by)
+
+    def moe_glue_outcome(self) -> str:
+        """"on", or "off (<why>)": the manifest's moe_glue.outcome and the summary's `MoE glue:` line."""
+        return self.kernel_outcome(self.moe_glue_requested, self.moe_glue_status, self.moe_glue_reason,
+                                   self.moe_glue_disabled_by)
+
+    def kernel_outcome(self, requested: bool, status, reason, disabled_by) -> str:
+        """The outcome words of one kind of kernels, from its request, its card test and who took it out."""
+        if not requested:
+            return "off (not requested)"
+        if disabled_by == "tiny":
+            passed = self.variant_status("tiny") == int(GateStatus.PASSED)
+            return "off (the tiny gate failed with it%s)" % (" and passed without" if passed else "")
+        if status == gates.HC_PASSED:
+            return "on"
+        if status is None:
+            return "off (the card test has not run)"
+        return "off (%s)" % (reason or status)
+
     def gate_tiny(self, phase_dir: Path):
+        """G2 with every fallback. After the newest pieces (``gate_tiny_kernels``), the fused GDN decode
+        kernel: gate G1b qualifies it with op tests, and a server is still its first run inside the full
+        model (on 2026-11-20 the op tests passed on the card and the tiny server died with
+        "ValidateSyncInputTensors tensor_data is empty"). When the gate still fails or times out with
+        the kernel on, the attempt is kept under tiny/attempt-gdn-fused/, every later server runs the
+        PyTorch GDN path (VLLM_HPU_GDN_CORE_DECODE=0) and the gate runs once more."""
+        status, details = self.gate_tiny_kernels(phase_dir)
+        failed = (GateStatus.FAILED, GateStatus.TIMED_OUT)
+        if (self.stub or status not in failed or self.gdn_mode != gates.GDN_MODE_FUSED or
+                str(details.get("reason") or "").startswith("tiny port")):
+            return status, details
+        first = self.keep_tiny_attempt(phase_dir, status, details, 0.0, TINY_ATTEMPT_GDN_FUSED)
+        self.gdn_env = dict(gates.GDN_FALLBACK_ENV)
+        self.gdn_mode = gates.GDN_MODE_PYTORCH
+        self.gdn_fused_disabled_by = "tiny"
+        self.write_manifest()
+        print("tiny: %s with the fused GDN decode kernel (%s); kept under %s, running the gate once more on "
+              "the PyTorch GDN path (%s=0), which every later server then uses" %
+              (GateStatus(status).name, first["reason"], phase_dir / TINY_ATTEMPT_GDN_FUSED, gates.GDN_MODE_ENV),
+              flush=True)
+        for text in first["errors"]:
+            print("    %s" % text, flush=True)
+        earlier = details
+        status, details, _ = self.tiny_attempt(phase_dir)
+        for key in ("combined_kernel_db", "combined_kernel_db_disabled_by", "attempt_combined", "hc_fused",
+                    "hc_fused_disabled_by", "attempt_hc_fused", "moe_glue", "moe_glue_disabled_by",
+                    "attempt_moe_glue"):  # what the earlier fallbacks decided
+            if key in earlier:
+                details.setdefault(key, earlier[key])
+        details["gdn_fused_disabled_by"] = "tiny"
+        details["attempt_gdn_fused"] = first
+        return status, details
+
+    def gate_tiny_kernels(self, phase_dir: Path):
+        """G2. When the gate fails or times out with a server that ran the fused hyper-connection
+        kernels (--hc-fused), the MoE glue kernels (--moe-glue) or both, the attempt is kept (under
+        tiny/attempt-hc-fused/ when only the hyper-connection kernels were on, under
+        tiny/attempt-moe-glue/ when the MoE glue kernels were on, alone or not), every kind that was on
+        is switched off for the rest of the run and the gate runs once more: one retry without both
+        kinds, never one retry for each. When it (still) fails or times out with
+        a server that loaded the combined kernel database (first hardware run of the adapter in a full
+        server), the attempt is kept under tiny/attempt-combined/, the database is switched off for the
+        rest of the run and the gate runs once more (RUK-3248). The newest piece goes first."""
         if self.stub:
             return GateStatus.SKIPPED, {"reason": "stub mode"}
+        if self.combined_db_disabled_by == "tiny":
+            self.combined_db_disabled_by = None  # a rerun of the gate decides again
+        if self.hc_fused_disabled_by == "tiny":
+            self.hc_fused_disabled_by = None
+        if self.moe_glue_disabled_by == "tiny":
+            self.moe_glue_disabled_by = None
+        failed = (GateStatus.FAILED, GateStatus.TIMED_OUT)
+        kept = {}  # the kinds of kernels this gate switched off ("hc_fused", "moe_glue"), see note_kernel_attempt
+        combined = self.combined_db_active()
+        t0 = time.time()
+        status, details, server_ran = self.tiny_attempt(phase_dir)
+        details["combined_kernel_db"] = combined
+        hc_on, moe_on = self.hc_fused_on(), self.moe_glue_on()
+        details["hc_fused"] = hc_on
+        details["moe_glue"] = moe_on
+        if (hc_on or moe_on) and server_ran and status in failed:
+            name = TINY_ATTEMPT_MOE_GLUE if moe_on else TINY_ATTEMPT_HC_FUSED
+            attempt = self.keep_tiny_attempt(phase_dir, status, details, time.time() - t0, name)
+            what, flags = [], []
+            if hc_on:
+                self.hc_fused_disabled_by = "tiny"
+                kept["hc_fused"] = None if moe_on else attempt  # one attempt, recorded once: under its folder's kind
+                what.append("the fused hyper-connection kernels")
+                flags.append("%s=0" % gates.HC_FUSED_ENV)
+            if moe_on:
+                self.moe_glue_disabled_by = "tiny"
+                kept["moe_glue"] = attempt
+                what.append("the MoE glue kernels")
+                flags.append("%s=0" % gates.MOE_GLUE_ENV)
+            self.write_manifest()
+            print("tiny: %s with %s (%s); kept under %s, running the gate once more with %s" %
+                  (GateStatus(status).name, " and ".join(what), attempt["reason"], phase_dir / name,
+                   " and ".join(flags)), flush=True)
+            for text in attempt["errors"]:
+                print("    %s" % text, flush=True)
+            t0 = time.time()
+            status, details, server_ran = self.tiny_attempt(phase_dir)
+            details["combined_kernel_db"] = combined
+            self.note_kernel_attempt(details, kept)
+        if not (combined and server_ran and status in failed):
+            return status, details
+        first = self.keep_tiny_attempt(phase_dir, status, details, time.time() - t0)
+        self.combined_db_disabled_by = "tiny"
+        self.write_manifest()
+        print("tiny: %s with the combined kernel database (%s); kept under %s, running the gate once more "
+              "with %s=0" % (GateStatus(status).name, first["reason"], phase_dir / TINY_ATTEMPT_COMBINED,
+                             serve.COMBINED_KERNEL_DB_ENV), flush=True)
+        for text in first["errors"]:
+            print("    %s" % text, flush=True)
+        status, details, _ = self.tiny_attempt(phase_dir)
+        details["combined_kernel_db"] = False
+        details["combined_kernel_db_disabled_by"] = "tiny"
+        details["attempt_combined"] = first
+        self.note_kernel_attempt(details, kept)
+        return status, details
+
+    def note_kernel_attempt(self, details: dict, kept: dict) -> None:
+        """What a tiny attempt's details say about the hyper-connection and the MoE glue kernels: whether
+        its server ran them, and for each kind the tiny gate switched off (a key of `kept`: "hc_fused",
+        "moe_glue") that it did. The kept attempt that failed is recorded once, under the kind of its
+        folder: `attempt_moe_glue` when the MoE glue kernels were on (`kept["hc_fused"]` is then None),
+        `attempt_hc_fused` when only the hyper-connection kernels were."""
+        details["hc_fused"] = self.hc_fused_on()
+        details["moe_glue"] = self.moe_glue_on()
+        for kind, attempt in kept.items():
+            details["%s_disabled_by" % kind] = "tiny"
+            if attempt is not None:
+                details["attempt_%s" % kind] = attempt
+
+    def tiny_attempt(self, phase_dir: Path) -> tuple:
+        """One run of the tiny gate: (status, details, whether its server was started)."""
         if serve.port_in_use(TINY_PORT):
-            return GateStatus.FAILED, {"reason": "tiny port %d already in use" % TINY_PORT}
+            return GateStatus.FAILED, {"reason": "tiny port %d already in use" % TINY_PORT}, False
+        phase_dir.mkdir(parents=True, exist_ok=True)
         ckpt = phase_dir / "ckpt"
-        proc = gates.run_step(tiny_checkpoint_command(ckpt), repo_root(), TINY_CHECKPOINT_TIMEOUT_S)
-        if proc.returncode != 0:
-            tail = (proc.stderr or proc.stdout or "")[-400:]
-            reason = "tiny checkpoint failed (exit %d): %s" % (proc.returncode, tail.strip())
-            return GateStatus.FAILED, {"reason": reason}
+        reason = ensure_tiny_checkpoint(ckpt, say=lambda text: print("tiny: %s" % text, flush=True))
+        if reason is not None:
+            return GateStatus.FAILED, {"reason": reason}, False
         serve_cmd = tiny_serve_command(ckpt, TINY_PORT)
         env = self.tiny_env()
-        popen = serve.start_server(serve_cmd, env, phase_dir / "server0.log", phase_dir)
+        log_path = phase_dir / "server0.log"
+        started = time.monotonic()
+        popen = serve.start_server(serve_cmd, env, log_path, phase_dir)
         self.active.append(("server", popen))
         try:
-            if not serve.wait_healthy(TINY_PORT, TINY_HEALTH_TIMEOUT_S, popen):
-                reason = "tiny server not healthy within %d s" % int(TINY_HEALTH_TIMEOUT_S)
-                return GateStatus.TIMED_OUT, {"reason": reason}
-            return gates.tiny_compare("http://127.0.0.1:%d" % TINY_PORT, ckpt / "reference.json")
+            if serve.wait_healthy(TINY_PORT, TINY_HEALTH_TIMEOUT_S, popen):
+                status, details = gates.tiny_compare("http://127.0.0.1:%d" % TINY_PORT, ckpt / "reference.json")
+            else:
+                status, reason = serve.unhealthy_reason(popen, time.monotonic() - started, TINY_HEALTH_TIMEOUT_S,
+                                                        "tiny server")
+                details = {"reason": reason}
         finally:
             self.active = [a for a in self.active if a[1] is not popen]
             serve.stop_server(popen)
+        log_text = self._read_log(log_path)
+        fallback = gates.gdn_fallback_lines(log_text)  # recorded: did the fused kernel run in this server
+        details["gdn_fallback_lines"] = {"count": len(fallback), "first": fallback[:serve.MAX_ERROR_LINES]}
+        if status != GateStatus.PASSED:
+            details["errors"] = serve.error_lines(log_text)
+            details["log"] = [str(log_path)]
+        return status, details, True
+
+    def keep_tiny_attempt(self, phase_dir: Path, status, details: dict, seconds: float,
+                          name: str = TINY_ATTEMPT_COMBINED) -> dict:
+        """Move the failed attempt's server log, status and details to tiny/<name>/ (attempt-combined,
+        attempt-hc-fused or attempt-moe-glue); its summary."""
+        keep = phase_dir / name
+        keep.mkdir(parents=True, exist_ok=True)
+        log_path = phase_dir / "server0.log"
+        if log_path.is_file():
+            os.replace(log_path, keep / "server0.log")
+        details = dict(details, log=[str(keep / "server0.log")])
+        reason = details.get("reason") or details.get("error")
+        errors = list(details.get("errors") or [])
+        write_status(keep, "tiny", status, reason, seconds, extra={"errors": errors} if errors else None)
+        write_json(keep / "details.json", details)
+        return {"dir": name, "status": int(status), "reason": reason, "errors": errors}
 
     def run_variant(self, variant) -> bool:
         vid = variant["id"]
@@ -425,6 +978,7 @@ class Runner:
             planned.append(cmd)
             envs.append(env)
         procs = []
+        started = []
         try:
             if not self.stub:
                 for k, srv in enumerate(servers):
@@ -438,6 +992,7 @@ class Runner:
                         port_file.unlink(missing_ok=True)
                     cmd = self._stub_command(port_file) if self.stub else planned[k]
                     env = self._child_env() if self.stub else envs[k]
+                    started.append(time.monotonic())
                     proc = serve.start_server(cmd, env, vdir / ("server%d.log" % k), vdir)
                     procs.append(proc)
                     self.active.append(("server", proc))
@@ -452,8 +1007,9 @@ class Runner:
                                 break
                             urls[k] = "http://127.0.0.1:%d" % port
                         if not serve.wait_healthy(port, self.server_timeout_s, procs[k]):
-                            failures.append((GateStatus.TIMED_OUT,
-                                             "server %d not healthy within %d s" % (k, int(self.server_timeout_s))))
+                            # a server that exited is FAILED with its exit code, not a timeout
+                            failures.append(serve.unhealthy_reason(procs[k], time.monotonic() - started[k],
+                                                                   self.server_timeout_s, "server %d" % k))
                             break
                 if not failures:
                     startup = self._startup_records(servers, vdir, time.time() - t0)
@@ -463,6 +1019,11 @@ class Runner:
                         if cap != GateStatus.PASSED:
                             reason = cap_det.get("reason") or cap_det.get("error") or "capacity failed"
                             failures.append((GateStatus.FAILED, "server %d capacity: %s" % (k, reason)))
+                if not failures:
+                    # the proof of life, before anything expensive: one short completion per server
+                    failure = self.run_first_token(vid, urls, vdir)
+                    if failure is not None:
+                        failures.append(failure)
                 if not failures:
                     w = self.ensure_workload(urls[0])
                 if not failures and self.warm_pass:
@@ -484,7 +1045,7 @@ class Runner:
                                                 vdir / REQUESTS_FILE,
                                                 stagger_s=stagger,
                                                 timeout_s=LOAD_TIMEOUT_S,
-                                                request_timeout_s=LOAD_REQUEST_TIMEOUT_S))
+                                                request_timeout_s=self.load_read_timeout_s))
                     finally:
                         self.stop_monitor(monitor)
                     if non_ok:
@@ -501,7 +1062,18 @@ class Runner:
             if note:
                 reason = note if reason is None else "%s; %s" % (reason, note)
             extra = {"servers": self._server_records(servers, urls, planned, envs)}
+            errors, logs = [], []
+            if status != GateStatus.PASSED:
+                for k in range(len(procs)):
+                    log_path = vdir / ("server%d.log" % k)
+                    logs.append(str(log_path))
+                    errors += ["server%d: %s" % (k, text) for text in serve.error_lines(self._read_log(log_path))]
+                if errors:
+                    extra["errors"] = errors
             write_status(vdir, vid, status, reason, time.time() - t0, extra=extra)
+            self.announce("variant %s" % vid, status, reason, time.time() - t0, errors, logs)
+            if status != GateStatus.PASSED:
+                self.failure_evidence(vid)  # before the teardown: the cards as the failure left them
             if status != GateStatus.PASSED and int(variant.get("on_fail", 1)) == int(OnFail.STOP):
                 return False
             return True
@@ -524,6 +1096,28 @@ class Runner:
             return eff, "inherits speculation from %s (%s PASSED)" % (base_id, base_id)
         name = GateStatus(status).name if status is not None else "NOT_RUN"
         return eff, "runs without speculation (%s %s)" % (base_id, name)
+
+    def run_first_token(self, vid: str, urls: list, vdir: Path):
+        """The proof of life of a started variant: one short completion from every server, before the
+        workload is built and anything is warmed or measured. Each answer goes to first-token.json and
+        to one console line. Returns None, or the (status, reason) of the first server that gave no token;
+        the timeout is the coherence gate's (the first request pays the first graph compile)."""
+        records = []
+        failure = None
+        for k, url in enumerate(urls):
+            status, details = gates.first_token(url, self.served_name, self.request_timeout_s)
+            records.append(dict(details, server=k, url=url, status=int(status)))
+            seconds = float(details.get("seconds") or 0.0)
+            if status == GateStatus.PASSED:
+                print("variant %s server%d: first token after %.1f s: %r" % (vid, k, seconds, details.get("text")),
+                      flush=True)
+                continue
+            reason = details.get("reason") or details.get("error") or "no answer"
+            print("variant %s server%d: no first token after %.1f s: %s" % (vid, k, seconds, reason), flush=True)
+            failure = (status, "server %d first token: %s" % (k, reason))
+            break
+        write_json(vdir / FIRST_TOKEN_FILE, records)
+        return failure
 
     def run_coherence(self, url: str, w: dict):
         cdir = self.run_dir / "coherence"
@@ -609,7 +1203,7 @@ class Runner:
                                 vdir / WARM_REQUESTS_FILE,
                                 stagger_s=stagger,
                                 timeout_s=LOAD_TIMEOUT_S,
-                                request_timeout_s=WARM_PASS_REQUEST_TIMEOUT_S))
+                                request_timeout_s=self.warm_request_timeout_s))
         write_json(vdir / WARM_PASS_FILE, {
             "requests": len(warm.get("agents") or []),
             "non_ok": int(non_ok),
@@ -716,12 +1310,48 @@ class Runner:
             self.gdn_env = dict(details.get("env") or {})
             self.gdn_mode = details.get("mode")
             self.gdn_reason = details.get("reason")
+            if details.get("combined_kernel_db") == gates.COMBINED_DB_DISABLED_BY_G1B and \
+                    self.combined_db_disabled_by is None:
+                self.combined_db_disabled_by = "g1b"
+            hc_fused = details.get("hc_fused")  # absent in a run made before the kernels were wired in
+            if isinstance(hc_fused, dict):
+                self.hc_fused_status = hc_fused.get("status")
+                self.hc_fused_reason = hc_fused.get("reason")
+            moe_glue = details.get("moe_glue")  # absent in a run made before --moe-glue existed
+            if isinstance(moe_glue, dict):
+                self.moe_glue_status = moe_glue.get("status")
+                self.moe_glue_reason = moe_glue.get("reason")
+
+    def restore_hc_fused(self, manifest: dict) -> None:
+        """On a resume: a tiny gate of the earlier start that took the fused hyper-connection kernels out
+        of the run keeps its decision (a gate that runs again resets its own). The request itself is this
+        start's --hc-fused, and the card test's result comes back with G1b's details (restore_gdn)."""
+        hc_fused = manifest.get("hc_fused")
+        by = hc_fused.get("disabled_by") if isinstance(hc_fused, dict) else None
+        if self.hc_fused_disabled_by is None and by == "tiny":
+            self.hc_fused_disabled_by = by
+
+    def restore_moe_glue(self, manifest: dict) -> None:
+        """On a resume, the same for the MoE glue kernels: the tiny gate's decision of the earlier start
+        stays, the request is this start's --moe-glue, the card test's result comes with G1b's details."""
+        moe_glue = manifest.get("moe_glue")
+        by = moe_glue.get("disabled_by") if isinstance(moe_glue, dict) else None
+        if self.moe_glue_disabled_by is None and by == "tiny":
+            self.moe_glue_disabled_by = by
+
+    def restore_combined_db(self, manifest: dict) -> None:
+        """On a resume: a gate of the earlier start that took the combined kernel database out of the
+        run keeps its decision (a gate that runs again resets its own)."""
+        recipe = manifest.get("recipe_cache")
+        by = recipe.get("combined_kernel_db_disabled_by") if isinstance(recipe, dict) else None
+        if self.combined_db_disabled_by is None and by in ("g1b", "tiny"):
+            self.combined_db_disabled_by = by
 
     def write_manifest(self) -> None:
         manifest = read_json(self.run_dir / "manifest.json")
         if not isinstance(manifest, dict):
             manifest = {"created": time.time()}
-        bundle = self._bundle_text()
+        bundle = bundle_text()
         manifest.update({
             "run_id": self.run_id,
             "mode": self.mode,
@@ -729,7 +1359,7 @@ class Runner:
             "bundle": bundle if bundle is not None else self.bundle_commit,
             "bundle_commit": self.bundle_commit,
             "python": sys.version,
-            "env": {k: v for k, v in os.environ.items() if k.startswith(ENV_PREFIXES)},
+            "env": recorded_env(os.environ),
             "hl_smi_q": self.hl_smi_q,
             "variants": self.selected,
             "phases": [n for _, n in self.phases()[self.start_index:]],
@@ -739,11 +1369,32 @@ class Runner:
         manifest["skip_warmup"] = self.skip_warmup
         manifest["warm_pass"] = self.warm_pass
         manifest["server_timeout_s"] = self.server_timeout_s
+        manifest["load_read_timeout_s"] = self.load_read_timeout_s
+        manifest["warm_request_timeout_s"] = self.warm_request_timeout_s
+        manifest["quick_gates"] = self.quick_gates
+        manifest["skipped_steps"] = self.skipped_steps()
         manifest["recipe_cache"] = {
             "dir": self.recipe_cache_dir,
             "size_mb": self.recipe_cache_mb,
             "combined_kernel_db": self.combined_db_installed,
+            "combined_kernel_db_disabled_by": self.combined_db_disabled_by,
             "variants": dict(self.recipe_cache_notes),
+        }
+        manifest["hc_fused"] = {
+            "requested": self.hc_fused_requested,
+            "status": self.hc_fused_status,
+            "reason": self.hc_fused_reason,
+            "on": self.hc_fused_on(),
+            "disabled_by": self.hc_fused_disabled_by,
+            "outcome": self.hc_fused_outcome(),
+        }
+        manifest["moe_glue"] = {
+            "requested": self.moe_glue_requested,
+            "status": self.moe_glue_status,
+            "reason": self.moe_glue_reason,
+            "on": self.moe_glue_on(),
+            "disabled_by": self.moe_glue_disabled_by,
+            "outcome": self.moe_glue_outcome(),
         }
         if self.workload_info is not None:
             manifest["workload"] = self.workload_info
@@ -758,7 +1409,7 @@ class Runner:
                 "url": urls[k],
                 "agents": srv["agents"],
                 "planned_command": planned[k],
-                "planned_env": {key: value for key, value in envs[k].items() if key.startswith(ENV_PREFIXES)},
+                "planned_env": recorded_env(envs[k]),
             })
         return records
 
@@ -792,13 +1443,17 @@ class Runner:
         ]
 
     def variant_server_env(self, variant_env: dict) -> dict:
-        """The environment of a variant's servers: the variant's flags, the GDN flags, the recipe cache
-        for the servers that run without the fused GDN kernel (`serve.recipe_cache_env`) and, by default,
-        the skipped bucket warmup (the compiled graphs land in the recipe cache)."""
+        """The environment of a variant's servers: the variant's flags, the GDN flags, the fused
+        hyper-connection flag and the MoE glue flag (always explicit: "1" only when the operator asked
+        and the card test passed, `hc_fused_on` and `moe_glue_on`), the recipe cache for the servers that
+        register no kernel database of their own (`serve.recipe_cache_env`) and, by default, the skipped
+        bucket warmup (the compiled graphs land in the recipe cache)."""
         env = server_env(variant_env, self.gdn_env)
+        env[gates.HC_FUSED_ENV] = "1" if self.hc_fused_on() else "0"
+        env[gates.MOE_GLUE_ENV] = "1" if self.moe_glue_on() else "0"
         if self.skip_warmup:
             env["VLLM_SKIP_WARMUP"] = "true"
-        combined = self.combined_db_installed and self.gdn_mode == gates.GDN_MODE_FUSED
+        combined = self.combined_db_active()
         if self.combined_db_installed and not combined:
             env[serve.COMBINED_KERNEL_DB_ENV] = "0"  # a database G1b did not pass stays out of every server
         cache_env, note = serve.recipe_cache_env(self.recipe_cache_dir, self.recipe_cache_mb, env, combined)
@@ -807,6 +1462,12 @@ class Runner:
         env.update(cache_env)
         self.recipe_cache_note = note
         return env
+
+    def combined_db_active(self) -> bool:
+        """True when this run's servers load the combined kernel database: it is installed, nobody
+        (the operator, G1b, the tiny gate) took it out, and G1b passed with the fused kernel."""
+        return (self.combined_db_installed and self.combined_db_disabled_by is None and
+                self.gdn_mode == gates.GDN_MODE_FUSED)
 
     def tiny_env(self) -> dict:
         """The tiny gate's server environment: a variant's environment without a variant's own flags."""
@@ -824,23 +1485,6 @@ class Runner:
             return path.read_text(encoding="utf-8", errors="replace")
         except OSError:
             return ""
-
-    def _bundle_text(self):
-        try:
-            return (repo_root().parent / "BUNDLE.txt").read_text(encoding="utf-8")
-        except OSError:
-            return None
-
-    def _git_commit(self):
-        try:
-            out = subprocess.run(["git", "rev-parse", "HEAD"],
-                                 cwd=str(repo_root()),
-                                 capture_output=True,
-                                 text=True,
-                                 timeout=30)
-            return out.stdout.strip() or None
-        except (OSError, subprocess.SubprocessError):
-            return None
 
     def _hl_smi_q(self) -> str:
         if self.stub:
@@ -870,9 +1514,30 @@ def _parse_args(argv):
                         help="seconds to wait for a server to become healthy")
     parser.add_argument("--no-warm-pass", action="store_true",
                         help="skip the one-turn warm pass that compiles the graphs before the gates")
+    parser.add_argument("--load-read-timeout", type=float, default=LOAD_REQUEST_TIMEOUT_S, metavar="S",
+                        help="measured load: seconds a request may go without receiving data "
+                        "(default %(default)s)")
+    parser.add_argument("--warm-request-timeout", type=float, default=WARM_PASS_REQUEST_TIMEOUT_S, metavar="S",
+                        help="warm pass: seconds a request may go without receiving data, first graph compiles "
+                        "included (default %(default)s)")
+    parser.add_argument("--quick-gates", action="store_true",
+                        help="skip the recorded-only steps before the first measurement: G1b's eager replays "
+                        "and bench, the verify crash probe and the card_tests phase; the checks that decide "
+                        "the GDN kernel and the verify op still run")
+    parser.add_argument("--no-verify-probe", action="store_true",
+                        help="skip only the automatic crash probe that follows a crashed or hung verify op test")
+    parser.add_argument("--hc-fused", action="store_true",
+                        help="ask for the fused hyper-connection kernels: the servers get VLLM_HPU_HC_FUSED=1 "
+                        "when the kernels' card test in G1b passed (default: off, every server gets "
+                        "VLLM_HPU_HC_FUSED=0); a tiny gate that fails with them runs once more without")
+    parser.add_argument("--moe-glue", action="store_true",
+                        help="ask for the MoE glue kernels: the servers get VLLM_HPU_MOE_GLUE=1 when the "
+                        "kernels' card test in G1b passed (default: off, every server gets "
+                        "VLLM_HPU_MOE_GLUE=0); a tiny gate that fails with them runs once more without")
     parser.add_argument("--recipe-cache", metavar="DIR", default=None,
                         help="folder for the HPU recipe cache; a server gets it only when it runs without the "
-                        "fused GDN kernel, or when the combined kernel database is installed and G1b passed")
+                        "fused GDN kernel, or when the combined kernel database is installed, G1b passed "
+                        "through it and nobody (the operator, G1b, the tiny gate) switched it off")
     parser.add_argument("--recipe-cache-mb", type=int, default=16384,
                         help="recipe cache size in MB (default 16384)")
     parser.add_argument("--agents", type=int, default=32)

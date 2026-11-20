@@ -99,7 +99,17 @@ def to_fp32(model: torch.nn.Module) -> None:
             module.cos_sin_cache = module._compute_cos_sin_cache().float()
 
 
-def bind_cpu_states(model: torch.nn.Module, num_slots: int, fp32: bool, max_model_len: int = 512) -> None:
+def speculative_tokens(vllm_config) -> int:
+    """``num_speculative_tokens`` of an engine config, 0 without speculation."""
+    speculative_config = getattr(vllm_config, "speculative_config", None)
+    return int(getattr(speculative_config, "num_speculative_tokens", 0) or 0)
+
+
+def bind_cpu_states(model: torch.nn.Module,
+                    num_slots: int,
+                    fp32: bool,
+                    max_model_len: int = 512,
+                    num_speculative_tokens: int = 0) -> None:
     """Bind hand-made cache tensors on every stateful module.
 
     Each ``MambaBase`` module (the 3 GDN layers, the PLE layer) gets
@@ -111,7 +121,10 @@ def bind_cpu_states(model: torch.nn.Module, num_slots: int, fp32: bool, max_mode
     In sparse QSA mode each QSA layer's indexer also gets its two side caches
     (``compressed_key_cache`` of ``max_model_len // compress_ratio`` block rows and a
     ``key_ring`` of ``num_slots`` raw-key rows) from ``allocate_side_caches``; the
-    model runner allocates these on a real engine.
+    model runner allocates these on a real engine, the ring with ``ring_rows(compress_ratio,
+    num_speculative_tokens)`` rows per slot (``_allocate_flash_next_side_caches``), so
+    ``num_speculative_tokens`` must be the engine config's: a verification step writes ``1 + k``
+    ring rows before it reads any, and a ring sized for no speculation loses keys.
     """
     for module in model.modules():
         if isinstance(module, MambaBase):
@@ -125,7 +138,7 @@ def bind_cpu_states(model: torch.nn.Module, num_slots: int, fp32: bool, max_mode
                 gdn_state_rows=num_slots,
                 compress_ratio=int(config.indexer_compress_ratio),
                 index_head_dim=int(config.indexer_head_dim),
-                num_speculative_tokens=0,
+                num_speculative_tokens=num_speculative_tokens,
                 device=torch.device("cpu"),
                 dtype=torch.float32 if fp32 else torch.bfloat16,
             )
@@ -455,7 +468,7 @@ def cpu_model(ckpt_dir: Path,
             model = get_model(vllm_config=vllm_config)
             if fp32:
                 to_fp32(model)
-            bind_cpu_states(model, num_slots, fp32, max_model_len)
+            bind_cpu_states(model, num_slots, fp32, max_model_len, speculative_tokens(vllm_config))
             use_sdpa_attention(model)
             yield vllm_config, model
         finally:
@@ -498,6 +511,6 @@ def cpu_draft_model(vllm_config, fp32: bool = False, num_slots: int = 4, max_mod
                           load_config=sc.draft_load_config)
     if fp32:
         to_fp32(draft)
-    bind_cpu_states(draft, num_slots, fp32, max_model_len)
+    bind_cpu_states(draft, num_slots, fp32, max_model_len, speculative_tokens(vllm_config))
     use_sdpa_attention(draft)
     return draft

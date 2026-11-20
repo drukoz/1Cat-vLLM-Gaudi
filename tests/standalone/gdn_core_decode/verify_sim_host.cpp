@@ -8,6 +8,9 @@
 // instruction simulator and writes out.bin, conv_state.out.bin and ssm_state.out.bin
 // back into the folder for the pytest to compare with the loop oracle.
 //
+// Exit code 6: the glue rejected the geometry with GLUE_INCOMPATIBLE_INPUT_SIZE (for example T above
+// kGdnCoreVerifyMaxNodes); nothing is simulated and no output file is written.
+//
 // The SDK headers come first so that a syntax-only check on a machine without the SDK
 // (this Mac) fails only with "file not found" for them and checks nothing else.
 #include <tpc_test_core_api.h>
@@ -185,6 +188,14 @@ int main(int argc, char** argv)
     g.kernel.kernelElf = nullptr;
     g.kernel.elfSize = 0;
     GlueCodeReturn result = glue.GetGcDefinitions(&p, &g);
+    if (result == GLUE_INCOMPATIBLE_INPUT_SIZE) {
+        std::fprintf(
+            stderr,
+            "verify_sim_host: the glue rejected the geometry (T = %u) with GLUE_INCOMPATIBLE_INPUT_SIZE; "
+            "the kernel was not run\n",
+            static_cast<unsigned>(T));
+        return 6;
+    }
     if (result != GLUE_INSUFFICIENT_ELF_BUFFER) {
         std::fprintf(
             stderr,

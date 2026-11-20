@@ -61,6 +61,54 @@ class QsaMode(enum.IntEnum):
     SPARSE = 1
 
 
+def platform_is_hpu() -> bool:
+    """True when vLLM's current platform is the Gaudi (HPU) platform.
+
+    No platform defines ``is_hpu`` (``Platform.__getattr__`` answers an unknown name with ``None``
+    and the log line "Current platform hpu does not have 'is_hpu' attribute."), so the test reads
+    the two attributes ``HpuPlatform`` declares. ``device_name`` is checked next to ``device_type``
+    because ``HPUModelRunner.load_model`` sets ``device_type`` to the load device (``"cpu"`` for an
+    INC quantization run) while the model is being built.
+    """
+    return "hpu" in (current_platform.device_type, current_platform.device_name)
+
+
+def prefill_row_lengths(md: object, rows: int, seq: int, device: torch.device) -> torch.Tensor:
+    """Real token count of every row of a prompt bucket: int64 ``[rows]``, at most ``seq``.
+
+    ``query_start_loc_p`` is the runner's int32 cumulative sum of the real query lengths of the
+    bucket's rows (``_form_prefill_batch``; a chunk of a chunked prefill is its own bucket) and
+    ``seq_lens_tensor`` the lengths themselves. Metadata with neither describes unpadded rows.
+    """
+    query_start_loc = getattr(md, "query_start_loc_p", None)
+    if query_start_loc is not None and query_start_loc.numel() == rows + 1:
+        qsl = query_start_loc.to(device=device, dtype=torch.long)
+        return (qsl[1:] - qsl[:-1]).clamp(min=0, max=seq)
+    seq_lens = getattr(md, "seq_lens_tensor", None)
+    if seq_lens is not None and seq_lens.numel() == rows:
+        return seq_lens.to(device=device, dtype=torch.long).clamp(min=0, max=seq)
+    return torch.full((rows,), seq, dtype=torch.long, device=device)
+
+
+def indexer_positions(positions: torch.Tensor, mrope: bool = True) -> torch.Tensor:
+    """The one position per query row the indexer works with: ``[num_tokens]``, ``-1`` on bucket padding.
+
+    Without M-RoPE (``--language-model-only``: the engine strips ``mrope_section``, ``uses_mrope`` is
+    False) the runner sends ``[num_tokens]`` or ``[rows, bucket]`` positions, which flatten to one per
+    row. With M-RoPE it sends ``[3, num_tokens]`` (temporal, height and width rows), and row 0 is taken.
+
+    Row 0 is exact for text tokens only. The engine (``nvidia/indexer_qsa.py``) rotates the indexer
+    queries and block keys with the attention's M-RoPE composition (each rotary section from its own
+    row) and does the block bookkeeping on the request's logical token index, not on a RoPE row. For a
+    text token the three rows are equal and equal to that index, so both reduce to row 0. Tokens of an
+    image or video (rows that differ, and the text after them, whose index and RoPE position differ by
+    ``mrope_position_delta``) are not supported by this indexer.
+    """
+    if mrope and positions.dim() == 2:
+        return positions[0]
+    return positions.reshape(-1)
+
+
 class HpuQsaIndexer(nn.Module):
     """Flash-Next QSA indexer: checkpoint weights plus top-k token selection.
 
@@ -104,8 +152,44 @@ class HpuQsaIndexer(nn.Module):
         self.k_layernorm = GemmaRMSNorm(self.index_head_dim, eps=self.eps)
 
         self.compressed_key_cache: torch.Tensor | None = None
-        self.key_ring: torch.Tensor | None = None
+        # The raw-key ring as the flat table [slots * rows, D] and its rows per slot (see key_ring).
+        self._key_ring_flat: torch.Tensor | None = None
+        self._key_ring_rows: int = 0
         self.ring_group_idx: torch.Tensor | None = None
+
+    @property
+    def key_ring(self) -> torch.Tensor | None:
+        """The raw-key ring as ``[slots, rows, D]``: a view of the flat table the layer works on.
+
+        The forward never uses this view. The ring is stored and written as the flat table
+        ``[slots * rows, D]`` (``bind_key_ring``): an in-place write through a view of a three-axis
+        ring does not compile on a card (rental 2026-11-20, see ``qsa_sparse_ops.ring_write``).
+        """
+        if self._key_ring_flat is None:
+            return None
+        return self._key_ring_flat.view(-1, self._key_ring_rows, self._key_ring_flat.shape[1])
+
+    @key_ring.setter
+    def key_ring(self, ring: torch.Tensor | None) -> None:
+        """Bind a three-axis ring ``[slots, rows, D]`` (the CPU tests): the layer works on its flat view."""
+        if ring is None:
+            self._key_ring_flat, self._key_ring_rows = None, 0
+            return
+        if ring.dim() != 3:
+            raise ValueError(f"key_ring takes [slots, rows, D], got {tuple(ring.shape)}; use bind_key_ring for the "
+                             "flat table")
+        self._key_ring_flat, self._key_ring_rows = ring.view(-1, ring.shape[2]), int(ring.shape[1])
+
+    def bind_key_ring(self, flat: torch.Tensor, rows: int) -> None:
+        """Bind the flat ring table ``[slots * rows, D]`` (what the runner allocates on the card)."""
+        if flat.dim() != 2 or rows <= 0 or flat.shape[0] % rows:
+            raise ValueError(f"the flat key ring must be [slots * rows, D] with rows={rows}, got {tuple(flat.shape)}")
+        self._key_ring_flat, self._key_ring_rows = flat, int(rows)
+
+    @property
+    def key_ring_slots(self) -> int:
+        """Slots of the bound ring (the last one is the scratch slot)."""
+        return self._key_ring_flat.shape[0] // self._key_ring_rows
 
     def _state_indices(self, md: object, name: str) -> torch.Tensor | None:
         """Resolve one state-index tensor for this layer's ring group (see ``HpuQwen4ExpPLELayer``).
@@ -179,11 +263,30 @@ class HpuQsaIndexer(nn.Module):
             keys = compress_block_keys(blocks, self.k_layernorm.weight, self.eps, cs, sn)
             last_slots = compressed_row_slots(slot_mapping.view(rows, seq)[:, ratio - 1:n_full * ratio:ratio].
                                               reshape(-1), ratio)
-            cache.index_copy_(0, last_slots, keys.to(cache.dtype))
-            tail = seq - n_full * ratio
-            if tail:
-                ring_write(self.key_ring, store.repeat_interleave(tail), positions2[:, n_full * ratio:].reshape(-1),
-                           raw2[:, n_full * ratio:].reshape(-1, D))
+            # ``seq`` is the bucket length: a block whose last token is bucket padding (the block
+            # that straddles the end of the prompt, and every block after it) is not complete. Its
+            # key is built from padding and its last token's slot is the runner's pad slot (-1), so
+            # it writes the cache's scratch row (its last row, see qsa_side_caches) and the write
+            # keeps one fixed shape.
+            lens = prefill_row_lengths(md, rows, seq, hidden.device)
+            block_ends = (torch.arange(n_full, device=hidden.device) + 1) * ratio
+            in_prompt = (block_ends[None, :] <= lens[:, None]).reshape(-1)
+            scratch_row = torch.full_like(last_slots, cache.shape[0] - 1)
+            cache.index_copy_(0, torch.where(in_prompt, last_slots, scratch_row), keys.to(cache.dtype))
+            # The prompt's tail: the up to ``ratio - 1`` real tokens after the row's last complete
+            # block. Their raw keys go to the ring, where the decode step that completes the block
+            # reads them (``ring_block_rows``). The tail sits at the row's REAL length, not at the
+            # end of the bucket, so it is gathered per row; the entries past the real length (and
+            # every entry of a row without a tail) are parked on the ring's scratch slot, which
+            # keeps the write at one fixed shape, ``rows * (ratio - 1)``.
+            tail_cols = (lens // ratio * ratio)[:, None] + torch.arange(ratio - 1, device=hidden.device)[None, :]
+            tail_real = (tail_cols < lens[:, None]).reshape(-1)
+            tail_rows = (torch.arange(rows, device=hidden.device)[:, None] * seq
+                         + tail_cols.clamp(max=seq - 1)).reshape(-1)
+            ring_scratch = torch.full_like(tail_rows, self.key_ring_slots - 1)
+            ring_write(self._key_ring_flat, torch.where(tail_real, store.repeat_interleave(ratio - 1), ring_scratch),
+                       positions.index_select(0, tail_rows).clamp_min(0), raw_k.index_select(0, tail_rows),
+                       rows=self._key_ring_rows)
             # Block keys per row in absolute block order (column i = tokens 4*i ..): the context
             # rows come from the row's kernel blocks (block_list, rpb compressed rows each), the
             # chunk's blocks go at ctx // ratio + j (overwriting a partial last context block).
@@ -269,9 +372,11 @@ class HpuQsaIndexer(nn.Module):
             load_rows, store_rows = load.repeat_interleave(T_cols), store.repeat_interleave(T_cols)
         else:
             raise NotImplementedError(f"QSA decode got {n_slots} state slots for {T} rows of {bs} requests")
-        scratch = torch.full((T,), self.key_ring.shape[0] - 1, dtype=torch.long, device=positions.device)
-        ring_write(self.key_ring, torch.where(valid, store_rows, scratch), positions, raw_k)
-        blk = ring_block_rows(self.key_ring, torch.where(valid, load_rows, scratch), positions, raw_k, ratio)
+        scratch = torch.full((T,), self.key_ring_slots - 1, dtype=torch.long, device=positions.device)
+        ring_write(self._key_ring_flat, torch.where(valid, store_rows, scratch), positions, raw_k,
+                   rows=self._key_ring_rows)
+        blk = ring_block_rows(self._key_ring_flat, torch.where(valid, load_rows, scratch), positions, raw_k, ratio,
+                              rows=self._key_ring_rows)
         complete = valid & ((positions % ratio) == ratio - 1)
         cs, sn = cos_sin_at(positions - (ratio - 1))
         keys = compress_block_keys(blk, self.k_layernorm.weight, self.eps, cs, sn)
@@ -414,18 +519,22 @@ class HpuQwen4ExpQSAAttention(Qwen4ExpQSAAttention):
         )
 
         # Sparse mode runs the indexer's selection through a dedicated
-        # attention wrapper. On HPU that is ``HpuQsaSparseAttention`` (M2-T5c);
-        # the import is guarded so the layer still builds before it lands. On
-        # CPU it stays ``None`` and the tests install a stand-in.
+        # attention wrapper. On HPU that is ``HpuQsaSparseAttention`` (M2-T5c)
+        # and a wrapper that cannot be built stops the model build: without it
+        # the forward below would run dense attention, which is wrong beyond
+        # about 2050 tokens of context. Off HPU (the CPU tests) it stays
+        # ``None`` and the harness installs a stand-in.
         self.prefix = prefix
         self.sparse_attn = None
-        is_hpu = getattr(current_platform, "is_hpu", None)
-        if self.qsa_mode is QsaMode.SPARSE and is_hpu is not None and is_hpu():
+        if self.qsa_mode is QsaMode.SPARSE and platform_is_hpu():
             try:
                 from vllm_gaudi.models.qwen4_exp.qsa_hpu_attention import HpuQsaSparseAttention
                 self.sparse_attn = HpuQsaSparseAttention(self.attn)
-            except ImportError:
-                self.sparse_attn = None
+            except Exception as exc:
+                raise RuntimeError(
+                    f"VLLM_HPU_FLASH_NEXT_QSA_MODE={int(QsaMode.SPARSE)} (sparse QSA) needs the HPU sparse "
+                    f"attention wrapper, which could not be built for {prefix or 'the QSA layer'}: {exc!r}. "
+                    "Dense attention is not a fallback for sparse mode.") from exc
 
     def get_attn_backend(self) -> type[AttentionBackend]:
         return self.attn.get_attn_backend()
@@ -467,7 +576,7 @@ class HpuQwen4ExpQSAAttention(Qwen4ExpQSAAttention):
         md = self._forward_metadata()
         if (self.qsa_mode is QsaMode.SPARSE and self.indexer.compressed_key_cache is not None
                 and self.sparse_attn is not None and md is not None):
-            pos = positions.reshape(-1)
+            pos = indexer_positions(positions, bool(getattr(self.rotary_emb, "mrope_section", None)))
             cos_sin_at = lambda p: self.rotary_emb.cos_sin_cache[p.clamp_min(0)].chunk(2, dim=-1)  # noqa: E731
             selected = self.indexer.select(hidden_states.reshape(-1, self.hidden_size), pos, cos_sin_at, md)
             attn_output = self.sparse_attn(q, k, v, selected, pos, md)
@@ -485,4 +594,6 @@ __all__ = [
     "HpuQsaIndexerWeights",
     "HpuQwen4ExpQSAAttention",
     "QsaMode",
+    "indexer_positions",
+    "platform_is_hpu",
 ]

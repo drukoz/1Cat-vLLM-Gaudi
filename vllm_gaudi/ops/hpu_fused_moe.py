@@ -3,6 +3,7 @@ from enum import Enum
 from functools import partial
 import os
 from typing import Union
+import weakref
 
 from vllm.model_executor.layers.fused_moe.runner.moe_runner import (
     MoERunner as MoERunnerBase, )
@@ -11,6 +12,8 @@ import vllm
 import vllm.envs as envs
 from vllm.config import get_current_vllm_config, get_current_vllm_config_or_none
 from vllm.distributed.eplb.eplb_state import EplbLayerState
+from vllm.logger import init_logger
+from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.fused_moe.layer import FusedMoEFactory as FusedMoE
 from vllm.model_executor.layers.fused_moe.unquantized_fused_moe_method import UnquantizedFusedMoEMethod
 from vllm.model_executor.layers.fused_moe.router.custom_routing_router import (
@@ -28,10 +31,13 @@ from vllm.model_executor.layers.fused_moe.router.routing_simulator_router import
 from vllm.model_executor.layers.fused_moe.router.zero_expert_router import (
     ZeroExpertRouter, )
 import vllm_gaudi.envs as gaudi_envs
+import vllm_gaudi.extension.ops as hpu_ops
 from vllm_gaudi.extension.ops import VllmMixtureOfExpertsOp
 from vllm_gaudi.extension.runtime import get_config
 from vllm_gaudi.utils import has_quant_config
 from vllm_gaudi.v1.worker.hpu_dp_utils import dispatch_hidden_states, dispatch_tensor, get_hpu_dp_metadata
+
+logger = init_logger(__name__)
 
 # Map model activation names to the activation strings the Gaudi fused-MoE op's
 # MoeActivationMode_t enum accepts. The synapse MoE kernel enumerates "gelu" (and
@@ -299,6 +305,305 @@ def _swigluoai_moe(
     return _unfused_swigluoai_moe(layer, x, topk_ids, topk_weights, alpha=alpha, beta=beta, limit=limit)
 
 
+# --- MoE glue (VLLM_HPU_MOE_GLUE=1) ------------------------------------------
+# The element-wise ops around the GEMMs and the vendor expert op of one MoE
+# block, as four TPC kernels (flashinfer_gaudi/moe_glue.py; kernels in
+# csrc/hc_fused; contract: docs/design/flash-next/hc-fused.md, "MoE glue
+# kernels"):
+#
+#   gates  = linear(x, [router rows; shared-gate row])     one GEMM, the weight built at load
+#   ids, w = moe_route(gates)                              softmax, top-k, renormalization, casts
+#   act    = moe_silu_mul(gate_up(x))                      the shared expert's SiLU-multiply
+#   x8, s  = moe_row_quant(x)                              FP8 experts: the per-row quantization
+#   routed = hpu.mixture_of_experts(...)                   unchanged
+#   out    = moe_combine(down(act), gates, routed)         sigmoid(gate) * shared + routed
+#
+# With the flag at 0 (the default) none of this exists: no state object, no
+# merged weight, and patched_fused_moe_forward dispatches the ops it always did.
+_MOE_GLUE_BUFFER = "_hpu_moe_glue_gate_weight"
+_MOE_GLUE_OFF_LINE = "MoE glue (VLLM_HPU_MOE_GLUE=1) is off for %s: %s; using the torch path"
+# The flags that send dynamic_quant (vllm_gaudi/extension/ops.py) down another branch than the one
+# moe_row_quant replaces.
+_MOE_GLUE_QUANT_FLAGS = ("VLLM_HPU_TP2_NATIVE_DYNAMIC_QUANT", "VLLM_HPU_FP8_JIT_DYNAMIC_QUANT",
+                         "VLLM_HPU_DYNAMIC_QUANT_CGUID")
+
+
+class _MoeGlueFallback(Exception):
+    """A call the fused kernels do not take; the message is the reason the block logs."""
+
+
+class _MoeGlueState:
+    """What one MoE block keeps for its fused glue path. Created with the block, only with the flag at 1."""
+
+    def __init__(self, runner) -> None:
+        self.layer_name = str(getattr(runner, "layer_name", type(runner).__name__))
+        self._runner = weakref.ref(runner)
+        self.ok: bool | None = None  # None: not checked yet. True: fused. False: the torch path for good.
+        self.logged = False
+        self.prepare_error: str | None = None
+        self.ops = None  # the flashinfer_gaudi.moe_glue module, once the layer check passed
+        self.experts = 0
+        self.top_k = 0
+        self.fp8 = False
+        self.fp8_max = 0.0
+
+    def runner(self):
+        return self._runner()
+
+    def log(self, reason: str) -> None:
+        """One warning line per block, whatever the number of reasons and calls."""
+        if not self.logged:
+            self.logged = True
+            logger.warning(_MOE_GLUE_OFF_LINE, self.layer_name, reason)
+
+    def off(self, reason: str) -> None:
+        self.ok = False
+        self.log(reason)
+
+    # What the monolithic quant methods call instead of their torch code.
+    def route(self, router_logits: torch.Tensor, top_k: int) -> tuple[torch.Tensor, torch.Tensor]:
+        """``(topk_weights, topk_ids)``: the ids are int32, the caller widens them for the vendor op."""
+        ids, weights = self.ops.moe_route(router_logits, self.experts, int(top_k))
+        return weights, ids
+
+    def row_quant(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """``(x_fp8, x_scale)``, what dynamic_quant returns."""
+        return self.ops.moe_row_quant(x, self.fp8_max)
+
+
+def _moe_glue_attach(runner) -> None:
+    """Give a new MoE runner its glue state (VLLM_HPU_MOE_GLUE=1 only; the flag is read once, here)."""
+    state = _MoeGlueState(runner)
+    runner._hpu_moe_glue = state
+    # The quant method's process_weights_after_loading gets the routed experts, not the runner.
+    runner.routed_experts._hpu_moe_glue = state
+
+
+def _moe_glue_shared_layer(runner):
+    shared = getattr(runner, "_shared_experts", None)
+    return getattr(shared, "_layer", None) if shared is not None else None
+
+
+def _moe_glue_prepare(layer) -> None:
+    """At load: build the block's merged gate weight, the router rows followed by the shared-gate row.
+
+    Called at the end of process_weights_after_loading with the routed experts. It does nothing without
+    VLLM_HPU_MOE_GLUE=1 (no state was attached) and never raises: what is missing is named by the layer check.
+    """
+    state = getattr(layer, "_hpu_moe_glue", None)
+    if state is None:
+        return
+    runner = state.runner()
+    try:
+        gate_weight = runner.gate.weight
+        shared_gate_weight = _moe_glue_shared_layer(runner).expert_gate.weight
+        merged = torch.cat([gate_weight.detach(), shared_gate_weight.detach()], dim=0).contiguous()
+        runner.register_buffer(_MOE_GLUE_BUFFER, merged, persistent=False)
+    except Exception as exc:  # noqa: BLE001 - an optional fast path never stops a load
+        state.prepare_error = f"{type(exc).__name__}: {exc}"
+
+
+def _moe_glue_library_checked_device(device: torch.device) -> bool:
+    """True for a device whose kernels come from libhc_fused_gaudi2.so (the loader knows which it serves)."""
+    return device.type == "hpu"
+
+
+def _moe_glue_plain_linear(layer) -> bool:
+    """True for a bias-free linear whose forward is F.linear(x, layer.weight)."""
+    return (getattr(layer, "bias", None) is None and not getattr(layer, "skip_bias_add", False)
+            and type(getattr(layer, "quant_method", None)).__name__ == "UnquantizedLinearMethod"
+            and isinstance(getattr(layer, "weight", None), torch.Tensor) and layer.weight.dim() == 2)
+
+
+def _moe_glue_layer_reason(runner, device_type: str | None = None) -> str | None:
+    """Why this MoE block cannot run the fused glue, or None. Reads the block, never a tensor's data.
+
+    ``device_type`` overrides the device of the merged gate weight (tests).
+    """
+    config = runner.moe_config
+    routed = runner.routed_experts
+    if config.dp_size != 1 or getattr(config, "pcp_size", 1) != 1 or config.is_sequence_parallel:
+        return "data-parallel, context-parallel or sequence-parallel MoE"
+    if runner.routed_input_transform is not None or runner.routed_output_transform is not None:
+        return "a routed input or output transform (latent MoE)"
+    if runner.routed_scaling_factor != 1.0:
+        return f"routed_scaling_factor is {runner.routed_scaling_factor}, not 1"
+    if isinstance(runner.router, ZeroExpertRouter) or runner._fse_fuse_gate or runner._fused_output_is_reduced:
+        return "a zero expert, fused shared experts or an expert kernel that reduces its own output"
+    if routed.use_grouped_topk or getattr(routed, "custom_routing_function", None) is not None:
+        return "grouped top-k or custom routing"
+    gate = runner.gate
+    shared = _moe_glue_shared_layer(runner)
+    if gate is None or shared is None:
+        return "the MoE runner does not hold the router gate and a shared expert"
+    expert_gate = getattr(shared, "expert_gate", None)
+    if expert_gate is None or any(getattr(shared, name, None) is None for name in ("gate_up_proj", "down_proj")):
+        return "the shared expert has no shared expert gate, gate_up_proj or down_proj"
+    if not isinstance(getattr(shared, "act_fn", None), SiluAndMul):
+        return "the shared expert's activation is not SiluAndMul"
+    if gaudi_envs.VLLM_HPU_EXPLICIT_SIGMOID_SILU:
+        return "VLLM_HPU_EXPLICIT_SIGMOID_SILU is set (another SiLU formula)"
+    if os.environ.get("VLLM_HPU_TRITON_MODE", "off").strip().lower() != "off":
+        return "VLLM_HPU_TRITON_MODE is not off (another SiLU-multiply and quantization path)"
+    if not _moe_glue_plain_linear(gate) or not _moe_glue_plain_linear(expert_gate):
+        return "the router gate or the shared expert gate is not a plain linear without bias"
+    experts, hidden = gate.weight.shape
+    top_k = int(routed.top_k)
+    if tuple(expert_gate.weight.shape) != (1, hidden):
+        return f"the shared expert gate weight is {tuple(expert_gate.weight.shape)}, not (1, {hidden})"
+
+    method = routed.quant_method
+    kind = type(method).__dict__.get("_hpu_moe_glue_kind")
+    if kind is None:
+        return f"the expert method {type(method).__name__} has no fused glue"
+    if kind == "bf16" and getattr(method, "model_type", None) == "gpt_oss":
+        return "gpt_oss routing (top-k before the softmax)"
+    if kind == "fp8":
+        op = getattr(routed, "moe_op", None)
+        if type(op).__name__ != "VllmMixtureOfExpertsOpFP8PerChannel":
+            return f"the FP8 expert op is {type(op).__name__} (block FP8 with VLLM_HPU_FORCE_CHANNEL_FP8=0)"
+        if op.w13_input_scale is not None:
+            return "the FP8 experts have a static input scale"
+        flags = [name for name in _MOE_GLUE_QUANT_FLAGS if getattr(gaudi_envs, name)]
+        if hpu_ops.envs.VLLM_HPU_CGUID_DYNAMIC_QUANT:
+            flags.append("VLLM_HPU_CGUID_DYNAMIC_QUANT")
+        if flags:
+            return f"{', '.join(flags)} selects another dynamic quantization than the one the kernel replaces"
+
+    from flashinfer_gaudi.moe_glue import GAUDI2_FP8_MAX, MAX_EXPERTS, MAX_TOP_K, VECTOR_LANES
+
+    if hidden % VECTOR_LANES != 0:
+        return f"hidden size {hidden} is not a multiple of {VECTOR_LANES}"
+    if not (1 <= top_k <= MAX_TOP_K and top_k <= experts <= MAX_EXPERTS):
+        return f"top_k {top_k} of {experts} experts is outside 1..{MAX_TOP_K} of at most {MAX_EXPERTS}"
+    merged = getattr(runner, _MOE_GLUE_BUFFER, None)
+    if merged is None:
+        error = getattr(getattr(runner, "_hpu_moe_glue", None), "prepare_error", None)
+        return "the merged gate weight was not built at load" + (f" ({error})" if error else "")
+    if merged.dtype != torch.bfloat16 or tuple(merged.shape) != (experts + 1, hidden):
+        return f"the merged gate weight is {merged.dtype} {tuple(merged.shape)}, not bfloat16 {(experts + 1, hidden)}"
+    device_type = device_type or merged.device.type
+    if kind == "fp8" and device_type == "hpu" and float(hpu_ops.FP8_MAX) != GAUDI2_FP8_MAX:
+        return f"FP8_MAX is {float(hpu_ops.FP8_MAX)}: the quantization kernel takes {GAUDI2_FP8_MAX} (Gaudi2) only"
+
+    # The kernels: every op this block needs has one for the device, and the kernel library serves them.
+    try:
+        from flashinfer_gaudi import moe_glue as ops
+    except Exception as exc:  # noqa: BLE001
+        return f"flashinfer_gaudi.moe_glue does not import ({type(exc).__name__}: {exc})"
+    needed = [name for name in ops.OP_NAMES if kind == "fp8" or name != "moe_row_quant"]
+    device = torch.device(device_type)
+    missing = [name for name in ops.moe_glue_missing_ops(device) if name in needed]
+    if missing:
+        from flashinfer_gaudi import _native
+
+        errors = "; ".join(getattr(_native, "moe_glue_extension_errors", tuple)())
+        return f"no {device_type} kernel for {', '.join(missing)}" + (f" ({errors})" if errors else "")
+    if _moe_glue_library_checked_device(device):
+        from flashinfer_gaudi import _native
+
+        # The ops can have HPU kernels without the library serving them: the extension registers all four,
+        # and a MoE kernel that did not compile is left out of the library. Only the loader knows.
+        if _native.moe_glue_extension_loaded() is None:
+            return "the kernel library was not asked for its MoE kernels (load_moe_glue_extension was not called)"
+        unserved = [name for name in _native.moe_glue_missing_kernels() if name in needed]
+        if unserved:
+            return f"libhc_fused_gaudi2.so has no kernel for {', '.join(unserved)}"
+    return None
+
+
+def _moe_glue_accept(state: _MoeGlueState, runner) -> None:
+    """The layer check passed: keep what the calls need."""
+    from flashinfer_gaudi import moe_glue as ops
+
+    state.ops = ops
+    state.experts = int(runner.gate.weight.shape[0])
+    state.top_k = int(runner.routed_experts.top_k)
+    state.fp8 = type(runner.routed_experts.quant_method).__dict__.get("_hpu_moe_glue_kind") == "fp8"
+    state.fp8_max = float(hpu_ops.FP8_MAX)
+    state.ok = True
+
+
+def _moe_glue_matrix_reason(tensor, name: str, columns: int | None, device: torch.device) -> str | None:
+    """Why `tensor` is not a [tokens, columns] activation the kernels take, or None (shape and dtype only)."""
+    if not isinstance(tensor, torch.Tensor):
+        return f"{name} are not a tensor"
+    if tensor.dtype != torch.bfloat16:
+        return f"{name} are {tensor.dtype}, not bfloat16"
+    if tensor.dim() != 2 or tensor.shape[0] < 1 or (columns is not None and tensor.shape[1] != columns):
+        return f"{name} are {tuple(tensor.shape)}, not [tokens, {columns if columns is not None else 'columns'}]"
+    if not tensor.is_contiguous():
+        return f"{name} are not contiguous"
+    if tensor.device != device:
+        return f"{name} are on {tensor.device}, not {device}"
+    return None
+
+
+def _moe_glue_call_reason(state: _MoeGlueState, runner, hidden_states, shared_experts_input) -> str | None:
+    """Why this call cannot run the fused glue, or None. Ranks, dtypes, sizes, layout and devices only."""
+    merged = getattr(runner, _MOE_GLUE_BUFFER)
+    reason = _moe_glue_matrix_reason(hidden_states, "hidden states", merged.shape[1], merged.device)
+    if reason is None and shared_experts_input is not hidden_states:
+        reason = _moe_glue_matrix_reason(shared_experts_input, "the shared expert's input", merged.shape[1],
+                                         merged.device)
+        if reason is None and shared_experts_input.shape[0] != hidden_states.shape[0]:
+            reason = "the shared expert's input has other rows than the hidden states"
+    return reason
+
+
+def _moe_glue_require(tensor, name: str, columns: int | None, device: torch.device) -> None:
+    reason = _moe_glue_matrix_reason(tensor, name, columns, device)
+    if reason is not None:
+        raise _MoeGlueFallback(reason)
+
+
+def _moe_glue_forward(runner, state: _MoeGlueState, hidden_states, shared_experts_input, padded: bool):
+    """One MoE block through the fused glue: the block's output before its all-reduce, or None.
+
+    None means the torch path: the block is off (one log line, once), or this call is outside what the
+    kernels take. Nothing here reads a tensor's data, and no op writes an input, so the torch path then
+    runs on the same inputs.
+    """
+    if state.ok is False:
+        return None
+    if state.ok is None:
+        reason = _moe_glue_layer_reason(runner)
+        if reason is not None:
+            state.off(reason)
+            return None
+        _moe_glue_accept(state, runner)
+    reason = "the hidden states are padded" if padded else _moe_glue_call_reason(
+        state, runner, hidden_states, shared_experts_input)
+    if reason is not None:
+        state.log(reason)
+        return None
+    ops = state.ops
+    merged = getattr(runner, _MOE_GLUE_BUFFER)
+    hidden = merged.shape[1]
+    try:
+        # One GEMM for the router logits (columns [0, experts)) and the shared-gate logit (column experts).
+        gates = torch.nn.functional.linear(hidden_states, merged)
+        _moe_glue_require(gates, "the merged gate output", state.experts + 1, merged.device)
+        shared = _moe_glue_shared_layer(runner)
+        gate_up, _ = shared.gate_up_proj(shared_experts_input)
+        _moe_glue_require(gate_up, "the shared expert's gate_up output", None, merged.device)
+        if gate_up.shape[1] % 2 != 0:
+            raise _MoeGlueFallback("the shared expert's gate_up output has an odd number of columns")
+        shared_output, _ = shared.down_proj(ops.moe_silu_mul(gate_up))
+        _moe_glue_require(shared_output, "the shared expert's output", hidden, merged.device)
+        routed = runner.routed_experts
+        routed_output = routed.quant_method.apply_monolithic(layer=routed, x=hidden_states, router_logits=gates,
+                                                             moe_glue=state)
+        _moe_glue_require(routed_output, "the routed experts' output", hidden, merged.device)
+        return ops.moe_combine(shared_output, gates, routed_output, state.experts)
+    except _MoeGlueFallback as exc:
+        state.log(str(exc))
+        return None
+    except Exception as exc:  # noqa: BLE001 - a fused op that raises turns the block's fused path off
+        state.off(f"a fused op raised {type(exc).__name__}: {exc}")
+        return None
+
+
 def model_has_quant_config() -> bool:
     """Whether the active model runs with a MoE quantization config.
 
@@ -371,6 +676,9 @@ def select_experts_from_routed(layer, hidden_states: torch.Tensor,
 class HPUUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
     """MoE method without quantization."""
 
+    # VLLM_HPU_MOE_GLUE: this class (not a subclass) runs the fused glue with bf16 experts.
+    _hpu_moe_glue_kind = "bf16"
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.use_dispatch_fn = get_config().use_dispatch_fn
@@ -442,6 +750,9 @@ class HPUUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
         if cache_weight_lists and hasattr(layer.moe_op, "_cache_weight_lists"):
             layer.moe_op._cache_weight_lists()
 
+        # VLLM_HPU_MOE_GLUE=1: the merged gate weight of the block (nothing with the flag at 0).
+        _moe_glue_prepare(layer)
+
     def apply_monolithic(
         self,
         layer: FusedMoE,
@@ -451,7 +762,11 @@ class HPUUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
     ):
         input_shape = x.shape
         x = x.view(-1, x.shape[-1])
-        if layer.use_grouped_topk or getattr(layer, "custom_routing_function", None) is not None:
+        moe_glue = kwargs.get("moe_glue")
+        if moe_glue is not None:
+            # VLLM_HPU_MOE_GLUE=1: softmax, top-k, renormalization and the casts as one fused op.
+            topk_weights, topk_ids = moe_glue.route(router_logits, layer.top_k)
+        elif layer.use_grouped_topk or getattr(layer, "custom_routing_function", None) is not None:
             topk_weights, topk_ids = select_experts_from_routed(layer, x, router_logits)
         else:
             import torch.nn.functional as F
@@ -672,6 +987,15 @@ def patched_fused_moe_forward(
         # is initialized on routed_experts (which the runner holds directly), so
         # unlike the old FusedMoE-layer-based init we do NOT need the layer here.
         self.routed_experts._ensure_moe_quant_config_init()
+        # VLLM_HPU_MOE_GLUE=1: the block's element-wise ops as fused kernels around one merged gate GEMM.
+        # The state exists only with the flag at 1; a block (or a call) the kernels do not take returns
+        # None here, after one log line, and runs the code below.
+        moe_glue = getattr(self, "_hpu_moe_glue", None)
+        if moe_glue is not None:
+            combined = _moe_glue_forward(self, moe_glue, hidden_states, shared_experts_input,
+                                         og_hidden_dim_pre_xform is not None or og_hidden_dim_post_xform is not None)
+            if combined is not None:
+                return self._maybe_reduce_final_output(combined, None, False)
         # Launch the shared experts the way MoERunner._forward_impl does at the
         # engine pin (vllm 8f816a3f): SharedExperts.maybe_forward_async returns
         # True only on a CUDA-alike platform with an aux stream, so on HPU it is
@@ -943,6 +1267,19 @@ def _patched_default_moe_runner_forward(self, *args, **kwargs):
 
 
 MoERunnerBase.forward = _patched_default_moe_runner_forward
+
+_orig_default_moe_runner_init = MoERunnerBase.__init__
+
+
+def _patched_default_moe_runner_init(self, *args, **kwargs):
+    _orig_default_moe_runner_init(self, *args, **kwargs)
+    # VLLM_HPU_MOE_GLUE is read once per MoE block, here; exactly 1 means the fused glue. With any other
+    # value nothing is attached and the block is what it was.
+    if gaudi_envs.VLLM_HPU_MOE_GLUE == 1:
+        _moe_glue_attach(self)
+
+
+MoERunnerBase.__init__ = _patched_default_moe_runner_init
 
 # Note: after upstream PR #41184, FusedMoE is a factory function (not an
 # nn.Module subclass), so there is no FusedMoE.__init__ to patch. The

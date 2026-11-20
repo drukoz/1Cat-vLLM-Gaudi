@@ -96,6 +96,50 @@ step, and the plain step after one, through
 (`GDN core verify ... is off for <layer>: <reason>`) and runs the torch path.
 It stays off until the rental's gate G1b has checked the op on a card.
 
+`VLLM_HPU_HC_FUSED` selects the path of the Flash-Next hyper-connections as an
+integer. `0` (default) keeps the torch path. `1` runs the element-wise parts of
+every hyper-connection (the grouped norm, the silu with the injection split, the
+gated mix and the combine) through six fused TPC kernels,
+`torch.ops.flashinfer_gaudi.hc_norm`, `hc_silu`, `hc_silu_split`, `hc_gate_mix`,
+`hc_combine` and `hc_combine_norm`; the two GEMMs stay torch linears. Any other
+value is the torch path. The flag is read once per layer at construction. The
+kernels ship in their own library, `libhc_fused_gaudi2.so` with the extension
+`hc_fused_ops*.so`, built by `tools/build_flashinfer_gaudi.py --hc-fused-only`
+or by `VLLM_GAUDI_BUILD_HC_FUSED=1` at install time; `HC_FUSED_GAUDI_KERNEL_LIBRARY`
+and `HC_FUSED_GAUDI_NATIVE_LIBRARY` name the two files when they are not in the
+package's `lib` folder. When they do not load, the plugin logs one warning at
+startup (`HC fused (VLLM_HPU_HC_FUSED=1) has no HPU kernel: ...`). A layer whose
+kernels are not loaded, or whose input they do not take (not 2-D bfloat16 and
+contiguous, a hidden size that is not a multiple of 128), logs one warning
+(`HC fused (VLLM_HPU_HC_FUSED=1) is off for <layer>: <reason>; using the torch
+path`) and runs the torch path. With `0` the kernels are not loaded and their
+ops are not registered. The kernels pass the Gaudi2 instruction simulator and
+have not run on a card; see `docs/design/flash-next/hc-fused.md`.
+
+`VLLM_HPU_MOE_GLUE` selects the path of the element-wise ops of the Flash-Next
+MoE block as an integer. `0` (default) keeps the torch path. `1` computes the
+router logits and the shared-gate logit with one merged GEMM (the weight is
+built once at load) and runs the routing (softmax, top-k, renormalization), the
+shared expert's SiLU-multiply, the per-row FP8 quantization of the routed
+experts' input and the shared-gate multiply with the final add through four
+fused TPC kernels, `torch.ops.flashinfer_gaudi.moe_route`, `moe_silu_mul`,
+`moe_row_quant` and `moe_combine`; the GEMMs and the vendor expert op are
+unchanged. Any other value is the torch path. The flag is read once per MoE
+block at construction. The kernels are part of the hyper-connection library
+(`libhc_fused_gaudi2.so`, `hc_fused_ops*.so`), so they are built, installed
+and located like it (previous paragraph); a kernel that did not compile is left
+out of the library. When they are not usable the plugin logs one warning at
+startup (`MoE glue (VLLM_HPU_MOE_GLUE=1) has no HPU kernel: ...`). A block whose
+kernels are missing, or whose configuration or input they do not take (not 2-D
+bfloat16 and contiguous, a hidden size that is not a multiple of 128, grouped
+or custom routing, data- or sequence-parallel MoE, block-FP8 experts), logs one
+warning (`MoE glue (VLLM_HPU_MOE_GLUE=1) is off for <layer>: <reason>; using
+the torch path`) and runs the torch path. Among experts with equal router
+logits the routing kernel takes the lowest expert id, where `torch.topk`
+leaves the choice open. With `0` nothing is loaded, registered or logged. The
+kernels pass the Gaudi2 instruction simulator and have not run on a card; see
+`docs/design/flash-next/hc-fused.md` ("MoE glue kernels").
+
 `VLLM_HPU_RECURRENT_STATE_POOL` selects the allocation mode for the recurrent
 (GDN / short-conv) state slots as an integer. `0` (default) keeps today's
 allocation, one recurrent state slot per attention block id. `1` gives the
@@ -370,6 +414,7 @@ prepared-model entrypoint and disabled in the generic entrypoint.
 | `VLLM_HPU_TRITON_BLOCK_SIZE` | Logical Triton block size used by the initial 2048-bit TPC elementwise kernels. | `256` |
 | `VLLM_HPU_TRITON_SILU_BLOCK_SIZE` | Power-of-two row chunk used to distribute each fused SiLU-and-mul row across Gaudi2 TPC engines; accepted range is 128–1024. | `128` |
 | `VLLM_HPU_TRITON_GDN_VALUE_TILE` | Value rows owned by each experimental Qwen3.5 packed GDN decode program; accepted values are 16, 32, 64, and 128. | `16` |
+| `VLLM_HPU_PLE_HOST_NGRAM_IDS` | Flash-Next only: where the PLE n-gram ids are computed. `0` computes them inside every graph (token packing, `searchsorted`, the EOS shift scan, the int32 hash). `1` computes the same ids on the host when a batch is built and passes them to the model as the int32 input `ple_ngram_ids`, which removes those ops from every prompt and decode graph (speculative verification steps included). A batch whose token ids are not all on the host (async scheduling, merged prefill) keeps the in-graph path and logs the reason once. Not yet checked on a card. | `0` |
 
 The Gaudi2 backend routes supported contiguous BF16 residual RMSNorm calls with
 hidden sizes up to 8192 to one Triton-generated TPC kernel. It returns both the

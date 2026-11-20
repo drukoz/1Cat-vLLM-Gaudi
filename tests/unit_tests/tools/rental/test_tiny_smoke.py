@@ -10,14 +10,21 @@ comparison, the fallback check and the stop. Runs on CPU from the worktree root 
 from __future__ import annotations
 
 import json
+import os
 import socket
+import subprocess
 import sys
 from pathlib import Path
 
 import pytest
 
+from tools.flash_next.rental import gates
 from tools.flash_next.rental import main as orchestrator
 from tools.flash_next.rental import serve, tiny_smoke
+
+REAL_COMBINED_KERNEL_DB_INSTALLED = orchestrator.combined_kernel_db_installed
+BUNDLE_SHA = "abcdef0123456789abcdef0123456789abcdef01"
+CACHE_KEY = BUNDLE_SHA[:12]  # the per-bundle subfolder of the recipe cache, as in the run
 
 FAKE_BUILDER = r"""
 import json, os, sys
@@ -32,7 +39,10 @@ prompts = []
 for i, n in enumerate([1, 7]):
     prompts.append({"prompt_ids": list(range(1, n + 1)),
                     "generated_ids": list(range(100 + 16 * i, 100 + 16 * i + 16))})
-(out / "reference.json").write_text(json.dumps({"prompts": prompts}), encoding="utf-8")
+reference = {"schema": 2, "prompts": prompts}
+if os.environ.get("FAKE_BUILD_SETTINGS"):
+    reference["build"] = json.loads(os.environ["FAKE_BUILD_SETTINGS"])
+(out / "reference.json").write_text(json.dumps(reference), encoding="utf-8")
 """
 
 FAKE_SERVER = r"""
@@ -104,9 +114,13 @@ def fakes(tmp_path, monkeypatch):
                         lambda ckpt, port: [sys.executable, str(server), "--port", str(port), "--reference",
                                             str(Path(ckpt) / "reference.json")])
     monkeypatch.setattr(serve, "_HEALTH_POLL_S", 0.1)
+    monkeypatch.setattr(orchestrator, "bundle_commit", lambda: BUNDLE_SHA)
     for name in ("FAKE_BUILD_EXIT", "FAKE_SERVER_EXIT", "FAKE_SERVER_LINE", "FAKE_SERVER_WRONG",
                  "FAKE_SERVER_ENV_KEYS"):
         monkeypatch.delenv(name, raising=False)
+    # the fake builder records the settings the real generator would record for the smoke test's command
+    monkeypatch.setenv("FAKE_BUILD_SETTINGS", json.dumps(dict(
+        orchestrator.tiny_build_settings(), schema=2, prompt_lengths=[1, 7], max_new_tokens=16)))
     port = free_port()
     out = tmp_path / "out"
     return out, port
@@ -195,17 +209,20 @@ def test_env_pairs_are_applied_last(fakes):
     assert env["VLLM_HPU_GDN_CORE_DECODE"] == "0"
 
 
-def test_the_pytorch_mode_gets_the_recipe_cache_and_the_fused_mode_does_not(fakes, monkeypatch, capsys):
+def test_the_pytorch_mode_gets_the_recipe_cache_and_the_fused_mode_does_not(fakes, tmp_path, monkeypatch, capsys):
+    # Changed on purpose: the cache folder now has the run's per-bundle subfolder (the plugin commit).
     out, port = fakes
+    rc = tmp_path / "rc"
     monkeypatch.setenv("FAKE_SERVER_ENV_KEYS", serve.RECIPE_CACHE_ENV)
-    code, summary = run(out, port, "--recipe-cache", "/rc")
+    code, summary = run(out, port, "--recipe-cache", str(rc))
     assert code == 0
     pytorch = json.loads((out / "pytorch" / "server_env.json").read_text(encoding="utf-8"))
     fused = json.loads((out / "fused" / "server_env.json").read_text(encoding="utf-8"))
-    assert pytorch[serve.RECIPE_CACHE_ENV] == "/rc,false,8192"
+    assert pytorch[serve.RECIPE_CACHE_ENV] == "%s/%s,false,8192" % (rc, CACHE_KEY)
+    assert (rc / CACHE_KEY).is_dir()
     assert fused[serve.RECIPE_CACHE_ENV] is None
     modes = by_mode(summary)
-    assert modes["pytorch"]["recipe_cache"] == "/rc"
+    assert modes["pytorch"]["recipe_cache"] == "%s/%s" % (rc, CACHE_KEY)
     assert modes["fused"]["recipe_cache"] == serve.RECIPE_CACHE_OFF_REASON
     printed = capsys.readouterr().out
     assert "starting the server (recipe cache on" in printed
@@ -226,27 +243,65 @@ def test_without_recipe_cache_no_server_gets_the_variable(fakes, monkeypatch):
         assert modes[mode]["recipe_cache"] == serve.RECIPE_CACHE_NONE
 
 
-def test_env_pairs_override_the_recipe_cache(fakes, monkeypatch):
+def test_the_recipe_cache_key_is_unknown_without_a_commit(fakes, tmp_path, monkeypatch):
+    out, port = fakes
+    monkeypatch.setattr(orchestrator, "bundle_commit", lambda: None)
+    monkeypatch.setenv("FAKE_SERVER_ENV_KEYS", serve.RECIPE_CACHE_ENV)
+    code, _ = run(out, port, "--gdn", "pytorch", "--recipe-cache", str(tmp_path / "rc"))
+    assert code == 0
+    env = json.loads((out / "pytorch" / "server_env.json").read_text(encoding="utf-8"))
+    assert env[serve.RECIPE_CACHE_ENV] == "%s/unknown,false,8192" % (tmp_path / "rc")
+
+
+def test_env_pairs_override_the_recipe_cache(fakes, tmp_path, monkeypatch):
     out, port = fakes
     monkeypatch.setenv("FAKE_SERVER_ENV_KEYS", serve.RECIPE_CACHE_ENV)
-    code, _ = run(out, port, "--gdn", "pytorch", "--recipe-cache", "/rc",
+    code, _ = run(out, port, "--gdn", "pytorch", "--recipe-cache", str(tmp_path / "rc"),
                   "--env", "PT_HPU_RECIPE_CACHE_CONFIG=/x,false,1")
     assert code == 0
     env = json.loads((out / "pytorch" / "server_env.json").read_text(encoding="utf-8"))
     assert env[serve.RECIPE_CACHE_ENV] == "/x,false,1"
 
 
-def test_with_the_combined_kernel_database_both_modes_get_the_cache(fakes, monkeypatch):
+def test_with_the_combined_kernel_database_both_modes_get_the_cache(fakes, tmp_path, monkeypatch):
     out, port = fakes
+    rc = tmp_path / "rc"
     monkeypatch.setattr(orchestrator, "combined_kernel_db_installed", lambda *args, **kwargs: True)
     monkeypatch.setenv("FAKE_SERVER_ENV_KEYS", serve.RECIPE_CACHE_ENV)
-    code, summary = run(out, port, "--recipe-cache", "/rc")
+    code, summary = run(out, port, "--recipe-cache", str(rc))
     assert code == 0
     modes = by_mode(summary)
     for mode in ("pytorch", "fused"):
         env = json.loads((out / mode / "server_env.json").read_text(encoding="utf-8"))
-        assert env[serve.RECIPE_CACHE_ENV] == "/rc,false,8192"
-        assert modes[mode]["recipe_cache"] == "/rc"
+        assert env[serve.RECIPE_CACHE_ENV] == "%s/%s,false,8192" % (rc, CACHE_KEY)
+        assert modes[mode]["recipe_cache"] == "%s/%s" % (rc, CACHE_KEY)
+
+
+def test_the_operator_switch_keeps_the_cache_from_the_fused_mode(fakes, tmp_path, monkeypatch):
+    # tiny_smoke.sh --no-combined-kernel-db: the database is installed, the switch is 0 in the container.
+    out, port = fakes
+    lib = tmp_path / "site" / "flashinfer_gaudi" / "lib"
+    lib.mkdir(parents=True)
+    (lib / serve.COMBINED_KERNEL_DB).write_bytes(b"\0")
+    real_run_step = gates.run_step
+
+    def run_step(cmd, cwd, timeout_s, env=None):
+        if list(cmd[1:3]) == ["-c", gates.GDN_LIB_LOOKUP_CODE]:
+            return subprocess.CompletedProcess(cmd, 0, "%s\n" % lib, "")
+        return real_run_step(cmd, cwd, timeout_s, env)
+
+    monkeypatch.setattr(gates, "run_step", run_step)
+    monkeypatch.setattr(orchestrator, "combined_kernel_db_installed", REAL_COMBINED_KERNEL_DB_INSTALLED)
+    monkeypatch.setenv(serve.COMBINED_KERNEL_DB_ENV, "0")
+    monkeypatch.setenv("FAKE_SERVER_ENV_KEYS", "%s,%s" % (serve.RECIPE_CACHE_ENV, serve.COMBINED_KERNEL_DB_ENV))
+    code, summary = run(out, port, "--recipe-cache", str(tmp_path / "rc"))
+    assert code == 0
+    fused = json.loads((out / "fused" / "server_env.json").read_text(encoding="utf-8"))
+    assert fused[serve.RECIPE_CACHE_ENV] is None
+    assert fused[serve.COMBINED_KERNEL_DB_ENV] == "0"
+    assert by_mode(summary)["fused"]["recipe_cache"] == serve.RECIPE_CACHE_OFF_REASON
+    pytorch = json.loads((out / "pytorch" / "server_env.json").read_text(encoding="utf-8"))
+    assert pytorch[serve.RECIPE_CACHE_ENV] is not None  # the torch path registers no kernel database
 
 
 def test_env_without_equals_is_a_usage_error(fakes):
@@ -287,7 +342,9 @@ def test_wrong_tokens_are_a_failure(fakes, monkeypatch):
     assert code == 1
     entry = by_mode(summary)["pytorch"]
     assert entry["status"] == "failed"
-    assert "do not match" in entry["reason"]
+    # the reason's wording changed with the per-prompt record: it names the shortest failing prompt
+    assert entry["reason"] == ("2 of 2 prompts failed; the shortest failing prompt has 1 tokens: "
+                               "15 of 16 tokens match, first difference at token 3 (the server sent 16 tokens)")
 
 
 def test_fused_mode_fails_when_the_server_fell_back_to_the_torch_path(fakes, monkeypatch):
@@ -338,6 +395,25 @@ def test_a_checkpoint_folder_is_built_once_and_reused(fakes, tmp_path, monkeypat
     assert by_mode(summary)["pytorch"]["status"] == "passed"
 
 
+def test_a_checkpoint_built_with_other_settings_is_not_reused(fakes, tmp_path, monkeypatch, capsys):
+    # A folder kept from an earlier bundle (GDN head dim 16, where the fused kernel can never run) is rebuilt.
+    out, port = fakes
+    ckpt = tmp_path / "kept-ckpt"
+    old = dict(json.loads(os.environ["FAKE_BUILD_SETTINGS"]), gdn_head_dim=16)
+    wanted = os.environ["FAKE_BUILD_SETTINGS"]
+    monkeypatch.setenv("FAKE_BUILD_SETTINGS", json.dumps(old))
+    code, _ = run(out, port, "--gdn", "pytorch", "--ckpt", str(ckpt))
+    assert code == 0
+    assert json.loads((ckpt / "reference.json").read_text(encoding="utf-8"))["build"]["gdn_head_dim"] == 16
+    capsys.readouterr()
+    monkeypatch.setenv("FAKE_BUILD_SETTINGS", wanted)
+    code, _ = run(tmp_path / "out2", port, "--gdn", "pytorch", "--ckpt", str(ckpt))
+    assert code == 0
+    assert json.loads((ckpt / "reference.json").read_text(encoding="utf-8"))["build"]["gdn_head_dim"] == 128
+    printed = capsys.readouterr().out
+    assert "gdn_head_dim" in printed and "reusing" not in printed
+
+
 def test_port_in_use_is_a_failure_before_any_start(fakes):
     out, port = fakes
     with socket.socket() as sock:
@@ -361,15 +437,30 @@ def test_the_commands_are_the_tiny_gate_commands(tmp_path):
     ckpt = tmp_path / "ckpt"
     assert tiny_smoke.checkpoint_command(ckpt) == orchestrator.tiny_checkpoint_command(ckpt)
     assert tiny_smoke.serve_command(ckpt, 8010) == orchestrator.tiny_serve_command(ckpt, 8010)
+    # Changed on purpose: the model length now follows the reference (4096 while there is none: 512 was
+    # below the 700 and 2600 token reference prompts), and the GDN layers are built at head dim 128.
     assert orchestrator.tiny_serve_command(ckpt, 8010) == [
         "vllm", "serve", str(ckpt), "--served-model-name", "tiny", "--tensor-parallel-size", "8",
-        "--max-model-len", "512", "--max-num-seqs", "4", "--language-model-only", "--trust-remote-code",
+        "--max-model-len", "4096", "--max-num-seqs", "4", "--language-model-only", "--trust-remote-code",
         "--port", "8010", "--host", "127.0.0.1",
     ]
     assert orchestrator.tiny_checkpoint_command(ckpt) == [
         sys.executable, "tools/flash_next/make_tiny_checkpoint.py", "--out", str(ckpt), "--fixture",
-        orchestrator.TINY_FIXTURE,
+        orchestrator.TINY_FIXTURE, "--gdn-head-dim", "128",
     ]
+
+
+def test_the_smoke_servers_get_the_fault_handler(fakes, monkeypatch):
+    out, port = fakes
+    monkeypatch.delenv("PYTHONFAULTHANDLER", raising=False)
+    monkeypatch.setenv("FAKE_SERVER_ENV_KEYS", "PYTHONFAULTHANDLER")
+    code, _ = run(out, port, "--gdn", "pytorch")
+    assert code == 0
+    assert json.loads((out / "pytorch" / "server_env.json").read_text(encoding="utf-8"))["PYTHONFAULTHANDLER"] == "1"
+
+
+def test_the_error_lines_are_the_orchestrators():
+    assert tiny_smoke.error_lines is serve.error_lines
 
 
 def test_error_lines_keeps_the_last_distinct_errors():

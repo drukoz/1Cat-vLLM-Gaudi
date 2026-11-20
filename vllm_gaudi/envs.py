@@ -532,6 +532,10 @@ if TYPE_CHECKING:
     VLLM_HPU_GDN_CORE_DECODE: int = 1  # GdnCoreDecodeMode: 1 fused (default), 0 off, 2 recurrence
     VLLM_HPU_GDN_CORE_DECODE_DEBUG: int = 0  # GdnCoreDecodeDebug: 0 off, 1 check slot indices every step (host sync)
     VLLM_HPU_GDN_CORE_VERIFY: int = 0  # GdnCoreVerifyMode: 0 off (default), 1 fused verification steps
+    VLLM_HPU_PLE_HOST_NGRAM_IDS: int = 0  # 0 PLE n-gram ids computed in the graph (default), 1 on the host
+    VLLM_HPU_HC_FUSED: int = 0  # 0 torch hyper-connections (default), 1 the fused hyper-connection kernels
+    VLLM_HPU_MOE_GLUE: int = 0  # 0 torch MoE glue (default), 1 the fused MoE glue kernels
+    VLLM_HPU_COLLECTIVE_MARK_STEP: int = 1  # 1 (default) mark_step() before every HPU collective, 0 none
     VLLM_HPU_RECURRENT_STATE_POOL: int = 0  # RecurrentStatePoolMode: 0 off, 1 pool
     VLLM_HPU_RECURRENT_STATE_POOL_SLOTS: int = 0  # resolved by the hook; positive overrides the formula
     VLLM_HPU_RECURRENT_STATE_POOL_CACHE_SLOTS: int = 512  # retained prefix states added to the live need
@@ -1884,6 +1888,40 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # docs/design/flash-next/gdn-core-decode.md, "Phase 2 contract, version 2".
     "VLLM_HPU_GDN_CORE_VERIFY":
     lambda: int(os.environ.get("VLLM_HPU_GDN_CORE_VERIFY", "0")),
+
+    # Flash-Next PLE n-gram ids. 0 (default) = every forward computes them on the device (token
+    # packing, searchsorted, the EOS shift scan, the int32 limb hash). 1 = the runner computes the
+    # same ids on the host from the batch's token ids (ple_ops.host_ngram_ids) and passes them as the
+    # int32 model input ple_ngram_ids ([ple_layers, tokens, heads], fixed per bucket); the id ops leave
+    # every graph. A batch whose token ids are not all on the host (async scheduling, merged prefill)
+    # keeps the device path and logs the reason once. Any other value is 0.
+    "VLLM_HPU_PLE_HOST_NGRAM_IDS":
+    lambda: int(os.environ.get("VLLM_HPU_PLE_HOST_NGRAM_IDS", "0")),
+
+    # Flash-Next hyper-connections through the fused TPC kernels (flashinfer_gaudi.hc_fused: hc_norm,
+    # hc_silu, hc_silu_split, hc_gate_mix, hc_combine, hc_combine_norm). 0 (default) = the torch path,
+    # 1 = fused; any other value is the torch path. Read once per layer at construction. A layer whose
+    # kernels are not loaded, or whose input the kernels do not take, logs one line and runs the torch
+    # path. Not yet proven in a served model; see docs/design/flash-next/hc-fused.md.
+    "VLLM_HPU_HC_FUSED":
+    lambda: int(os.environ.get("VLLM_HPU_HC_FUSED", "0")),
+
+    # Element-wise glue of the Flash-Next MoE block (routing softmax/top-k/renormalization, the shared
+    # expert's SiLU-multiply, the per-row FP8 quantization of the routed experts' input, the shared-gate
+    # multiply and the final add) as four TPC kernels of the hyper-connection kernel library, around one
+    # merged gate GEMM: 0 = torch path (default), 1 = fused; any other value is the torch path. Read once
+    # per MoE block at construction. A block whose kernels are not loaded, or whose configuration or input
+    # the kernels do not take, logs one line and runs the torch path. Not yet proven on a card; see
+    # docs/design/flash-next/hc-fused.md ("MoE glue kernels").
+    "VLLM_HPU_MOE_GLUE":
+    lambda: int(os.environ.get("VLLM_HPU_MOE_GLUE", "0")),
+
+    # The htorch.core.mark_step() that HpuCommunicator issues before every all-reduce and all-gather
+    # (a workaround for a Habana bridge bug with PT_HPU_ENABLE_LAZY_COLLECTIVES). 1 (default) keeps it.
+    # 0 removes it: an experiment for a card, where a Flash-Next TP8 decode step has 99 collectives and
+    # so 99 graph cuts; only use it when the served tokens still match a reference (tiny_smoke.sh --env).
+    "VLLM_HPU_COLLECTIVE_MARK_STEP":
+    lambda: int(os.environ.get("VLLM_HPU_COLLECTIVE_MARK_STEP", "1")),
 
     # Recurrent (GDN / short-conv) state pool: 0 (default) keeps today's
     # one-recurrent-slot-per-attention-block-id allocation, 1 gives the

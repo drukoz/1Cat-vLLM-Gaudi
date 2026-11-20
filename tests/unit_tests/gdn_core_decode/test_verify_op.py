@@ -4,7 +4,8 @@
 The op wraps the T-node verification reference (contract: ``docs/design/flash-next/gdn-core-decode.md``,
 "Phase 2 contract, version 2"): ``gdn_core_verify_reference`` matches ``verify_oracle`` (the contract's loop
 form), the reference matches M3's composed speculative path (the probe's check, copied from
-``spikes/gdn-core-verify/probe.py`` into this file) at all four TP head counts over 4 chained steps, the CPU
+``spikes/gdn-core-verify/probe.py`` into this file) at all four TP head counts over 4 chained steps, with k = 3
+draft tokens (T = 4) and with k = 5 (T = 6, the largest the op takes), the CPU
 kernel matches the reference bit-exactly (output and both mutated pools), ``opcheck`` passes on schema and fake
 tensor, the fake kernel allocates only, ``gdn_core_verify_available`` reports kernel presence per device type,
 and ``GdnCoreVerifyMode`` carries the flag values.
@@ -17,8 +18,8 @@ import vllm_gaudi  # noqa: F401  (the plugin registers the platform the composed
 from vllm.model_executor.layers.layernorm import RMSNormGated
 
 from flashinfer_gaudi.gdn_core_decode import GdnGateActivation
-from flashinfer_gaudi.gdn_core_verify import (GdnCoreVerifyMode, gdn_core_verify, gdn_core_verify_available,
-                                              gdn_core_verify_reference)
+from flashinfer_gaudi.gdn_core_verify import (GDN_CORE_VERIFY_MAX_NODES, GdnCoreVerifyMode, gdn_core_verify,
+                                              gdn_core_verify_available, gdn_core_verify_reference)
 from flashinfer_gaudi.gdn_decode import gated_delta_rule_mtp_packed
 from tests.unit_tests.gdn_core_decode.sim_case import D
 from tests.unit_tests.gdn_core_decode.verify_sim_case import (VERIFY_ARG_ORDER, VERIFY_HPU_CASES, compare_verify,
@@ -28,14 +29,21 @@ from vllm_gaudi.ops.hpu_gdn_pytorch import hpu_fused_gdn_gating
 
 GATE = int(GdnGateActivation.SIGMOID)
 
-# The probe's chain schedule (spikes/gdn-core-verify/probe.py): B = 3 requests, k = 3 (T = 4 nodes, R = 6 conv
-# rows), 4 chained steps; "full" accepts every draft, "trimmed" trims query lengths (step 1 row 2 is padding).
+# The probe's chain schedule (spikes/gdn-core-verify/probe.py): B = 3 requests, k draft tokens (T = 1 + k nodes,
+# R = 3 + k conv rows; the probe ran k = 3), 4 chained steps; "full" accepts every draft, "trimmed" trims query
+# lengths (step 1 row 2 is padding).
 HEAD_COUNTS = [(16, 48), (8, 24), (4, 12), (2, 6)]  # TP1, TP2, TP4, TP8
-K = 3
+DRAFT_COUNTS = [3, 5]  # k: Flash-Next's recipe so far, and the op's maximum (GDN_CORE_VERIFY_MAX_NODES - 1)
 B = 3
 STEPS = 4
-FULL_QLENS = [[K + 1] * B] * STEPS
-TRIMMED_QLENS = [[K + 1, 2, K + 1], [K + 1, K + 1, 1], [3, K + 1, K + 1], [K + 1] * B]
+
+
+def _full_qlens(k: int) -> list[list[int]]:
+    return [[k + 1] * B] * STEPS
+
+
+def _trimmed_qlens(k: int) -> list[list[int]]:
+    return [[k + 1, 2, k + 1], [k + 1, k + 1, 1], [3, k + 1, k + 1], [k + 1] * B]
 
 
 def _case(name: str):
@@ -111,11 +119,16 @@ def test_reference_matches_oracle(case):
     assert compare_verify(case, inputs, {"out": out_ref, "conv_state": conv_ref, "ssm_state": ssm_ref}) == []
 
 
+def test_draft_counts_end_at_the_op_maximum():
+    assert max(DRAFT_COUNTS) + 1 == GDN_CORE_VERIFY_MAX_NODES
+
+
 @pytest.mark.parametrize("H,HV", HEAD_COUNTS, ids=["tp1", "tp2", "tp4", "tp8"])
 @pytest.mark.parametrize("align", [False, True], ids=["noalign", "align"])
 @pytest.mark.parametrize("trimmed", [False, True], ids=["full", "trimmed"])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16], ids=["fp32", "bf16"])
-def test_matches_m3_composed_path(H, HV, dtype, align, trimmed):
+@pytest.mark.parametrize("K", DRAFT_COUNTS, ids=["k3", "k5"])
+def test_matches_m3_composed_path(H, HV, dtype, align, trimmed, K):
     """The reference vs M3's composed speculative path, 4 chained steps, accepted counts threaded forward.
 
     The probe's check (spikes/gdn-core-verify/probe.py), adapted to the token-major op layout.  Tolerances from
@@ -137,7 +150,7 @@ def test_matches_m3_composed_path(H, HV, dtype, align, trimmed):
     c2, s2 = conv0.clone(), ssm0.clone()  # the composed path's pools
     out_tol = dict(atol=1e-5, rtol=1e-5) if dtype == torch.float32 else dict(atol=5e-2, rtol=1e-2)
     ssm_tol = dict(atol=1e-5, rtol=1e-5) if dtype == torch.float32 else dict(atol=3e-2, rtol=1e-2)
-    qlens = TRIMMED_QLENS if trimmed else FULL_QLENS
+    qlens = _trimmed_qlens(K) if trimmed else _full_qlens(K)
     accepted = torch.ones(B, dtype=torch.int32)
     for step in range(STEPS):
         mixed = bf(B, T, C)
@@ -184,7 +197,7 @@ def test_matches_m3_composed_path(H, HV, dtype, align, trimmed):
         accepted = torch.tensor([min(nxt[r], int(ql[r])) for r in range(B)], dtype=torch.int32)
 
 
-@pytest.mark.parametrize("name", ["ver_tp8_chain", "ver_tp4_t1"])
+@pytest.mark.parametrize("name", ["ver_tp8_chain", "ver_tp4_t1", "ver_tp8_t6_chain", "ver_tp4_t5_b2"])
 def test_op_matches_reference(name):
     """The op (torch.ops and the wrapper) matches the reference bit-exactly: out and both pools."""
     case = _case(name)

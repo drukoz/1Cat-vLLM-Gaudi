@@ -131,7 +131,7 @@ void validate_verify(const at::Tensor& conv_state, const at::Tensor& ssm_state, 
     const auto batch = row_indices.size(0);
     TORCH_CHECK(ssm_store_indices.dim() == 2 && ssm_store_indices.size(0) == batch &&
                     ssm_store_indices.size(1) >= 1 && ssm_store_indices.size(1) <= kGdnCoreVerifyMaxNodes,
-                "GDN core verify ssm_store_indices must be [B,T] with 1<=T<=8");
+                "GDN core verify ssm_store_indices must be [B,T] with 1<=T<=", kGdnCoreVerifyMaxNodes);
     const auto nodes = ssm_store_indices.size(1);
     TORCH_CHECK(mixed_qkv.dim() == 2 && mixed_qkv.size(0) == batch * nodes,
                 "GDN core verify mixed_qkv must be [B*T,C] with B*T = row_indices rows x ssm_store_indices columns");

@@ -11,14 +11,73 @@ import torch  # noqa: E402
 from vllm_gaudi.v1.worker.recurrent_commit import (align_precopy_plan, boundary_commits, commit_conv, commit_ssm,
                                                    precopy_slot_pairs, self_commit_requests)  # noqa: E402
 
+from tests.unit_tests.flash_next_spec_sizes import SPEC_SIZES, require_startup, size_id  # noqa: E402
+
 BS = 128
 K = 3
 # Row of the CPU trace of the design (bs = 4, k = 3): slots 8..23, one per block index.
 R = list(range(8, 24))
 
 
+@pytest.fixture(params=SPEC_SIZES, ids=size_id)
+def spec_k(request) -> int:
+    """Each speculative size k the Flash-Next tests run at, after flash_next_spec_sizes' startup check."""
+    require_startup(request.param, prefix_caching=True)
+    return request.param
+
+
 def _store(rows):
     return torch.tensor(rows, dtype=torch.int32)
+
+
+def test_every_lattice_column_commits_at_every_size(spec_k):
+    """A full acceptance of 1 + k tokens: the token of column t commits from store column t when it ends a block."""
+    t = 1 + spec_k
+    store = _store([list(range(40, 40 + t))])
+    for col in range(t):
+        ctx = 35 - col  # bs 4: token `col` sits on position 35, the last of block 8 (slot 16)
+        pairs = boundary_commits([ctx], [t], 4, store, [R])
+        want = [(0, c, 40 + c, R[(ctx + c) // 4]) for c in range(t) if (ctx + c + 1) % 4 == 0]
+        assert pairs == want and (0, col, 40 + col, 16) in pairs, f"column {col}: {pairs}"
+        # Rejected with the draft tail: with `col` accepted tokens (0 .. col - 1) token `col` commits nothing.
+        assert all(c < col for (_i, c, _s, _d) in boundary_commits([ctx], [col], 4, store, [R]))
+    # Gaudi-scale blocks: only the last column's token ends block 0.
+    assert boundary_commits([BS - 1 - spec_k], [t], BS, store, [[7, 8]]) == [(0, spec_k, 40 + spec_k, 7)]
+    # An accepted count beyond the lattice width is refused when its token ends a block.
+    with pytest.raises(ValueError, match="exceeds the store lattice width"):
+        boundary_commits([BS - 1 - t], [t + 1], BS, store, [[7, 8]])
+
+
+def test_precopy_carries_every_accepted_count_at_every_size(spec_k):
+    """After n accepted tokens (1 .. 1 + k) a moved window copies conv at bias n - 1 and the ssm row of column n - 1."""
+    t = 1 + spec_k
+    row = list(range(8, 40))
+    curr = (40 + t - 1) // 4  # bs 4, 40 computed tokens: the block of the last scheduled token
+    assert curr > 9
+    for n in range(1, t + 1):
+        plan, new_prev, new_accepted = align_precopy_plan([9], [40], [t], [n], 4)
+        assert (plan, new_prev, new_accepted) == ([(0, n - 1, 9, curr)], [curr], [1])
+        conv_pairs, ssm_pairs, ts = precopy_slot_pairs(plan, [row])
+        assert conv_pairs == [(0, n - 1, row[9], row[curr])]
+        assert ssm_pairs == [(0, n - 1, row[9 + n - 1], row[curr])]  # the previous window's column n - 1
+        assert ts == [n - 1]
+    # The previous window's last column must be inside the row.
+    with pytest.raises(ValueError, match="src_block \\+ bias"):
+        precopy_slot_pairs([(0, spec_k, 9, curr)], [row[:9 + spec_k]])
+
+
+def test_commit_conv_reads_every_window_of_the_expanded_state_at_every_size(spec_k):
+    """The expanded conv state has window + k rows; the plain window after token t is rows [t, t + window)."""
+    for window in (3, 9):  # GDN (kernel 4), PLE (kernel 4, dilation 3)
+        rows = window + spec_k
+        for token in range(spec_k + 1):
+            state = torch.arange(4 * rows * 2, dtype=torch.float32).view(4, rows, 2)
+            before = state.clone()
+            commit_conv(state, [(0, token, 1, 2)], window)
+            assert torch.equal(state[2, :window], before[1, token:token + window]), f"window {window} token {token}"
+            assert torch.equal(state[2, window:], before[2, window:]) and torch.equal(state[1], before[1])
+        with pytest.raises(RuntimeError):  # token k + 1 has no window in a state of window + k rows
+            commit_conv(torch.zeros(4, rows, 2), [(0, spec_k + 1, 1, 2)], window)
 
 
 def test_no_boundary_in_the_verified_window():

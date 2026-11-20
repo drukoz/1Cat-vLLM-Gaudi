@@ -236,6 +236,58 @@ class TestProcessHandling:
         finally:
             serve.stop_server(proc, timeout_s=2.0)
 
+    def test_stop_server_kills_at_once_when_the_lead_process_is_dead(self, tmp_path):
+        # Session 1: a crashed server left workers that ignore SIGINT, and every stop waited the full 60 s.
+        worker = ("import signal, time; signal.signal(signal.SIGINT, signal.SIG_IGN); "
+                  "print('worker up', flush=True); time.sleep(600)")
+        code = f"import subprocess, sys; subprocess.Popen([sys.executable, '-c', {worker!r}]); sys.exit(3)"
+        log_path = tmp_path / "dead-lead.log"
+        proc = serve.start_server([sys.executable, "-c", code], os.environ.copy(), log_path, tmp_path)
+        try:
+            assert proc.wait(timeout=30) == 3
+            deadline = time.time() + 20
+            while "worker up" not in log_path.read_text() and time.time() < deadline:
+                time.sleep(0.1)
+            assert "worker up" in log_path.read_text()
+            started = time.time()
+            serve.stop_server(proc, timeout_s=30.0)
+            assert time.time() - started < 10  # no SIGINT grace for a group whose server is gone
+            with pytest.raises(ProcessLookupError):
+                os.killpg(proc.pid, 0)
+        finally:
+            serve.stop_server(proc, timeout_s=2.0)
+
+    def test_stop_server_gives_a_live_server_its_sigint_grace(self, tmp_path):
+        # A server that is alive still gets SIGINT first and may finish its shutdown work.
+        code = ("import signal, sys, time\n"
+                "def bye(*args):\n"
+                "    time.sleep(1.0); print('clean shutdown', flush=True); sys.exit(0)\n"
+                "signal.signal(signal.SIGINT, bye)\n"
+                "print('up', flush=True); time.sleep(600)\n")
+        log_path = tmp_path / "live.log"
+        proc = serve.start_server([sys.executable, "-c", code], os.environ.copy(), log_path, tmp_path)
+        try:
+            deadline = time.time() + 20
+            while "up" not in log_path.read_text() and time.time() < deadline:
+                time.sleep(0.1)
+            serve.stop_server(proc, timeout_s=30.0)
+            assert "clean shutdown" in log_path.read_text()
+        finally:
+            serve.stop_server(proc, timeout_s=2.0)
+
+    def test_unhealthy_reason_tells_a_crash_from_a_timeout(self, tmp_path):
+        crashed = serve.start_server([sys.executable, "-c", "import sys; sys.exit(7)"], os.environ.copy(),
+                                     tmp_path / "c.log", tmp_path)
+        assert crashed.wait(timeout=30) == 7
+        assert serve.unhealthy_reason(crashed, 220.4, 1200.0, "tiny server") == (
+            schema.GateStatus.FAILED, "tiny server exited with code 7 after 220 s")
+        alive = http_server_proc(tmp_path, free_port())
+        try:
+            assert serve.unhealthy_reason(alive, 1200.0, 1200.0, "server 1") == (
+                schema.GateStatus.TIMED_OUT, "server 1 not healthy within 1200 s")
+        finally:
+            serve.stop_server(alive)
+
     def test_stop_server_on_exited_process_never_raises(self, tmp_path):
         proc = serve.start_server([sys.executable, "-c", "pass"], os.environ.copy(), tmp_path / "x.log", tmp_path)
         assert proc.wait(timeout=30) == 0
@@ -313,3 +365,50 @@ class TestRecipeCacheEnv:
         env = {"VLLM_HPU_GDN_CORE_DECODE": "1", "VLLM_HPU_GDN_CORE_VERIFY": "1"}
         assert serve.recipe_cache_env("/rc/abc123456789", 4096, env, combined_db=True) == (
             {"PT_HPU_RECIPE_CACHE_CONFIG": "/rc/abc123456789,false,4096"}, "/rc/abc123456789")
+
+    def test_the_moe_glue_flag_loads_the_fused_library_like_the_hc_flag(self):
+        """VLLM_HPU_MOE_GLUE=1 loads the library of the fused hyper-connection kernels (the MoE glue
+        kernels live in it), so the server registers a kernel database of its own: no recipe cache, unless
+        through the combined kernel database. A missing key or "0" is the plugin default, off."""
+        cache = ({"PT_HPU_RECIPE_CACHE_CONFIG": "/rc/abc123456789,false,16384"}, "/rc/abc123456789")
+        off = ({}, serve.RECIPE_CACHE_OFF_REASON)
+        moe_on = dict(self.PYTORCH_GDN, VLLM_HPU_MOE_GLUE="1")
+        assert serve.recipe_cache_env("/rc/abc123456789", 16384, dict(self.PYTORCH_GDN, VLLM_HPU_MOE_GLUE="0")) == cache
+        assert serve.recipe_cache_env("/rc/abc123456789", 16384, moe_on) == off
+        assert serve.recipe_cache_env("/rc/abc123456789", 16384, dict(moe_on, VLLM_HPU_HC_FUSED="0")) == off
+        assert serve.recipe_cache_env("/rc/abc123456789", 16384, dict(moe_on, VLLM_HPU_HC_FUSED="1")) == off
+        assert serve.recipe_cache_env("/rc/abc123456789", 16384, moe_on, combined_db=True) == cache
+        assert serve.recipe_cache_env(None, 16384, moe_on) == ({}, "none")
+
+    def test_the_hc_flag_alone_still_counts(self):
+        hc_on = dict(self.PYTORCH_GDN, VLLM_HPU_HC_FUSED="1", VLLM_HPU_MOE_GLUE="0")
+        assert serve.recipe_cache_env("/rc/abc123456789", 16384, hc_on) == ({}, serve.RECIPE_CACHE_OFF_REASON)
+        assert serve.recipe_cache_env("/rc/abc123456789", 16384, hc_on, combined_db=True)[0] != {}
+
+    def test_the_reason_names_every_library_a_server_may_register(self):
+        reason = serve.RECIPE_CACHE_OFF_REASON
+        assert reason.startswith("off: ") and "GC_KERNEL_PATH" in reason
+        assert "fused GDN kernel" in reason and "hyper-connection" in reason and "MoE glue" in reason
+
+
+def test_error_lines_keeps_the_last_distinct_errors():
+    log = "\n".join([
+        "(Worker_TP0 pid=1) INFO 11-18 22:27:10 [runtime.py:32] skip_warmup: False",
+        "(Worker_TP0 pid=1) ERROR 11-18 22:27:11 [multiproc_executor.py:944] TypeError: bad keyword 'bias_vl'",
+        "(Worker_TP1 pid=2) ERROR 11-18 22:27:11 [multiproc_executor.py:944] TypeError: bad keyword 'bias_vl'",
+        "(APIServer pid=9) RuntimeError: Engine core initialization failed. See root cause above.",
+    ])
+    assert serve.error_lines(log) == [
+        "TypeError: bad keyword 'bias_vl'",
+        "RuntimeError: Engine core initialization failed. See root cause above.",
+    ]
+    assert serve.error_lines(log, limit=1) == ["RuntimeError: Engine core initialization failed. See root cause above."]
+    assert serve.error_lines("all fine\n") == []
+    assert serve.error_lines(None) == []
+
+
+def test_every_server_gets_the_fault_handler(monkeypatch):
+    monkeypatch.delenv("PYTHONFAULTHANDLER", raising=False)
+    assert serve.server_environment({})["PYTHONFAULTHANDLER"] == "1"  # the tiny gate and the smoke test
+    _, env = serve.build_command(make_variant(), SERVER_TP8, MODEL, SERVED_NAME)
+    assert env["PYTHONFAULTHANDLER"] == "1"

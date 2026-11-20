@@ -13,11 +13,21 @@ cast back to the input dtype at the end.
 Hidden states between layers have shape ``[..., HC*HS]`` with HS inner
 (HC outer, HS inner — checkpoint-native layout). Both 2-D
 ``[tokens, HC*HS]`` and 3-D ``[batch, seq, HC*HS]`` inputs are supported.
+
+With ``VLLM_HPU_HC_FUSED=1`` (default 0) the glue between and around the two
+GEMMs runs as fused TPC kernels instead (``flashinfer_gaudi.hc_fused``; see
+``docs/design/flash-next/hc-fused.md``): one op each for the norm, the silu
+(with the injection split), the gated mix and the combine. A layer whose
+kernels are not loaded, or whose input they do not take, logs one line and
+runs the torch code below, which is unchanged.
 """
+
+import importlib
 
 import torch
 from torch import nn
 
+from vllm.logger import init_logger
 from vllm.model_executor.layers.linear import (
     MergedColumnParallelLinear,
     ReplicatedLinear,
@@ -27,6 +37,18 @@ from vllm.models.qwen4_exp.common.hyperconnection import (
     GroupedGemmaRMSNorm,
     HyperConnectionConfig,
 )
+from vllm_gaudi import envs
+
+logger = init_logger(__name__)
+
+# The fused hyper-connection ops. Importing the module defines their schemas, so it is imported on a layer's
+# first call and only when that layer was built with VLLM_HPU_HC_FUSED=1.
+_HC_FUSED_OPS_MODULE = "flashinfer_gaudi.hc_fused"
+
+
+def _hc_fused_ops():
+    """The op module of the fused hyper-connection kernels (``flashinfer_gaudi.hc_fused``)."""
+    return importlib.import_module(_HC_FUSED_OPS_MODULE)
 
 
 # ---------------------------------------------------------------------------
@@ -166,6 +188,11 @@ class HpuGatedResidual(nn.Module):
         self.hc_count = config.hc_count
         self.hidden_size = config.hidden_size
         self.use_combine = use_combine
+        self.layer_name = prefix or type(self).__name__
+        # Fused hyper-connection kernels: the flag is read once, here. 1 = fused; anything else = torch.
+        self.hc_fused_requested = envs.VLLM_HPU_HC_FUSED == 1
+        self._hc_fused_ok: bool | None = None  # None = the once-per-layer check has not run yet
+        self._hc_fused_logged = False  # the layer's one "is off" line was written
 
         norm_size = (self.hyper_hidden_size if config.hc_per_branch_norm else config.hidden_size)
         group_size = config.hidden_size if config.hc_per_branch_norm else None
@@ -217,7 +244,154 @@ class HpuGatedResidual(nn.Module):
             return_bias=False,
         )
 
+    # -- fused kernels (VLLM_HPU_HC_FUSED=1) --------------------------------
+    def _hc_fused_log_off(self, reason: str) -> None:
+        """One line per layer, the first time it runs the torch path although the flag is on."""
+        if self._hc_fused_logged:
+            return
+        self._hc_fused_logged = True
+        logger.warning("HC fused (VLLM_HPU_HC_FUSED=1) is off for %s: %s; using the torch path", self.layer_name,
+                       reason)
+
+    def _hc_fused_layer_reason(self, device: torch.device) -> str | None:
+        """Why the fused kernels cannot serve this layer at all, or ``None``: what does not change per call.
+
+        The list is what the ops' validation callback and the kernel glue check (``hpu_hc_fused.cpp``,
+        ``hc_fused_gaudi2.cpp``): an input they refuse raises inside the op, so the layer checks first.
+        """
+        try:
+            ops = _hc_fused_ops()
+        except Exception as exc:  # noqa: BLE001 - whatever stops the import, this layer runs torch
+            return f"{_HC_FUSED_OPS_MODULE} cannot be imported ({type(exc).__name__}: {exc})"
+        missing = ops.hc_fused_missing_ops(device)
+        if missing:
+            # No HPU kernel means no extension, or no kernel database for its GUIDs (the loader registers
+            # the kernels only after the database is in GC_KERNEL_PATH).
+            return f"the hc_fused_ops extension is not loaded (no {device.type} kernel for {', '.join(missing)})"
+        if not 1 <= self.hc_count <= ops.MAX_STREAMS:
+            return f"hc_count {self.hc_count} is outside [1, {ops.MAX_STREAMS}]"
+        if self.hidden_size % ops.VECTOR_LANES != 0:
+            return f"hidden_size {self.hidden_size} is not a multiple of {ops.VECTOR_LANES} (one TPC vector)"
+        if self.lora_rank < 1:
+            return f"hc_lowrank {self.lora_rank} is below 1"
+        eps = float(self.config.rms_norm_eps)
+        if not ops.FP32_MIN_NORMAL <= eps <= ops.FP32_MAX:
+            return f"rms_norm_eps {eps!r} is not a positive normal fp32 value"
+        weight = self.hc_norm.weight
+        if (weight.dtype != torch.bfloat16 or weight.dim() != 1
+                or weight.numel() not in (self.hidden_size, self.hyper_hidden_size) or not weight.is_contiguous()):
+            return (f"hc_norm.weight is {weight.dtype} {tuple(weight.shape)}, the fused ops take a contiguous 1-D "
+                    f"bfloat16 weight of {self.hidden_size} or {self.hyper_hidden_size} elements")
+        down = "input_mix_weight_down_block_inject" if self.use_combine else "input_mix_weight_down"
+        for name in (down, "input_mix_weight_up"):
+            projection = getattr(getattr(self, name), "weight", None)
+            if projection is None or projection.dtype != torch.bfloat16:
+                found = "missing" if projection is None else str(projection.dtype)
+                return f"{name}.weight is {found}, the fused ops take the bfloat16 output of the GEMMs"
+        return None
+
+    def _hc_fused_call_reason(self, hidden_states: torch.Tensor, combine: bool, block_output,
+                              injection) -> str | None:
+        """Why the fused kernels cannot take this call's inputs, or ``None``.
+
+        Ranks, dtypes, sizes, memory layout and devices only: nothing here reads tensor data.
+        """
+        if hidden_states.dim() != 2:
+            return f"hidden states are {hidden_states.dim()}-D, the fused ops take [tokens, width]"
+        if hidden_states.dtype != torch.bfloat16:
+            return f"hidden states are {hidden_states.dtype}, the fused ops take bfloat16"
+        tokens = hidden_states.shape[0]
+        if tokens < 1 or hidden_states.shape[1] != self.hyper_hidden_size:
+            return (f"hidden states are {tuple(hidden_states.shape)}, the fused ops take "
+                    f"[tokens >= 1, {self.hyper_hidden_size}]")
+        if not hidden_states.is_contiguous():
+            return "hidden states are not contiguous"
+        device = hidden_states.device
+        if self.hc_norm.weight.device != device:
+            return f"hc_norm.weight is on {self.hc_norm.weight.device}, the hidden states on {device}"
+        if not combine:
+            return None
+        for name, tensor, columns in (("block output", block_output, self.hidden_size), ("injection", injection,
+                                                                                         self.hc_count)):
+            if not isinstance(tensor, torch.Tensor):
+                return f"the {name} is not a tensor"
+            if tensor.dtype != torch.bfloat16 or tuple(tensor.shape) != (tokens, columns):
+                return (f"the {name} is {tensor.dtype} {tuple(tensor.shape)}, the fused ops take bfloat16 "
+                        f"[{tokens}, {columns}]")
+            if not tensor.is_contiguous():
+                return f"the {name} is not contiguous"
+            if tensor.device != device:
+                return f"the {name} is on {tensor.device}, the hidden states on {device}"
+        return None
+
+    def _hc_fused(self, hidden_states: torch.Tensor, combine: bool = False, block_output=None, injection=None):
+        """The fused op module when this call runs the fused kernels, else ``None`` (the torch path).
+
+        The layer check runs once, on the layer's first call; the input check runs on every call. Either one
+        failing writes the layer's one log line.
+        """
+        if not self.hc_fused_requested:
+            return None
+        if self._hc_fused_ok is None:
+            reason = self._hc_fused_layer_reason(hidden_states.device)
+            self._hc_fused_ok = reason is None
+            if reason is not None:
+                self._hc_fused_log_off(reason)
+        if not self._hc_fused_ok:
+            return None
+        reason = self._hc_fused_call_reason(hidden_states, combine, block_output, injection)
+        if reason is not None:
+            self._hc_fused_log_off(reason)
+            return None
+        return _hc_fused_ops()
+
+    def _hc_fused_raised(self, exc: Exception) -> None:
+        """A fused op raised when it was called (it refused its inputs, or its extension is broken).
+
+        No op writes an input, so the caller runs the torch path on the same inputs; the layer stays on it.
+        """
+        self._hc_fused_ok = False
+        self._hc_fused_log_off(f"a fused op raised {type(exc).__name__}: {exc}")
+
+    def _hc_fused_mix_tail(self, ops, hidden_states: torch.Tensor,
+                           xn: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+        """GEMM, silu (and the injection split), GEMM, gated mix: the part ``mix`` and ``combine_and_mix`` share."""
+        if self.use_combine:
+            down_and_injection = self.input_mix_weight_down_block_inject(xn)  # GEMM 1 (matrix engine)
+            lora, injection = ops.hc_silu_split(down_and_injection, self.hc_count, self.lora_rank)
+        else:
+            lora = ops.hc_silu(self.input_mix_weight_down(xn), self.hc_count)
+            injection = None
+        gate = self.input_mix_weight_up(lora)  # GEMM 2 (matrix engine)
+        block_input = ops.hc_gate_mix(xn, gate, self.hc_count)
+        return hidden_states, block_input, injection
+
+    def _hc_fused_mix(self, ops,
+                      hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+        xn = ops.hc_norm(hidden_states, self.hc_norm.weight, self.config.rms_norm_eps, self.hc_count)
+        return self._hc_fused_mix_tail(ops, hidden_states, xn)
+
+    def _hc_fused_combine_and_mix(
+        self,
+        ops,
+        hidden_states: torch.Tensor,
+        prev_block_output: torch.Tensor,
+        prev_injection: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+        # One kernel: the combine, rounded to bf16, and the norm of the rounded result.
+        hidden_states, xn = ops.hc_combine_norm(hidden_states, prev_block_output, prev_injection, self.hc_norm.weight,
+                                                self.config.rms_norm_eps, self.hc_count)
+        return self._hc_fused_mix_tail(ops, hidden_states, xn)
+
+    # -- torch path (default), with the fused path in front of it ------------
     def mix(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+        ops = self._hc_fused(hidden_states)
+        if ops is not None:
+            try:
+                return self._hc_fused_mix(ops, hidden_states)
+            except Exception as exc:  # noqa: BLE001 - the torch path below takes over
+                self._hc_fused_raised(exc)
+
         xn = grouped_gemma_rmsnorm_torch(
             hidden_states,
             self.hc_norm.weight,
@@ -252,6 +426,13 @@ class HpuGatedResidual(nn.Module):
         block's mix. Its combine with ``block_output`` is fused with this
         module's input RMSNorm.
         """
+        ops = self._hc_fused(hidden_states, True, prev_block_output, prev_injection)
+        if ops is not None:
+            try:
+                return self._hc_fused_combine_and_mix(ops, hidden_states, prev_block_output, prev_injection)
+            except Exception as exc:  # noqa: BLE001 - the torch path below takes over
+                self._hc_fused_raised(exc)
+
         hidden_states, xn = hc_combine_norm_torch(
             hidden_states,
             prev_block_output,
@@ -282,6 +463,13 @@ class HpuGatedResidual(nn.Module):
         block_output: torch.Tensor,
         injection: torch.Tensor,
     ) -> torch.Tensor:
+        ops = self._hc_fused(hidden_states, True, block_output, injection)
+        if ops is not None:
+            try:
+                return ops.hc_combine(hidden_states, block_output, injection, self.hc_count)
+            except Exception as exc:  # noqa: BLE001 - the torch path below takes over
+                self._hc_fused_raised(exc)
+
         return hc_combine_torch(hidden_states, block_output, injection, self.hc_count)
 
     @property

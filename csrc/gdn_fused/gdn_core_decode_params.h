@@ -20,7 +20,12 @@ static_assert(sizeof(GdnRecurrentDecodeParams) == 4, "GDN recurrent-decode scala
 // Phase 2: the fused GDN step over the T = 1 + k nodes of a speculative verification step
 // (docs/design/flash-next/gdn-core-decode.md, "Phase 2 contract, version 2").
 inline constexpr const char* kGdnCoreVerifyGuid = "gdn_fused_core_verify_f32state_gaudi2";
-inline constexpr unsigned kGdnCoreVerifyMaxNodes = 8;  // T <= 8 (GDN_VERIFY_MAX_NODES in the kernel)
+// T <= 6 (T = 1 + k, so at most k = 5 draft tokens). The same number is GDN_VERIFY_MAX_NODES in
+// kernels/gdn_core_verify_gaudi2.c (the size of its per-node arrays in the 16 KiB of vector local memory),
+// GDN_CORE_VERIFY_MAX_NODES in flashinfer_gaudi/gdn_core_verify.py and MAX_NODES in
+// tests/unit_tests/gdn_core_decode/verify_sim_case.py; tests/unit_tests/gdn_core_decode/test_verify_limits.py
+// checks that they agree.
+inline constexpr unsigned kGdnCoreVerifyMaxNodes = 6;
 struct GdnCoreVerifyParams {
     float scale;
     float eps;

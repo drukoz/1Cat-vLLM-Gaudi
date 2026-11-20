@@ -9,6 +9,9 @@ from the accepted checkpoint at ``ssm_load``, node ``t``'s state is stored at ``
 Activations are token-major: node ``t`` of row ``r`` is row ``r * T + t``.  A row with an out-of-range slot, an
 offset outside ``[0, R - 3]`` or a query length below 1 is padding: zero outputs, no writes.  Nodes past a row's
 query length are masked: zero output, no state change, nothing stored, their conv input rows are stored as zeros.
+``T`` is at most ``GDN_CORE_VERIFY_MAX_NODES`` (6).  The reference (so the CPU kernel too) and the ``gdn_core_verify``
+wrapper raise ``ValueError`` for a larger ``T``; the HPU op and the host glue reject it as well, so it never reaches
+the Gaudi2 kernel.  The layer checks ``T`` first and takes the torch path.
 Contract: ``docs/design/flash-next/gdn-core-decode.md``, "Phase 2 contract, version 2".  This is an executable
 specification, not a fast path; imports on CPU with no Habana packages.
 
@@ -24,6 +27,14 @@ import torch
 
 from flashinfer_gaudi.gdn_core_decode import (_DISPATCH_KEYS_BY_DEVICE_TYPE, _LIBRARY, _require,
                                               gdn_core_decode_reference)
+
+
+# The largest T (= 1 + k draft tokens, so k <= 5) of ``gdn_core_verify``.  The Gaudi2 kernel keeps its per-node
+# vectors in fixed arrays in the 16 KiB of vector local memory a kernel with lookup-table functions has, sized for
+# this many nodes.  The same number: ``kGdnCoreVerifyMaxNodes`` (``csrc/gdn_fused/gdn_core_decode_params.h``),
+# ``GDN_VERIFY_MAX_NODES`` (``csrc/gdn_fused/kernels/gdn_core_verify_gaudi2.c``) and ``MAX_NODES``
+# (``tests/unit_tests/gdn_core_decode/verify_sim_case.py``).
+GDN_CORE_VERIFY_MAX_NODES = 6
 
 
 class GdnCoreVerifyMode(enum.IntEnum):
@@ -171,7 +182,7 @@ def gdn_core_verify_reference(
     _require(ssm_store_indices.dim() == 2 and ssm_store_indices.shape[0] == B,
              f"ssm_store_indices must be [B, T] = ({B}, T), got {tuple(ssm_store_indices.shape)}")
     T = ssm_store_indices.shape[1]
-    _require(T >= 1, f"T must be >= 1, got {T}")
+    _require(1 <= T <= GDN_CORE_VERIFY_MAX_NODES, f"T must be in [1, {GDN_CORE_VERIFY_MAX_NODES}], got {T}")
     _require(T + 2 <= R, f"T + 2 = {T + 2} must be <= conv_state rows R = {R}")
     _require(mixed_qkv.dim() == 2 and tuple(mixed_qkv.shape) == (B * T, C),
              f"mixed_qkv must be [B*T, C] = ({B * T}, {C}), got shape {tuple(mixed_qkv.shape)}")
@@ -300,8 +311,12 @@ def gdn_core_verify(
 
     Mutates ``conv_state`` and ``ssm_state`` in place, returns ``[B*T, HV, D]`` fp32; semantics are exactly
     ``gdn_core_verify_reference`` (contract: ``docs/design/flash-next/gdn-core-decode.md``, "Phase 2 contract,
-    version 2").
+    version 2").  ``T`` outside ``[1, GDN_CORE_VERIFY_MAX_NODES]`` raises ``ValueError`` here, on every device,
+    before the op is dispatched.
     """
+    if ssm_store_indices.dim() == 2:
+        T = ssm_store_indices.shape[1]
+        _require(1 <= T <= GDN_CORE_VERIFY_MAX_NODES, f"T must be in [1, {GDN_CORE_VERIFY_MAX_NODES}], got {T}")
     return torch.ops.flashinfer_gaudi.gdn_core_verify(conv_state, ssm_state, mixed_qkv, z, a, b, A_log, dt_bias,
                                                       conv_weight_t, norm_weight, row_indices, ssm_store_indices, scale,
                                                       eps, int(gate_activation))
