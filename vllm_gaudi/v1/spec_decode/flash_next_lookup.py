@@ -26,7 +26,9 @@ Pure host code, importable on CPU; the runner calls :meth:`HybridLookup.merge` f
 from __future__ import annotations
 
 import enum
+import json
 import logging
+import os
 from collections.abc import Sequence
 
 import numpy as np
@@ -110,18 +112,82 @@ def merge_drafts(mtp_drafts: list[list[int]], lookup_drafts: list[list[int]], k:
     return drafts, sources
 
 
+ORACLE_ENV = "VLLM_HPU_FLASH_NEXT_LOOKUP_ORACLE"
+
+
+class LookupOracle:
+    """Card rehearsal hook (``VLLM_HPU_FLASH_NEXT_LOOKUP_ORACLE=FILE``): lookup drafts from recorded streams.
+
+    A random tiny model never repeats its context, so on the tiny model neither the n-gram search nor the MTP
+    layer gets a draft accepted, and a rehearsal then runs rejections only: the commits of several tokens, the
+    widened steps after them and the block-completion commits stay untested until the real model. ``FILE`` holds
+    token streams recorded on the same server without speculation: ``{"streams": [[prompt + output ids], ...],
+    "schedule": [L, ...], "tamper_every": N}``. For a context that is a proper prefix of a recorded stream the
+    draft is the stream's next ``L`` tokens (``L = schedule[len(context) % len(schedule)]``, at most ``k``; ``0``
+    is no draft); when ``N > 0`` and ``len(context) % N == 0`` the draft's last token is replaced by another
+    token id, so that step rejects at a known depth. Any other context gets no draft. It replaces the n-gram
+    search of the ``ngram`` method and of the lookup beside MTP. Never set it on a production server.
+    """
+
+    def __init__(self, streams: Sequence[Sequence[int]], schedule: Sequence[int], tamper_every: int = 0) -> None:
+        if not schedule or min(int(n) for n in schedule) < 0:
+            raise ValueError(f"the oracle's schedule is a non-empty list of draft lengths, got {list(schedule)}")
+        self.streams = [np.asarray(stream, dtype=np.int32) for stream in streams]
+        self.schedule = [int(n) for n in schedule]
+        self.tamper_every = int(tamper_every)
+        self.drafts = 0
+        self.tampered = 0
+
+    @classmethod
+    def from_file(cls, path: str) -> "LookupOracle":
+        with open(path, encoding="utf-8") as f:
+            plan = json.load(f)
+        return cls(plan["streams"], plan.get("schedule") or [1 << 30], int(plan.get("tamper_every") or 0))
+
+    def draft(self, tokens: np.ndarray, k: int) -> list[int]:
+        """The draft for the context ``tokens`` (1-D ids: prompt + output so far): up to ``k`` tokens, or ``[]``."""
+        n = int(len(tokens))
+        length = min(int(k), self.schedule[n % len(self.schedule)])
+        if n == 0 or length <= 0:
+            return []
+        context = np.asarray(tokens, dtype=np.int32)
+        for stream in self.streams:
+            if len(stream) > n and stream[n - 1] == context[-1] and np.array_equal(stream[:n], context):
+                draft = [int(t) for t in stream[n:n + length]]
+                if self.tamper_every > 0 and n % self.tamper_every == 0:
+                    draft[-1] ^= 1  # another token id: the target's choice here is the stream's own token
+                    self.tampered += 1
+                self.drafts += 1
+                return draft
+        return []
+
+
+def lookup_oracle() -> LookupOracle | None:
+    """The rehearsal oracle named by ``VLLM_HPU_FLASH_NEXT_LOOKUP_ORACLE``, or None (the default: no file)."""
+    path = os.environ.get(ORACLE_ENV, "").strip()
+    if not path:
+        return None
+    oracle = LookupOracle.from_file(path)
+    logger.warning("Flash-Next lookup: REHEARSAL ORACLE %s (%d recorded streams, schedule %s, tamper every %d): "
+                   "drafts come from the file, not from the n-gram search", path, len(oracle.streams),
+                   oracle.schedule, oracle.tamper_every)
+    return oracle
+
+
 class HybridLookup:
     """The runner-side state of the hybrid: the n-gram sizes, the source of every request's last draft and the
     acceptance counters (logged every ``LOG_EVERY_STEPS`` steps)."""
 
     def __init__(self, k: int, min_ngram: int, max_ngram: int, max_model_len: int,
-                 default_mode: SpecLookupMode = SpecLookupMode.HYBRID) -> None:
+                 default_mode: SpecLookupMode = SpecLookupMode.HYBRID, oracle: LookupOracle | None = None) -> None:
         if not 1 <= min_ngram <= max_ngram:
             raise ValueError(f"lookup n-gram sizes need 1 <= min <= max, got {min_ngram}, {max_ngram}")
         self.k, self.min_ngram, self.max_ngram, self.max_model_len = int(k), int(min_ngram), int(max_ngram), int(
             max_model_len)
         self.default_mode = SpecLookupMode(default_mode)
+        self.oracle = oracle  # rehearsals only (LookupOracle): replaces the n-gram search
         self.last_source: dict[str, str] = {}
+        self.live: frozenset[str] = frozenset()  # the requests of the previous call (a disjoint set: a new load)
         self.steps = 0
         # per source: [rows drafted, drafts accepted, rows verified]
         self.counts = {"lookup": [0, 0, 0], "mtp": [0, 0, 0], "none": [0, 0, 0]}
@@ -131,7 +197,8 @@ class HybridLookup:
         from vllm_gaudi import envs as gaudi_envs
 
         return cls(k, int(gaudi_envs.VLLM_HPU_FLASH_NEXT_LOOKUP_MIN_NGRAM),
-                   int(gaudi_envs.VLLM_HPU_FLASH_NEXT_LOOKUP_MAX_NGRAM), max_model_len, lookup_mode())
+                   int(gaudi_envs.VLLM_HPU_FLASH_NEXT_LOOKUP_MAX_NGRAM), max_model_len, lookup_mode(),
+                   lookup_oracle())
 
     def observe(self, req_ids: Sequence[str], sampled_token_ids: Sequence[Sequence[int]]) -> None:
         """Credit the previous step's drafts: a request with ``n`` sampled tokens accepted ``n - 1`` drafts."""
@@ -152,6 +219,13 @@ class HybridLookup:
         chunk) gets no lookup either. ``extra_args[i]`` (the request's ``SamplingParams.extra_args``) may pick the
         row's mode (``REQUEST_KEY``); otherwise the server's default mode applies."""
         self.observe(req_ids, sampled_token_ids)
+        live = frozenset(req_ids)
+        if self.live and not (live & self.live):
+            # None of the previous step's requests is left: the counters of the load that just ended (a probe reads
+            # one line per round of requests; the last round's line comes with the next request).
+            logger.info("Flash-Next lookup hybrid: %s (after %d steps, a new set of requests)", self.summary(),
+                        self.steps)
+        self.live = live
         rows = len(mtp_drafts)
         aligned = rows == len(req_ids)
         lookup, eligible = [], []
@@ -161,8 +235,11 @@ class HybridLookup:
             if ok and request_mode(extra_args[i] if extra_args is not None and i < len(extra_args) else None,
                                    self.default_mode) != SpecLookupMode.OFF:
                 n = int(num_tokens_no_spec[i])
-                draft = find_lookup_draft(token_ids_cpu[i, :n], self.min_ngram, self.max_ngram, self.k,
-                                          self.max_model_len)
+                if self.oracle is not None:
+                    draft = self.oracle.draft(token_ids_cpu[i, :n], self.k)
+                else:
+                    draft = find_lookup_draft(token_ids_cpu[i, :n], self.min_ngram, self.max_ngram, self.k,
+                                              self.max_model_len)
             lookup.append(draft)
             eligible.append(ok)
         modes = [request_mode(extra_args[i] if extra_args is not None and i < len(extra_args) else None,

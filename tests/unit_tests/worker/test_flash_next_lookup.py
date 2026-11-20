@@ -155,3 +155,68 @@ def test_hybrid_merge_honours_per_request_modes():
                           [{REQUEST_KEY: 0}, None, {REQUEST_KEY: 2}])
     assert drafts == [[90, 91, 92], [7, 8, 9], [PAD_DRAFT] * K]
     assert hybrid.last_source == {"a": "mtp", "b": "lookup", "c": "none"}
+
+
+def test_a_new_set_of_requests_logs_the_counters_of_the_load_that_ended(caplog):
+    hybrid = HybridLookup(K, 2, 4, 4096)
+    rep = [1, 5, 6, 7, 8, 9, 2, 5, 6]
+    token_ids, num_tokens = np.stack([_row(rep)]), np.array([len(rep)], dtype=np.int32)
+    with caplog.at_level("INFO", logger="vllm_gaudi.v1.spec_decode.flash_next_lookup"):
+        hybrid.merge([[90, 91, 92]], ["a"], token_ids, num_tokens, [[6]], 1)
+        hybrid.merge([[90, 91, 92]], ["a"], token_ids, num_tokens, [[6, 7, 8]], 1)  # the lookup row accepted 2
+        assert not [r for r in caplog.records if "a new set of requests" in r.getMessage()]
+        hybrid.merge([[90, 91, 92]], ["b"], token_ids, num_tokens, [[6]], 1)  # "a" is gone: one line
+    lines = [r.getMessage() for r in caplog.records if "a new set of requests" in r.getMessage()]
+    assert len(lines) == 1 and "lookup rows 2, accepted 2 over 1 verified rows" in lines[0]
+    assert "after 2 steps" in lines[0]
+
+
+def test_oracle_drafts_the_recorded_continuation():
+    from vllm_gaudi.v1.spec_decode.flash_next_lookup import LookupOracle
+
+    stream = list(range(100, 120))
+    oracle = LookupOracle([stream, [7, 8, 9]], schedule=[3, 1, 0, 2], tamper_every=0)
+    # context length 5: schedule[5 % 4] = 1 token; length 6: none; length 7: 2; length 8: 3
+    assert oracle.draft(np.array(stream[:5], dtype=np.int32), K) == [105]
+    assert oracle.draft(np.array(stream[:6], dtype=np.int32), K) == []
+    assert oracle.draft(np.array(stream[:7], dtype=np.int32), K) == [107, 108]
+    assert oracle.draft(np.array(stream[:8], dtype=np.int32), K) == [108, 109, 110]
+    assert oracle.draft(np.array(stream[:8], dtype=np.int32), 2) == [108, 109]  # never more than k
+    # the end of a stream shortens the draft; a whole stream, an unknown context and an empty one draft nothing
+    assert oracle.draft(np.array(stream[:19], dtype=np.int32), K) == [119]
+    assert oracle.draft(np.array(stream, dtype=np.int32), K) == []
+    assert oracle.draft(np.array(stream[:7] + [1], dtype=np.int32), K) == []
+    assert oracle.draft(np.array([], dtype=np.int32), K) == []
+    assert oracle.drafts == 5
+
+
+def test_oracle_tampers_the_last_draft_token_on_schedule():
+    from vllm_gaudi.v1.spec_decode.flash_next_lookup import LookupOracle
+
+    stream = list(range(100, 140))
+    oracle = LookupOracle([stream], schedule=[3], tamper_every=4)
+    assert oracle.draft(np.array(stream[:7], dtype=np.int32), K) == [107, 108, 109]
+    tampered = oracle.draft(np.array(stream[:8], dtype=np.int32), K)
+    assert tampered[:2] == [108, 109] and tampered[2] != 110 and tampered[2] == 110 ^ 1
+    assert oracle.tampered == 1
+    with pytest.raises(ValueError):
+        LookupOracle([stream], schedule=[])
+
+
+def test_oracle_file_and_the_hybrid(monkeypatch, tmp_path):
+    from vllm_gaudi.v1.spec_decode.flash_next_lookup import ORACLE_ENV, lookup_oracle
+
+    monkeypatch.delenv(ORACLE_ENV, raising=False)
+    assert lookup_oracle() is None and HybridLookup.from_env(K, 4096).oracle is None
+    stream = list(range(200, 230))
+    path = tmp_path / "oracle.json"
+    path.write_text('{"streams": [%s], "schedule": [2], "tamper_every": 0}' % stream)
+    monkeypatch.setenv(ORACLE_ENV, str(path))
+    monkeypatch.setenv("VLLM_HPU_FLASH_NEXT_SPEC_LOOKUP", "1")
+    hybrid = HybridLookup.from_env(K, 4096)
+    assert hybrid.oracle is not None and hybrid.oracle.schedule == [2]
+    token_ids = np.stack([_row(stream[:9]), _row(list(range(9)))])
+    num_tokens = np.array([9, 9], dtype=np.int32)
+    drafts = hybrid.merge([[90, 91, 92], [93, 94, 95]], ["a", "b"], token_ids, num_tokens, [[208], [8]], 2)
+    # the recorded stream's next two tokens padded to k; the unknown context keeps MTP's draft (no n-gram search)
+    assert drafts == [[209, 210, PAD_DRAFT], [93, 94, 95]]

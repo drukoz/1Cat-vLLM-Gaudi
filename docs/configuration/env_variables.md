@@ -185,6 +185,16 @@ written as with MTP alone. The server logs the rows and accepted drafts of each
 source every 200 steps (`Flash-Next lookup hybrid: ...`). Any other value is
 `0`. Requires the `mtp` method; not yet run on a card.
 
+`VLLM_HPU_FLASH_NEXT_LOOKUP_ORACLE` is a rehearsal hook, empty by default: the
+path of a JSON file of token streams recorded without speculation
+(`{"streams": [[prompt + output ids], ...], "schedule": [L, ...],
+"tamper_every": N}`). The n-gram search of the `ngram` method and of the lookup
+beside MTP then drafts each recorded stream's own continuation (`L` tokens by
+the context length, every `N`-th context with a wrong last token), so drafts
+are accepted on the tiny model, which never repeats its context
+(`tools/flash_next/rental/lookup_tiny.py` runs it on a card). Never set it on a
+production server.
+
 `VLLM_HPU_RECURRENT_STATE_POOL` selects the allocation mode for the recurrent
 (GDN / short-conv) state slots as an integer. `0` (default) keeps today's
 allocation, one recurrent state slot per attention block id. `1` gives the

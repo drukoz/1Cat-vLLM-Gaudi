@@ -2326,6 +2326,13 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                 logger.info("Flash-Next speculation: lookup beside MTP on (default mode %s, n-gram %d..%d, k = %d)",
                             self._spec_lookup.default_mode.name, self._spec_lookup.min_ngram,
                             self._spec_lookup.max_ngram, self._spec_lookup.k)
+        # Card rehearsals on the tiny model (VLLM_HPU_FLASH_NEXT_LOOKUP_ORACLE): recorded streams answer for the
+        # n-gram search. None on every server that does not name a file.
+        self._lookup_oracle = None
+        if self.speculative_config is not None and self.speculative_config.method == "ngram":
+            from vllm_gaudi.v1.spec_decode.flash_next_lookup import lookup_oracle
+
+            self._lookup_oracle = lookup_oracle()
 
         # Keep in int64 to avoid overflow with long context
         self.max_num_reqs = self.scheduler_config.max_num_seqs
@@ -10323,6 +10330,14 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             self.input_batch.num_tokens_no_spec,
             self.input_batch.token_ids_cpu,
         )
+        oracle = getattr(self, "_lookup_oracle", None)
+        if oracle is not None:
+            # rehearsal: the recorded stream's continuation for every request that sampled this step
+            draft_token_ids = [
+                oracle.draft(self.input_batch.token_ids_cpu[i, :int(self.input_batch.num_tokens_no_spec[i])],
+                             num_speculative_tokens) if sampled else []
+                for i, sampled in enumerate(sampled_token_ids)
+            ]
         # swipe draft_token_ids_native replacing [] to [-1]
         for i in range(len(draft_token_ids)):
             if len(draft_token_ids[i]) == 0:

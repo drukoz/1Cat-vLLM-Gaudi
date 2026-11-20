@@ -542,6 +542,7 @@ if TYPE_CHECKING:
     VLLM_HPU_FLASH_NEXT_SPEC_LOOKUP: int = 0  # SpecLookupMode: 0 off (MTP drafts), 1 hybrid, 2 lookup only
     VLLM_HPU_FLASH_NEXT_LOOKUP_MIN_NGRAM: int = 3  # hybrid lookup: shortest suffix n-gram matched
     VLLM_HPU_FLASH_NEXT_LOOKUP_MAX_NGRAM: int = 8  # hybrid lookup: longest suffix n-gram matched
+    VLLM_HPU_FLASH_NEXT_LOOKUP_ORACLE: str = ""  # rehearsals only: a file of recorded streams answers the search
     VLLM_HPU_RECURRENT_STATE_POOL: int = 0  # RecurrentStatePoolMode: 0 off, 1 pool
     VLLM_HPU_RECURRENT_STATE_POOL_SLOTS: int = 0  # resolved by the hook; positive overrides the formula
     VLLM_HPU_RECURRENT_STATE_POOL_CACHE_SLOTS: int = 512  # retained prefix states added to the live need
@@ -1964,6 +1965,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     lambda: int(os.environ.get("VLLM_HPU_FLASH_NEXT_LOOKUP_MIN_NGRAM", "3")),
     "VLLM_HPU_FLASH_NEXT_LOOKUP_MAX_NGRAM":
     lambda: int(os.environ.get("VLLM_HPU_FLASH_NEXT_LOOKUP_MAX_NGRAM", "8")),
+    # Card rehearsals on the tiny model only (flash_next_lookup.LookupOracle): the path of a JSON file of token
+    # streams recorded without speculation; the n-gram search (the ngram method, and the lookup beside MTP) then
+    # drafts each stream's own continuation, so drafts are accepted on a model that never repeats its context.
+    # Empty (default) = no oracle. Never set on a production server.
+    "VLLM_HPU_FLASH_NEXT_LOOKUP_ORACLE":
+    lambda: os.environ.get("VLLM_HPU_FLASH_NEXT_LOOKUP_ORACLE", ""),
 
     # Recurrent (GDN / short-conv) state pool: 0 (default) keeps today's
     # one-recurrent-slot-per-attention-block-id allocation, 1 gives the
