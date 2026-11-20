@@ -19,9 +19,8 @@ SERVE = REPO_ROOT / "tools" / "flash_next" / "rental" / "lookup_serve.sh"
 
 
 def test_rounds_parse():
-    assert lp.parse_rounds("edit:32:384:0,prose:1:256:-, editl:8:512:2") == [("edit", 32, 384, 0),
-                                                                            ("prose", 1, 256, None),
-                                                                            ("editl", 8, 512, 2)]
+    assert lp.parse_rounds("edit:32:384:0,prose:1:256:-, editl:8:512:2,editf:8:1400:-") == [
+        ("edit", 32, 384, 0), ("prose", 1, 256, None), ("editl", 8, 512, 2), ("editf", 8, 1400, None)]
     for bad in ("edit:32:384", "poem:1:8:-", "edit:0:8:-", "edit:1:1:-", "edit:1:8:3", "edit:x:8:-"):
         with pytest.raises(ValueError):
             lp.parse_rounds(bad)
@@ -55,6 +54,10 @@ def test_request_body_has_no_min_tokens_and_carries_the_mode():
     assert body["temperature"] == 0 and body["stream"] is True and "vllm_xargs" not in body
     assert body["stream_options"] == {"include_usage": True, "continuous_usage_stats": True}
     assert lp.request_body("fn", "hello", 64, 2)["vllm_xargs"] == {"spec_lookup": 2}
+    whole = lp.request_body("fn", "hello", 64, None, ignore_eos=False)
+    assert whole["ignore_eos"] is False and whole["max_tokens"] == 64 and "min_tokens" not in whole
+    small = lp.load_files(str(REPO_ROOT), lp.SMALL_FILES)
+    assert lp.prompt_for("editf", 5, small) == lp.prompt_for("edit", 5, small)  # the same prompt, answered whole
 
 
 def test_request_body_is_a_valid_vllm_request():
@@ -176,18 +179,24 @@ def test_probe_end_to_end_against_a_fake_server(tmp_path, capsys):
     try:
         out = tmp_path / "probe.json"
         rc = lp.main(["--port", str(server.server_address[1]), "--out", str(out), "--label", "fake", "--rounds",
-                      "edit:3:8:0,edit:3:8:1,prose:1:6:-", "--tree", str(REPO_ROOT)])
+                      "edit:3:8:0,edit:3:8:1,prose:1:6:-,editf:2:120:-", "--tree", str(REPO_ROOT)])
     finally:
         server.shutdown()
     assert rc == 0
     record = json.loads(out.read_text())
     assert [(r["kind"], r["streams"], r["mode"], r["ok"]) for r in record["rounds"]] == [("edit", 3, 0, 3),
                                                                                        ("edit", 3, 1, 3),
-                                                                                       ("prose", 1, None, 1)]
+                                                                                       ("prose", 1, None, 1),
+                                                                                       ("editf", 2, None, 2)]
     first = record["rounds"][0]
     assert first["spec"]["drafts"] == 12 and first["spec"]["acceptance_length"] == pytest.approx(2.0)
     assert first["spec"]["position_rates"] == [1.0, 0.0] and first["step_sizes"] == {"2": 12}
-    assert len(record["warm"]) == 2 and "texts" not in record["warm"][0]  # one warm round per (kind, streams)
+    assert len(record["warm"]) == 3 and "texts" not in record["warm"][0]  # one warm round per (kind, streams)
+    # the warm round is as long as the round for edit and prose, 48 tokens for the whole-answer round
+    assert [w["tokens"] for w in record["warm"]] == [8, 6, 48]
+    whole = [b for b in _FakeServer.bodies if b["max_tokens"] == 120]
+    assert len(whole) == 2 and all(b["ignore_eos"] is False for b in whole)
+    assert all(b["ignore_eos"] is True for b in _FakeServer.bodies if b["max_tokens"] in (8, 6))
     assert all("min_tokens" not in b for b in _FakeServer.bodies)
     assert [b.get("vllm_xargs") for b in _FakeServer.bodies if b["messages"][0]["content"].startswith("Stream")] == [
         None, None]

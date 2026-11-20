@@ -17,6 +17,8 @@ commit, decode the same contexts and their texts can be compared token for token
          (VLLM_HPU_MTP_CHUNK_KV=0); under 1,024 tokens an MTP server prefills the prompt in one chunk.
   editl  the same with a file of 3,000 to 3,600 tokens (longer copy spans; on an MTP server most of the prompt is in
          chunks the drafter did not see).
+  editf  the edit prompts again, answered to the model's own end (no ignore_eos; TOKENS is only the cap): whole
+         answers, for replaying lookup drafters over what the model really wrote (tools/flash_next/lookup_replay.py).
   prose  a story request with a distinct opening per stream (nothing to copy).
 
 A round may carry a per-request lookup mode for a server with VLLM_HPU_FLASH_NEXT_SPEC_LOOKUP (vllm_xargs
@@ -30,7 +32,8 @@ chunk per step); effective ms per token over the decode span (compile pauses inc
 Usage:
   lookup_probe.py --port P --out OUT.json --label L --rounds edit:32:384:0,edit:32:384:1,prose:32:256:-
       round = KIND:STREAMS:TOKENS:MODE (MODE '-' sends no vllm_xargs). Before the first round of each
-      (KIND, STREAMS) a warm round of the same length runs (--warm-tokens N shortens it, 0 skips it).
+      (KIND, STREAMS) a warm round runs: as long as the round for edit and prose, 48 tokens for editl and editf
+      (--warm-tokens N sets one length for all, 0 skips it).
   lookup_probe.py --compare A.json B.json ...   compare the texts of several probe files
   lookup_probe.py --list-prompts                the prompts' files and character counts
 Standard library only (Python 3.10).
@@ -78,7 +81,9 @@ LARGE_FILES = [
     "vllm_gaudi/models/llama4.py",
     "vllm_gaudi/utils.py",
 ]
-KINDS = ("edit", "editl", "prose")
+KINDS = ("edit", "editl", "editf", "prose")
+FULL_WARM = ("edit", "prose")  # kinds whose warm round is as long as the round (the others: SHORT_WARM tokens)
+SHORT_WARM = 48
 TREE = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 
@@ -95,7 +100,7 @@ def load_files(tree: str, paths: list[str]) -> list[tuple[str, str]]:
 
 def prompt_for(kind: str, i: int, files: list[tuple[str, str]]) -> str:
     """The prompt of stream ``i`` of a round of ``kind`` (``files``: the kind's files; unused for prose)."""
-    if kind in ("edit", "editl"):
+    if kind in ("edit", "editl", "editf"):
         if not files:
             raise ValueError(f"no file for the {kind} prompts")
         rel, text = files[i % len(files)]
@@ -126,10 +131,11 @@ def parse_rounds(text: str) -> list[tuple[str, int, int, int | None]]:
     return rounds
 
 
-def request_body(model: str, prompt: str, ntok: int, mode: int | None) -> dict:
-    """The chat completion request of one stream. No ``min_tokens`` (see the module docstring)."""
+def request_body(model: str, prompt: str, ntok: int, mode: int | None, ignore_eos: bool = True) -> dict:
+    """The chat completion request of one stream. No ``min_tokens`` (see the module docstring); ``ignore_eos``
+    False lets the answer end where the model ends it (``ntok`` is then only the cap)."""
     body = {"model": model, "messages": [{"role": "user", "content": prompt}], "max_tokens": ntok,
-            "ignore_eos": True, "temperature": 0, "stream": True,
+            "ignore_eos": bool(ignore_eos), "temperature": 0, "stream": True,
             "stream_options": {"include_usage": True, "continuous_usage_stats": True},
             "chat_template_kwargs": {"enable_thinking": False}}
     if mode is not None:
@@ -257,7 +263,8 @@ def run_round(args, kind: str, n: int, ntok: int, mode: int | None, files: dict)
     before = read_counters(args.host, args.port)
     out = [None] * n
     barrier = threading.Barrier(n)
-    threads = [threading.Thread(target=one_stream, args=(args, request_body(args.model, prompts[i], ntok, mode), out,
+    threads = [threading.Thread(target=one_stream, args=(args, request_body(args.model, prompts[i], ntok, mode,
+                                                                           ignore_eos=kind != "editf"), out,
                                                          i, barrier), daemon=True) for i in range(n)]
     t_start = time.perf_counter()
     for t in threads:
@@ -330,7 +337,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--rounds", default="")
     ap.add_argument("--warm-tokens", type=int, default=-1,
                     help="tokens of the warm round before the first round of each (kind, streams): -1 (default) the "
-                    "round's own length, 0 no warm round")
+                    "round's own length for edit and prose and 48 for editl and editf, 0 no warm round")
     ap.add_argument("--timeout", type=float, default=900.0)
     ap.add_argument("--label", default="")
     ap.add_argument("--tree", default=TREE, help="the repository tree whose files the edit prompts hold")
@@ -346,6 +353,7 @@ def main(argv: list[str] | None = None) -> int:
         print("\n".join(compare_texts(runs)))
         return 0
     files = {"edit": load_files(args.tree, SMALL_FILES), "editl": load_files(args.tree, LARGE_FILES)}
+    files["editf"] = files["edit"]
     if args.list_prompts:
         for kind in KINDS:
             for i in range(len(files.get(kind) or [0])):
@@ -373,7 +381,10 @@ def main(argv: list[str] | None = None) -> int:
     failed = 0
     for kind, n, ntok, mode in rounds:
         if args.warm_tokens != 0 and (kind, n) not in warmed:
-            warm_tokens = ntok if args.warm_tokens < 0 else args.warm_tokens
+            if args.warm_tokens >= 0:
+                warm_tokens = args.warm_tokens
+            else:
+                warm_tokens = ntok if kind in FULL_WARM else min(ntok, SHORT_WARM)
             w = run_round(args, kind, n, warm_tokens, mode, files)
             warmed.add((kind, n))
             print(round_line(args.label, "warm", w), flush=True)
