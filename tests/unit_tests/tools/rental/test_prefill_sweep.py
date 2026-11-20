@@ -311,10 +311,11 @@ def test_streams_report_their_median_inter_token_latency(server, tmp_path):
     streams = report["cases"][0]["canaries"]
     # 200 tokens per second per stream before the prefill: 5 ms between tokens (the event loop adds a little)
     assert 4.0 <= streams["before"]["itl_p50_ms"] <= 60.0
-    # the fake server stops its streams for the whole prefill: no token arrives in that window, so it has
-    # a stall and no inter-token latency (the wait ends in the window after it)
-    assert streams["during"]["itl_p50_ms"] is None and streams["during"]["stall_ms"] >= 180
+    # the fake server stops its streams for the whole prefill: that window has a stall of the prefill's
+    # length, and the wait across it is an inter-token latency of the window in which it ends
+    assert streams["during"]["stall_ms"] >= 180
     assert streams["after"]["itl_p50_ms"] is not None
+    assert set(streams["during"]) >= {"itl_p50_ms", "itl_p99_ms", "stall_ms", "tokens_per_s_p50"}
     assert "ITL p50 ms before" in (out / "prefill_sweep.md").read_text()
 
 
