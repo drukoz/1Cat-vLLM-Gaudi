@@ -268,3 +268,31 @@ def test_k3_verification_tokens_and_logits_match_the_dense_buffers(tiny_checkpoi
     dense = _serve(tiny_checkpoint, reference, 0, spec_k=3)
     assert dense[2].query_widths.count(4) >= 4, f"too few k = 3 verification steps: {dense[2].query_widths}"
     _assert_same_run(dense, _serve(tiny_checkpoint, reference, 1, spec_k=3))
+
+
+@pytest.mark.parametrize("state_width,with_offsets", [(1, False), (1, True), (4, False)])
+def test_vectorized_state_indices_are_prepare_mamba_state_idxs(state_width, with_offsets):
+    """The decode builder's state slots under the flag (``prepare_mamba_state_idxs_vectorized``) against the
+    per-request loop: compact GDN groups, a block-table group, padding rows, checkpoint offsets."""
+    from vllm_gaudi.v1.worker.hpu_model_runner import HPUModelRunner
+
+    rng = np.random.default_rng(6)
+    tables = [torch.from_numpy(rng.integers(0, 900, size=(10, 40), dtype=np.int32)) for _ in range(4)]
+    runner = object.__new__(HPUModelRunner)
+    class _Tables:  # the input batch's MultiGroupBlockTable: .block_tables and [group]
+        block_tables = tables
+
+        def __getitem__(self, group):
+            return SimpleNamespace(get_cpu_tensor=lambda: tables[group])
+
+    runner.input_batch = SimpleNamespace(req_ids=[f"q{i}" for i in range(10)], block_table=_Tables())
+    runner._compact_gdn_group_ids = {0, 2, 3}
+    runner._compact_gdn_group_offset = {0: 0, 2: 1, 3: 2}
+    runner._gdn_req_to_base_slot = {f"q{i}": int(s) for i, s in enumerate(rng.permutation(10))}
+    runner._gdn_max_reqs, runner._gdn_state_slots_per_req, runner._MAMBA_PAD_BLOCK_ID = 12, 4, 901
+    req_indices = [3, 0, 7, 5, 9]
+    offsets = rng.integers(0, 40, size=len(req_indices))
+    checkpoint = [0, 5, 2, -1, 3] if with_offsets else None
+    want = HPUModelRunner.prepare_mamba_state_idxs(runner, req_indices, offsets, 8, state_width, checkpoint)
+    got = HPUModelRunner.prepare_mamba_state_idxs_vectorized(runner, req_indices, offsets, 8, state_width, checkpoint)
+    assert got.dtype == want.dtype == torch.int32 and torch.equal(got, want)

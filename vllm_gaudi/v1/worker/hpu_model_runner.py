@@ -40,8 +40,8 @@ from vllm_gaudi.v1.worker.hpu_dp_utils import set_hpu_dp_metadata
 from vllm_gaudi.v1.worker.gdn_state_layout import has_contiguous_dflash_checkpoints
 from vllm_gaudi.v1.worker.flash_next_inputs import (build_block_table, build_ple_inputs, dummy_ple_inputs,
                                                     model_requires_block_table, model_requires_raw_input_tokens)
-from vllm_gaudi.v1.worker.flash_next_decode_metadata import (fill_pad_slots, request_block_table,
-                                                             sparse_decode_metadata_refusal)
+from vllm_gaudi.v1.worker.flash_next_decode_metadata import (compact_state_indices, fill_pad_slots,
+                                                             request_block_table, sparse_decode_metadata_refusal)
 from vllm_gaudi.v1.sample.fused_greedy import STOP_ID_WIDTH, mask_stop_tokens, min_tokens_stop_ids
 from vllm_gaudi.v1.worker.recurrent_commit import (apply_align_precopy, boundary_commits, commit_conv, commit_ssm,
                                                    self_commit_requests)
@@ -2551,6 +2551,43 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
 
         state_indices = torch.stack(all_state_indices_cpu, dim=0)
         return state_indices.squeeze(-1) if state_width == 1 else state_indices
+
+    def prepare_mamba_state_idxs_vectorized(
+        self,
+        req_indices,
+        block_table_offsets,
+        target_bs,
+        state_width=1,
+        checkpoint_offsets=None,
+    ):
+        """``prepare_mamba_state_idxs`` without its per-request loop (``compact_state_indices``): the same int32
+        tensor. Used by decode steps under VLLM_HPU_FLASH_NEXT_DECODE_METADATA=1."""
+        num_indices = len(req_indices)
+        if checkpoint_offsets is not None:
+            if state_width != 1:
+                raise ValueError("checkpoint_offsets are valid only for scalar state indices")
+            if len(checkpoint_offsets) != num_indices:
+                raise ValueError("checkpoint_offsets must contain one entry per request")
+        num_groups = len(self.input_batch.block_table.block_tables)
+        state_indices = np.empty((num_groups, target_bs, state_width), dtype=np.int32)
+        base_slots = None
+        for group_idx in range(num_groups):
+            compact = group_idx in self._compact_gdn_group_ids
+            if compact:
+                if base_slots is None:
+                    req_ids = self.input_batch.req_ids
+                    base_slots = np.fromiter((self._gdn_req_to_base_slot[req_ids[i]] for i in req_indices),
+                                             dtype=np.int64,
+                                             count=num_indices)
+                state_indices[group_idx, :num_indices] = compact_state_indices(
+                    base_slots, self._compact_gdn_group_offset[group_idx], self._gdn_max_reqs,
+                    self._gdn_state_slots_per_req, state_width, checkpoint_offsets)
+            else:
+                table = self.input_batch.block_table[group_idx].get_cpu_tensor().numpy()
+                state_indices[group_idx, :num_indices] = table[req_indices, block_table_offsets].reshape(-1, 1)
+            state_indices[group_idx, num_indices:] = -1 if compact else self._MAMBA_PAD_BLOCK_ID
+        result = torch.from_numpy(state_indices)
+        return result.squeeze(-1) if state_width == 1 else result
 
     def _build_recurrent_commit_registry(self, kv_caches: dict) -> dict:
         """Map recurrent cache groups to ``(state tensor, kind, window rows)`` for boundary commits (M3-T10b).
@@ -5179,6 +5216,8 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
 
         if self.num_mamba_like_layers > 0:
             mamba_block_size = self.cache_config.mamba_block_size
+            prepare_state_idxs = (self.prepare_mamba_state_idxs_vectorized if sparse_md else
+                                  self.prepare_mamba_state_idxs)
             (block_idx_last_computed_token_cpu,
              block_idx_first_scheduled_token_cpu,
              block_idx_last_scheduled_token_cpu) = \
@@ -5223,9 +5262,9 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                 # Loading row[(ctx-1)//bs] at a block-aligned ctx let PLE overwrite the committed checkpoint.
                 load_blocks = (block_idx_last_scheduled_token_cpu if is_recurrent_spec_decode and not is_spec_batch
                                else block_idx_last_computed_token_cpu)
-                load_state_indices_cpu = self.prepare_mamba_state_idxs(req_indices, load_blocks, padded_batch_size,
+                load_state_indices_cpu = prepare_state_idxs(req_indices, load_blocks, padded_batch_size,
                                                                        state_width, load_offsets)
-                store_state_indices_cpu = self.prepare_mamba_state_idxs(req_indices, block_idx_last_scheduled_token_cpu,
+                store_state_indices_cpu = prepare_state_idxs(req_indices, block_idx_last_scheduled_token_cpu,
                                                                         padded_batch_size, state_width)
                 if is_spec_batch:
                     # Align mode (M3-T10b, T10c): one lattice row[curr : curr + 1 + k],
@@ -5263,14 +5302,14 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                                           list(context_lens)[:num_decodes], num_decodes, mamba_block_size)
             else:
                 zeros = [0] * len(req_indices)
-                load_state_indices_cpu = self.prepare_mamba_state_idxs(
+                load_state_indices_cpu = prepare_state_idxs(
                     req_indices,
                     zeros,
                     padded_batch_size,
                     state_width,
                     load_offsets,
                 )
-                store_state_indices_cpu = self.prepare_mamba_state_idxs(
+                store_state_indices_cpu = prepare_state_idxs(
                     req_indices,
                     zeros,
                     padded_batch_size,

@@ -129,6 +129,22 @@ def draft_step_block_table_and_slots(block_table_cpu: TensorLike, positions: tor
     return table, slot_mapping.to(torch.int64)
 
 
+def compact_state_indices(base_slots: np.ndarray, group_offset: int, max_reqs: int, slots_per_req: int,
+                          state_width: int, checkpoint_offsets: Optional[Sequence[int]] = None) -> np.ndarray:
+    """int32 ``[len(base_slots), state_width]`` compact-GDN state slots of one cache group: the vectorised loop
+    body of ``HPUModelRunner.prepare_mamba_state_idxs``.
+
+    A request's first slot is ``(group_offset * max_reqs + base_slot) * slots_per_req + 1``; row ``i`` holds that
+    slot plus ``0 .. state_width - 1``, or (with ``checkpoint_offsets``, ``state_width == 1``) plus its offset
+    clamped to ``[0, slots_per_req - 1]``.
+    """
+    first = (int(group_offset) * int(max_reqs) + np.asarray(base_slots, dtype=np.int64)) * int(slots_per_req) + 1
+    if checkpoint_offsets is None:
+        return (first[:, None] + np.arange(int(state_width), dtype=np.int64)[None, :]).astype(np.int32)
+    offsets = np.clip(np.asarray(checkpoint_offsets, dtype=np.int64), 0, int(slots_per_req) - 1)
+    return (first + offsets)[:, None].astype(np.int32)
+
+
 def sparse_decode_metadata_refusal(*, flag: int, needs_block_table: bool, qsa_sparse: bool, framework_layout: bool,
                                    sliding_window: bool, chunked_attention: bool, defragmenter_enabled: bool,
                                    speculative_method: Optional[str], dense_qsa_layers: int) -> Optional[str]:
@@ -153,6 +169,7 @@ def sparse_decode_metadata_refusal(*, flag: int, needs_block_table: bool, qsa_sp
 
 
 __all__ = [
+    "compact_state_indices",
     "draft_step_block_table_and_slots",
     "fill_pad_slots",
     "request_block_table",
