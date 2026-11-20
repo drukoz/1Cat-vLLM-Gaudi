@@ -22,6 +22,8 @@ lazy process (``PT_HPU_LAZY_MODE=1``, ``PT_HPU_ENABLE_LAZY_COLLECTIVES=true``, `
 * ``replay_seg``    the replayed body cut where each all-reduce would be, without the all-reduces: the recipe
                     launches of a step with collectives, alone (one launch = (replay_seg - replay) / 2L without
                     collectives; one collective alone = (replay with - replay_seg) / 2L)
+* ``replay_ag``     the replayed body with every all-reduce written as an all-gather and a local sum (one HCL
+                    operation instead of the reduce-scatter and all-gather pair of an all-reduce)
 * ``*_cache``       the same regime wrapped with ``disable_tensor_cache=False`` (the runner passes True): the
                     captured tensors keep their device memory between replays
 * ``*_busy``        the same regime behind one long device operation (``--busy-n``, ``--busy-k``: k products of
@@ -74,7 +76,7 @@ EXIT_GRACE_S = 20.0
 LAZY_REGIMES = ("lazy", "lazy_layer", "lazy_coll", "replay", "replay_layer", "replay_coll", "graph_raw",
                 "replay_async", "replay_meta", "replay_tail", "replay_async_tail", "replay_par2", "replay_fused2",
                 "replay_coalesce", "replay_seg", "replay_cache", "replay_seg_cache", "replay_layer_cache",
-                "replay_busy", "replay_layer_busy", "replay_seg_busy")
+                "replay_busy", "replay_layer_busy", "replay_seg_busy", "replay_ag", "replay_ag_busy")
 # Regimes that only exist without the collectives (a cut at every collective position and no collective).
 NO_COLLECTIVE_REGIMES = ("replay_seg", "replay_seg_cache", "replay_seg_busy")
 CACHE_SUFFIX = "_cache"
@@ -97,7 +99,8 @@ PAIR_REGIMES = {"replay_par2": "par2", "replay_fused2": "fused2", "replay_coales
 # derive(): each of these against its reference regime, with the collectives.
 COMPARE_WITH = {"graph_raw": "replay", "replay_async": "replay", "replay_meta": "replay",
                 "replay_async_tail": "replay_tail", "replay_fused2": "replay_par2", "replay_coalesce": "replay_par2",
-                "replay_cache": "replay", "replay_layer_cache": "replay_layer"}
+                "replay_cache": "replay", "replay_layer_cache": "replay_layer", "replay_ag": "replay",
+                "replay_ag_busy": "replay_busy"}
 # An environment set's run of a regime is recorded as "<regime>@<set name>" and compared with the regime itself.
 ENV_SEPARATOR = "@"
 # The sampler stand-in after a replay in the *_tail regimes: lazy ops on [rows, TAIL_COLS] of the output.
@@ -339,6 +342,16 @@ class Rank:
             self.dist.all_reduce(tensor, group=self.group)
         return tensor
 
+    def gather_sum_reduce(self, tensor):
+        """The all-reduce as an all-gather of every rank's tensor and a sum on the device: the same value."""
+        if self.group is None:
+            return tensor
+        torch = self.torch
+        rows = tensor.shape[0]
+        out = torch.empty((self.world * rows, ) + tuple(tensor.shape[1:]), dtype=tensor.dtype, device=tensor.device)
+        self.dist.all_gather_into_tensor(out, tensor, group=self.group)
+        return out.view((self.world, rows) + tuple(tensor.shape[1:])).sum(0)
+
     def functional_reduce(self):
         import torch.distributed._functional_collectives as funcol
         group = self.group
@@ -465,6 +478,8 @@ class Rank:
         # "<regime>_cache": the same regime with the wrapper's tensor cache on (disable_tensor_cache=False).
         shape, cache_suffix, busy_suffix = split_regime(regime)
         tensor_cache = bool(cache_suffix)
+        if collectives and shape == "replay_ag":
+            reduce = self.gather_sum_reduce
         cut = self.mark_step if shape.endswith(("_layer", "_coll")) else None
         cut_coll = self.mark_step if shape.endswith("_coll") else None
         cut_seg = self.mark_step if shape.endswith("_seg") else None

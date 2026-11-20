@@ -269,3 +269,18 @@ def test_derive_gives_the_device_floor_behind_a_long_operation():
     assert lines[("replay_seg_busy", 1)]["collective_alone_ms_each"] == pytest.approx(0.05)
     assert lines[("replay_seg_busy", 1)]["call_without_ms"] == pytest.approx(8.0)
     assert lines[("replay_layer_busy", 1)]["cut_ms_each_without_collectives"] == pytest.approx(0.03)
+
+
+def test_gather_sum_reduce_gives_the_all_reduce_value():
+    class FakeDist:
+
+        @staticmethod
+        def all_gather_into_tensor(out, tensor, group=None):
+            out.copy_(torch.cat([tensor * (k + 1) for k in range(4)], 0))  # rank k holds (k + 1) x tensor
+
+    rank = bench.Rank.__new__(bench.Rank)
+    rank.torch, rank.dist, rank.world, rank.group = torch, FakeDist, 4, object()
+    x = torch.randn(3, 8)
+    assert torch.allclose(rank.gather_sum_reduce(x), x * 10)
+    rank.group = None  # one rank alone: the identity
+    assert rank.gather_sum_reduce(x) is x
