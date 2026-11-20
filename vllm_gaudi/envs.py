@@ -1996,9 +1996,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Collective cuts of a tensor-parallel Flash-Next step (docs/design/flash-next/collectives.md). All default 0.
     # VLLM_HPU_VOCAB_PARALLEL_LOGITS: 0 = every consumer gets the all-gathered logits; 1 = arg-max consumers
     # (plain greedy decode, MTP drafts, greedy MTP verification) reduce each rank's vocabulary shard first and
-    # gather [rows, 2] fp32 per rank; 2 = 1, and callers of vocab_parallel.top_k get the per-rank top
-    # candidates gathered instead of the logits (no serving path calls it yet: the building block of sampled
-    # verification). Any other value is 0. Not yet run on a card.
+    # gather [rows, 2] fp32 per rank; 2 = 1, and vocab_parallel.top_k (the call of a sampler stage that draws
+    # from candidates, and of sampled verification) gathers each rank's k largest logits with their ids instead
+    # of the logits. Any other value is 0. Not yet run on a card.
     "VLLM_HPU_VOCAB_PARALLEL_LOGITS":
     lambda: int(os.environ.get("VLLM_HPU_VOCAB_PARALLEL_LOGITS", "0")),
     # VLLM_HPU_REPLICATED_EMBEDDING=1: every rank holds the whole token embedding of a Flash-Next model
