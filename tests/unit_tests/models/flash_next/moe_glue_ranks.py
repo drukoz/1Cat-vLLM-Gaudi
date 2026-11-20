@@ -34,7 +34,9 @@ def moe_rank(rank: int, ckpt_dir: str, tp: int, expert_parallel: bool, flag: str
     all-reduce) as float32 arrays of the bf16 values, the collectives, the expert range of this rank, what
     the vendor op was given, the glue state of every block and every warning line of the MoE module.
     """
-    os.environ["VLLM_HPU_MOE_GLUE"] = flag
+    # "1m": VLLM_HPU_MOE_GLUE=1 with the shared expert's gate_up GEMM merged into the gate GEMM.
+    os.environ["VLLM_HPU_MOE_GLUE"] = flag.removesuffix("m")
+    os.environ["VLLM_HPU_MOE_GLUE_MERGE_GATE_UP"] = "1" if flag.endswith("m") else "0"
 
     from tests.unit_tests.models.flash_next import moe_block
 
@@ -110,5 +112,8 @@ def moe_rank(rank: int, ckpt_dir: str, tp: int, expert_parallel: bool, flag: str
         "glue_ops": sorted({name for name in recorder.names if name.startswith("flashinfer_gaudi.moe_")}),
         "glue_ok": [None if state is None else state.ok for state in states],
         "merged_gate_shape": None if states[0] is None else tuple(runner._hpu_moe_glue_gate_weight.shape),
+        "merged_gate_up_shape": (tuple(runner._hpu_moe_glue_gate_up_weight.shape)
+                                 if hasattr(runner, "_hpu_moe_glue_gate_up_weight") else None),
+        "gate_up_first_column": [None if state is None else state.gate_up_first_column for state in states],
         "lines": lines,
     }

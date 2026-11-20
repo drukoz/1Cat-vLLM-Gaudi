@@ -45,6 +45,12 @@ def fused(tiny_tp8_checkpoint) -> list:
     return _ranks(tiny_tp8_checkpoint, TP, True, "1")
 
 
+@pytest.fixture(scope="module")
+def merged(tiny_tp8_checkpoint) -> list:
+    """VLLM_HPU_MOE_GLUE=1 with VLLM_HPU_MOE_GLUE_MERGE_GATE_UP=1."""
+    return _ranks(tiny_tp8_checkpoint, TP, True, "1m")
+
+
 def test_layout_is_tp8_with_expert_parallelism(plain):
     """Rank r holds experts 2r and 2r + 1 whole; the shared expert is sharded; every rank routes all 16."""
     for rank, result in enumerate(plain):
@@ -103,3 +109,17 @@ def test_tp8_without_expert_parallelism_falls_back_or_matches(tiny_tp8_checkpoin
         for line in fused[rank]["lines"]:
             assert line.startswith(OFF_LINE) and line.endswith("; using the torch path")
         assert all(ok is True for ok in fused[rank]["glue_ok"]) or len(fused[rank]["lines"]) == 4
+
+
+def test_merged_gate_up_equals_flag_off_bit_for_bit_on_every_rank(plain, merged):
+    """The gate_up rows are TP-sharded: each rank appends its own shard to the replicated gate rows."""
+    for rank, result in enumerate(merged):
+        assert result["lines"] == [], f"rank {rank}: {result['lines']}"
+        assert result["glue_ok"] == [True] * 4 and result["gate_up_first_column"] == [16 + 1] * 4
+        assert result["merged_gate_shape"] == (16 + 1, 128)
+        assert result["merged_gate_up_shape"] == (16 + 1 + 2 * 64 // TP, 128)  # this rank's gate and up rows
+        np.testing.assert_array_equal(result["hidden"], plain[rank]["hidden"], err_msg=f"rank {rank} hidden")
+        np.testing.assert_array_equal(result["block_out"], plain[rank]["block_out"], err_msg=f"rank {rank} blocks")
+        assert result["collectives"] == plain[rank]["collectives"]
+        assert result["vendor_calls"] == plain[rank]["vendor_calls"]
+    assert plain[0]["merged_gate_up_shape"] is None
