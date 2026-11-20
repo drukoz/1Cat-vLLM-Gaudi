@@ -150,6 +150,31 @@ def test_dynamic_quant_takes_the_copied_branch_by_default_and_returns_its_bits(m
     assert calls[-1][0] == BF16 and calls[-1][1] == (5, 1) and calls[-1][2] == (False, False, torch.float8_e4m3fn)
 
 
+def test_dynamic_quant_with_the_cards_division_is_the_kernel_oracle(monkeypatch):
+    """What moe_row_quant replaces on a card: the plugin's own dynamic_quant with the card's scalar division.
+
+    A Gaudi2 card computes ``bf16_tensor / FP8_MAX`` as a product with ``bf16(1 / FP8_MAX)``
+    (``hpu_arithmetic.py``, first card run 2026-11-20), so the scales of the plugin's function on a card are
+    not CPU torch's.  The kernel's oracle is the card's.
+    """
+    from tests.unit_tests.hc_fused import hpu_arithmetic
+    from tests.unit_tests.hc_fused.moe_case import case_by_name, make_inputs
+
+    fp8_max = moe_reference.GAUDI2_FP8_MAX
+    monkeypatch.setattr(plugin_ops, "FP8_MAX", fp8_max)
+    monkeypatch.setattr(torch.ops.hpu, "cast_to_fp8_v2",
+                        lambda data, scale_inv, *rest: moe_reference.cast_to_fp8_reference(data, scale_inv, fp8_max),
+                        raising=False)
+    for name in ("row_quant_real_r32", "row_quant_real_stress", "row_quant_real_edge"):
+        x = make_inputs(case_by_name(name))["x"]
+        with hpu_arithmetic.card_arithmetic():
+            card_fp8, card_scale = plugin_ops.dynamic_quant(x)
+        want_fp8, want_scale = moe_reference.moe_row_quant_reference(x, fp8_max)
+        differs = int((card_scale != want_scale).sum())
+        assert differs == 0, f"{name}: {differs} of {want_scale.numel()} scales of the oracle are not the card's"
+        assert torch.equal(card_fp8.view(torch.uint8), want_fp8.view(torch.uint8)), name
+
+
 def test_gaudi2_fp8_max_is_the_e4m3fnuz_maximum():
     """FP8_MAX of the plugin on Gaudi2, the only value the row quantization kernel takes."""
     assert torch.finfo(torch.float8_e4m3fnuz).max == moe_reference.GAUDI2_FP8_MAX == 240.0

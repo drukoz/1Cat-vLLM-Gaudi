@@ -83,6 +83,20 @@ def cast_to_fp8_reference(data: torch.Tensor, scale_inv: torch.Tensor, fp8_max: 
 
 
 # ---------------------------------------------------------------------------
+# What a Gaudi2 card computes differently from CPU torch
+# ---------------------------------------------------------------------------
+def hpu_div_by_scalar(x: torch.Tensor, divisor: float) -> torch.Tensor:
+    """``x / divisor`` for a bf16 tensor and a Python number, as a Gaudi2 card computes it.
+
+    The card multiplies by the reciprocal rounded to the tensor's dtype: ``bf16(x * bf16(1 / divisor))``.
+    CPU torch divides, ``bf16(x / divisor)``.  For 240 the constant is ``0x1.12p-8``, 0.34 % above 1/240,
+    and the card's result is CPU torch's or one bf16 step above it.  Found on the first card run of the
+    MoE glue kernels (2026-11-20); the evidence and the scope are in ``hpu_arithmetic.py``.
+    """
+    return x * torch.tensor(1.0 / divisor, dtype=x.dtype)
+
+
+# ---------------------------------------------------------------------------
 # The fused ops
 # ---------------------------------------------------------------------------
 class _TopK:
