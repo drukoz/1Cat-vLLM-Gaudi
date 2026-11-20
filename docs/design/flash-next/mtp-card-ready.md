@@ -6,6 +6,72 @@ This file is the track's report. The harness of the track's agents does not writ
 
 ## Handoff (if this agent stops)
 
+Last update: 2026-11-20 23:37 UTC (fourth agent of the track, Opus 5.5, started 23:15 UTC). Coordinator's rule
+for tonight (BRIEF 23:21): card evidence first, no pull request before 04:00 UTC; push the branch after each green
+step and tell the coordinator the commit and the flags (the integration track builds from this branch).
+
+**State.** MTP k = 3 works on the real model at TP8 and TP4 and pays at 1 stream (TP4: 23.5 ms per token against
+39.8, 1.69 times), about even at 8 streams, and LOSES at 32 streams on today's torch QSA path (133.7 against 108.1).
+The timer (job 00104) says why: the verification part Ft grows with its rows (47 / 109 / 303 ms at 4 / 32 / 128
+rows) while a draft pass Fd is small (4.4 / 6.0 / 10.7 ms). Acceptance holds at 32 streams (0.72 / 0.51 / 0.36
+per position). The open questions are what the QSA data-flow change and the kernel-fixes flags do to Ft at 128
+rows, whether k = 1 beats k = 3 at 32 streams, and what sampled verification (I07) costs: jobs 00126 / 00127.
+
+**Branch** (pushed: `origin/feat/flash-next-gaudi-mtp-card-ready` = `13d7393a`):
+- `6a0a046e` spec_scaling.py + mtp_real_card.sh (the previous agent's uncommitted probe, 18 tests passed).
+- `fc43e7de` merge of the program head `938dada4` (PR #13, #14), clean; `697bffed` merge of
+  `origin/feat/flash-next-gaudi-qsa-fused` (`a5f837ca`), clean; `26d9ee1a` merge of
+  `origin/feat/flash-next-gaudi-kernel-fixes` (`821253cf`), two both-added conflicts (envs.py,
+  env_variables.md), both sides kept.
+- `0d1be6fc` FIX: the sampling metadata of a verification step has one row per request (it was padded to the
+  logits' 1 + k rows per request, so a sampled request crashed the sampler: test_engine_mtp's sampled test, red
+  since the merge of PR 13); the step no longer runs a discarded sampler pass over the bonus rows. Run sheet names
+  `tiny_smoke.sh --spec`. CPU: `test_engine_mtp.py` 14 passed on a snapshot of `0d1be6fc`
+  (`reports/mtp-card-ready/cpu4/engine_mtp-0d1be6fc.log`).
+- `13d7393a` `tools/flash_next/rental/mtp_arms.sh`: several real-model arms in one farm job (each in
+  `$FARM_OUT/NAME`, a fallback run without COPY_MODE / DRAFT_LOOP / CHUNK_KV when an arm's server dies or measures
+  nothing), hl-smi memory every 15 s; spec_scaling.py exits 1 when nothing was measured. 20 tests passed.
+- Not gated (`bin/gate` has five tracks queued: hours). The previous agent's gate of `6285cfae` was red in
+  test_engine_mtp (fixed in `0d1be6fc`), test_sh_run_sheet (fixed), and tools/rental signal / git tests that fail
+  the same way on other tracks' trees (prefill's gate log `reports/prefill/logs/gate_5d8af094.log`).
+
+**Card jobs queued (23:35 UTC, both from `13d7393a`, image `farm-mtp-card-ready:13d7393a3b8f`; bump asked):**
+- **00126 `real4-qsa-mtp-k3-k1`** (any:4, 40 min): `bash tools/flash_next/rental/mtp_arms.sh 'k3|3||--levels
+  1,8,32 --tokens 256 --sampled-levels 1,32' 'k1|1||--levels 1,32 --tokens 256 --repeat-top 1 --sampled-levels
+  32'` with `VLLM_HPU_QSA_FUSED=1 VLLM_HPU_QSA_INDEXER_SHARD=1 VLLM_HPU_GDN_KERNEL_INTERLEAVE=1
+  VLLM_HPU_GDN_GLUE_CACHE=1 VLLM_HPU_HC_FUSED_COPY_MODE=2 VLLM_GRAPH_RESERVED_MEM=0.5 VLLM_HPU_GDN_CORE_VERIFY=1
+  VLLM_HPU_MTP_TIMING=1 VLLM_HPU_SPEC_SAMPLED_VERIFY=1 VLLM_HPU_MTP_DRAFT_LOOP=1 VLLM_HPU_MTP_CHUNK_KV=1`.
+- **00127 `real4-qsa-ref-nospec`** (any:4, 25 min): the same server without speculation, `'k0|0||--levels 1,8,32
+  --tokens 256 --sampled-levels 1,32'`, the first six flags.
+- Local waiters write `reports/mtp-card-ready/card/submit-*.log` and copy the results to
+  `reports/mtp-card-ready/card/<id>-<name>/`; if they are gone: `bin/farm fetch mtp-card-ready 00126
+  00126-real4-qsa-mtp-k3-k1` (and 00127). What to read per arm folder (`k3/`, `k1/`, `k0/`, `*-fallback/`):
+  `probe.log` (MEAS / SAMPL lines: ms per step, tokens per step, acceptance per position, TEXT lines),
+  `scaling.json`, `server0.log` (`MTP step timing` lines: Ft, Fd; `PT_DEVMEM` = out of graph memory),
+  `mtp_step_timing_r*.jsonl`, `hlsmi.log` in the job folder. Report to the coordinator: ms per token at 1 / 8 / 32
+  streams greedy and sampled, k = 3 against k = 1 against the reference, Ft / Fd at 128 rows, which verification
+  rung ran (the fused one, `VLLM_HPU_GDN_CORE_VERIFY=1`).
+
+**Pending, in order**
+1. Read 00126 / 00127 when they end; numbers to the coordinator and into "Card results" below.
+2. I07 fast path (`VLLM_HPU_SPEC_SAMPLED_VERIFY=2`): sampled verification over the top-64 candidates of every
+   verification and bonus row (engine-step's `candidate_probs` without the int64 gather; ids from an fp32 id table
+   as collectives' `vocab_parallel.top_k` makes them, so no top-k index is read back to the host as data, BRIEF
+   23:23), host-made noise from a generator seeded alike on every rank; eligible when every request has
+   1 <= top_k <= 64, no seed, no logprobs; otherwise today's exact path (`=1`). Then a card arm against `=1`.
+3. k from arithmetic (`tools/flash_next/mtp_k_choice.py`): E(k) = 1 + r1 + ... + rk with the unconditional
+   per-position rates; cost Ft(rows(k)) + k Fd. k = 4 / 5 only where Fd stays small against Ft (1 stream).
+4. Pull request after 04:00 UTC: gate (`bin/gate <worktree> --tools`) on a snapshot, PR to
+   `feat/flash-next-gaudi` (the merges of qsa-fused and kernel-fixes are then on the program branch or not: if
+   not, the PR carries them, say so).
+
+**Results of the jobs the third agent left (read 23:20 UTC)** are in "Card results" (00099, 00104, 00105).
+The fused verify rung's mismatch on the tiny model at TP2 (00105, 700-token prompt, token 4) is a near tie: the
+CPU engine rehearsal with the QSA flags diverges on the same prompt at a reference margin of 0.002 (random
+weights: every logit within about 0.05), and the coordinator confirmed it (BRIEF 23:23, 23:24).
+
+## Earlier handoff (third agent, 20:20 UTC; superseded, kept for its details)
+
 Last update: 2026-11-20 20:10 UTC (third agent of the track, started 19:00 UTC).
 
 **State in one paragraph.** MTP speculative decoding (k = 3) WORKS on the card. Tiny model (TP8, fused GDN
@@ -125,6 +191,9 @@ short-prompt numbers.
 | 00021 run 1 | tiny model TP8, `hc` then `hc+mtp3`, failure-6 fix | `hc` passed (7.8 ms/token); both speculative rungs: failure 7 (aux hidden view of the buffer) |
 | 00021 run 2 | tiny model TP8, `hc+mtp3`, both fixes | PASSED on the fused verification rung: tokens equal the non-speculative server for 1, 7, 33, 100, 700 and 2,600-token prompts; 0 of 270 drafts accepted (random weights); 22.0 ms/token against 8.2 without speculation |
 | 00021 run 3 | REAL model TP8 + EP8, k = 3, fused verification, greedy, both fixes, 128 tokens | healthy after 466 s. 1 stream: acceptance per position 0.83 / 0.57 / 0.39, 2.78 tokens per step (2.72 per streamed chunk), 84.3 ms per step, 31.0 ms per token steady (55.9 with the round's 2.8 s compile pause). 32 streams: only the warm round fitted (24 tokens: acceptance length 2.13; the server's window: per-position 0.548 / 0.299 / 0.201 over the first tokens of 32 prompts) |
+| 00099 `real4-nospec-ref` | TP4 + EP4, no speculation, `9d013a36`, modules 0-3, greedy, 256 tokens, torch QSA path | steady ms per step 39.8 (1 stream), 53.7 (8), 108.1 / 108.1 (32, two rounds) |
+| 00104 `real4-mtp3-timed` | TP4 + EP4, k = 3, fused verify rung (`VLLM_HPU_GDN_CORE_VERIFY=1`), timer, `317c33c5`, modules 4-7, greedy, 256 tokens | ms per token 23.5 / 49.0 / 133.7 (1 / 8 / 32 streams), tokens per step 2.56 / 2.57 / 2.53, step 60 / 126 / 338 ms. Timer (means of 25 steps, 4 ranks within 1 ms): Ft 47.0-48.4 / 109.2-109.5 / 302.5-303.4 ms at 4 / 32 / 128 rows (415-438 in the first 32-stream rounds, compiles); draft 12.8-13.5 / 17.8 / 32.1-32.5 ms, so Fd 4.3-4.5 / 5.9-6.0 / 10.7-10.8 ms per pass. Acceptance per position (server windows): 0.75 / 0.55 / 0.38 at 8 streams (1,959 drafted), 0.72 / 0.51 / 0.36 at 32 (16,134 drafted), 0.64 / 0.39 / 0.23 at 1 stream (windows with warm rounds). Texts coherent; the 1-stream text leaves the reference's after 4 words (a near tie under 4 rows). Pauses up to 24.6 s in the first 32-stream round (compiles) |
+| 00105 `tiny2-mtp-arms` | tiny model TP2, k = 3, image `317c33c5`; arm base, arm `VLLM_HPU_MTP_DRAFT_LOOP=1` + `VLLM_HPU_MTP_CHUNK_KV=1` | both arms PASS on the torch-verification rung (tokens equal the non-speculative server, 1 to 2,600-token prompts; 0 of 270 drafts accepted, random weights), 20.0 and 16.2 ms per token; the fused verify rung missed the 700-token prompt at token 4 in both arms (a near tie, see the handoff). First card run of DRAFT_LOOP and CHUNK_KV: no error |
 
 ## How the jobs of this track run (late-bound)
 
