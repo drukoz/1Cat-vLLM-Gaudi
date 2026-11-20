@@ -24,6 +24,11 @@ lazy process (``PT_HPU_LAZY_MODE=1``, ``PT_HPU_ENABLE_LAZY_COLLECTIVES=true``, `
                     collectives; one collective alone = (replay with - replay_seg) / 2L)
 * ``*_cache``       the same regime wrapped with ``disable_tensor_cache=False`` (the runner passes True): the
                     captured tensors keep their device memory between replays
+* ``*_busy``        the same regime behind one long device operation (``--busy-n``, ``--busy-k``: k products of
+                    two n x n matrices, whose result the body's input waits for). The host has issued every
+                    launch and collective of the step before the device starts on them, so total minus the
+                    long operation is what the device and the links need for the step when the host costs
+                    nothing: the floor that no change of the host path can go below
 
 eager process (``PT_HPU_LAZY_MODE=0``):
 
@@ -68,10 +73,23 @@ COMPILE_FULL_ROWS = (1, 32)
 EXIT_GRACE_S = 20.0
 LAZY_REGIMES = ("lazy", "lazy_layer", "lazy_coll", "replay", "replay_layer", "replay_coll", "graph_raw",
                 "replay_async", "replay_meta", "replay_tail", "replay_async_tail", "replay_par2", "replay_fused2",
-                "replay_coalesce", "replay_seg", "replay_cache", "replay_seg_cache", "replay_layer_cache")
+                "replay_coalesce", "replay_seg", "replay_cache", "replay_seg_cache", "replay_layer_cache",
+                "replay_busy", "replay_layer_busy", "replay_seg_busy")
 # Regimes that only exist without the collectives (a cut at every collective position and no collective).
-NO_COLLECTIVE_REGIMES = ("replay_seg", "replay_seg_cache")
+NO_COLLECTIVE_REGIMES = ("replay_seg", "replay_seg_cache", "replay_seg_busy")
 CACHE_SUFFIX = "_cache"
+BUSY_SUFFIX = "_busy"
+DEFAULT_BUSY_N = 8192
+DEFAULT_BUSY_K = 4
+
+
+def split_regime(regime: str) -> tuple:
+    """``<shape>[_cache][_busy]`` -> (shape, cache suffix or "", busy suffix or "")."""
+    busy = BUSY_SUFFIX if regime.endswith(BUSY_SUFFIX) else ""
+    rest = regime[:-len(BUSY_SUFFIX)] if busy else regime
+    cache = CACHE_SUFFIX if rest.endswith(CACHE_SUFFIX) else ""
+    shape = rest[:-len(CACHE_SUFFIX)] if cache else rest
+    return shape, cache, busy
 # The pair regimes: both sub-blocks of a layer from the same input, so the layer's two all-reduces are independent
 # (par2: two calls; fused2: one call over the stacked pair, the same bytes; coalesce: the two calls in a coalescing
 # context). Layer.layer_pair. They have the compute of a pair layer, so they compare with each other, not with replay.
@@ -159,6 +177,24 @@ class Body:
                        for _ in range(2)]
         self.down = [weight(HIDDEN, PROJ, scale_down) for _ in range(2)]
         self.up = [weight(PROJ, HIDDEN, scale_up) for _ in range(2)]
+
+    def make_busy(self, device, n: int, k: int, seed: int = 7) -> None:
+        """The operand of the long device operation of the ``*_busy`` regimes (n x n bf16)."""
+        torch = self.torch
+        gen = torch.Generator().manual_seed(seed)
+        self.busy_w = (torch.randn(n, n, generator=gen) / (n**0.5)).to(torch.bfloat16).to(device)
+        self.busy_k = k
+
+    def delay(self, x):
+        """x after a long device operation it now depends on (k products of n x n matrices); the value is x.
+
+        One element of the last product times zero is added, so every later operation of the step waits for
+        the products while the host goes on issuing.
+        """
+        y = self.busy_w
+        for _ in range(self.busy_k):
+            y = y @ self.busy_w
+        return x + (y[:1, :1].float().sum() * 0.0).to(x.dtype)
 
     def branch(self, x, k: int):
         """RMS norm, GEMM down, SiLU, GEMM up: the part of a sub-block before its all-reduce."""
@@ -280,6 +316,8 @@ class Rank:
                                    (probe.item(), self.rank, self.world))
         self.barrier_probe = torch.zeros(1).to(self.device)
         self.body = Body(torch, self.device, args.layers, self.world)
+        if any(regime.endswith(BUSY_SUFFIX) for regime in args.regimes):
+            self.body.make_busy(self.device, args.busy_n, args.busy_k)
 
     # ------------------------------------------------------------------------------- primitives
     def mark_step(self) -> None:
@@ -425,8 +463,8 @@ class Rank:
         body = self.body
         reduce = self.inplace_reduce if collectives else None
         # "<regime>_cache": the same regime with the wrapper's tensor cache on (disable_tensor_cache=False).
-        tensor_cache = regime.endswith(CACHE_SUFFIX)
-        shape = regime[:-len(CACHE_SUFFIX)] if tensor_cache else regime
+        shape, cache_suffix, busy_suffix = split_regime(regime)
+        tensor_cache = bool(cache_suffix)
         cut = self.mark_step if shape.endswith(("_layer", "_coll")) else None
         cut_coll = self.mark_step if shape.endswith("_coll") else None
         cut_seg = self.mark_step if shape.endswith("_seg") else None
@@ -434,6 +472,8 @@ class Rank:
         pair_mode = PAIR_REGIMES.get(regime)
 
         def step(x):
+            if busy_suffix:
+                x = body.delay(x)
             if pair_mode is not None:
                 return body.forward_pair(x, reduce, pair_mode, self.coalescing_context)
             return body.forward(x, reduce, cut, cut_coll, cut_seg)
@@ -862,8 +902,9 @@ def derive(merged: list, reference: list | None = None) -> list:
         without, _, layers_without = total(case, rows, False)
         with_c, call_with, layers_with = total(case, rows, True)
         layers = layers_with or layers_without
+        _, call_without, _ = total(case, rows, False)
         line = {"case": case, "rows": rows, "total_without_ms": without, "total_with_ms": with_c,
-                "call_with_ms": call_with}
+                "call_with_ms": call_with, "call_without_ms": call_without}
         if None not in (without, with_c) and layers:
             calls = next((e.get("all_reduces") for e in merged if case_key(e) == (case, rows, True)), None)
             line["all_reduce_ms_each"] = (with_c - without) / (calls or 2 * layers)
@@ -871,8 +912,11 @@ def derive(merged: list, reference: list | None = None) -> list:
             line["host_call_share"] = call_with / with_c
         name, _, env_name = case.partition(ENV_SEPARATOR)
         suffix = (ENV_SEPARATOR + env_name) if env_name else ""
-        cache = CACHE_SUFFIX if name.endswith(CACHE_SUFFIX) else ""
-        shape = name[:-len(CACHE_SUFFIX)] if cache else name
+        shape, cache, busy = split_regime(name)
+        cache = cache + busy  # the uncut body and the base regime of the same family
+        if busy:
+            # Behind the long device operation the host is done issuing before the device starts on the step.
+            line["busy_ms"], _, _ = total("replay" + cache + suffix, rows, False)
         if shape == "replay_seg" and layers:
             # A cut at each of the 2L collective positions and no collective: the launches of a step with
             # collectives. One launch = (this - the uncut body) / 2L; one collective alone = (the body with
@@ -943,7 +987,11 @@ def print_summary(merged: list, derived: list, ranks: int, echo=print) -> None:
               ("; against %s: total %s ms (without coll %s), call %s ms" %
                (line["vs"], _fmt(line.get("vs_total_ms"), 4), _fmt(line.get("vs_total_without_ms"), 4),
                 _fmt(line.get("vs_call_ms"), 4)))
-              if "vs" in line else ""))
+              if "vs" in line else "") +
+             ("; long operation %s ms, host call %s ms (a device floor only when the call is the shorter)" %
+              (_fmt(line.get("busy_ms")), _fmt(line.get("call_with_ms") if line.get("call_with_ms") is not None
+                                                 else line.get("call_without_ms")))
+              if "busy_ms" in line else ""))
 
 
 def run_ranks(args, process: str, echo=print, env_set=None) -> dict:
@@ -984,7 +1032,7 @@ def run_ranks(args, process: str, echo=print, env_set=None) -> dict:
                ",".join(str(r) for r in rows), "--layers", str(args.layers), "--repeats", str(args.repeats),
                "--timeout", str(int(timeout)), "--regimes", ",".join(regimes),
                "--compile-full-rows", ",".join(str(r) for r in args.compile_full_rows),
-               "--collectives", args.collectives]
+               "--collectives", args.collectives, "--busy-n", str(args.busy_n), "--busy-k", str(args.busy_k)]
         if args.dump_dir and not env_set:
             cmd += ["--dump-dir", os.path.abspath(args.dump_dir)]
         if args.trace_dir and not env_set:
@@ -1065,6 +1113,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--hold-calls", type=int, default=0)
     parser.add_argument("--hold-rows", type=int, default=1)
     parser.add_argument("--hold-regime", default="replay", choices=("replay", "replay_seg"))
+    parser.add_argument("--busy-n", type=int, default=DEFAULT_BUSY_N,
+                        help="the *_busy regimes: size of the matrices of the long device operation")
+    parser.add_argument("--busy-k", type=int, default=DEFAULT_BUSY_K, help="and how many products of them")
     parser.add_argument("--env-sets", default="",
                         help="more runs of the lazy process under other settings: name:KEY=VALUE,KEY=VALUE;name2:...")
     parser.add_argument("--env-regimes", default="replay", help="the regimes of the --env-sets runs")

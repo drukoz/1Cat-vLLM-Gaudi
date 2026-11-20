@@ -236,3 +236,36 @@ def test_parse_args_environment_sets_and_hold_options():
     assert args.env_sets == [("a", {"K": "1"})] and args.env_rows == [1, 32]
     assert args.env_regimes == ["replay", "replay_seg"]
     assert args.hold_calls == 7 and args.hold_regime == "replay" and args.collectives == "off"
+
+
+def test_split_regime_reads_the_cache_and_busy_suffixes():
+    assert bench.split_regime("replay") == ("replay", "", "")
+    assert bench.split_regime("replay_seg_cache") == ("replay_seg", "_cache", "")
+    assert bench.split_regime("replay_layer_busy") == ("replay_layer", "", "_busy")
+    assert bench.split_regime("replay_seg_cache_busy") == ("replay_seg", "_cache", "_busy")
+
+
+def test_delay_adds_a_dependency_and_keeps_the_value():
+    body = bench.Body(torch, "cpu", layers=1, world=1)
+    body.make_busy("cpu", n=16, k=3)
+    x = torch.randn(2, bench.HIDDEN).to(torch.bfloat16)
+    assert torch.equal(body.delay(x), x)
+    assert body.busy_w.shape == (16, 16) and body.busy_w.dtype == torch.bfloat16
+
+
+def test_derive_gives_the_device_floor_behind_a_long_operation():
+    # The long operation takes 30 ms; behind it 96 launches cost the device 96 x 0.03 and 96 collectives 96 x 0.05.
+    merged = [
+        _entry("replay_busy", 1, False, 30.0, call=0.3),
+        _entry("replay_busy", 1, True, 30.0 + 96 * 0.08, call=17.0),
+        _entry("replay_seg_busy", 1, False, 30.0 + 96 * 0.03, call=8.0),
+        _entry("replay_layer_busy", 1, False, 30.0 + 47 * 0.03, call=4.0),
+    ]
+    lines = {(line["case"], line["rows"]): line for line in bench.derive(merged)}
+    assert lines[("replay_busy", 1)]["all_reduce_ms_each"] == pytest.approx(0.08)
+    assert lines[("replay_busy", 1)]["busy_ms"] == pytest.approx(30.0)
+    assert lines[("replay_busy", 1)]["call_with_ms"] == pytest.approx(17.0)
+    assert lines[("replay_seg_busy", 1)]["launch_ms_each"] == pytest.approx(0.03)
+    assert lines[("replay_seg_busy", 1)]["collective_alone_ms_each"] == pytest.approx(0.05)
+    assert lines[("replay_seg_busy", 1)]["call_without_ms"] == pytest.approx(8.0)
+    assert lines[("replay_layer_busy", 1)]["cut_ms_each_without_collectives"] == pytest.approx(0.03)
