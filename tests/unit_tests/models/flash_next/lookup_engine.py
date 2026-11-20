@@ -30,7 +30,10 @@ request (its prompt is that request's prompt, plus its baseline output, plus ``s
 prefix-cache hit. A config is ``{"name", "speculative_config", "prefix_caching", "oracle": null | {"schedule": [L,
 ...], "tamper_every": int}}``: with an oracle the drafter's ``propose`` returns, per request and step, the next
 ``L`` tokens of the baseline stream (``L = 0`` is the empty draft, which the runner schedules as ``[-1]``), every
-``tamper_every``-th step with one draft token replaced by a token the target never picks first. A config may name
+``tamper_every``-th step with one draft token replaced by a token the target never picks first. A config with ``env_oracle`` (``{"schedule": [...], "tamper_every": int}``) uses the product's own
+rehearsal oracle instead (``flash_next_lookup.LookupOracle``): the child writes the baseline streams to a file and
+names it in ``VLLM_HPU_FLASH_NEXT_LOOKUP_ORACLE``, as ``tools/flash_next/rental/lookup_tiny.py`` does on a card.
+A config may name
 the ``scenarios`` it runs and ``mutations`` of the runner (``"no_widen"``: the verification batch is the widest
 scheduled row, the width before ``verify_width``), for the check that the comparison catches a broken lattice.
 """
@@ -277,6 +280,7 @@ def _boot(LLM, plan: dict, speculative_config: dict | None, prefix_caching: bool
         else:
             os.environ[name] = value
     os.environ.pop("VLLM_HPU_FLASH_NEXT_SPEC_LOOKUP", None)
+    os.environ.pop("VLLM_HPU_FLASH_NEXT_LOOKUP_ORACLE", None)
     for name, value in (env or {}).items():
         os.environ[name] = str(value)
     kwargs = dict(model=plan["ckpt"], tokenizer=plan["ckpt"], skip_tokenizer_init=True, dtype="bfloat16",
@@ -330,7 +334,18 @@ def run_baseline(LLM, SamplingParams, plan: dict) -> dict:
 
 def run_config(LLM, SamplingParams, plan: dict, config: dict, base: dict) -> dict:
     """One speculative engine over every scenario; each request runs to its baseline's tie-free length."""
-    llm = _boot(LLM, plan, config["speculative_config"], config["prefix_caching"], config.get("env"))
+    env = dict(config.get("env") or {})
+    env_oracle = config.get("env_oracle")
+    if env_oracle is not None:
+        # the product's rehearsal oracle: the baseline streams in a file named by the environment
+        import tempfile
+
+        fd, oracle_path = tempfile.mkstemp(prefix="lookup-oracle-", suffix=".json", dir="/tmp")
+        with os.fdopen(fd, "w") as f:
+            json.dump({"streams": [list(s["prompt_ids"]) + list(s["tokens"]) for s in base.values()],
+                       "schedule": env_oracle["schedule"], "tamper_every": int(env_oracle.get("tamper_every", 0))}, f)
+        env["VLLM_HPU_FLASH_NEXT_LOOKUP_ORACLE"] = oracle_path
+    llm = _boot(LLM, plan, config["speculative_config"], config["prefix_caching"], env)
     runner = _runner(llm)
     record = {"drafter": type(runner.drafter).__name__, "prefix_caching": bool(runner.use_prefix_caching),
               "recurrent_spec": bool(runner._recurrent_spec), "steps": [], "widths": [], "boundary_commits": 0,
@@ -434,6 +449,32 @@ def run_config(LLM, SamplingParams, plan: dict, config: dict, base: dict) -> dic
             return drafts
 
         runner.drafter.propose = oracle_propose
+    elif env_oracle is not None and config["speculative_config"].get("method") == "ngram":
+        if getattr(runner, "_lookup_oracle", None) is None:
+            raise RuntimeError("the rehearsal oracle did not reach the runner (VLLM_HPU_FLASH_NEXT_LOOKUP_ORACLE)")
+        real_ngram = runner.propose_ngram_draft_token_ids
+
+        def ngram_spy(sampled_token_ids):
+            drafts = real_ngram(sampled_token_ids)
+            for i, draft in enumerate(drafts):
+                record["steps"].append({"step": state["step"], "row": i, "sampled": [int(t) for t in sampled_token_ids[i]],
+                                        "draft": [int(t) for t in draft if int(t) != -1], "tampered": None})
+            state["step"] += 1
+            return drafts
+
+        runner.propose_ngram_draft_token_ids = ngram_spy
+    elif env_oracle is not None:
+        if runner._spec_lookup is None or runner._spec_lookup.oracle is None:
+            raise RuntimeError("the lookup hook or its rehearsal oracle is not installed")
+        real_env_merge = runner._spec_lookup.merge
+
+        def env_merge_spy(mtp_drafts, req_ids, *args, **kwargs):
+            drafts = real_env_merge(mtp_drafts, req_ids, *args, **kwargs)
+            record.setdefault("hybrid_rows", []).append({"drafts": drafts, "sources": [
+                runner._spec_lookup.last_source.get(r) for r in req_ids]})
+            return drafts
+
+        runner._spec_lookup.merge = env_merge_spy
     elif config["speculative_config"].get("method") == "ngram":
         real_propose = runner.drafter.propose
 
@@ -461,6 +502,12 @@ def run_config(LLM, SamplingParams, plan: dict, config: dict, base: dict) -> dic
     if real_find is not None:
         lookup_module.find_lookup_draft = real_find
         record["hybrid_counts"] = runner._spec_lookup.counts
+    if env_oracle is not None:
+        oracle_object = getattr(runner, "_lookup_oracle", None) or getattr(runner._spec_lookup, "oracle", None)
+        record["oracle"] = {"drafts": oracle_object.drafts, "tampered": oracle_object.tampered}
+        if runner._spec_lookup is not None:
+            record["hybrid_counts"] = runner._spec_lookup.counts
+        os.unlink(env["VLLM_HPU_FLASH_NEXT_LOOKUP_ORACLE"])
     del llm
     return record
 
