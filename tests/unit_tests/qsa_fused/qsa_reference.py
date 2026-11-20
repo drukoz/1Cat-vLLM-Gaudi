@@ -86,6 +86,73 @@ def qsa_index_emit_ref(blocks: torch.Tensor, positions: torch.Tensor, block_tabl
     return slots, valid
 
 
+def score_keys(scores: torch.Tensor) -> torch.Tensor:
+    """int64 order keys of fp32 block scores: the bits without the sign (-0 -> +0; NaN above +inf)."""
+    return (scores.contiguous().view(torch.int32).to(torch.int64) & 0x7FFFFFFF)
+
+
+def _pack_words(bits: torch.Tensor) -> torch.Tensor:
+    """bool ``[32 * n]`` -> int32 ``[n]``: bit ``b`` of word ``w`` is ``bits[32 w + b]``."""
+    weights = (torch.ones(32, dtype=torch.int64) << torch.arange(32, dtype=torch.int64))
+    words = (bits.view(-1, 32).to(torch.int64) * weights).sum(1)
+    return torch.where(words >= 2**31, words - 2**32, words).to(torch.int32)
+
+
+def qsa_index_threshold_ref(scores: torch.Tensor, positions: torch.Tensor, ratio: int, topk: int) -> torch.Tensor:
+    """K3a. int32 ``[T, 4 + N / 16]``: visible, threshold key (-1 in prefix mode), G, 0, the greater and equal bitmaps.
+
+    Words past the row's last 128-block tile are left 0 here (the kernel leaves them unspecified).
+    """
+    T, N = scores.shape
+    words = N // 32
+    meta = torch.zeros(T, 4 + 2 * words, dtype=torch.int32)
+    keys = score_keys(scores)
+    visible = ((positions.to(torch.int64) + 1) // ratio).clamp(0, N)
+    for t in range(T):
+        v = int(visible[t])
+        meta[t, 0] = v
+        if v <= topk:
+            meta[t, 1], meta[t, 2] = -1, v
+            continue
+        k = keys[t, :v]
+        theta = int(torch.sort(k, descending=True).values[topk - 1])
+        span = (v + 127) // 128 * 128
+        gt = torch.zeros(span, dtype=torch.bool)
+        eq = torch.zeros(span, dtype=torch.bool)
+        gt[:v], eq[:v] = k > theta, k == theta
+        meta[t, 1], meta[t, 2] = theta, int(gt.sum())
+        meta[t, 4:4 + span // 32] = _pack_words(gt)
+        meta[t, 4 + words:4 + words + span // 32] = _pack_words(eq)
+    return meta
+
+
+def qsa_index_select_ref(meta: torch.Tensor, topk: int) -> torch.Tensor:
+    """K3b. int32 ``[T, topk]``: the selected blocks, ascending, then -1 (ties at the cut: the lowest blocks)."""
+    T = meta.shape[0]
+    words = (meta.shape[1] - 4) // 2
+    out = torch.full((T, topk), -1, dtype=torch.int32)
+    shifts = torch.arange(32, dtype=torch.int64)
+    for t in range(T):
+        v, theta, greater = int(meta[t, 0]), int(meta[t, 1]), int(meta[t, 2])
+        if theta < 0:
+            n = min(v, topk)
+            out[t, :n] = torch.arange(n, dtype=torch.int32)
+            continue
+        gt = ((meta[t, 4:4 + words].to(torch.int64) & 0xFFFFFFFF)[:, None] >> shifts & 1).reshape(-1).bool()[:v]
+        eq = ((meta[t, 4 + words:].to(torch.int64) & 0xFFFFFFFF)[:, None] >> shifts & 1).reshape(-1).bool()[:v]
+        eq_ids = eq.nonzero().reshape(-1)[:topk - greater]
+        keep = gt.clone()
+        keep[eq_ids] = True
+        ids = keep.nonzero().reshape(-1)[:topk].to(torch.int32)
+        out[t, :ids.numel()] = ids
+    return out
+
+
+def qsa_index_topk_ref(scores: torch.Tensor, positions: torch.Tensor, ratio: int, topk: int) -> torch.Tensor:
+    """K3a then K3b: what ``select_blocks`` selects, as ascending block ids, with ties at the cut to the lowest block."""
+    return qsa_index_select_ref(qsa_index_threshold_ref(scores, positions, ratio, topk), topk)
+
+
 # ---------------------------------------------------------------------------
 # Verbatim copies (qsa_sparse_ops.py, qsa_hpu_attention.py)
 # ---------------------------------------------------------------------------
@@ -215,4 +282,5 @@ def decode_selected_slots(selected: torch.Tensor, block_table: torch.Tensor, blo
 COPIED = ("gemma_rms_norm", "rope_neox_partial", "index_queries", "compress_block_keys", "visible_blocks",
           "select_blocks", "expand_selection", "rows_without_selection", "decode_selected_slots")
 
-__all__ = ["COPIED", "qsa_index_emit_ref", "qsa_index_prepare_ref", "rows_table", *COPIED]
+__all__ = ["COPIED", "qsa_index_emit_ref", "qsa_index_prepare_ref", "qsa_index_select_ref", "qsa_index_threshold_ref",
+           "qsa_index_topk_ref", "rows_table", "score_keys", *COPIED]

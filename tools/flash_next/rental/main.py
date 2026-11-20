@@ -738,7 +738,8 @@ class Runner:
             details["env"] = dict(details.get("env") or {})
             details["env"][gates.HC_FUSED_ENV] = "1" if self.hc_fused_on() else "0"
             details["env"][gates.MOE_GLUE_ENV] = "1" if self.moe_glue_on() else "0"
-            details["env"].update(self.qsa_fused_env())
+            if self.qsa_fused_requested:
+                details["env"].update(self.qsa_fused_env())
         self.gdn_env = dict(details.get("env") or {})
         self.gdn_mode = details.get("mode")
         self.gdn_reason = details.get("reason")
@@ -1472,7 +1473,8 @@ class Runner:
         env = server_env(variant_env, self.gdn_env)
         env[gates.HC_FUSED_ENV] = "1" if self.hc_fused_on() else "0"
         env[gates.MOE_GLUE_ENV] = "1" if self.moe_glue_on() else "0"
-        env.update(self.qsa_fused_env())
+        if self.qsa_fused_requested:  # without the switch the plugin default (0) holds
+            env.update(self.qsa_fused_env())
         if self.skip_warmup:
             env["VLLM_SKIP_WARMUP"] = "true"
         combined = self.combined_db_active()

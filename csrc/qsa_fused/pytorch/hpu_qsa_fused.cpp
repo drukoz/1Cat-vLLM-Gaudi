@@ -18,6 +18,8 @@ namespace {
 //                  -> (Tensor, Tensor)
 constexpr auto kPrepareSchema = "flashinfer_gaudi::qsa_index_prepare";
 constexpr auto kEmitSchema = "flashinfer_gaudi::qsa_index_emit";
+constexpr auto kThresholdSchema = "flashinfer_gaudi::qsa_index_threshold";
+constexpr auto kSelectSchema = "flashinfer_gaudi::qsa_index_select";
 
 bool power_of_two(int64_t value) { return value > 0 && (value & (value - 1)) == 0; }
 
@@ -74,12 +76,29 @@ void validate_emit(const at::Tensor& blocks, const at::Tensor& positions, const 
                 "QSA fused block_size must be a power of two >= ratio");
 }
 
+void validate_threshold(const at::Tensor& scores, const at::Tensor& positions, int64_t ratio, int64_t topk) {
+    check_tensor(scores, at::kFloat, 2, "scores");
+    check_tensor(positions, at::kInt, 1, "positions");
+    check_same_device(scores, positions, "positions");
+    TORCH_CHECK(positions.size(0) == scores.size(0), "QSA fused positions must have one entry per score row");
+    TORCH_CHECK(scores.size(1) % 128 == 0, "QSA fused scores must have a multiple of 128 columns");
+    TORCH_CHECK(power_of_two(ratio) && ratio >= 2 && ratio <= kQsaFusedMaxRatio, "QSA fused ratio must be 2, 4 or 8");
+    TORCH_CHECK(topk >= 1, "QSA fused topk must be >= 1");
+}
+
+void validate_select(const at::Tensor& meta, int64_t topk) {
+    check_tensor(meta, at::kInt, 2, "meta");
+    TORCH_CHECK(meta.size(1) >= 12 && (meta.size(1) - 4) % 8 == 0, "QSA fused meta must be [T, 4 + N / 16]");
+    TORCH_CHECK(topk >= 1, "QSA fused topk must be >= 1");
+}
+
 std::shared_ptr<void> node_params(size_t& size, double eps, int64_t heads, int64_t ring_rows, int64_t ratio,
-                                  int64_t block_size, int64_t rotary_half) {
+                                  int64_t block_size, int64_t rotary_half, int64_t topk = 0) {
     size = sizeof(QsaFusedParams);
     return std::make_shared<QsaFusedParams>(QsaFusedParams{
         static_cast<float>(eps), static_cast<int32_t>(heads), static_cast<int32_t>(ring_rows),
-        static_cast<int32_t>(ratio), static_cast<int32_t>(block_size), static_cast<int32_t>(rotary_half)});
+        static_cast<int32_t>(ratio), static_cast<int32_t>(block_size), static_cast<int32_t>(rotary_half),
+        static_cast<int32_t>(topk)});
 }
 
 const bool prepare_registered = [] {
@@ -119,6 +138,36 @@ const bool emit_registered = [] {
     return true;
 }();
 
+const bool threshold_registered = [] {
+    habana::custom_op::registerUserCustomOp(
+        kThresholdSchema, kQsaFusedThresholdGuid,
+        [](const at::Stack& stack) {
+            const auto& scores = stack.at(0).toTensor();
+            validate_threshold(scores, stack.at(1).toTensor(), stack.at(2).toInt(), stack.at(3).toInt());
+            return habana::PartialOutputMetaDataVector{
+                habana::PartialOutputMetaData{at::kInt, {scores.size(0), 4 + scores.size(1) / 16}}};
+        },
+        [](const at::Stack& stack, size_t& size) -> std::shared_ptr<void> {
+            return node_params(size, 0.0, 0, 0, stack.at(2).toInt(), 0, 0, stack.at(3).toInt());
+        });
+    return true;
+}();
+
+const bool select_registered = [] {
+    habana::custom_op::registerUserCustomOp(
+        kSelectSchema, kQsaFusedSelectGuid,
+        [](const at::Stack& stack) {
+            const auto& meta = stack.at(0).toTensor();
+            const int64_t topk = stack.at(1).toInt();
+            validate_select(meta, topk);
+            return habana::PartialOutputMetaDataVector{habana::PartialOutputMetaData{at::kInt, {meta.size(0), topk}}};
+        },
+        [](const at::Stack& stack, size_t& size) -> std::shared_ptr<void> {
+            return node_params(size, 0.0, 0, 0, 0, 0, 0, stack.at(1).toInt());
+        });
+    return true;
+}();
+
 std::vector<at::Tensor> execute(const char* schema, const at::Tensor& first, std::vector<c10::IValue> inputs,
                                 size_t outputs) {
     TORCH_CHECK(first.device().type() == c10::DeviceType::HPU, "QSA fused ops require HPU inputs");
@@ -148,9 +197,22 @@ std::tuple<at::Tensor, at::Tensor> run_emit(const at::Tensor& blocks, const at::
     const auto outputs = execute(kEmitSchema, blocks, {blocks, positions, block_table, ratio, block_size}, 2);
     return std::make_tuple(outputs.at(0), outputs.at(1));
 }
+at::Tensor run_threshold(const at::Tensor& scores, const at::Tensor& positions, int64_t ratio, int64_t topk) {
+    validate_threshold(scores, positions, ratio, topk);
+    TORCH_CHECK(threshold_registered);
+    return execute(kThresholdSchema, scores, {scores, positions, ratio, topk}, 1).at(0);
+}
+
+at::Tensor run_select(const at::Tensor& meta, int64_t topk) {
+    validate_select(meta, topk);
+    TORCH_CHECK(select_registered);
+    return execute(kSelectSchema, meta, {meta, topk}, 1).at(0);
+}
 }  // namespace
 
 TORCH_LIBRARY_IMPL(flashinfer_gaudi, HPU, m) {
     m.impl("qsa_index_prepare", run_prepare);
     m.impl("qsa_index_emit", run_emit);
+    m.impl("qsa_index_threshold", run_threshold);
+    m.impl("qsa_index_select", run_select);
 }

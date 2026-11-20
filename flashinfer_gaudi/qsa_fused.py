@@ -9,7 +9,9 @@ computes anything: the HPU kernels come from the C++ extension ``qsa_fused_ops*.
 kernel database ``libqsa_fused_gaudi2.so`` is registered. Nothing imports this module unless
 ``VLLM_HPU_QSA_FUSED=2``.
 
-Schemas (torch shapes; every integer tensor int32):
+Schemas (torch shapes; every integer tensor int32). ``qsa_index_threshold`` and ``qsa_index_select`` (mode 3) take
+the place of ``select_blocks``: scores ``[T, N]`` fp32 (``N`` a multiple of 128) -> meta ``[T, 4 + N / 16]`` ->
+blocks ``[T, topk]`` (ascending, ties at the cut to the lowest block).
 
     qsa_index_prepare(Tensor(a!) key_ring, Tensor(b!) key_cache, Tensor qk, Tensor rows, Tensor q_norm_weight,
                       Tensor k_norm_weight, Tensor cos_sin, float eps, int heads, int ring_rows, int ratio) -> Tensor
@@ -29,14 +31,17 @@ from __future__ import annotations
 import torch
 
 NAMESPACE = "flashinfer_gaudi"
-OP_NAMES = ("qsa_index_prepare", "qsa_index_emit")
-GUIDS = {"qsa_index_prepare": "qsa_fused_prepare_bf16_gaudi2", "qsa_index_emit": "qsa_fused_emit_i32_gaudi2"}
+OP_NAMES = ("qsa_index_prepare", "qsa_index_emit", "qsa_index_threshold", "qsa_index_select")
+GUIDS = {"qsa_index_prepare": "qsa_fused_prepare_bf16_gaudi2", "qsa_index_emit": "qsa_fused_emit_i32_gaudi2",
+         "qsa_index_threshold": "qsa_fused_threshold_f32_gaudi2", "qsa_index_select": "qsa_fused_select_i32_gaudi2"}
 SCHEMAS = {
     "qsa_index_prepare": ("qsa_index_prepare(Tensor(a!) key_ring, Tensor(b!) key_cache, Tensor qk, Tensor rows, "
                           "Tensor q_norm_weight, Tensor k_norm_weight, Tensor cos_sin, float eps, int heads, "
                           "int ring_rows, int ratio) -> Tensor"),
     "qsa_index_emit": ("qsa_index_emit(Tensor blocks, Tensor positions, Tensor block_table, int ratio, "
                        "int block_size) -> (Tensor, Tensor)"),
+    "qsa_index_threshold": "qsa_index_threshold(Tensor scores, Tensor positions, int ratio, int topk) -> Tensor",
+    "qsa_index_select": "qsa_index_select(Tensor meta, int topk) -> Tensor",
 }
 
 # What the HPU kernels accept (csrc/qsa_fused/qsa_fused_params.h, checked by the op's validation callback and the
@@ -63,6 +68,26 @@ def _qsa_index_emit_fake(blocks, positions, block_table, ratio, block_size):
     width = blocks.shape[1] * ratio + ratio - 1
     return (blocks.new_empty((blocks.shape[0], width), dtype=torch.int32),
             blocks.new_empty((blocks.shape[0], width), dtype=torch.int32))
+
+
+@torch.library.register_fake(f"{NAMESPACE}::qsa_index_threshold", lib=_LIBRARY)
+def _qsa_index_threshold_fake(scores, positions, ratio, topk):
+    return scores.new_empty((scores.shape[0], 4 + scores.shape[1] // 16), dtype=torch.int32)
+
+
+@torch.library.register_fake(f"{NAMESPACE}::qsa_index_select", lib=_LIBRARY)
+def _qsa_index_select_fake(meta, topk):
+    return meta.new_empty((meta.shape[0], topk), dtype=torch.int32)
+
+
+def qsa_index_threshold(scores: torch.Tensor, positions: torch.Tensor, ratio: int, topk: int) -> torch.Tensor:
+    """K3a as ``torch.ops.flashinfer_gaudi.qsa_index_threshold``: int32 meta ``[T, 4 + N / 16]``."""
+    return torch.ops.flashinfer_gaudi.qsa_index_threshold(scores, positions, int(ratio), int(topk))
+
+
+def qsa_index_select(meta: torch.Tensor, topk: int) -> torch.Tensor:
+    """K3b as ``torch.ops.flashinfer_gaudi.qsa_index_select``: int32 ``[T, topk]`` ascending block ids, -1 padded."""
+    return torch.ops.flashinfer_gaudi.qsa_index_select(meta, int(topk))
 
 
 def qsa_index_prepare(key_ring: torch.Tensor, key_cache: torch.Tensor, qk: torch.Tensor, rows: torch.Tensor,
@@ -93,4 +118,5 @@ def qsa_fused_missing_ops(device_type: str = "hpu") -> tuple[str, ...]:
     return tuple(missing)
 
 
-__all__ = ["GUIDS", "OP_NAMES", "SCHEMAS", "qsa_fused_missing_ops", "qsa_index_emit", "qsa_index_prepare"]
+__all__ = ["GUIDS", "OP_NAMES", "SCHEMAS", "qsa_fused_missing_ops", "qsa_index_emit", "qsa_index_prepare",
+           "qsa_index_select", "qsa_index_threshold"]

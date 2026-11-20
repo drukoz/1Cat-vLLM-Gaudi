@@ -9,7 +9,7 @@
 
 namespace qsa_fused {
 
-enum class Kind { Prepare, Emit };
+enum class Kind { Prepare, Emit, Threshold, Select };
 
 struct KernelInfo {
     Kind kind;

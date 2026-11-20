@@ -686,7 +686,7 @@ QSA_FUSED_KERNEL_DB = "libqsa_fused_gaudi2.so"  # an optional member of the comb
 QSA_FUSED_KERNEL_LIBRARY_ENV = "QSA_FUSED_GAUDI_KERNEL_LIBRARY"  # its path, when it is not in the package's lib/
 QSA_FUSED_NATIVE_LIBRARY_ENV = "QSA_FUSED_GAUDI_NATIVE_LIBRARY"  # the path of qsa_fused_ops*.so, same rule
 QSA_FUSED_EXTENSION_GLOB = "qsa_fused_ops*.so"
-QSA_FUSED_SCHEMA_MODULE = "flashinfer_gaudi.qsa_fused"  # defines the two op schemas; imported only with the flag at 2
+QSA_FUSED_SCHEMA_MODULE = "flashinfer_gaudi.qsa_fused"  # defines the op schemas; imported only with the flag at 2 or 3
 _QSA_FUSED_LOADED: bool | None = None  # None = not attempted
 _QSA_FUSED_ERRORS: list[str] = []
 _QSA_FUSED_LOCK = threading.Lock()
@@ -763,7 +763,7 @@ def _load_qsa_fused_locked() -> bool:
 def load_qsa_fused_extension() -> bool:
     """Register libqsa_fused_gaudi2.so and load qsa_fused_ops*.so once; True when loaded. Never raises.
 
-    Called only with ``VLLM_HPU_QSA_FUSED=2``, before the first HPU op of the process (SynapseAI reads
+    Called only with ``VLLM_HPU_QSA_FUSED=2`` or ``3``, before the first HPU op of the process (SynapseAI reads
     ``GC_KERNEL_PATH`` when its graph compiler starts). ``qsa_fused_extension_errors`` says why it returned False.
     """
     global _QSA_FUSED_LOADED

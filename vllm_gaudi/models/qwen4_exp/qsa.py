@@ -51,6 +51,7 @@ from vllm_gaudi.models.qwen4_exp.qsa_fused_path import (
     qsa_shard_mode,
     rows_table,
     select_blocks_request_major,
+    step_cached,
 )
 from vllm_gaudi.models.qwen4_exp.qsa_sparse_ops import (
     compress_block_keys,
@@ -275,7 +276,7 @@ class HpuQsaIndexer(nn.Module):
         topk, width = self.block_topk, self.output_width
         T = hidden.shape[0]
         qk, _ = self.index_qk_proj(hidden)
-        if (self.fused_mode is QsaFusedMode.KERNELS and not md.is_prompt
+        if (self.fused_mode in (QsaFusedMode.KERNELS, QsaFusedMode.KERNELS_TOPK) and not md.is_prompt
                 and self._kernels_serve(md, cos_sin, qk.device)):
             return self._select_decode_kernels(qk, positions, cos_sin, md)
         q, raw_k = qk.split([H * D, self.index_kv_heads * D], dim=-1)
@@ -355,21 +356,31 @@ class HpuQsaIndexer(nn.Module):
         return self._select_decode(q, raw_k, positions, cos_sin_at, md, load, store, slot_mapping, cache, rpb)
 
     @staticmethod
-    def _decode_rows(md: object, positions: torch.Tensor, load: torch.Tensor, store: torch.Tensor):
-        """``(bs, lens, T_cols, valid, load_rows, store_rows)`` of a decode step's ``T`` rows (``_select_decode``)."""
+    def _decode_rows(md: object, positions: torch.Tensor, load: torch.Tensor, store: torch.Tensor,
+                     shared: bool = False):
+        """``(bs, lens, T_cols, valid, load_rows, store_rows)`` of a decode step's ``T`` rows (``_select_decode``).
+
+        ``shared`` (modes 1 and 2): the layer-independent part is built once per step (``step_cached``).
+        """
         T = int(positions.numel())
-        qsl = getattr(md, "query_start_loc_p", None)
-        if qsl is not None and int(qsl.numel()) >= 2:
-            bs = int(qsl.numel()) - 1
-            lens = (qsl[1:].long() - qsl[:bs].long()).to(device=positions.device)
-        else:
-            bs, lens = int(load.numel()), None
-        T_cols = T // bs
-        if lens is None:
-            valid = torch.ones(T, dtype=torch.bool, device=positions.device)
-        else:
-            cols = torch.arange(T, device=positions.device)
-            valid = (cols % T_cols) < lens.repeat_interleave(T_cols)
+
+        def layout():
+            qsl = getattr(md, "query_start_loc_p", None)
+            if qsl is not None and int(qsl.numel()) >= 2:
+                bs = int(qsl.numel()) - 1
+                lens = (qsl[1:].long() - qsl[:bs].long()).to(device=positions.device)
+            else:
+                bs, lens = int(load.numel()), None
+            T_cols = T // bs
+            if lens is None:
+                valid = torch.ones(T, dtype=torch.bool, device=positions.device)
+            else:
+                cols = torch.arange(T, device=positions.device)
+                valid = (cols % T_cols) < lens.repeat_interleave(T_cols)
+            return bs, lens, T_cols, valid
+
+        bs, lens, T_cols, valid = (step_cached(md, ("layout", T, int(load.numel())), layout)
+                                   if shared else layout())
         # ``load``/``store`` carry one slot per state row: the [groups, bs] form
         # repeats each request's slot over its rows, the lattice form already
         # is one slot per row (see ``_state_indices``).
@@ -399,16 +410,18 @@ class HpuQsaIndexer(nn.Module):
         if store is None:
             store = load
         slot_mapping = md.slot_mapping.reshape(-1)[:T]
-        bs, lens, T_cols, valid, load_rows, store_rows = self._decode_rows(md, positions, load, store)
+        bs, lens, T_cols, valid, load_rows, store_rows = self._decode_rows(md, positions, load, store, shared=True)
         rows = rows_table(positions, slot_mapping, load_rows, store_rows, valid)
         cache = self.compressed_key_cache
         q_idx = qsa_index_prepare(self._key_ring_flat, cache, owned(qk), rows, self.q_layernorm.weight,
                                   self.k_layernorm.weight, owned(cos_sin), self.eps, H, self._key_ring_rows, ratio)
         rpb = int(md.block_size) // ratio
         blocks_sel = select_blocks_request_major(q_idx.view(T, H, D), positions, md.block_table, lens, bs, T_cols, cache,
-                                                 rpb, ratio, self.block_topk, self.shard_mode)
-        slots, valid_cols = qsa_index_emit(owned(blocks_sel), positions.to(torch.int32, copy=True),
-                                           owned(md.block_table.to(torch.int32)), ratio, int(md.block_size))
+                                                 rpb, ratio, self.block_topk, self.shard_mode, md=md,
+                                                 use_topk_kernels=self.fused_mode is QsaFusedMode.KERNELS_TOPK)
+        positions32, table32 = step_cached(
+            md, ("emit_inputs", T), lambda: (positions.to(torch.int32, copy=True), owned(md.block_table.to(torch.int32))))
+        slots, valid_cols = qsa_index_emit(owned(blocks_sel), positions32, table32, ratio, int(md.block_size))
         return QsaDecodeSelection(slots, valid_cols)
 
     def _select_decode(
@@ -451,7 +464,8 @@ class HpuQsaIndexer(nn.Module):
         D, ratio = self.index_head_dim, self.compress_ratio
         topk = self.block_topk
         T = int(positions.numel())
-        bs, lens, T_cols, valid, load_rows, store_rows = self._decode_rows(md, positions, load, store)
+        shared = self.fused_mode is not QsaFusedMode.OFF
+        bs, lens, T_cols, valid, load_rows, store_rows = self._decode_rows(md, positions, load, store, shared=shared)
         scratch = torch.full((T,), self.key_ring_slots - 1, dtype=torch.long, device=positions.device)
         ring_write(self._key_ring_flat, torch.where(valid, store_rows, scratch), positions, raw_k,
                    rows=self._key_ring_rows)
@@ -471,7 +485,7 @@ class HpuQsaIndexer(nn.Module):
             # One key gather per request for all its rows, optionally this rank's requests only
             # (qsa_fused_path): the same scores, the same top-k, without the [T, N] gather.
             blocks_sel = select_blocks_request_major(q, positions, md.block_table, lens, bs, T_cols, cache, rpb, ratio,
-                                                     topk, self.shard_mode)
+                                                     topk, self.shard_mode, md=md)
             return expand_selection(blocks_sel, positions, ratio)
         MB = int(md.block_table.shape[1])
         n = MB * rpb

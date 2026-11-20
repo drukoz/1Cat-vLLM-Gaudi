@@ -151,3 +151,90 @@ def test_mode_two_falls_back_off_hpu(world):
     got = indexer.select(hidden, md.positions, csa, md, cos_sin=table)
     assert not isinstance(got, QsaDecodeSelection)
     assert "device cpu" in indexer.kernels_off_reason
+
+
+@pytest.mark.parametrize("ties", [False, True])
+def test_topk_reference_equals_select_blocks(ties):
+    """threshold + select (mode 3) == select_blocks as sets; with ties at the cut, the lowest blocks win."""
+    from tests.unit_tests.qsa_fused.qsa_reference import qsa_index_topk_ref
+    from vllm_gaudi.models.qwen4_exp.qsa_sparse_ops import select_blocks, visible_blocks
+    gen = torch.Generator().manual_seed(11)
+    T, N = 12, 1024
+    if ties:  # relu sums: exact zeros, and a coarse grid of equal scores at the cut
+        scores = (torch.relu(torch.randn(T, N, generator=gen)) * 4).round() / 12
+    else:  # continuous and positive: no two scores are equal
+        scores = torch.rand(T, N, generator=gen) + 0.01
+    positions = torch.tensor([3, 2047, 2051, 4095, 100, 0, -1, 3000, 2500, 2048, 4000, 1999])
+    got = qsa_index_topk_ref(scores, positions, RATIO, 512)
+    want = select_blocks(scores, visible_blocks(positions, RATIO), 512)
+    keys = scores.view(torch.int32) & 0x7FFFFFFF
+    for t in range(T):
+        g = {int(b) for b in got[t] if b >= 0}
+        w = {int(b) for b in want[t] if b >= 0}
+        assert len(g) == len(w)
+        assert got[t][got[t] >= 0].tolist() == sorted(g), "ascending order"
+        if not ties:
+            assert g == w, t
+        else:
+            visible = int(visible_blocks(positions[t:t + 1], RATIO)[0])
+            if visible > 512:  # the same keys above the cut; at the cut the lowest blocks
+                k = keys[t, :visible]
+                theta = int(torch.sort(k, descending=True).values[511])
+                above = {n for n in range(visible) if int(k[n]) > theta}
+                at_cut = [n for n in range(visible) if int(k[n]) == theta][:512 - len(above)]
+                assert g == above | set(at_cut), t
+
+
+@pytest.mark.parametrize("name", sorted(CASES))
+def test_mode_three_selects_the_same_set(world, name, monkeypatch):
+    """Mode 3 (the top-k kernels' references as CPU kernels) selects mode 2's blocks except among scores equal at
+    the cut (the lowest blocks win there; torch.topk's choice is open), and K4 maps them the same way."""
+    monkeypatch.setattr(qsa_fused_path, "KERNEL_DEVICE_TYPES", ["hpu", "cpu"])
+    recorded = {"scores": [], "blocks": []}
+    real_score, real_select, real_topk = (qsa_fused_path.score_request_major, qsa_fused_path.select_blocks,
+                                          qsa_fused_path.topk_kernels)
+
+    def score(*a, **k):
+        out = real_score(*a, **k)
+        recorded["scores"].append(out)
+        return out
+
+    def select(*a, **k):
+        out = real_select(*a, **k)
+        recorded["blocks"].append(out)
+        return out
+
+    def topk(*a, **k):
+        out = real_topk(*a, **k)
+        recorded["blocks"].append(out)
+        return out
+
+    monkeypatch.setattr(qsa_fused_path, "score_request_major", score)
+    monkeypatch.setattr(qsa_fused_path, "select_blocks", select)
+    monkeypatch.setattr(qsa_fused_path, "topk_kernels", topk)
+    indexer, md, hidden, table, requests, t_cols = setup_case(name)
+    csa = lambda p: table[p.clamp_min(0)].chunk(2, dim=-1)  # noqa: E731
+    ring0, cache0 = indexer._key_ring_flat.clone(), indexer.compressed_key_cache.clone()
+    indexer.fused_mode, indexer.shard_mode = QsaFusedMode.KERNELS, QsaShardMode.REPLICATED
+    two = indexer.select(hidden, md.positions, csa, md, cos_sin=table)
+    indexer._key_ring_flat.copy_(ring0)
+    indexer.compressed_key_cache.copy_(cache0)
+    indexer.fused_mode = QsaFusedMode.KERNELS_TOPK
+    three = indexer.select(hidden, md.positions, csa, md, cos_sin=table)
+    assert isinstance(two, QsaDecodeSelection) and isinstance(three, QsaDecodeSelection)
+    scores2, scores3 = recorded["scores"]
+    assert torch.equal(scores2, scores3)
+    blocks2, blocks3 = recorded["blocks"]
+    keys = scores2.view(torch.int32) & 0x7FFFFFFF
+    visible = ((md.positions + 1) // RATIO).clamp(0, scores2.shape[1])
+    tied_rows = 0
+    for t in real_rows(requests, t_cols):
+        a = {int(b) for b in blocks2[t] if b >= 0}
+        b = {int(x) for x in blocks3[t] if x >= 0}
+        assert len(a) == len(b), t
+        if a != b:  # only blocks whose score equals the score at the cut may differ
+            k = keys[t, :int(visible[t])]
+            theta = int(torch.sort(k, descending=True).values[indexer.block_topk - 1])
+            assert all(int(k[n]) == theta for n in a ^ b), t
+            tied_rows += 1
+    assert tied_rows < len(real_rows(requests, t_cols))

@@ -222,13 +222,13 @@ def _load_moe_glue_if_requested(flag: int, warn=None) -> bool | None:
 
 
 def _load_qsa_fused_if_requested(flag: int, warn=None) -> bool | None:
-    """With VLLM_HPU_QSA_FUSED=2, load the fused QSA decode kernels and warn once when they are not usable.
+    """With VLLM_HPU_QSA_FUSED=2 or 3, load the fused QSA decode kernels and warn once when they are not usable.
 
-    Returns the loader's result, or ``None`` when the flag is not 2: then nothing is imported, loaded or logged.
+    Returns the loader's result, or ``None`` when the flag is not 2 or 3: then nothing is imported, loaded or logged.
     Before warmup, for the reason of the hyper-connection loader (GC_KERNEL_PATH). The loader never raises; the
     QSA layers then run the mode-1 torch data flow (qsa_fused_path).
     """
-    if flag != 2:
+    if flag not in (2, 3):
         return None
     from flashinfer_gaudi._native import load_qsa_fused_extension, qsa_fused_extension_errors
 
@@ -275,7 +275,7 @@ def register_ops():
     _load_hc_fused_if_requested(_gaudi_envs.VLLM_HPU_HC_FUSED)
     # The fused MoE glue kernels, only with VLLM_HPU_MOE_GLUE=1 (default 0: nothing happens here).
     _load_moe_glue_if_requested(_gaudi_envs.VLLM_HPU_MOE_GLUE)
-    # The fused QSA decode kernels, only with VLLM_HPU_QSA_FUSED=2 (default 0: nothing happens here).
+    # The fused QSA decode kernels, only with VLLM_HPU_QSA_FUSED=2 or 3 (default 0: nothing happens here).
     _load_qsa_fused_if_requested(_gaudi_envs.VLLM_HPU_QSA_FUSED)
     # One line per process with what the loader decided (state, GC_KERNEL_PATH, combined database, errors):
     # the server log then shows which kernel database every worker really runs.

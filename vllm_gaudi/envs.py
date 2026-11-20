@@ -529,7 +529,7 @@ if TYPE_CHECKING:
     VLLM_HPU_FUSED_GREEDY_LOGITS: bool = False
     VLLM_HPU_FLASH_NEXT_QSA_MODE: int = 0
     VLLM_HPU_FLASH_NEXT_QSA_PREFILL_TILE: int = 2048
-    VLLM_HPU_QSA_FUSED: int = 0  # QsaFusedMode: 0 torch QSA decode (default), 1 torch data flow, 2 TPC kernels
+    VLLM_HPU_QSA_FUSED: int = 0  # QsaFusedMode: 0 torch (default), 1 torch data flow, 2 TPC kernels, 3 + top-k kernels
     VLLM_HPU_QSA_INDEXER_SHARD: int = 0  # QsaShardMode: 0 replicated decode indexer (default), 1 by request
     VLLM_HPU_GDN_CORE_DECODE: int = 1  # GdnCoreDecodeMode: 1 fused (default), 0 off, 2 recurrence
     VLLM_HPU_GDN_CORE_DECODE_DEBUG: int = 0  # GdnCoreDecodeDebug: 0 off, 1 check slot indices every step (host sync)
@@ -1877,8 +1877,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # request's compressed keys once for all its rows (one whole-block gather per request, not one
     # [rows, N] gather per row) and the attention folds the grouped query heads into the GEMM instead
     # of repeating K and V. 2 = mode 1 plus the TPC kernels of flashinfer_gaudi.qsa_fused (each piece
-    # falls back to its mode-1 torch form with one log line). Any other value is 0. Read once per
-    # layer at construction; see docs/design/flash-next/qsa-fused.md.
+    # falls back to its mode-1 torch form with one log line). 3 = mode 2 plus the top-k kernels
+    # (threshold + select): the same selected set except at ties at the cut, which go to the lowest
+    # block, in ascending block order. Any other value is 0. Read once per layer at construction; see
+    # docs/design/flash-next/qsa-fused.md.
     "VLLM_HPU_QSA_FUSED":
     lambda: int(os.environ.get("VLLM_HPU_QSA_FUSED", "0")),
 

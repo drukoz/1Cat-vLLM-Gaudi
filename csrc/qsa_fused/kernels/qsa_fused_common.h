@@ -93,3 +93,51 @@ static inline bfloat128 qsa_rope(bfloat128 y, bfloat128 cs, int r2)
     const bfloat128 high = qsa_bf16_add(first, second);
     return qsa_bf16_select_lanes_below(r2, low, qsa_bf16_select_lanes_below(2 * r2, high, y));
 }
+
+// ---------------------------------------------------------------------------------------------------------
+// Selection bitmaps (qsa_fused_threshold / qsa_fused_select): the lane packing and the lane sum of the
+// card-proven DeepSeek V4.1 index kernels (csrc/deepseek_v4/include/deepseek_v41_selection_bitmap.h and
+// kernels/deepseek_v41_index_threshold_gaudi2.c), copied: word j of pack_words(pack_half(a), pack_half(b)) holds
+// the predicate of lanes 32 j .. 32 j + 31 of the 128 lanes a (0..63) and b (64..127), bit (lane % 32).
+// ---------------------------------------------------------------------------------------------------------
+static inline uint64 qsa_pack_half(bool64 predicate)
+{
+    const uint64 lanes = (uint64)V_LANE_ID_32;
+    uint64 bits = v_u32_mov_vb((uint64)1 << (lanes & 31), 0, (uint64)0, predicate, 0);
+    bits |= v_u32_mov_dual_group_all_b(bits, 0xffffffff, 1, 0, 3, 2, MkWrA(3, 3, 3, 3), 0);
+    bits |= v_u32_mov_group_b(bits, 0xffffffff, 63, 0);
+#pragma loop_unroll(3)
+    for (int shift = 4; shift > 0; shift >>= 1) {
+        const uint64 mask = (((lanes & 7) ^ shift) | 0x80) * 0x01010101;
+        bits |= v_u32_shuffle_b(bits, *((const uchar256*)&mask), 0, 0);
+    }
+    return bits;
+}
+
+static inline uint64 qsa_pack_words(uint64 first, uint64 second)
+{
+    uint64 words = v_u32_mov_dual_group_b(first, 0x000000f0, 2, 0, SW_WR_LOWER_GROUP, first);
+    words = v_u32_mov_dual_group_b(second, 0x00000f00, 0, 0, SW_WR_LOWER_GROUP, words);
+    return v_u32_mov_dual_group_b(second, 0x0000f000, 2, 0, SW_WR_LOWER_GROUP, words);
+}
+
+// The sum over the 64 lanes of `value`, in every lane (integer shuffles: no lookup table, no local memory).
+static inline int64 qsa_sum_broadcast(int64 value)
+{
+    value += v_i32_mov_dual_group_all_b(value, 0xffffffff, 1, 0, 3, 2, MkWrA(3, 3, 3, 3), 0);
+    value += v_i32_mov_dual_group_all_b(value, 0xffffffff, 2, 3, 0, 1, MkWrA(3, 3, 3, 3), 0);
+    value += v_i32_mov_group_b(value, 0xffffffff, 63, 0);
+#pragma loop_unroll(3)
+    for (int shift = 4; shift > 0; shift >>= 1) {
+        const uint64 mask = ((((uint64)V_LANE_ID_32 & 7) ^ shift) | 0x80) * 0x01010101;
+        value += v_i32_shuffle_b(value, *((const uchar256*)&mask), 0, 0);
+    }
+    return value;
+}
+
+// The order key of a block score: its fp32 bits without the sign bit. Scores are relu sums (>= +0; -0 maps to +0),
+// so the integer order is the float order; NaN sorts above +inf, as torch.topk puts NaN first.
+static inline int64 qsa_score_key(float64 score)
+{
+    return as_int64(score) & 0x7fffffff;
+}

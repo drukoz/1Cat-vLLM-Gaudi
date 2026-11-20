@@ -5,7 +5,7 @@
 // argv[1] is one case folder written by tests/unit_tests/qsa_fused/qsa_case.py: case.txt plus one raw
 // little-endian <name>.bin per input tensor.  case.txt lines:
 //   guid <kernel guid>
-//   eps <float> / heads / ring_rows / ratio / block_size / rotary_half <int>   the QsaFusedParams fields
+//   eps <float> / heads / ring_rows / ratio / block_size / rotary_half / topk <int>   the QsaFusedParams fields
 //   in    <name> <dtype> <dim0> <dim1> ...                  TPC dims, fastest first
 //   inout <name> <dtype> <dim0> <dim1> ...                  an input the kernel writes in place (its
 //                                                           contents after the run go to <name>.out.bin)
@@ -155,6 +155,8 @@ int main(int argc, char** argv)
                 line >> scalar.block_size;
             } else if (key == "rotary_half") {
                 line >> scalar.rotary_half;
+            } else if (key == "topk") {
+                line >> scalar.topk;
             } else if (key == "in" || key == "inout" || key == "out") {
                 TensorSpec spec;
                 std::string type;

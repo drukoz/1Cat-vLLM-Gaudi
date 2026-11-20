@@ -19,7 +19,8 @@ if not load_qsa_fused_extension():
     pytest.skip("qsa_fused_ops extension is not loaded: " + "; ".join(qsa_fused_extension_errors()),
                 allow_module_level=True)
 
-from flashinfer_gaudi.qsa_fused import qsa_fused_missing_ops, qsa_index_emit, qsa_index_prepare  # noqa: E402
+from flashinfer_gaudi.qsa_fused import (qsa_fused_missing_ops, qsa_index_emit, qsa_index_prepare,  # noqa: E402
+                                        qsa_index_select, qsa_index_threshold)
 from tests.unit_tests.qsa_fused.qsa_case import EPS, HPU_CASES, case_by_name, compare, make_inputs, summary  # noqa: E402
 
 
@@ -29,6 +30,10 @@ def _run(case, inputs: dict) -> dict:
         q = qsa_index_prepare(hpu["key_ring"], hpu["key_cache"], hpu["qk"], hpu["rows"], hpu["q_norm_weight"],
                               hpu["k_norm_weight"], hpu["cos_sin"], EPS, case.heads, case.ring_rows, case.ratio)
         return {"key_ring": hpu["key_ring"].cpu(), "key_cache": hpu["key_cache"].cpu(), "q_idx": q.cpu()}
+    if case.kernel == "threshold":
+        return {"meta": qsa_index_threshold(hpu["scores"], hpu["positions"], case.ratio, case.topk).cpu()}
+    if case.kernel == "select":
+        return {"blocks": qsa_index_select(hpu["meta"], case.topk).cpu()}
     slots, valid = qsa_index_emit(hpu["blocks"], hpu["positions"], hpu["block_table"], case.ratio, case.block_size)
     return {"slots": slots.cpu(), "valid": valid.cpu()}
 

@@ -72,8 +72,10 @@ ship in `libqsa_fused_gaudi2.so` with the extension `qsa_fused_ops*.so`, built b
 (`QSA_FUSED_GAUDI_KERNEL_LIBRARY` and `QSA_FUSED_GAUDI_NATIVE_LIBRARY` name the two
 files when they are not in the package's `lib` folder). When they do not load the
 plugin logs one warning at startup, and a layer they cannot serve logs `QSA fused
-... is off for <layer>: <reason>` and runs mode `1`. Any other value is `0`. See
-`docs/design/flash-next/qsa-fused.md`.
+... is off for <layer>: <reason>` and runs mode `1`. `3` is mode `2` plus two more
+kernels, `qsa_index_threshold` and `qsa_index_select`, in place of `torch.topk`: the
+same selected blocks except among scores equal at the cut, where the lowest blocks
+win. Any other value is `0`. See `docs/design/flash-next/qsa-fused.md`.
 
 `VLLM_HPU_QSA_INDEXER_SHARD` (with `VLLM_HPU_QSA_FUSED` `1` or `2`): `0` (default)
 scores every decode row on every TP rank; `1` scores each rank's share of the

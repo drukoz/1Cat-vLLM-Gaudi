@@ -45,11 +45,12 @@ from vllm_gaudi.models.qwen4_exp.qsa_sparse_ops import select_blocks, visible_bl
 
 
 class QsaFusedMode(enum.IntEnum):
-    """``VLLM_HPU_QSA_FUSED`` (next free: 3)."""
+    """``VLLM_HPU_QSA_FUSED`` (next free: 4)."""
 
     OFF = 0  # the torch path of today
     TORCH = 1  # the restructured torch data flow (this module)
     KERNELS = 2  # TORCH plus the TPC kernels (flashinfer_gaudi.qsa_fused), each with its torch fallback
+    KERNELS_TOPK = 3  # KERNELS plus the top-k kernels (threshold + select): ties at the cut to the lowest block
 
 
 class QsaShardMode(enum.IntEnum):
@@ -73,6 +74,28 @@ def qsa_shard_mode() -> QsaShardMode:
         return QsaShardMode(int(envs.VLLM_HPU_QSA_INDEXER_SHARD))
     except ValueError:
         return QsaShardMode.REPLICATED
+
+
+# What the QSA layers of one forward share: keyed by the step's attention metadata object (one per forward; the
+# runner's trimmed namedtuple cannot carry attributes, so the cache holds the object until the next step's).
+_STEP_MD: object | None = None
+_STEP_CACHE: dict = {}
+
+
+def step_cached(md: object, key: tuple, build):
+    """``build()`` once per step metadata ``md`` and ``key``: the layer-independent glue of a decode step.
+
+    Every QSA layer of a forward gets the same ``md`` and the same positions, so the row validity, the request
+    tables, the int32 copies the kernels take and the visible-block counts are built by the first layer and
+    reused by the other eleven (fewer graph nodes; the values are the same). A new ``md`` (the next step, a draft
+    step, a warmup run) starts a new cache. Modes 1 and 2 only.
+    """
+    global _STEP_MD, _STEP_CACHE
+    if md is not _STEP_MD:
+        _STEP_MD, _STEP_CACHE = md, {}
+    if key not in _STEP_CACHE:
+        _STEP_CACHE[key] = build()
+    return _STEP_CACHE[key]
 
 
 def request_table_rows(lens: torch.Tensor | None, bs: int, t_cols: int, device: torch.device) -> torch.Tensor:
@@ -134,9 +157,16 @@ def all_gather_rows(x: torch.Tensor) -> torch.Tensor:
     return tensor_model_parallel_all_gather(x, dim=0)
 
 
+def topk_kernels(scores: torch.Tensor, positions32: torch.Tensor, ratio: int, topk: int) -> torch.Tensor:
+    """Mode 3: ``select_blocks`` as the two TPC kernels (threshold, select): ascending ids, ties to the lowest block."""
+    from flashinfer_gaudi.qsa_fused import qsa_index_select, qsa_index_threshold
+    return qsa_index_select(qsa_index_threshold(owned(scores), positions32, ratio, topk), topk)
+
+
 def select_blocks_request_major(q: torch.Tensor, positions: torch.Tensor, block_table: torch.Tensor,
                                 lens: torch.Tensor | None, bs: int, t_cols: int, cache: torch.Tensor, rpb: int,
-                                ratio: int, topk: int, shard: QsaShardMode) -> torch.Tensor:
+                                ratio: int, topk: int, shard: QsaShardMode, md: object | None = None,
+                                use_topk_kernels: bool = False) -> torch.Tensor:
     """int32 ``[T, topk]`` selected block indices (``-1`` padded) of the ``T = bs * T_cols`` decode rows.
 
     The scoring and top-k of ``_select_decode`` in the request-major form (``score_request_major``),
@@ -145,17 +175,40 @@ def select_blocks_request_major(q: torch.Tensor, positions: torch.Tensor, block_
     """
     T = int(positions.numel())
     heads, dim = int(q.shape[1]), int(q.shape[2])
-    rows = request_table_rows(lens, bs, t_cols, positions.device)
-    table = block_table.to(torch.int32).index_select(0, rows)  # [bs, MB]
+
+    def shared(key, build):
+        return build() if md is None else step_cached(md, key, build)
+
+    def request_table():
+        if t_cols == 1:  # one row per request: its own table row is the request's table
+            return block_table.to(torch.int32)
+        return block_table.to(torch.int32).index_select(0, request_table_rows(lens, bs, t_cols, positions.device))
+
+    n_keys = int(block_table.shape[1]) * rpb
+    use_topk_kernels = use_topk_kernels and n_keys % 128 == 0  # the threshold kernel's gate
+
     rank, world, per = shard_requests(bs, shard)
     if world == 1:
+        table = shared(("request_table", bs, t_cols), request_table)
         scores = score_request_major(q, cache, table, rpb, t_cols)
-        return select_blocks(scores, visible_blocks(positions, ratio), topk)
-    mine = torch.arange(rank * per, (rank + 1) * per, dtype=torch.int32, device=positions.device)
+        if use_topk_kernels:
+            positions32 = shared(("positions32", T), lambda: positions.to(torch.int32, copy=True))
+            return topk_kernels(scores, positions32, ratio, topk)
+        visible = shared(("visible", T, ratio), lambda: visible_blocks(positions, ratio))
+        return select_blocks(scores, visible, topk)
+
+    def my_share():
+        mine = torch.arange(rank * per, (rank + 1) * per, dtype=torch.int32, device=positions.device)
+        pos_mine = positions.reshape(bs, t_cols).index_select(0, mine).reshape(-1)
+        return mine, request_table().index_select(0, mine), visible_blocks(pos_mine, ratio), pos_mine.to(torch.int32)
+
+    mine, table_mine, visible_mine, pos32_mine = shared(("share", bs, t_cols, rank, world, ratio), my_share)
     q_mine = q.reshape(bs, t_cols, heads, dim).index_select(0, mine).reshape(per * t_cols, heads, dim)
-    pos_mine = positions.reshape(bs, t_cols).index_select(0, mine).reshape(-1)
-    scores = score_request_major(q_mine, cache, table.index_select(0, mine), rpb, t_cols)
-    local = select_blocks(scores, visible_blocks(pos_mine, ratio), topk)  # [per * T_cols, topk]
+    scores = score_request_major(q_mine, cache, table_mine, rpb, t_cols)
+    if use_topk_kernels:
+        local = topk_kernels(scores, owned(pos32_mine), ratio, topk)
+    else:
+        local = select_blocks(scores, visible_mine, topk)  # [per * T_cols, topk]
     gathered = all_gather_rows(local)
     if int(gathered.shape[0]) != T:
         raise RuntimeError(f"QSA sharded indexer gathered {int(gathered.shape[0])} rows for {T}")
@@ -260,5 +313,7 @@ __all__ = [
     "score_request_major",
     "select_blocks_request_major",
     "shard_requests",
+    "step_cached",
+    "topk_kernels",
     "tp_rank_and_size",
 ]

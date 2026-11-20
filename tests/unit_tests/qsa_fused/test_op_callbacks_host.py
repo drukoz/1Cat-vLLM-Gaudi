@@ -30,12 +30,15 @@ REPO = HERE.parents[2]
 POSITIVES = {
     "prepare/real": ("qsa_index_prepare",
                      ["bf16:96,128", "bf16:1024,128", "bf16:32,640", "i32:32,4", "bf16:128", "bf16:128",
-                      "bf16:4096,64"], ["f:1e-06", "i:4", "i:4", "i:4"], ("<fiiiii", 1e-6, 4, 4, 4, 0, 32)),
+                      "bf16:4096,64"], ["f:1e-06", "i:4", "i:4", "i:4"], ("<fiiiiii", 1e-6, 4, 4, 4, 0, 32, 0)),
     "prepare/tiny_k3": ("qsa_index_prepare",
                         ["bf16:64,16", "bf16:256,16", "bf16:8,80", "i32:8,4", "bf16:16", "bf16:16", "bf16:4096,8"],
-                        ["f:1e-06", "i:4", "i:8", "i:4"], ("<fiiiii", 1e-6, 4, 8, 4, 0, 4)),
+                        ["f:1e-06", "i:4", "i:8", "i:4"], ("<fiiiiii", 1e-6, 4, 8, 4, 0, 4, 0)),
     "emit/real": ("qsa_index_emit", ["i32:32,512", "i32:32", "i32:32,1024"], ["i:4", "i:128"],
-                  ("<fiiiii", 0.0, 0, 0, 4, 128, 0)),
+                  ("<fiiiiii", 0.0, 0, 0, 4, 128, 0, 0)),
+    "threshold/real": ("qsa_index_threshold", ["f32:32,32768", "i32:32"], ["i:4", "i:512"],
+                       ("<fiiiiii", 0.0, 0, 0, 4, 0, 0, 512)),
+    "select/real": ("qsa_index_select", ["i32:32,2052"], ["i:512"], ("<fiiiiii", 0.0, 0, 0, 0, 0, 0, 512)),
 }
 NEGATIVES = {
     "neg/prepare_dim_too_large": ("qsa_index_prepare", ["bf16:96,256", "bf16:1024,256", "bf16:32,1280", "i32:32,4",
@@ -57,6 +60,9 @@ NEGATIVES = {
     "neg/emit_block_size": ("qsa_index_emit", ["i32:32,512", "i32:32", "i32:32,1024"], ["i:4", "i:100"],
                             "block_size"),
     "neg/emit_f32_blocks": ("qsa_index_emit", ["f32:32,512", "i32:32", "i32:32,1024"], ["i:4", "i:128"], "blocks"),
+    "neg/threshold_columns": ("qsa_index_threshold", ["f32:32,1000", "i32:32"], ["i:4", "i:512"], "multiple of 128"),
+    "neg/threshold_bf16": ("qsa_index_threshold", ["bf16:32,1024", "i32:32"], ["i:4", "i:512"], "scores"),
+    "neg/select_width": ("qsa_index_select", ["i32:32,101"], ["i:512"], "meta"),
 }
 
 
@@ -124,7 +130,7 @@ def test_callbacks(name, parsed):
     names = {torch.bfloat16: "bf16", torch.int32: "i32"}
     assert line["outputs"] == [f"{names[m.dtype]}:{','.join(str(d) for d in m.shape)}" for m in meta]
     assert line["guid"] == qsa_fused.GUIDS[op]
-    assert line["size"] == 24
+    assert line["size"] == 28
     assert line["hex"] == struct.pack(*packed).hex()
 
 

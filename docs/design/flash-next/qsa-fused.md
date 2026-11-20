@@ -9,6 +9,7 @@ Version 2, 2026-11-20. The sparse QSA decode path of Flash-Next (`vllm_gaudi/mod
 | 0 | the torch path as before (nothing of this page is imported, loaded or logged) |
 | 1 | the restructured **torch data flow**: one key gather per request (I14), the grouped attention (I21, G5-1), and with `VLLM_HPU_QSA_INDEXER_SHARD=1` the indexer scored by request on each TP rank (I18) |
 | 2 | mode 1 plus two **TPC kernels**: `qsa_index_prepare` (K1) and `qsa_index_emit` (K4); each layer falls back to mode 1 with one log line when the kernels cannot serve it |
+| 3 | mode 2 plus the **top-k kernels** `qsa_index_threshold` (K3a) and `qsa_index_select` (K3b) in place of `torch.topk`: the same selected set except among scores equal at the cut, where the lowest blocks win; blocks in ascending order |
 
 Status words: **VERIFIED** (by the named test, probe or source line) and **INFERRED** (reasoned, not measured).
 Nothing here has run on a card yet; "Unproven without a card" lists what that leaves open. Version 1 of this page
@@ -54,6 +55,19 @@ registered as the ops' CPU kernels, one node per op as on the card):
 Mode 2 by stage at 32 rows: the row table and K1 31 ops (the ring, cache and query work is one node), the
 request-major scores and top-k 36, K4 1, the attention 41 (cache write, gather, grouped GEMMs, softmax), the
 layer's projections, norms, RoPE and gate 29.
+
+The layer-independent glue of a step (row validity, the request tables, the visible-block counts, the int32
+copies K4 takes) is built by the first QSA layer of a forward and reused by the other eleven
+(`qsa_fused_path.step_cached`, keyed by the step's metadata object). `HpuQsaIndexer.select` alone, first layer /
+each later layer of a step (`reports/qsa-fused/measure/step_cache_ops.py`, VERIFIED):
+
+| `select`, ops (compute) | 32 x 1 rows | 32 x 4 rows |
+|---|---|---|
+| mode 0 | 174 (124) / 174 (124) | 182 (126) / 182 (126) |
+| mode 1 | 162 (117) / 148 (108) | 177 (126) / 156 (110) |
+| mode 2 | 65 (37) / 50 (27) | 80 (46) / 58 (29) |
+
+Per step at 32 x 1 rows the indexer goes from 2,088 ops (1,488 compute) to 615 (334) in mode 2.
 
 ### Bytes: the block table is as wide as the engine's longest context
 
@@ -177,18 +191,18 @@ the prefill attention (they share the side caches with the kernels, in the same 
 
 | What | Name |
 |---|---|
-| Ops | `torch.ops.flashinfer_gaudi.qsa_index_prepare`, `qsa_index_emit` |
+| Ops | `torch.ops.flashinfer_gaudi.qsa_index_prepare`, `qsa_index_emit`, `qsa_index_threshold`, `qsa_index_select` |
 | Schemas, fake kernels, wrappers (the only definition) | `flashinfer_gaudi/qsa_fused.py`; imported only with the flag at 2 |
 | Torch references (the executable definition) | `tests/unit_tests/qsa_fused/qsa_reference.py` |
 | CPU stand-in (the references as the ops' CPU kernels) | `tests/unit_tests/qsa_fused/qsa_ops.py` |
 | Data flow of modes 1 and 2 | `vllm_gaudi/models/qwen4_exp/qsa_fused_path.py`; `HpuQsaIndexer.select` / `_select_decode_kernels`; `HpuQsaSparseAttention.forward` |
-| TPC kernels | `csrc/qsa_fused/kernels/qsa_fused_{prepare,emit}_gaudi2.c` + `qsa_fused_common.h` |
-| GUIDs | `qsa_fused_prepare_bf16_gaudi2`, `qsa_fused_emit_i32_gaudi2` (`csrc/qsa_fused/qsa_fused_params.h`) |
+| TPC kernels | `csrc/qsa_fused/kernels/qsa_fused_{prepare,emit,threshold,select}_gaudi2.c` + `qsa_fused_common.h` |
+| GUIDs | `qsa_fused_prepare_bf16_gaudi2`, `qsa_fused_emit_i32_gaudi2`, `qsa_fused_threshold_f32_gaudi2`, `qsa_fused_select_i32_gaudi2` (`csrc/qsa_fused/qsa_fused_params.h`) |
 | Kernel database | `libqsa_fused_gaudi2.so` (CMake target `qsa_fused_gaudi2`); its own library; a member of the combined kernel database (`csrc/kernel_db_adapter/adapter.cpp`) |
 | Host glue | `csrc/qsa_fused/host/qsa_fused_gaudi2.cpp`, `host/entry_points.cpp` |
 | PyTorch extension | `qsa_fused_ops*.so` (`csrc/qsa_fused/pytorch/hpu_qsa_fused.cpp`, `setup.py`); registers only the `HPU` kernels |
 | Loader | `flashinfer_gaudi/_native.py::load_qsa_fused_extension`, `qsa_fused_extension_errors`, `qsa_fused_extension_loaded`; overrides `QSA_FUSED_GAUDI_KERNEL_LIBRARY`, `QSA_FUSED_GAUDI_NATIVE_LIBRARY`; called by `vllm_gaudi/__init__.py::_load_qsa_fused_if_requested` |
-| Flags | `VLLM_HPU_QSA_FUSED` (`QsaFusedMode`: 0, 1, 2), `VLLM_HPU_QSA_INDEXER_SHARD` (`QsaShardMode`: 0, 1) in `vllm_gaudi/envs.py` |
+| Flags | `VLLM_HPU_QSA_FUSED` (`QsaFusedMode`: 0, 1, 2, 3), `VLLM_HPU_QSA_INDEXER_SHARD` (`QsaShardMode`: 0, 1) in `vllm_gaudi/envs.py` |
 | Build switch | `VLLM_GAUDI_BUILD_QSA_FUSED=1` (the rental's install sets it with the other native builds), or `tools/build_flashinfer_gaudi.py --qsa-fused-only` |
 
 ## Geometry and symbols
@@ -310,6 +324,25 @@ clamped: the kernel never reads outside its tensors). A row with `p < 0` gets va
 when `p < 0`). This is `expand_selection` + `decode_selected_slots` + `(selected >= 0) | rows_without_selection`,
 in the same column order, so the attention sums in the same order as mode 1.
 
+### K3a `qsa_index_threshold` and K3b `qsa_index_select` (mode 3)
+
+`select_blocks` (mask, `topk(512)`, int32) as two nodes. With `key(n)` the fp32 bits of `scores[t, n]` without the
+sign (scores are relu sums: `-0` maps to `+0`, NaN sorts first as in `torch.topk`) and `visible = clamp(floordiv(p
++ 1, ratio), 0, N)`:
+
+- K3a writes `meta[t]` (int32 `[4 + N / 16]`): `visible`; the threshold `theta`, the largest key with `#{n < visible
+  : key(n) >= theta} >= topk`, found bit by bit from bit 30 (31 passes over the visible scores, the count a lane
+  sum: `theta` never leaves the vector registers), or `-1` when `visible <= topk`; `G = #{key > theta}`; then a
+  "greater" and an "equal" bitmap, word `w` bit `b` for block `32 w + b`, packed with the lane packing of the
+  card-proven DeepSeek V4.1 index kernels. Words past the row's last 128-block tile are unspecified.
+- K3b reads `meta[t]` with scalar loads and writes `blocks[t]` (int32 `[topk]`): prefix mode `0 .. visible - 1`;
+  otherwise every block of the greater bitmap and the first `topk - G` blocks of the equal bitmap, in ascending
+  order. Two nodes because a kernel cannot read back what it stores.
+- `N` must be a multiple of 128 (`MB * rpb`: 32,768 at 128K, 1,024 on the tiny model); otherwise mode 3 keeps
+  `select_blocks`.
+- The blocks feed K4 unchanged; the attention then sums over the same columns in ascending block order instead of
+  `torch.topk`'s order (within the bf16 decode tolerance of the attention, not bit-exact against mode 2).
+
 ### What each mode is equal to
 
 | Quantity | Mode 1 against mode 0 (CPU) | Mode 2 with the references as kernels, against mode 1 (CPU) | TPC kernel against its reference (simulator) |
@@ -319,6 +352,7 @@ in the same column order, so the attention sums in the same order as mode 1.
 | Block scores | the same products and sums; GEMM blocking may sum in another fp32 order (bit-exact on this CPU) | the same | (torch on both sides) |
 | Selection of a real row | bit-exact on every tested case | bit-exact | (torch) |
 | `slots`, `valid` | (not formed) | bit-exact | bit-exact |
+| Selected blocks, mode 3 against mode 2 | (not formed) | the same set except among scores equal at the cut (lowest blocks win), ascending (`test_mode_three_selects_the_same_set`) | K3a meta and K3b ids bit-exact |
 | Attention output | grouped GEMM: bit-exact in bf16 on this CPU, fp32 within `1e-6` | the same as mode 1 | (torch) |
 
 VERIFIED by `test_qsa_fused_torch.py`, `test_qsa_fused_torch_tp.py`, `tests/unit_tests/qsa_fused/test_qsa_reference.py`
@@ -330,13 +364,15 @@ order other than the CPU's; a changed selection then needs two scores equal with
 Scalar arguments: K1 `float eps, inv_dim, inv_ring, inv_ratio; int heads, ring_rows, ratio, rotary_half`
 (`QsaFusedPrepareArgs`, 32 bytes, the reciprocals from the host: no kernel divides); K4 `int ratio_log2,
 block_log2, topk` (12 bytes). Node parameters: `QsaFusedParams {float eps; int32 heads, ring_rows, ratio,
-block_size, rotary_half}`, 24 bytes, the same for both GUIDs (unused fields 0; K1 derives `rotary_half` from
-`cos_sin`).
+block_size, rotary_half, topk}`, 28 bytes, the same for every GUID (unused fields 0; K1 derives `rotary_half` from
+`cos_sin`). K3a and K3b take `int ratio_log2, topk`.
 
 | Kernel | Tensors (in + out) | Index space | One point owns | Special functions | VLM |
 |---|---|---|---|---|---|
 | `qsa_fused_prepare_bf16_gaudi2` | 7 + 1 | `{T}` | one row: its `q_idx` row, its ring row, its compressed row | `rsqrt` | 0 bytes |
 | `qsa_fused_emit_i32_gaudi2` | 3 + 2 | `{T}` | one row of `slots` and `valid` | none | 0 bytes |
+| `qsa_fused_threshold_f32_gaudi2` | 2 + 1 | `{T}` | one row of `meta` | none | 0 bytes |
+| `qsa_fused_select_i32_gaudi2` | 1 + 1 | `{T}` | one row of `blocks` | none | 0 bytes |
 
 - **In-place tensors.** `key_ring` and `key_cache` are inputs K1 stores to, declared as whole tensors read by
   every point: the form the card-proven `gdn_core_decode` uses for its state pools.
@@ -346,8 +382,10 @@ block_size, rotary_half}`, 24 bytes, the same for both GUIDs (unused fields 0; K
 - **Instruction counts** (simulator, VERIFIED): K1 5.6 K words per row at the real geometry (180,746 for 32 rows)
   and 8.8 K at 32 x 4 rows (1,122,610 for 128 rows: the write-then-read search scans the 128 rows); K4 11.8 K
   words per row (378,328 for 32 rows, 1,513,048 for 128: about 23 words per selected block, four blocks' scalar
-  loads in flight; 60 with one). INFERRED at 1.5 to 2 GHz: K1 about 6 to 8 us and K4 about 12 to 16 us per layer at
-  32 rows (two rows per engine), K1 30 to 40 us and K4 35 to 50 us at 128 rows.
+  loads in flight; 60 with one). K3a 56 K words per row at `N` = 32,768 (1,793,454 for 32 rows), K3b 17 K
+  (548,895). INFERRED at 1.5 to 2 GHz: K1 about 6 to 8 us and K4 about 12 to 16 us per layer at 32 rows (two rows
+  per engine), K1 30 to 40 us and K4 35 to 50 us at 128 rows; K3a + K3b 75 to 100 us at 32 rows against 0.66 ms
+  for `torch.topk` on the card (job 00011).
 
 ## Card rules (BRIEF.md) and how each is met
 
@@ -369,8 +407,8 @@ block_size, rotary_half}`, 24 bytes, the same for both GUIDs (unused fields 0; K
 |---|---|---|
 | `pytest tests/unit_tests/models/flash_next/test_qsa_fused_torch.py` | mode 1 vs mode 0 on the tiny indexer: 1 row, 32 rows, lattice k = 3/4/5, 32 x 4, page crossing, slot moves, no `query_start_loc_p`, fp32; grouped attention vs repeat (KV 1 and 2, G 1 to 4) | see REPORT |
 | `pytest tests/unit_tests/models/flash_next/test_qsa_fused_torch_tp.py` | sharded vs replicated vs mode 0 on 1/2/4/8 gloo ranks, the collective issued | 16 passed |
-| `pytest tests/unit_tests/qsa_fused` | references vs torch path, mode 2 (references as kernels) vs mode 1, fallback, op callbacks (ASan/UBSan), reference copies | 37 passed |
-| `tools/flash_next/tpcsim.sh 'python3 -m pytest -q -p no:cacheprovider --noconftest tests/standalone/qsa_fused/test_qsa_simulation.py'` | both kernels compile with the default flags (0 bytes VLM) and match the references on 7 cases | 10 passed |
+| `pytest tests/unit_tests/qsa_fused` | references vs torch path, mode 2 (references as kernels) vs mode 1, mode 3 vs mode 2 (ties), fallback, op callbacks (ASan/UBSan), reference copies | 48 passed, 1 skipped (the card test) |
+| `tools/flash_next/tpcsim.sh 'python3 -m pytest -q -p no:cacheprovider --noconftest tests/standalone/qsa_fused/test_qsa_simulation.py'` | the four kernels compile with the default flags (0 bytes VLM) and match the references on 13 cases | 18 passed |
 
 ## Unproven without a card
 
@@ -396,8 +434,9 @@ attention. Rule 6 applies (Gaudi2 range 240).
   and widens in one pass.
 - **K4 at fewer words per block** (23 now): split a row over several index-space points (24 engines for 32 rows
   leave most engines at two rows).
-- **K3**, a radix-select threshold for the top-512 (the DeepSeek V4.1 `index_threshold` precedent), only if card
-  job `qsa-select-attn-bench` shows `torch.topk` over `[T, 32768]` costs more than the rest of the indexer.
+- **K3a across engines**: one row per point leaves 20 of 24 engines idle at 4 rows (the sharded share); split a
+  row's 31 counting passes over several points with a reduction node.
 - **Tile layout of the compressed key cache** and a TPC scan (version 1's "Next"): only worth it if the MME path
   stays bandwidth-bound above the TPC scan's cost.
-- **The row table once per step** for all 12 layers (about 20 ops per layer today), keyed to the forward's metadata.
+- **The ring-group-dependent glue once per step** (the row table's ring slots: the layers of one ring group could
+  share it too; today each layer builds it).

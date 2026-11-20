@@ -14,7 +14,7 @@ from tests.unit_tests.hc_fused.sim_build import TOOLS_INCLUDE, host_include, mis
 REPO_ROOT = Path(__file__).resolve().parents[3]
 CSRC = REPO_ROOT / "csrc" / "qsa_fused"
 STANDALONE = REPO_ROOT / "tests" / "standalone" / "qsa_fused"
-KERNELS = ("qsa_fused_prepare_gaudi2", "qsa_fused_emit_gaudi2")
+KERNELS = ("qsa_fused_prepare_gaudi2", "qsa_fused_emit_gaudi2", "qsa_fused_threshold_gaudi2", "qsa_fused_select_gaudi2")
 TPC_FLAGS = ("-Wall", "-Werror", "-O2", "-march=gaudi2")
 LIBRARY = "libqsa_fused_gaudi2.so"
 

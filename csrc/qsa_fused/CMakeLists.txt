@@ -18,7 +18,9 @@ set(HABANA_INCLUDE_DIR "/usr/include/habanalabs" CACHE PATH "Gaudi host API incl
 # calls a lookup-table special function, which leaves 16 KiB of vector local memory; it keeps none).
 set(QSA_FUSED_KERNELS
     qsa_fused_prepare_gaudi2
-    qsa_fused_emit_gaudi2)
+    qsa_fused_emit_gaudi2
+    qsa_fused_threshold_gaudi2
+    qsa_fused_select_gaudi2)
 set(QSA_FUSED_KERNEL_HEADERS "${CMAKE_CURRENT_SOURCE_DIR}/kernels/qsa_fused_common.h")
 
 set(QSA_FUSED_EMBEDDED_OBJECTS "")

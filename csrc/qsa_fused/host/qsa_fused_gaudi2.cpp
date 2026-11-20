@@ -10,6 +10,8 @@
 //            output  q_idx {H*D, T} bf16
 //   emit     inputs  blocks {topk, T} i32, positions {T} i32, block_table {MB, T} i32
 //            outputs slots {topk*ratio + ratio - 1, T} i32, valid {same} i32
+//   threshold inputs scores {N, T} f32 (N a multiple of 128), positions {T} i32; output meta {4 + N / 16, T} i32
+//   select   input   meta {4 + 2 NW, T} i32; output blocks {topk, T} i32
 
 #include <cstdint>
 #include <cstring>
@@ -20,6 +22,10 @@ extern unsigned char _binary_qsa_fused_prepare_gaudi2_o_start;
 extern unsigned char _binary_qsa_fused_prepare_gaudi2_o_end;
 extern unsigned char _binary_qsa_fused_emit_gaudi2_o_start;
 extern unsigned char _binary_qsa_fused_emit_gaudi2_o_end;
+extern unsigned char _binary_qsa_fused_threshold_gaudi2_o_start;
+extern unsigned char _binary_qsa_fused_threshold_gaudi2_o_end;
+extern unsigned char _binary_qsa_fused_select_gaudi2_o_start;
+extern unsigned char _binary_qsa_fused_select_gaudi2_o_end;
 
 namespace qsa_fused {
 namespace {
@@ -32,6 +38,8 @@ constexpr unsigned kMaxOutputs = 2;
 const KernelInfo kKernels[] = {
     {Kind::Prepare, kQsaFusedPrepareGuid, 7, 1},
     {Kind::Emit, kQsaFusedEmitGuid, 3, 2},
+    {Kind::Threshold, kQsaFusedThresholdGuid, 2, 1},
+    {Kind::Select, kQsaFusedSelectGuid, 1, 1},
 };
 
 struct Elf {
@@ -41,8 +49,17 @@ struct Elf {
 
 Elf KernelElf(Kind kind)
 {
-    if (kind == Kind::Prepare) return {&_binary_qsa_fused_prepare_gaudi2_o_start, &_binary_qsa_fused_prepare_gaudi2_o_end};
-    return {&_binary_qsa_fused_emit_gaudi2_o_start, &_binary_qsa_fused_emit_gaudi2_o_end};
+    switch (kind) {
+        case Kind::Prepare:
+            return {&_binary_qsa_fused_prepare_gaudi2_o_start, &_binary_qsa_fused_prepare_gaudi2_o_end};
+        case Kind::Emit:
+            return {&_binary_qsa_fused_emit_gaudi2_o_start, &_binary_qsa_fused_emit_gaudi2_o_end};
+        case Kind::Threshold:
+            return {&_binary_qsa_fused_threshold_gaudi2_o_start, &_binary_qsa_fused_threshold_gaudi2_o_end};
+        case Kind::Select:
+            return {&_binary_qsa_fused_select_gaudi2_o_start, &_binary_qsa_fused_select_gaudi2_o_end};
+    }
+    return {nullptr, nullptr};
 }
 
 bool PowerOfTwo(int64_t value) { return value > 0 && (value & (value - 1)) == 0; }
@@ -118,6 +135,36 @@ GlueCodeReturn Resolve(const KernelInfo& kernel, const TensorGeometry* const* in
         r.positions = cs.maxSizes[1];
         r.outputColumns[0] = static_cast<uint64_t>(s.heads) * dim;
         r.outputType[0] = DATA_BF16;
+        return GLUE_SUCCESS;
+    }
+    if (kernel.kind == Kind::Threshold) {
+        const TensorGeometry& scores = *in[0];
+        const TensorGeometry& positions = *in[1];
+        if (!Is(scores, DATA_F32, 2) || !Is(positions, DATA_I32, 1)) return GLUE_INCOMPATIBLE_DATA_TYPE;
+        if (!PowerOfTwo(s.ratio) || s.ratio < 2 || s.ratio > kQsaFusedMaxRatio || s.topk < 1) {
+            return GLUE_KERNEL_INVALID_SCALAR_ARGUMENT;
+        }
+        const uint64_t columns = scores.maxSizes[0];
+        if (columns % 128 != 0 || columns > (uint64_t{1} << 24) || positions.maxSizes[0] != scores.maxSizes[1]) {
+            return GLUE_INCOMPATIBLE_INPUT_SIZE;
+        }
+        r.rows = scores.maxSizes[1];
+        r.topk = static_cast<uint64_t>(s.topk);
+        r.tableColumns = columns;
+        r.outputColumns[0] = 4 + columns / 16;  // two bitmaps of columns / 32 words
+        r.outputType[0] = DATA_I32;
+        return GLUE_SUCCESS;
+    }
+    if (kernel.kind == Kind::Select) {
+        const TensorGeometry& meta = *in[0];
+        if (!Is(meta, DATA_I32, 2)) return GLUE_INCOMPATIBLE_DATA_TYPE;
+        if (s.topk < 1) return GLUE_KERNEL_INVALID_SCALAR_ARGUMENT;
+        if (meta.maxSizes[0] < 4 + 8 || (meta.maxSizes[0] - 4) % 8 != 0) return GLUE_INCOMPATIBLE_INPUT_SIZE;
+        r.rows = meta.maxSizes[1];
+        r.topk = static_cast<uint64_t>(s.topk);
+        r.tableColumns = meta.maxSizes[0];
+        r.outputColumns[0] = r.topk;
+        r.outputType[0] = DATA_I32;
         return GLUE_SUCCESS;
     }
     const TensorGeometry& blocks = *in[0];
@@ -253,6 +300,19 @@ GlueCodeReturn Instantiate(const KernelInfo& kernel, HabanaKernelParams* params,
         args.ring_rows = scalar.ring_rows;
         args.ratio = scalar.ratio;
         args.rotary_half = scalar.rotary_half;
+        instance->kernel.paramsNr = sizeof(args) / sizeof(uint32_t);
+        std::memcpy(instance->kernel.scalarParams, &args, sizeof(args));
+    } else if (kernel.kind == Kind::Threshold || kernel.kind == Kind::Select) {
+        if (kernel.kind == Kind::Threshold) {
+            MapRow(inputPattern[0], r.tableColumns);  // the row's scores
+            MapDimension(inputPattern[1], 0, 0, 1, 0, 0);
+        } else {
+            MapRow(inputPattern[0], r.tableColumns);  // the row's meta
+        }
+        MapRow(outputPattern[0], r.outputColumns[0]);
+        QsaFusedSelectArgs args{};
+        args.ratio_log2 = Log2(scalar.ratio);
+        args.topk = scalar.topk;
         instance->kernel.paramsNr = sizeof(args) / sizeof(uint32_t);
         std::memcpy(instance->kernel.scalarParams, &args, sizeof(args));
     } else {

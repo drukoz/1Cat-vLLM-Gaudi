@@ -22,11 +22,14 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from tests.unit_tests.qsa_fused.qsa_reference import (qsa_index_emit_ref, qsa_index_prepare_ref, select_blocks,
+from tests.unit_tests.qsa_fused.qsa_reference import (qsa_index_emit_ref, qsa_index_prepare_ref,
+                                                      qsa_index_select_ref, qsa_index_threshold_ref, select_blocks,
                                                       visible_blocks)
 
 PREPARE_GUID = "qsa_fused_prepare_bf16_gaudi2"
 EMIT_GUID = "qsa_fused_emit_i32_gaudi2"
+THRESHOLD_GUID = "qsa_fused_threshold_f32_gaudi2"
+SELECT_GUID = "qsa_fused_select_i32_gaudi2"
 BF16_STEPS = 2
 EXACT_FRACTION = 0.97
 EPS = 1e-6
@@ -35,7 +38,7 @@ EPS = 1e-6
 @dataclasses.dataclass(frozen=True)
 class Case:
     name: str
-    kernel: str  # "prepare" or "emit"
+    kernel: str  # "prepare", "emit", "threshold" or "select"
     # prepare
     dim: int = 16
     heads: int = 4
@@ -50,7 +53,8 @@ class Case:
     topk: int = 8
     block_size: int = 128
     table_columns: int = 8
-    emit_rows: tuple = ()  # positions of the rows (-1: a padding row under M-RoPE)
+    emit_rows: tuple = ()  # positions of the rows (-1: a padding row under M-RoPE); also threshold and select
+    score_columns: int = 1024  # threshold and select: N
     seed: int = 0
 
 
@@ -74,6 +78,20 @@ SIM_CASES = (
          emit_rows=(0, 7, 8, 127, 128, 129, 2000, 2559, -1), seed=7),
 )
 
+
+SELECT_CASES = (
+    Case("threshold_tiny", "threshold", topk=8, ratio=4, score_columns=128,
+         emit_rows=(0, 3, 30, 31, 35, 300, 511, 600, -1), seed=10),
+    Case("threshold_real32", "threshold", topk=512, ratio=4, score_columns=32768,
+         emit_rows=(3, 2047, 2048, 2051, 131071, 65536, 100000, 0, 1, 2, 4095, 8191, 12345, 99999, 77777, 1 << 16,
+                    3000, 3001, 3002, 3003, 120000, 130000, 4, 5, 6, 7, 2052, 2053, 2054, -1, 50000, 2055), seed=11),
+    Case("select_tiny", "select", topk=8, ratio=4, score_columns=128,
+         emit_rows=(0, 3, 30, 31, 35, 300, 511, 600, -1), seed=12),
+    Case("select_real32", "select", topk=512, ratio=4, score_columns=32768,
+         emit_rows=(3, 2047, 2048, 2051, 131071, 65536, 100000, 0, 1, 2, 4095, 8191, 12345, 99999, 77777, 1 << 16,
+                    3000, 3001, 3002, 3003, 120000, 130000, 4, 5, 6, 7, 2052, 2053, 2054, -1, 50000, 2055), seed=13),
+)
+SIM_CASES = SIM_CASES + SELECT_CASES
 
 # Card cases: the simulator cases plus the target's verification shape (32 requests x 4 rows, k = 3) for both
 # kernels, and a 128-row emit with the 1,024-column block table of --max-model-len 131072.
@@ -123,6 +141,16 @@ def make_inputs(case: Case) -> dict:
             "k_norm_weight": _bf16(gen, D, scale=0.2),
             "cos_sin": rope_table(case.positions, case.rotary_half),
         }
+    if case.kernel in ("threshold", "select"):
+        T = len(case.emit_rows)
+        positions = torch.tensor(case.emit_rows, dtype=torch.int32)
+        # relu sums: non-negative, many exact zeros, exact ties on a coarse grid in some rows
+        raw = torch.relu(torch.randn(T, case.score_columns, generator=gen))
+        raw[::3] = (raw[::3] * 8).round() / 8
+        scores = raw / 11.3
+        if case.kernel == "threshold":
+            return {"scores": scores.contiguous(), "positions": positions}
+        return {"meta": qsa_index_threshold_ref(scores, positions, case.ratio, case.topk)}
     T = len(case.emit_rows)
     positions = torch.tensor(case.emit_rows, dtype=torch.int32)
     columns = case.table_columns * (case.block_size // case.ratio)
@@ -141,6 +169,10 @@ def reference(case: Case, inputs: dict) -> dict:
                                   inputs["k_norm_weight"], inputs["cos_sin"], EPS, case.heads, case.ring_rows,
                                   case.ratio)
         return {"key_ring": ring, "key_cache": cache, "q_idx": q}
+    if case.kernel == "threshold":
+        return {"meta": qsa_index_threshold_ref(inputs["scores"], inputs["positions"], case.ratio, case.topk)}
+    if case.kernel == "select":
+        return {"blocks": qsa_index_select_ref(inputs["meta"], case.topk)}
     slots, valid = qsa_index_emit_ref(inputs["blocks"], inputs["positions"], inputs["block_table"], case.ratio,
                                       case.block_size)
     return {"slots": slots, "valid": valid}
@@ -166,6 +198,15 @@ def manifest(case: Case, inputs: dict) -> list[str]:
         T = inputs["qk"].shape[0]
         lines.append(f"out q_idx bf16 {case.heads * case.dim} {T}")
         return lines
+    if case.kernel == "threshold":
+        T = inputs["scores"].shape[0]
+        return [f"guid {THRESHOLD_GUID}", f"ratio {case.ratio}", f"topk {case.topk}",
+                f"in scores f32 {_tpc_dims(inputs['scores'])}", f"in positions i32 {_tpc_dims(inputs['positions'])}",
+                f"out meta i32 {4 + case.score_columns // 16} {T}"]
+    if case.kernel == "select":
+        T = inputs["meta"].shape[0]
+        return [f"guid {SELECT_GUID}", f"topk {case.topk}", f"in meta i32 {_tpc_dims(inputs['meta'])}",
+                f"out blocks i32 {case.topk} {T}"]
     lines += [f"guid {EMIT_GUID}", f"ratio {case.ratio}", f"block_size {case.block_size}"]
     for name in ("blocks", "positions", "block_table"):
         lines.append(f"in {name} i32 {_tpc_dims(inputs[name])}")
@@ -184,7 +225,8 @@ def write_inputs(case: Case, inputs: dict, folder: Path) -> None:
 
 
 def _read(path: Path, like: torch.Tensor) -> torch.Tensor:
-    data = np.frombuffer(path.read_bytes(), dtype=np.int16 if like.dtype == torch.bfloat16 else np.int32)
+    np_type = {torch.bfloat16: np.int16, torch.float32: np.float32}.get(like.dtype, np.int32)
+    data = np.frombuffer(path.read_bytes(), dtype=np_type)
     t = torch.from_numpy(data.copy()).view(like.shape)
     return t.view(torch.bfloat16) if like.dtype == torch.bfloat16 else t
 
@@ -207,6 +249,23 @@ def _bf16_steps(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
 def compare(case: Case, inputs: dict, got: dict) -> list[str]:
     want = reference(case, inputs)
     errors = []
+    if case.kernel == "threshold":
+        # the header and the bitmap words of every 128-block tile a row touches; later words are unspecified
+        words = (want["meta"].shape[1] - 4) // 2
+        for t in range(want["meta"].shape[0]):
+            g, w = got["meta"][t], want["meta"][t]
+            visible = int(w[0])
+            span = 0 if int(w[1]) < 0 else (visible + 127) // 128 * 4
+            parts = [(0, 3), (4, 4 + span), (4 + words, 4 + words + span)]
+            for lo, hi in parts:
+                if not torch.equal(g[lo:hi], w[lo:hi]):
+                    errors.append(f"meta row {t} words [{lo}, {hi}) differ")
+        return errors
+    if case.kernel == "select":
+        if not torch.equal(got["blocks"], want["blocks"]):
+            bad = (got["blocks"] != want["blocks"]).any(1).nonzero().reshape(-1).tolist()
+            errors.append(f"blocks differ on rows {bad[:8]}")
+        return errors
     if case.kernel == "emit":
         for name in ("slots", "valid"):
             if not torch.equal(got[name], want[name]):
