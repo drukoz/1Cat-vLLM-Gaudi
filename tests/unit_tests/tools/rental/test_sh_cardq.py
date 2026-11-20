@@ -243,7 +243,8 @@ def test_an_empty_command_is_refused(farm):
 
 
 def test_jobs_on_the_same_cards_run_one_after_the_other_and_others_side_by_side(farm):
-    a = farm.hold("0,1,2,3", 1.0)
+    # 3 s: the two submits that follow must be done before the first job ends, also on a slow host
+    a = farm.hold("0,1,2,3", 3.0)
     b = farm.hold("3,2", 0.3)  # written descending: taken ascending
     c = farm.hold("4,5,6,7", 1.0)
     for job in (a, b, c):
@@ -303,7 +304,7 @@ def test_many_jobs_never_share_a_card_and_all_end(farm):
 
 
 def test_an_all_card_job_is_not_starved_and_short_jobs_slip_in_front(farm):
-    long_one = farm.hold("0", 2.5, hold="9s")  # its card is free by start + 9 s + 1 s grace at the latest
+    long_one = farm.hold("0", 6.0, hold="12s")  # its card is free by start + 12 s + 1 s grace at the latest
     assert farm.until(lambda: farm.file(long_one, "state") == "running")
     whole = farm.hold("all", 0.2, hold="5s")
     time.sleep(0.4)
@@ -409,7 +410,7 @@ def test_a_track_cancels_only_its_own_jobs(farm):
 
 
 def test_a_waiting_job_can_be_cancelled_and_never_runs(farm):
-    a = farm.hold("0", 1.0)
+    a = farm.hold("0", 4.0)  # still running when the two submits and the cancel below are done
     assert farm.until(lambda: farm.file(a, "state") == "running")
     b = farm.hold("0", 0.1, name="second")
     c = farm.hold("0", 0.1, name="third")
