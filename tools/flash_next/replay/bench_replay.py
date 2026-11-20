@@ -26,6 +26,11 @@ lazy process (``PT_HPU_LAZY_MODE=1``, ``PT_HPU_ENABLE_LAZY_COLLECTIVES=true``, `
                     operation instead of the reduce-scatter and all-gather pair of an all-reduce)
 * ``*_cache``       the same regime wrapped with ``disable_tensor_cache=False`` (the runner passes True): the
                     captured tensors keep their device memory between replays
+* ``*_work``        the same regime with device work in every sub-block (``--work-n``, ``--work-k``: k products
+                    of two n x n matrices that the sub-block's output waits for), so the device needs longer
+                    per segment than the host needs to issue it. If the call still returns as early as without
+                    the work, the host issues ahead of the device without limit; if the call grows with the
+                    work, the host is held back by the device and a cheaper host path saves nothing there
 * ``*_busy``        the same regime behind one long device operation (``--busy-n``, ``--busy-k``: k products of
                     two n x n matrices, whose result the body's input waits for). The host has issued every
                     launch and collective of the step before the device starts on them, so total minus the
@@ -76,22 +81,26 @@ EXIT_GRACE_S = 20.0
 LAZY_REGIMES = ("lazy", "lazy_layer", "lazy_coll", "replay", "replay_layer", "replay_coll", "graph_raw",
                 "replay_async", "replay_meta", "replay_tail", "replay_async_tail", "replay_par2", "replay_fused2",
                 "replay_coalesce", "replay_seg", "replay_cache", "replay_seg_cache", "replay_layer_cache",
-                "replay_busy", "replay_layer_busy", "replay_seg_busy", "replay_ag", "replay_ag_busy")
+                "replay_busy", "replay_layer_busy", "replay_seg_busy", "replay_ag", "replay_ag_busy",
+                "replay_work", "replay_seg_work")
 # Regimes that only exist without the collectives (a cut at every collective position and no collective).
-NO_COLLECTIVE_REGIMES = ("replay_seg", "replay_seg_cache", "replay_seg_busy")
+NO_COLLECTIVE_REGIMES = ("replay_seg", "replay_seg_cache", "replay_seg_busy", "replay_seg_work")
 CACHE_SUFFIX = "_cache"
 BUSY_SUFFIX = "_busy"
+WORK_SUFFIX = "_work"
 DEFAULT_BUSY_N = 8192
 DEFAULT_BUSY_K = 4
+DEFAULT_WORK_N = 2560
+DEFAULT_WORK_K = 1
 
 
 def split_regime(regime: str) -> tuple:
-    """``<shape>[_cache][_busy]`` -> (shape, cache suffix or "", busy suffix or "")."""
-    busy = BUSY_SUFFIX if regime.endswith(BUSY_SUFFIX) else ""
-    rest = regime[:-len(BUSY_SUFFIX)] if busy else regime
+    """``<shape>[_cache][_busy|_work]`` -> (shape, cache suffix or "", "_busy", "_work" or "")."""
+    load = next((suffix for suffix in (BUSY_SUFFIX, WORK_SUFFIX) if regime.endswith(suffix)), "")
+    rest = regime[:-len(load)] if load else regime
     cache = CACHE_SUFFIX if rest.endswith(CACHE_SUFFIX) else ""
     shape = rest[:-len(CACHE_SUFFIX)] if cache else rest
-    return shape, cache, busy
+    return shape, cache, load
 # The pair regimes: both sub-blocks of a layer from the same input, so the layer's two all-reduces are independent
 # (par2: two calls; fused2: one call over the stacked pair, the same bytes; coalesce: the two calls in a coalescing
 # context). Layer.layer_pair. They have the compute of a pair layer, so they compare with each other, not with replay.
@@ -176,6 +185,8 @@ class Body:
             return (torch.randn(rows, cols, generator=gen) * scale).to(torch.bfloat16).to(device)
 
         # Two weight sets shared by every layer: the bytes per step stay small, the graph keeps its shape.
+        self.work_w = None  # the operand of the *_work regimes (make_work), used while work_on is set
+        self.work_on = False
         self.norm_w = [(torch.ones(HIDDEN) + 0.01 * torch.randn(HIDDEN, generator=gen)).to(torch.bfloat16).to(device)
                        for _ in range(2)]
         self.down = [weight(HIDDEN, PROJ, scale_down) for _ in range(2)]
@@ -187,6 +198,13 @@ class Body:
         gen = torch.Generator().manual_seed(seed)
         self.busy_w = (torch.randn(n, n, generator=gen) / (n**0.5)).to(torch.bfloat16).to(device)
         self.busy_k = k
+
+    def make_work(self, device, n: int, k: int, seed: int = 11) -> None:
+        """The operand of the device work of the ``*_work`` regimes (n x n bf16), one product chain per sub-block."""
+        torch = self.torch
+        gen = torch.Generator().manual_seed(seed)
+        self.work_w = (torch.randn(n, n, generator=gen) / (n**0.5)).to(torch.bfloat16).to(device)
+        self.work_k = k
 
     def delay(self, x):
         """x after a long device operation it now depends on (k products of n x n matrices); the value is x.
@@ -205,7 +223,14 @@ class Body:
         x32 = x.float()
         var = x32.pow(2).mean(-1, keepdim=True)
         h = (x32 * torch.rsqrt(var + 1e-6)).to(torch.bfloat16) * self.norm_w[k]
-        return torch.nn.functional.silu(h @ self.down[k]) @ self.up[k]
+        out = torch.nn.functional.silu(h @ self.down[k]) @ self.up[k]
+        if self.work_on and self.work_w is not None:
+            # Device work this sub-block's output (and so its all-reduce) waits for; the value is unchanged.
+            y = self.work_w
+            for _ in range(self.work_k):
+                y = y @ self.work_w
+            out = out + (y[:1, :1].float().sum() * 0.0).to(out.dtype)
+        return out
 
     def layer_pair(self, x, reduce, mode: str, coalesce=None):
         """Both sub-blocks from the same input, so their two all-reduces are independent of each other.
@@ -321,6 +346,8 @@ class Rank:
         self.body = Body(torch, self.device, args.layers, self.world)
         if any(regime.endswith(BUSY_SUFFIX) for regime in args.regimes):
             self.body.make_busy(self.device, args.busy_n, args.busy_k)
+        if any(regime.endswith(WORK_SUFFIX) for regime in args.regimes):
+            self.body.make_work(self.device, args.work_n, args.work_k)
 
     # ------------------------------------------------------------------------------- primitives
     def mark_step(self) -> None:
@@ -476,7 +503,9 @@ class Rank:
         body = self.body
         reduce = self.inplace_reduce if collectives else None
         # "<regime>_cache": the same regime with the wrapper's tensor cache on (disable_tensor_cache=False).
-        shape, cache_suffix, busy_suffix = split_regime(regime)
+        shape, cache_suffix, load_suffix = split_regime(regime)
+        busy_suffix = load_suffix == BUSY_SUFFIX
+        body.work_on = load_suffix == WORK_SUFFIX  # read while the graph is captured (the first call)
         tensor_cache = bool(cache_suffix)
         if collectives and shape == "replay_ag":
             reduce = self.gather_sum_reduce
@@ -548,7 +577,10 @@ class Rank:
                 module = self.htorch.hpu.wrap_in_hpu_graph(module, asynchronous=(regime == "replay_async"),
                                                            disable_tensor_cache=not tensor_cache)
             call = module
-        record = self.timed(call, inputs, repeats, warmup=3)
+        try:
+            record = self.timed(call, inputs, repeats, warmup=3)
+        finally:
+            body.work_on = False
         record.update({"case": regime, "rows": rows, "collectives": collectives, "layers": body.layers,
                        "all_reduces": ((body.layers if pair_mode == "fused2" else 2 * body.layers)
                                        if collectives else 0)})
@@ -927,9 +959,9 @@ def derive(merged: list, reference: list | None = None) -> list:
             line["host_call_share"] = call_with / with_c
         name, _, env_name = case.partition(ENV_SEPARATOR)
         suffix = (ENV_SEPARATOR + env_name) if env_name else ""
-        shape, cache, busy = split_regime(name)
-        cache = cache + busy  # the uncut body and the base regime of the same family
-        if busy:
+        shape, cache, load = split_regime(name)
+        cache = cache + load  # the uncut body and the base regime of the same family
+        if load == BUSY_SUFFIX:
             # Behind the long device operation the host is done issuing before the device starts on the step.
             line["busy_ms"], _, _ = total("replay" + cache + suffix, rows, False)
         if shape == "replay_seg" and layers:
@@ -1047,7 +1079,8 @@ def run_ranks(args, process: str, echo=print, env_set=None) -> dict:
                ",".join(str(r) for r in rows), "--layers", str(args.layers), "--repeats", str(args.repeats),
                "--timeout", str(int(timeout)), "--regimes", ",".join(regimes),
                "--compile-full-rows", ",".join(str(r) for r in args.compile_full_rows),
-               "--collectives", args.collectives, "--busy-n", str(args.busy_n), "--busy-k", str(args.busy_k)]
+               "--collectives", args.collectives, "--busy-n", str(args.busy_n), "--busy-k", str(args.busy_k),
+               "--work-n", str(args.work_n), "--work-k", str(args.work_k)]
         if args.dump_dir and not env_set:
             cmd += ["--dump-dir", os.path.abspath(args.dump_dir)]
         if args.trace_dir and not env_set:
@@ -1131,6 +1164,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--busy-n", type=int, default=DEFAULT_BUSY_N,
                         help="the *_busy regimes: size of the matrices of the long device operation")
     parser.add_argument("--busy-k", type=int, default=DEFAULT_BUSY_K, help="and how many products of them")
+    parser.add_argument("--work-n", type=int, default=DEFAULT_WORK_N,
+                        help="the *_work regimes: size of the matrices of the device work of every sub-block")
+    parser.add_argument("--work-k", type=int, default=DEFAULT_WORK_K, help="and how many products of them")
     parser.add_argument("--env-sets", default="",
                         help="more runs of the lazy process under other settings: name:KEY=VALUE,KEY=VALUE;name2:...")
     parser.add_argument("--env-regimes", default="replay", help="the regimes of the --env-sets runs")

@@ -284,3 +284,18 @@ def test_gather_sum_reduce_gives_the_all_reduce_value():
     assert torch.allclose(rank.gather_sum_reduce(x), x * 10)
     rank.group = None  # one rank alone: the identity
     assert rank.gather_sum_reduce(x) is x
+
+
+def test_work_adds_device_work_to_every_sub_block_and_keeps_the_value():
+    body = bench.Body(torch, "cpu", layers=2, world=1)
+    x = torch.randn(2, bench.HIDDEN).to(torch.bfloat16)
+    plain = body.forward(x, None)
+    body.make_work("cpu", n=8, k=2)
+    assert torch.equal(body.forward(x, None), plain)  # off until a *_work regime turns it on
+    body.work_on = True
+    products = bench.count_ops(torch, lambda: body.forward(x, None)) - bench.count_ops(torch, lambda: plain + 0)
+    assert torch.equal(body.forward(x, None), plain)
+    body.work_on = False
+    assert products > bench.count_ops(torch, lambda: body.forward(x, None))  # more ops with the work on
+    assert bench.split_regime("replay_seg_work") == ("replay_seg", "", "_work")
+    assert bench.split_regime("replay_cache_work") == ("replay", "_cache", "_work")
