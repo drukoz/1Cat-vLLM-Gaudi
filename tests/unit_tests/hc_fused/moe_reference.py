@@ -17,6 +17,14 @@ change the plugin and copy again.
 
 The ``*_reference`` functions below them define what each fused op returns, in terms of those
 copies.  Contract: ``docs/design/flash-next/hc-fused.md``, "MoE glue kernels".
+
+A kernel replaces the torch path on a card, and for one expression a Gaudi2 card does not compute what
+CPU torch computes: a bf16 tensor divided by a Python number (``hpu_div_by_scalar``; first card run,
+2026-11-20).  ``dynamic_quant`` has such a division, so the row quantization has two references:
+``moe_row_quant_reference``, the kernel's oracle, is the copied code with the card's division
+(``moe_row_quant_hpu``), and ``moe_row_quant_cpu_reference`` is the copied code as CPU torch runs it,
+which is what the op's CPU stand-in must return for the fused path to equal the torch path on a CPU.
+The other three ops have no such expression and one reference each.
 """
 
 from __future__ import annotations
@@ -83,6 +91,32 @@ def cast_to_fp8_reference(data: torch.Tensor, scale_inv: torch.Tensor, fp8_max: 
 
 
 # ---------------------------------------------------------------------------
+# What a Gaudi2 card computes differently from CPU torch
+# ---------------------------------------------------------------------------
+def hpu_div_by_scalar(x: torch.Tensor, divisor: float) -> torch.Tensor:
+    """``x / divisor`` for a bf16 tensor and a Python number, as a Gaudi2 card computes it.
+
+    The card multiplies by the reciprocal rounded to the tensor's dtype: ``bf16(x * bf16(1 / divisor))``.
+    CPU torch divides, ``bf16(x / divisor)``.  For 240 the constant is ``0x1.12p-8``, 0.34 % above 1/240,
+    and the card's result is CPU torch's or one bf16 step above it.  Found on the first card run of the
+    MoE glue kernels (2026-11-20); the evidence and the scope are in ``hpu_arithmetic.py``.
+    """
+    return x * torch.tensor(1.0 / divisor, dtype=x.dtype)
+
+
+def moe_row_quant_hpu(data: torch.Tensor, FP8_MAX: float, cast_to_fp8_v2) -> tuple[torch.Tensor, torch.Tensor]:
+    """``moe_row_quant_torch`` as a Gaudi2 card runs it: the same lines, the division by ``FP8_MAX`` the card's way.
+
+    ``test_moe_card_arithmetic.py`` holds the two functions together: they differ in that one expression,
+    and this one returns what the copy returns under the emulation of ``hpu_arithmetic.py``.
+    """
+    scale = hpu_div_by_scalar((torch.abs(data)).max(dim=-1).values + 1e-8, FP8_MAX)
+    scale = scale.unsqueeze(-1)
+    data_fp8 = cast_to_fp8_v2(data, 1.0 / scale, False, False, torch.float8_e4m3fn)[0]
+    return data_fp8, scale.float()
+
+
+# ---------------------------------------------------------------------------
 # The fused ops
 # ---------------------------------------------------------------------------
 class _TopK:
@@ -105,7 +139,25 @@ def moe_route_reference(gates: torch.Tensor, experts: int, top_k: int) -> tuple[
 
 
 def moe_row_quant_reference(x: torch.Tensor, fp8_max: float = GAUDI2_FP8_MAX) -> tuple[torch.Tensor, torch.Tensor]:
-    """``moe_row_quant``: ``(x_fp8 float8_e4m3fn [T, H], scale float32 [T, 1])``."""
+    """``moe_row_quant``: ``(x_fp8 float8_e4m3fn [T, H], scale float32 [T, 1])``, the kernel's oracle.
+
+    The plugin's ``dynamic_quant`` as a Gaudi2 card computes it:
+    ``scale = bf16(bf16(max|x| + bf16(1e-8)) * bf16(1 / fp8_max))``, ``x_fp8 = fp8(bf16(x * bf16(1 / scale)))``.
+    The scale is CPU torch's or one bf16 step above it (``moe_row_quant_cpu_reference``).
+    """
+
+    def cast(data, scale_inv, *_):
+        return cast_to_fp8_reference(data, scale_inv, fp8_max)
+
+    return moe_row_quant_hpu(x, fp8_max, cast)
+
+
+def moe_row_quant_cpu_reference(x: torch.Tensor,
+                                fp8_max: float = GAUDI2_FP8_MAX) -> tuple[torch.Tensor, torch.Tensor]:
+    """``moe_row_quant`` where the torch path is CPU torch's: the op's CPU stand-in (``moe_ops.py``).
+
+    ``scale = bf16(bf16(max|x| + bf16(1e-8)) / fp8_max)``.  Not what a kernel returns: no kernel runs on a CPU.
+    """
 
     def cast(data, scale_inv, *_):
         return cast_to_fp8_reference(data, scale_inv, fp8_max)

@@ -247,8 +247,10 @@ def test_zero_rows_quantize_to_zero_with_the_epsilon_scale():
     inputs = make_inputs(case)
     exp = expected(case, inputs)
     assert bool((exp["x_fp8"][0].float() == 0).all())
-    epsilon_scale = (torch.tensor(1e-8, dtype=BF16) / 240.0).float()
+    # bf16(1e-8) times bf16(1 / 240): a card divides by 240 as a product with 0x1.12p-8 (hpu_arithmetic.py)
+    epsilon_scale = (torch.tensor(1e-8, dtype=BF16).float() * float.fromhex("0x1.12p-8")).to(BF16).float()
     assert exp["scale"][0, 0] == epsilon_scale and float(epsilon_scale) > 0
+    assert epsilon_scale != (torch.tensor(1e-8, dtype=BF16) / 240.0).float()  # not CPU torch's quotient
 
 
 def test_missing_and_misshaped_outputs():
