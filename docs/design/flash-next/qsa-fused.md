@@ -12,10 +12,36 @@ Version 2, 2026-11-20. The sparse QSA decode path of Flash-Next (`vllm_gaudi/mod
 | 3 | mode 2 plus the **top-k kernels** `qsa_index_threshold` (K3a) and `qsa_index_select` (K3b) in place of `torch.topk`: the same selected set except among scores equal at the cut, where the lowest blocks win; blocks in ascending order |
 
 Status words: **VERIFIED** (by the named test, probe or source line) and **INFERRED** (reasoned, not measured).
-Nothing here has run on a card yet; "Unproven without a card" lists what that leaves open. Version 1 of this page
+What the card showed on 2026-11-20 is in "On the card" below; "Unproven without a card" lists what is still open.
+**Use mode 1 (with the shard); do not use modes 2 and 3**: K1 is wrong on the card (below). Version 1 of this page
 (the first agent, 2026-11-20 morning) planned four kernels with a per-row TPC key scan; version 2 keeps its row
 table, K1 and its rounding analysis, moves the scores to the matrix engine and changes the data flow (below, "Why
 the cut moved").
+
+## On the card (2026-11-20)
+
+- **Mode 1 + request-sharded indexer on the real model** (TP4 + EP4, the two arms at once on the two halves of the
+  node, jobs 00062 off / 00063 on, commit 82fc7188; `reports/qsa-fused/REPORT.md`), ms per decode step p50:
+  1 stream 46.7 against 45.5 (no shard and no grouping at 1 row); 16 streams 79.6 against **59.9** (-25 %);
+  32 streams 108.3 against **73.4** (-32 %). The int32 all-gather ran inside the served decode graph. With 34.5K- and
+  64K-token prompts (prefix cached) decode costs what it costs at a short context in both arms (the block table is
+  as wide as the engine's longest context: "Bytes" below), and the needle is answered in every text of every round.
+  From 16 to 32 streams the step grows by 1.79 ms per row off and 0.84 ms per row on; of the 0.84 about 0.09 is
+  still QSA (INFERRED from the per-piece slopes of the one-card bench 2, job 00088).
+- **Card rule 9 at the QSA shapes**: `topk(...).indices.to(int32)` in one graph is right at `[8, 32768]`, `k = 512`
+  (0 of 3,585 ids; through an in-graph consumer too), and one indexer decode step equals an integer oracle in modes
+  0 and 1 and sharded as each of 4 and 8 ranks (`tests/unit_tests/qsa_select/test_hpu_select_ids.py`, jobs 00062 and
+  00063). `select_blocks` keeps the gather form.
+- **The kernels** (`tests/unit_tests/qsa_fused/test_hpu_op.py`, 00063 and 00088, two cards): 11 passed, 5 failed.
+  K4, K3a and K3b equal their references; the op runs twice with the same bits. **K1's stores into its inputs
+  `key_ring` and `key_cache` never reach the caller's tensors**: the card returned both unchanged (their statistics
+  against the reference equal those of the unchanged inputs in all five cases), while `q_idx`, K1's declared output,
+  matches to one bf16 step. Fix: K1 returns the new ring and cache rows as declared outputs and the glue writes them
+  with `index_copy_` ("Next").
+- **Bench 2** (job 00088, one card, device ms per layer and rank): mode-1 scores 0.36 / 0.39 / 0.82 at 4 / 8 / 32
+  requests; `select_blocks` 0.30 / 0.33 / 0.81 at 4 / 8 / 32 rows; grouped attention 0.38 (G = 3) and 0.39 (G = 6)
+  at 32 rows; torch emit 0.52. K3a + K3b (0.90 at 32 rows) and K4 (0.59) are no faster on the device than torch;
+  K1 0.13 against 0.43 for its torch reference. `torch.ops.hpu.fp8_gemm_v2` refuses bf16 operands.
 
 ## Why
 
@@ -412,12 +438,13 @@ block_size, rotary_half, topk}`, 28 bytes, the same for every GUID (unused field
 
 ## Unproven without a card
 
-1. The extension against the real bridge (the schema with `Tensor(a!)`, an int32 pair of outputs).
-2. The graph compiler's reading of an input that the kernel stores to (`key_cache` in K1) next to a later node
-   that reads it (the scores' gather): the dependency is `q_idx`.
+1. (Settled by jobs 00063 and 00088: the extension runs against the real bridge; K4's int32 pair of outputs is right.)
+2. (Answered by jobs 00063 and 00088: **no**. K1's stores into its inputs `key_ring` and `key_cache` are lost on
+   the card; a kernel of this page writes only declared outputs.)
 3. (Settled by job 00011: `index_select` with an int32 index and an 8-rank int32 HCCL all-gather work.)
-4. `v_rsqrt_f32` on hardware against the simulator.
-5. Speed: every ms in this page is arithmetic.
+4. (Settled: `q_idx`, which goes through `v_rsqrt_f32`, matches the reference to one bf16 step on the card.)
+5. Speed: mode 1 + shard is measured on the real model at TP4 ("On the card"); TP8, MTP's verification rows and the
+   kernels in a served model are not.
 
 ## G5-3: FP8 KV cache with sparse QSA (not built)
 
@@ -429,9 +456,17 @@ attention. Rule 6 applies (Gaudi2 range 240).
 
 ## Next
 
-- **The fp32 copy of the gathered keys** (mode 1's largest byte term): a bf16 x bf16 -> fp32 GEMM (the HPU
-  `fp8_gemm_v2` takes bf16 operands with an fp32 output in some releases; unverified), or a TPC kernel that gathers
-  and widens in one pass.
+- **K1 writes declared outputs**: the raw key and the pooled key of each row as two `[T, D]` outputs, written into
+  the ring and the compressed cache by `index_copy_` at the rows the torch path computes (padding rows to the
+  scratch rows). Worth about 0.3 ms per layer if the production glue costs what K1's torch reference costs (measure
+  the glue first).
+- **A per-request indexer width**: the scan of 32,768 keys per layer (8 to 9 ms per 32-stream step) follows the
+  engine's longest context; per request (balanced across the ranks, since the step waits for the slowest one) it
+  would follow each agent's own context: about 5.5 to 6 ms per step at a mean context of 40K, 3 to 3.5 ms at 80K
+  (INFERRED; `reports/qsa-fused/REPORT.md`, next-week item B).
+- **The fp32 copy of the gathered keys** (mode 1's largest byte term): not by `fp8_gemm_v2` (it refuses bf16
+  operands on HPU, job 00088); a TPC kernel that gathers and widens in one pass, or bf16 scores if the selections
+  allow it (not exact).
 - **K4 at fewer words per block** (23 now): split a row over several index-space points (24 engines for 32 rows
   leave most engines at two rows).
 - **K3a across engines**: one row per point leaves 20 of 24 engines idle at 4 rows (the sharded share); split a
