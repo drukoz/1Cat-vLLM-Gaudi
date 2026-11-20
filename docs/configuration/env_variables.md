@@ -115,6 +115,15 @@ accepted token, `num_tokens_no_spec - 2` once the step's tokens are counted),
 so the host builds the next step's metadata while the device runs draft step 0;
 the drafts are the same.
 
+`VLLM_HPU_MTP_DRAFT_IDS` selects how the Flash-Next MTP draft turns its logits into
+token ids, as an integer. `0` (default): `argmax`, whose int64 ids the draft loop
+narrows to int32 in the same lazy graph before they feed the next draft pass. `1`:
+int32 ids from an fp32 id table (the first index of the row maximum), so no int64 id
+exists on the device. For card rule 9: `torch.topk` ids narrowed to int32 in the same
+lazy graph came back as every second id (job 00038). The sampler's `argmax` narrowing
+is sound at 8 and 32 rows (job 00021, by the streams' texts); set `1` only if the card
+shows draft positions 2 to k collapsing with more than one stream.
+
 `VLLM_HPU_MTP_CHUNK_KV` decides whether the Flash-Next MTP draft runs over the
 prefill chunks that complete no prompt, as an integer. `0` (default): it runs
 only over the chunk that completes a prompt, so its attention layer has no KV

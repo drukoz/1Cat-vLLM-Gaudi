@@ -31,6 +31,7 @@ from vllm_gaudi.utils import async_h2d_copy
 from vllm_gaudi.v1.attention.backends.hpu_attn import HPUAttentionMetadataV1
 from vllm.model_executor.models.llama_eagle3 import Eagle3LlamaForCausalLM
 
+from vllm_gaudi.v1.spec_decode.flash_next_mtp_steps import draft_argmax
 from vllm_gaudi.v1.spec_decode.flash_next_mtp_steps import (DRAFT_RANK_TOP, DraftRankStats,
                                                              align_draft_rope_with_target, draft_rank_log_enabled,
                                                              flash_next_target_model_name, flat_token_rows,
@@ -339,7 +340,8 @@ class HpuFlashNextMtpProposer(HpuEagleProposer):
 
         ``VLLM_HPU_VOCAB_PARALLEL_LOGITS`` >= 1 and no draft-rank log: every rank reduces its own vocabulary shard
         and only ``[rows, 2]`` fp32 per rank is gathered (``vocab_parallel.vocab_parallel_argmax``, int32 ids).
-        Otherwise the gathered logits and their arg max, as before (the rank log needs the logits).
+        Otherwise the gathered logits and their arg max, as before (the rank log needs the logits); the ids come
+        from ``draft_argmax`` (``VLLM_HPU_MTP_DRAFT_IDS``).
         """
         from vllm_gaudi.distributed import vocab_parallel
 
@@ -347,4 +349,4 @@ class HpuFlashNextMtpProposer(HpuEagleProposer):
             return vocab_parallel.vocab_parallel_argmax(self.model, hidden_states), None
         logits = self.model.compute_logits(hidden_states)
         top_ids = None if self.draft_rank_stats is None else logits.topk(DRAFT_RANK_TOP, dim=-1).indices
-        return logits.argmax(dim=-1), top_ids
+        return draft_argmax(logits), top_ids
