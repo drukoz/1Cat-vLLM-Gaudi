@@ -547,6 +547,8 @@ if TYPE_CHECKING:
     VLLM_HPU_PROMPT_GRAPH_MAX_TOKENS: int = 0  # 0 upstream; >0 prompt forwards up to this size replay HPU graphs
     VLLM_HPU_QSA_PREFILL_INDEXER_SPLIT: int = 0  # 0 every rank scores all prompt rows; 1 rows split over TP ranks
     VLLM_HPU_PREFIX_KEEP_PROMPT_END: int = 0  # 0 upstream's sparse retention; 1 also a prompt end on a block boundary
+    VLLM_HPU_PREFIX_KEEP_DECODE_END: int = 0  # 0 upstream's sparse retention; 1 also the last boundary reached in decode
+    VLLM_HPU_PREFIX_ALIGN_SPLIT: int = 0  # 0 engine's chunk split as it is; 1 chunk ends at the recurrent block
 
 
 def _optional_bool_env(name: str) -> Optional[bool]:
@@ -1985,6 +1987,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # prefix cache completely at retention interval 0).
     "VLLM_HPU_PREFIX_KEEP_PROMPT_END":
     lambda: int(os.environ.get("VLLM_HPU_PREFIX_KEEP_PROMPT_END", "0")),
+    # Recurrent state pool: 1 keeps the recurrent state at the last scheduler-block boundary a request reached
+    # while decoding (one per request), so the next turn does not prefill the previous output again.
+    "VLLM_HPU_PREFIX_KEEP_DECODE_END":
+    lambda: int(os.environ.get("VLLM_HPU_PREFIX_KEEP_DECODE_END", "0")),
+    # Prompt chunk ends at the recurrent block (896 tokens at TP4, 512 at TP8) instead of the engine core's
+    # cache_config.block_size, so the state at a prompt's last block boundary exists and is the right one.
+    "VLLM_HPU_PREFIX_ALIGN_SPLIT":
+    lambda: int(os.environ.get("VLLM_HPU_PREFIX_ALIGN_SPLIT", "0")),
 }
 
 # end-env-vars-definition

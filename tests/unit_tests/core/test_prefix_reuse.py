@@ -201,3 +201,115 @@ def test_the_previous_output_is_prefilled_again_at_retention_zero(monkeypatch):
     assert dense.admissions["t2"].cached_tokens == reached == 25_088
     assert len(dense_prompts[1]) - reached == 12 + new_tokens
     assert sparse.violations == [] and dense.violations == []
+
+
+# ----- VLLM_HPU_PREFIX_KEEP_DECODE_END=1: the last block boundary a request reached while decoding is kept -----
+
+ENV_KEEP_DECODE = "VLLM_HPU_PREFIX_KEEP_DECODE_END"
+
+
+def _cached_recurrent_blocks(sim: h.Sim) -> int:
+    return sum(1 for block in sim.coordinator.recurrent_pool.blocks if block.block_hash is not None)
+
+
+def test_keeping_the_decode_end_spares_the_next_turn_the_previous_output(monkeypatch):
+    monkeypatch.setenv(ENV_KEEP_DECODE, "1")
+    generate, new_tokens = 1100, 600
+    sim = h.Sim()
+    prompts = _turns(sim, h.agent_prompt(0, 24_000), turns=3, generate=generate, new_tokens=new_tokens)
+    for turn in (2, 3):
+        previous = prompts[turn - 2]
+        # the last block boundary the previous request computed (its last output token is never fed back)
+        reached = (len(previous) + generate - 1) // BLOCK * BLOCK
+        cached = sim.admissions[f"t{turn}"].cached_tokens
+        assert cached == reached, (turn, cached, reached)
+        assert len(prompts[turn - 1]) - cached < BLOCK + new_tokens  # under one block of the old turn is left
+    assert sim.admissions["t2"].cached_tokens == 25_088  # 23,552 without the flag: 1,536 tokens fewer to prefill
+    assert sim.violations == []
+
+
+def test_keeping_the_decode_end_keeps_one_decode_state_per_request(monkeypatch):
+    """A long output crosses many block boundaries; only the last one stays in the prefix cache, next to the
+    prompt's replay boundary, so the pool is not flooded with states no turn can use."""
+    def cached_after(generate: int) -> tuple[int, int]:
+        sim = h.Sim()
+        sim.add("t1", h.agent_prompt(0, 24_000), max_tokens=generate)
+        sim.run_until_finished(["t1"], 400 + generate)
+        assert sim.violations == []
+        return _cached_recurrent_blocks(sim), len(sim.recurrent_groups)
+
+    monkeypatch.delenv(ENV_KEEP_DECODE, raising=False)
+    plain, groups = cached_after(3000)
+    monkeypatch.setenv(ENV_KEEP_DECODE, "1")
+    kept, _ = cached_after(3000)  # the output crosses 6 block boundaries
+    assert kept - plain == groups
+    short, _ = cached_after(40)  # no boundary crossed while decoding: nothing more is kept
+    assert short == plain
+
+
+def test_keeping_the_decode_end_changes_nothing_when_no_boundary_is_crossed(monkeypatch):
+    def run() -> list[tuple[int, int, int]]:
+        sim = h.Sim()
+        _turns(sim, h.agent_prompt(0, 24_000), turns=3)  # 8 output tokens per turn
+        assert sim.violations == []
+        return [(a.prompt_tokens, a.cached_tokens, a.first_chunk) for a in sim.admissions.values()]
+
+    monkeypatch.delenv(ENV_KEEP_DECODE, raising=False)
+    off = run()
+    monkeypatch.setenv(ENV_KEEP_DECODE, "1")
+    assert run() == off
+
+
+def test_keeping_the_decode_end_with_several_agents_and_at_tp4(monkeypatch):
+    monkeypatch.setenv(ENV_KEEP_DECODE, "1")
+    generate, new_tokens = 1100, 600
+    for tp, block in ((8, 512), (4, 896)):
+        sim = h.Sim(h.Settings(tp=tp))
+        prompts = {agent: h.agent_prompt(agent, 20_000 + 300 * agent) for agent in range(4)}
+        for turn in range(3):
+            ids = [f"a{agent}-t{turn}" for agent in prompts]
+            for agent, rid in zip(prompts, ids):
+                sim.add(rid, prompts[agent], max_tokens=generate)
+            sim.run_until_finished(ids, 4000)
+            for agent, rid in zip(list(prompts), ids):
+                if turn:
+                    reached = (previous_len[agent] + generate - 1) // block * block
+                    assert sim.admissions[rid].cached_tokens == reached, (tp, rid)
+            previous_len = {agent: len(prompt) for agent, prompt in prompts.items()}
+            prompts = {agent: prompts[agent] + sim.outputs[rid] + h.own_tokens(agent, new_tokens, salt=turn + 1)
+                       for agent, rid in zip(prompts, ids)}
+        assert sim.violations == [], (tp, sim.violations[:3])
+
+
+def test_both_keep_flags_together_on_a_block_aligned_prompt(monkeypatch):
+    monkeypatch.setenv(ENV_KEEP, "1")
+    monkeypatch.setenv(ENV_KEEP_DECODE, "1")
+    aligned = h.agent_prompt(0, 24_576)
+    short = h.Sim()
+    _turns(short, aligned, turns=2)  # 8 output tokens: the prompt end is the furthest state
+    assert short.admissions["t2"].cached_tokens == len(aligned)
+    long = h.Sim()
+    _turns(long, aligned, turns=2, generate=1100)
+    assert long.admissions["t2"].cached_tokens == (len(aligned) + 1100 - 1) // BLOCK * BLOCK
+    assert short.violations == [] and long.violations == []
+
+
+def test_keeping_the_decode_end_is_refused_for_a_group_with_speculative_blocks():
+    """Under speculative decoding a step of 1 + k tokens that straddles a block boundary keeps its running state
+    in the block of its last scheduled token: the earlier block's slot is then not the state at the boundary."""
+    from types import SimpleNamespace
+
+    from vllm_gaudi.v1.core.recurrent_pool_coordinator import keep_last_decode_boundary
+    from vllm_gaudi.v1.worker.recurrent_lattice import align_running_block
+
+    def untouched(*_args, **_kwargs):
+        raise AssertionError("not called")
+
+    manager = SimpleNamespace(kv_cache_spec=SimpleNamespace(num_speculative_blocks=3), cache_blocks=untouched,
+                              reachable_block_mask=untouched, pop_blocks_for_free=untouched)
+    assert keep_last_decode_boundary(manager) is False
+    assert manager.cache_blocks is untouched and manager.reachable_block_mask is untouched
+    # the reason, in the lattice's own terms: 4 tokens scheduled 2 before a boundary run in the NEXT block
+    assert align_running_block(context_len=510, num_scheduled=4, block_size=BLOCK) == 1
+    assert align_running_block(context_len=510, num_scheduled=1, block_size=BLOCK) == 0
+    assert align_running_block(context_len=511, num_scheduled=1, block_size=BLOCK) == 0  # ends ON the boundary

@@ -180,6 +180,38 @@ aligned prompt is not helped (it must compute its last token again). Default
 `0`. See `keep_block_aligned_prompt_end` in
 `vllm_gaudi/v1/core/recurrent_pool_coordinator.py`.
 
+`VLLM_HPU_PREFIX_KEEP_DECODE_END=1` makes the recurrent state pool keep the
+recurrent state at the last scheduler-block boundary a request reached while
+decoding. At retention interval 0 a request leaves one recurrent state behind,
+at its prompt's end aligned down to the block, so the next turn of a
+conversation prefills the previous turn's whole output again (with a
+1,100-token output at TP8: 2,148 tokens prefilled where 612 are new or
+unaligned). With `1` the state its decode steps completed at the last block
+boundary is kept too (one per request and recurrent group: an earlier one
+leaves the prefix cache when a later one is cached), and the next turn starts
+there. Dense retention (`--prefix-cache-retention-interval` at the block size)
+gives the same hit but keeps every chunk-end state of every prompt. Ignored,
+with a warning, when speculative decoding is on: a speculative step that
+straddles a block boundary leaves no state exactly at it. Default `0`. See
+`keep_last_decode_boundary` in
+`vllm_gaudi/v1/core/recurrent_pool_coordinator.py`.
+
+`VLLM_HPU_PREFIX_ALIGN_SPLIT=1` makes prompt chunks end at the recurrent
+state block (896 tokens at TP4, 512 at TP8) when the engine core's
+`cache_config.block_size` differs from it. The engine's
+`Scheduler._mamba_block_aligned_split` aligns chunk ends to
+`cache_config.block_size`, while the runner keeps a recurrent state per
+recurrent block. On the card the chunk ends were multiples of 2,048 (prefill
+job 00014), so the state at a prompt's last block boundary existed only when a
+chunk happened to end there: the next turn of most conversations missed the
+prefix cache completely (00014, and a 120,832-token prefix in engine-step job
+00110). At TP4 a state slot could also receive the state of another position,
+which a later prefix hit reads. With `1` the engine's own rule runs with the
+recurrent block. Either way the first prompt chunk logs both block sizes once
+("Prefill chunk ends follow ..." or a warning). Default `0`. See
+`install_recurrent_aligned_split` in
+`vllm_gaudi/v1/core/recurrent_pool_coordinator.py`.
+
 `VLLM_HPU_PREFILL_PACING` keeps decoding streams alive while prompts are
 prefilled, as an integer mode. `0` (default) leaves vLLM's scheduler untouched.
 `1` (time share) wraps `Scheduler.schedule`: while at least one request is

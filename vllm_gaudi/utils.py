@@ -322,6 +322,13 @@ from vllm_gaudi.v1.core.sched.prefill_pacing import install_prefill_pacing as _i
 
 _install_prefill_pacing()
 
+# Prompt chunk ends at the recurrent block (prefill track): logs the engine core's and the recurrent block size once;
+# with VLLM_HPU_PREFIX_ALIGN_SPLIT=1 and the two different, the engine's aligned split uses the recurrent block.
+from vllm_gaudi.v1.core.recurrent_pool_coordinator import (  # noqa: E402
+    install_recurrent_aligned_split as _install_recurrent_aligned_split)
+
+_install_recurrent_aligned_split()
+
 # Guard Prometheus counters against negative prompt-token counts that can arise
 # when KV-cache blocks are invalidated during OOM and token-count bookkeeping
 # becomes temporarily inconsistent.  Prometheus counters require non-negative

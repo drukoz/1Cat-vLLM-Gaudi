@@ -9,10 +9,12 @@ talks to `coordinator.block_pool`, so the attention pool is a `RecurrentRoutingB
 forwards the deferred frees, prefix-cache resets and events of recurrent blocks to the recurrent
 pool.
 """
+import functools
 import os
 from collections.abc import Iterable, Sequence
 
 from vllm.distributed.kv_events import KVCacheEvent
+from vllm.logger import init_logger
 from vllm.utils.math_utils import cdiv
 from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_coordinator import HybridKVCacheCoordinator
@@ -21,6 +23,8 @@ from vllm.v1.core.kv_cache_utils import BlockHash, KVCacheBlock
 from vllm.v1.core.single_type_kv_cache_manager import CrossAttentionManager
 from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheConfig, MambaSpec
 
+
+logger = init_logger(__name__)
 
 ENV_KEEP_PROMPT_END = "VLLM_HPU_PREFIX_KEEP_PROMPT_END"
 
@@ -65,6 +69,180 @@ def keep_block_aligned_prompt_end(manager) -> None:
         return base(*args, alignment_tokens=alignment_tokens, reachable_boundaries=reachable_boundaries, **kwargs)
 
     manager.reachable_block_mask = reachable_block_mask
+
+
+ENV_KEEP_DECODE_END = "VLLM_HPU_PREFIX_KEEP_DECODE_END"
+
+
+def keep_decode_end_requested(environ=None) -> bool:
+    """``VLLM_HPU_PREFIX_KEEP_DECODE_END``: 0 (default) upstream's sparse retention, 1 ``keep_last_decode_boundary``."""
+    value = int((os.environ if environ is None else environ).get(ENV_KEEP_DECODE_END, "0"))
+    if value not in (0, 1):
+        raise ValueError(f"{ENV_KEEP_DECODE_END} must be 0 or 1, got {value}")
+    return value == 1
+
+
+def keep_last_decode_boundary(manager) -> bool:
+    """Make a recurrent group's sparse retention keep the state at the last block boundary a request reached
+    while decoding.
+
+    Why. Under sparse retention a request leaves one recurrent state behind, at its prompt's replay boundary
+    (``keep_block_aligned_prompt_end``). The states its decode steps complete at later block boundaries are
+    masked out of the prefix cache, although the attention group caches those blocks, so the next turn of the
+    conversation, whose prompt holds this turn's output, prefills that whole output again (1,100 output tokens
+    at TP8: 2,148 tokens prefilled where 612 are new or unaligned). Dense retention keeps them, and with them
+    every chunk-end state of every prompt, which fills the pool's cache slots with states no turn can use.
+
+    What. When ``cache_blocks`` sees a new full block that ends behind the prompt, the mask keeps that one
+    block: slot ``p`` holds the state after exactly ``(p + 1) * block_size`` tokens for decode steps as for
+    prompt chunks, and the request's block hashes cover its output, so a longer prompt that starts with the
+    same tokens hits there. Each request keeps one such state: when a later boundary is cached the earlier
+    one leaves the prefix cache again (only while the block still carries the hash this request gave it, so a
+    block the pool has handed to another request since is left alone). Cost: one more retained state per
+    recurrent group for a request whose output crossed a block boundary.
+
+    Not with speculative decoding: a step of ``1 + k`` scheduled tokens that straddles a block boundary keeps
+    its running state in the block of its LAST scheduled token (``recurrent_lattice.align_running_block``), so
+    the earlier block's slot stays at the position before that step, which is not the boundary. A group with
+    speculative blocks is left as it is (returns False).
+    """
+    if int(getattr(manager.kv_cache_spec, "num_speculative_blocks", 0) or 0) > 0:
+        return False
+    base_cache_blocks = manager.cache_blocks
+    base_mask = manager.reachable_block_mask
+    base_pop = manager.pop_blocks_for_free
+    kept: dict[str, tuple[KVCacheBlock, object]] = {}  # request id -> (its decode-boundary block, the hash given)
+    call: dict = {}
+
+    def reachable_block_mask(*args, **kwargs):
+        mask = base_mask(*args, **kwargs)
+        request = call.get("request")
+        if mask is None or request is None or not mask:
+            return mask
+        end_block = kwargs["end_block"]
+        if end_block * kwargs["kv_cache_spec"].block_size > request.num_prompt_tokens:
+            mask[-1] = True  # the newest full block ends behind the prompt: a boundary reached while decoding
+            call["marked"] = end_block - 1
+        return mask
+
+    def cache_blocks(request, num_tokens, retention_interval=None):
+        call["request"] = request
+        call.pop("marked", None)
+        try:
+            base_cache_blocks(request, num_tokens, retention_interval=retention_interval)
+        finally:
+            marked = call.pop("marked", None)
+            call.pop("request", None)
+        if marked is None:
+            return
+        blocks = manager.req_to_blocks.get(request.request_id) or []
+        block = blocks[marked] if marked < len(blocks) else None
+        if block is None or block.is_null or block.block_hash is None:
+            return
+        previous = kept.get(request.request_id)
+        if previous is not None and previous[0] is not block and previous[0].block_hash == previous[1]:
+            manager.block_pool._maybe_evict_cached_block(previous[0])
+        kept[request.request_id] = (block, block.block_hash)
+
+    def pop_blocks_for_free(request_id):
+        kept.pop(request_id, None)
+        return base_pop(request_id)
+
+    manager.reachable_block_mask = reachable_block_mask
+    manager.cache_blocks = cache_blocks
+    manager.pop_blocks_for_free = pop_blocks_for_free
+    return True
+
+
+ENV_ALIGN_SPLIT = "VLLM_HPU_PREFIX_ALIGN_SPLIT"
+
+
+def align_split_requested(environ=None) -> bool:
+    """``VLLM_HPU_PREFIX_ALIGN_SPLIT``: 0 (default) the engine's split as it is, 1 chunk ends at the recurrent block."""
+    value = int((os.environ if environ is None else environ).get(ENV_ALIGN_SPLIT, "0"))
+    if value not in (0, 1):
+        raise ValueError(f"{ENV_ALIGN_SPLIT} must be 0 or 1, got {value}")
+    return value == 1
+
+
+def recurrent_block_size(kv_cache_config: KVCacheConfig) -> int | None:
+    """The block of the recurrent (MambaSpec) groups: slot ``p`` holds the state after ``(p + 1) * block`` tokens."""
+    sizes = {int(group.kv_cache_spec.block_size) for group in kv_cache_config.kv_cache_groups
+             if isinstance(group.kv_cache_spec, MambaSpec)}
+    return max(sizes) if sizes else None
+
+
+def _resolve_split_block(scheduler) -> int | None:
+    """The block the aligned split should use instead of ``cache_config.block_size``, or None to leave it alone.
+
+    Logs the two block sizes once per scheduler, so a server log shows what its engine core holds."""
+    kv_cache_config = getattr(scheduler, "kv_cache_config", None)
+    recurrent = recurrent_block_size(kv_cache_config) if kv_cache_config is not None else None
+    engine = int(scheduler.cache_config.block_size)
+    if recurrent is None:
+        return None
+    if recurrent == engine:
+        logger.info("[HPU] Prefill chunk ends follow the recurrent block: cache_config.block_size %d = recurrent block "
+                    "%d (%s not needed)", engine, recurrent, ENV_ALIGN_SPLIT)
+        return None
+    if align_split_requested():
+        logger.info("[HPU] %s=1: prefill chunk ends follow the recurrent block %d, not cache_config.block_size %d of "
+                    "the engine core", ENV_ALIGN_SPLIT, recurrent, engine)
+        return recurrent
+    logger.warning("[HPU] The engine core's cache_config.block_size is %d but the recurrent block is %d: prompt chunks "
+                   "end at multiples of %d, so the state at a prompt's last block boundary exists only when a chunk "
+                   "happens to end there (the next turn then misses the prefix cache) and a state slot can hold the "
+                   "state of another position (a stale prefix hit). %s=1 aligns chunk ends to the recurrent block.",
+                   engine, recurrent, engine, ENV_ALIGN_SPLIT)
+    return None
+
+
+_UNSET = object()
+
+
+def install_recurrent_aligned_split(scheduler_cls=None) -> bool:
+    """Wrap ``Scheduler._mamba_block_aligned_split`` so that it aligns to the recurrent block when asked.
+
+    Why. The engine's rule keeps its invariant ("slot p holds the state after exactly (p + 1) * block_size tokens;
+    state is written at chunk ends, so chunk ends must be block aligned") with ``self.cache_config.block_size``, the
+    engine-core process's block size. The runner indexes the recurrent state slots with the recurrent group's block
+    (``compute_prefix_caching_block_indices``: 896 tokens at TP4, 512 at TP8). On the card the engine core held 128
+    (prefill job 00014: chunk ends at multiples of 2,048, not 896), so a prompt kept its last-boundary state only
+    when a chunk happened to end there, and the next turn of most conversations prefilled everything again
+    (00014: agents 0 to 3 cached 0; engine-step 00110: a 120,832-token prefix cached 0); at TP4 a slot could
+    also receive the state of another position, which a later hit reads (wrong output, silently).
+
+    What. With ``VLLM_HPU_PREFIX_ALIGN_SPLIT=1`` and the two sizes different, the engine's own rule runs with the
+    recurrent block in ``cache_config.block_size`` for the duration of the call, so chunk ends, the stop at the
+    prompt's last cacheable boundary and the shared-prefix junction stops all follow the slots the runner uses.
+    Without the flag the rule runs unchanged; either way the first call logs both sizes (one line per scheduler).
+    """
+    if scheduler_cls is None:
+        from vllm.v1.core.sched.scheduler import Scheduler as scheduler_cls
+    base = scheduler_cls._mamba_block_aligned_split
+    if getattr(base, "_hpu_recurrent_split", False):
+        return True
+
+    @functools.wraps(base)
+    def split(self, request, num_new_tokens, *args, **kwargs):
+        block = self.__dict__.get("_hpu_split_block", _UNSET)
+        if block is _UNSET:
+            block = _resolve_split_block(self)
+            self._hpu_split_block = block
+        if block is None:
+            return base(self, request, num_new_tokens, *args, **kwargs)
+        cache_config = self.cache_config
+        saved = cache_config.block_size
+        cache_config.block_size = block
+        try:
+            return base(self, request, num_new_tokens, *args, **kwargs)
+        finally:
+            cache_config.block_size = saved
+
+    split._hpu_recurrent_split = True
+    split._hpu_base = base
+    scheduler_cls._mamba_block_aligned_split = split
+    return True
 
 
 class RecurrentRoutingBlockPool(BlockPool):
@@ -164,11 +342,17 @@ class HpuRecurrentPoolCoordinator(HybridKVCacheCoordinator):
             recurrent_pool=self.recurrent_pool,
         )
         keep_prompt_end = keep_prompt_end_requested()
+        keep_decode_end = keep_decode_end_requested()
         for gid, manager in enumerate(self.single_type_managers):
             manager.block_pool = self._pool_for_group(gid)
             manager._null_block = manager.block_pool.null_block
-            if keep_prompt_end and gid in self.recurrent_group_ids:
-                keep_block_aligned_prompt_end(manager)
+            if gid in self.recurrent_group_ids:
+                if keep_prompt_end:
+                    keep_block_aligned_prompt_end(manager)
+                if keep_decode_end and not keep_last_decode_boundary(manager):
+                    logger.warning("%s=1 is ignored for recurrent group %d: it has speculative blocks, and a "
+                                   "speculative step that straddles a block boundary leaves no state at it",
+                                   ENV_KEEP_DECODE_END, gid)
 
     def _pool_for_group(self, group_id: int) -> BlockPool:
         return self.recurrent_pool if group_id in self.recurrent_group_ids else self.block_pool
