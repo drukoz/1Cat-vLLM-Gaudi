@@ -402,12 +402,15 @@ what makes the fallback safe:
 
 1. Both files exist: `libhc_fused_gaudi2.so` (`HC_FUSED_GAUDI_KERNEL_LIBRARY`, else the package's `lib/`) and
    `hc_fused_ops*.so` (`HC_FUSED_GAUDI_NATIVE_LIBRARY`, else the package's `lib/`).
-2. The kernel database is registered under the rules of the GDN library: through the combined kernel database when
+2. The bridge can run a custom op: in a lazy process `PT_HPU_LAZY_ACC_PAR_MODE` must be exactly 0
+   (`lazy_accumulation_reason()`; [native-extensions.md](native-extensions.md), "Custom ops and the lazy
+   accumulation thread"). Otherwise nothing is registered or loaded and the error names the variable.
+3. The kernel database is registered under the rules of the GDN library: through the combined kernel database when
    it can be the single `GC_KERNEL_PATH` file, otherwise first in the colon list, which `_prepend_kernel_database`
    refuses next to `PT_HPU_RECIPE_CACHE_CONFIG`. One condition more: the combined file must serve the library
    (`combined_db_serves_hc_fused`: the library sits next to it and the file's bytes contain the name). An adapter
    built before the library was a member does not, and would leave the six GUIDs unserved.
-3. Only then the schemas are imported and the extension, which registers the HPU kernels, is loaded.
+4. Only then the schemas are imported and the extension, which registers the HPU kernels, is loaded.
 
 A failure at any step leaves the ops without an HPU kernel, and the layers run torch.
 
@@ -435,20 +438,27 @@ forwards both. Host test: `csrc/kernel_db_adapter/test/test_adapter.cpp`; with t
 The orchestrator calls it right after G1b's own steps and records the result as G1b's `details["hc_fused"]`:
 
 ```bash
-PT_HPU_LAZY_MODE=1 python -m pytest -q -rs -p no:cacheprovider tests/unit_tests/hc_fused/test_hpu_op.py
+PT_HPU_LAZY_MODE=1 PT_HPU_LAZY_ACC_PAR_MODE=0 python -m pytest -q -rs -p no:cacheprovider tests/unit_tests/hc_fused/test_hpu_op.py
 ```
 
 from the plugin tree with the installed libraries by path, in its own process group, 600 s, log
-`fused_gdn/hc_hpu_op.log`. `status` is `passed` (exit 0, tests passed (90 today), none skipped, failed or in error), `failed` (anything else the test did;
-a skip means the extension or the kernel database is missing and counts as a failure, a timeout too), `skipped` (the
-library is not installed, or `--quick-gates` without `--hc-fused`) or `not_run` (the test file is not in the bundle).
-It never changes G1b's status, the GDN mode or the GDN flags.
+`fused_gdn/hc_hpu_op.log`. The step sets `PT_HPU_LAZY_ACC_PAR_MODE=0` unless the operator's environment has the
+variable (`lazy_acc_par_mode` records the value); without it at 0 the loader refuses the kernels and the test
+skips. `status` is `passed` (exit 0, tests passed (90 today), none skipped, failed or in error), `failed`
+(anything else the test did; a skip means the kernels did not load and counts as a failure, a timeout too),
+`skipped` (the library is not installed, or `--quick-gates` without `--hc-fused`) or `not_run` (the test file is
+not in the bundle). `failed_tests` names the failed tests and `empty_inputs` counts the lazy bridge's failing
+graphs and how many of them have an op built before the producer of its input
+(`tools/flash_next/rental/lazy_graph.py`). It never changes G1b's status, the GDN mode or the GDN flags.
 
 The 90 tests are: every op has an HPU kernel; 81 cases against the CPU oracle with `hc_case.compare` (the 56
 simulator cases plus rows 4, 8, 12, 20 and 8192 at the real geometry for the five decode-loop kernels), each also
 checking that no input changed; 6 cases against the same torch functions run on the card (atol 5e-2, rtol 1e-2); a
 repeat call that must give the same bits; one chain `hc_combine_norm` -> GEMM -> `hc_silu_split` -> GEMM ->
-`hc_gate_mix` -> `hc_combine_norm` against the torch chain on the card. What a pass means: the extension builds and
+`hc_gate_mix` -> `hc_combine_norm` against the torch chain on the card. Card runs on 2026-11-20 (Gaudi2, bridge
+1.24.1, build `4d6bc84`): 84 and 83 passed at
+`PT_HPU_LAZY_ACC_PAR_MODE=1`, a different failing set each time and every failure the same bridge error; 90 passed
+at 0. What a pass means: the extension builds and
 loads against the real bridge, the graph compiler accepts the six GUIDs with their glue, and the hardware gives the
 simulator's numbers. If only the two "against the torch path on the card" tests fail while the 81 oracle cases pass,
 the card's torch path differs from the CPU oracle; record the printed `HCHPU` lines before deciding.
@@ -485,6 +495,12 @@ with and without the flag on the real checkpoint is not measured by anything her
   does, so each bucket compiles its own recipe as today.
 
 ## Unproven without a card
+
+Since this list was written the card test ran (2026-11-20, Gaudi2, bridge 1.24.1, build `4d6bc84`): 90 of 90
+passed with `PT_HPU_LAZY_ACC_PAR_MODE=0`, which by "Rental gate" above answers items 1, 2, 3 and 6 for the cases of
+that test. At the bridge's default of 1 the same build failed 6 and 7 of the 90 at random; that is the bridge
+behaviour of [native-extensions.md](native-extensions.md), "Custom ops and the lazy accumulation thread", not a
+fault of a kernel. The items are kept as they were written.
 
 1. `hc_fused_ops` has never been built against the real Habana bridge. Its callbacks compile and run against the
    stub header under ASan/UBSan; the real `hpu_custom_op_pt2.h`, the link with `habana_pytorch_backend` and

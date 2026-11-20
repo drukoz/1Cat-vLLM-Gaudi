@@ -33,6 +33,7 @@ FAKE_PY = r"""
   echo "COMBINED: ${FLASHINFER_GAUDI_COMBINED_KERNEL_DB-<unset>}"
   echo "HCFLAG: ${VLLM_HPU_HC_FUSED-<unset>}"
   echo "RECIPE: ${PT_HPU_RECIPE_CACHE_CONFIG-<unset>}"
+  echo "ACCPAR: ${PT_HPU_LAZY_ACC_PAR_MODE-<unset>}"
 } >> "$FAKE_PY_LOG"
 case "$1" in
   -c) echo "INFO some import noise"
@@ -69,7 +70,7 @@ def make_lib(tmp_path, *, kernel=True, ops=True, gdn=True, combined=False):
 
 
 def setup(tmp_path, monkeypatch, *, lib, pytest_out=PASS_OUT, pytest_exit=0, test_file=True, **extra):
-    for name in (KILL_SWITCH, "VLLM_HPU_HC_FUSED", "PT_HPU_RECIPE_CACHE_CONFIG"):
+    for name in (KILL_SWITCH, "VLLM_HPU_HC_FUSED", "PT_HPU_RECIPE_CACHE_CONFIG", "PT_HPU_LAZY_ACC_PAR_MODE"):
         monkeypatch.delenv(name, raising=False)
     log = tmp_path / "fake.log"
     monkeypatch.setenv("FAKE_PY_LOG", str(log))
@@ -136,6 +137,32 @@ def test_the_step_never_runs_next_to_a_recipe_cache(tmp_path, monkeypatch):
 
     assert gates.hc_fused(plugin, tmp_path / "g1b", python=fake)["status"] == "passed"
     assert records(log)[1]["RECIPE"] == "<unset>"
+
+
+def test_the_step_runs_with_the_accumulation_thread_off(tmp_path, monkeypatch):
+    """A custom op is not safe next to the lazy bridge's accumulation thread (the card test of 2026-11-20
+    failed 6 and 7 of 90 at PT_HPU_LAZY_ACC_PAR_MODE=1 and none at 0), and the loader refuses the kernels in a
+    lazy process without the variable at 0: the step sets it, as the plugin does for a server."""
+    lib = make_lib(tmp_path)
+    fake, plugin, log = setup(tmp_path, monkeypatch, lib=lib)
+
+    result = gates.hc_fused(plugin, tmp_path / "g1b", python=fake)
+
+    assert result["status"] == "passed"
+    assert records(log)[1]["ACCPAR"] == "0"
+    assert result["lazy_acc_par_mode"] == "0"
+
+
+def test_the_operators_accumulation_mode_reaches_the_step(tmp_path, monkeypatch):
+    """A control run at mode 1 is the operator's to ask for; the servers of that run inherit the same value."""
+    lib = make_lib(tmp_path)
+    fake, plugin, log = setup(tmp_path, monkeypatch, lib=lib)
+    monkeypatch.setenv("PT_HPU_LAZY_ACC_PAR_MODE", "1")
+
+    result = gates.hc_fused(plugin, tmp_path / "g1b", python=fake)
+
+    assert records(log)[1]["ACCPAR"] == "1"
+    assert result["lazy_acc_par_mode"] == "1"
 
 
 def test_a_skip_inside_the_test_file_is_a_failure(tmp_path, monkeypatch):

@@ -62,6 +62,61 @@ upstream-PyTorch Bridge build (`GAUDI_PYTORCH_BRIDGE_ROOT`) and call Bridge inte
 custom-op API, so they keep their `habana_pytorch2_plugin.upstream` + `habana_pytorch_backend.upstream`
 link and stay eager-only. RUK-3103 does not change them.
 
+## Custom ops and the lazy accumulation thread
+
+**Rule.** In lazy mode a custom HPU op (`UserCustomOpDescriptor::execute`) is only safe with
+`PT_HPU_LAZY_ACC_PAR_MODE=0`. The bridge's default is 1.
+
+**What goes wrong at 1.** The bridge then builds the graph nodes of queued ops on a second thread, and builds
+the node of a custom op at once on the calling thread. When the op is called while the producer of one of its
+inputs (a clone, a linear, a cast, the vendor MoE op) is still queued, the op takes that input as a graph input
+(`hpu::input`), and the producer's node arrives later in the same graph. The graph fails when it runs:
+
+```text
+RuntimeError: Empty tensor optional Uniqueid: 3 Strided Params Has Value: 0 Failing Graph: IR {
+   %id_20_hpu__input Unique ID:3 = n4_hpu::input{}
+   %id_17_flashinfer_gaudi__hc_norm Unique ID:4 = n7_flashinfer_gaudi::hc_norm{id_20_hpu__input Uniqueid: 3 ...}
+   %id_20_aten__clone Unique ID:3 = n9_aten::clone{id_5_hpu__input Uniqueid: 1 ...}
+}
+```
+
+or, from `mark_step()`, `MODULE:PT_LAZY Error, ValidateSyncInputTensors tensor_data is empty`. It is a race, so
+it is intermittent, and no op is immune: it hit `hc_*`, `moe_route`, `moe_combine`, `gdn_core_decode` and
+`gdn_recurrent_decode`.
+
+**Evidence (Gaudi2 node, bridge 1.24.1, 2026-11-20).** Read from the logs: all 21 failing-graph dumps of the day
+have this shape (two hyper-connection card tests, two MoE glue card tests, the GDN replay tool, one GDN server,
+two hyper-connection servers), and the node numbers of the op and of the producers interleave one by one. On the
+card: the hyper-connection card test failed 6 of 90 at 06:05 UTC and 7 of 90 at 06:45 UTC at mode 1, with only
+the first test of the process in both sets, and passed 90 of 90 at mode 0 in between; the MoE glue card test lost
+its two bridge errors at mode 0 and kept its two numeric failures. That the second builder is the accumulation
+thread is an inference from those two facts: the bridge is not open source.
+
+**What the plugin does.**
+
+| Where | What |
+|---|---|
+| `vllm_gaudi.register` (`_default_serial_lazy_accumulation`) | With `VLLM_HPU_HC_FUSED=1` or `VLLM_HPU_MOE_GLUE=1`, in a process that is not eager, sets the variable to 0 when it is unset. It runs before the platform module imports the bridge, in the process that starts the workers, which inherit it. A value the user set stays |
+| `flashinfer_gaudi._native.load_hc_fused_extension` (`lazy_accumulation_reason`) | In a lazy process without the variable at exactly 0 the extension is not loaded and nothing is registered. The hyper-connection and MoE glue ops then have no HPU kernel and every layer runs its torch path with its usual line; the startup warning carries the reason |
+| `gates.hc_fused`, `gates.moe_glue` | The card tests run at mode 0 unless the operator's environment sets the variable |
+| `FLASHINFER_GAUDI_ALLOW_LAZY_ACC_THREAD=1` | Lifts the loader's refusal, for the probes and control runs that reproduce the failure on purpose |
+
+**Not covered.** `load_gdn_fused_extension` is unchanged: the fused GDN kernel is on by default, so a refusal or a
+default there changes servers that never asked for the kernels above. It is exposed to the same race (the GDN
+server of 06:19 UTC failed with it, and so did the `recurrent` replay of G1b's attempt through the combined
+kernel database, which G1b read as a fault of that database and switched off). Until that loader gets the same rule, a lazy
+process that runs the fused GDN kernel needs `PT_HPU_LAZY_ACC_PAR_MODE=0` in its environment.
+
+**Reading a failure.** `python -m tools.flash_next.rental.lazy_graph <log>...` prints one sentence per dump: the
+empty tensor, the op that took it as a graph input, and the node of the same graph that produces it. A dump
+whose empty input has no producer in the graph is a different failure.
+
+**Not known without a card.** Whether the bridge still honours the variable when it is set after
+`import habana_frameworks.torch` (the default above is set before, so it does not depend on it). Whether a
+custom op can take a view at mode 0: the clones in front of the ops (`_owned` in `flashinfer_gaudi/hc_fused.py`
+and `vllm_gaudi/models/qwen3_5.py`) were added for servers that ran at mode 1. Whether the legacy lazy API
+(`hpu_custom_op.h`) queues an op like a built-in one, which would make mode 1 safe.
+
 ## When an extension does not load
 
 `gdn_fused_extension_errors()` and `native_diagnostics()["load_errors"]` carry the `dlopen` error:
