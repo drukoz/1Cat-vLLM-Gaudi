@@ -161,6 +161,9 @@ VERIFY_HPU_CASES = VERIFY_CASES + (
         VerifyRow(5, 1, 9, 6, 4, (9, 10, 11, 12)),  # moved, all nodes real
     ), GdnGateActivation.SIGMOID, 40),
     VerifySimCase("ver_tp2_b16", 8, 24, 1 + 16 * 4, 6, _lattice_rows(16, 4), GdnGateActivation.SIGMOID, 41),
+    # One slot (a 15 KB conv pool, rule 10): node 3 stores over the load slot, nodes 0 to 2 store nothing.
+    VerifySimCase("ver_tp8_s1", 2, 6, 1, 6, (VerifyRow(0, 3, 0, 0, 4, (-1, -1, -1, 0)), ), GdnGateActivation.SIGMOID,
+                  42),
 )
 
 
