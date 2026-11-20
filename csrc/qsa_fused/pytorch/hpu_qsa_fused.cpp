@@ -1,0 +1,156 @@
+// SPDX-License-Identifier: Apache-2.0
+// HPU kernels of the fused QSA decode ops (torch.ops.flashinfer_gaudi.qsa_index_prepare / qsa_index_emit).
+#include <ATen/ATen.h>
+#include <ATen/core/stack.h>
+#include <torch/library.h>
+#include <cmath>
+#include <tuple>
+#include "hpu_custom_op_pt2.h"
+#include "../qsa_fused_params.h"
+
+namespace {
+// The schemas and the fake kernels are defined in Python (flashinfer_gaudi/qsa_fused.py, imported by
+// flashinfer_gaudi._native.load_qsa_fused_extension before this library is loaded); this file registers only the
+// HPU kernels. There is no CPU kernel outside the tests (tests/unit_tests/qsa_fused/qsa_ops.py adds the references).
+//   qsa_index_prepare(Tensor(a!) key_ring, Tensor(b!) key_cache, Tensor qk, Tensor rows, Tensor q_norm_weight,
+//                     Tensor k_norm_weight, Tensor cos_sin, float eps, int heads, int ring_rows, int ratio) -> Tensor
+//   qsa_index_emit(Tensor blocks, Tensor positions, Tensor block_table, int ratio, int block_size)
+//                  -> (Tensor, Tensor)
+constexpr auto kPrepareSchema = "flashinfer_gaudi::qsa_index_prepare";
+constexpr auto kEmitSchema = "flashinfer_gaudi::qsa_index_emit";
+
+bool power_of_two(int64_t value) { return value > 0 && (value & (value - 1)) == 0; }
+
+void check_tensor(const at::Tensor& t, at::ScalarType type, int64_t dims, const char* name) {
+    TORCH_CHECK(t.scalar_type() == type, "QSA fused ", name, " has the wrong dtype");
+    TORCH_CHECK(t.dim() == dims, "QSA fused ", name, " must be ", dims, "-D");
+    TORCH_CHECK(t.numel() > 0, "QSA fused ", name, " must not be empty");
+    TORCH_CHECK(t.is_contiguous(), "QSA fused ", name, " must be contiguous");
+}
+
+void check_same_device(const at::Tensor& first, const at::Tensor& other, const char* name) {
+    TORCH_CHECK(other.device() == first.device(), "QSA fused ", name, " must be on the device of the first input");
+}
+
+void validate_prepare(const at::Tensor& key_ring, const at::Tensor& key_cache, const at::Tensor& qk,
+                      const at::Tensor& rows, const at::Tensor& q_norm_weight, const at::Tensor& k_norm_weight,
+                      const at::Tensor& cos_sin, double eps, int64_t heads, int64_t ring_rows, int64_t ratio) {
+    check_tensor(key_ring, at::kBFloat16, 2, "key_ring");
+    check_tensor(key_cache, at::kBFloat16, 2, "key_cache");
+    check_tensor(qk, at::kBFloat16, 2, "qk");
+    check_tensor(rows, at::kInt, 2, "rows");
+    check_tensor(q_norm_weight, at::kBFloat16, 1, "q_norm_weight");
+    check_tensor(k_norm_weight, at::kBFloat16, 1, "k_norm_weight");
+    check_tensor(cos_sin, at::kBFloat16, 2, "cos_sin");
+    for (const auto* t : {&key_cache, &qk, &rows, &q_norm_weight, &k_norm_weight, &cos_sin}) {
+        check_same_device(key_ring, *t, "every tensor");
+    }
+    const int64_t dim = key_cache.size(1);
+    TORCH_CHECK(dim >= 1 && dim <= kQsaFusedMaxDim, "QSA fused head dim must be in [1, ", kQsaFusedMaxDim, "]");
+    TORCH_CHECK(key_ring.size(1) == dim && q_norm_weight.size(0) == dim && k_norm_weight.size(0) == dim,
+                "QSA fused key_ring, the weights and key_cache must share the head dim");
+    TORCH_CHECK(heads >= 1 && heads <= kQsaFusedMaxHeads, "QSA fused heads must be in [1, ", kQsaFusedMaxHeads, "]");
+    TORCH_CHECK(qk.size(1) == (heads + 1) * dim, "QSA fused qk must be [T, (heads + 1) * D]");
+    TORCH_CHECK(rows.size(0) == qk.size(0) && rows.size(1) == 4, "QSA fused rows must be [T, 4]");
+    TORCH_CHECK(power_of_two(ratio) && ratio >= 2 && ratio <= kQsaFusedMaxRatio, "QSA fused ratio must be 2, 4 or 8");
+    TORCH_CHECK(ring_rows >= ratio && ring_rows <= kQsaFusedMaxRingRows && key_ring.size(0) % ring_rows == 0,
+                "QSA fused key_ring must hold whole slots of ring_rows >= ratio rows");
+    TORCH_CHECK(cos_sin.size(1) % 2 == 0 && power_of_two(cos_sin.size(1) / 2) && cos_sin.size(1) <= dim,
+                "QSA fused cos_sin must be [P, 2 * R2] with R2 a power of two and 2 * R2 <= D");
+    TORCH_CHECK(std::isnormal(static_cast<float>(eps)) && eps > 0 && eps < 1, "QSA fused eps must be in (0, 1)");
+}
+
+void validate_emit(const at::Tensor& blocks, const at::Tensor& positions, const at::Tensor& block_table,
+                   int64_t ratio, int64_t block_size) {
+    check_tensor(blocks, at::kInt, 2, "blocks");
+    check_tensor(positions, at::kInt, 1, "positions");
+    check_tensor(block_table, at::kInt, 2, "block_table");
+    check_same_device(blocks, positions, "positions");
+    check_same_device(blocks, block_table, "block_table");
+    TORCH_CHECK(positions.size(0) == blocks.size(0) && block_table.size(0) == blocks.size(0),
+                "QSA fused blocks, positions and block_table must have one row per query row");
+    TORCH_CHECK(power_of_two(ratio) && ratio >= 2 && ratio <= kQsaFusedMaxRatio, "QSA fused ratio must be 2, 4 or 8");
+    TORCH_CHECK(power_of_two(block_size) && block_size >= ratio && block_size <= kQsaFusedMaxBlockSize,
+                "QSA fused block_size must be a power of two >= ratio");
+}
+
+std::shared_ptr<void> node_params(size_t& size, double eps, int64_t heads, int64_t ring_rows, int64_t ratio,
+                                  int64_t block_size, int64_t rotary_half) {
+    size = sizeof(QsaFusedParams);
+    return std::make_shared<QsaFusedParams>(QsaFusedParams{
+        static_cast<float>(eps), static_cast<int32_t>(heads), static_cast<int32_t>(ring_rows),
+        static_cast<int32_t>(ratio), static_cast<int32_t>(block_size), static_cast<int32_t>(rotary_half)});
+}
+
+const bool prepare_registered = [] {
+    habana::custom_op::registerUserCustomOp(
+        kPrepareSchema, kQsaFusedPrepareGuid,
+        [](const at::Stack& stack) {
+            const auto& key_cache = stack.at(1).toTensor();
+            const auto& qk = stack.at(2).toTensor();
+            const int64_t heads = stack.at(8).toInt();
+            validate_prepare(stack.at(0).toTensor(), key_cache, qk, stack.at(3).toTensor(), stack.at(4).toTensor(),
+                             stack.at(5).toTensor(), stack.at(6).toTensor(), stack.at(7).toDouble(), heads,
+                             stack.at(9).toInt(), stack.at(10).toInt());
+            return habana::PartialOutputMetaDataVector{
+                habana::PartialOutputMetaData{at::kBFloat16, {qk.size(0), heads * key_cache.size(1)}}};
+        },
+        [](const at::Stack& stack, size_t& size) -> std::shared_ptr<void> {
+            return node_params(size, stack.at(7).toDouble(), stack.at(8).toInt(), stack.at(9).toInt(),
+                               stack.at(10).toInt(), 0, stack.at(6).toTensor().size(1) / 2);
+        });
+    return true;
+}();
+
+const bool emit_registered = [] {
+    habana::custom_op::registerUserCustomOp(
+        kEmitSchema, kQsaFusedEmitGuid,
+        [](const at::Stack& stack) {
+            const auto& blocks = stack.at(0).toTensor();
+            const int64_t ratio = stack.at(3).toInt();
+            validate_emit(blocks, stack.at(1).toTensor(), stack.at(2).toTensor(), ratio, stack.at(4).toInt());
+            const int64_t width = blocks.size(1) * ratio + ratio - 1;
+            return habana::PartialOutputMetaDataVector{habana::PartialOutputMetaData{at::kInt, {blocks.size(0), width}},
+                                                       habana::PartialOutputMetaData{at::kInt, {blocks.size(0), width}}};
+        },
+        [](const at::Stack& stack, size_t& size) -> std::shared_ptr<void> {
+            return node_params(size, 0.0, 0, 0, stack.at(3).toInt(), stack.at(4).toInt(), 0);
+        });
+    return true;
+}();
+
+std::vector<at::Tensor> execute(const char* schema, const at::Tensor& first, std::vector<c10::IValue> inputs,
+                                size_t outputs) {
+    TORCH_CHECK(first.device().type() == c10::DeviceType::HPU, "QSA fused ops require HPU inputs");
+    auto descriptor = habana::custom_op::UserCustomOpDescriptor::getUserCustomOpDescriptor(schema);
+    std::vector<at::Tensor> result = descriptor.execute(inputs);
+    TORCH_CHECK(result.size() == outputs, "QSA fused op ", schema, " returned ", result.size(),
+                " outputs, expected ", outputs);
+    return result;
+}
+
+at::Tensor run_prepare(const at::Tensor& key_ring, const at::Tensor& key_cache, const at::Tensor& qk,
+                       const at::Tensor& rows, const at::Tensor& q_norm_weight, const at::Tensor& k_norm_weight,
+                       const at::Tensor& cos_sin, double eps, int64_t heads, int64_t ring_rows, int64_t ratio) {
+    validate_prepare(key_ring, key_cache, qk, rows, q_norm_weight, k_norm_weight, cos_sin, eps, heads, ring_rows,
+                     ratio);
+    TORCH_CHECK(prepare_registered);
+    return execute(kPrepareSchema, key_ring,
+                   {key_ring, key_cache, qk, rows, q_norm_weight, k_norm_weight, cos_sin, eps, heads, ring_rows, ratio},
+                   1)
+        .at(0);
+}
+
+std::tuple<at::Tensor, at::Tensor> run_emit(const at::Tensor& blocks, const at::Tensor& positions,
+                                            const at::Tensor& block_table, int64_t ratio, int64_t block_size) {
+    validate_emit(blocks, positions, block_table, ratio, block_size);
+    TORCH_CHECK(emit_registered);
+    const auto outputs = execute(kEmitSchema, blocks, {blocks, positions, block_table, ratio, block_size}, 2);
+    return std::make_tuple(outputs.at(0), outputs.at(1));
+}
+}  // namespace
+
+TORCH_LIBRARY_IMPL(flashinfer_gaudi, HPU, m) {
+    m.impl("qsa_index_prepare", run_prepare);
+    m.impl("qsa_index_emit", run_emit);
+}
