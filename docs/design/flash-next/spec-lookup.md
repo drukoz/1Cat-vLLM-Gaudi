@@ -319,6 +319,11 @@ that accepted at least j tokens:
 
 - A draft on 87 % (k = 3) to 64 % (k = 16) of the steps of the whole answers; on prose on 1 % of the steps.
 - The `follow` policy adds 0 to 0.1 tokens per step; `recent` is slightly worse: the search policy is not the lever.
+- The shortest match is not a lever either (`--min-ngram`, k = 3 / 5 on the whole answers): 2 -> 3.56 / 4.94,
+  3 -> 3.48 / 4.78, 4 -> 3.40 / 4.63, 5 -> 3.33 / 4.49, 8 -> 3.16 / 4.17 tokens per step; on prose a minimum of 4
+  already removes every draft (2: 7 % of the steps draft, 3: 1 %). For the hybrid a minimum of 4 keeps MTP's drafts
+  on prose and costs the edits about 1 % (INFERRED); for the n-gram server it turns 32 prose streams' 76 rows into
+  the 64 of the placeholder.
 - Rows: an n-gram step is as wide as its longest draft and an empty draft runs as the 2-row placeholder, so 32
   editing streams carry `32 (1 + k)` rows; 32 prose streams still carry 76 to 143 rows (expected, streams drafting
   independently) for nothing. The MTP and hybrid shapes are always `32 (1 + k)`.
