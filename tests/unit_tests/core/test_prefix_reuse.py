@@ -23,7 +23,7 @@ def _turns(sim: h.Sim, first_prompt: list[int], turns: int, generate: int = 8, n
     for turn in range(turns):
         rid = f"t{turn + 1}"
         sim.add(rid, prompt, max_tokens=generate)
-        sim.run_until_finished([rid], 400)
+        sim.run_until_finished([rid], 400 + generate)
         prompts.append(prompt)
         prompt = prompt + sim.outputs[rid] + h.own_tokens(0, new_tokens, salt=turn + 1)
     return prompts
@@ -180,3 +180,24 @@ def test_a_replay_of_the_same_block_aligned_prompt_still_misses(monkeypatch):
         sim.run_until_finished([rid], 400)
     assert sim.admissions["again"].cached_tokens == 0
     assert sim.violations == []
+
+
+def test_the_previous_output_is_prefilled_again_at_retention_zero(monkeypatch):
+    """What a turn costs today: the states a request produces while decoding are not kept, so the next turn
+    hits at the previous PROMPT's end aligned down and prefills the previous output again. Dense retention
+    keeps them (and every chunk-end state of every prompt)."""
+    monkeypatch.delenv(ENV_KEEP, raising=False)
+    generate, new_tokens = 1100, 600
+    sparse = h.Sim()
+    prompts = _turns(sparse, h.agent_prompt(0, 24_000), turns=2, generate=generate, new_tokens=new_tokens)
+    cached = sparse.admissions["t2"].cached_tokens
+    assert cached == (len(prompts[0]) - 1) // BLOCK * BLOCK == 23_552
+    # the last partial block of the prompt, the 1,100 output tokens and the 600 new ones
+    assert len(prompts[1]) - cached == 448 + generate + new_tokens
+    dense = h.Sim(h.Settings(retention_interval=BLOCK))
+    dense_prompts = _turns(dense, h.agent_prompt(0, 24_000), turns=2, generate=generate, new_tokens=new_tokens)
+    # the last boundary the first request reached while decoding (its last output token is never computed)
+    reached = (len(dense_prompts[0]) + generate - 1) // BLOCK * BLOCK
+    assert dense.admissions["t2"].cached_tokens == reached == 25_088
+    assert len(dense_prompts[1]) - reached == 12 + new_tokens
+    assert sparse.violations == [] and dense.violations == []
