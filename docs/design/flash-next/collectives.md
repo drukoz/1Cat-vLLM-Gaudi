@@ -251,7 +251,7 @@ Every job runs the committed tree in the farm's per-commit image (`CARD.md`); sc
 | 00064 `idcheck-rule9`, 1 card | `id_check.py`: every id pattern of the token path against the CPU, one lazy graph and a replayed one, rows 1, 2, 5, 32, 128, untied and tied, at a shard's width and at a whole row | serving cases (`vp_argmax`, `fp32_ids_row`) must equal the CPU; the probes say which patterns card rule 9 breaks (`argmax -> int32` is the fused greedy region and vLLM's sampler, `argmax -> .int()` the MTP draft loop, `topk -> int32` the control) | pending |
 | 00073 `c4-bench-r8-r4`, 8 cards, in the place of 00019 | `bench_job.sh`: the id check through the all-gather on 8 ranks; `bench_c4.py` on 8 ranks, on the module group 0-3, and on both groups at once | `decide_g41.py`: alpha and us per MB per rank count, regime and form; C4 pays where `gather_sum` (the flag) or `gather_first` (the collective alone, the fused-kernel form) is below `all_reduce` under replay; alpha8 against alpha4 for the layout | pending |
 | 00074 `tiny-tp4-logits-rider`, 4 cards | the tiny model at TP4 with `VLLM_HPU_VOCAB_PARALLEL_LOGITS=1 VLLM_HPU_PLE_TABLE_RIDER=1`, fused hyper-connections | tokens equal the CPU reference (one request at a time: one row) | pending |
-| 00081 `idcheck-consumers`, 1 card | `id_check.py`, the cases whose narrowed ids are consumed inside the graph (`argmax_int_embed`: the MTP draft loop; `topk_int32_embed`: the QSA block selection's shape) | whether a wrong narrowing is seen by the graph itself or only by a read to the host | pending |
+| 00108 `idcheck-shapes`, 1 card (replaced 00081) | `id_check.py` at commit `1c9abfef`: the top-k forms at k = 20 and 64 on a shard of 31,040 columns with 64 known largest logits (`vp_topk@k` = this branch's `vocab_parallel_topk`, `topk_gather_fp32@k`, `stage2_topk_gather@k`, `first_maximum@k`, the old casts `topk_to_int32@k` and `topk_to_fp32@k`), the arg max forms, and the cases whose narrowed ids are consumed inside the graph (`argmax_int_embed`: the MTP draft loop; `topk_int32_embed@k`: the QSA block selection's shape) | this branch's top-k must equal the CPU at every row count; the probes say which casts the card gets wrong at these shapes, and whether a wrong narrowing is seen by the graph itself or only by a read to the host | pending |
 | 00082 `real4-ab2-off`, 00083 `real4-ab2-logits-rider`, 4 cards each | `ab_job.sh`: the real model at TP4 + EP4, 1 and 32 streams, 256 tokens, no `min_tokens`, every stream's text kept; 6 lone requests; one 32-stream round with the server's default sampling | `compare_arms.py <off> <logits-rider>`: the lone requests' texts are equal (texts of batched streams change with the batch: job 00021), the ms per token of both, and what a sampled step costs next to a greedy one | pending |
 
 A probe that sends `min_tokens` measures none of this: a request with `min_tokens` is kept out of the greedy region
@@ -259,7 +259,7 @@ A probe that sends `min_tokens` measures none of this: a request with `min_token
 
 ## Handoff (if this agent stops)
 
-State at 20:10 UTC 2026-11-20 (third agent of this track, started 19:00 UTC). Branch
+State at 20:20 UTC 2026-11-20 (third agent of this track, started 19:00 UTC). Branch
 `feat/flash-next-gaudi-collectives`, worktree `/Volumes/Storage/Claude/gaudi-work/wt/collectives`, scratch, logs and
 card results in `/Volumes/Storage/Claude/gaudi-work/reports/collectives/` (`logs/`, `card/`). This section is the
 track's report (the harness refuses a REPORT.md).
@@ -269,8 +269,10 @@ Where things are:
 - Pull request #13 carries everything on the branch: the five cuts (default off), the card tools
   (`tools/flash_next/collectives/`), and the top-k interface of the sampled step (section 2, mode 2). The program
   head `b0cd0bb` is merged into the branch (`6b265d50`). The common gate (`bin/gate <worktree> --tools`) was
-  restarted at 20:10 UTC on the branch head with all of it: its lines are in the newest `/tmp/gate.*/summary.txt`
-  and at the end in `logs/gate_<sha>.log` (`rc=0` in the last line = green). An earlier run on `fc71ef83` had 44 of
+  restarted at 20:08 UTC on the branch head with all of it (`bin/gate` runs one gate at a time on this Mac since
+  20:12 UTC: it waits its turn, see `/tmp/gaudi-gate.lock/tree`): its lines are in the newest
+  `/tmp/gate.*/summary.txt` and at the end in `logs/gate_3c0ada27.log` (`rc=0` in the last line = green; later
+  commits touched only `tools/flash_next/collectives/`, its unit test and this note). An earlier run on `fc71ef83` had 44 of
   82 files green and none red when it was stopped. Green: `gh pr merge 13 --merge`. A red line: run that file
   alone (`reports/collectives/pt2.sh <name> <file>`; add `-p tests.unit_tests.hpu_cpu_stubs` for
   `tests/unit_tests/worker/test_hpu_model_runner.py`) and compare with the program head before deciding.
@@ -287,13 +289,18 @@ Where things are:
   the dispatched ops). The fused greedy region and its gathered fallback belong to engine-step: not edited here.
 - Reported to the coordinator: the MTP draft loop's `argmax -> .int()` (19:12), the farm probe's `min_tokens`
   (fixed 19:20), that every probe was greedy (19:42; a program rule since 19:45), the structural answer (19:42).
+- An incident of this agent (20:05:25 UTC, reported at once; BRIEF has the rule since): a `pkill -f` with options
+  after its pattern matched nearly every process of the user. Never kill by name or pattern on this Mac: only a
+  pid your own command started (`ps -eo pid,ppid,etime,command | grep ...`, then `kill <pid>`).
 
-Card jobs (section 6 has what each decides). Bumped by the coordinator: 00064 and 00081 (single-card wave after
-the QSA pair, about 20:45 to 21:30 UTC), 00073 (all cards, after prefill's 00014 and step-anatomy's 00069; do not
-replace it: a replacement loses the bump). At the end of the queue, any:4: 00074 (tiny TP4 token parity), 00082
+Card jobs (section 6 has what each decides). 00064 (bumped: single-card wave after the QSA pair, about 20:45
+to 21:30 UTC), 00108 (replaced 00081; the coordinator was asked at 20:16 UTC to bump it into the same wave),
+00073 (all cards, bumped behind prefill's 00014 and step-anatomy's 00069; do not replace it: a replacement loses
+the bump). At the end of the queue, any:4: 00074 (tiny TP4 token parity), 00082
 and 00083 (real TP4 arms off / logits + rider; `ab_job.sh` with 6 lone requests for the text test and one round
-with the server's default sampling). Each `farm` command waits in a background shell of this agent and copies the
-results to `reports/collectives/card/<id>-<name>/` when its job ends; if the agent is gone:
+with the server's default sampling). One waiter per job runs in a background shell of this agent
+(`reports/collectives/waitfetch.sh <id> <name>`; for 00108 the `farm job` command itself) and copies the results
+to `reports/collectives/card/<id>-<name>/` when the job ends; if the agent is gone:
 `bin/farm ledger | grep -w collectives`, then `bin/farm fetch collectives <id> <id>-<name>`. Cancel the any:4 jobs
 if they have not started by about 03:00 UTC.
 
