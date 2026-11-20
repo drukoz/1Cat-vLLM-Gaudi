@@ -20,6 +20,9 @@
 # MME row sweep (G1-1) and the small lazy-op cases, then VLLM_CONFIG_HIDDEN_LAYERS 4 (and 12 with time left).
 # Q = one server, one short phase (a check of this script's plumbing). T = the profiler capture with the Habana
 # SDK in API-controlled mode (HABANA_PROFILE=1 and a profiler configuration file).
+# P = the device time per model component against the rows (MTP's verification rows): one server with room for
+# 128 sequences and the torch profiler, timer rounds, then one capture each in a 32- and a 128-stream decode round
+# (read on the workstation with trace_components.py).
 #
 # A stage-2 job reads the file anatomy_late.sh next to its results folder (on the node:
 # ~/farm/<track>/results/anatomy_late.sh) before its plan starts: it may set ANATOMY_S_PHASES, ANATOMY_C_PHASES,
@@ -119,8 +122,9 @@ serve() {
     { echo "label $label"; echo "phases $phases"; echo "trace $trace"; echo "extra args: $*"
       env | grep -E '^(VLLM_|PT_HPU|HABANA_|FLASHINFER)' | sort; } > versions.txt
     say "$label: starting the server"
+    # shellcheck disable=SC2086  # ANATOMY_SERVE_EXTRA: vllm serve options of the plan (P: --max-num-seqs 128)
     vllm serve "$MODEL" --served-model-name fn --host 127.0.0.1 --port "$PORT" \
-        --tensor-parallel-size "$TP" "${MODEL_ARGS[@]}" "$@" > server0.log 2>&1 &
+        --tensor-parallel-size "$TP" "${MODEL_ARGS[@]}" "$@" ${ANATOMY_SERVE_EXTRA:-} > server0.log 2>&1 &
     SP=$!
     t0=$(date +%s)
     while :; do
@@ -334,6 +338,19 @@ run_benches() {
     tail -n 30 "$RESULTS/lazy_ops_mode0.log" 2>/dev/null | cut -c1-250
 }
 
+plan_p() {
+    # P: what a decode row costs per model component, at 32 and 128 rows (MTP k = 3 verifies 4 rows per stream:
+    # 128 rows at 32 streams). One server with room for 128 sequences and the torch profiler (HPU activities): warm
+    # rounds at the capture's length (no bucket compile inside a capture), timer rounds, then one capture in the
+    # middle of a 32-stream and of a 128-stream round. The traces are read on the workstation with
+    # trace_components.py (device time per component, graph launches per step). The profiler's stop takes minutes
+    # (job 00113: 140 s at 32 streams on 4 cards): the probe waits up to 600 s for a stream's next chunk.
+    ANATOMY_SERVE_EXTRA="--max-num-seqs ${ANATOMY_MAX_SEQS:-128}" \
+        ANATOMY_PROBE_ARGS="${ANATOMY_PROBE_ARGS:---measured-timeout 600 --trace-seconds 1.0}" \
+        ANATOMY_TRACE_PHASES="${ANATOMY_P_PHASES:-warm:32,128:160;1:32,128:128}" \
+        ANATOMY_TRACE_LEVELS="${ANATOMY_P_LEVELS:-32,128}" trace_server p-trace
+}
+
 plan_b() {
     run_benches 600
     # I10 / G4-2: the per-decoder-layer mark_step every 4 layers (default every layer). A bigger recipe compiles
@@ -379,6 +396,7 @@ case "$PLAN" in
     B) plan_b ;;
     Q) plan_q ;;
     T) plan_t ;;
+    P) plan_p ;;
     *) say "unknown plan $PLAN"; exit 2 ;;
 esac
 say "plan $PLAN done"
