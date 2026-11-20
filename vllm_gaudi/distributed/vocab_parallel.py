@@ -21,8 +21,15 @@ Exactness (``docs/design/flash-next/collectives.md`` has the argument and the te
   several tokens tie at the ``k``-th value, which of the tied tokens are returned is not defined (it is not
   defined for ``torch.topk`` over the gathered logits either).
 
-Device rules: ids travel as fp32 (exact below 2**24), are never int64 on the device, and no op here indexes
-with a tensor.
+* :func:`top_k` is the head's side of a sampled step that draws from candidates (the sampler stage is
+  ``vllm_gaudi/v1/sample/candidate_sampling.py``, the engine-step track's): with a top-k of at most ``k`` on
+  every sampled row the tokens top-k keeps are all among the returned ones, unless more than ``k`` of them lie in
+  one rank's shard. :func:`first_maximum` picks a greedy row's token from the same candidates.
+
+Device rules: ids travel as fp32 (exact below 2**24) and no id is int64 on the device where this module can
+avoid it. Where an op hands out int64 indices (``torch.topk``, the sampler's arg max) they are used as they are,
+as the index of a ``torch.gather`` into an fp32 id table: an integer cast of device-made int64 ids in the graph
+that made them is card rule 9's failing pattern (``topk`` ids narrowed to int32 came back as every second id).
 """
 
 from __future__ import annotations
@@ -119,8 +126,7 @@ def vocab_parallel_argmax(model, hidden_states: torch.Tensor) -> torch.Tensor:
     logits, start, count = _shard_logits(owner, hidden_states)
     rows = logits.shape[0]
     if count > 0:
-        ids = torch.arange(start, start + count, dtype=torch.float32, device=logits.device).expand(rows, count)
-        value, token = _lowest_id_of_max(logits, ids)
+        value, token = _lowest_id_of_max(logits, _id_table(start, count, rows, logits.device))
     else:  # a shard with no real row: it never wins
         value = torch.full((rows, ), float("-inf"), dtype=torch.float32, device=logits.device)
         token = torch.full((rows, ), _NO_TOKEN, dtype=torch.float32, device=logits.device)
@@ -133,11 +139,21 @@ def vocab_parallel_argmax(model, hidden_states: torch.Tensor) -> torch.Tensor:
     return token.clamp(min=0.0, max=last).to(torch.int32)
 
 
-def vocab_parallel_topk(model, hidden_states: torch.Tensor, k: int) -> tuple[torch.Tensor, torch.Tensor]:
-    """The ``k`` largest logits of every row: ``(values fp32 [rows, k] descending, ids int32 [rows, k])``.
+def _id_table(start: int, count: int, rows: int, device) -> torch.Tensor:
+    """The global ids ``start .. start + count - 1`` as fp32 ``[rows, count]`` (a broadcast, no copy)."""
+    return torch.arange(start, start + count, dtype=torch.float32, device=device).expand(rows, count)
 
-    Each rank: ``torch.topk`` of its shard. One all-gather of ``[rows, 2k]`` fp32 per rank (values, then
-    ids), then ``torch.topk`` over the ``world * k`` candidates.
+
+def vocab_parallel_candidates(model, hidden_states: torch.Tensor, k: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """Every rank's ``k`` largest logits of every row: ``(values fp32, global ids fp32)``, both ``[rows, world * k]``.
+
+    Each rank: ``torch.topk`` of its shard, the ids read out of an fp32 id table with the indices as ``topk``
+    made them. One all-gather of ``[rows, 2k]`` fp32 per rank (values, then ids). Rank ``r``'s candidates are the
+    columns ``r * k .. (r + 1) * k - 1``, descending. A shard with fewer than ``k`` real rows fills up with
+    ``-inf`` values (id 0), which no consumer picks.
+
+    The ``j`` largest logits of the vocabulary are among these for every ``j <= k``; so is every token whose
+    logit is at least the ``j``-th largest value, unless more than ``k`` such tokens lie in one rank's shard.
     """
     owner = head_owner(model)
     logits, start, count = _shard_logits(owner, hidden_states)
@@ -147,7 +163,7 @@ def vocab_parallel_topk(model, hidden_states: torch.Tensor, k: int) -> tuple[tor
     local_k = min(k, count)
     if local_k > 0:
         values, index = torch.topk(logits, local_k, dim=-1)
-        ids = index.to(torch.float32) + float(start)
+        ids = torch.gather(_id_table(start, count, rows, logits.device), -1, index)
     else:
         values = logits.new_empty((rows, 0))
         ids = logits.new_empty((rows, 0))
@@ -159,11 +175,46 @@ def vocab_parallel_topk(model, hidden_states: torch.Tensor, k: int) -> tuple[tor
     if world > 1:
         gathered = tensor_model_parallel_all_gather(torch.cat((values, ids), dim=-1), dim=-1)  # [rows, world * 2k]
         gathered = gathered.reshape(rows, world, 2, k)
-        all_values = gathered.select(2, 0).reshape(rows, world * k)
-        all_ids = gathered.select(2, 1).reshape(rows, world * k)
-        values, chosen = torch.topk(all_values, k, dim=-1)
-        ids = torch.gather(all_ids, -1, chosen)
-    return values, ids.to(torch.int32)
+        values = gathered.select(2, 0).reshape(rows, world * k)
+        ids = gathered.select(2, 1).reshape(rows, world * k)
+    return values, ids
+
+
+def vocab_parallel_topk(model, hidden_states: torch.Tensor, k: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """The ``k`` largest logits of every row: ``(values fp32 [rows, k] descending, ids int32 [rows, k])``.
+
+    :func:`vocab_parallel_candidates` (each rank's top ``k``, one all-gather of ``[rows, 2k]`` fp32 per rank),
+    then ``torch.topk`` over the ``world * k`` candidates.
+    """
+    all_values, all_ids = vocab_parallel_candidates(model, hidden_states, k)
+    if all_values.shape[-1] == k:  # one rank: its top k is the answer, already descending
+        return all_values, all_ids.to(torch.int32)
+    values, chosen = torch.topk(all_values, k, dim=-1)
+    return values, torch.gather(all_ids, -1, chosen).to(torch.int32)
+
+
+def first_maximum(values: torch.Tensor, ids: torch.Tensor) -> torch.Tensor:
+    """The lowest of the ``ids`` that hold the largest value of each row: ``[rows, 1]`` in the dtype of ``ids``.
+
+    ``values`` ``[rows, C]`` and ``ids`` ``[rows, C]`` are candidates with their global token ids, as
+    :func:`top_k` or :func:`vocab_parallel_candidates` return them. The result is a row's greedy token, the one
+    :func:`top_tokens` gives, as long as every token that ties at the maximum is a candidate (always, unless more
+    than ``C`` tokens of one shard tie there). A row without a maximum (NaN) gets its first candidate.
+
+    fp32 and int32 ids go through the ops of :func:`vocab_parallel_argmax` (ids as fp32, max / where / min, an
+    fp32 to int32 cast: exact below 2**24). int64 ids are compared and reduced as they are, with no cast.
+    """
+    best = values.amax(dim=-1, keepdim=True)
+    is_best = values == best
+    first = ids.narrow(-1, 0, 1)
+    if ids.dtype == torch.int64:  # as an op made them (topk over gathered logits): never cast
+        sentinel = torch.full_like(ids, torch.iinfo(torch.int64).max)
+        token = torch.where(is_best, ids, sentinel).amin(dim=-1, keepdim=True)
+        return torch.where(is_best.any(dim=-1, keepdim=True), token, first)
+    as_fp32 = ids.to(torch.float32)
+    token = torch.where(is_best, as_fp32, torch.full_like(as_fp32, _NO_TOKEN)).amin(dim=-1, keepdim=True)
+    token = torch.where(token < _NO_TOKEN, token, as_fp32.narrow(-1, 0, 1))
+    return token.to(ids.dtype)
 
 
 def _gathered_logits(model, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -188,12 +239,15 @@ def top_tokens(model, hidden_states: torch.Tensor) -> torch.Tensor:
 
 
 def top_k(model, hidden_states: torch.Tensor, k: int) -> tuple[torch.Tensor, torch.Tensor]:
-    """The ``k`` largest logits of every row, ``(values fp32 [rows, k], ids int32 [rows, k])``.
+    """The ``k`` largest logits of every row: ``(values fp32 [rows, k] largest first, global ids int32 [rows, k])``.
 
-    ``VLLM_HPU_VOCAB_PARALLEL_LOGITS=2`` and a supported model: the vocabulary-parallel top-k. Otherwise
-    ``torch.topk`` over the all-gathered logits.
+    The one call of a consumer that samples from candidates. ``VLLM_HPU_VOCAB_PARALLEL_LOGITS=2`` and a model
+    :func:`unsupported_reason` accepts: :func:`vocab_parallel_topk` (each rank's top ``k``, ``[rows, 2k]`` fp32
+    gathered per rank, no logits all-gather). Otherwise ``compute_logits`` (the all-gather) and ``torch.topk``.
+    Either way the ids come out of an fp32 id table and are int32: no int64 id is cast.
     """
     if mode() == VocabParallelMode.CANDIDATES and enabled(model):
         return vocab_parallel_topk(model, hidden_states, k)
-    values, ids = torch.topk(_gathered_logits(model, hidden_states).to(torch.float32), k, dim=-1)
-    return values, ids.to(torch.int32)
+    logits = _gathered_logits(model, hidden_states).to(torch.float32)
+    values, index = torch.topk(logits, k, dim=-1)
+    return values, torch.gather(_id_table(0, logits.shape[-1], logits.shape[0], logits.device), -1, index).to(torch.int32)
