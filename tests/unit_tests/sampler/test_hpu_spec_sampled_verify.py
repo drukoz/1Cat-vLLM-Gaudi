@@ -53,25 +53,28 @@ def _chi_square_bound(dof: int) -> float:
     return dof * (1 - 2 / (9 * dof) + z * math.sqrt(2 / (9 * dof)))**3
 
 
-def test_expand_batch_to_tokens_is_upstreams_definition():
+def test_expand_batch_to_tokens_follows_the_hpu_padded_layout():
+    # 3 requests x 3 draft rows, real drafts 1, 1 and 3 (cu = [1, 2, 5]): upstream's packed rule would give row 3,
+    # request 1's draft, the value of request 2
     x = torch.tensor([7.0, -1.0, 3.0])
-    cumulative = torch.tensor([2, 5, 6], dtype=torch.int32)
-    out = hrs.expand_batch_to_tokens(x, cumulative, 6)
-    assert out.tolist() == [7.0, 7.0, -1.0, -1.0, -1.0, 3.0]
-    out = hrs.expand_batch_to_tokens(x, cumulative, 6, replace_from=-1.0, replace_to=1.0)
-    assert out.tolist() == [7.0, 7.0, 1.0, 1.0, 1.0, 3.0]
-    # the HPU's padded layout: 3 requests x 3 rows, 2 + 3 + 1 real (cu = [2, 5, 6]), padded rows take any value
-    assert hrs.expand_batch_to_tokens(torch.tensor([1, 2, 3]), cumulative, 6).tolist() == [1, 1, 2, 2, 2, 3]
-    assert hrs.expand_batch_to_tokens(torch.tensor([4, 5]), torch.tensor([0, 3], dtype=torch.int32), 3).tolist() \
-        == [5, 5, 5]
+    cumulative = torch.tensor([1, 2, 5], dtype=torch.int32)
+    out = hrs.expand_batch_to_tokens(x, cumulative, 9)
+    assert out.tolist() == [7.0, 7.0, 7.0, -1.0, -1.0, -1.0, 3.0, 3.0, 3.0]
+    out = hrs.expand_batch_to_tokens(x, cumulative, 9, replace_from=-1.0, replace_to=1.0)
+    assert out.tolist() == [7.0, 7.0, 7.0, 1.0, 1.0, 1.0, 3.0, 3.0, 3.0]
+    assert hrs.expand_batch_to_tokens(torch.tensor([4, 5]), torch.tensor([0, 3], dtype=torch.int32), 6).tolist() \
+        == [4, 4, 4, 5, 5, 5]
+    with pytest.raises(ValueError, match="padded per request"):
+        hrs.expand_batch_to_tokens(x, cumulative, 5)
 
 
 def test_apply_sampling_constraints_divides_a_greedy_row_by_one():
     logits = torch.tensor([[1.0, 4.0, 2.0], [1.0, 4.0, 2.0], [3.0, 0.0, 9.0]])
     # request 0 greedy (the HPU batch stores -1.0), request 1 at temperature 2 (two draft rows)
+    logits = torch.cat((logits[:1], logits[:1], logits[1:]))  # padded layout: 2 requests x 2 rows
     md = _metadata(temperature=torch.tensor([-1.0, 2.0]))
     out = hrs.apply_sampling_constraints(logits.clone(), torch.tensor([1, 3], dtype=torch.int32), md)
-    assert out.tolist() == [[1.0, 4.0, 2.0], [0.5, 2.0, 1.0], [1.5, 0.0, 4.5]]
+    assert out.tolist() == [[1.0, 4.0, 2.0], [1.0, 4.0, 2.0], [0.5, 2.0, 1.0], [1.5, 0.0, 4.5]]
     greedy = _metadata(temperature=None, all_greedy=True)
     assert hrs.apply_sampling_constraints(logits, torch.tensor([3], dtype=torch.int32), greedy) is logits
 

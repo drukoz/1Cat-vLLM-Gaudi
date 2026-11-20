@@ -191,17 +191,19 @@ def expand_batch_to_tokens(
     replace_from: int = 0,
     replace_to: int = 0,
 ) -> torch.Tensor:
-    """Upstream's ``expand_batch_to_tokens`` (a Triton kernel) in torch: ``[batch] -> [num_tokens]``, request i's
-    value on its tokens ``cu_num_tokens[i - 1] .. cu_num_tokens[i] - 1``, ``replace_from`` becoming ``replace_to``.
+    """Upstream's ``expand_batch_to_tokens`` (a Triton kernel) in torch, for the HPU's padded draft layout:
+    ``[batch] -> [num_tokens]`` with request i's value on rows ``i * k .. i * k + k - 1``, ``k = num_tokens //
+    batch``, ``replace_from`` becoming ``replace_to``.
 
-    Tokens after ``cu_num_tokens[-1]`` (none upstream) get the last request's value. Comparisons, a sum and one
-    ``index_select``: no host sync, no advanced indexing.
+    The HPU runner lays every request's draft rows out padded to the step's ``k`` (``target_logits_indices`` holds
+    ``-1`` for a request's missing drafts), where upstream packs them by ``cu_num_tokens``; with uneven draft
+    counts the packed rule would give a request the temperature, top-k and top-p of the next. Padded rows get
+    their request's value and are never read. One ``index_select``: no host sync, no advanced indexing.
     """
     batch_size = x.shape[0]
-    token = torch.arange(num_tokens, device=x.device, dtype=torch.int32)
-    request = (token.unsqueeze(1) >= cu_num_tokens.to(device=x.device, dtype=torch.int32).unsqueeze(0)).sum(
-        dim=1, dtype=torch.int32)
-    request = request.clamp(max=batch_size - 1)
+    if batch_size == 0 or num_tokens % batch_size:
+        raise ValueError(f"HPU draft rows are padded per request: {num_tokens} rows for {batch_size} requests")
+    request = torch.arange(num_tokens, device=x.device, dtype=torch.int32) // (num_tokens // batch_size)
     expanded = torch.index_select(x, 0, request)
     return torch.where(expanded == replace_from, torch.full_like(expanded, replace_to), expanded)
 
