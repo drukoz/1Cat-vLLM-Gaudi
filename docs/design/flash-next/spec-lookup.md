@@ -10,7 +10,23 @@ repository is under `/Volumes/Storage/Claude/gaudi-work/reports/spec-lookup/` (`
 
 ## Handoff (if this agent stops)
 
-State at **2026-11-20 19:50 UTC**. Branch head `628d9716` plus this file, pushed.
+State at **2026-11-20 19:55 UTC**. Branch head: the commit that holds this text, pushed.
+
+**Card jobs in the queue** (`bin/farm status`; results land in `reports/spec-lookup/card/<id>-<name>/`)
+
+| Job | What | State |
+|---|---|---|
+| 00086 `tiny2-ngram3-oracle` (any:2, 10 min) | tiny model: baseline, then n-gram k = 3 with prefix caching and the rehearsal oracle | waiting, bumped by the coordinator to the tail of the 1-card wave (expected 20:25 to 21:40 UTC); runs commit `628d9716` |
+| 00087 `tiny2-ngram8-search` (any:2, 14 min) | tiny model: baseline, n-gram k = 8 with the oracle, n-gram k = 3 with vLLM's own search | the same |
+| `real4-nospec-edit-prose` (any:4, 28 min, `--replaces 00029`) | real model without speculation: the edit, prose, whole-answer and large-file rounds (section 6) | submitted 19:51 UTC from commit `c13d1b97`; takes 00029's place (bound 03:38 UTC, realistically hours earlier) |
+
+When a tiny job ends: send its result lines (the `lookup tiny [...]` lines: tokens per step, the rate of every
+draft position, drafts and accepted; any failure with its traceback from `<config>/server0.log`) to the
+coordinator (`main`) and to the mtp-card-ready track at once: it is the first card run with accepted drafts
+(mtp-card-ready's tiny MTP run passed with 0 of 270 drafts accepted). When the no-speculation job ends: run
+`tools/flash_next/lookup_replay.py reports/spec-lookup/card/<id>-real4-nospec-edit-prose/probe.json --out ...`
+and send the acceptance per draft position for depths 3 to 16 on the edit prompts (section 5 has the
+synthetic preview).
 
 **Done and verified on CPU**
 
@@ -21,64 +37,56 @@ State at **2026-11-20 19:50 UTC**. Branch head `628d9716` plus this file, pushed
 | Hybrid proposer, its modes, the per-request mode, the per-load log line, the rehearsal oracle | `tests/unit_tests/worker/test_flash_next_lookup.py` 19 passed (head) |
 | Verification width helpers | `tests/unit_tests/worker/test_verify_width.py` 12 passed |
 | Platform: n-gram with prefix caching served, k limits `{"mtp": 5, "ngram": 8}` | `tests/unit_tests/test_flash_next_platform.py` 75 passed (head) |
-| Card job tools | `tests/unit_tests/tools/rental/test_lookup_probe.py` 10 passed, `test_lookup_tiny.py` 9 passed, `test_spec_probe.py` 13 passed (head) |
+| Card job tools | `tests/unit_tests/tools/rental/test_lookup_probe.py` 11 passed, `test_lookup_tiny.py` 9 passed, `test_spec_probe.py` 13 passed (head) |
+| The replay tool; its `earliest` policy equals vLLM's n-gram kernel on 400 random streams | `tests/unit_tests/tools/test_lookup_replay.py` 5 passed (head) |
 | Model-level n-gram tests at k = 3, 4, 5, 8 (earlier agent, `7dcc65a3`; not rerun after the merges) | `tests/unit_tests/models/flash_next/test_ngram_end_to_end.py`, logs `reports/spec-lookup/logs/ngram_k8*.log` |
 
 **Not verified yet**
 
 - The CPU engine tests on the head. mtp-card-ready's fix `f0e7d02f` passes an int32 index to `index_copy_`
   (`vllm_gaudi/ops/causal_conv1d_pytorch.py:498`), which the CPU kernel refuses, so every CPU engine test of a
-  speculative config stops at its first prefill until that track casts the index (reported 19:45 UTC; do not
-  change those lines here, take their commit). Then rerun `test_lookup_engine.py` (19 min under load) and
+  speculative config stops at its first prefill until that track casts the index (reported 19:45 UTC, their fix
+  was not pushed at 19:53; do not change those lines here, merge their commit). The card takes the int32 index
+  (their tiny MTP run passed with `f0e7d02f`). Then rerun `test_lookup_engine.py` (19 min under load) and
   `test_engine_mtp.py` (30 min; a run that started on the tree of `3d536265` while later merges changed the
   files under it had 12 passed, 1 failure from this defect and 1 from a file read mid-merge:
   `reports/spec-lookup/logs/m1_test_engine_mtp.log`).
 - `bin/gate /Volumes/Storage/Claude/gaudi-work/wt/spec-lookup --tools` on the head (needed before a pull request).
-- **Nothing of this track has run on a card.** The MTP server starts on the card since job 00021 (healthy after
-  435 s); its first prompt died (the conv-state slice write, fixed by `f0e7d02f`); mtp-card-ready's tiny run with
-  the fix then failed with `Empty tensor optional` (19:34 UTC, their job 00021 hold). The n-gram server shares
-  the target's speculative path (widened PLE and GDN conv state, state lattices), not the drafter.
+- **Nothing of this track has run on a card yet.** MTP on the card (mtp-card-ready): the real server starts
+  (job 00021, healthy after 435 s); its first prompt died on the conv-state slice write, fixed by `f0e7d02f`;
+  with the fix the tiny model passes MTP k = 3 with every draft rejected. Accepted drafts, widened steps and
+  block-completion commits have not run on a card: jobs 00086 and 00087 are the first.
 
 **Pending, in order**
 
-1. **Tiny-model rehearsal on the card** (coordinator, 19:26 UTC: the real model only after the tiny model runs
-   drafts and verification cleanly). One server is about a minute; each job is a baseline server plus the named
-   configurations (`tools/flash_next/rental/lookup_tiny.py`, section 6):
+1. **Read the tiny rehearsals** (00086, 00087) and report them (above). If a configuration fails: the traceback
+   is in `reports/spec-lookup/card/<id>-<name>/<config>/server0.log`; `lookup_tiny.json` has every stream.
+   Then the hybrid's rehearsal, which needs nothing new:
    ```bash
    F=/Volumes/Storage/Claude/gaudi-work/bin/farm
-   $F job spec-lookup tiny2-ngram3 any:2 10m --no-model -- python tools/flash_next/rental/lookup_tiny.py --configs ngram3
-   $F job spec-lookup tiny2-ngram8-search any:2 14m --no-model -- python tools/flash_next/rental/lookup_tiny.py --configs ngram8,ngram3-search
-   $F job spec-lookup tiny2-mtp3-lookup any:2 10m --no-model -- python tools/flash_next/rental/lookup_tiny.py --configs mtp3-lookup
+   $F job spec-lookup tiny2-mtp3-lookup any:2 12m --no-model -- python tools/flash_next/rental/lookup_tiny.py --configs mtp3-lookup
    ```
-   Results: `reports/spec-lookup/card/<id>-<name>/lookup_tiny.json` and one `server0.log` per server. The
-   `mtp3-lookup` job needs mtp-card-ready's MTP path to run on the tiny model first.
-2. **Real-model jobs, TP4 + EP4, replacing the queued 8-card job 00029** (do not let 00029 run: it is the old
-   stage-1 plan with `min_tokens` and a tree without the MTP fixes). Section 6 has the rounds. With the tiny
-   rehearsal of the matching configuration passed:
+2. **Real-model speculative jobs, TP4 + EP4** (section 6 has the rounds), each after its tiny rehearsal passed.
+   One of them can still take the other half of 00029's place until 21:20 UTC (`--replaces 00029`; the
+   no-speculation job took the first half); after that they queue at the end:
    ```bash
    $F job spec-lookup real4-ngram8 any:4 30m --replaces 00029 -- bash tools/flash_next/rental/lookup_serve.sh \
        --label ngram8 --ngram 8 --rounds edit:32:384:-,prose:32:256:-,edit:1:384:-,prose:1:256:-,editl:8:512:-
-   $F job spec-lookup real4-mtp3-lookup any:4 30m --replaces 00029 -- bash tools/flash_next/rental/lookup_serve.sh \
+   $F job spec-lookup real4-mtp3-lookup any:4 30m -- bash tools/flash_next/rental/lookup_serve.sh \
        --label mtp3lookup --mtp 3 --lookup 1 --rounds edit:32:384:0,edit:32:384:1,edit:32:384:2,prose:32:256:0,prose:32:256:1,edit:1:384:0,edit:1:384:1,edit:1:384:2,prose:1:256:0,prose:1:256:1,editl:8:512:0,editl:8:512:1
-   $F job spec-lookup real4-nospec any:4 25m -- bash tools/flash_next/rental/lookup_serve.sh \
-       --label nospec --rounds edit:32:384:-,prose:32:256:-,edit:1:384:-,prose:1:256:-,editl:8:512:-
    ```
-   (`--replaces` lets two 4-card jobs take the place of the 8-card job; the third queues at the end.) Reread
-   CARD.md before each submit. Results: `reports/spec-lookup/card/<id>-<name>/probe.json`, `probe.log`,
-   `server0.log`; compare texts across jobs with
-   `python3 tools/flash_next/rental/lookup_probe.py --compare A/probe.json B/probe.json ...`.
-3. **Numbers to the report (section 7) and to the coordinator** (SendMessage to `main`): accepted tokens per
-   step, ms per step, effective ms per token for lookup and the hybrid against MTP alone and against no
-   speculation, on edit-and-return and on fresh prose, at 1 and 32 streams.
-4. **Depth beyond 5 and the search's host cost** (section 4 and 5): the hybrid's lookup rows are capped at the
-   MTP k (the rows are the MTP shapes); deeper lookup drafts need either the n-gram server (k = 8 proven on
-   CPU) or rows wider than MTP's. `HybridLookup.merge` runs vLLM's O(context) search once per request and step
-   in Python: at 32 x 128K tokens that is INFERRED to cost several ms per step; an incremental n-gram index
-   (the `IndexDrafter` of `reports/spec-lookup/replay/replay.py`, "most recent match, follow the copy") makes it
-   O(k) and accepts more in the replay (section 5).
-5. **Acceptance estimates by replay** on the real model's own outputs: the texts of the card jobs
-   (`probe.json`) replayed through the drafters of `replay.py` (today's estimates use synthetic edits).
-6. **Merge** per the protocol: after mtp-card-ready's pull request (this branch contains that branch), run the
+   Reread CARD.md before each submit. Results: `probe.json`, `probe.log`, `server0.log`; compare texts across
+   jobs with `python3 tools/flash_next/rental/lookup_probe.py --compare A/probe.json B/probe.json ...`.
+3. **Numbers to section 7 and to the coordinator** (SendMessage to `main`): accepted tokens per step, ms per
+   step, effective ms per token for lookup and the hybrid against MTP alone and against no speculation, on
+   edit-and-return and on fresh prose, at 1 and 32 streams.
+4. **Depth beyond 5 and the search's host cost** (sections 4 and 5): the hybrid's lookup rows are capped at
+   the MTP k (the rows are the MTP shapes); deeper lookup drafts need either the n-gram server (k = 8 proven on
+   CPU) or hybrid rows wider than MTP's (not built). `HybridLookup.merge` runs vLLM's O(context) search once
+   per request and step: MEASURED on the workstation 0.10 ms per search at 128,000 tokens, 3.2 ms per step for
+   32 requests (0.1 ms per step at 4,000 tokens); the index drafter of `tools/flash_next/lookup_replay.py`
+   is O(n) per step and its `follow` policy accepts more in the replay. Not yet in the server.
+5. **Merge** per the protocol: after mtp-card-ready's pull request (this branch contains that branch), run the
    gate on the merged tree, `gh pr create --base feat/flash-next-gaudi`, `gh pr merge --merge`. The flags of
    this track are its own (`VLLM_HPU_FLASH_NEXT_SPEC_LOOKUP`, `..._LOOKUP_MIN_NGRAM`, `..._LOOKUP_MAX_NGRAM`,
    `..._LOOKUP_ORACLE`), all default off.
@@ -96,6 +104,8 @@ State at **2026-11-20 19:50 UTC**. Branch head `628d9716` plus this file, pushed
 | `64e10aa6` | `tools/flash_next/rental/lookup_serve.sh`, `lookup_probe.py`: the real-model card job |
 | `bf19334a` | the rehearsal oracle, `tools/flash_next/rental/lookup_tiny.py`, the hybrid's per-load log line |
 | `0953885a` | merge of the program head `1b28bbff` (PR #12, PR #13) |
+| `ffb4d87e`, `c13d1b97` | `lookup_probe.py`: whole answers (`editf`), the token ids of every stream and prompt |
+| `8c5ac747` | `tools/flash_next/lookup_replay.py`: lookup drafters replayed over recorded streams |
 
 ## 2. n-gram lookup with prefix caching
 
@@ -153,24 +163,34 @@ O(context) per request and step (section 4).
 - What limits a deeper lookup draft on the card is the step cost of the rows (32 streams x 9 rows = 288 rows
   per step), which no job has measured.
 
-## 5. Acceptance estimates by replay (REPLAY ESTIMATE, synthetic outputs)
+## 5. Acceptance estimates by replay
 
-`reports/spec-lookup/replay/replay.py` plays known (prompt, output) token streams through lookup drafters
-(greedy verification accepts a draft token exactly when it equals the output's token). The outputs are
-synthetic coding-agent answers (a repository file returned with one-line docstrings, type hints or renamed
-locals), a second turn editing the first answer, and prose written from a one-line request; real tokenizer.
-Tokens per step (`replay.log`):
+Greedy verification accepts a draft token exactly when it equals the token the target emits, so for a recorded
+greedy stream the outcome of any lookup drafter at any depth is arithmetic. `tools/flash_next/lookup_replay.py`
+plays the streams of a probe record (`lookup_probe.py` keeps the token ids) through an n-gram index drafter:
+`earliest` (vLLM's search, what the server uses; VERIFIED equal to vLLM's kernel on 400 random streams),
+`recent`, `follow`. A run without speculation is enough; MTP's acceptance is not replayable.
 
-| Drafter | edit k=3 | k=4 | k=5 | k=8 | k=16 | prose k=3 |
-|---|---|---|---|---|---|---|
-| vLLM search, n 2..4 (earliest match) | 3.40 | 4.08 | 4.73 | 6.48 | 10.24 | 1.13 |
-| most recent match, n 3..8 | 3.53 | 4.25 | 4.94 | 6.72 | 10.45 | 1.09 |
-| most recent match, n 3..8, follow the copy | 3.66 | 4.44 | 5.19 | 7.18 | 11.26 | 1.09 |
-| earliest match, n 3..8 | 3.57 | 4.31 | 5.03 | 6.89 | 10.78 | 1.09 |
+**Synthetic preview (REPLAY ESTIMATE, not the model's answers).** 24 files of this tree returned with a
+synthetic edit (one-line docstrings, type hints, renamed locals; 56,667 output tokens, prompts of 783 to 5,106
+tokens), n-gram 3 to 8, `reports/spec-lookup/replay/synthetic_replay.json`. Share of ALL steps that accepted at
+least j drafted tokens (the server's per-position rate counts the same way), `earliest` policy:
 
-A lookup draft is on the table for 82 to 94 % of the steps of an edit (k up to 8) and for 6 to 18 % of the steps
-of prose (with n >= 3: 6 to 7 %, and 1.2 to 1.8 tokens accepted per hit). These figures say what lookup can accept when
-the model does copy; whether the real model copies as these synthetic answers do is what the card job measures.
+| Depth k | tokens per step | steps with a draft | j=1 | 2 | 3 | 4 | 5 | 8 | 12 | 16 |
+|---|---|---|---|---|---|---|---|---|---|---|
+| 3 | 3.61 | 92 % | 0.89 | 0.87 | 0.86 | | | | | |
+| 4 | 4.38 | 91 % | 0.87 | 0.85 | 0.84 | 0.83 | | | | |
+| 5 | 5.12 | 89 % | 0.85 | 0.84 | 0.82 | 0.81 | 0.80 | | | |
+| 8 | 7.09 | 85 % | 0.80 | 0.78 | 0.77 | 0.76 | 0.75 | 0.73 | | |
+| 12 | 9.30 | 80 % | 0.75 | 0.73 | 0.71 | 0.70 | 0.70 | 0.68 | 0.66 | |
+| 16 | 11.18 | 76 % | 0.71 | 0.68 | 0.66 | 0.65 | 0.65 | 0.63 | 0.62 | 0.61 |
+
+`follow` gives 3.70, 4.50, 5.26, 7.35, 9.70 and 11.69 tokens per step at the same depths (2 to 5 % more);
+`recent` slightly less than `earliest` (3.58 to 10.94). Prose (one 2,252-token document): 1.20 to 1.25 tokens
+per step at every depth, a draft on 10 to 13 % of the steps. The rates fall with depth because a deeper draft
+makes the steps longer, so a larger share of the steps starts at an edit. These figures say what lookup accepts
+when the model copies as the synthetic edits do; the same table from the real model's answers comes from the
+no-speculation job (section 7).
 
 ## 6. Card jobs
 
