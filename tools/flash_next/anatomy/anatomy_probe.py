@@ -17,7 +17,8 @@ greedy LM-head path (``VLLM_HPU_FUSED_GREEDY_LOGITS``) off. The trace and flush 
 The option ``ctx=N`` gives every stream a prompt of about N tokens (decode cost against context length; warm such
 a round first: with prefix caching the measured round then decodes almost at once).
 Per round: ms per token over each stream's own decode span (p50, min, max over the streams), time to first token,
-the aggregate tokens per second, and a hash of every stream's text (greedy text parity between two servers).
+the aggregate tokens per second, a hash of every stream's text (greedy text parity between two servers) and one
+``TEXT`` line with the start of the first, the middle and the last stream's text.
 
 ``--trace LEVELS`` then takes one torch-profiler capture per level in the middle of a decode round: the round
 starts, the probe waits until every stream has ``--trace-after`` tokens, calls ``/start_profile``, sleeps
@@ -201,7 +202,9 @@ def finish_round(args, n, ntok, records, threads, t_start) -> dict:
     texts = ["".join(rec["text"]) for rec in records]
     res = {"streams": n, "tokens": ntok, "ok": len(per), "errors": errors, "wall_s": round(wall, 3),
            "text_sha1": [hashlib.sha1(t.encode("utf-8")).hexdigest()[:16] for t in texts],
-           "text0": texts[0][:400] if texts else ""}
+           "text0": texts[0][:400] if texts else "",
+           # The start of a few streams' text (first, middle, last): what a reader checks multi-stream output with.
+           "text_samples": {str(i): texts[i][:160] for i in sorted({0, n // 2, n - 1}) if i < len(texts)}}
     if per:
         ms = sorted(p["ms_per_token"] for p in per)
         res["ms_per_token_p50"] = statistics.median(ms)
@@ -286,6 +289,12 @@ def describe(res: dict) -> str:
              res["wall_s"]))
 
 
+def print_text(mode, n, res: dict) -> None:
+    """One TEXT line per sampled stream of a round: the start of its text, on one line."""
+    for i, text in sorted((res.get("text_samples") or {}).items(), key=lambda kv: int(kv[0])):
+        print("TEXT %-4s N=%-3d stream %-2s: %s" % (mode, n, i, " ".join(text.split())[:110]), flush=True)
+
+
 def run(args) -> int:
     phases = parse_phases(args.phases, args.tokens)
     if not args.selftest:
@@ -328,6 +337,7 @@ def run(args) -> int:
                     mode, n, phase["tokens"], " min" if phase["min_tokens"] else " nomin",
                     " ctx=%d (prompt %s tokens)" % (phase["ctx"], res.get("prompt_tokens_p50")) if phase["ctx"] else "",
                     describe(res)), flush=True)
+                print_text(mode, n, res)
                 if not res.get("ok"):
                     entry["t_end"] = time.time()
                     return False
