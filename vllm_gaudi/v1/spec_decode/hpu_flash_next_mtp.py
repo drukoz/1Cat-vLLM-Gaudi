@@ -146,9 +146,15 @@ class HpuFlashNextMtpProposer(HpuEagleProposer):
         # Generate the remaining draft tokens.
         draft_token_ids_list = [draft_token_ids]
 
+        # VLLM_HPU_MTP_TIMING=1: the runner's step timer takes a lap per draft pass (None: no timer).
+        timer = getattr(self, "mtp_step_timer", None)
+        if timer is not None:
+            timer.lap("pass0")
         # Positions used by prepare_attn_metadata needs to be cpu because
         # compile only mode for warmup will not do any real computations
         positions_cpu = self._draft_positions_cpu(target_positions, last_token_indices, batch_size)
+        if timer is not None:
+            timer.lap("pass0_wait")
 
         # The QSA raw-key ring is addressed by the request's GDN state slot:
         # the state lattice's column 0, identical for every draft step.
@@ -171,6 +177,8 @@ class HpuFlashNextMtpProposer(HpuEagleProposer):
             # Prepare the attn metadata
             positions_cpu += 1
             attn_metadata = self.prepare_attn_metadata(block_table_cpu_tensor, positions_cpu, model_runner, ring_slots)
+            if timer is not None:
+                timer.lap("pass%d_meta" % (token_index + 1))
 
             # [batch_size, 1]
             input_ids = input_ids.view(-1, 1)
@@ -201,6 +209,8 @@ class HpuFlashNextMtpProposer(HpuEagleProposer):
             if top_ids is not None:
                 draft_top_ids.append(top_ids)
             draft_token_ids_list.append(draft_token_ids)
+            if timer is not None:
+                timer.lap("pass%d" % (token_index + 1))
 
         # [batch_size, num_speculative_tokens]
         draft_token_ids = torch.stack(draft_token_ids_list, dim=1)

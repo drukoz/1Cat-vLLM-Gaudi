@@ -535,6 +535,7 @@ if TYPE_CHECKING:
     VLLM_HPU_SPEC_SAMPLED_VERIFY: int = 0  # 0 speculation serves greedy requests only (default), 1 also sampled
     VLLM_HPU_MTP_DRAFT_LOOP: int = 0  # 0 draft positions read back from the device (default), 1 host books
     VLLM_HPU_MTP_DRAFT_IDS: int = 0  # 0 draft ids by argmax, int64 narrowed in the graph (default), 1 int32 ids
+    VLLM_HPU_MTP_TIMING: int = 0  # 0 off (default), 1 time the verification part and the draft of every step
     VLLM_HPU_MTP_CHUNK_KV: int = 0  # 1 the MTP draft also runs over prefill chunks that complete no prompt
     VLLM_HPU_PLE_HOST_NGRAM_IDS: int = 0  # 0 PLE n-gram ids computed in the graph (default), 1 on the host
     VLLM_HPU_HC_FUSED: int = 0  # 0 torch hyper-connections (default), 1 the fused hyper-connection kernels
@@ -1923,6 +1924,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # same is not measured yet (with it, draft positions 2 to k of every row but the first would be wrong).
     "VLLM_HPU_MTP_DRAFT_IDS":
     lambda: int(os.environ.get("VLLM_HPU_MTP_DRAFT_IDS", "0")),
+
+    # What a speculative step is made of. 1 = the runner times every step of a speculative server: the verification
+    # part (to the drafter call) and the draft, with the proposer's laps per draft pass and one device wait after
+    # the draft (vllm_gaudi/v1/spec_decode/mtp_step_timer.py): a log line and a JSON line per 25 steps of a row
+    # count (mtp_step_timing_r<rank>_<pid>.jsonl in the working directory). 0 (default) = no timer exists.
+    "VLLM_HPU_MTP_TIMING":
+    lambda: int(os.environ.get("VLLM_HPU_MTP_TIMING", "0")),
 
     # The Flash-Next MTP draft over chunked prompts. 0 (default) = the draft runs only over the prefill chunk that
     # completes a prompt, so its attention layer holds no KV for the earlier chunks of a prompt above the chunk

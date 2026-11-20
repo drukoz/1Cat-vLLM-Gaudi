@@ -124,6 +124,13 @@ lazy graph came back as every second id (job 00038). The sampler's `argmax` narr
 is sound at 8 and 32 rows (job 00021, by the streams' texts); set `1` only if the card
 shows draft positions 2 to k collapsing with more than one stream.
 
+`VLLM_HPU_MTP_TIMING` times the steps of a Flash-Next MTP server, as an integer. `0`
+(default): no timer. `1`: per step the verification part (to the drafter call) and the
+draft, with a lap per draft pass and one device wait after the draft; every 25 steps of
+a row count the means go to a log line (`MTP step timing: ...`) and to
+`mtp_step_timing_r<rank>_<pid>.jsonl` in the server's working directory, with
+`Ft_ms` (the verification part) and `Fd_ms` (the draft divided by k).
+
 `VLLM_HPU_MTP_CHUNK_KV` decides whether the Flash-Next MTP draft runs over the
 prefill chunks that complete no prompt, as an integer. `0` (default): it runs
 only over the chunk that completes a prompt, so its attention layer has no KV
