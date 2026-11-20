@@ -204,8 +204,11 @@ cache are replicated, so by default every rank scores every query row of a
 prompt chunk against all block keys (fp32 tiles of `[512, heads, context / 4]`
 and a top-k over `context / 4` blocks) and gets the same selection. With `1`,
 rank `r` scores rows `[r * T / tp, (r + 1) * T / tp)` and one all-gather per
-prompt row collects the selected block ids (sent as fp32, exact). A bucket that
-does not split evenly keeps the default. Default `0`.
+prompt row collects the selected block ids (sent as fp32, exact). The ids are
+fp32 from the selection on: the top-k's int64 ids index an fp32 table and are
+never cast on the device (a cast of them in the graph that made them returns
+every second id on the card). A bucket that does not split evenly keeps the
+default. Default `0`.
 
 `VLLM_COMPACT_GDN` selects the compact-GDN fast path with per-token state
 checkpoints for GDN hybrids. Under prefix caching the platform hook defaults

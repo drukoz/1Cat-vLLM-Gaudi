@@ -54,3 +54,122 @@ def test_split_adds_one_all_gather_per_row_and_unsplit_none(ranks):
 def test_the_selection_uses_the_top_k():
     # a guard on the cases: at these contexts the budget is smaller than the visible blocks
     assert any((ctx + seq) // 4 > BUDGET // 4 for ctx, seq, _ in CASES)
+
+
+# ----- card rule 9: the top-k's int64 ids are never cast on the device -----
+
+_CASTS = ("_to_copy", "to", "type_as", "int", "long", "float")
+_ALIASES = ("view", "reshape", "_reshape_alias", "flatten", "contiguous", "clone", "alias", "squeeze", "unsqueeze",
+            "slice", "select", "expand", "cat")
+
+
+def _op_name(func) -> str:
+    return func._schema.name.split("::")[-1]
+
+
+def _topk_id_casts(fn) -> tuple[list[str], int]:
+    """Run ``fn`` and return the cast ops that read a top-k's indices (or a view or copy of them), and how
+    many top-k calls there were. A dispatch-mode trace: every aten op ``fn`` runs is seen."""
+    import torch
+    from torch.utils._python_dispatch import TorchDispatchMode
+
+    class Trace(TorchDispatchMode):
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.ids: list = []  # tensors that hold top-k indices (kept alive so their identity stays unique)
+            self.casts: list[str] = []
+            self.topks = 0
+
+        def _tainted(self, value) -> bool:
+            if isinstance(value, torch.Tensor):
+                return any(value is t for t in self.ids)
+            if isinstance(value, (list, tuple)):
+                return any(self._tainted(v) for v in value)
+            return False
+
+        def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+            out = func(*args, **(kwargs or {}))
+            name = _op_name(func)
+            if name == "topk":
+                self.topks += 1
+                self.ids.append(out[1])
+            elif self._tainted(args) or self._tainted(list((kwargs or {}).values())):
+                tainted_first = self._tainted(args[:1])
+                if name in _CASTS and tainted_first:
+                    self.casts.append(f"{name}: {args[0].dtype} -> {out.dtype}")
+                elif name in _ALIASES and tainted_first and isinstance(out, torch.Tensor):
+                    self.ids.append(out)
+            return out
+
+    trace = Trace()
+    with trace:
+        fn()
+    return trace.casts, trace.topks
+
+
+def _scores_case(t: int, n: int, seed: int = 7):
+    import torch
+
+    gen = torch.Generator().manual_seed(seed)
+    scores = torch.rand(t, n, generator=gen)
+    visible = torch.randint(0, n + 1, (t, ), generator=gen)  # some rows see nothing, some everything
+    visible[0] = 0
+    visible[-1] = n
+    return scores, visible
+
+
+@pytest.mark.parametrize("t,n,topk", [(8, 64, 16), (8, 8, 16), (5, 40, 16), (16, 320, 16)])
+def test_fp32_block_ids_equal_select_blocks(t, n, topk):
+    import torch
+
+    from vllm_gaudi.models.qwen4_exp.qsa import select_block_ids_fp32
+    from vllm_gaudi.models.qwen4_exp.qsa_sparse_ops import select_blocks
+
+    scores, visible = _scores_case(t, n)
+    got = select_block_ids_fp32(scores, visible, topk)
+    assert got.dtype == torch.float32 and got.shape == (t, topk)
+    assert torch.equal(got.to(torch.int32), select_blocks(scores, visible, topk))
+
+
+def test_the_trace_sees_the_cast_that_card_rule_9_forbids():
+    # the guard on the guard: the served selection narrows the top-k's ids in its own graph
+    from vllm_gaudi.models.qwen4_exp.qsa_sparse_ops import select_blocks
+
+    scores, visible = _scores_case(8, 64)
+    casts, topks = _topk_id_casts(lambda: select_blocks(scores, visible, 16))
+    assert topks == 1
+    assert casts == ["_to_copy: torch.int64 -> torch.int32"]
+
+
+def test_fp32_block_ids_never_cast_the_top_k_ids():
+    from vllm_gaudi.models.qwen4_exp.qsa import select_block_ids_fp32
+
+    scores, visible = _scores_case(8, 64)
+    casts, topks = _topk_id_casts(lambda: select_block_ids_fp32(scores, visible, 16))
+    assert topks == 1
+    assert casts == []
+
+
+def test_the_split_selection_never_casts_the_top_k_ids(monkeypatch):
+    """The whole split path of one prompt row (scoring, top-k, the all-gather, the expansion) on one rank."""
+    from types import SimpleNamespace
+
+    import torch
+
+    from vllm_gaudi.models.qwen4_exp import qsa
+
+    # rank 0 of 2 (no TP group in this process): the other rank's half is stood in for by a copy
+    monkeypatch.setattr(qsa, "tensor_model_parallel_all_gather", lambda x, dim=0: torch.cat((x, x), dim=dim))
+    indexer = SimpleNamespace(SCORE_TILE=16, compress_ratio=4)  # all the method reads of its indexer
+    gen = torch.Generator().manual_seed(5)
+    seq, n, dim = 64, 96, 16
+    q_row = torch.randn(seq, 4, dim, generator=gen)
+    row_keys = torch.randn(n, dim, generator=gen)
+    pos_row = torch.arange(320, 320 + seq)
+    selected = []
+    casts, topks = _topk_id_casts(lambda: selected.append(
+        qsa.HpuQsaIndexer._select_prompt_rows_split(indexer, q_row, row_keys, pos_row, BUDGET // 4, (0, 2))))
+    assert topks == 2  # two score tiles of 16 rows for this rank's 32 rows
+    assert casts == []
+    assert selected[0].dtype == torch.int32 and selected[0].shape[0] == seq
