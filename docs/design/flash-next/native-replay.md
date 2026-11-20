@@ -394,6 +394,10 @@ Readings:
    65-90 us is about 19-20 ms, the fastest rank's replay call in step-anatomy's 00013 and 00117.
 3. The calling thread is on a CPU for 60-75 % of a replay call with collectives (thread CPU 3.4-6.7 ms in a 5-7 ms
    call at 1 row): the host time is mostly work, partly waiting.
+4. A lead, not a finding: with the tensor cache kept (`replay_seg_cache`, `wrap_in_hpu_graph` without
+   `disable_tensor_cache`) one launch cost 41 / 9 us at 1 / 32 rows against 72 / 65 us without it at 8 ranks
+   (`replay_r8`), but nothing less on one card (00067). The runner wraps with `disable_tensor_cache=True`; with the
+   cache kept the intermediates keep fixed addresses, which is also what a lean replay path (Handoff, item 3) needs.
 
 ### 7.5 What the host does inside a replay (1-card sampler, 00067)
 
@@ -600,12 +604,14 @@ all-reduces already split every layer).
    the fork's 347 KB patch carries the backports); (b) the unattended build recipe is drafted, never run:
    `tools/flash_next/native_runtime/build_native_runtime.sh` (stages: versions, sources at the pins, the fork's patches
    through `apply_native_runtime.py`, HCL, Synapse through the snapshot's own environment and build order, the bridge,
-   the plugin's adapter, a tarball with a manifest); (c) not drafted yet: `tools/flash_next/replay/bench_native_tp4.py`,
-   the same TP4 body (2 plans of 48 x (x + c; `tp2_allreduce_plain`) on `[rows, 2560]` bf16, rows 1 and 32) under stock
-   lazy HPU-graph replay and under the fork's native joint replay, written on the pattern of
-   `tools/communication/check_dsv4_native_allreduce.py` (load the patched bridge, `set_prepared_communication(True)`,
-   `register_tp2_prepared_group_pass()`, `torch.compile(..., backend="hpu_backend")` in eager mode, capture under
-   `collect_prepared_group_replays`, then `replay_native_decoder` per step), plus a 30-minute `any:4` stub.
+   the plugin's adapter, a tarball with a manifest); (c) drafted, never run: `tools/flash_next/replay/bench_native_tp4.py`
+   (the same TP4 body, 2 plans of 24 layers x 2 sub-blocks `x = all_reduce((x + 1) * 0.25) - 1` on `[rows, 2560]` bf16,
+   rows 1 and 32, value-checked, under stock lazy HPU-graph replay or under the fork's native joint replay, written on
+   the pattern of `tools/communication/check_dsv4_native_allreduce.py`: the patched bridge's adapter,
+   `set_prepared_communication(True)`, `register_tp2_prepared_group_pass()`, `torch.compile(..., backend="hpu_backend")`
+   in eager mode, capture under `collect_prepared_group_replays` with `DecoderTopology("deepseek_v4", (24, 24), 2,
+   False)`, then `replay_native_decoder` per step) and `tools/flash_next/replay/native_tp4_job.sh` (the 30-minute
+   `any:4` job: stock and native, each with and without collectives).
 5. After the node is gone (after 04:00 UTC): a snapshot of HEAD (`git archive HEAD | tar -x -C
    reports/native-replay/trees/gate-<sha>`), `bin/gate <snapshot> --tools`, the three worker test files and
    `tests/unit_tests/tools/test_bench_replay.py`, then `gh pr create --base feat/flash-next-gaudi --title "Replay
