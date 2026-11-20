@@ -152,3 +152,30 @@ def test_what_is_outside_the_conditions_keeps_vllms_sampler(tiny_checkpoint, ref
         engine.run()
         assert len(engine.tokens["r"]) == 8
     assert steps.sampled == 0 and steps.general > 0
+
+
+def test_the_path_says_once_which_way_a_sampled_step_went(tiny_checkpoint, reference, monkeypatch):
+    """One INFO line the first time a sampled step draws in the region, one the first time a sampled step keeps
+    vLLM's sampler, with the reason (an operator must see which path a server's sampled rows took)."""
+    from vllm_gaudi.v1.worker import hpu_model_runner
+
+    lines = []
+    original = hpu_model_runner.logger.info
+
+    def info(message, *args, **kwargs):
+        if "Candidate sampling" in str(message):
+            lines.append(str(message) % args)
+        return original(message, *args, **kwargs)
+
+    monkeypatch.setattr(hpu_model_runner.logger, "info", info)
+    prompt = next(p for p in reference if len(p["prompt_ids"]) <= 700)
+    with eh.open_engine(tiny_checkpoint, eh.Options(max_num_seqs=2, env=FLAG)) as engine:
+        engine.add("in", prompt["prompt_ids"], max_tokens=6, **SAMPLED)
+        engine.run()
+        engine.add("in2", prompt["prompt_ids"], max_tokens=4, **SAMPLED)
+        engine.add("out", prompt["prompt_ids"], max_tokens=4, temperature=1.0, top_p=0.95)  # top_k unset
+        engine.run()
+    drew = [line for line in lines if "drew in the logits region" in line]
+    fell = [line for line in lines if "took vLLM's sampler instead" in line]
+    assert len(drew) == 1 and "64 candidates per row from the gathered logits" in drew[0], lines
+    assert len(fell) == 1 and "request out: top_k 0 is outside 1..64" in fell[0], lines
