@@ -25,11 +25,11 @@ I05 changed nothing measurable at a short context (as expected: I01 saves host t
 the long-prefix rounds could not run because the prefix cache served 0 tokens of a 120,832-token prefix, which
 prefill owns now). The tiny model with I01 + I05 took another token at the 5th position of its 700-token prompt:
 a near tie of the tiny model that the in-graph greedy region resolves the other way (collectives and mtp-card-ready
-saw the same token stream; INFERRED until job A below shows it with I05 alone). New since 23:15 UTC: top-k ids that
+saw the same token stream; INFERRED until job 00130 shows it with I05 alone). New since 23:15 UTC: top-k ids that
 the host reads (logprobs, prompt logprobs, the sampled region) now come out of an fp32 id table
 (`v1/sample/topk_ids.py`): the `logprobs=5` crash of spec-lookup's 00086 (OverflowError in the detokenizer, the
 server died) is fixed on the CPU model of the card rule; the sampled region now takes `vocab_parallel.top_k`, so
-with `VLLM_HPU_VOCAB_PARALLEL_LOGITS=2` it gathers each rank's top 64 instead of the logits (job B measures it).
+with `VLLM_HPU_VOCAB_PARALLEL_LOGITS=2` it gathers each rank's top 64 instead of the logits (job 00131 measures it).
 No pull request tonight (BRIEF.md 23:45): push and tell the coordinator the commit and the proven flags.
 
 ### If you take over, in this order
@@ -51,8 +51,8 @@ No pull request tonight (BRIEF.md 23:45): push and tell the coordinator the comm
 |---|---|---|---|
 | 00093 `hpu-ids-sampler-tiny-flags` (1 card) | id verdicts, sampler-stage times, tiny model with I01 + I05 | ended 20:29 UTC, exit 1 (the tiny 700-token prompt, a near tie) | done: section 9 |
 | 00110 `real4-ab3-greedy-sampled-long` (TP4) | greedy base / I01 / I05 / both, sampled base / cand, long prefix | ended 22:29 UTC, exit 5 (probe counting artifact; no prefix-cache hit) | done: section 9 |
-| A `tiny-i01-i05-logprobs` (any:1, 15m, commit `0cb55ebb`) | `tools/flash_next/engine_step/tiny_checks.py --arms i01,i05`: the tiny smoke with I01 alone and I05 alone; while each server is up, every reference prompt with `logprobs=5` and one with `prompt_logprobs=2`, then `/health` | submitted 23:35 UTC | `TOKENS` lines (I05 alone should show the 700-token near tie, I01 alone should pass: then record the near tie, no more card time on it) and `LOGPROBS` lines (must be `ok` with `/health after: 200` in both arms: the crash fix is card-proven) |
-| B `real4-ab4-short-candvp` (any:4, 28m, commit `0cb55ebb`, `VLLM_GRAPH_RESERVED_MEM=0.5`) | `serve_long_probe.sh --arms both --no-long --candvp --logprobs-check`: 32 greedy streams base / both (twice, in turn), text1 compared at 1 stream, 32 sampled streams base / cand / candvp (`VLLM_HPU_VOCAB_PARALLEL_LOGITS=2`), seeded requests, min_tokens round, the logprobs check last; hl-smi memory in `hlsmi.log` | submitted 23:35 UTC; ask the coordinator for a bump | `probe.log`: `SUMMARY` (sampled cand and candvp against base, candvp against cand), `TASK` for candvp (must be 32 of 32), `TEXTS text1`, `LOGPROBS ok`; then tell the coordinator whether `VLLM_HPU_VOCAB_PARALLEL_LOGITS=2` with candidates is proven |
+| **00130** `tiny-i01-i05-logprobs` (any:1, 15m, commit `0cb55ebb`) | `tools/flash_next/engine_step/tiny_checks.py --arms i01,i05`: the tiny smoke with I01 alone and I05 alone; while each server is up, every reference prompt with `logprobs=5` and one with `prompt_logprobs=2`, then `/health` | queued 23:39 UTC; placed by the coordinator beside kernel-fixes' 00123, about 01:00 UTC | `TOKENS` lines (I05 alone should show the 700-token near tie, I01 alone should pass: then record the near tie, no more card time on it) and `LOGPROBS` lines (must be `ok` with `/health after: 200` in both arms: the crash fix is card-proven) |
+| **00131** `real4-ab4-short-candvp` (any:4, 28m, commit `0cb55ebb`, `VLLM_GRAPH_RESERVED_MEM=0.5`) | `serve_long_probe.sh --arms both --no-long --candvp --logprobs-check`: 32 greedy streams base / both (twice, in turn), text1 compared at 1 stream, 32 sampled streams base / cand / candvp (`VLLM_HPU_VOCAB_PARALLEL_LOGITS=2`), seeded requests, min_tokens round, the logprobs check last; hl-smi memory in `hlsmi.log` | queued 23:39 UTC; placed after step-anatomy's 00119, about 02:00 to 02:30 UTC | `probe.log`: `SUMMARY` (sampled cand and candvp against base, candvp against cand), `TASK` for candvp (must be 32 of 32), `TEXTS text1`, `LOGPROBS ok`; then tell the coordinator whether `VLLM_HPU_VOCAB_PARALLEL_LOGITS=2` with candidates is proven |
 
 ### Pending subtasks after those steps, in order
 
@@ -279,7 +279,7 @@ reaches past 64 candidates is cut at 64. The design:
   rows of a mixed batch; a step with a row below its `min_tokens` masks the gathered logits and takes
   `topk_ids.topk_with_ids`. The drawn ids are int32 out of an fp32 id table: no top-k index is cast or read back
   as data (the card evidence is in `v1/sample/topk_ids.py`). `VLLM_HPU_VOCAB_PARALLEL_LOGITS=2` turns the logits
-  all-gather of a sampled step into one `[rows, 128]` fp32 all-gather per rank (job B of the handoff measures it).
+  all-gather of a sampled step into one `[rows, 128]` fp32 all-gather per rank (job 00131 measures it).
 - mtp-card-ready (sampled verification, idea I07): one function `candidate_probs(values, temperature, top_k,
   top_p) -> probs [rows, C]` (zero outside the kept set) serves both the pick (`argmax(probs / noise)`) and the
   rejection sampler (`p(draft token)` = the probability at the column whose id equals the draft id, zero when
@@ -312,7 +312,7 @@ reaches past 64 candidates is cut at 64. The design:
   position (4 of 16 tokens match); the same server without the flags: 16 of 16. The same alternative token stream
   came from collectives' vocabulary-parallel arg max (TP4) and mtp-card-ready's TP2 verify arms; the tiny model's
   top-2 logit margins there are 0.0005 to 0.02 at values near 0.27 (one bf16 step is 0.002): a near tie that the
-  in-graph greedy region resolves the other way (INFERRED; job A runs I05 alone).
+  in-graph greedy region resolves the other way (INFERRED; job 00130 runs I05 alone).
 
 **00110 `real4-ab3-greedy-sampled-long`** (TP4 + EP4 on modules 0-3, commit `9bf1920f`, 22:11 to 22:29 UTC, exit 5).
 One server, flags flipped by the switch file, rounds in turn. Healthy after 426 s. MEASURED, steady ms per step
