@@ -76,43 +76,91 @@ logits. No serving path calls it yet. When it is exact for sampling:
   same numbers (a shared seed), because speculative bookkeeping (accepted counts, recurrent state slots) is
   computed on every rank.
 
-## 3. What cannot be cut: two all-reduces per layer (VERIFIED in the code, algebra INFERRED)
+## 3. The structural question: two all-reduces per layer is the floor of this layout
 
-The decoder layer (`vllm/models/qwen4_exp/nvidia/model.py` `Qwen4ExpDecoderLayer.forward`, hyper-connections in
-`nvidia/hyperconnection.py` and `nvidia/ops/hc.py`): `R` is the 4-stream residual `[rows, 4 x 2560]`.
+Asked at 19:00 UTC on 2026-11-20, when the host cost of a collective was known (section 5): can the two all-reduces
+of a layer become one, can the expert-parallel MoE send only from ranks that hold a routed expert, can several
+collectives be issued as one. Short answer: **no, no, and only where two collectives do not depend on each other
+(one pair per target step, already merged by section 4).** The count of a target step is 96 + 1 at best in any
+layout that shards both the mixers and the experts; only a layout with fewer sharded blocks has fewer.
 
-    mix:      xn_s = RMSNorm(R_s) (per stream),  [lora, inj] = xn @ W_down,  gate = silu(lora) @ W_up,
-              block_in = 1/4 sum_s sigmoid(gate_s) * xn_s                                       (replicated)
-    block:    out = sum over ranks r of out_r          (TP-sharded mixer, or EP experts + TP shared expert)
-    combine:  R'_s = R_s + out * 2 sigmoid(inj_s / 4)                     (delayed into the next mix's norm)
+### 3.1 The layer, exactly (VERIFIED in the code)
 
-- **Merge the mixer and MoE all-reduces of a layer: no.** The MoE input is `mix(R')` and `R'` contains the full
-  mixer output; the per-stream RMSNorm needs `mean((R_s + c_s sum_r out_r)^2)`, whose cross terms
-  `out_r . out_r'` exist on no single rank, and the silu and sigmoid follow. Every rank needs the whole mixer
-  output before the MoE input exists. The same holds from the MoE output to the next layer's mixer input, and
-  from the last MoE output to the final mixer and the vocabulary-parallel LM head.
-- **Defer one: no.** The combine is linear in `out` given `R` and `inj`, but the first nonlinear op (the norm)
-  comes right after it; deferring the reduction past the combine would reduce `R'`, 4 times the payload.
-- **Replace an all-reduce by reduce-scatter + all-gather with the hyper-connection row-sharded between them:** the
-  count doubles (96 to 192 per step) for the same bytes. In decode it saves nothing: the hyper-connection GEMMs
-  are bound by their weights (1.30 GB per rank per step, read whatever the row count), and every rank still reads
-  all of them. In prefill (8,192 rows) it cuts 7/8 of the replicated hyper-connection MACs: a prefill idea
-  (target-model.md section 8, idea 15), not a decode one.
-- **Replicate a block to drop its all-reduce:** the GDN weights and states would be 8 times larger per rank
-  (about 3.6 GB more weights read per step, and 48 value heads of fp32 state per request per layer instead of 6):
-  far more than 48 all-reduces cost.
-- **Send the MoE output only from ranks that hold a routed expert: no.** Every rank also holds a shard of the
-  shared expert, so every rank's partial is nonzero for every row. Without the shared expert's shard a rank has no
-  routed expert for a row with probability `(1 - 64/512)^10 = 0.26`; at 32 rows the probability that a rank has
-  no routed expert in the whole step is `0.875^320`, about `3e-19`. A captured HPU graph cannot make a rank's part
-  in a collective depend on the routing anyway; an all-to-all dispatch and combine is two collectives per layer
-  instead of one.
+`Qwen4ExpDecoderLayer.forward` (`vllm/models/qwen4_exp/nvidia/model.py:276-327`), `GatedResidual.mix` and
+`combine_and_mix` (`nvidia/hyperconnection.py:131-190`), the kernels' arithmetic (`nvidia/ops/hc.py`:
+`_grouped_gemma_rmsnorm_kernel`, `_hc_silu_kernel`, `_hc_gate_mix_kernel`, `_hc_combine_norm_kernel`). `R` is the
+residual of 4 streams, `[rows, 4 x 2560]`; every weight below is replicated (`disable_tp=True`,
+`ReplicatedLinear`), so every rank computes the same glue.
+
+    combine + norm:  R'_s = bf16(R_s + c_s * a),  c_s = 2 sigmoid(inj_s / 4)      a = the pending block output
+                     xn_s = R'_s * rsqrt(mean(R'_s^2) + eps) * (1 + w_s)                         (per stream s)
+    down, inject:    [lora, inj'] = xn @ W_down          (10240 -> 320 + 4),  lora <- silu(lora / 4)
+    up, gate mix:    gate = lora @ W_up  (320 -> 10240),  block_in = 1/4 sum_s sigmoid(gate_s) * xn_s
+    block:           a' = sum over ranks r of a'_r(block_in)
+
+The block is the mixer (GDN: `in_proj_qkvz` column-parallel, the recurrence per head, `out_proj` row-parallel;
+QSA: heads split over the ranks, `o_proj` row-parallel) or the MoE (rank `r` holds experts `64r .. 64r + 63`
+whole, and an 80-wide shard of the 640-wide shared expert: `Qwen3NextSparseMoeBlock`,
+`vllm/model_executor/models/qwen3_next.py:128-260`; one reduction of experts and shared expert together,
+upstream `moe_runner.py` `_maybe_reduce_final_output`). A layer is two such sub-blocks, 96 per step, and after
+the last one the final mixer and the vocabulary-parallel head.
+
+### 3.2 Why consecutive sharded sub-blocks cannot share a collective (algebra, INFERRED from 3.1)
+
+Rank `r` needs `block_in` to run its shard of the next sub-block, and `block_in` is a function of the whole
+`a = sum_r a_r`, not of any rank's part:
+
+- the norm's scalar is `mean((R_s + c_s a)^2) = mean(R_s^2) + 2 c_s mean(R_s a) + c_s^2 mean(a^2)`. The middle
+  term is linear in `a` (each rank could send one number per stream), but `mean(a^2) = sum_r sum_r' mean(a_r a_r')`
+  has the products of different ranks' parts, which exist on no rank;
+- after the norm come `silu`, `sigmoid` and the gated mean over the streams, which need the whole normalized
+  vector, 2560 numbers per row, on every rank.
+
+So between two consecutive sharded sub-blocks every rank must receive something that determines `a`: one
+collective per sharded sub-block, whatever its form (all-reduce, all-gather of the parts, reduce-scatter and
+all-gather). Consequences, each checked against the code:
+
+- **Mixer and MoE of a layer in one all-reduce: no.** The MoE input is `mix(R')` with `R'` holding the mixer
+  output; likewise from a MoE output to the next layer's mixer, and from the last MoE to the final mixer.
+- **Defer a reduction past the combine: no.** The combine is linear in `a`, the norm right after it is not, and
+  reducing `R'` instead of `a` is 4 times the payload for the same count.
+- **Send the MoE output only from ranks that hold a routed expert: no**, for three independent reasons. Every rank
+  holds a shard of the shared expert, so every rank's part is nonzero for every row (`shared_expert` is built
+  with `reduce_results=False` and reduced with the experts). Without that shard a rank has no routed expert for
+  a row with probability `C(448,10) / C(512,10) = 0.26`, so at one row about 2 of 8 ranks would have nothing to
+  send, and at 32 rows the chance that a rank has none in the whole step is `0.26^32`, about `2e-19`. And a
+  captured HPU graph cannot make a rank's part in a collective depend on the routing: the group and the order of
+  collectives are fixed at capture (section 1: the same order on every rank). The cost is per collective, not per
+  byte (section 5), so sending zeros costs what sending values costs.
+- **Token dispatch and combine instead of all-gather and all-reduce (the classic expert-parallel pattern):** two
+  collectives per MoE for one, plus the mixer's; more, not fewer.
+- **Several collectives issued as one:** only collectives that do not depend on each other can share a call. In a
+  target step that is exactly one pair, the embedding and the PLE table rows (both depend on the ids only):
+  section 4 merges them. Every layer all-reduce depends on the one before it. (What the bridge does per call, and
+  whether a grouped or coalesced call is cheaper, is the native-replay track's measurement: its job 00027,
+  `docs/design/flash-next/native-replay.md` on its branch.)
 - **Overlap a collective with independent compute:** within a layer there is none (each op needs the previous
   collective's result); two half-batches would read every weight twice.
 
-So a decode step keeps 96 layer all-reduces. With the cuts: 98 per target step (the embedding replicated, or the
-PLE table rows on the embedding all-reduce, section 4), the logits payload goes from 497 KB per row to 8 B per row,
-and a k = 3 draft pass from 6 to 3 collectives per token. What is left is the cost of each collective: section 5.
+### 3.3 Layouts with fewer sharded blocks (INFERRED; costs at 150 to 190 us per collective, section 5)
+
+The floor follows the layout: a target step has `(sharded sub-blocks) + 1` collectives (the arg-max gather; the
+embedding replicated or its all-reduce carrying the PLE rows).
+
+| Layout | Layer collectives per step | What it costs | Verdict |
+|---|---|---|---|
+| TP8 mixers + EP8 experts (today) | 96 at 8 ranks | the reference | 97 or 98 with the cuts |
+| Two servers, TP4 + EP4 each | 96 per server step at 4 ranks | the same count; a gain only if a 4-rank collective is much cheaper than an 8-rank one (the bench of section 5, the coordinator's job 00048); expert bytes per step rise (target-model.md section 7) | measured, not built here |
+| PP2 x TP4, PP4 x TP2 | 96 per token (48 or 24 per stage) | the same count, fewer ranks per collective, the stages serial | no gain in count |
+| Mixers replicated, experts EP8 | 48 | every rank computes all heads: GDN projections 8 times the MACs (0.26 -> 2.1 GMAC per row per rank), about 5.1 GB more weights read per step (GDN 3.6, QSA 1.5), 8 times the GDN state (113 MB per request against 14, the state pool 4.2 -> 33.6 GiB per card) and both QSA KV heads on every rank (12.3 -> 24.6 KB per token) | saves about 7 to 9 ms of host time at one stream and a short context; **does not fit the target** (32 x 128K needs 52 GB of KV per card at one KV head) |
+| GDN mixers replicated only | 60 | the GDN part of the row above: the state pool at 33.6 GiB per card next to the KV cache | does not fit 32 x 128K either; a small-context, few-stream setup only |
+| Experts replicated | 48 | 512 experts x 48 layers = 120 GB of FP8 weights per card | impossible |
+| PP8 x TP1 (8 single-card stages of 6 layers) | 0, plus 7 card-to-card hand-offs of `[rows, 10240]` | serial stages: a step is the sum of 8 stage times, so at one micro-batch 7 of 8 cards idle; all cards busy only with 8 micro-batches in rotation (4 streams each), which vLLM's engine does not do, and each micro-batch reads its own routed experts (about 2.3 times the expert bytes of TP8 at 4 rows per stream); the hand-off through the host costs more than the collectives it removes, so it needs a device-to-device send | the one layout without the collective term; an engine project, not a flag (estimate: about 2.3 ms per stage at one stream, 18 to 22 ms per token against 37 today; with 8 rotating micro-batches of 4 streams about 27 ms per token per stream without speculation) |
+
+So for the target (32 streams, 128K, speculation) the layer floor is 96 collectives per target step, and the two
+levers left are the cost of each collective (section 5: its form, the rank count, the replay's host path) and
+the number of target steps per token (speculation). What this track could still remove is counted in
+section 6.
 
 ## 4. The PLE table all-reduce (`VLLM_HPU_PLE_TABLE_RIDER=1`)
 
@@ -155,80 +203,92 @@ every collective (`VLLM_HPU_COLLECTIVE_MARK_STEP=1`, the plugin's default) added
 At 8 ranks (MEASURED, native-replay job 00012, `tools/flash_next/replay/bench_replay.py` on its branch, a 48-layer
 body with GEMMs): one all-reduce costs 177 / 129 / 195 us at 1 / 32 / 128 rows under HPU-graph replay as the runner
 does it (`wrap_in_hpu_graph`, `asynchronous=False`), 73 to 93 % of it host time inside the replay; 89 to 164 us in
-plain lazy mode; 74 to 158 us under `torch.compile`. So the collectives of a decode step, 98 x about 150 us = 13 to
-19 ms, are most of the fixed term of today's step, and **every collective removed is worth about 0.15 ms per step**
-at TP8, whatever its payload. In that light (INFERRED from the counts of section 1):
+plain lazy mode; 74 to 158 us under `torch.compile`. The real step agrees (MEASURED, step-anatomy job 00013, the
+step timer on worker rank 0, TP8 + EP8): the replay call holds the host 22.8 ms of a 37.1 ms step at one stream,
+27.1 of 46.4 ms at 8 and 35.2 of 83.6 ms at 32 streams; the wait for the device after it is 11.6, 15.0 and
+42.7 ms. So the collectives of a decode step, 98 x about 150 to 190 us = 15 to 19 ms, are most of the fixed term of
+today's step, and **every collective removed is worth about 0.15 to 0.19 ms per step** at TP8, whatever its
+payload. In that light (INFERRED from the counts of section 1):
 
-- the cuts of sections 2 and 4 remove 1 collective per target step (0.15 ms) and, with the replicated embedding and
-  the unsharded MTP entry linears, 9 per k = 3 draft pass set (1.35 ms per MTP step); the bytes of the logits
-  gather matter less than its existence, which stays;
-- the per-layer floor of section 3 stays at 2 for every layout that keeps the experts sharded over the ranks that
-  also shard the mixers: with a tensor-parallel degree above 1, `2 x (layers per stage) x (micro-batches)` is 96
-  collectives per card per round for any pipeline split (PP2 x TP4 and PP4 x TP2 included); only TP1 stages
-  (a pipeline of 8 single-card stages) have none, at the price of reading each stage's weights once per micro-batch
-  and of 8 graph replays per card per round;
-- the cost of each collective is therefore the lever: it is mostly the host's work per collective inside the
-  replay, which is native replay's (B10) and C6's territory, and possibly the replay's `asynchronous=True` mode;
-  job 00019 measures that mode next to the default one.
+- the cuts of sections 2 and 4 remove 1 collective per target step and, with the replicated embedding and the
+  unsharded MTP entry linears, 9 per k = 3 draft pass set (about 1.4 to 1.7 ms per MTP step); the logits gather's
+  bytes come on top where they are large (16 MB per rank at 32 rows, 64 MB at 128 verification rows: an own-launch
+  logits all-gather of 32 rows cost 0.8 ms at 4 ranks in job 00009);
+- the per-layer floor of section 3 stays at 2;
+- the cost of each collective is therefore the lever: its form (this section's bench), the rank count (the same
+  bench, and the coordinator's two-server job 00048), and the host's work per collective inside the replay
+  (native-replay: asynchronous replay, the bridge's host path).
 
-The decision between C4, C6 and the two-server layout (G4-1) comes from the collectives track's job 00019, which
-opens with the same payloads on 8 and then 4 ranks, lazy, HPU-graph replay and asynchronous replay, all-reduce
-against all-gather plus local sum (`reports/collectives/job/bench_c4.py`), and from the track report.
+## 6. Card jobs of this track, their readings and their results
+
+Every job runs the committed tree in the farm's per-commit image (`CARD.md`); scripts in
+`tools/flash_next/collectives/`.
+
+| Job | What | Reading | Result |
+|---|---|---|---|
+| 00064 `idcheck-rule9`, 1 card | `id_check.py`: every id pattern of the token path against the CPU, one lazy graph and a replayed one, rows 1, 2, 5, 32, 128, untied and tied, at a shard's width and at a whole row | serving cases (`vp_argmax`, `fp32_ids_row`) must equal the CPU; the probes say which patterns card rule 9 breaks (`argmax -> int32` is the fused greedy region and vLLM's sampler, `argmax -> .int()` the MTP draft loop, `topk -> int32` the control) | pending |
+| 00073 `c4-bench-r8-r4`, 8 cards, in the place of 00019 | `bench_job.sh`: the id check through the all-gather on 8 ranks; `bench_c4.py` on 8 ranks, on the module group 0-3, and on both groups at once | `decide_g41.py`: alpha and us per MB per rank count, regime and form; C4 pays where `gather_sum` (the flag) or `gather_first` (the collective alone, the fused-kernel form) is below `all_reduce` under replay; alpha8 against alpha4 for the layout | pending |
+| 00074 `tiny-tp4-logits-rider`, 4 cards | the tiny model at TP4 with `VLLM_HPU_VOCAB_PARALLEL_LOGITS=1 VLLM_HPU_PLE_TABLE_RIDER=1`, fused hyper-connections | tokens equal the CPU reference (one request at a time: one row) | pending |
+| 00075 `real4-ab-off`, 00076 `real4-ab-logits-rider`, 4 cards each | `ab_job.sh`: the real model at TP4 + EP4, 1 and 32 streams, 256 tokens, no `min_tokens`, every stream's text kept | `compare_arms.py <off> <logits-rider>`: the same texts (a wrong id parts at once), and the ms per token of both | pending |
+
+A probe that sends `min_tokens` measures none of this: a request with `min_tokens` is kept out of the greedy region
+(`_can_fuse_plain_greedy_sampling`, `hpu_model_runner.py`), so the logits are gathered and sampled as before.
 
 ## Handoff (if this agent stops)
 
-State at 18:50 UTC 2026-11-20, branch `feat/flash-next-gaudi-collectives` (pushed), worktree
-`/Volumes/Storage/Claude/gaudi-work/wt/collectives`, scratch and card files `/Volumes/Storage/Claude/gaudi-work/reports/collectives/`.
-Nothing is uncommitted. The program branch (`40c90082`, the MoE glue merge) is merged into the branch (`6b265d50`);
-pull request #13 (`feat/flash-next-gaudi-collectives` into `feat/flash-next-gaudi`) is open, not merged.
+State at 19:35 UTC 2026-11-20 (third agent of this track, started 19:00 UTC). Branch
+`feat/flash-next-gaudi-collectives`, worktree `/Volumes/Storage/Claude/gaudi-work/wt/collectives`, scratch, logs and
+card results in `/Volumes/Storage/Claude/gaudi-work/reports/collectives/` (`logs/`, `card/`). This section is the
+track's report (the harness refuses a REPORT.md).
 
-Done and verified (CPU):
+Where things are:
 
-- Commits: `2d644ce9` the three cuts (`VLLM_HPU_VOCAB_PARALLEL_LOGITS`, `VLLM_HPU_REPLICATED_EMBEDDING`,
-  `VLLM_HPU_MTP_REPLICATED_FC`; `vllm_gaudi/distributed/vocab_parallel.py`, `vllm_gaudi/v1/sample/hpu_greedy_verify.py`,
-  runner gate, proposer `_draft_tokens`; `hpu_rejection_sampler.py` unchanged); `b113ef14` count tool
-  `tools/flash_next/collective_count.py`, rank harness `tests/unit_tests/models/flash_next/collective_ranks.py`,
-  `test_collective_cuts.py`; `1ffa8e61` `VLLM_HPU_PLE_TABLE_RIDER` and `VLLM_HPU_ALL_REDUCE_AS_GATHER_ROWS`;
-  `7d8d04cc` op-sequence fix of the PLE helper; the rest are notes.
-- Tests: `test_collective_cuts.py` 33 passed + `::test_small_all_reduces_as_gather` 2 passed; sampler, runner gate
-  and communicator tests 122 passed on the merged tree (`reports/collectives/logs/merged_quick.log`); the common gate
-  679 passed, 6 failed (`logs/gate_1.log`): 3 fixed since (7d8d04cc, then 48 passed), 3 order-dependent and red on
-  the program branch too (two of them still are: `test_ple_ngram_hash.py::test_matches_on_device[hpu]`,
-  `test_qsa_hpu_platform.py::test_hpu_platform_has_no_is_hpu`, both green alone; `moe_block.py` installs the HPU
-  CPU stub at import).
-- Run tests with `reports/collectives/pt2.sh <log name> <pytest args>` (`PT_ALARM=<s>`; the CPU is shared and slow:
-  the cut suite takes about 30 min, the common gate about 60).
+- `origin` has the branch up to `fc71ef83` (pull request #13's head). **Local commits after it are not pushed on
+  purpose** until #13 is merged, so that the gate result covers the pull request's head: `3abbd8df` (id check),
+  `684b54ad` (bench, A/B and reader tools, a unit test), and the commits of this note. After the merge:
+  `git push origin feat/flash-next-gaudi-collectives`, then a second pull request for them.
+- Pull request #13 (the five cuts, default off): the program head `b0cd0bb` is already merged into the branch
+  (`6b265d50`); the cut suite gave 35 passed on the merged tree (`logs/cuts_m2.log`); the common gate
+  (`bin/gate <worktree> --tools`) was started at 19:00 UTC on `fc71ef83`: its lines are in `/tmp/gate.rqDQHN/summary.txt`
+  and at the end in `logs/gate_fc71ef83.log` (`rc=0` in the last line = green). Green: `gh pr merge 13 --merge`.
+  A red line: run that file alone (`reports/collectives/pt2.sh <name> <file>`) and compare with the program head
+  before deciding (two files were order-dependent in one process; the gate runs one process per file).
+- Card rule 9 (BRIEF 19:15) on this track's paths, by reading: the vocabulary-parallel arg max has no int64 on the
+  device (fp32 id table, max / where / min, an fp32 to int32 cast); mode 2 (`vocab_parallel_topk`, no serving
+  caller) casts topk indices to fp32 in the graph: change it to a gather from an fp32 id table when job 00064 shows
+  which form the card computes right (`topk_to_fp32` against `topk_gather_fp32`). The fused greedy region
+  (`select_compute_logits_and_greedy`) and its gathered fallback belong to engine-step (its commit `121c88b0` and
+  later): do not edit them here; when both branches meet, its region keeps its own path and calls
+  `vocab_parallel.vocab_parallel_argmax` when `vocab_parallel.enabled(model)`.
+- Reported to the coordinator at 19:12 and 19:20 UTC: the MTP draft loop (`hpu_flash_next_mtp.py:118, 141` on the
+  program branch) is `argmax -> .int()` in one graph (wrong from the second row on if rule 9 holds for argmax; with
+  `VLLM_HPU_VOCAB_PARALLEL_LOGITS=1` the drafts are int32 from the start); the farm's probe sent `min_tokens`
+  (fixed on the node at 19:20).
+
+Card jobs (section 6 has what each decides): 00064 (bumped, runs after 00048 and the QSA pair, about 20:20 to
+21:15 UTC), 00073 (all cards, 15 min, in the place of 00019, by 00:26 UTC at the latest), 00074, 00075, 00076
+(any:4, at the end of the queue: they run only if the queue moves faster than its maximum holds; cancel them if
+they have not started by about 03:00 UTC). Each `farm` command waits in a background shell of this agent and
+copies the results to `reports/collectives/card/<id>-<name>/` when its job ends; if the agent is gone:
+`bin/farm ledger | grep -w collectives`, then `bin/farm fetch collectives <id> <id>-<name>`. A job can be
+changed while it waits by a new submit with `--replaces <id>` (00073 passes on the place of 00019).
 
 Pending, in order:
 
-1. Merge per protocol: on the tree merged with `40c90082`, the cut suite and the common gate are rerunning
-   (`reports/collectives/logs/cuts_m2.log`, `gate_m2.log`; the quick tests gave 20 passed). When the cut suite is
-   green and the gate shows no failure beyond the two order-dependent ones above: `git fetch origin`; if the program
-   branch moved, merge it and rerun what it touches; then `gh pr merge 13 --merge`.
-2. Card job 00019 (`farm status`; it starts by 22:28 UTC at the latest, 40 min hold, stage-1 style `all` job). Its
-   script mounts `~/farm/collectives/scripts` on the node (copies of `reports/collectives/job/`: `ab.sh`,
-   `bench_c4.py`, `probe_ab.py`, `arms.txt`, `overlay.txt`, `plugin/` = the changed files of commit 1ffa8e61/7d8d04cc,
-   copied over the installed plugin of `farm-base` built from e238f84). Those files can be changed until the job
-   starts (`bin/node-scp`). It runs: `bench_c4.py` on 8 ranks, then 4 ranks (modules 0-3), regimes lazy / replay /
-   replay_async, forms all_reduce / gather_sum, rows 1, 32, 128; then two real-model TP8 servers, arms `off` and
-   `logits-rider-gather` (`VLLM_HPU_VOCAB_PARALLEL_LOGITS=1 VLLM_HPU_PLE_TABLE_RIDER=1
-   VLLM_HPU_ALL_REDUCE_AS_GATHER_ROWS=32`), probe at 1 and 32 streams, 256 tokens, texts compared.
-3. When it lands: `bin/farm fetch collectives 00019 ab1` (or read `~/farm/collectives/results/ab1/` on the node);
-   `python3 -I reports/collectives/job/decide_g41.py <results>/ab1 --json <results>/ab1/g41.json`; put the per-collective
-   cost (alpha, us per MB) for 8 and 4 ranks and every regime into `reports/collectives/collective_alpha.json` (the
-   `pending` fields; the coordinator, step-anatomy and native-replay read it) and send it to the coordinator. Read
-   `ab1/ab.log` lines `ab: texts ... identical; common prefix` (a wrong cut parts at once; a tie late) and the
-   ms per token of both arms.
-4. Decide from it: G4-1 (alpha8 replay at 32 rows against the bands of `reports/idea-sweep/recommended.md` G4-1;
-   E1 only if alpha8 - alpha4 >= 34 us, the coordinator runs the E1 serving comparison itself), I34 (keep
-   `VLLM_HPU_ALL_REDUCE_AS_GATHER_ROWS` only for the rows where gather_sum < all_reduce in replay; build the fused
-   form in `hc_combine_norm` only then), C6/G4-4 (ceiling (alpha8 - 16 us) x collectives per step; hand to
-   native-replay), and whether `replay_async` cuts the per-collective host cost (native-replay's change if so).
-   Write the decisions into section 5 of this note.
-5. Count work left (each collective is worth about 0.15 ms at TP8): the rider on layer 0's first all-reduce when the
-   embedding is replicated (target 98 to 97; changes the summation order of that all-reduce, needs an fp32 parity
-   test like the gather one); the draft's argmax gather carrying the winner's embedding row (removes the draft's
-   embedding all-reduce without the replicated table). Both small. The per-layer floor of 2 is algebraic (section 3).
-6. Not this track's, reported: job 00009's 8-rank HCCL run failed at device acquire (card 0 not yet released by the
-   step before it); sampled requests keep the logits all-gather (wiring `vocab_parallel.top_k` into the sampler needs
-   the owner's answer on whether the agents sample; the sampled MTP verification is mtp-card-ready's).
+1. Merge #13 when the gate is green; push; open the second pull request (tools and the id check: no flag, no
+   plugin code) after its own gate.
+2. 00064's lines to the coordinator, mtp-card-ready and engine-step the moment it ends
+   (`grep '^idcheck:' reports/collectives/card/00064-idcheck-rule9.log`).
+3. 00073: `python3 -I tools/flash_next/collectives/decide_g41.py reports/collectives/card/00073-c4-bench-r8-r4 --json ...`;
+   alpha and us per MB for 8 and 4 ranks, lazy and replay, into `reports/collectives/collective_alpha.json` (its
+   `pending` fields) and to the coordinator (`main`); the decisions into section 5.
+4. C4 only where the replay regime of 00073 shows the gather form below the all-reduce (I34 row gate): then a
+   real-model arm with `VLLM_HPU_ALL_REDUCE_AS_GATHER_ROWS=<rows>` (`ab_job.sh`), and the fused form (the sum
+   inside `hc_combine_norm`) only if `gather_first` beats `gather_sum` by more than the sum op.
+5. Count work left (each collective about 0.15 to 0.19 ms at TP8): the PLE rows on layer 0's mixer all-reduce when
+   the embedding is replicated (98 to 97); the draft's arg-max gather carrying the winner's embedding row (the
+   draft's embedding all-reduce without the 1.11 GB replicated table). The per-layer floor of 2 is algebraic
+   (section 3).
+6. When MTP runs on the card (mtp-card-ready's fixes merged): an MTP k = 3 A/B of
+   `VLLM_HPU_VOCAB_PARALLEL_LOGITS=1 VLLM_HPU_REPLICATED_EMBEDDING=1 VLLM_HPU_MTP_REPLICATED_FC=1` (9 collectives
+   and four logits gathers fewer per MTP step, the verification from tokens).
