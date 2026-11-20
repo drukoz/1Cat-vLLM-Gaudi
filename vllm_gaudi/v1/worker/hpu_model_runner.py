@@ -877,13 +877,42 @@ def get_target_layer_suffix_list(model_type) -> list[str]:
     return [decoder_layer_table.get(model_type, "DecoderLayer"), "EncoderLayer", "BertLayer"]
 
 
-def modify_model_layers(module: torch.nn.Module, suffix_list: list[str], n=1, counter=None):
+def _forward_is_decode() -> bool:
+    """True when the current forward's attention metadata says ``is_prompt=False`` (decode or verification).
+
+    A forward without a context, with per-layer (dict) metadata or with metadata that has no ``is_prompt``
+    counts as a prompt forward, which keeps the ``VLLM_CONFIG_HIDDEN_LAYERS`` cuts.
+    """
+    from vllm.forward_context import get_forward_context, is_forward_context_available
+    if not is_forward_context_available():
+        return False
+    metadata = get_forward_context().attn_metadata
+    if metadata is None or isinstance(metadata, Mapping):
+        return False
+    return getattr(metadata, "is_prompt", None) is False
+
+
+def modify_model_layers(module: torch.nn.Module, suffix_list: list[str], n=1, counter=None, decode_n=0):
     """Currently add mark_step at the end of specified layers.
+
+    ``decode_n`` (``VLLM_HPU_DECODE_CUT_INTERVAL``): 0 registers a cut after every ``n``-th layer for every
+    forward, as always. ``decode_n >= 1`` hooks every layer and decides per forward: a decode forward cuts after
+    every ``decode_n``-th layer, any other forward after every ``n``-th. The hook runs while an HPU graph is
+    captured (or on a step outside graphs), so the decision is taken once per captured decode graph.
     """
 
     def forward_hook(module, args, output):
         htorch.core.mark_step()
         return output
+
+    def interval_hook(index):
+
+        def hook(module, args, output):
+            if index % (decode_n if _forward_is_decode() else n) == 0:
+                htorch.core.mark_step()
+            return output
+
+        return hook
 
     if counter is None:
         counter = [0]
@@ -891,10 +920,12 @@ def modify_model_layers(module: torch.nn.Module, suffix_list: list[str], n=1, co
     for child_name, child_module in module.named_children():
         if any(child_module.__class__.__name__.endswith(layer) for layer in suffix_list):
             counter[0] += 1
-            if counter[0] % n == 0:
+            if decode_n > 0:
+                child_module.register_forward_hook(interval_hook(counter[0]))
+            elif counter[0] % n == 0:
                 child_module.register_forward_hook(forward_hook)
         else:
-            modify_model_layers(child_module, suffix_list, n, counter)
+            modify_model_layers(child_module, suffix_list, n, counter, decode_n)
 
 
 def is_mm_optimized(model):
@@ -7079,7 +7110,8 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         model_config = getattr(self.model, "config", None)
         modify_model_layers(self.model,
                             get_target_layer_suffix_list(model_config.model_type if model_config is not None else None),
-                            hidden_layer_markstep_interval)
+                            hidden_layer_markstep_interval,
+                            decode_n=gaudi_envs.VLLM_HPU_DECODE_CUT_INTERVAL)
         torch.hpu.synchronize()
         if self.is_pooling_model:
             self.set_causal_option(self.model)

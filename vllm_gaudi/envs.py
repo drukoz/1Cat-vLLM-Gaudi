@@ -536,6 +536,7 @@ if TYPE_CHECKING:
     VLLM_HPU_HC_FUSED: int = 0  # 0 torch hyper-connections (default), 1 the fused hyper-connection kernels
     VLLM_HPU_MOE_GLUE: int = 0  # 0 torch MoE glue (default), 1 the fused MoE glue kernels
     VLLM_HPU_COLLECTIVE_MARK_STEP: int = 1  # 1 (default) mark_step() before every HPU collective, 0 none
+    VLLM_HPU_DECODE_CUT_INTERVAL: int = 0  # 0 (default) decode keeps the per-layer cuts, N cut every N-th layer
     VLLM_HPU_RECURRENT_STATE_POOL: int = 0  # RecurrentStatePoolMode: 0 off, 1 pool
     VLLM_HPU_RECURRENT_STATE_POOL_SLOTS: int = 0  # resolved by the hook; positive overrides the formula
     VLLM_HPU_RECURRENT_STATE_POOL_CACHE_SLOTS: int = 512  # retained prefix states added to the live need
@@ -1922,6 +1923,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # so 99 graph cuts; only use it when the served tokens still match a reference (tiny_smoke.sh --env).
     "VLLM_HPU_COLLECTIVE_MARK_STEP":
     lambda: int(os.environ.get("VLLM_HPU_COLLECTIVE_MARK_STEP", "1")),
+
+    # The mark_step() that modify_model_layers hooks after every VLLM_CONFIG_HIDDEN_LAYERS-th decoder layer,
+    # in decode and verification forwards (attention metadata with is_prompt=False). 0 (default) keeps the
+    # hooks as they are for every forward. N >= 1 cuts a decode forward after every N-th layer only; a value
+    # above the layer count (1000) leaves a captured decode graph with no per-layer cut. Prompt forwards keep
+    # VLLM_CONFIG_HIDDEN_LAYERS. docs/design/flash-next/native-replay.md.
+    "VLLM_HPU_DECODE_CUT_INTERVAL":
+    lambda: int(os.environ.get("VLLM_HPU_DECODE_CUT_INTERVAL", "0")),
 
     # Recurrent (GDN / short-conv) state pool: 0 (default) keeps today's
     # one-recurrent-slot-per-attention-block-id allocation, 1 gives the
