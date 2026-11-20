@@ -1,0 +1,3 @@
+# Decode streams during a warm 120K prefill: pacing off, then two shares (the server needs VLLM_HPU_SCHED_KNOBS_FILE).
+warm120k --plan baseline --cold-tokens 122880 --repeat 1 --warm-tokens "" --concurrent "" --turn2-tokens 0 --shared-prefix 0 --canaries 0 --nonce prefill-pacing-warm
+pacing --plan pacing --knobs-file /tmp/prefill_knobs.json --pacing 100:0,50:2048,25:2048 --sweep-tokens 122880 --canaries 4 --nonce prefill-pacing
