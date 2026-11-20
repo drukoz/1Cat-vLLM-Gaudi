@@ -26,8 +26,9 @@ import flashinfer_gaudi.gdn_core_verify  # noqa: F401  registers gdn_core_verify
 from tests.unit_tests.gdn_core_decode.recurrent_sim_case import (RECURRENT_ARG_ORDER, RECURRENT_HPU_CASES,
                                                                  make_recurrent_inputs, recurrent_scalars)
 from tests.unit_tests.gdn_core_decode.sim_case import ARG_ORDER, HPU_CASES, make_inputs, scalars
-from tests.unit_tests.gdn_core_decode.verify_sim_case import (VERIFY_ARG_ORDER, VERIFY_HPU_CASES,
-                                                              make_verify_inputs, verify_scalars)
+from tests.unit_tests.gdn_core_decode.verify_sim_case import (MAX_NODES, VERIFY_ARG_ORDER, VERIFY_HPU_CASES,
+                                                              VERIFY_TOO_MANY_NODES_CASE, make_verify_inputs,
+                                                              verify_scalars)
 
 pytestmark = pytest.mark.skipif(shutil.which("c++") is None, reason="no c++ on PATH")
 
@@ -41,7 +42,7 @@ SCHEMA = {
 }
 _DTYPE = {torch.bfloat16: "bf16", torch.float32: "f32", torch.int32: "i32"}
 _PACK = {"decode": "<ffi", "recurrent": "<f", "verify": "<ffi"}
-_NEGATIVES = ("verify/bad_rows", "decode/short_stack")
+_NEGATIVES = ("verify/bad_rows", "decode/short_stack", "verify/too_many_nodes")
 
 
 def _case_list():
@@ -78,6 +79,8 @@ def _input_lines():
     dec = HPU_CASES[0]
     inputs, order, sc = _args("decode", dec)
     lines.append(" ".join([SCHEMA["decode"], _NEGATIVES[1]] + _arg_strings(inputs, order, sc)[:-1]))  # no gate
+    inputs, order, sc = _args("verify", VERIFY_TOO_MANY_NODES_CASE)  # T = MAX_NODES + 1, otherwise well-formed
+    lines.append(" ".join([SCHEMA["verify"], _NEGATIVES[2]] + _arg_strings(inputs, order, sc)))
     return lines
 
 
@@ -174,3 +177,11 @@ def test_negative_lines(parsed):
     assert "mixed_qkv must be [B*T,C]" in bad["message"]
     short = parsed["decode/short_stack"]
     assert short["status"] == "error"
+
+
+def test_verify_rejects_too_many_nodes(parsed):
+    """T = MAX_NODES + 1 fails the op callback's check, so the HPU bridge never builds a node for the kernel."""
+    assert VERIFY_TOO_MANY_NODES_CASE.T == MAX_NODES + 1
+    line = parsed["verify/too_many_nodes"]
+    assert line["status"] == "error"
+    assert f"ssm_store_indices must be [B,T] with 1<=T<={MAX_NODES}" in line["message"]

@@ -284,7 +284,7 @@ node order) and per-node row states in the kernel; both are out of scope until t
 | Loop oracle and shared cases | `tests/unit_tests/gdn_core_decode/verify_sim_case.py` (`verify_oracle`, `VERIFY_CASES`, `VERIFY_HPU_CASES`, `compare_verify`, raw-file I/O) |
 | Flag | `VLLM_HPU_GDN_CORE_VERIFY`, `GdnCoreVerifyMode(IntEnum)`: `OFF = 0`, `FUSED = 1`; **default `OFF` (0)** until rental gate G1b has checked the op on a card |
 | TPC kernel | `csrc/gdn_fused/kernels/gdn_core_verify_gaudi2.c` + `gdn_core_verify_recurrence.h`; reuses `gdn_core_decode_norm.h`. GUID `gdn_fused_core_verify_f32state_gaudi2` (`kGdnCoreVerifyGuid`) |
-| Scalar params ABI | `struct GdnCoreVerifyParams { float scale; float eps; int32_t gate_activation; };`, 12 bytes, in `csrc/gdn_fused/gdn_core_decode_params.h` (with `kGdnCoreVerifyMaxNodes = 8`) |
+| Scalar params ABI | `struct GdnCoreVerifyParams { float scale; float eps; int32_t gate_activation; };`, 12 bytes, in `csrc/gdn_fused/gdn_core_decode_params.h` (with `kGdnCoreVerifyMaxNodes = 4`, the largest `T`) |
 | Host glue | `csrc/gdn_fused/host/gdn_core_verify_gaudi2.{hpp,cpp}`, a third GUID in `libgdn_fused_gaudi2.so` |
 | HPU registration | `csrc/gdn_fused/pytorch/hpu_gdn_core_decode.cpp` (the `gdn_fused_ops` extension) |
 | Card checks | `tests/unit_tests/gdn_core_decode/test_hpu_verify_op.py`; `tools/flash_next/gdn_core_decode_replay.py --ops verify --case ver_tp8_b16` (and `ver_tp8_b64`) |
@@ -315,8 +315,23 @@ them: node `t` of row `r` is row `r * T + t` of `mixed_qkv`, `z`, `a`, `b` and t
 | `ssm_store_indices` | `[B, T]`, int32 | `{node, request}` | where node t's SSM state is stored; out of range = not stored |
 | returns | `[B*T, HV, D]`, **fp32** | `{v_row, value_head, token}` | gated-RMSNorm output per node; the layer casts it to the model dtype |
 
-Preconditions (the layer checks them; the HPU host code rejects anything else): `1 <= T <= 8`, `T + 2 <= R`, no conv
+Preconditions (the layer checks them; the HPU host code rejects anything else): `1 <= T <= 4`, `T + 2 <= R`, no conv
 bias, conv width 4, fp32 SSM state; HPU only: `D == 128`, all tensors contiguous.
+
+**The largest `T` is 4** (`T = 1 + k`, `k = 3`), because the kernel keeps its per-node vectors in fixed arrays in
+vector local memory (see "Vector local memory" below). The number is written in four places, and
+`tests/unit_tests/gdn_core_decode/test_verify_limits.py` checks that they agree: `GDN_VERIFY_MAX_NODES` (the
+kernel), `kGdnCoreVerifyMaxNodes` (`gdn_core_decode_params.h`; the host glue and the HPU op callback compare with
+it), `GDN_CORE_VERIFY_MAX_NODES` (`flashinfer_gaudi/gdn_core_verify.py`) and `MAX_NODES` (`verify_sim_case.py`). A
+larger `T` never reaches the kernel:
+
+| Where | What happens for `T = 5` |
+|---|---|
+| The layer (`_maybe_gdn_core_verify` in `vllm_gaudi/models/qwen3_5.py`) | returns `None`: the step takes the torch path |
+| `gdn_core_verify(...)` (the Python wrapper), `gdn_core_verify_reference`, the CPU kernel | `ValueError("T must be in [1, 4], got 5")`, before the op is dispatched, no state touched |
+| The HPU op callback (`validate_verify` in `hpu_gdn_core_decode.cpp`) | `TORCH_CHECK` fails: `... must be [B,T] with 1<=T<=4` |
+| The host glue (`GdnCoreVerifyGaudi2::GetGcDefinitions`) | `GLUE_INCOMPATIBLE_INPUT_SIZE`: the node is not instantiated |
+| The kernel (cannot be reached; last line of defence) | every row is treated as padding: zero output, no state write |
 
 ### Semantics (`verify_oracle` in `verify_sim_case.py` is the executable form; the reference and the kernel match it)
 
@@ -396,17 +411,21 @@ value heads' SSM rows. No two points touch the same channel or state row.
 before including the two headers:
 
 ```c
-#define GDN_VERIFY_MAX_NODES 8
+#define GDN_VERIFY_MAX_NODES 4
 __local__ float64 verify_q[2 * GDN_VERIFY_MAX_NODES];   // node t: [2t] = elements 0..63, [2t+1] = 64..127
 __local__ float64 verify_k[2 * GDN_VERIFY_MAX_NODES];
-__local__ float64 verify_v[2 * GDN_VERIFY_MAX_NODES];   // the current value head
+__local__ float64 verify_vo[2 * GDN_VERIFY_MAX_NODES];  // the conv block's result; v, then o, of the current value head
 __local__ float64 verify_decay[GDN_VERIFY_MAX_NODES];   // the current value head, all lanes equal
 __local__ float64 verify_beta[GDN_VERIFY_MAX_NODES];
-__local__ float64 verify_o[2 * GDN_VERIFY_MAX_NODES];   // written by the recurrence header
 __local__ int verify_store_slot[GDN_VERIFY_MAX_NODES];  // ssm_store_indices[r, t] if t < n and in [0, S), else -1
 #include "gdn_core_verify_recurrence.h"
 #include "gdn_core_decode_norm.h"
 ```
+
+`verify_vo` has three uses, one after the other. `conv_verify_block` writes the conv + SiLU result of one
+128-channel block into it; `main` normalizes the Q block from it into `verify_q` and the K block into `verify_k`;
+the V block of a value head stays in it as `v`. The recurrence header then reads `v` from it and replaces it with
+`o`: value row `i` reads only element `i` of `v` and then writes only element `i` of `o`, so the two never collide.
 
 (`__local__` vector and scalar arrays with a runtime index compile with `-Wall -Werror` in tpcsim, checked with the
 contract commit; the fork's precedent is `csrc/deepseek_v41_unique/kernels/deepseek_v41_softmax_parts_gaudi2.c:4`.)
@@ -443,3 +462,54 @@ const bool128 n2 = v_bf16_cmp_grt_b(h2, (bf16)(1.0f / 0.0f));
 SSM: each value row is loaded once from `load_slot` and stored only after it is updated, so every store of row
 `i` data-depends on the load of row `i`, and stores of row `i` never alias a later load (other rows). No guard is
 needed there.
+
+### Vector local memory (RUK-3105, 2026-11-19)
+
+A TPC kernel that calls lookup-table functions (here `v_sigmoid_f32`, `v_rsqrt_f32`, `v_exp_cephes_f32`,
+`v_log_f32`, `v_f32_reduce_add`) has **16 KiB (16384 bytes) of vector local memory** for its `__local__` vectors
+plus the compiler's vector spills; one `float64` is 256 bytes. tpc-clang checks the total when it compiles with the
+default flags and fails past it ("too much vector memory is used for statically allocated data", "Too many vector
+spills. Available: 16384"). `-vlm <KB>` raises the compiler's limit and nothing else. The first version of this
+kernel declared 96 vectors (24576 bytes, room for 8 nodes) and was compiled with `-vlm 32`: it used 28928 bytes,
+passed the simulator, and the op segfaulted on a card at the first `T = 4` case.
+
+**Rule: every kernel of `csrc/gdn_fused` is compiled with the same flags (`GDN_TPC_FLAGS` in `CMakeLists.txt`:
+`-Wall -Werror -O2 -march=gaudi2`) and no local-memory override (`-vlm`, `-slm`, `-spill-vlm`).** A kernel that
+does not fit must get smaller.
+
+`tpc-clang -reg-mem-count` (with the flags above) prints what the compiler accounts for, tpc-clang 2.7.33:
+
+| Kernel | `__local__` vectors | Total VLM used (statics + spills) | Free of 16384 |
+|---|---|---|---|
+| `gdn_core_decode_gaudi2.c` | 0 | 3840 bytes | 12544 |
+| `gdn_recurrent_decode_gaudi2.c` | 0 | 768 bytes | 15616 |
+| `gdn_core_verify_gaudi2.c` | 32 = 8192 bytes | 11008 bytes (11 spilled vectors) | 5376 |
+| the first verify kernel, `-vlm 32` | 96 = 24576 bytes | 28928 bytes (17 spilled vectors) | none: 12544 over |
+
+How the verify kernel got there, with the arithmetic and its order unchanged (the simulator outputs are
+bit-identical to the first kernel's on every case, `T` = 1 to 4):
+- `GDN_VERIFY_MAX_NODES` 8 -> 4;
+- `verify_act`, `verify_v` and `verify_o` are one array, `verify_vo` (above);
+- the SiLU of the conv block runs in its own loop after the conv loop, where the conv weights and the history
+  rows are no longer live: the lookup-table sigmoid needs many registers, and inside the conv loop it cost 6 more
+  spilled vectors.
+
+`decay` and `beta` stay broadcast vectors, 4 + 4 of the 32. Holding them as scalars needs a move from a vector
+lane to a scalar register, and tpc-clang 2.7.33 declares no intrinsic for it. A measured alternative keeps both in
+two registers (lane `t` = node `t`, broadcast back with `v_f32_shuffle_b` and the index `0x80 | t`): it uses 9472
+bytes and is also bit-identical, but runs 4.3 % more instructions in the simulator. It is the next step if the
+5376 free bytes ever get tight.
+
+Tests (tpcsim container; `tests/standalone/gdn_core_decode/`):
+- `test_simulation.py`: all three kernels are compiled with one flag list; `test_vector_local_memory` asserts the
+  compiler's count is at most 12288 bytes (4 KiB free) for each kernel;
+  `test_verify_glue_rejects_too_many_nodes` runs `T = 5` through the host glue;
+- `test_kernel_build.py`: the real `cmake` build passes no local-memory override to any kernel and serves the
+  three GUIDs.
+
+**Build isolation.** `CMakeLists.txt` tries the verify kernel's compile at configure time. When it fails, or
+with `-DGDN_FUSED_VERIFY=OFF`, `libgdn_fused_gaudi2.so` is built with the decode and recurrent kernels only:
+`GetKernelGuids` lists two GUIDs and `InstantiateTpcKernel` answers `GLUE_NODE_NOT_FOUND` for the verify GUID
+(`test_kernel_build.py` checks both ways). CMake prints a warning and records `GDN_FUSED_VERIFY_BUILT` in
+`CMakeCache.txt`. The op extension (`gdn_fused_ops`) still registers `gdn_core_verify` for HPU, so with such a
+library `VLLM_HPU_GDN_CORE_VERIFY` must stay `0`.

@@ -18,12 +18,14 @@ import pathlib
 import torch
 
 from flashinfer_gaudi.gdn_core_decode import GdnGateActivation
+from flashinfer_gaudi.gdn_core_verify import GDN_CORE_VERIFY_MAX_NODES
 from tests.unit_tests.gdn_core_decode.sim_case import D, OUT_ATOL, OUT_RTOL, SSM_ATOL, SSM_RTOL, _raw_bytes, _read_raw
 
 # Columns of row_indices [B, 5] int32.
 CONV_LOAD, CONV_OFFSET, CONV_STORE, SSM_LOAD, QUERY_LEN = 0, 1, 2, 3, 4
 ROW_FIELDS = 5
-MAX_NODES = 8  # T <= 8: the kernel keeps per-node vectors in fixed __local__ arrays
+MAX_NODES = 4  # T <= 4: the kernel keeps per-node vectors in fixed __local__ arrays (16 KiB of vector local memory)
+assert MAX_NODES == GDN_CORE_VERIFY_MAX_NODES, "verify_sim_case.MAX_NODES must equal the op's GDN_CORE_VERIFY_MAX_NODES"
 
 VERIFY_ARG_ORDER = ("conv_state", "ssm_state", "mixed_qkv", "z", "a", "b", "A_log", "dt_bias", "conv_weight_t",
                     "norm_weight", "row_indices", "ssm_store_indices")
@@ -91,7 +93,16 @@ VERIFY_CASES = (  # simulator + HPU
         VerifyRow(5, 1, 6, 5, 1, (6, 7)),  # one real node: only slot 6 is stored
     ), GdnGateActivation.SILU, 22),
     VerifySimCase("ver_tp1_move", 16, 48, 3, 6, (VerifyRow(0, 0, 1, 0, 2, (1, 2)), ), GdnGateActivation.SIGMOID, 23),
+    VerifySimCase("ver_tp8_t3", 2, 6, 10, 6, (
+        VerifyRow(1, 0, 1, 1, 3, (1, 2, 3)),  # T = 3, in place; node 0 stores over the load slot
+        VerifyRow(4, 2, 5, 4, 2, (5, 99, 7)),  # moved, trimmed to 2 nodes, node 1 not stored (slot out of range)
+        _pad(3),
+    ), GdnGateActivation.SIGMOID, 26),
 )
+# One node more than the op takes: the host glue and the HPU op callback must reject it, the reference raises.
+VERIFY_TOO_MANY_NODES_CASE = VerifySimCase(
+    "ver_too_many_nodes", 2, 6, 8, MAX_NODES + 3,
+    (VerifyRow(1, 0, 1, 1, MAX_NODES + 1, tuple(range(1, MAX_NODES + 2))), ), GdnGateActivation.SIGMOID, 27)
 VERIFY_HPU_CASES = VERIFY_CASES + (  # HPU only (too slow for the simulator)
     VerifySimCase("ver_tp8_b16", 2, 6, 1 + 16 * 4, 6, _lattice_rows(16, 4), GdnGateActivation.SIGMOID, 24),
     VerifySimCase("ver_tp8_b64", 2, 6, 1 + 64 * 4, 6, _lattice_rows(64, 4), GdnGateActivation.SIGMOID, 25),

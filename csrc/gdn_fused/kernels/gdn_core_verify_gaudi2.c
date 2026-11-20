@@ -18,6 +18,15 @@
 // (RUK-2829). The store slot's rows 0..R-1 overlap the history rows offset..offset+2 the same
 // point reads when load slot == store slot (the normal case), so every conv store goes through
 // conv_guarded_store, which makes it data-depend on all three history loads h0, h1 and h2.
+//
+// Vector local memory: this kernel calls lookup-table functions (v_sigmoid_f32, v_rsqrt_f32,
+// v_exp_cephes_f32, v_log_f32, v_f32_reduce_add), and a kernel that does has 16 KiB (16384 bytes)
+// of vector local memory for its __local__ vectors plus the compiler's vector spills. It must
+// compile with the default flags, exactly as the decode kernel. Never add -vlm: it only raises the
+// compiler's limit. Built with -vlm 32 (28928 bytes used) this kernel passed the simulator and
+// segfaulted on a card (RUK-3105). `tpc-clang -reg-mem-count` prints the total: 11008 bytes with
+// tpc-clang 2.7.33, of which the arrays below are 32 vectors x 256 bytes = 8192 bytes and the
+// rest is 11 spilled vectors.
 float64_pair_t bf16_to_f32_linear(bfloat128 input)
 {
     // The native all-lanes conversion preserves Gaudi dual-group ordering,
@@ -58,15 +67,18 @@ float64_pair_t bf16_to_f32_linear(bfloat128 input)
     return result;
 }
 
-#define GDN_VERIFY_MAX_NODES 8
+// T <= 4 (T = 1 + k with k = 3 draft tokens). The same number is kGdnCoreVerifyMaxNodes in
+// gdn_core_decode_params.h; the host glue rejects a larger T, so it never reaches this kernel.
+#define GDN_VERIFY_MAX_NODES 4
 __local__ float64 verify_q[2 * GDN_VERIFY_MAX_NODES];   // node t: [2t] = elements 0..63, [2t+1] = 64..127
 __local__ float64 verify_k[2 * GDN_VERIFY_MAX_NODES];
-__local__ float64 verify_v[2 * GDN_VERIFY_MAX_NODES];   // the current value head
+// conv_verify_block's result for one 128-channel block: the Q block and the K block before their
+// normalization, then v of the current value head. The recurrence header reads v from it and
+// replaces it element by element with o, so after the recurrence it holds o of that value head.
+__local__ float64 verify_vo[2 * GDN_VERIFY_MAX_NODES];
 __local__ float64 verify_decay[GDN_VERIFY_MAX_NODES];   // the current value head, all lanes equal
 __local__ float64 verify_beta[GDN_VERIFY_MAX_NODES];
-__local__ float64 verify_o[2 * GDN_VERIFY_MAX_NODES];   // written by the recurrence header
 __local__ int verify_store_slot[GDN_VERIFY_MAX_NODES];  // ssm_store_indices[r, t] if t < n and in [0, S), else -1
-__local__ float64 verify_act[2 * GDN_VERIFY_MAX_NODES]; // conv_verify_block's result for one 128-channel block
 #include "gdn_core_verify_recurrence.h"
 #include "gdn_core_decode_norm.h"
 
@@ -88,8 +100,8 @@ static inline void conv_guarded_store(tensor conv_state, int channel, int row, i
 // Causal width-4 conv + SiLU, fp32, for the 128 channels starting at `channel` over the `nodes`
 // nodes of one request. The 3-row history is read from rows offset..offset+2 of load_slot before
 // any store; store_slot receives the shifted history (h1, h2, the T node inputs, zeros to the end)
-// through conv_guarded_store. The SiLU output of node t lands in verify_act[2t] (elements 0..63)
-// and verify_act[2t + 1] (64..127); nodes at or past the row's real length `n` take a zero input
+// through conv_guarded_store. The SiLU output of node t lands in verify_vo[2t] (elements 0..63)
+// and verify_vo[2t + 1] (64..127); nodes at or past the row's real length `n` take a zero input
 // vector, are not convolved, and store zeros.
 static inline void conv_verify_block(tensor conv_state, tensor mixed_qkv, tensor conv_weight_t,
                                      int channel, int request, int nodes, int n,
@@ -140,8 +152,8 @@ static inline void conv_verify_block(tensor conv_state, tensor mixed_qkv, tensor
             conv.v1 = v_f32_mac_b(term.v1, w3.v1, conv.v1);
             conv.v2 = v_f32_mac_b(term.v2, w3.v2, conv.v2);
 
-            verify_act[2 * t] = conv.v1 * v_sigmoid_f32(conv.v1);
-            verify_act[2 * t + 1] = conv.v2 * v_sigmoid_f32(conv.v2);
+            verify_vo[2 * t] = conv.v1;   // SiLU is applied after the loop
+            verify_vo[2 * t + 1] = conv.v2;
         }
         conv_guarded_store(conv_state, channel, 2 + t, store_slot, x, h0, h1, h2, n0, n1, n2);
         p0 = p1;
@@ -153,6 +165,14 @@ static inline void conv_verify_block(tensor conv_state, tensor mixed_qkv, tensor
     conv_guarded_store(conv_state, channel, 1, store_slot, h2, h0, h1, h2, n0, n1, n2);
     for (int row = 2 + nodes; row < conv_rows; ++row) {
         conv_guarded_store(conv_state, channel, row, store_slot, zero_row, h0, h1, h2, n0, n1, n2);
+    }
+
+    // SiLU in place, x * sigmoid(x) on the same values as before. It runs here, after the weights and
+    // the history rows are dead, because the lookup-table sigmoid needs many registers: inside the
+    // loop above it costs 6 more spilled vectors of the 16 KiB.
+    for (int i = 0; i < 2 * n; ++i) {
+        const float64 pre = verify_vo[i];
+        verify_vo[i] = pre * v_sigmoid_f32(pre);
     }
 }
 
@@ -188,7 +208,10 @@ void main(tensor conv_state, tensor ssm_state, tensor mixed_qkv, tensor z, tenso
         const int ssm_load = s_i32_ld_g(gen_addr(field_coords, row_indices));
         field_coords[0] = 4;
         const int query_len = s_i32_ld_g(gen_addr(field_coords, row_indices));
-        const bool real = conv_load >= 0 && conv_load < conv_slots &&
+        // nodes > GDN_VERIFY_MAX_NODES cannot come through the host glue; if it ever did, the row is
+        // treated as padding, so that no node index runs past the __local__ arrays.
+        const bool real = nodes <= GDN_VERIFY_MAX_NODES &&
+                          conv_load >= 0 && conv_load < conv_slots &&
                           conv_store >= 0 && conv_store < conv_slots &&
                           ssm_load >= 0 && ssm_load < state_slots &&
                           offset >= 0 && offset <= conv_rows - 3 && query_len >= 1;
@@ -214,8 +237,8 @@ void main(tensor conv_state, tensor ssm_state, tensor mixed_qkv, tensor z, tenso
             conv_verify_block(conv_state, mixed_qkv, conv_weight_t, key_head * head_dim, request,
                               nodes, n, conv_load, offset, conv_store, conv_rows);
             for (int t = 0; t < n; ++t) {
-                const float64 q_lo = verify_act[2 * t];
-                const float64 q_hi = verify_act[2 * t + 1];
+                const float64 q_lo = verify_vo[2 * t];
+                const float64 q_hi = verify_vo[2 * t + 1];
                 float64 q_norm = v_f32_mac_b(q_lo, q_lo, q_hi * q_hi);
                 q_norm = v_f32_reduce_add(q_norm);
                 q_norm = v_f32_shuffle_b(q_norm, broadcast_lane_zero, 0, q_norm);
@@ -227,8 +250,8 @@ void main(tensor conv_state, tensor ssm_state, tensor mixed_qkv, tensor z, tenso
             conv_verify_block(conv_state, mixed_qkv, conv_weight_t, key_offset + key_head * head_dim, request,
                               nodes, n, conv_load, offset, conv_store, conv_rows);
             for (int t = 0; t < n; ++t) {
-                const float64 k_lo = verify_act[2 * t];
-                const float64 k_hi = verify_act[2 * t + 1];
+                const float64 k_lo = verify_vo[2 * t];
+                const float64 k_hi = verify_vo[2 * t + 1];
                 float64 k_norm = v_f32_mac_b(k_lo, k_lo, k_hi * k_hi);
                 k_norm = v_f32_reduce_add(k_norm);
                 k_norm = v_f32_shuffle_b(k_norm, broadcast_lane_zero, 0, k_norm);
@@ -240,12 +263,9 @@ void main(tensor conv_state, tensor ssm_state, tensor mixed_qkv, tensor z, tenso
             for (int j = 0; j < head_repeat; ++j) {
                 const int value_head = key_head * head_repeat + j;
 
+                // v of this value head, straight into verify_vo.
                 conv_verify_block(conv_state, mixed_qkv, conv_weight_t, value_offset + value_head * head_dim,
                                   request, nodes, n, conv_load, offset, conv_store, conv_rows);
-                for (int t = 0; t < n; ++t) {
-                    verify_v[2 * t] = verify_act[2 * t];
-                    verify_v[2 * t + 1] = verify_act[2 * t + 1];
-                }
 
                 for (int t = 0; t < n; ++t) {
                     int5 head_coords = {value_head, 0, 0, 0, 0};
@@ -281,8 +301,8 @@ void main(tensor conv_state, tensor ssm_state, tensor mixed_qkv, tensor z, tenso
                 for (int t = 0; t < nodes; ++t) {
                     if (t < n) {
                         float64_pair_t o;
-                        o.v1 = verify_o[2 * t];
-                        o.v2 = verify_o[2 * t + 1];
+                        o.v1 = verify_vo[2 * t];
+                        o.v2 = verify_vo[2 * t + 1];
                         gdn_core_norm_store(z, norm_weight, output, request * nodes + t, value_head, o, eps,
                                             gate_activation);
                     } else {

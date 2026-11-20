@@ -5,12 +5,14 @@
 //
 // Inputs, in the __local__ arrays that gdn_core_verify_gaudi2.c declares before including this file
 // (node t's 128-wide vectors in linear lane order: [2t] = elements 0..63, [2t + 1] = elements 64..127):
-//   verify_q[2t], verify_q[2t + 1]   q of node t, L2-normalized and multiplied by scale
-//   verify_k[2t], verify_k[2t + 1]   k of node t, L2-normalized
-//   verify_v[2t], verify_v[2t + 1]   v of node t for this value head
-//   verify_decay[t], verify_beta[t]  this value head's decay and beta of node t (the same value in all 64 lanes)
-//   verify_store_slot[t]             SSM slot node t's state is stored to, or -1 for "not stored"
-// Output: verify_o[2t], verify_o[2t + 1] = o of node t (linear lanes), for t < nodes.
+//   verify_q[2t], verify_q[2t + 1]     q of node t, L2-normalized and multiplied by scale
+//   verify_k[2t], verify_k[2t + 1]     k of node t, L2-normalized
+//   verify_vo[2t], verify_vo[2t + 1]   v of node t for this value head (replaced by o, see Output)
+//   verify_decay[t], verify_beta[t]    this value head's decay and beta of node t (the same value in all 64 lanes)
+//   verify_store_slot[t]               SSM slot node t's state is stored to, or -1 for "not stored"
+// Output: verify_vo[2t], verify_vo[2t + 1] = o of node t (linear lanes), for t < nodes. v and o share one array
+// to save vector local memory: value row i reads only element i of v and then writes only element i of o, so
+// while row i is processed the elements below i already hold o and the elements from i up still hold v.
 //
 // Reads the head's 128x128 fp32 state from load_slot once, row by row; each value row is carried through
 // nodes 0 .. nodes - 1 in registers and stored after node t wherever verify_store_slot[t] >= 0.
@@ -25,11 +27,6 @@ static inline void gdn_core_verify_recurrence_head(
     const uchar256 broadcast_lane_zero = 0x80;
     const float64 zero = 0.0f;
 
-    for (int t = 0; t < nodes; ++t) {
-        verify_o[2 * t] = 0.0f;
-        verify_o[2 * t + 1] = 0.0f;
-    }
-
     for (int vh = 0; vh < 2; ++vh) {
         for (int lane = 0; lane < 64; ++lane) {
             const int value_row = vh * 64 + lane;
@@ -42,8 +39,8 @@ static inline void gdn_core_verify_recurrence_head(
             const bool64 row_lane = v_u32_cmp_eq_b(lanes, (uint64)lane);
 
             for (int t = 0; t < nodes; ++t) {
-                const float64 v_half = verify_v[2 * t + vh];
-                float64 v_value = v_f32_mov_vb(v_half, 0, zero, row_lane);
+                const float64 vo_half = verify_vo[2 * t + vh];  // element `lane` is still v, the ones below are o
+                float64 v_value = v_f32_mov_vb(vo_half, 0, zero, row_lane);
                 v_value = v_f32_reduce_add(v_value);
                 v_value = v_f32_shuffle_b(v_value, broadcast_lane_zero, 0, v_value);
 
@@ -66,7 +63,7 @@ static inline void gdn_core_verify_recurrence_head(
                 out_value = v_f32_mac_b(state_hi, verify_q[2 * t + 1], out_value);
                 out_value = v_f32_reduce_add(out_value);
                 out_value = v_broadcast_element_f32(out_value, 0);
-                verify_o[2 * t + vh] = v_f32_mov_vb(out_value, 0, verify_o[2 * t + vh], row_lane);
+                verify_vo[2 * t + vh] = v_f32_mov_vb(out_value, 0, vo_half, row_lane);
 
                 const int slot = verify_store_slot[t];
                 if (slot >= 0) {

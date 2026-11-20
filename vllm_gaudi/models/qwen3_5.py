@@ -12,6 +12,7 @@ from flashinfer_gaudi.gdn_core_decode import (
     gdn_recurrent_decode_available,
 )
 from flashinfer_gaudi.gdn_core_verify import (
+    GDN_CORE_VERIFY_MAX_NODES,
     GdnCoreVerifyMode,
     gdn_core_verify,
     gdn_core_verify_available,
@@ -415,7 +416,7 @@ class HPUGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 return None  # direct state takes a narrowed conv view in mode 0, which the op does not reproduce
         else:
             return None
-        if not (1 <= T <= 8 and T + 2 <= R):
+        if not (1 <= T <= GDN_CORE_VERIFY_MAX_NODES and T + 2 <= R):
             return None
         if self._gdn_core_verify_ok is None:
             reason = self._gdn_core_verify_reason(conv_pool, ssm_pool)

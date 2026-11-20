@@ -19,6 +19,12 @@ The third fixture does the same for the fused GDN verification kernel (phase 2, 
 ``csrc/gdn_fused/host/gdn_core_verify_gaudi2.cpp``), and each ``verify_sim_case.VERIFY_CASES``
 case is compared by ``verify_sim_case.compare_verify``.
 
+All three kernels are compiled with the same flags, ``TPC_FLAGS``, and no local-memory override:
+a kernel that calls lookup-table functions has 16 KiB of vector local memory, tpc-clang enforces
+that only without ``-vlm``, and the simulator does not (RUK-3105: the verify kernel built with
+``-vlm 32`` passed here and segfaulted on a card).  ``test_vector_local_memory`` reads the
+compiler's own count (``-reg-mem-count``) for each kernel.
+
 Skips on machines without the TPC toolchain (this Mac); runs for real in the tpcsim container
 (``tools/flash_next/tpcsim.sh``, guide ``docs/design/flash-next/tpcsim.md``) and in the rental's
 stage 1 container.  Contract: ``docs/design/flash-next/gdn-core-decode.md``.
@@ -27,6 +33,7 @@ stage 1 container.  Contract: ``docs/design/flash-next/gdn-core-decode.md``.
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -37,8 +44,9 @@ from tests.unit_tests.gdn_core_decode.recurrent_sim_case import (RECURRENT_CASES
                                                                   make_recurrent_inputs, read_recurrent_outputs,
                                                                   write_recurrent_inputs)
 from tests.unit_tests.gdn_core_decode.sim_case import CASES, compare, make_inputs, read_outputs, write_inputs
-from tests.unit_tests.gdn_core_decode.verify_sim_case import (VERIFY_CASES, compare_verify, make_verify_inputs,
-                                                              read_verify_outputs, write_verify_inputs)
+from tests.unit_tests.gdn_core_decode.verify_sim_case import (MAX_NODES, VERIFY_CASES, VERIFY_TOO_MANY_NODES_CASE,
+                                                              compare_verify, make_verify_inputs, read_verify_outputs,
+                                                              write_verify_inputs)
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 TOOLS_INCLUDE = Path("/usr/lib/habanatools/include")
@@ -55,6 +63,13 @@ VERIFY_KERNEL_SOURCE = REPO_ROOT / "csrc" / "gdn_fused" / "kernels" / "gdn_core_
 VERIFY_GLUE_SOURCE = REPO_ROOT / "csrc" / "gdn_fused" / "host" / "gdn_core_verify_gaudi2.cpp"
 VERIFY_HOST_SOURCE = Path(__file__).resolve().parent / "verify_sim_host.cpp"
 VERIFY_KERNEL_OBJECT = "gdn_core_verify_gaudi2.o"
+
+# The flags of every kernel, as GDN_TPC_FLAGS in csrc/gdn_fused/CMakeLists.txt.  No -vlm, -slm or -spill-vlm.
+TPC_FLAGS = ("-Wall", "-Werror", "-O2", "-march=gaudi2")
+# Vector local memory of a kernel that calls lookup-table functions, in bytes (tpc-clang's own limit for
+# __local__ vectors plus vector spills), and the most each kernel may use so that 4 KiB (16 vectors) stay free.
+VLM_LIMIT = 16384
+VLM_BUDGET = VLM_LIMIT - 4096
 
 
 def _missing_sdk_parts() -> list[str]:
@@ -85,10 +100,7 @@ def _run(cmd: list, *, cwd: Path | None = None, timeout: float | None = None) ->
 def sim_binary(tmp_path_factory: pytest.TempPathFactory) -> Path:
     """Build folder with the compiled kernel .o and the linked sim_host binary (built once)."""
     build = tmp_path_factory.mktemp("gdn_core_decode_sim")
-    _run([
-        "tpc-clang", "-Wall", "-Werror", "-O2", "-march=gaudi2", f"-I{TOOLS_INCLUDE}", KERNEL_SOURCE, "-c", "-o",
-        build / KERNEL_OBJECT
-    ],
+    _run(["tpc-clang", *TPC_FLAGS, f"-I{TOOLS_INCLUDE}", KERNEL_SOURCE, "-c", "-o", build / KERNEL_OBJECT],
          timeout=1800)
     _run([
         "objcopy", "-I", "binary", "-O", "elf64-x86-64", "-B", "i386:x86-64", KERNEL_OBJECT,
@@ -112,8 +124,8 @@ def recurrent_sim_binary(tmp_path_factory: pytest.TempPathFactory) -> Path:
     """Build folder with the compiled recurrence kernel .o and the linked recurrent_sim_host binary (built once)."""
     build = tmp_path_factory.mktemp("gdn_recurrent_decode_sim")
     _run([
-        "tpc-clang", "-Wall", "-Werror", "-O2", "-march=gaudi2", f"-I{TOOLS_INCLUDE}", RECURRENT_KERNEL_SOURCE, "-c",
-        "-o", build / RECURRENT_KERNEL_OBJECT
+        "tpc-clang", *TPC_FLAGS, f"-I{TOOLS_INCLUDE}", RECURRENT_KERNEL_SOURCE, "-c", "-o",
+        build / RECURRENT_KERNEL_OBJECT
     ],
          timeout=1800)
     _run([
@@ -137,16 +149,17 @@ def recurrent_sim_binary(tmp_path_factory: pytest.TempPathFactory) -> Path:
 def verify_sim_binary(tmp_path_factory: pytest.TempPathFactory) -> Path:
     """Build folder with the compiled verification kernel .o and the linked verify_sim_host binary (built once).
 
-    The kernel is compiled with ``-vlm 32`` exactly as the ``gdn_core_verify_gaudi2.o`` rule in
-    ``csrc/gdn_fused/CMakeLists.txt`` does (its per-node ``__local__`` arrays exceed the default VLM).
+    The kernel is compiled with ``TPC_FLAGS``, the flags of the decode kernel, exactly as the
+    ``gdn_core_verify_gaudi2.o`` rule in ``csrc/gdn_fused/CMakeLists.txt`` does: with the default vector
+    local memory limit this compile fails when the kernel's ``__local__`` arrays plus spills pass 16 KiB.
     With ``GDN_VERIFY_SIM_STRIP_BITCODE=1`` in the environment the compiled object is stripped of its
     ``.llvmbc`` section before embedding, mirroring ``cmake -DGDN_FUSED_VERIFY_STRIP_BITCODE=ON``
-    (RUK-3105 H2 diagnostic).
+    (a card diagnostic, never the shipped build).
     """
     build = tmp_path_factory.mktemp("gdn_core_verify_sim")
     _run([
-        "tpc-clang", "-Wall", "-Werror", "-O2", "-march=gaudi2", "-vlm", "32", f"-I{TOOLS_INCLUDE}",
-        VERIFY_KERNEL_SOURCE, "-c", "-o", build / VERIFY_KERNEL_OBJECT
+        "tpc-clang", *TPC_FLAGS, f"-I{TOOLS_INCLUDE}", VERIFY_KERNEL_SOURCE, "-c", "-o",
+        build / VERIFY_KERNEL_OBJECT
     ],
          timeout=1800)
     if os.environ.get("GDN_VERIFY_SIM_STRIP_BITCODE") == "1":
@@ -184,6 +197,59 @@ def test_verify_kernel_disassembles_for_gaudi2(verify_sim_binary: Path) -> None:
     listing = _run(
         ["tpc-llvm-objdump", "--triple=tpc", "--mcpu=gaudi2", "-d", verify_sim_binary / VERIFY_KERNEL_OBJECT]).stdout
     assert "TPC architecture: gaudi2" in listing
+
+
+def test_no_kernel_is_compiled_with_a_local_memory_override() -> None:
+    """The flags of this file's fixtures: one list for the three kernels, without -vlm, -slm or -spill-vlm."""
+    assert not [flag for flag in TPC_FLAGS if flag.lstrip("-") in ("vlm", "slm", "spill-vlm")]
+    source = Path(__file__).read_text()
+    compiles = re.findall('"tpc-' + r'clang",([^\]]*)\]', source)  # every tpc-clang argument list of this file
+    assert len(compiles) == 4, compiles  # the three fixtures and test_vector_local_memory
+    for arguments in compiles:
+        assert "*TPC_FLAGS" in arguments, arguments
+        assert not re.search(r'"-(vlm|slm|spill-vlm)"', arguments), arguments
+
+
+@pytest.mark.parametrize("source", [KERNEL_SOURCE, RECURRENT_KERNEL_SOURCE, VERIFY_KERNEL_SOURCE],
+                         ids=["decode", "recurrent", "verify"])
+def test_vector_local_memory(source: Path, tmp_path: Path) -> None:
+    """tpc-clang's own count of vector local memory (statics plus spills), compiled with the default flags.
+
+    The compile itself fails past ``VLM_LIMIT`` ("too much vector memory is used for statically allocated
+    data", "Too many vector spills"); the assertion keeps 4 KiB of that free.
+    """
+    proc = _run(
+        ["tpc-clang", *TPC_FLAGS, "-reg-mem-count", f"-I{TOOLS_INCLUDE}", source, "-c", "-o", tmp_path / "kernel.o"],
+        timeout=1800)
+    match = re.search(r"Total VLM used: (\d+) bytes", proc.stdout + proc.stderr)
+    assert match, f"no 'Total VLM used' line in the -reg-mem-count output:\n{proc.stdout}\n{proc.stderr}"
+    used = int(match.group(1))
+    print(f"{source.name}: Total VLM used: {used} bytes of {VLM_LIMIT}")
+    assert used <= VLM_BUDGET, f"{source.name} uses {used} bytes of vector local memory, budget {VLM_BUDGET}"
+
+
+def test_verify_object_keeps_its_bitcode(verify_sim_binary: Path) -> None:
+    """The verify kernel ELF is embedded as tpc-clang wrote it, with its .llvmbc section (never stripped)."""
+    if os.environ.get("GDN_VERIFY_SIM_STRIP_BITCODE") == "1":
+        pytest.skip("GDN_VERIFY_SIM_STRIP_BITCODE=1 strips the section on purpose")
+    sections = _run(["readelf", "-S", "-W", verify_sim_binary / VERIFY_KERNEL_OBJECT]).stdout
+    assert ".llvmbc" in sections
+
+
+def test_verify_glue_rejects_too_many_nodes(verify_sim_binary: Path, tmp_path: Path) -> None:
+    """T = MAX_NODES + 1: the host glue answers GLUE_INCOMPATIBLE_INPUT_SIZE and the kernel never runs."""
+    case = VERIFY_TOO_MANY_NODES_CASE
+    assert case.T == MAX_NODES + 1
+    case_dir = tmp_path / case.name
+    write_verify_inputs(case, make_verify_inputs(case), case_dir)
+    proc = subprocess.run([str(verify_sim_binary / "verify_sim_host"), str(case_dir)],
+                          capture_output=True,
+                          text=True,
+                          timeout=900)
+    assert proc.returncode == 6, f"rc={proc.returncode}\nstdout:\n{proc.stdout}\nstderr:\n{proc.stderr}"
+    assert "GLUE_INCOMPATIBLE_INPUT_SIZE" in proc.stderr
+    assert "instructions executed" not in proc.stdout
+    assert not (case_dir / "out.bin").exists()
 
 
 @pytest.mark.parametrize("case", CASES, ids=[case.name for case in CASES])
