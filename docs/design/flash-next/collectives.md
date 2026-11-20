@@ -333,18 +333,26 @@ What is proven on the card (VERIFIED by the jobs named):
 
 Card jobs: the real-model pair **00124** `real4-ab3-region` / **00125** `real4-ab3-cuts` (commit 0a66722b, any:4,
 25 min each, side by side on the two halves, in the places of 00082 / 00083; at 23:33 UTC both "start by 02:50
-UTC at the latest"). Waiters: this agent's two background `bin/farm job` commands (logs
-`reports/collectives/logs/farm_real4_ab3_{region,cuts}.log`) copy each job's log and results to
-`reports/collectives/card/<id>-<name>/` when it ends. When both have ended:
-`python3 -I tools/flash_next/collectives/compare_arms.py <region folder> <cuts folder>` (folders under
-`reports/collectives/card/`): the 6 lone texts must be equal; the ms per step at 1 and 32 streams is the cuts'
-own effect. If no waiter of this agent is alive: `bin/farm ledger | grep -w collectives`, then
-`bin/farm fetch collectives <id> <id>-<name>`. Cancel the pair if it has not started by about 03:00 UTC.
+UTC at the latest"). This agent handed back at about 23:45 UTC, before the pair started: its two background
+`bin/farm job` commands (logs `reports/collectives/logs/farm_real4_ab3_{region,cuts}.log`) copy each job's log and
+results to `reports/collectives/card/<id>-<name>/` if they are still alive when the jobs end; otherwise
+`bin/farm fetch collectives 00124 00124-real4-ab3-region` and `bin/farm fetch collectives 00125
+00125-real4-ab3-cuts` (or the mirror `node-mirror/farm/collectives/results/`). Then, from the worktree root:
+`python3 -I tools/flash_next/collectives/compare_arms.py reports-folder/00124-real4-ab3-region
+reports-folder/00125-real4-ab3-cuts` (`reports-folder` = `/Volumes/Storage/Claude/gaudi-work/reports/collectives/card`).
+Reading: the line `texts ... lone requests: N/6 identical` decides. 6/6: mode 1 + rider are token-exact on the real
+model, and the steady ms per step of the two arms at 1 and 32 streams is their effect (expected under 1 ms per
+step at TP4, inside the noise between the halves). Fewer than 6: look at the first differing token of that
+request (the two arms compute the same bf16 logits, so a difference is a defect of the cuts, unless a server
+error or a compile pause explains it; check both `server0.log`). Also read the `TEXT` lines (no garbage) and the
+`SAMPLED` lines (the sampled round runs neither the region nor the arg max: the same in both arms but for the
+rider's one all-reduce). Cancel the pair if it has not started by about 03:00 UTC.
 
 Pending, in order:
 
-1. When the pair ends: compare the arms, write the result into section 6, tell the coordinator (`main`) which
-   flags are proven for the integration build (mode 1 + rider if the lone texts are equal), push.
+1. When the pair ends: compare the arms (above), write the result into section 6, tell the coordinator (`main`)
+   whether mode 1 + rider are proven (the integration build keeps every flag of this track off tonight; the
+   verdict is for the next run and the pull request), push.
 2. Pull requests after 04:00 UTC: this note (sections 5 and 6, the handoff); nothing else is unmerged.
 3. Count work left, small (0.15 to 0.19 ms each at TP8, coordinator: not worth card time tonight): the PLE rows on
    layer 0's mixer all-reduce when the embedding is replicated; the draft's arg-max gather carrying the winner's
