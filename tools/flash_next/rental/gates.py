@@ -35,7 +35,7 @@ import urllib.request
 from collections import Counter
 from pathlib import Path
 
-from tools.flash_next.rental import serve
+from tools.flash_next.rental import lazy_graph, serve
 from tools.flash_next.rental.schema import MAX_MODEL_LEN, GateStatus
 
 try:  # M4-H0 (written in parallel): the FP8 layout checker
@@ -409,6 +409,33 @@ def _gdn_pytest_summary(output: str) -> dict:
     return counts
 
 
+_PYTEST_FAILURE_SECTION = re.compile(r"^=+ (FAILURES|ERRORS) =+$")
+_PYTEST_FAILURE_HEADER = re.compile(r"^_{3,} (\S.*?) _{3,}$")
+
+
+def _pytest_failed_tests(output: str) -> list[str]:
+    """The failed tests pytest names in `output`, each as a line starting with "FAILED ".
+
+    With `-rf` pytest prints "FAILED <node id> - <message>" lines and those are returned. The card tests run
+    with `-q -rs`, which prints none: the names are then taken from the headers of the FAILURES and ERRORS
+    sections ("____ test_name[case] ____"), in order and once each.
+    """
+    lines = output.splitlines()
+    named = [ln for ln in lines if ln.startswith("FAILED ")]
+    if named:
+        return named
+    found: list[str] = []
+    in_failures = False
+    for ln in lines:
+        if _PYTEST_FAILURE_SECTION.match(ln):
+            in_failures = True
+            continue
+        header = _PYTEST_FAILURE_HEADER.match(ln) if in_failures else None
+        if header and "FAILED " + header.group(1) not in found:
+            found.append("FAILED " + header.group(1))
+    return found
+
+
 def _gdn_verify_not_run(reason: str) -> dict:
     """The "verify" details of a run in which the verify checks did not run at all."""
     return {"status": "not_run", "reason": reason, "hpu_op": None, "replay": []}
@@ -558,7 +585,7 @@ def fused_gdn(plugin_root: Path, out_dir: Path, python: str = sys.executable, sk
                     "skipped": counts["skipped"],
                     "failed": counts["failed"],
                 }
-                details["failed_tests"] = [ln for ln in text.splitlines() if ln.startswith("FAILED ")]
+                details["failed_tests"] = _pytest_failed_tests(text)
                 op_ok = (proc.returncode == 0 and counts["passed"] > 0 and counts["skipped"] == 0 and
                          counts["failed"] == 0 and counts["error"] == 0)
                 if not op_ok:
@@ -875,7 +902,9 @@ def _kernel_card_test(plugin_root: Path, out_dir: Path, python: str, skip: str, 
         counts = _gdn_pytest_summary(text)
         result["hpu_op"] = {"exit": exit_code, "passed": counts["passed"], "skipped": counts["skipped"],
                             "failed": counts["failed"], "error": counts["error"], "timed_out": timed_out}
-        result["failed_tests"] = [ln for ln in text.splitlines() if ln.startswith("FAILED ")]
+        result["failed_tests"] = _pytest_failed_tests(text)
+        # which of the failures are the lazy bridge's empty graph input, and whether its producer was queued
+        result["empty_inputs"] = lazy_graph.summary(text)
         if timed_out:
             result.update(status=HC_FAILED, reason="%s did not finish in %s s" % (test_name, timeout_s))
         elif (exit_code == 0 and counts["passed"] > 0 and counts["skipped"] == 0 and counts["failed"] == 0
