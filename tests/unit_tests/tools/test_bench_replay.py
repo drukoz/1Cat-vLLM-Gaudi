@@ -299,3 +299,29 @@ def test_work_adds_device_work_to_every_sub_block_and_keeps_the_value():
     assert products > bench.count_ops(torch, lambda: body.forward(x, None))  # more ops with the work on
     assert bench.split_regime("replay_seg_work") == ("replay_seg", "", "_work")
     assert bench.split_regime("replay_cache_work") == ("replay", "_cache", "_work")
+
+
+def test_derive_uses_the_read_of_the_output_when_it_was_measured():
+    merged = [
+        dict(_entry("replay", 1, False, 1.0), done_p50_max_rank_ms=2.0),
+        dict(_entry("replay", 1, True, 3.0), done_p50_max_rank_ms=2.0 + 96 * 0.2),
+    ]
+    line = bench.derive(merged)[0]
+    assert line["all_reduce_ms_each"] == pytest.approx(0.2)  # from done, not from total
+    assert line["total_with_ms"] == pytest.approx(2.0 + 96 * 0.2)
+
+
+def test_merge_carries_the_slowest_ranks_done_time():
+    record = {"case": "replay", "rows": 1, "collectives": True, "layers": 48,
+              "call_ms": {"p50": 0.2}, "total_ms": {"p50": 0.8}, "done_ms": {"p50": 13.0}}
+    ahead = dict(record, done_ms={"p50": 13.5})
+    merged = bench.merge({0: [record], 1: [ahead]})
+    assert merged[0]["done_p50_max_rank_ms"] == 13.5 and merged[0]["total_p50_max_rank_ms"] == 0.8
+
+
+def test_read_back_takes_a_tensor_or_the_first_of_a_tuple():
+    rank = bench.Rank.__new__(bench.Rank)
+    rank.torch = torch
+    rank.read_back(torch.zeros(2, 3))  # a CPU tensor: nothing to read
+    rank.read_back((torch.zeros(2), torch.zeros(1)))
+    rank.read_back(None)

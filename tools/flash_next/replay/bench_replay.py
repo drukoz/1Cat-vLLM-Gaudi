@@ -44,8 +44,10 @@ eager process (``PT_HPU_LAZY_MODE=0``):
 * ``compile_layer`` one layer compiled the same way and called L times per step (regional compilation)
 
 Per call: ``call`` is the time until the call returns on the host, ``total`` until ``torch.hpu.synchronize()``
-returns. Derived per regime and row count: one all-reduce (with minus without, over 2L), one cut (``*_layer``
-minus the regime without cuts, over L - 1), and the host share of a replay.
+returns, ``done`` until one element of the output has been read back to the host (what the runner's read of the
+sampled tokens waits for: every launch and collective of the step, on every rank). The derived costs use ``done``.
+Derived per regime and row count: one all-reduce (with minus without, over 2L), one cut (``*_layer`` minus the
+regime without cuts, over L - 1), and the host share of a replay.
 
 Run on a Gaudi2 node, inside the container with ``habana_frameworks``, with ``--ranks`` free cards::
 
@@ -358,6 +360,14 @@ class Rank:
         if self.htorch is not None:
             self.torch.hpu.synchronize()
 
+    def read_back(self, out) -> None:
+        """One element of the output on the host (a tensor, or the first tensor of a tuple or list)."""
+        torch = self.torch
+        while isinstance(out, (tuple, list)) and out:
+            out = out[0]
+        if torch.is_tensor(out) and out.device.type != "cpu" and out.numel():
+            out.reshape(-1)[:1].float().cpu()
+
     def barrier(self) -> None:
         if self.group is None:
             return
@@ -458,7 +468,7 @@ class Rank:
         self.synchronize()
         self.barrier()
         first = None
-        calls, totals = [], []
+        calls, totals, dones = [], [], []
         # Where the host's time goes: CPU seconds of the calling thread during the call and during call plus
         # synchronize, CPU seconds of the whole process (every thread) during both, the calling thread's system
         # time and its voluntary context switches (a thread that waits sleeps; one that issues or polls burns CPU).
@@ -476,11 +486,17 @@ class Rank:
             t2 = _now()
             c2, s2, v2 = thread_usage()
             p2 = time.process_time()
+            # A read of the output, as the runner reads the sampled tokens: the step is complete on every rank
+            # when it returns (synchronize alone may return while launches behind a collective still wait), and
+            # the next call starts with nothing in flight.
+            self.read_back(out)
+            t3 = _now()
             if i == 0:
                 first = t2 - t0
             elif i >= warmup:
                 calls.append(t1 - t0)
                 totals.append(t2 - t0)
+                dones.append(t3 - t0)
                 cpu_calls.append(c1 - c0)
                 cpu_totals.append(c2 - c0)
                 cpu_procs.append(p2 - p0)
@@ -491,7 +507,7 @@ class Rank:
         if out is not None:
             finite = bool(self.torch.isfinite(out.float()).all().item())
         return {"first_ms": None if first is None else 1e3 * first, "call_ms": stats_ms(calls),
-                "total_ms": stats_ms(totals), "finite": finite,
+                "total_ms": stats_ms(totals), "done_ms": stats_ms(dones), "finite": finite,
                 "cpu": {"call_ms": _median([1e3 * v for v in cpu_calls]),
                         "total_ms": _median([1e3 * v for v in cpu_totals]),
                         "process_ms": _median([1e3 * v for v in cpu_procs]),
@@ -753,8 +769,9 @@ class Rank:
         cpu0, sys0, switches0 = thread_usage()
         process0 = time.process_time()
         for i in range(calls):
-            module(inputs[i % len(inputs)])
+            out = module(inputs[i % len(inputs)])
             self.synchronize()
+            self.read_back(out)
         seconds = _now() - started
         cpu1, sys1, switches1 = thread_usage()
         record = {"case": "hold", "regime": regime, "rows": rows, "calls": calls, "seconds": seconds,
@@ -920,7 +937,7 @@ def merge(per_rank: dict) -> list:
             continue
         entry = dict(record)
         key = case_key(record)
-        for field in ("call_ms", "total_ms"):
+        for field in ("call_ms", "total_ms", "done_ms"):
             medians = [other[field]["p50"] for records in per_rank.values() for other in records
                        if case_key(other) == key and isinstance(other.get(field), dict)
                        and other[field].get("p50") is not None]
@@ -938,9 +955,13 @@ def derive(merged: list, reference: list | None = None) -> list:
     lookup = list(merged) + list(reference or [])
 
     def total(case, rows, collectives):
+        # The end of a call: the read of the output when it was measured (done), else synchronize (total).
         for entry in lookup:
             if case_key(entry) == (case, rows, collectives):
-                return entry.get("total_p50_max_rank_ms"), entry.get("call_p50_max_rank_ms"), entry.get("layers")
+                end = entry.get("done_p50_max_rank_ms")
+                if end is None:
+                    end = entry.get("total_p50_max_rank_ms")
+                return end, entry.get("call_p50_max_rank_ms"), entry.get("layers")
         return None, None, None
 
     lines = []
@@ -1013,13 +1034,15 @@ def _fmt(value, digits=3):
 
 
 def print_summary(merged: list, derived: list, ranks: int, echo=print) -> None:
-    echo("== %d ranks; the slowest rank's median per call, ms (call = until the call returns on the host)" % ranks)
+    echo("== %d ranks; the slowest rank's median per call, ms (call = until the call returns on the host, total = "
+         "until synchronize returns, done = until a read of the output returns)" % ranks)
     echo("   (cpu, rank 0: CPU ms of the calling thread in the call / in call + synchronize, of the whole process,"
          " the thread's system ms, its voluntary context switches)")
     for entry in merged:
         cpu = entry.get("cpu") or {}
-        echo("   %-22s rows %3d coll %-5s: total %s  call %s  first %s  cpu %s / %s  proc %s  sys %s  sw %s" %
-             (entry["case"], entry["rows"], entry["collectives"], _fmt(entry.get("total_p50_max_rank_ms")),
+        echo("   %-22s rows %3d coll %-5s: done %s  total %s  call %s  first %s  cpu %s / %s  proc %s  sys %s  sw %s" %
+             (entry["case"], entry["rows"], entry["collectives"], _fmt(entry.get("done_p50_max_rank_ms")),
+              _fmt(entry.get("total_p50_max_rank_ms")),
               _fmt(entry.get("call_p50_max_rank_ms")), _fmt(entry.get("first_ms"), 1), _fmt(cpu.get("call_ms")),
               _fmt(cpu.get("total_ms")), _fmt(cpu.get("process_ms")), _fmt(cpu.get("thread_sys_ms")),
               _fmt(cpu.get("thread_voluntary_switches"), 0)))
