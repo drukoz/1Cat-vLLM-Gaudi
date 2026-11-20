@@ -187,10 +187,12 @@ def test_spec_ngram_passes(monkeypatch):
     _validate_flash_next_speculative_config(_spec_config(method="ngram", draft_archs=()))
 
 
-def test_spec_ngram_prefix_caching_raises(monkeypatch):
-    monkeypatch.setenv("VLLM_COMPACT_GDN", "1")
-    with pytest.raises(ValueError, match="prefix caching disabled"):
-        _validate_flash_next_speculative_config(_spec_config(method="ngram", draft_archs=(), prefix_caching=True))
+def test_spec_ngram_prefix_caching_passes(monkeypatch):
+    """n-gram lookup with prefix caching runs on the align-mode lattices (the state pool, compact GDN off)."""
+    monkeypatch.setenv("VLLM_COMPACT_GDN", "0")
+    _validate_flash_next_speculative_config(_spec_config(method="ngram", draft_archs=(), prefix_caching=True))
+    monkeypatch.delenv("VLLM_COMPACT_GDN", raising=False)
+    _validate_flash_next_speculative_config(_spec_config(method="ngram", draft_archs=(), prefix_caching=True))
 
 
 def test_spec_ngram_too_many_tokens_raises(monkeypatch):
@@ -228,8 +230,9 @@ def test_spec_too_many_tokens_raises(monkeypatch):
 
 
 SUPPORTED_SIZES = (1, 2, 3, 4)
-SERVER_KINDS = [("mtp", ("Qwen4ExpMTP", ), False), ("mtp", ("Qwen4ExpMTP", ), True), ("ngram", (), False)]
-SERVER_KIND_IDS = ["mtp", "mtp_prefix_caching", "ngram"]
+SERVER_KINDS = [("mtp", ("Qwen4ExpMTP", ), False), ("mtp", ("Qwen4ExpMTP", ), True), ("ngram", (), False),
+                ("ngram", (), True)]
+SERVER_KIND_IDS = ["mtp", "mtp_prefix_caching", "ngram", "ngram_prefix_caching"]
 
 
 def _validate_size(monkeypatch, method, draft_archs, prefix_caching, k):

@@ -265,11 +265,11 @@ def _validate_flash_next_speculative_config(vllm_config: VllmConfig) -> None:
         return
     draft_model_config = speculative_config.draft_model_config
     draft_architectures = set(getattr(getattr(draft_model_config, "hf_config", None), "architectures", ()) or ())
-    if speculative_config.method == "ngram":
-        if vllm_config.cache_config.enable_prefix_caching:
-            raise ValueError("Flash-Next n-gram speculation runs with prefix caching disabled for now: add "
-                             "--no-enable-prefix-caching")
-    elif speculative_config.method != "mtp" or "Qwen4ExpMTP" not in draft_architectures:
+    # n-gram prompt lookup runs on the same verification lattices as MTP, with prefix caching on (align mode) or
+    # off (compact GDN): its ragged drafts widen a verification batch to the previous step's accepted count
+    # (vllm_gaudi/v1/worker/verify_width.py), so the recurrent layers always find the committed state.
+    if speculative_config.method != "ngram" and (speculative_config.method != "mtp"
+                                                 or "Qwen4ExpMTP" not in draft_architectures):
         raise ValueError("Flash-Next supports speculative decoding with its own MTP layer or n-gram prompt lookup "
                          "only: use --speculative-config '{\"method\": \"mtp\", \"num_speculative_tokens\": 3}' or "
                          "'{\"method\": \"ngram\", \"num_speculative_tokens\": 3, \"prompt_lookup_max\": 4, "

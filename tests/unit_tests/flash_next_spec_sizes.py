@@ -35,9 +35,8 @@ PROVEN_NOT_SERVED = (5, )  # of those, the sizes the platform's validator still 
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 
-# (method, prefix caching) of the configurations the tests run; n-gram with prefix caching is refused for
-# another reason and no test runs it.
-_CONFIGURATIONS = (("mtp", False), ("mtp", True), ("ngram", False))
+# (method, prefix caching) of the configurations the tests run.
+_CONFIGURATIONS = (("mtp", False), ("mtp", True), ("ngram", False), ("ngram", True))
 
 _CHILD = r"""
 import json, os, sys

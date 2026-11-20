@@ -46,6 +46,7 @@ from vllm_gaudi.v1.worker.recurrent_lattice import align_lattices
 from vllm_gaudi.v1.worker.recurrent_spec import (accepted_counts, load_checkpoint_offsets, qsa_modules,
                                                  recurrent_spec_enabled, state_slots_per_request,
                                                  verification_state_width)
+from vllm_gaudi.v1.worker.verify_width import pad_query_rows, verification_width
 from vllm_gaudi.v1.spec_decode.flash_next_mtp_steps import is_flash_next_mtp
 from vllm_gaudi.platform import is_flash_next_model
 
@@ -3820,6 +3821,11 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         return target_bs <= self.max_prefill_batch_size and\
             target_bs * target_seq <= self.max_num_tokens
 
+    def _has_recurrent_state(self, group_idx: int) -> bool:
+        """True for a KV cache group of recurrent (mamba-like) state: GDN, PLE short conv."""
+        groups = self.kv_cache_config.kv_cache_groups
+        return 0 <= group_idx < len(groups) and isinstance(groups[group_idx].kv_cache_spec, MambaSpec)
+
     def _get_attention_group_id_for_hybrid(self):
         if self.num_mamba_like_layers == 0 or len(self.kv_cache_config.kv_cache_groups) == 0:
             return 0
@@ -4925,7 +4931,12 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         decode_block_size = self.attn_block_size
 
         num_tokens_per_req = num_scheduled_tokens[:num_decodes]
-        num_tokens = max(num_tokens_per_req)
+        # A verification batch must also be as wide as the previous step's largest accepted count: the
+        # recurrent layers load from lattice column num_accepted - 1 (ragged n-gram drafts, verify_width.py).
+        num_tokens = verification_width(
+            num_tokens_per_req,
+            accepted_counts(self.input_batch.req_ids[:num_decodes], self._gdn_num_accepted_by_req, num_decodes)
+            if self._recurrent_spec and scheduler_output is not None else [], self._recurrent_spec)
         # Bucketing must cover the last scheduled verification token, not
         # only the first one. A DFlash2 block can cross a physical KV page.
         query_ends = context_lens + np.asarray(num_tokens_per_req, dtype=np.int64)
@@ -4974,10 +4985,7 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         else:
             # per request using universal self.positions_cpu then pad
             position_split_tensors = torch.split(self.positions_cpu[:total_num_scheduled_tokens], num_tokens_per_req)
-            positions[:num_decodes] = \
-                pad_sequence(list(position_split_tensors),
-                                batch_first=True,
-                                padding_value=0)[:num_decodes]
+            positions[:num_decodes] = pad_query_rows(position_split_tensors, num_tokens)[:num_decodes]
 
         padded_index = torch.zeros((padded_batch_size, num_tokens), dtype=torch.int64)
         index = positions.to(torch.int64)[:num_decodes]
@@ -5011,10 +5019,7 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             token_ids[:num_decodes] = self.input_ids_cpu[:num_decodes].view(-1, 1)
         else:
             token_ids_split_tensors = torch.split(self.input_ids_cpu[:total_num_scheduled_tokens], num_tokens_per_req)
-            token_ids[:num_decodes] = \
-                pad_sequence(list(token_ids_split_tensors),
-                                batch_first=True,
-                                padding_value=0)[:num_decodes]
+            token_ids[:num_decodes] = pad_query_rows(token_ids_split_tensors, num_tokens)[:num_decodes]
 
         ###################################
         # SLOT_MAPPING [batch, 1]
@@ -5184,6 +5189,14 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                             load_rows.append(load_state_indices_cpu[group_idx])
                             store_rows.append(store_state_indices_cpu[group_idx])
                             continue
+                        if not self._has_recurrent_state(group_idx):
+                            # An attention group has no state lattice (no layer reads its row), and its block
+                            # row is kernel blocks: a short context has null entries where a lattice would be.
+                            load_rows.append(torch.full_like(load_state_indices_cpu[group_idx],
+                                                             self._MAMBA_PAD_BLOCK_ID))
+                            store_rows.append(torch.full_like(store_state_indices_cpu[group_idx],
+                                                              self._MAMBA_PAD_BLOCK_ID))
+                            continue
                         lat_load, lat_store = align_lattices(
                             self.input_batch.block_table[group_idx].get_cpu_tensor(),
                             req_indices,
@@ -5313,9 +5326,7 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                 # Index [:num_decodes*num_tokens] to write all rows for the
                 # decode region (not just the first num_decodes rows).
                 token_ids_device[:num_decodes * num_tokens] = \
-                    pad_sequence(list(token_ids_split_tensors),
-                                    batch_first=True,
-                                    padding_value=0)[:num_decodes].view(-1, 1)
+                    pad_query_rows(token_ids_split_tensors, num_tokens)[:num_decodes].view(-1, 1)
 
             #####################################
             # NOTE(Chendi): Since we can't actually do num_tokens = 2,
@@ -6481,6 +6492,9 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         decode_sampled_token_ids = []
         decode_sampled_requests = []
         device_prepared_dflash_drafts = None
+        # A step whose only work is a prefill chunk that does not finish its prompt samples nothing; the drafter
+        # call below still runs (and only DFlash2 reads sampling_metadata).
+        sampling_metadata = None
         # Logprobs tracking: collect (req_ids, logprobs_tensors) segments
         # from each sampling call to combine at the end.
         logprobs_segments: list[tuple[list[str], LogprobsTensors | None]] = []
