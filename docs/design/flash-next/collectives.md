@@ -174,3 +174,58 @@ at TP8, whatever its payload. In that light (INFERRED from the counts of section
 The decision between C4, C6 and the two-server layout (G4-1) comes from the collectives track's job 00019, which
 opens with the same payloads on 8 and then 4 ranks, lazy, HPU-graph replay and asynchronous replay, all-reduce
 against all-gather plus local sum (`reports/collectives/job/bench_c4.py`), and from the track report.
+
+## Handoff (if this agent stops)
+
+State at 18:50 UTC 2026-11-20, branch `feat/flash-next-gaudi-collectives` (pushed), worktree
+`/Volumes/Storage/Claude/gaudi-work/wt/collectives`, scratch and card files `/Volumes/Storage/Claude/gaudi-work/reports/collectives/`.
+Nothing is uncommitted. The program branch (`53dedec4`, PR #11) is merged into the branch; no pull request is open yet.
+
+Done and verified (CPU):
+
+- Commits: `2d644ce9` the three cuts (`VLLM_HPU_VOCAB_PARALLEL_LOGITS`, `VLLM_HPU_REPLICATED_EMBEDDING`,
+  `VLLM_HPU_MTP_REPLICATED_FC`; `vllm_gaudi/distributed/vocab_parallel.py`, `vllm_gaudi/v1/sample/hpu_greedy_verify.py`,
+  runner gate, proposer `_draft_tokens`; `hpu_rejection_sampler.py` unchanged); `b113ef14` count tool
+  `tools/flash_next/collective_count.py`, rank harness `tests/unit_tests/models/flash_next/collective_ranks.py`,
+  `test_collective_cuts.py`; `1ffa8e61` `VLLM_HPU_PLE_TABLE_RIDER` and `VLLM_HPU_ALL_REDUCE_AS_GATHER_ROWS`;
+  `7d8d04cc` op-sequence fix of the PLE helper; the rest are notes.
+- Tests: `test_collective_cuts.py` 33 passed + `::test_small_all_reduces_as_gather` 2 passed; sampler, runner gate
+  and communicator tests 122 passed on the merged tree (`reports/collectives/logs/merged_quick.log`); the common gate
+  679 passed, 6 failed (`logs/gate_1.log`): 3 fixed since (7d8d04cc, then 48 passed), 3 order-dependent and red on
+  the program branch too (two of them still are: `test_ple_ngram_hash.py::test_matches_on_device[hpu]`,
+  `test_qsa_hpu_platform.py::test_hpu_platform_has_no_is_hpu`, both green alone; `moe_block.py` installs the HPU
+  CPU stub at import).
+- Run tests with `reports/collectives/pt2.sh <log name> <pytest args>` (`PT_ALARM=<s>`; the CPU is shared and slow:
+  the cut suite takes about 30 min, the common gate about 60).
+
+Pending, in order:
+
+1. Merge per protocol: `gh pr create --base feat/flash-next-gaudi` with the body in
+   `reports/collectives/pr1_body.md` (replace `MERGED_QUICK` by "122 passed"), then `gh pr merge --merge`.
+2. Card job 00019 (`farm status`; it starts by 22:28 UTC at the latest, 40 min hold, stage-1 style `all` job). Its
+   script mounts `~/farm/collectives/scripts` on the node (copies of `reports/collectives/job/`: `ab.sh`,
+   `bench_c4.py`, `probe_ab.py`, `arms.txt`, `overlay.txt`, `plugin/` = the changed files of commit 1ffa8e61/7d8d04cc,
+   copied over the installed plugin of `farm-base` built from e238f84). Those files can be changed until the job
+   starts (`bin/node-scp`). It runs: `bench_c4.py` on 8 ranks, then 4 ranks (modules 0-3), regimes lazy / replay /
+   replay_async, forms all_reduce / gather_sum, rows 1, 32, 128; then two real-model TP8 servers, arms `off` and
+   `logits-rider-gather` (`VLLM_HPU_VOCAB_PARALLEL_LOGITS=1 VLLM_HPU_PLE_TABLE_RIDER=1
+   VLLM_HPU_ALL_REDUCE_AS_GATHER_ROWS=32`), probe at 1 and 32 streams, 256 tokens, texts compared.
+3. When it lands: `bin/farm fetch collectives 00019 ab1` (or read `~/farm/collectives/results/ab1/` on the node);
+   `python3 -I reports/collectives/job/decide_g41.py <results>/ab1 --json <results>/ab1/g41.json`; put the per-collective
+   cost (alpha, us per MB) for 8 and 4 ranks and every regime into `reports/collectives/collective_alpha.json` (the
+   `pending` fields; the coordinator, step-anatomy and native-replay read it) and send it to the coordinator. Read
+   `ab1/ab.log` lines `ab: texts ... identical; common prefix` (a wrong cut parts at once; a tie late) and the
+   ms per token of both arms.
+4. Decide from it: G4-1 (alpha8 replay at 32 rows against the bands of `reports/idea-sweep/recommended.md` G4-1;
+   E1 only if alpha8 - alpha4 >= 34 us, the coordinator runs the E1 serving comparison itself), I34 (keep
+   `VLLM_HPU_ALL_REDUCE_AS_GATHER_ROWS` only for the rows where gather_sum < all_reduce in replay; build the fused
+   form in `hc_combine_norm` only then), C6/G4-4 (ceiling (alpha8 - 16 us) x collectives per step; hand to
+   native-replay), and whether `replay_async` cuts the per-collective host cost (native-replay's change if so).
+   Write the decisions into section 5 of this note.
+5. Count work left (each collective is worth about 0.15 ms at TP8): the rider on layer 0's first all-reduce when the
+   embedding is replicated (target 98 to 97; changes the summation order of that all-reduce, needs an fp32 parity
+   test like the gather one); the draft's argmax gather carrying the winner's embedding row (removes the draft's
+   embedding all-reduce without the replicated table). Both small. The per-layer floor of 2 is algebraic (section 3).
+6. Not this track's, reported: job 00009's 8-rank HCCL run failed at device acquire (card 0 not yet released by the
+   step before it); sampled requests keep the logits all-gather (wiring `vocab_parallel.top_k` into the sampler needs
+   the owner's answer on whether the agents sample; the sampled MTP verification is mtp-card-ready's).
