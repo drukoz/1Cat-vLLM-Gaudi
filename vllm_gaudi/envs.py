@@ -538,6 +538,7 @@ if TYPE_CHECKING:
     VLLM_HPU_HC_FUSED: int = 0  # 0 torch hyper-connections (default), 1 the fused hyper-connection kernels
     VLLM_HPU_MOE_GLUE: int = 0  # 0 torch MoE glue (default), 1 the fused MoE glue kernels
     VLLM_HPU_MOE_GLUE_MERGE_GATE_UP: int = 0  # with VLLM_HPU_MOE_GLUE=1: 1 merges the shared gate_up GEMM into the gate GEMM
+    VLLM_HPU_HC_FUSED_COPY_MODE: int = 0  # copies before a fused HC op: 0 all, 1 not its own outputs, 2 block output
     VLLM_HPU_COLLECTIVE_MARK_STEP: int = 1  # 1 (default) mark_step() before every HPU collective, 0 none
     VLLM_HPU_RECURRENT_STATE_POOL: int = 0  # RecurrentStatePoolMode: 0 off, 1 pool
     VLLM_HPU_RECURRENT_STATE_POOL_SLOTS: int = 0  # resolved by the hook; positive overrides the formula
@@ -1947,6 +1948,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # linear without bias logs one line and keeps the separate GEMM; the rest of the glue is unchanged.
     "VLLM_HPU_MOE_GLUE_MERGE_GATE_UP":
     lambda: int(os.environ.get("VLLM_HPU_MOE_GLUE_MERGE_GATE_UP", "0")),
+
+    # (Declared here because tests pin GDN_CORE_VERIFY, HC_FUSED, MOE_GLUE and MOE_GLUE_MERGE_GATE_UP as
+    # neighbours.) With VLLM_HPU_HC_FUSED=1 only: which activations get an owned copy before a fused
+    # hyper-connection op (a custom HPU op is never given a view: card job 00043, 2026-11-20). 0 = every
+    # activation, six copies per hyper-connection (default); 1 = not the tensors the hyper-connection makes
+    # inside the call (its norm output and its two GEMM outputs), three copies; 2 = only the block output, one
+    # copy: the residual stream and the injection must then be op outputs, which they are in the target
+    # model's layer chain. A caller that hands in a view all the same gets no fallback (in lazy mode the
+    # refusal comes when the graph is launched, not when the op is called), so 2 is for the paths a test has
+    # shown to pass no view. Any other value is 0. Read once per layer at construction. Not yet run on a card.
+    "VLLM_HPU_HC_FUSED_COPY_MODE":
+    lambda: int(os.environ.get("VLLM_HPU_HC_FUSED_COPY_MODE", "0")),
 
     # The htorch.core.mark_step() that HpuCommunicator issues before every all-reduce and all-gather
     # (a workaround for a Habana bridge bug with PT_HPU_ENABLE_LAZY_COLLECTIVES). 1 (default) keeps it.

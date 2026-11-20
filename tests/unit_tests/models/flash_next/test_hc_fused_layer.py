@@ -285,6 +285,43 @@ def test_op_count_of_one_decode_step_call(world1, vllm_ctx, flag_on):
     assert fused == {"hc_combine": 1} and total == 1 + 3 and gemm == 0  # the op and its three input copies
 
 
+def test_copy_mode_flag_default_value_and_documentation(monkeypatch):
+    from vllm_gaudi import envs as gaudi_envs
+
+    flag = "VLLM_HPU_HC_FUSED_COPY_MODE"
+    monkeypatch.delenv(flag, raising=False)
+    assert gaudi_envs.VLLM_HPU_HC_FUSED_COPY_MODE == 0
+    monkeypatch.setenv(flag, "2")
+    assert gaudi_envs.VLLM_HPU_HC_FUSED_COPY_MODE == 2
+    assert f"    {flag}: int = 0" in Path(gaudi_envs.__file__).read_text()
+    assert f"`{flag}`" in (REPO_ROOT / "docs" / "configuration" / "env_variables.md").read_text()
+    assert hc_fused.COPY_MODES == (0, 1, 2)
+
+
+@pytest.mark.parametrize("mode,copies,combine_copies,norm_copies", [("1", 3, 3, 1), ("2", 1, 1, 1), ("7", 6, 3, 1)])
+def test_copy_mode_leaves_out_copies_and_changes_no_bit(world1, vllm_ctx, flag_on, monkeypatch, warnings, mode, copies,
+                                                        combine_copies, norm_copies):
+    """VLLM_HPU_HC_FUSED_COPY_MODE: 1 copies what the layer is handed (residual, block output, injection), 2 only
+    the block output; another value is 0. The ops and their results are those of mode 0."""
+    base = _module(*REAL)
+    hidden, block, injection = _inputs(base, 32)
+    want_cm, _, _, _ = _run(lambda: base.combine_and_mix(hidden, block, injection))
+    want_combine, _, _, _ = _run(lambda: base.combine(hidden, block, injection))
+    want_mix, _, _, _ = _run(lambda: base.mix(hidden))
+
+    monkeypatch.setenv("VLLM_HPU_HC_FUSED_COPY_MODE", mode)
+    module = _module(*REAL)
+    got, fused, total, gemm = _run(lambda: module.combine_and_mix(hidden, block, injection))
+    assert fused == {"hc_combine_norm": 1, "hc_silu_split": 1, "hc_gate_mix": 1} and total - gemm == 3 + copies
+    assert _same_tuple(got, want_cm)
+    got, fused, total, gemm = _run(lambda: module.combine(hidden, block, injection))
+    assert fused == {"hc_combine": 1} and total == 1 + combine_copies and _same(got, want_combine)
+    got, fused, total, gemm = _run(lambda: module.mix(hidden))
+    assert fused == {"hc_norm": 1, "hc_silu_split": 1, "hc_gate_mix": 1}
+    assert total - gemm == 3 + norm_copies + (3 if mode == "7" else 0) and _same_tuple(got, want_mix)
+    assert warnings == []
+
+
 # ----- the wiring, through a stand-in that records and validates -------------------------------------------------
 
 

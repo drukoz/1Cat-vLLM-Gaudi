@@ -378,8 +378,16 @@ class _MoeGlueState:
         return weights, ids
 
     def row_quant(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """``(x_fp8, x_scale)``, what dynamic_quant returns."""
-        return self.ops.moe_row_quant(x, self.fp8_max)
+        """``(x_fp8, x_scale)``, what dynamic_quant returns.
+
+        ``x`` is the block input after the model block's ``hidden_states.view(-1, hidden_dim)`` and
+        ``HPUFp8MoEMethod.apply_monolithic``'s ``x.view(-1, H)``: a view object on every call. The lazy bridge
+        hands a view to a custom op as a graph input without data ("Empty tensor optional ... Strided Params Has
+        Value: 1"), also with the accumulation thread off (card probe probe_view_inputs.py, job 00043,
+        2026-11-20: 7 of 7 view cases raised at PT_HPU_LAZY_ACC_PAR_MODE=0), so the op gets a tensor of its own.
+        The other three ops get GEMM outputs and the vendor op's output as they are made: on this path the
+        monolithic methods return the vendor op's output itself, not their ``output.view(...)``."""
+        return self.ops.moe_row_quant(x.clone(memory_format=torch.contiguous_format), self.fp8_max)
 
 
 def _moe_glue_attach(runner) -> None:
@@ -902,6 +910,8 @@ class HPUUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
                 permuted_weights=True,
                 activation=activation,
             )
+        if moe_glue is not None and output.shape == input_shape:
+            return output  # not output.view(...): moe_combine is a custom op (_MoeGlueState.row_quant)
         if layer.moe_config.dp_size > 1 or layer.moe_config.is_sequence_parallel:
             return output.view(*(output.size(0), *input_shape[1:]))
         else:

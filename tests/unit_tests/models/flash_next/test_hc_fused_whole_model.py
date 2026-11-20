@@ -37,19 +37,26 @@ class _FusedOpCounter(TorchDispatchMode):
     def __init__(self):
         super().__init__()
         self.ops = collections.Counter()
+        self.views = collections.Counter()  # (op, argument index) of every tensor argument that is a view
+        self.clones = 0
 
     def __torch_dispatch__(self, func, types, args=(), kwargs=None):
         name = func._schema.name
         if name.startswith(FUSED_PREFIX):
             self.ops[name[len("flashinfer_gaudi::"):]] += 1
+            for index, arg in enumerate(args):
+                if isinstance(arg, torch.Tensor) and (arg._is_view() or not arg.is_contiguous()):
+                    self.views[(name[len("flashinfer_gaudi::"):], index)] += 1
+        elif name == "aten::clone":
+            self.clones += 1
         return func(*args, **(kwargs or {}))
 
 
-def _prefill_all(tiny_checkpoint, token_lists) -> tuple[list, collections.Counter, list]:
+def _prefill_all(tiny_checkpoint, token_lists, counters: list | None = None) -> tuple[list, collections.Counter, list]:
     """Build the bf16 model with the environment as it is now, prefill every token list, close the model.
 
     Returns the hidden states of each prefill, the fused ops dispatched, and the hyper-connection layers'
-    (name, requested, check result, logged) records.
+    (name, requested, check result, logged) records. The counter itself is appended to ``counters``.
     """
     with cpu_model(tiny_checkpoint) as (vllm_config, model):
         eos = eos_token_id(vllm_config)
@@ -65,6 +72,8 @@ def _prefill_all(tiny_checkpoint, token_lists) -> tuple[list, collections.Counte
                 outputs.append(hidden.clone())
         layers = [(module.layer_name, module.hc_fused_requested, module._hc_fused_ok, module._hc_fused_logged)
                   for module in model.modules() if isinstance(module, HpuGatedResidual)]
+    if counters is not None:
+        counters.append(counter)
     return outputs, counter.ops, layers
 
 
@@ -118,3 +127,33 @@ def test_the_layers_carry_their_checkpoint_names(tiny_checkpoint, token_lists, m
     assert any(name.endswith("layers.0.attn_hyper_connection") for name in names)
     assert any(name.endswith("layers.3.mlp_hyper_connection") for name in names)
     assert any(name.endswith("hyper_connection_mixer") for name in names)
+
+
+def test_fewer_owned_copies_change_no_bit_and_hand_no_op_a_view(tiny_checkpoint, token_lists, monkeypatch):
+    """VLLM_HPU_HC_FUSED_COPY_MODE 1 and 2 over the whole model: the bits of mode 0, no layer off, and every
+    tensor a fused op gets is a tensor of its own (a card refuses a view, so the copies that are left out must
+    be copies of op outputs: the layer chain's residual and injection, a hyper-connection's own norm and GEMMs).
+    """
+    lines: list[str] = []
+    monkeypatch.setattr(layer_module.logger, "warning", lambda message, *args: lines.append(message % args))
+    monkeypatch.setenv("VLLM_HPU_HC_FUSED", "1")
+    token_lists = token_lists[:2]  # one token (a decode-sized call) and one prompt
+    calls = len(token_lists)
+    runs = {}
+    for mode in ("0", "1", "2"):
+        monkeypatch.setenv("VLLM_HPU_HC_FUSED_COPY_MODE", mode)
+        counters: list = []
+        outputs, ops, layers = _prefill_all(tiny_checkpoint, token_lists, counters)
+        runs[mode] = (outputs, ops, counters[0])
+        assert [name for name, requested, ok, logged in layers if not (requested and ok is True and not logged)] == []
+    assert lines == []
+    base_out, base_ops, base_counter = runs["0"]
+    # mode 0 copies every activation: norm 1, combine 3, combine_norm 3, silu and silu_split 1, gate_mix 2
+    per_forward = {"0": 2 * 1 + 1 * 3 + 7 * 3 + 9 * 1 + 9 * 2, "1": 2 * 1 + 1 * 3 + 7 * 3, "2": 2 * 1 + 1 * 1 + 7 * 1}
+    assert per_forward == {"0": 53, "1": 26, "2": 10}
+    for mode, (outputs, ops, counter) in runs.items():
+        assert ops == base_ops
+        assert dict(counter.views) == {}, f"mode {mode}: fused ops were given views"
+        assert base_counter.clones - counter.clones == calls * (per_forward["0"] - per_forward[mode]), mode
+        for got, want in zip(outputs, base_out):
+            assert got.dtype == want.dtype and torch.equal(got, want), f"mode {mode}"

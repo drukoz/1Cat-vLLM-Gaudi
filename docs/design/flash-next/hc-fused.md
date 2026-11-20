@@ -349,6 +349,24 @@ one process raises) and nothing imports it unless the flag is 1. It registers no
 come from `hc_fused_ops*.so`, and a process without that extension has no kernel for any device. The CPU tests import
 `tests/unit_tests/hc_fused/hc_ops.py`, which adds the oracle as the CPU kernels.
 
+**Owned copies (`VLLM_HPU_HC_FUSED_COPY_MODE`).** A custom op takes no view (card job 00043: every view raised,
+also with the accumulation thread off), so the wrappers copy activations (`_owned`). Mode 0, the default, copies
+every one: six copies per `combine_and_mix` (residual, block output, injection; the down GEMM output; the norm
+output and the up GEMM output), twelve per decoder layer next to its six fused ops, about 580 graph nodes per
+decode step of the 48-layer model, three of the six of width `4H`. Only a tensor that is handed to the layer can
+be a view. Mode 1 leaves out the three the hyper-connection makes inside the call (its norm output and its two GEMM
+outputs). Mode 2 copies only the block output (a MoE block returns `final_hidden_states.view(orig_shape)`) and a
+lone norm's input: the residual and the injection are op outputs in the target model's layer chain (the previous
+hyper-connection's outputs, `hidden_states + ple(...)`, the repeated embedding). A caller that hands in a view all
+the same has no fallback: in lazy mode an op is only recorded when it is called, the refusal comes when the graph
+is launched, outside the layer's `try`, and the step fails (the first servers that passed views died). So mode 2
+is for the paths a test has shown to pass no view; the MTP draft layer is not among them yet. The values do not change
+(`test_copy_mode_leaves_out_copies_and_changes_no_bit`; over the whole tiny model
+`test_fewer_owned_copies_change_no_bit_and_hand_no_op_a_view`: 53, 26 and 10 copies per forward of the 4-layer
+model in modes 0, 1 and 2, and no fused op is given a view in any mode). Not yet run on a card: that a pending
+GEMM output or fused-op output needs no copy is what `probe_view_inputs.py` asks (line `OP OUTPUTS`) and what a
+served run with the mode shows (no `is off for` line).
+
 ### 2. Layer (`vllm_gaudi/models/qwen4_exp/hyperconnection.py`)
 
 `HpuGatedResidual.__init__` reads the flag once (`hc_fused_requested`; exactly 1 means fused) and keeps the layer's
@@ -866,6 +884,36 @@ The log of that run held the `MOEHPU` lines of the failed tests only: the gate r
 the output of passed tests (the tie rule of the card's `torch.topk` among them). The card test now prints every
 measurement once more after its last test, outside pytest's capture.
 
+### Second card session (2026-11-20, 18:43 UTC, one card, accumulation mode 0)
+
+**Item 2 is closed: the reference was wrong, not the kernel** (job 00038, `tools/flash_next/kernel_probes/
+probe_moe_route.py`, 27 s). `torch.topk`'s int64 ids, narrowed with `.to(torch.int32)` on the device in the lazy
+graph that holds the top-k, come back as every second id of the true table (an 8-byte read of 4-byte ids; the
+second half of the table is out of range): `got row 0 [380, 200, 180, 268, 192, 478, ...]` against
+`want row 0 [380, 197, 200, 493, 180, 242, ...]`. That alone gives "0 of 16". Every other construct is right: the
+production routing (softmax and top-k of its own logits tensor, int64 ids) returns CPU torch's set on 16 of 16 rows,
+so does the routing on the view `gates[:, :experts]` with int64 ids; a host-made int64 table narrowed on the device
+is right, and so are top-k ids narrowed in a second graph. `moe_route` returns its rule on 16 of 16 rows alone and
+in every shared graph, and selects the production routing's experts on every row without a tie (15 of 15 at 512
+experts and top 10, 13 of 13 on router-only logits, 16 of 16 at 16 experts and top 2), with bit-identical weights.
+The card's top-k takes the lowest ids among all-equal values, but expert 511 among five equal values at the cut
+(the kernel: the lowest id), so rows that tie at the cut can route to another expert of equal weight. The card
+test's torch side now keeps its int64 ids on the device and narrows them on the host
+(`_torch_path_on_the_device`), and prints what the in-graph narrowing returns as a measurement.
+The same pattern, top-k ids narrowed in the graph, is in the served sparse-QSA indexer
+(`qsa_sparse_ops.select_blocks`); `probe_index_narrowing.py` checks it and the argmax paths on a card.
+
+**A custom op takes no view, also with the accumulation thread off** (job 00043, `probe_view_inputs.py`, 26 s):
+seven of seven view cases (a row slice at offset 0 and at offset 2, a reshape of a 1-D tensor, a column slice of
+one row, and the three of a pending op) raise `Empty tensor optional ... Strided Params Has Value: 1` on five of
+five calls; a fresh tensor and a clone of a slice pass five of five. Two places of the block handed an op a view,
+and a served block would not have fallen back but failed its step (the op is only recorded when it is called; the
+refusal comes when the graph is launched, outside the block's `try`): `moe_row_quant` got
+`x.view(-1, H)` (it now gets a copy, one node), and `moe_combine` got the monolithic method's
+`output.view(...)` of the vendor op's output (on the glue path the methods now return the vendor op's output
+itself: no node). `test_no_glue_op_is_ever_given_a_view` holds both, with bf16 and FP8 experts and with the
+merged gate_up GEMM.
+
 ## What is wired
 
 1. **Startup** (`vllm_gaudi/__init__.py::register_ops`): after the hyper-connection block and before the kernel
@@ -963,7 +1011,9 @@ the SiLU and sigmoid comparisons passed. Items 5 and 6 are the two open ones, 8 
    same ids and weights; max abs diff ...`: the same-row outputs must be bit-identical.
 4. **Slot order.** `MOEHPU vendor op with the routing slots reversed: bit-identical ...`. `False` would mean the
    vendor op's sum depends on the slot order, which matters only on rows with equal logits.
-5. **The routing against the torch path, and the tie rule of the card's `torch.topk`.** `MOEHPU route_real_r16
+5. **The routing against the torch path, and the tie rule of the card's `torch.topk`.** Closed by job 00038
+   ("Second card session" above): the kernel routes as production does; the failing reference narrowed its ids on
+   the device. What the lines mean, for a later run: `MOEHPU route_real_r16
    ids: moe_route returns the kernel's rule (CPU) on 16 of 16 rows; the card's torch path returns CPU torch.topk's
    set on N of the 15 rows that do not tie at the cut`, and `MOEHPU route_* production routing on the card ...: CPU
    torch.topk's set on N of M rows`, `MOEHPU route_* moe_route against the production routing on the card: the same
@@ -1004,10 +1054,9 @@ the SiLU and sigmoid comparisons passed. Items 5 and 6 are the two open ones, 8 
 - The merged gate weight is built at load only; a block whose weights are post-processed by another expert method
   has none and logs its line.
 - `moe_row_quant` is Gaudi2 only (fp8 range 240).
-- The MoE op wrappers (`flashinfer_gaudi/moe_glue.py`) hand their tensors to the ops as they are; the
-  hyper-connection and GDN wrappers clone every activation first, because a custom op that was given a view stopped
-  a server (`flashinfer_gaudi/hc_fused.py`, `_owned`). In a block three of the four MoE ops get GEMM or vendor-op
-  outputs, but `moe_row_quant` gets `x.view(-1, x.shape[-1])` (`HPUFp8MoEMethod.apply_monolithic`), a view object on
-  every call, and the card test only hands the ops tensors of their own. Whether the op takes a view with the
-  parallel graph accumulation off has not been tried; if it raises, the FP8 block logs its line and runs torch.
+- The MoE op wrappers (`flashinfer_gaudi/moe_glue.py`) hand their tensors to the ops as they are; the block gives
+  them GEMM outputs and the vendor op's output, and one copy: the input of `moe_row_quant` (a view on every call,
+  and a card refuses views: "Second card session"). Whether a view that changes nothing (`x.view(-1, H)` of a
+  `[tokens, H]` tensor) is refused like a slice is what `probe_view_inputs.py` now also asks (line `IDENTITY
+  VIEWS`); if it is taken, that copy can go.
 - No case has NaN router logits. `-inf` logits are covered (they are selected last, lowest id first, with weight 0).

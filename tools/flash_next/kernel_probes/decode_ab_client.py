@@ -150,12 +150,18 @@ def run_round(args, n, ntok, ctx_tokens=0):
 
 
 def compare(path_a, path_b):
-    """Per round of two arms: streams with the same text, and the shortest common prefix in characters."""
+    """Per round of two arms: streams with the same text, and the shortest common prefix in characters.
+
+    Only the 1-stream rounds are a test: the real model's greedy output is not reproducible across batch
+    compositions, nor between two 32-stream rounds of one server (job 00021, 2026-11-20: stream 0 leaves its
+    1-stream text after 55 characters at 8 streams and after 23 at 32). The other rounds are printed to be read.
+    """
     with open(path_a) as f:
         a = {r["round"]: r for r in json.load(f)}
     with open(path_b) as f:
         b = {r["round"]: r for r in json.load(f)}
     all_same = True
+    single_same, single_rounds = 0, 0
     for name, ra in a.items():
         rb = b.get(name)
         if rb is None:
@@ -175,10 +181,15 @@ def compare(path_a, path_b):
             lengths.append(min(len(ta), len(tb)))
             shortest = common if shortest is None else min(shortest, common)
         all_same = all_same and same == pairs
+        if " N=1 " in name and pairs:
+            single_rounds += 1
+            single_same += int(same == pairs)
         print("COMPARE %-22s %d of %d streams returned the same text; shortest common prefix %s of about %s "
               "characters" % (name, same, pairs, shortest, (sum(lengths) // len(lengths)) if lengths else "-"))
-    print("COMPARE verdict: %s" % ("every stream of every round returned the same text in both arms" if all_same
-                                   else "some texts differ (greedy decoding: one flipped token changes the rest)"))
+    print("COMPARE verdict: 1-stream rounds (the test): the same text in %d of %d; all rounds: %s" % (
+        single_same, single_rounds, "the same text everywhere" if all_same else
+        "texts differ in some multi-stream round (expected: batched greedy output is not reproducible; read them)"
+        if single_same == single_rounds else "texts differ"))
     return 0
 
 
@@ -205,9 +216,18 @@ def main():
     texts_path = os.path.join(os.path.dirname(os.path.abspath(args.out)), "texts.json")
 
     def keep(kind, m, rep=0):
-        """Move the round's texts out of its record (scaling.json keeps the coordinator's fields)."""
+        """Move the round's texts out of its record (scaling.json keeps the coordinator's fields).
+
+        A measured round prints the start of the first, the second, a middle and the last stream's text (TEXT
+        lines): a multi-stream round whose later streams decode garbage must not pass as a speed number.
+        """
+        round_texts = m.pop("_texts", [])
         texts.append({"round": "%s N=%d rep=%d" % (kind, m["streams"], rep), "tokens": m["tokens"],
-                      "ctx_tokens": m["ctx_tokens"], "texts": m.pop("_texts", [])})
+                      "ctx_tokens": m["ctx_tokens"], "texts": round_texts})
+        if kind in ("meas", "ctx") and rep == 0:
+            n = len(round_texts)
+            for i in sorted({0, 1, n // 2, n - 1} & set(range(n))):
+                print("TEXT  N=%-3d stream %2d: %r" % (n, i, (round_texts[i] or "")[:90]), flush=True)
 
     def save():
         with open(args.out, "w") as f:
