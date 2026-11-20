@@ -76,7 +76,7 @@ wait "$CHILD"
 RC=$?
 echo "PROBE-RC $RC"
 echo "runtime switches logged by the workers: $(grep -c "Runtime switches from" server0.log)"
-grep -h "Runtime switch file\|sparse-QSA decode metadata\|is off for this server" server0.log | sed 's/^.*\] //' | sort | uniq -c | head -8
+grep -h "Runtime switch file\|sparse-QSA decode metadata\|is off for this server\|Candidate sampling" server0.log | sed 's/^.*\] //' | sort | uniq -c | head -12
 echo "decode configurations compiled at run time: $(grep -o "Configuration: ('decode'[^)]*)" server0.log | sort -u | wc -l)"
 grep -o "Configuration: ('decode'[^)]*)" server0.log | sort | uniq -c | head -40
 grep -ciE "fallback|is off for|has no HPU kernel" server0.log | xargs echo "fallback/off lines:"

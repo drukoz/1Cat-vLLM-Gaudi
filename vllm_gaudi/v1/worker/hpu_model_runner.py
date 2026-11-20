@@ -48,6 +48,7 @@ from vllm_gaudi.v1.worker.flash_next_decode_metadata import (compact_state_indic
 from vllm_gaudi.v1.sample.fused_greedy import STOP_ID_WIDTH, mask_stop_tokens, min_tokens_stop_ids
 from vllm_gaudi.v1.sample.candidate_sampling import (CANDIDATES, candidate_parameters, candidate_refusal,
                                                      sample_candidates)
+from vllm_gaudi.v1.sample.candidate_sampling import PARAM_COLUMNS as CANDIDATE_PARAM_COLUMNS
 from vllm_gaudi.v1.sample.topk_ids import topk_with_ids
 from vllm_gaudi.v1.worker.runtime_switches import RuntimeSwitchFile
 from vllm_gaudi.v1.worker.recurrent_commit import (apply_align_precopy, boundary_commits, commit_conv, commit_ssm,
@@ -6397,13 +6398,62 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         min_tokens mask of ``fused_greedy.min_tokens_stop_ids`` (or ``None``)."""
         if int(gaudi_envs.VLLM_HPU_CANDIDATE_SAMPLING) != 1:
             return None
-        if (not request_ids or self.speculative_config is not None or self.use_structured_output
-                or self.use_async_scheduling):
-            return None
+        inputs, reason = self._candidate_sampling_decision(request_ids, rows)
+        self._log_candidate_path(inputs, reason, len(request_ids), rows)
+        return inputs
+
+    def _log_candidate_path(self, inputs, reason: Optional[str], requests: int, rows: int) -> None:
+        """One INFO line per server (TP rank 0) the first time a sampled decode step takes the candidate region,
+        and one the first time a sampled step falls back to vLLM's sampler, with the reason. A change of the
+        runtime switch file logs them again (``_poll_runtime_switches``)."""
+        if inputs is None and reason is None:
+            return  # no sampled request in the step: nothing fell back
+        key = '_candidate_path_logged' if inputs is not None else '_candidate_fallback_logged'
+        if getattr(self, key, False):
+            return
+        setattr(self, key, True)
+        try:
+            from vllm.distributed import get_tensor_model_parallel_rank
+            if get_tensor_model_parallel_rank() != 0:
+                return
+        except Exception:  # noqa: BLE001 - no TP group (a test): log
+            pass
+        if inputs is not None:
+            vocab_mode = vocab_parallel.mode() == vocab_parallel.VocabParallelMode.CANDIDATES
+            try:
+                vocab_mode = vocab_mode and vocab_parallel.enabled(self.model)
+            except Exception:  # noqa: BLE001 - only the log line depends on it
+                vocab_mode = False
+            logger.info(
+                "Candidate sampling (VLLM_HPU_CANDIDATE_SAMPLING=1): a sampled decode step drew in the logits "
+                "region: %d requests in %d rows, %d candidates per row from %s. Logged once.", requests, rows,
+                int(inputs[0].shape[1]) - CANDIDATE_PARAM_COLUMNS,
+                "each rank's vocabulary shard (VLLM_HPU_VOCAB_PARALLEL_LOGITS=2)" if vocab_mode else "the gathered "
+                "logits")
+        else:
+            logger.info(
+                "Candidate sampling (VLLM_HPU_CANDIDATE_SAMPLING=1): a sampled decode step took vLLM's sampler "
+                "instead: %s. Logged once.", reason)
+
+    def _candidate_sampling_decision(self, request_ids: list[str], rows: int):
+        """``(inputs, None)`` when the step samples over candidates; ``(None, reason)`` when a step with a sampled
+        request keeps vLLM's sampler; ``(None, None)`` for a step without a sampled request."""
+        sampled = [r for r in request_ids
+                   if self.requests[r].sampling_params is not None
+                   and self.requests[r].sampling_params.sampling_type != SamplingType.GREEDY]
+        if not sampled:
+            return None, None
+        if self.speculative_config is not None:
+            return None, "a speculative config (the verification step samples in the rejection sampler)"
+        if self.use_structured_output:
+            return None, "structured output"
+        if self.use_async_scheduling:
+            return None, "async scheduling"
         builtin_processors = (LogitBiasLogitsProcessor, MinTokensLogitsProcessor)
-        if any(not isinstance(processor, builtin_processors)
-               for processor in self.input_batch.logitsprocs.non_argmax_invariant):
-            return None
+        custom = [type(processor).__name__ for processor in self.input_batch.logitsprocs.non_argmax_invariant
+                  if not isinstance(processor, builtin_processors)]
+        if custom:
+            return None, "a logits processor of its own: " + ", ".join(custom)
         temperatures, top_ks, top_ps, stops = [], [], [], []
         generators = {}
         host_generators = self.__dict__.setdefault('_candidate_generators', {})
@@ -6412,9 +6462,9 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             state = self.requests[request_id]
             params = state.sampling_params
             if params is None:
-                return None
+                return None, f"request {request_id} has no sampling parameters"
             greedy = params.sampling_type == SamplingType.GREEDY
-            if candidate_refusal(greedy=greedy,
+            refusal = candidate_refusal(greedy=greedy,
                                  top_k=params.top_k,
                                  logprobs=params.logprobs,
                                  logprob_token_ids=params.logprob_token_ids,
@@ -6428,8 +6478,9 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                                  thinking_token_budget=params.thinking_token_budget,
                                  extra_args=params.extra_args,
                                  trace_decode_token_ids=params.trace_decode_token_ids,
-                                 stop_ids=len(params.all_stop_token_ids) if params.min_tokens else 0) is not None:
-                return None
+                                 stop_ids=len(params.all_stop_token_ids) if params.min_tokens else 0)
+            if refusal is not None:
+                return None, f"request {request_id}: {refusal}"
             mixed = mixed or greedy
             temperatures.append(0.0 if greedy else params.temperature)
             top_ks.append(params.top_k)
@@ -6442,12 +6493,12 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                     host_generators[request_id] = torch.Generator().manual_seed(params.seed)
                 generators[row] = host_generators[request_id]
         if all(temperature == 0.0 for temperature in temperatures):
-            return None  # an all-greedy batch: the greedy region or the general sampler, as before
+            return None, None  # every request greedy after all: the greedy region or the general sampler
         if len(host_generators) > len(generators):
             for request_id in [r for r in host_generators if r not in self.requests]:
                 del host_generators[request_id]
         params, top_k_index = candidate_parameters(temperatures, top_ks, top_ps, rows, generators=generators)
-        return params, top_k_index, mixed, min_tokens_stop_ids(stops, rows)
+        return (params, top_k_index, mixed, min_tokens_stop_ids(stops, rows)), None
 
     def _run_sampling(self,
                       batch_changed: bool,
@@ -6609,6 +6660,7 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             return
         os.environ.update(values)
         self._sparse_decode_md = None  # decided again at the next decode step
+        self._candidate_path_logged = self._candidate_fallback_logged = False  # the candidate path logs again
         logger.info("Runtime switches from %s: %s", switches.path,
                     ", ".join(f"{name}={value}" for name, value in sorted(values.items())) or "none")
 
