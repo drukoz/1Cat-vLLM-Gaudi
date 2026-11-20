@@ -179,7 +179,8 @@ against all-gather plus local sum (`reports/collectives/job/bench_c4.py`), and f
 
 State at 18:50 UTC 2026-11-20, branch `feat/flash-next-gaudi-collectives` (pushed), worktree
 `/Volumes/Storage/Claude/gaudi-work/wt/collectives`, scratch and card files `/Volumes/Storage/Claude/gaudi-work/reports/collectives/`.
-Nothing is uncommitted. The program branch (`53dedec4`, PR #11) is merged into the branch; no pull request is open yet.
+Nothing is uncommitted. The program branch (`40c90082`, the MoE glue merge) is merged into the branch (`6b265d50`);
+pull request #13 (`feat/flash-next-gaudi-collectives` into `feat/flash-next-gaudi`) is open, not merged.
 
 Done and verified (CPU):
 
@@ -200,8 +201,10 @@ Done and verified (CPU):
 
 Pending, in order:
 
-1. Merge per protocol: `gh pr create --base feat/flash-next-gaudi` with the body in
-   `reports/collectives/pr1_body.md` (replace `MERGED_QUICK` by "122 passed"), then `gh pr merge --merge`.
+1. Merge per protocol: on the tree merged with `40c90082`, the cut suite and the common gate are rerunning
+   (`reports/collectives/logs/cuts_m2.log`, `gate_m2.log`; the quick tests gave 20 passed). When the cut suite is
+   green and the gate shows no failure beyond the two order-dependent ones above: `git fetch origin`; if the program
+   branch moved, merge it and rerun what it touches; then `gh pr merge 13 --merge`.
 2. Card job 00019 (`farm status`; it starts by 22:28 UTC at the latest, 40 min hold, stage-1 style `all` job). Its
    script mounts `~/farm/collectives/scripts` on the node (copies of `reports/collectives/job/`: `ab.sh`,
    `bench_c4.py`, `probe_ab.py`, `arms.txt`, `overlay.txt`, `plugin/` = the changed files of commit 1ffa8e61/7d8d04cc,
