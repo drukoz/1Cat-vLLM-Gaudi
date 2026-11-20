@@ -13,17 +13,30 @@ pattern in places a six-token prompt and one stream hide:
   * `vllm_gaudi/v1/spec_decode/hpu_flash_next_mtp.py`: `logits.argmax(dim=-1)`, then `.int()` as the next draft
     step's input ids;
   * `vllm_gaudi/v1/worker/hpu_model_runner.py` `select_compute_logits_and_greedy` (VLLM_HPU_FUSED_GREEDY_LOGITS):
-    `logits.to(torch.float32).argmax(dim=-1).to(torch.int32)`.
+    `logits.to(torch.float32).argmax(dim=-1).to(torch.int32)`;
+  * the sampler's top logprobs (`Sampler.gather_logprobs`, on HPU `vllm_gaudi/patches.py::_hpu_gather_logprobs`):
+    top-k of `log_softmax(dtype=float32)` over the whole vocabulary, `torch.cat` with the sampled ids, then
+    `.to(torch.int32)`. spec-lookup's job 00086 (tiny model, TP2, `logprobs=5`) died in the output handler with
+    `OverflowError: out of range integral type conversion` while decoding those ids.
 
-One card, about half a minute, no kernel library and no model:
+One card, a few minutes, no kernel library and no model:
 
     python probe_index_narrowing.py [--out DIR]
     PROBE_DEVICE=cpu python probe_index_narrowing.py     # a dry run of this script (every case RIGHT on a CPU)
 
-Every case is one function run twice on the same host-made inputs: on a CPU (the reference) and on the card, where
+Every case is one function run on the same host-made inputs on a CPU (the reference) and twice on the card, where
 the inputs are on the device before the case starts, so the case's ops are one lazy graph, run by the read of its
-result. Parts:
+result: the graph's first run (compiled then) and its second (the cached recipe). engine-step's job 00093 saw
+`topk -> int32` wrong on the first run of a new graph and right on its replays: state FIRST (letter F).
 
+Parts, in this order (each prints its lines as it goes, so a job cut at its hold keeps what ran):
+
+  logprobs the sampler's top-logprob ids as `gather_logprobs` makes them, from bf16 logits over V = 248,320 (the
+           whole vocabulary), 62,080 and 31,040 (a TP4 and a TP8 vocabulary shard) x k 1, 5, 20 x rows 1, 4, 32:
+           the whole construct (log_softmax, top-k, cat with host-made int64 sampled ids, .to(int32)) and the
+           top-k ids alone narrowed; at V = 248,320 and k = 5 also the sampled ids made by an in-graph arg max,
+           the int64 control and two replacements. 25 distinct largest logits per row: no tie at the cut. LOGPROBS
+           lines: one letter per row count, then VERDICT logprobs.
   served   `select_blocks` and `select_blocks` + `expand_selection` of the plugin's own file, at 2048 blocks (more
            than block_topk = 512, so the top-k selects) for 1, 4 and 32 rows, and at 64 blocks (a short prompt);
   pattern  top-k, argmax, max, sort and searchsorted ids: read as int64 (the control), narrowed in the graph, and
@@ -38,8 +51,8 @@ result. Parts:
            with and without its in-place division of the values, a multiply as the producer, bf16 scores, the
            QSA selection). Rows that tie at the cut on the CPU are left out of a case's verdict.
 
-Lines `PROBE narrow <part> <case>: RIGHT | WRONG (...) | ERROR (...)`, a BOUNDARY matrix (one letter per row
-count: R right, W wrong, E error), then four VERDICT lines.
+Lines `PROBE narrow <part> <case>: RIGHT | WRONG (...) | ERROR (...)`, the LOGPROBS and BOUNDARY matrices (one
+letter per row count: R right, W wrong, E error), then five VERDICT lines.
 """
 import argparse
 import importlib.util
@@ -52,8 +65,9 @@ from pathlib import Path
 
 DEVICE = os.environ.get("PROBE_DEVICE", "hpu")
 HERE = Path(__file__).resolve()
-SPARSE_OPS = HERE.parents[3] / "vllm_gaudi" / "models" / "qwen4_exp" / "qsa_sparse_ops.py"
+SPARSE_OPS_RELATIVE = Path("vllm_gaudi") / "models" / "qwen4_exp" / "qsa_sparse_ops.py"
 BLOCK_TOPK, RATIO = 512, 4  # the real model: indexer_budget 2048 tokens, 4 tokens per block
+VOCAB = 248320  # the real and the tiny checkpoint's vocabulary (the sampler sees all of it after the all-gather)
 T0 = time.monotonic()
 
 
@@ -79,12 +93,21 @@ def backend():
     return torch, flush
 
 
-def sparse_ops():
-    """The plugin's qsa_sparse_ops.py by path: it imports only math and torch, and nothing of vLLM is loaded.
+def sparse_ops_path(script=HERE, cwd=None):
+    """The plugin's qsa_sparse_ops.py: in a folder around this script (its tree), else in the working folder.
 
-    Looked up in the tree of this file, then in the working folder (a farm job runs in its tree)."""
-    relative = Path("vllm_gaudi") / "models" / "qwen4_exp" / "qsa_sparse_ops.py"
-    path = next((c for c in (SPARSE_OPS, Path.cwd() / relative) if c.is_file()), SPARSE_OPS)
+    A copy of this script outside the tree has no tree around it and may have few parents: job 00106 ran it from
+    /results/probe-src/, where the old `HERE.parents[3]` raised IndexError before the first case."""
+    cwd = Path.cwd() if cwd is None else Path(cwd)
+    for folder in (*Path(script).parents, cwd):
+        if (folder / SPARSE_OPS_RELATIVE).is_file():
+            return folder / SPARSE_OPS_RELATIVE
+    return cwd / SPARSE_OPS_RELATIVE
+
+
+def sparse_ops():
+    """The plugin's qsa_sparse_ops.py by path: it imports only math and torch, and nothing of vLLM is loaded."""
+    path = sparse_ops_path()
     spec = importlib.util.spec_from_file_location("probe_qsa_sparse_ops", path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
@@ -141,19 +164,38 @@ def main():
     results = {}
 
     def case(part, name, fn, inputs, sets=False, clear=None, quiet=False):
-        """Run fn(*inputs) on the CPU and on DEVICE (one lazy graph) and compare; returns the state."""
+        """Run fn(*inputs) on the CPU and on DEVICE (one lazy graph) and compare; returns the state.
+
+        fn may return a tuple: its first tensor is compared, the others are read too (they stay outputs of the
+        graph, as in the served code), not compared."""
         key = f"{part} {name}"
         try:
             want = fn(*inputs)
+            want = want[0] if isinstance(want, tuple) else want
         except Exception as error:  # noqa: BLE001 - a probe reports every failure
             results[key] = {"state": "ERROR", "detail": f"on the CPU: {error!r}"}
             say(f"{key}: ERROR on the CPU: {error!r}")
             return "ERROR"
+        def device_run(device_inputs):
+            out = fn(*device_inputs)
+            outs = out if isinstance(out, tuple) else (out, )
+            got = outs[0].cpu()
+            for other in outs[1:]:
+                other.cpu()
+            return describe(torch, got, want, sets, clear)
+
         try:
             device_inputs = [t.to(DEVICE) for t in inputs]
             flush()
-            got = fn(*device_inputs).cpu()
-            state, detail = describe(torch, got, want, sets, clear)
+            first, first_detail = device_run(device_inputs)  # the first run of a new graph: compiled here
+            flush()
+            second, second_detail = device_run(device_inputs)  # the same graph again: its cached recipe
+            if first == "RIGHT" and second == "RIGHT":
+                state, detail = "RIGHT", first_detail + "; the graph's second run too"
+            elif second == "RIGHT":
+                state, detail = "FIRST", f"wrong on the graph's first run only: {first_detail}"
+            else:
+                state, detail = "WRONG", f"first run {first}: {first_detail} || second run {second}: {second_detail}"
         except Exception as error:  # noqa: BLE001
             state, detail = "ERROR", " ".join(repr(error).split())[:300]
             if os.environ.get("PROBE_TRACEBACK"):
@@ -168,6 +210,81 @@ def main():
         return state
 
     g = torch.Generator().manual_seed(20261120)
+
+    # ---- logprobs: the sampler's top-logprob ids (Sampler.gather_logprobs; on HPU patches._hpu_gather_logprobs) ----
+    gl = torch.Generator().manual_seed(20261121)  # its own generator: the other parts keep their inputs
+    lp_rows, lp_columns, lp_k = (1, 4, 32), (VOCAB, VOCAB // 4, VOCAB // 8), (1, 5, 20)
+
+    def planted_logits(rows, columns):
+        """bf16 logits whose 25 largest per row are distinct (30.0 down to 18.0 by 0.5) at random columns."""
+        x = torch.randn(rows, columns, generator=gl) * 3.0
+        for r in range(rows):
+            x[r, torch.randperm(columns, generator=gl)[:25]] = 30.0 - 0.5 * torch.arange(25, dtype=torch.float32)
+        return x.to(torch.bfloat16)
+
+    def gather_logprobs(logits, sampled, k, narrow=True):
+        """Sampler.compute_logprobs, then patches._hpu_gather_logprobs: (ids, values, ranks) as the sampler has them."""
+        logprobs = logits.log_softmax(dim=-1, dtype=torch.float32)
+        top_values, top_ids = torch.topk(logprobs, k, dim=-1)
+        token_ids = sampled.unsqueeze(-1)
+        token_logprobs = logprobs.gather(-1, token_ids)
+        ranks = (logprobs >= token_logprobs).sum(-1)
+        indices = torch.cat((token_ids, top_ids), dim=1)
+        values = torch.cat((token_logprobs, top_values), dim=1)
+        return (indices.to(torch.int32) if narrow else indices), values, ranks
+
+    def gather_two_graphs(logits, sampled, k):
+        indices, values, ranks = gather_logprobs(logits, sampled, k, narrow=False)
+        flush()
+        return indices.to(torch.int32), values, ranks
+
+    lp_variants = {
+        "gather_logprobs (log_softmax, top-k, cat with the sampled ids, .to(int32))":
+        lambda x, s, k: gather_logprobs(x, s, k),
+        "top-k ids of log_softmax .to(int32) (no cat)":
+        lambda x, s, k: torch.topk(x.log_softmax(dim=-1, dtype=torch.float32), k, dim=-1).indices.to(torch.int32),
+    }
+    lp_extras = {  # at the whole vocabulary and k = 5 (the failing request's logprobs=5)
+        "gather_logprobs, the sampled ids by an in-graph arg max":
+        lambda x, s, k: gather_logprobs(x, x.to(torch.float32).argmax(dim=-1), k),
+        "gather_logprobs, ids kept int64 (control)": lambda x, s, k: gather_logprobs(x, s, k, narrow=False),
+        "gather_logprobs, ids through float32 (exact below 2^24)":
+        lambda x, s, k: (lambda t: (t[0].to(torch.float32).to(torch.int32), ) + t[1:])(gather_logprobs(
+            x, s, k, narrow=False)),
+        "gather_logprobs, narrowed after a mark_step (two graphs)": gather_two_graphs,
+    }
+    logprobs_matrix = {}
+    for name, fn in lp_variants.items():
+        for columns in lp_columns:
+            for k in lp_k:
+                letters = ""
+                for rows in lp_rows:
+                    x = planted_logits(rows, columns)
+                    s = torch.randint(0, columns, (rows, ), generator=gl, dtype=torch.int64)
+                    letters += case("logprobs", f"{name}, rows {rows} columns {columns} k {k}",
+                                    lambda a, b, fn=fn, k=k: fn(a, b, k), (x, s), sets=True)[0]
+                logprobs_matrix[f"{name} | columns {columns:6d} k {k:2d}"] = letters
+                say(f"LOGPROBS {name} | columns {columns:6d} k {k:2d}: {letters}")
+    for name, fn in lp_extras.items():
+        letters = ""
+        for rows in lp_rows:
+            x = planted_logits(rows, VOCAB)
+            s = torch.randint(0, VOCAB, (rows, ), generator=gl, dtype=torch.int64)
+            letters += case("logprobs", f"{name}, rows {rows} columns {VOCAB} k 5", lambda a, b, fn=fn: fn(a, b, 5),
+                            (x, s), sets=True)[0]
+        logprobs_matrix[f"{name} | columns {VOCAB:6d} k  5"] = letters
+        say(f"LOGPROBS {name} | columns {VOCAB:6d} k  5: {letters}")
+    lp_states = {key[len("logprobs "):]: value["state"] for key, value in results.items()
+                 if key.startswith("logprobs ")}
+    lp_wrong = [f"{key} [{state}]" for key, state in lp_states.items() if state != "RIGHT"]
+    lp_first = sum(state == "FIRST" for state in lp_states.values())
+    line_lp = (f"{len(lp_wrong)} of {len(lp_states)} top-logprob cases are not the CPU's" +
+               (f" ({lp_first} on the graph's first run only)" if lp_first else "") +
+               (": none" if not lp_wrong else ": " + "; ".join(lp_wrong[:10]) +
+                (" ..." if len(lp_wrong) > 10 else "")) +
+               " (LOGPROBS lines: one letter per row count 1, 4, 32: R right, F wrong on the first run only, "
+               "W wrong, E error)")
+    print(f"VERDICT logprobs: {line_lp}", flush=True)
 
     # ---- served: the plugin's own selection, as the decode indexer issues it ----
     def blocks_fn(scores, positions):
@@ -302,6 +419,8 @@ def main():
         (lambda x, k: torch.topk(softmax32(x), k, dim=-1).indices.to(torch.int32), bf16, True),
     }
     matrix = {}
+    say(f"BOUNDARY one letter per row count {grid_rows} (R right, F wrong on the graph's first run only, W wrong, "
+        f"E error); the last five lines: one letter per shape")
     for producer, (fn, dtype, is_softmax) in producers.items():
         for columns in grid_columns:
             for k in grid_k:
@@ -316,6 +435,7 @@ def main():
                                  lambda t, fn=fn, k=k: fn(t, k), (x, ), sets=True, clear=clear, quiet=True)
                     letters += state[0]
                 matrix[f"{producer} | columns {columns:5d} k {k:3d}"] = letters
+                say(f"BOUNDARY {producer} | columns {columns:5d} k {k:3d}: {letters}")
     others = {
         "00038's routing with the in-place division": (lambda x, k: route(x, k), bf16),
         "00038's routing without the division": (lambda x, k: route(x, k, divide=False), bf16),
@@ -338,10 +458,7 @@ def main():
                          (x, ), sets=True, clear=clear_rows(reference, k), quiet=True)
             letters += state[0]
         matrix[f"{name} | [16,512] k10, [16,16] k2, [4,2048] k512, [8,32768] k512"] = letters
-    say(f"BOUNDARY one letter per row count {grid_rows} (R right, W wrong, E error); the last five lines: one "
-        f"letter per shape")
-    for key, letters in matrix.items():
-        say(f"BOUNDARY {key}: {letters}")
+        say(f"BOUNDARY {name} | [16,512] k10, [16,16] k2, [4,2048] k512, [8,32768] k512: {letters}")
 
     # ---- verdicts ----
     def states(prefix):
@@ -361,15 +478,17 @@ def main():
     line3 = (f"replacements RIGHT on this device: {'; '.join(right) or 'none'} || not right: "
              f"{'; '.join(bad) or 'none'}")
     boundary = states("boundary ")
-    wrong = sorted(key[len("boundary "):] for key, state in boundary.items() if state != "RIGHT")
+    wrong = sorted(f"{key[len('boundary '):]} [{state}]" for key, state in boundary.items() if state != "RIGHT")
+    first_only = sum(state == "FIRST" for state in boundary.values())
     line4 = (f"{len(wrong)} of {len(boundary)} boundary cases are not the CPU's" +
+             (f" ({first_only} on the graph's first run only)" if first_only else "") +
              (": none" if not wrong else ": " + "; ".join(wrong[:12]) + (" ..." if len(wrong) > 12 else "")) +
              " (the BOUNDARY lines above hold the whole matrix)")
     for name, line in (("select_blocks", line1), ("narrowing", line2), ("fixes", line3), ("boundary", line4)):
         print(f"VERDICT {name}: {line}", flush=True)
     (args.out / "index_narrowing.json").write_text(
-        json.dumps({"device": DEVICE, "results": results, "matrix": matrix,
-                    "verdicts": [line1, line2, line3, line4]}, indent=1) + "\n")
+        json.dumps({"device": DEVICE, "results": results, "matrix": matrix, "logprobs_matrix": logprobs_matrix,
+                    "verdicts": [line_lp, line1, line2, line3, line4]}, indent=1) + "\n")
     return 0
 
 

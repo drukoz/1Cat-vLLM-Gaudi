@@ -9,8 +9,8 @@
 * ``probe_moe_expert_bytes.py`` (idea G2-1: does the vendor MoE op read every local expert): every routing arm
   runs and the verdict line is printed (times on a CPU mean nothing).
 * ``probe_view_inputs.py`` (can a custom op take a view at accumulation mode 0): its own self-test.
-* ``probe_index_narrowing.py`` (ids narrowed to int32 in the graph that makes them: the sparse-QSA selection,
-  argmax, replacements): on a CPU every case is RIGHT.
+* ``probe_index_narrowing.py`` (ids narrowed to int32 in the graph that makes them: the sampler's top logprobs,
+  the sparse-QSA selection, argmax, replacements): on a CPU every case is RIGHT.
 * ``probe_hc_copies.py`` (the owned copies in front of the fused hyper-connection ops): every copy mode returns
   the bits of mode 0.
 * ``decode_ab_client.py --compare``: the 1-stream rounds are the test of two arms' texts.
@@ -74,14 +74,39 @@ def test_index_narrowing_probe_is_right_on_cpu(tmp_path):
     states = ("RIGHT", "WRONG", "ERROR")
     cases = [line for line in out.splitlines()
              if line.startswith("PROBE narrow") and any(f": {state} (" in line for state in states)]
-    assert len(cases) == 38, cases  # 8 served, 12 pattern, 18 fix; a boundary case prints only when it is not RIGHT
+    # 66 logprobs, 8 served, 12 pattern, 18 fix; a boundary case prints only when it is not RIGHT
+    assert len(cases) == 66 + 38, cases
     assert all(": RIGHT (" in line for line in cases), [line for line in cases if ": RIGHT (" not in line]
+    assert "VERDICT logprobs: 0 of 66 top-logprob cases are not the CPU's: none" in out
+    assert out.index("VERDICT logprobs:") < out.index("PROBE narrow") + out[out.index("PROBE narrow"):].index(
+        "served select_blocks")  # the logprobs part runs first: a job cut at its hold keeps it
+    logprobs = [line for line in out.splitlines() if "] LOGPROBS " in line]
+    assert len(logprobs) == 22 and all(line.endswith(": RRR") for line in logprobs), logprobs
+    assert any("columns 248320 k  5" in line for line in logprobs)
     assert "VERDICT select_blocks: select_blocks on the card: RIGHT in every case" in out
     assert "VERDICT boundary: 0 of 188 boundary cases are not the CPU's" in out
     matrix = [line for line in out.splitlines() if "] BOUNDARY " in line and " | " in line]
     assert len(matrix) == 47 and all(line.endswith(": RRRR") for line in matrix), matrix
     result = json.loads((tmp_path / "narrow" / "index_narrowing.json").read_text())
-    assert len(result["results"]) == 38 + 188 and len(result["verdicts"]) == 4 and len(result["matrix"]) == 47
+    assert len(result["results"]) == 66 + 38 + 188 and len(result["verdicts"]) == 5
+    assert len(result["matrix"]) == 47 and len(result["logprobs_matrix"]) == 22
+
+
+def test_index_narrowing_probe_finds_the_plugin_file_from_a_copy_outside_the_tree(tmp_path):
+    """Job 00106 ran a copy of the probe from /results/probe-src/: `HERE.parents[3]` raised IndexError at import."""
+    code = ("import importlib.util, sys; from pathlib import Path; "
+            "spec = importlib.util.spec_from_file_location('p', sys.argv[1]); "
+            "m = importlib.util.module_from_spec(spec); "
+            "spec.loader.exec_module(m); "
+            "print('PATH', m.sparse_ops_path(Path('/results/probe-src/probe_index_narrowing.py'), cwd=sys.argv[2])); "
+            "print('OPS', hasattr(m.sparse_ops(), 'select_blocks'))")
+    copy = tmp_path / "probe_index_narrowing.py"
+    copy.write_text((PROBES / "probe_index_narrowing.py").read_text())
+    proc = subprocess.run([sys.executable, "-c", code, str(copy), str(ROOT)], cwd=ROOT, capture_output=True, text=True,
+                          timeout=300, env=dict(os.environ, PROBE_DEVICE="cpu"))
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert f"PATH {ROOT / 'vllm_gaudi' / 'models' / 'qwen4_exp' / 'qsa_sparse_ops.py'}" in proc.stdout
+    assert "OPS True" in proc.stdout
 
 
 def test_hc_copies_probe_modes_are_bit_identical_on_cpu(tmp_path):

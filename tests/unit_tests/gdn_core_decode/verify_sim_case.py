@@ -155,6 +155,12 @@ VERIFY_TOO_MANY_NODES_CASE = VerifySimCase(
 VERIFY_HPU_CASES = VERIFY_CASES + (
     VerifySimCase("ver_tp8_b16", 2, 6, 1 + 16 * 4, 6, _lattice_rows(16, 4), GdnGateActivation.SIGMOID, 24),
     VerifySimCase("ver_tp8_b64", 2, 6, 1 + 64 * 4, 6, _lattice_rows(64, 4), GdnGateActivation.SIGMOID, 25),
+    # TP2 geometry (8 key and 24 value heads per rank: the tiny model's TP2 jobs, mtp-card-ready 00105), T = 4.
+    VerifySimCase("ver_tp2_t4_b2", 8, 24, 13, 6, (
+        _all_accepted_row(1, 4),
+        VerifyRow(5, 1, 9, 6, 4, (9, 10, 11, 12)),  # moved, all nodes real
+    ), GdnGateActivation.SIGMOID, 40),
+    VerifySimCase("ver_tp2_b16", 8, 24, 1 + 16 * 4, 6, _lattice_rows(16, 4), GdnGateActivation.SIGMOID, 41),
 )
 
 
