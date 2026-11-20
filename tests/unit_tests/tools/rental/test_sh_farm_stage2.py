@@ -13,6 +13,8 @@ from pathlib import Path
 import pytest
 
 from tests.unit_tests.tools.rental.test_sh_cardq import FLOCK_SHIM, SETSID_SHIM
+from tests.unit_tests.tools.rental.test_sh_node_bringup import FAKES as NODE_FAKES
+from tests.unit_tests.tools.rental.test_sh_node_bringup import PREPARE_HOST
 
 REPO_ROOT = Path(__file__).resolve().parents[4]
 FARM_SRC = REPO_ROOT / "tools" / "flash_next" / "rental" / "farm"
@@ -37,9 +39,18 @@ case "$1" in
     ;;
   commit)
     for a in "$@"; do last="$a"; done
-    touch "$FAKE_STATE/image-$last"
+    n=$(($(cat "$FAKE_STATE/image-seq" 2>/dev/null || echo 0) + 1)); echo "$n" > "$FAKE_STATE/image-seq"
+    printf '%06d\n' "$n" > "$FAKE_STATE/image-$last"
     ;;
-  tag) touch "$FAKE_STATE/image-$3" ;;
+  tag) [ -e "$FAKE_STATE/image-$3" ] || touch "$FAKE_STATE/image-$3" ;;
+  images)
+    # docker images REPO --format '{{.Tag}} {{.CreatedAt}}': the newest has the highest counter
+    for f in "$FAKE_STATE"/image-"$2":*; do
+      [ -e "$f" ] || continue
+      echo "${f##*:} 2026-01-01 $(cat "$f")"
+    done
+    ;;
+  rmi) rm -f "$FAKE_STATE/image-$2" ;;
   info) echo /var/lib/docker ;;
   run)
     case " $* " in *" -d "*) exit 0 ;; esac
@@ -193,6 +204,96 @@ def test_farm_serve_passes_the_min_tokens_options_to_the_probe(rig):
     assert after(mask, "farm-kf:%s" % rig.sha) == ["bash", "/farm/serve_probe.sh", "--min-tokens", "--"]
 
 
+def test_farm_harvest_copies_every_tracks_results_and_the_queue(rig):
+    rig.synced()
+    proc = rig.farm("job", "kf", "hc-op", "any:1", "15m", "--no-sync", "--", "true")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    other = rig.node / "farm" / "pf" / "results" / "00009-x"  # a track whose agent is gone: nobody fetched it
+    other.mkdir(parents=True)
+    (other / "scaling.json").write_text("{}")
+    (other / "model.safetensors").write_text("weights")
+    (other / "ckpt-tiny").mkdir()
+    (other / "ckpt-tiny" / "config.json").write_text("{}")
+    images = rig.node / "farm" / "kf" / "images" / rig.sha
+    images.mkdir(parents=True, exist_ok=True)
+    (images / "install.log").write_text("ok")
+    dest = rig.tmp / "harvest"
+    proc = rig.farm("harvest", str(dest))
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert (dest / "kf" / "results" / "00001-hc-op" / "hello.txt").read_text() == "hello\n"
+    assert (dest / "pf" / "results" / "00009-x" / "scaling.json").is_file()
+    assert (dest / "kf" / "images" / rig.sha / "install.log").is_file()
+    assert "00001\tkf\thc-op" in (dest / "q" / "ledger.tsv").read_text()
+    assert "container output: done" in (dest / "q" / "jobs" / "00001" / "log").read_text()
+    assert not (dest / "pf" / "results" / "00009-x" / "model.safetensors").exists()  # checkpoints stay behind
+    assert not (dest / "pf" / "results" / "00009-x" / "ckpt-tiny").exists()
+    assert "files on the node now" in proc.stdout and str(dest) in proc.stdout
+
+
+def test_farm_health_and_status_print_what_the_queue_prints(rig):
+    rig.synced()
+    proc = rig.farm("health")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "habanalabs kernel lines since boot" in proc.stdout
+    proc = rig.farm("status")
+    assert proc.returncode == 0 and "waiting (in the order they start):" in proc.stdout
+
+
+def _fresh_node(rig):
+    """The rig as a freshly started node: host tools as stand-ins, the farm's own scripts as wt/card-farm."""
+    fakebin = rig.tmp / "fakebin"
+    for name, text in NODE_FAKES.items():
+        if name in ("sudo", "docker"):
+            continue  # the rig's own
+        (fakebin / name).write_text(text)
+        (fakebin / name).chmod(0o755)
+    (fakebin / "ssh-keyscan").write_text('#!/bin/bash\nfor a in "$@"; do h="$a"; done\necho "$h ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFakeKeyOfTheNewNode"\n')
+    (fakebin / "ssh-keyscan").chmod(0o755)
+    (rig.g / "wt" / "card-farm" / "tools" / "flash_next" / "rental").mkdir(parents=True)
+    (rig.g / "wt" / "card-farm" / "tools" / "flash_next" / "rental" / "farm").symlink_to(FARM_SRC)
+    (rig.node / "rental").mkdir()
+    (rig.node / "rental" / "prepare_host.sh").write_text(PREPARE_HOST)  # the stub bundle has none
+    (rig.tmp / "os-release").write_text('ID=ubuntu\nVERSION_ID="22.04"\n')
+    (rig.tmp / "meminfo").write_text("MemTotal:       970000000 kB\n")
+    (rig.g / "NODE").write_text("9.9.9.9\n")  # the node of the last rental
+    (rig.g / "node_known_hosts").write_text("9.9.9.9 ssh-ed25519 OLDKEY\n")
+    return dict(BRINGUP_MODELS_DIR=str(rig.tmp / "models"), BRINGUP_OS_RELEASE=str(rig.tmp / "os-release"),
+                BRINGUP_MEMINFO=str(rig.tmp / "meminfo"), BRINGUP_MIN_ROOT_GB="0", FARM_BRINGUP_POLL_S="0.2")
+
+
+def test_farm_bringup_takes_a_fresh_node_to_a_queue_that_answers(rig):
+    env = _fresh_node(rig)
+    proc = rig.farm("bringup", "1.2.3.4", "--commit", "HEAD", "--from", "kf", "--no-download", **env)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert (rig.g / "NODE").read_text() == "1.2.3.4\n"
+    assert (rig.g / "node_known_hosts").read_text().startswith("1.2.3.4 ssh-ed25519 AAAA")  # the old pin is gone
+    full = subprocess.run(["git", "-C", str(rig.g / "wt" / "kf"), "rev-parse", "HEAD"], capture_output=True,
+                          text=True).stdout.strip()
+    assert (rig.node / "rental" / "BUNDLE.txt").read_text() == "plugin sha: %s\n" % full
+    for f in ("cardq.sh", "farm_job.sh", "node_bringup.sh", "build_base.sh", "tools/serve_probe.sh"):
+        assert (rig.node / "farm" / f).is_file(), f
+    out = proc.stdout
+    for line in ("STEP 2 host: ok", "STEP 3 ram-disk: ok", "STEP 5 base-image: ok", "STEP 7 cards: ok",
+                 "  0-3 | 0,1,2,7 | 0-75", "BRINGUP-DONE", "farm: the node is up."):
+        assert line in out, line
+    assert "waiting (in the order they start):" in out  # the queue's status at the end
+    # the same command again: the address, the key and the bundle stay, the finished steps are skipped
+    proc = rig.farm("bringup", "1.2.3.4", "--commit", "HEAD", "--from", "kf", "--no-download", **env)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "host key kept" in proc.stdout and "is the bundle of %s already" % rig.sha in proc.stdout
+    assert "is mounted already" in proc.stdout and "BRINGUP-DONE" in proc.stdout
+
+
+def test_farm_bringup_stops_at_a_failed_step(rig):
+    env = _fresh_node(rig)
+    proc = rig.farm("bringup", "1.2.3.4", "--commit", "HEAD", "--from", "kf", "--no-download",
+                    FAKE_PREPARE_RC="1", **env)
+    assert proc.returncode != 0
+    assert "BRINGUP-FAILED at step 2 (host)" in proc.stdout and "the bring-up failed" in proc.stderr
+    proc = rig.farm("bringup", "not an address")
+    assert proc.returncode != 0 and "usage: farm bringup ADDRESS" in proc.stderr
+
+
 def test_farm_tiny_runs_the_farms_tiny_runner(rig):
     rig.synced()
     proc = rig.farm("tiny", "kf", "tiny-tp2", "any:2", "20m", "--no-sync", "--gdn", "hc", "--full-warmup")
@@ -238,6 +339,41 @@ def test_bad_calls_are_refused_before_anything_is_queued(rig, args, text):
     proc = rig.farm(*args)
     assert proc.returncode != 0 and text in proc.stderr
     assert not (rig.node / "farm" / "q" / "jobs").exists() or not list((rig.node / "farm" / "q" / "jobs").iterdir())
+
+
+def _commit(rig, text):
+    wt = rig.g / "wt" / "kf"
+    (wt / "note.txt").write_text(text)
+    git = ["git", "-C", str(wt)]
+    subprocess.run(git + ["add", "."], check=True)
+    subprocess.run(git + ["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q", "-m", text], check=True)
+    return subprocess.run(git + ["rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()[:12]
+
+
+def test_old_images_go_but_never_the_image_of_a_job_that_waits(rig):
+    # A track that syncs four commits while its first job still waits must not lose that job's image: the
+    # job would rebuild it at its start, three minutes with the cards in its hands.
+    first = rig.sha
+    assert rig.farm("sync", "kf", FARM_KEEP_IMAGES="2").returncode == 0
+    waiting = rig.node / "farm" / "q" / "jobs" / "00007"
+    waiting.mkdir(parents=True)
+    (waiting / "state").write_text("waiting\n")
+    (waiting / "track").write_text("kf\n")
+    (waiting / "cmd.sh").write_text("exec ~/farm/farm_job.sh --sha %s -- python -m pytest -q x.py\n" % first)
+    shas = [first]
+    for i in range(4):
+        shas.append(_commit(rig, "step %d" % i))
+        proc = rig.farm("sync", "kf", FARM_KEEP_IMAGES="2")
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+    have = sorted(p.name.split(":")[1] for p in rig.state.glob("image-farm-kf:*") if not p.name.endswith(":latest"))
+    assert have == sorted([first, shas[-2], shas[-1]])  # the two newest, and the one the waiting job runs from
+    assert "kept for a waiting or running job: farm-kf:%s" % first in proc.stdout
+    # the job has ended: the next sync lets its image go
+    (waiting / "state").write_text("ended\n")
+    shas.append(_commit(rig, "last"))
+    assert rig.farm("sync", "kf", FARM_KEEP_IMAGES="2").returncode == 0
+    have = sorted(p.name.split(":")[1] for p in rig.state.glob("image-farm-kf:*") if not p.name.endswith(":latest"))
+    assert have == sorted(shas[-2:])
 
 
 def test_image_builds_wait_for_a_free_node_slot(rig):

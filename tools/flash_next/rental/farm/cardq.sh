@@ -19,6 +19,8 @@
 #   cardq.sh log ID [-f]             the job's log; -f follows it until the job ends
 #   cardq.sh cancel --track T ID     stop a job of track T (a track stops only its own jobs)
 #   cardq.sh ledger                  one line per ended job: track, cards, start, end, seconds
+#   cardq.sh health                  the habanalabs kernel lines since boot per card and class, and the
+#                                    jobs that had some
 #   cardq.sh bump --by coord ID [WHY]  (the coordinator only) move a waiting job to the front
 #   cardq.sh place --by coord NEW OLD  (the coordinator only) the waiting job NEW takes the place of
 #                                    the job OLD its track cancelled (as submit --replaces would have)
@@ -52,9 +54,15 @@
 # also loses every running container of the habana runtime. Nothing else is ever stopped.
 #
 # Health: when a job ends, the habanalabs kernel lines since its start (dmesg, read with sudo) are
-# counted per PCI address and card; they go to the job's log, to its ledger reason ("ok; habanalabs: card
-# 1 (module 0, 0000:0b:00.0) 2 lines") and to $Q/health.tsv, so a card that errs is seen at once. Routine
-# lines (link renames, IB registration) are left out.
+# counted per PCI address and card, by class. Two classes follow from what a job did and are no card
+# fault: "killed while waiting" (user process got signal while waiting for interrupt: a process was
+# killed while it waited for the card) and "failure analysis" (Received unexpected user error interrupt:
+# Synapse started its device failure analysis in a process of the job, after a signal that process does
+# not handle or 600 s without progress; measured 8 ms apart, twice, on 2026-11-20). Every other line is
+# an ERROR. All of them go to the job's log and to $Q/health.tsv; the lines of the job's own cards go to
+# its end line and ledger reason ("ok; habanalabs: card 1 (module 0, 0000:0b:00.0) 2 lines (1 failure
+# analysis, 1 killed while waiting)", "habanalabs ERROR: ..." when one is an error). Routine lines (link
+# renames, IB registration) are left out.
 #
 # State: $CARDQ_DIR (default ~/farm/q): jobs/<id>/, locks/, ledger.tsv, health.tsv. Plain bash 3.2 and later.
 
@@ -904,38 +912,120 @@ uptime_now() {
     R="${R%%.*}"
 }
 
-# health_scan JOB_DIR CARDS: the habanalabs kernel lines since the job started, per PCI address; one
-# log line per address, a short summary in HEALTH ("" when there is none or no dmesg), rows in health.tsv.
-HEALTH=""
-health_scan() {
-    local d="$1" cards="$2" t0 lines bus n card mod mine first
-    HEALTH=""
-    rd "$d/uptime_start"
-    t0="$R"
-    case "$t0" in '' | *[!0-9]*) return 0 ;; esac
-    lines="$( (${SUDO:+$SUDO }dmesg 2>/dev/null || dmesg 2>/dev/null) | awk -v t0="$t0" '
+# kernel_lines T0: the habanalabs kernel lines since uptime T0 (seconds), routine ones left out.
+kernel_lines() {
+    (${SUDO:+$SUDO }dmesg 2>/dev/null || dmesg 2>/dev/null) | awk -v t0="$1" '
         /habanalabs/ && !/renamed from|IB device registered|hwmon|Successfully|firmware|version|device found|Found GAUDI/ {
             if (match($0, /^\[ *[0-9]+\.[0-9]+\]/)) {
                 t = substr($0, 2, RLENGTH - 2) + 0
                 if (t >= t0) print
             }
-        }')" || lines=""
+        }'
+}
+
+# classes LINES: the lines of one card by class: HK killed while waiting, HD failure analysis, HE any
+# other line (a card error) with the text of the first in HE_TEXT; HC is "2 ERROR, 1 failure analysis".
+HK=0
+HD=0
+HE=0
+HE_TEXT=""
+HC=""
+classes() {
+    local n
+    n="$(printf '%s\n' "$1" | grep -c .)"
+    HK="$(printf '%s\n' "$1" | grep -c 'got signal while waiting for interrupt')"
+    HD="$(printf '%s\n' "$1" | grep -c 'unexpected user error interrupt')"
+    HE=$((n - HK - HD))
+    HE_TEXT=""
+    HC=""
+    if [ "$HE" -gt 0 ]; then
+        HE_TEXT="$(printf '%s\n' "$1" | grep -v -e 'got signal while waiting for interrupt' -e 'unexpected user error interrupt' \
+            | head -n 1 | sed -E 's/^\[[^]]*\] *//; s/^habanalabs [0-9a-f:.]+: *//' | tr '\t' ' ' | cut -c1-80)"
+        HC="$HE ERROR"
+    fi
+    if [ "$HD" -gt 0 ]; then HC="$HC${HC:+, }$HD failure analysis"; fi
+    if [ "$HK" -gt 0 ]; then HC="$HC${HC:+, }$HK killed while waiting"; fi
+}
+
+# health_scan JOB_DIR CARDS: the habanalabs kernel lines since the job started, per PCI address and class
+# (see the header); one log line per address, the lines of the job's own cards as a short summary in HEALTH
+# ("" when there is none or no dmesg; HEALTH_BAD is 1 when one of them is an error), rows in health.tsv.
+HEALTH=""
+HEALTH_BAD=0
+health_scan() {
+    local d="$1" cards="$2" t0 lines bus n card mod mine own first of
+    HEALTH=""
+    HEALTH_BAD=0
+    rd "$d/uptime_start"
+    t0="$R"
+    case "$t0" in '' | *[!0-9]*) return 0 ;; esac
+    lines="$(kernel_lines "$t0")" || lines=""
     [ -n "$lines" ] || return 0
     for bus in $(printf '%s\n' "$lines" | grep -oE '[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-9]' | sort -u); do
-        n="$(printf '%s\n' "$lines" | grep -c "$bus")"
-        first="$(printf '%s\n' "$lines" | grep "$bus" | head -n 1 | cut -c1-160)"
+        of="$(printf '%s\n' "$lines" | grep "$bus")"
+        n="$(printf '%s\n' "$of" | grep -c .)"
+        first="$(printf '%s\n' "$of" | head -n 1 | cut -c1-160)"
+        classes "$of"
         card_of_pci "$bus"
         card="${R:-?}"
         mod="?"
         if [ -n "$R" ]; then mod="${MOD[R]:-?}"; fi
-        mine=""
-        case ",$cards," in *",$card,"*) mine=" (one of this job's cards)" ;; esac
-        echo "cardq: habanalabs kernel lines during the job: card $card (module $mod, $bus): $n$mine; first: $first" >>"$d/log"
-        HEALTH="$HEALTH${HEALTH:+, }card $card (module $mod, $bus) $n lines"
-        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "${d##*/}" "$(cat "$d/track")" "$(cat "$d/name")" "$cards" "$card" \
-            "$mod" "$bus" "$n" >>"$Q/health.tsv"
+        mine=" (not a card of this job)"
+        own=other
+        case ",$cards," in
+            *",$card,"*)
+                mine=" (one of this job's cards)"
+                own=own
+                HEALTH="$HEALTH${HEALTH:+, }card $card (module $mod, $bus) $n lines ($(
+                    if [ "$HE" -gt 0 ]; then printf '%s' "${HC/ERROR/ERROR: $HE_TEXT}"; else printf '%s' "$HC"; fi
+                ))"
+                if [ "$HE" -gt 0 ]; then HEALTH_BAD=1; fi
+                ;;
+        esac
+        echo "cardq: habanalabs kernel lines during the job: card $card (module $mod, $bus): $n$mine: $HC; first: $first" >>"$d/log"
+        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "${d##*/}" "$(cat "$d/track")" "$(cat "$d/name")" \
+            "$cards" "$card" "$mod" "$bus" "$n" "$own" "$HK" "$HD" "$HE" "$HE_TEXT" >>"$Q/health.tsv"
     done
     return 0
+}
+
+# health: the kernel lines since boot per card and class, and the jobs that had some (health.tsv).
+cmd_health() {
+    local lines bus of n card mod bad=0
+    mkdir -p "$Q/jobs" "$Q/locks" || die "cannot create $Q"
+    set_sudo
+    load_map
+    lines="$(kernel_lines 0)" || lines=""
+    echo "habanalabs kernel lines since boot, per card and class (routine lines left out):"
+    if [ -z "$lines" ]; then
+        echo "  none"
+    else
+        for bus in $(printf '%s\n' "$lines" | grep -oE '[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-9]' | sort -u); do
+            of="$(printf '%s\n' "$lines" | grep "$bus")"
+            n="$(printf '%s\n' "$of" | grep -c .)"
+            classes "$of"
+            card_of_pci "$bus"
+            card="${R:-?}"
+            mod="?"
+            if [ -n "$R" ]; then mod="${MOD[R]:-?}"; fi
+            if [ "$HE" -gt 0 ]; then
+                bad=1
+                echo "  card $card (module $mod, $bus): $n lines: ${HC/ERROR/ERROR (first: $HE_TEXT)}"
+            else
+                echo "  card $card (module $mod, $bus): $n lines: $HC"
+            fi
+        done
+    fi
+    if [ "$bad" -eq 1 ]; then
+        echo "CARD ERROR: a line of an unknown class above: tell the card-farm track and the coordinator (sudo dmesg | grep habanalabs)"
+    else
+        echo "no line of an unknown class: no card error"
+    fi
+    echo "  killed while waiting: 'user process got signal while waiting for interrupt', a process killed while it waited for the card"
+    echo "  failure analysis: 'Received unexpected user error interrupt', Synapse started its failure analysis in a job's process"
+    echo "    (a signal the process does not handle, or 600 s without progress): see habana_logs/dfa_log.txt in the job's results"
+    echo "jobs with kernel lines (job, track, name, cards, card, module, pci, lines, own/other card, killed, failure analysis, error, first error):"
+    if [ -s "$Q/health.tsv" ]; then cat "$Q/health.tsv"; else echo "  (none)"; fi
 }
 
 cmd_run() {
@@ -1041,7 +1131,9 @@ cmd_run() {
     kill_group KILL
     sweep_containers "$id" "$allc" "$abnormal"
     health_scan "$d" "$cards"
-    if [ -n "$HEALTH" ]; then reason="$reason; habanalabs: $HEALTH"; fi
+    if [ -n "$HEALTH" ]; then
+        if [ "$HEALTH_BAD" -eq 1 ]; then reason="$reason; habanalabs ERROR: $HEALTH"; else reason="$reason; habanalabs: $HEALTH"; fi
+    fi
     now="$(date -u +%s)"
     echo "cardq: job $id ended at $(iso "$now"): exit code $rc, $((now - start)) s on cards $cards, $reason" >>"$d/log"
     qlock
@@ -1426,7 +1518,7 @@ cmd_ledger() {
 }
 
 usage() {
-    sed -n '3,27p' "$SELF" | sed 's/^# \{0,1\}//'
+    sed -n '3,29p' "$SELF" | sed 's/^# \{0,1\}//'
 }
 
 if [ "$(id -u)" -eq 0 ] && [ "${CARDQ_ALLOW_ROOT:-0}" != 1 ]; then
@@ -1458,6 +1550,10 @@ case "${1:-}" in
     ledger)
         shift
         cmd_ledger "$@"
+        ;;
+    health)
+        shift
+        cmd_health "$@"
         ;;
     bump)
         shift

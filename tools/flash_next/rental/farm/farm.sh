@@ -16,6 +16,11 @@
 #   farm run TRACK NAME CARDS [MAX_HOLD] [-- RUN_ID...]   submit, wait, fetch in one command
 #   farm cancel TRACK ID                     stop a job of your own track
 #   farm ledger                              every ended job: track, cards, start, end, seconds
+#   farm health                              the habanalabs kernel lines since boot per card and class
+#   farm harvest [DEST]                      copy every track's results, the queue (job logs, scripts,
+#                                            ledger) and the image build logs from the node into DEST
+#                                            (default: node-harvest/ in the work folder); everything but
+#                                            checkpoints. Run it before the node is switched off.
 #
 # Stage 2: one command per test. Each syncs the committed HEAD of wt/TRACK first (farm sync), runs
 # the job in a container of the track's image on the granted cards, waits, and copies the job's log
@@ -35,6 +40,13 @@
 #     min_tokens), --min-tokens (send min_tokens in every round)
 #   farm install                             (card-farm only) put the farm scripts of wt/card-farm on
 #                                            the node and in bin/farm
+#   farm bringup ADDRESS [--commit REF] [--from TRACK] [NODE OPTIONS]
+#                                            a freshly started node (a new machine): pin its address and
+#                                            host key, copy the rental bundle of the program head (REF,
+#                                            default origin/feat/flash-next-gaudi, from wt/TRACK, default
+#                                            card-farm), install the farm, and run node_bringup.sh there
+#                                            (driver, RAM disk /models, checkpoint, base image, card map);
+#                                            NODE OPTIONS go to it (--ram-gb N, --no-download, --dry-run)
 
 # shellcheck disable=SC2088  # a ~ in a command for the node is expanded there, by the node's shell
 
@@ -50,7 +62,7 @@ die() {
 }
 
 usage() {
-    sed -n '6,37p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '6,49p' "$0" | sed 's/^# \{0,1\}//'
 }
 
 need_track() {
@@ -73,6 +85,45 @@ node() {
         echo "farm: no connection to the node, trying again in 10 s ($tries/30)" >&2
         sleep 10
     done
+}
+
+# show COMMAND: print what COMMAND prints on the node; no retry (the caller may have closed our output,
+# as in `farm status | head`, which looks like a dropped connection).
+show() {
+    local rc=0
+    "$SSH" "$1" || rc=$?
+    if [ "$rc" -eq 255 ]; then echo "farm: no connection to the node (or the output was closed): run it again" >&2; fi
+    return "$rc"
+}
+
+# harvest [DEST]: everything a track may need after the node is gone, in the node's layout under DEST:
+# q/ (every job's log, script and state, ledger.tsv, health.tsv), <track>/results/, <track>/images/ (build
+# logs). No size limit; only checkpoints (*.safetensors, ckpt* folders) stay behind. Files are overwritten,
+# so it can run at any time and again; the last run belongs right before the node is switched off.
+cmd_harvest() {
+    local dest="${1:-$G/node-harvest}" there here rcs
+    mkdir -p "$dest" || die "cannot create $dest"
+    echo "farm: harvest: every track's results, the queue and the image build logs -> $dest"
+    set +e
+    "$SSH" "cd ~/farm && sudo -n tar czf - --exclude='*.safetensors' --exclude='ckpt*' \$(ls -d q */results */images 2>/dev/null) 2>/dev/null" \
+        | tar xzf - -C "$dest"
+    rcs=("${PIPESTATUS[@]}")
+    set -e
+    if [ "${rcs[1]}" -ne 0 ]; then die "harvest: the copy is incomplete (tar on the workstation ended with ${rcs[1]}): run it again"; fi
+    there="$(node "cd ~/farm && sudo -n find \$(ls -d q */results */images 2>/dev/null) -type f ! -name '*.safetensors' ! -path '*/ckpt*' | wc -l" | tr -d ' ')"
+    here="$(cd "$dest" && find . -type f | wc -l | tr -d ' ')"
+    echo "farm: harvest: $there files on the node now, $here files in $dest ($(du -sh "$dest" | cut -f1))"
+    case "${rcs[0]}" in
+        0) ;;
+        1) echo "farm: harvest: some files changed while they were read (a job is running): run it again when the queue is empty" ;;
+        255) die "harvest: the connection to the node dropped: run it again" ;;
+        *) echo "farm: harvest: tar on the node ended with ${rcs[0]} (a file vanished or could not be read): run it again" >&2 ;;
+    esac
+    if [ "$here" -lt "$there" ]; then
+        echo "farm: harvest: fewer files here than on the node: run it again" >&2
+        return 1
+    fi
+    return 0
 }
 
 cmd_bundle() {
@@ -147,7 +198,7 @@ cmd_run() {
 
 # ------------------------------------------------------------------ stage 2
 
-FARM_FILES="cardq.sh farm_job.sh build_track_image.sh farm_unpack.sh build_base.sh"
+FARM_FILES="cardq.sh farm_job.sh build_track_image.sh farm_unpack.sh build_base.sh node_bringup.sh"
 FARM_TOOLS="serve_probe.sh decode_scaling.py farm_tiny.py kernel_test.sh"
 SYNCED=""
 
@@ -325,9 +376,100 @@ cmd_install() {
     echo "farm: installed on the node (~/farm, ~/farm/tools) and in $G/bin/farm"
 }
 
+# bringup ADDRESS [--commit REF] [--from TRACK] [NODE OPTIONS]: see the header. Every step can be repeated.
+cmd_bringup() {
+    local addr="${1:-}" ref="origin/feat/flash-next-gaudi" from="card-farm" wt sha tmp log tarball seen=0 total line state=""
+    local -a nodeopts=()
+    case "$addr" in '' | -* | *[!A-Za-z0-9.:-]*) die "usage: farm bringup ADDRESS [--commit REF] [--from TRACK] [--ram-gb N] [--no-download] [--dry-run]" ;; esac
+    shift
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --commit) [ $# -ge 2 ] || die "--commit needs a git ref"; ref="$2"; shift 2 ;;
+            --from) [ $# -ge 2 ] || die "--from needs a track"; from="$2"; shift 2 ;;
+            --ram-gb | --repo | --min-gb) [ $# -ge 2 ] || die "$1 needs a value"; need_word "$1" "${2//\//.}"; nodeopts+=("$1" "$2"); shift 2 ;;
+            --no-download | --dry-run) nodeopts+=("$1"); shift ;;
+            *) die "farm bringup: unknown option $1" ;;
+        esac
+    done
+    need_track "$from"
+    wt="$G/wt/$from"
+    [ -d "$wt" ] || die "no worktree $wt"
+
+    echo "farm: bringup 1/5: the node's address and host key"
+    if [ "$(cat "$G/NODE" 2>/dev/null || true)" != "$addr" ] || [ ! -s "$G/node_known_hosts" ]; then
+        # A node start is a new machine with a new host key: the old pin goes, the new key is pinned on first use.
+        ssh-keyscan -T 20 -t ed25519 "$addr" >"$G/node_known_hosts.new" 2>/dev/null || true
+        [ -s "$G/node_known_hosts.new" ] || { rm -f "$G/node_known_hosts.new"; die "no ed25519 host key from $addr (is the node up, is the address right?)"; }
+        mv -f "$G/node_known_hosts.new" "$G/node_known_hosts"
+        printf '%s\n' "$addr" >"$G/NODE"
+        echo "farm: NODE is now $addr; host key pinned: $(ssh-keygen -lf "$G/node_known_hosts" 2>/dev/null | head -n 1)"
+    else
+        echo "farm: NODE is $addr already, host key kept"
+    fi
+    node "true" || die "cannot reach the node with $SSH"
+
+    echo "farm: bringup 2/5: the rental bundle of $ref (from wt/$from)"
+    case "$ref" in origin/*) git -C "$wt" fetch -q origin "${ref#origin/}" || die "git fetch origin ${ref#origin/} failed in $wt" ;; esac
+    sha="$(git -C "$wt" rev-parse --verify -q "$ref^{commit}")" || die "no commit $ref in $wt"
+    if node "grep -q '^plugin sha: *$sha' ~/rental/BUNDLE.txt 2>/dev/null"; then
+        echo "farm: ~/rental on the node is the bundle of ${sha:0:12} already"
+    else
+        tmp="$(mktemp -d "${TMPDIR:-/tmp}/farm-bringup.XXXXXX")"
+        git clone -q --shared --no-checkout "$wt" "$tmp/head" && git -C "$tmp/head" checkout -q --detach "$sha" \
+            || { rm -rf "$tmp"; die "cannot check out $sha"; }
+        mkdir -p "$G/dist/program-head"
+        log="$(cd "$tmp/head" && bash tools/flash_next/rental/make_rental_bundle.sh --out "$G/dist/program-head" 2>&1)" \
+            || { printf '%s\n' "$log" >&2; rm -rf "$tmp"; die "make_rental_bundle.sh failed at $sha"; }
+        rm -rf "$tmp"
+        tarball="$(printf '%s\n' "$log" | sed -n 's/^bundle: //p')"
+        [ -f "$tarball" ] || die "make_rental_bundle.sh named no bundle"
+        "$SCP" "$tarball" ":rental.tar.gz"
+        node "mkdir -p ~/rental && tar xzf ~/rental.tar.gz -C ~/rental && rm -f ~/rental.tar.gz && sed -n 's/^plugin sha: */bundle on the node: /p' ~/rental/BUNDLE.txt"
+    fi
+
+    echo "farm: bringup 3/5: the farm scripts"
+    cmd_install >/dev/null
+    echo "farm: installed (~/farm, ~/farm/tools, bin/farm)"
+
+    echo "farm: bringup 4/5: node_bringup.sh on the node (log: ~/bringup/bringup.log there)"
+    if node "pgrep -f 'farm/node_bringup[.]sh' >/dev/null"; then
+        echo "farm: a node_bringup.sh runs there already: following it"
+    else
+        node "mkdir -p ~/bringup && (nohup bash ~/farm/node_bringup.sh $(job_line ${nodeopts[@]+"${nodeopts[@]}"}) >~/bringup/bringup.log 2>&1 </dev/null &) ; sleep 1"
+    fi
+    while :; do
+        total="$(node "wc -l <~/bringup/bringup.log 2>/dev/null || echo 0" | tr -d ' ')"
+        case "$total" in '' | *[!0-9]*) total="$seen" ;; esac
+        if [ "$total" -gt "$seen" ]; then
+            while IFS= read -r line; do
+                printf '  %s\n' "$line"
+                case "$line" in BRINGUP-DONE* | BRINGUP-FAILED*) state="$line" ;; esac
+            done < <(node "sed -n '$((seen + 1)),${total}p' ~/bringup/bringup.log")
+            seen="$total"
+        fi
+        if [ -n "$state" ]; then break; fi
+        if ! node "pgrep -f 'farm/node_bringup[.]sh' >/dev/null"; then
+            total="$(node "wc -l <~/bringup/bringup.log 2>/dev/null || echo 0" | tr -d ' ')"
+            if [ "${total:-0}" -le "$seen" ]; then die "node_bringup.sh ended without a result line; see ~/bringup/bringup.log on the node"; fi
+            continue
+        fi
+        sleep "${FARM_BRINGUP_POLL_S:-10}"
+    done
+    case "$state" in BRINGUP-DONE*) ;; *) die "the bring-up failed: fix the step and run the same command again (finished steps are skipped)" ;; esac
+
+    echo "farm: bringup 5/5: the queue"
+    show "~/farm/cardq.sh status" || true
+    echo "farm: the node is up. Next: (1) farm job card-farm selftest-1card any:1 10m --no-model -- python -c \"import torch, habana_frameworks.torch.core; print((torch.ones(4, device='hpu') * 3).sum().item())\""
+    echo "farm:   (2) compare the module groups printed above with the table in CARD.md and correct it; (3) add a line to BRIEF.md that the node is up."
+}
+
 case "${1:-}" in
-    status | ledger)
-        node "~/farm/cardq.sh $1"
+    status | ledger | health)
+        show "~/farm/cardq.sh $1"
+        ;;
+    harvest)
+        shift
+        cmd_harvest "$@"
         ;;
     bundle)
         shift
@@ -370,6 +512,10 @@ case "${1:-}" in
         ;;
     install)
         cmd_install
+        ;;
+    bringup)
+        shift
+        cmd_bringup "$@"
         ;;
     -h | --help | help)
         usage

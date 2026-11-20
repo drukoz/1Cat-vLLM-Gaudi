@@ -62,6 +62,8 @@ class Farm:
         self.tmp = tmp_path
         self.q = tmp_path / "q"
         self.events = tmp_path / "events"
+        self.gates = tmp_path / "gates"
+        self.gates.mkdir()
         self.state = tmp_path / "state"
         self.state.mkdir()
         home = tmp_path / "home"
@@ -85,6 +87,7 @@ class Farm:
             "CARDQ_SUDO": "",
             "CARDQ_ALLOW_ROOT": "1",
             "EVENTS": str(self.events),
+            "GATES": str(self.gates),
             "FAKE_DOCKER_LOG": str(tmp_path / "docker.log"),
             "FAKE_STATE": str(self.state),
         })
@@ -110,6 +113,19 @@ class Farm:
         script = ('echo "S $CARDQ_JOB $CARDQ_CARDS $(%s)" >>"$EVENTS"\nsleep %s\n'
                   'echo "E $CARDQ_JOB $CARDQ_CARDS $(%s)" >>"$EVENTS"\n' % (NOW, seconds, NOW))
         return self.submit(cards, script, **kw)
+
+    def block(self, cards, **kw):
+        """A job that records the cards it got and holds them until release(job). The test decides when it
+        ends, so the steps that must happen while it runs do so on a slow or busy host too (a fixed sleep
+        of two seconds was over before three submits were done when the workstation ran other test suites)."""
+        script = ('echo "S $CARDQ_JOB $CARDQ_CARDS $(%s)" >>"$EVENTS"\n'
+                  'while [ ! -e "$GATES/$CARDQ_JOB" ]; do sleep 0.05; done\n'
+                  'echo "E $CARDQ_JOB $CARDQ_CARDS $(%s)" >>"$EVENTS"\n' % (NOW, NOW))
+        return self.submit(cards, script, **kw)
+
+    def release(self, *jobs):
+        for job in jobs:
+            (self.gates / job).touch()
 
     def wait(self, job, timeout=60):
         return self.cq("wait", job, "--timeout", str(timeout), timeout=timeout + 30)
@@ -243,11 +259,13 @@ def test_an_empty_command_is_refused(farm):
 
 
 def test_jobs_on_the_same_cards_run_one_after_the_other_and_others_side_by_side(farm):
-    # 3 s: the two submits that follow must be done before the first job ends, also on a slow host
-    a = farm.hold("0,1,2,3", 3.0)
+    a = farm.block("0,1,2,3")
     b = farm.hold("3,2", 0.3)  # written descending: taken ascending
-    c = farm.hold("4,5,6,7", 1.0)
-    for job in (a, b, c):
+    c = farm.hold("4,5,6,7", 0.3)
+    assert farm.wait(c).returncode == 0  # next to the job on 0-3, which still runs
+    assert farm.file(b, "state") == "waiting"
+    farm.release(a)
+    for job in (a, b):
         assert farm.wait(job).returncode == 0
     iv = farm.intervals()
     assert iv[b][0] == [2, 3]
@@ -257,17 +275,19 @@ def test_jobs_on_the_same_cards_run_one_after_the_other_and_others_side_by_side(
 
 
 def test_any_n_takes_fours_from_the_bottom_and_small_sets_from_the_top(farm):
-    one = farm.hold("any:1", 1.5)
+    one = farm.block("any:1")
     assert farm.until(lambda: farm.file(one, "cards") != "")
-    two = farm.hold("any:2", 1.5)
+    two = farm.block("any:2")
     assert farm.until(lambda: farm.file(two, "cards") != "")
-    four = farm.hold("any:4", 1.5)
+    four = farm.block("any:4")
     assert farm.until(lambda: farm.file(four, "cards") != "")
     three = farm.hold("any:3", 0.2)
-    assert farm.until(lambda: farm.file(three, "cards") != "")
     assert farm.file(one, "cards") == "7"
     assert farm.file(two, "cards") == "4,5"  # the pair 6,7 is broken by the single job
     assert farm.file(four, "cards") == "0,1,2,3"
+    assert farm.file(three, "cards") == ""  # one card is free: it waits
+    farm.release(one, two, four)
+    assert farm.until(lambda: farm.file(three, "cards") != "")
     assert farm.file(three, "cards") in ("0,1,2", "4,5,6")  # after the others ended: the lowest three free
     for job in (one, two, four, three):
         assert farm.wait(job).returncode == 0
@@ -304,14 +324,15 @@ def test_many_jobs_never_share_a_card_and_all_end(farm):
 
 
 def test_an_all_card_job_is_not_starved_and_short_jobs_slip_in_front(farm):
-    long_one = farm.hold("0", 6.0, hold="12s")  # its card is free by start + 12 s + 1 s grace at the latest
+    long_one = farm.block("0", hold="120s")  # its card is free by start + 120 s + 1 s grace at the latest
     assert farm.until(lambda: farm.file(long_one, "state") == "running")
-    whole = farm.hold("all", 0.2, hold="5s")
-    time.sleep(0.4)
-    assert farm.file(whole, "state") == "waiting"
-    late = farm.hold("any:1", 0.2, hold="30s")  # would outlast the whole-node job's latest start: must wait
-    quick = farm.hold("any:1", 0.2, hold="3s")  # ends before it: runs now, on a card the first job leaves free
-    for job in (long_one, whole, late, quick):
+    whole = farm.hold("all", 0.2, hold="50s")
+    late = farm.hold("any:1", 0.2, hold="300s")  # would outlast the whole-node job's latest start: must wait
+    quick = farm.hold("any:1", 0.2, hold="30s")  # ends before it: runs now, on a card the first job leaves free
+    assert farm.wait(quick).returncode == 0
+    assert farm.file(whole, "state") == "waiting" and farm.file(late, "state") == "waiting"
+    farm.release(long_one)
+    for job in (long_one, whole, late):
         assert farm.wait(job).returncode == 0
     iv = farm.intervals()
     assert iv[quick][2] <= iv[whole][1], "the short job did not run ahead of the whole-node job"
@@ -322,10 +343,9 @@ def test_an_all_card_job_is_not_starved_and_short_jobs_slip_in_front(farm):
 
 
 def test_status_shows_holders_and_waiters(farm):
-    a = farm.hold("0,1,2,3", 3, track="prefill", name="real-tp4")
+    a = farm.block("0,1,2,3", track="prefill", name="real-tp4")
     assert farm.until(lambda: farm.file(a, "state") == "running")
     b = farm.hold("all", 0.1, track="step-anatomy", name="profile-8card")
-    time.sleep(0.3)
     out = farm.cq("status").stdout
     lines = out.splitlines()
     assert lines[0].startswith("cardq status at ")
@@ -410,13 +430,14 @@ def test_a_track_cancels_only_its_own_jobs(farm):
 
 
 def test_a_waiting_job_can_be_cancelled_and_never_runs(farm):
-    a = farm.hold("0", 4.0)  # still running when the two submits and the cancel below are done
+    a = farm.block("0")  # still running when the two submits and the cancel below are done
     assert farm.until(lambda: farm.file(a, "state") == "running")
     b = farm.hold("0", 0.1, name="second")
     c = farm.hold("0", 0.1, name="third")
     assert farm.cq("cancel", "--track", "alpha", b).returncode == 0
     assert farm.file(b, "state") == "cancelled"
     assert farm.wait(b).returncode == 125
+    farm.release(a)
     assert farm.wait(a).returncode == 0 and farm.wait(c).returncode == 0
     assert b not in farm.intervals()
     row = [ln.split("\t") for ln in farm.cq("ledger").stdout.splitlines() if ln.startswith(b)][0]
@@ -450,12 +471,13 @@ def test_a_killed_supervisor_still_ends_its_job_and_frees_the_cards(farm):
 
 
 def test_a_dead_waiting_job_does_not_block_the_queue(farm):
-    a = farm.hold("0", 1.0)
+    a = farm.block("0")
     assert farm.until(lambda: farm.file(a, "state") == "running")
     b = farm.hold("0", 0.1, name="dies-waiting")
     assert farm.until(lambda: farm.file(b, "pid") != "")
     os.kill(int(farm.file(b, "pid")), signal.SIGKILL)
     c = farm.hold("0", 0.1, name="after")
+    farm.release(a)
     assert farm.wait(a).returncode == 0
     assert farm.wait(c).returncode == 0
     assert farm.file(b, "state") == "lost"
@@ -495,7 +517,8 @@ NODE_MAP = "3,0,1,6,7,4,5,2"  # the 2026-11-20 node: the module id of card (inde
 
 def test_any_4_and_any_2_take_whole_module_groups_on_a_scrambled_node(farm):
     farm.env["CARDQ_MODULE_MAP"] = NODE_MAP
-    script = ('echo "S $CARDQ_JOB $CARDQ_CARDS $(%s)" >>"$EVENTS"\necho "modules=$CARDQ_MODULES"\nsleep 1.5\n'
+    script = ('echo "S $CARDQ_JOB $CARDQ_CARDS $(%s)" >>"$EVENTS"\necho "modules=$CARDQ_MODULES"\n'
+              'while [ ! -e "$GATES/$CARDQ_JOB" ]; do sleep 0.05; done\n'
               'echo "E $CARDQ_JOB $CARDQ_CARDS $(%s)" >>"$EVENTS"\n' % (NOW, NOW))
     first = farm.submit("any:4", script)
     assert farm.until(lambda: farm.file(first, "cards") != "")
@@ -503,13 +526,17 @@ def test_any_4_and_any_2_take_whole_module_groups_on_a_scrambled_node(farm):
     assert farm.until(lambda: farm.file(second, "cards") != "")
     assert farm.file(first, "cards") == "0,1,2,7"  # modules 3,0,1,2: the group 0-3
     assert farm.file(second, "cards") == "3,4,5,6"  # modules 6,7,4,5: the group 4-7
+    farm.release(first, second)
     for job in (first, second):
         assert farm.wait(job).returncode == 0
     assert "modules=0,1,2,3" in farm.cq("log", first).stdout
     assert "modules=4,5,6,7" in farm.cq("log", second).stdout
     assert "on cards 0,1,2,7 (modules 0,1,2,3)" in farm.cq("log", first).stdout
     pair = farm.submit("any:2", script)
+    assert farm.until(lambda: farm.file(pair, "cards") != "")
     one = farm.submit("any:1", script)
+    assert farm.until(lambda: farm.file(one, "cards") != "")
+    farm.release(pair, one)
     for job in (pair, one):
         assert farm.wait(job).returncode == 0
     assert farm.file(pair, "cards") == "3,4"  # modules 6,7, the top pair
@@ -521,12 +548,13 @@ def test_single_cards_come_from_the_top_modules(farm):
     farm.env["CARDQ_MODULE_MAP"] = NODE_MAP
     jobs = []
     for _ in range(3):
-        jobs.append(farm.hold("any:1", 2.0))
+        jobs.append(farm.block("any:1"))
         assert farm.until(lambda: farm.file(jobs[-1], "cards") != "")
     assert [farm.file(j, "cards") for j in jobs] == ["4", "3", "6"]  # modules 7, 6, 5
     four = farm.hold("any:4", 0.1)
     assert farm.until(lambda: farm.file(four, "cards") != "")
     assert farm.file(four, "cards") == "0,1,2,7"  # the whole group 0-3 is still free
+    farm.release(*jobs)
     for job in jobs + [four]:
         assert farm.wait(job).returncode == 0
 
@@ -562,15 +590,15 @@ def test_without_a_map_card_n_is_module_n(farm):
 
 def test_a_long_all_card_job_waits_behind_shorter_ones_submitted_soon_after(farm):
     farm.env.update(CARDQ_LONG_HOLD_S="30", CARDQ_LONG_DELAY_S="600")
-    busy = farm.hold("0", 3.0)
+    busy = farm.block("0")
     assert farm.until(lambda: farm.file(busy, "state") == "running")
     long_one = farm.hold("all", 0.3, hold="60s", name="long-all")  # more than 30 s of every card
     short_all = farm.hold("all", 0.3, hold="20s", name="short-all")
     short_one = farm.hold("any:1", 0.3, hold="20s", name="short-one")
-    time.sleep(0.3)
     lines = farm.cq("status").stdout.split("waiting (in the order they start):")[1].splitlines()
     order = [ln.split()[0] for ln in lines if ln.startswith("  0")]
     assert order.index(short_all) < order.index(long_one), lines
+    farm.release(busy)
     for job in (busy, long_one, short_all, short_one):
         assert farm.wait(job).returncode == 0
     iv = farm.intervals()
@@ -581,10 +609,11 @@ def test_a_long_all_card_job_waits_behind_shorter_ones_submitted_soon_after(farm
 
 def test_an_all_card_job_up_to_the_limit_keeps_its_place(farm):
     farm.env.update(CARDQ_LONG_HOLD_S="30", CARDQ_LONG_DELAY_S="600")
-    busy = farm.hold("0", 2.0)
+    busy = farm.block("0")
     assert farm.until(lambda: farm.file(busy, "state") == "running")
     first = farm.hold("all", 0.3, hold="30s", name="at-the-limit")
     second = farm.hold("all", 0.3, hold="20s", name="later")
+    farm.release(busy)
     for job in (busy, first, second):
         assert farm.wait(job).returncode == 0
     iv = farm.intervals()
@@ -592,7 +621,7 @@ def test_an_all_card_job_up_to_the_limit_keeps_its_place(farm):
 
 
 def test_the_coordinator_bumps_a_waiting_job_to_the_front(farm):
-    busy = farm.hold("0", 2.0)
+    busy = farm.block("0")
     assert farm.until(lambda: farm.file(busy, "state") == "running")
     a = farm.hold("all", 0.2, name="first-all")
     b = farm.hold("all", 0.2, name="second-all")
@@ -605,6 +634,7 @@ def test_the_coordinator_bumps_a_waiting_job_to_the_front(farm):
     assert "[bumped: coord: unlocks partial cards]" in farm.cq("status").stdout
     proc = farm.cq("bump", "--by", "coord", busy)
     assert proc.returncode == 1 and "not waiting" in proc.stderr
+    farm.release(busy)
     for job in (busy, a, b, c):
         assert farm.wait(job).returncode == 0
     iv = farm.intervals()
@@ -616,7 +646,7 @@ def test_the_coordinator_bumps_a_waiting_job_to_the_front(farm):
 
 
 def test_adopt_gives_a_waiting_job_a_new_supervisor_and_keeps_it(farm):
-    busy = farm.hold("0", 3.0)
+    busy = farm.block("0")
     assert farm.until(lambda: farm.file(busy, "state") == "running")
     w = farm.hold("0", 0.2, name="waits")
     assert farm.until(lambda: farm.file(w, "pid") != "")
@@ -629,6 +659,7 @@ def test_adopt_gives_a_waiting_job_a_new_supervisor_and_keeps_it(farm):
     new = int(farm.file(w, "pid"))
     assert new != old and farm.until(lambda: _gone(old))
     assert farm.file(busy, "pid") == running_pid, "a running job's supervisor was touched"
+    farm.release(busy)
     out, err = waiter.communicate(timeout=90)
     assert waiter.returncode == 0, err
     assert farm.file(w, "state") == "ended" and farm.wait(busy).returncode == 0
@@ -637,11 +668,12 @@ def test_adopt_gives_a_waiting_job_a_new_supervisor_and_keeps_it(farm):
 
 def test_a_long_job_queued_before_the_fairness_rule_keeps_its_place(farm):
     farm.env.update(CARDQ_LONG_HOLD_S="30", CARDQ_LONG_DELAY_S="600")
-    busy = farm.hold("0", 2.5)
+    busy = farm.block("0")
     assert farm.until(lambda: farm.file(busy, "state") == "running")
     old_long = farm.hold("all", 0.2, hold="60s", name="queued-before-the-rule")
     (farm.q / "jobs" / old_long / "rules").unlink()
     short = farm.hold("all", 0.2, hold="20s", name="short-after")
+    farm.release(busy)
     for job in (busy, old_long, short):
         assert farm.wait(job).returncode == 0
     iv = farm.intervals()
@@ -656,7 +688,7 @@ def _replace(farm, cards, old, seconds=0.2, track="alpha", name=None):
 
 
 def test_a_job_on_fewer_cards_takes_the_place_of_the_job_it_replaces(farm):
-    busy = farm.hold("0", 2.5)
+    busy = farm.block("0")
     assert farm.until(lambda: farm.file(busy, "state") == "running")
     old = farm.hold("all", 0.2, track="alpha", name="old-all")
     other = farm.hold("all", 0.2, track="beta", name="other-all")
@@ -665,6 +697,7 @@ def test_a_job_on_fewer_cards_takes_the_place_of_the_job_it_replaces(farm):
     new = proc.stdout.strip()
     assert "replaces job %s and takes its place" % old in proc.stderr
     assert farm.until(lambda: farm.file(old, "state") == "cancelled")
+    farm.release(busy)
     for job in (busy, other, new):
         assert farm.wait(job).returncode == 0
     iv = farm.intervals()
@@ -675,7 +708,7 @@ def test_a_job_on_fewer_cards_takes_the_place_of_the_job_it_replaces(farm):
 
 
 def test_replacements_hold_at_most_the_cards_of_the_old_job(farm):
-    busy = farm.hold("all", 2.0)
+    busy = farm.block("all")
     assert farm.until(lambda: farm.file(busy, "state") == "running")
     old = farm.hold("any:4", 0.1, name="old-four")
     first = _replace(farm, "any:2", old, name="half-a")
@@ -685,18 +718,20 @@ def test_replacements_hold_at_most_the_cards_of_the_old_job(farm):
     assert second.returncode == 0, second.stderr
     third = _replace(farm, "any:1", old, name="one-more")
     assert third.returncode == 1 and "do not fit" in third.stderr
+    farm.release(busy)
     for job in (busy, first.stdout.strip(), second.stdout.strip()):
         assert farm.wait(job).returncode == 0
 
 
 def test_only_the_tracks_own_waiting_or_recently_cancelled_job_can_be_replaced(farm):
-    busy = farm.hold("0", 1.5)
+    busy = farm.block("0")
     assert farm.until(lambda: farm.file(busy, "state") == "running")
     theirs = farm.hold("0", 0.1, track="beta", name="theirs")
     proc = _replace(farm, "any:1", theirs, track="alpha")
     assert proc.returncode == 4 and "belongs to track beta" in proc.stderr
     proc = _replace(farm, "any:1", busy, track="alpha")
     assert proc.returncode == 1 and "is running" in proc.stderr
+    farm.release(busy)
     assert farm.wait(busy).returncode == 0 and farm.wait(theirs).returncode == 0
     proc = _replace(farm, "any:1", busy, track="alpha")
     assert proc.returncode == 1 and "is ended" in proc.stderr
@@ -712,6 +747,7 @@ cat <<'LINES'
 [ 1003.000000] habanalabs 0000:0c:00.0 enp12s0d8: renamed from eth3
 [ 1004.000000] habanalabs 0000:0e:00.0: Received unexpected user error interrupt
 LINES
+if [ -n "${FAKE_DMESG_MORE:-}" ]; then printf '%s\n' "$FAKE_DMESG_MORE"; fi
 """
 
 
@@ -733,13 +769,57 @@ def test_the_kernel_lines_of_the_cards_during_a_job_go_to_its_log_and_the_ledger
     assert farm.wait(job).returncode == 0
     assert farm.file(job, "cards") == "0,1,2,7"
     log = farm.cq("log", job).stdout
-    assert "card 1 (module 0, 0000:0b:00.0): 2 (one of this job's cards)" in log
-    assert "card 4 (module 7, 0000:0e:00.0): 1;" in log  # another card's line: reported, not this job's
+    assert ("card 1 (module 0, 0000:0b:00.0): 2 (one of this job's cards): 1 failure analysis, "
+            "1 killed while waiting; first: [ 1001.500000]") in log
+    # another card's line: in the log, not in this job's reason
+    assert "card 4 (module 7, 0000:0e:00.0): 1 (not a card of this job): 1 failure analysis; first:" in log
     assert "0000:0c:00.0" not in log  # routine lines are left out
     row = [ln.split("\t") for ln in farm.cq("ledger").stdout.splitlines() if ln.startswith(job)][0]
-    assert row[10] == "ok; habanalabs: card 1 (module 0, 0000:0b:00.0) 2 lines, card 4 (module 7, 0000:0e:00.0) 1 lines"
-    health = (farm.q / "health.tsv").read_text().splitlines()
-    assert health[0].split("\t")[4:] == ["1", "0", "0000:0b:00.0", "2"]
+    assert row[10] == ("ok; habanalabs: card 1 (module 0, 0000:0b:00.0) 2 lines (1 failure analysis, "
+                       "1 killed while waiting)")
+    assert ": exit code 0, " in log and log.rstrip().endswith("1 killed while waiting)")
+    health = [ln.split("\t") for ln in (farm.q / "health.tsv").read_text().splitlines()]
+    assert health[0][4:] == ["1", "0", "0000:0b:00.0", "2", "own", "1", "1", "0", ""]
+    assert health[1][4:] == ["4", "7", "0000:0e:00.0", "1", "other", "0", "1", "0", ""]
+
+
+def test_a_kernel_line_of_no_known_class_is_an_error_in_the_reason(farm):
+    # Two classes are consequences of what the job did (a process killed while it waited for the card; Synapse
+    # starting its failure analysis). Any other habanalabs line is a card error and says so.
+    _fake_dmesg(farm, "1003.5")
+    farm.env.update(CARDQ_MODULE_MAP=NODE_MAP,
+                    FAKE_DMESG_MORE="[ 1006.000000] habanalabs 0000:0c:00.0: Device heartbeat failed!\n"
+                                    "[ 1007.000000] habanalabs 0000:0c:00.0: Going to reset device\n"
+                                    "[ 1008.000000] habanalabs 0000:0c:00.0: user process got signal while "
+                                    "waiting for interrupt ID 52")
+    farm.q.mkdir(parents=True, exist_ok=True)
+    (farm.q / "pci_map").write_text("".join("%d 0000:%02x:00.0\n" % (i, 0x0a + i) for i in range(8)))
+    job = farm.hold("any:4", 0.1)  # cards 0,1,2,7; card 2 = 0000:0c:00.0 = module 1
+    assert farm.wait(job).returncode == 0
+    row = [ln.split("\t") for ln in farm.cq("ledger").stdout.splitlines() if ln.startswith(job)][0]
+    assert row[10] == ("ok; habanalabs ERROR: card 2 (module 1, 0000:0c:00.0) 3 lines (2 ERROR: Device heartbeat "
+                       "failed!, 1 killed while waiting)")
+    health = [ln.split("\t") for ln in (farm.q / "health.tsv").read_text().splitlines()]
+    mine = [h for h in health if h[6] == "0000:0c:00.0"][0]
+    assert mine[7:] == ["3", "own", "1", "0", "2", "Device heartbeat failed!"]
+    assert "3 (one of this job's cards): 2 ERROR, 1 killed while waiting; first:" in farm.cq("log", job).stdout
+
+
+def test_health_lists_the_kernel_lines_since_boot_per_card_and_class(farm):
+    _fake_dmesg(farm, "1000.25")
+    farm.env.update(CARDQ_MODULE_MAP=NODE_MAP)
+    farm.q.mkdir(parents=True, exist_ok=True)
+    (farm.q / "pci_map").write_text("".join("%d 0000:%02x:00.0\n" % (i, 0x0a + i) for i in range(8)))
+    job = farm.hold("any:4", 0.1)
+    assert farm.wait(job).returncode == 0
+    out = farm.cq("health").stdout
+    assert "card 1 (module 0, 0000:0b:00.0): 3 lines: 2 failure analysis, 1 killed while waiting" in out
+    assert "card 4 (module 7, 0000:0e:00.0): 1 lines: 1 failure analysis" in out
+    assert "no line of an unknown class: no card error" in out
+    assert "%s\talpha" % job in out  # the jobs that had lines, from health.tsv
+    out = farm.cq("health", FAKE_DMESG_MORE="[ 1006.000000] habanalabs 0000:0c:00.0: Device heartbeat failed!").stdout
+    assert "card 2 (module 1, 0000:0c:00.0): 1 lines: 1 ERROR (first: Device heartbeat failed!)" in out
+    assert "CARD ERROR" in out
 
 
 def test_without_kernel_lines_since_the_start_the_reason_stays_ok(farm):
@@ -751,7 +831,7 @@ def test_without_kernel_lines_since_the_start_the_reason_stays_ok(farm):
 
 
 def test_the_coordinator_gives_a_converted_job_the_place_of_the_cancelled_one(farm):
-    busy = farm.hold("0", 2.5)
+    busy = farm.block("all")  # nothing starts while the places are given
     assert farm.until(lambda: farm.file(busy, "state") == "running")
     old = farm.hold("all", 0.2, track="alpha", name="old-all")
     other = farm.hold("all", 0.2, track="beta", name="other-all")
@@ -761,6 +841,7 @@ def test_the_coordinator_gives_a_converted_job_the_place_of_the_cancelled_one(fa
     assert farm.cq("place", "--by", "coord", other, old).returncode == 4  # another track's job
     proc = farm.cq("place", "--by", "coord", new, old)
     assert proc.returncode == 0, proc.stderr
+    farm.release(busy)
     for job in (busy, other, new):
         assert farm.wait(job).returncode == 0
     iv = farm.intervals()
@@ -770,12 +851,13 @@ def test_the_coordinator_gives_a_converted_job_the_place_of_the_cancelled_one(fa
 
 
 def test_place_never_cancels_a_waiting_job(farm):
-    busy = farm.hold("0", 1.5)
+    busy = farm.block("0")
     assert farm.until(lambda: farm.file(busy, "state") == "running")
     old = farm.hold("0", 0.1, name="still-waiting")
     new = farm.hold("0", 0.1, name="newer")
     proc = farm.cq("place", "--by", "coord", new, old)
     assert proc.returncode == 1 and "only gives the place of a job its track cancelled" in proc.stderr
     assert farm.file(old, "state") == "waiting"
+    farm.release(busy)
     for job in (busy, old, new):
         assert farm.wait(job).returncode == 0

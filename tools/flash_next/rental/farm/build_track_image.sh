@@ -9,7 +9,8 @@
 # FARM_BUILD_CPUS cores (default 24) and runs niced, so it can run next to card jobs. One build per
 # track at a time (a lock) and at most FARM_IMAGE_SLOTS builds on the node (default 3), so builds do not
 # crowd the host side of card jobs; a second call for a commit that has its image returns at once. Keeps the
-# newest FARM_KEEP_IMAGES images of the track (default 3) and removes older ones that no container uses.
+# newest FARM_KEEP_IMAGES images of the track (default 3) and removes older ones that no container uses and
+# no waiting or running job of the card queue runs from (its job script names the commit).
 # The bundle is ~/farm/TRACK/b/SHA12 (farm_unpack.sh --sha); logs go to ~/farm/TRACK/images/SHA12/.
 
 set -euo pipefail
@@ -110,8 +111,23 @@ $DOCKER commit --change 'CMD ["bash"]' "$NAME" "$TAG" >/dev/null
 $DOCKER tag "$TAG" "farm-$track:latest"
 echo "IMAGE-READY $TAG ($(($(date -u +%s) - started)) s, tiny checkpoint $tiny)"
 
-# The newest KEEP images of the track stay; an older one goes only when no container uses it. Never fails
-# the build.
+# job_runs_from SHA12: 0 when a waiting or running job of the track in the card queue names that commit
+# (farm job|tiny|serve write "farm_job.sh --sha SHA12"; a script of its own may name the image).
+job_runs_from() {
+    local d st
+    for d in "${CARDQ_DIR:-$FARM/q}"/jobs/*/; do
+        [ -f "${d}cmd.sh" ] || continue
+        st="$(head -n 1 "${d}state" 2>/dev/null || true)"
+        case "$st" in waiting | running) ;; *) continue ;; esac
+        [ "$(head -n 1 "${d}track" 2>/dev/null || true)" = "$track" ] || continue
+        if grep -q -e "--sha $1" -e "farm-$track:$1" "${d}cmd.sh" 2>/dev/null; then return 0; fi
+    done
+    return 1
+}
+
+# The newest KEEP images of the track stay; an older one goes only when no container uses it and no
+# waiting or running job runs from it (that job would rebuild it at its start, holding its cards for the
+# three minutes). Never fails the build.
 prune() {
     local n=0 old
     $DOCKER images "farm-$track" --format '{{.Tag}} {{.CreatedAt}}' 2>/dev/null | grep -v '^latest ' \
@@ -119,6 +135,10 @@ prune() {
         n=$((n + 1))
         if [ "$n" -le "$KEEP" ] || [ "$old" = "$sha" ]; then continue; fi
         if [ -n "$($DOCKER ps -aq --filter "ancestor=farm-$track:$old" 2>/dev/null)" ]; then continue; fi
+        if job_runs_from "$old"; then
+            echo "build_track_image: kept for a waiting or running job: farm-$track:$old"
+            continue
+        fi
         if $DOCKER rmi "farm-$track:$old" >/dev/null 2>&1; then
             echo "build_track_image: removed the old image farm-$track:$old"
         fi
