@@ -14,16 +14,21 @@
 # script returns.
 #
 # By default the servers skip the bucket warmup (VLLM_SKIP_WARMUP=true): the graphs compile on first
-# use and a run takes about 5 minutes per mode. --full-warmup keeps the real warmup, about 15 minutes
-# per mode on the tiny model. The pytorch mode's server gets a compiled-recipe cache under
-# /results/recipe-cache, reused on the next start, so its second run is faster; the fused mode runs
-# without it (its kernel database must be in GC_KERNEL_PATH, which the Habana bridge accepts only
-# without a recipe cache). --no-recipe-cache drops the cache. --health-timeout S and --env KEY=VALUE
+# use and a run takes about 4-6 minutes per mode. --full-warmup keeps the real warmup, about 15 minutes
+# per mode on the tiny model. The servers get a compiled-recipe cache under /results/recipe-cache,
+# reused on the next start, so a second run is faster: the pytorch mode's always, the fused mode's
+# only with the combined kernel database (without that database, or with --no-combined-kernel-db, its
+# kernel database is in a colon-list GC_KERNEL_PATH, which the Habana bridge accepts only without a
+# recipe cache). --no-recipe-cache drops the cache. --health-timeout S and --env KEY=VALUE
 # (repeatable) are passed through to the check.
 #
 # The container stays. A second call reuses it, skips the install and the checkpoint build, and takes
 # a few minutes. After a change under plugin/ pass --reinstall: the servers run the installed plugin,
 # not the source tree.
+#
+# Ctrl-C, SIGTERM and a dropped SSH session (SIGHUP) stop the check inside the container, so its
+# server releases the cards; the exit code is then 130, 143 or 129. The Habana runtime logs of a
+# call go to <results>/<run-id>/habana_logs.
 
 set -euo pipefail
 
@@ -47,8 +52,8 @@ usage() {
     echo "  --full-warmup   run the real bucket warmup (about 15 minutes per mode); the default skips it"
     echo "  --health-timeout S  seconds to wait for the server to get healthy (default in the check: 1800)"
     echo "  --env KEY=VALUE extra server environment variable, repeatable; applied after the mode's own flags"
-    echo "  --no-recipe-cache   do not give the pytorch mode's server the compiled-recipe cache under /results/recipe-cache (the fused mode never gets it)"
-    echo "  --no-combined-kernel-db  keep the combined kernel database out of the smoke servers (FLASHINFER_GAUDI_COMBINED_KERNEL_DB=0 in the container)"
+    echo "  --no-recipe-cache   give no server the compiled-recipe cache under /results/recipe-cache (by default the pytorch mode's server gets it, and the fused mode's with the combined kernel database)"
+    echo "  --no-combined-kernel-db  keep the combined kernel database out of the smoke servers (FLASHINFER_GAUDI_COMBINED_KERNEL_DB=0 for the check and its servers); the fused mode's server then runs the colon-list GC_KERNEL_PATH without a recipe cache"
     echo "  --dry-run       print the docker commands and exit 0"
 }
 
@@ -145,12 +150,20 @@ fi
 
 # The three docker commands of a first call; a later call skips the first two.
 build_commands() {
+    # --init: an init process as PID 1 reaps the workers a crashed server leaves behind (without it
+    # they stay zombies and the check waits its full 65 s stop time for them). PYTHONFAULTHANDLER
+    # gives every Python process a stack on a crash. HABANA_LOGS keeps the Habana runtime logs of
+    # anything started in the container by hand under the results folder; the check's own logs go
+    # to its run folder (below).
     RUN_CMD=(
         docker run -d --name "$NAME"
+        --init
         --runtime=habana
         -e HABANA_VISIBLE_DEVICES=all
         -e OMPI_MCA_btl_vader_single_copy_mechanism=none
         -e PYTHONUNBUFFERED=1
+        -e PYTHONFAULTHANDLER=1
+        -e HABANA_LOGS=/results/habana_logs
         --cap-add=sys_nice
         --net=host
         --ipc=host
@@ -160,7 +173,14 @@ build_commands() {
         sleep infinity
     )
     INSTALL_CMD=(docker exec "$NAME" bash "/bundle/$ENTRY" --install-only --results /results --run-id "$RUN_ID")
-    SMOKE_CMD=(docker exec -w /bundle/plugin)
+    # The container outlives one call, so what belongs to this call travels with the docker exec:
+    # the Habana logs of the check and its servers go to the call's run folder. The fault handler is
+    # repeated here for a container that an older bundle created without it.
+    SMOKE_CMD=(
+        docker exec -w /bundle/plugin
+        -e "HABANA_LOGS=/results/$RUN_ID/habana_logs"
+        -e PYTHONFAULTHANDLER=1
+    )
     if [ "$NO_COMBINED_DB" -eq 1 ]; then
         # docker exec -e reaches the check and the servers it starts: they then treat the
         # combined kernel database as absent and use the colon-list GC_KERNEL_PATH (RUK-3249).
@@ -172,8 +192,9 @@ build_commands() {
         --out "/results/$RUN_ID" --ckpt "$CKPT" --gdn "$GDN"
     )
     if [ "$NO_RECIPE_CACHE" -eq 0 ]; then
-        # The check hands the cache to the pytorch mode's server only: the fused mode's kernel database
-        # must be registered in GC_KERNEL_PATH, which the Habana bridge accepts only without a cache.
+        # The check hands the cache to the servers that may carry it: the pytorch mode's, and the fused
+        # mode's with the combined kernel database (a colon-list GC_KERNEL_PATH and a recipe cache
+        # together are refused by the Habana bridge).
         SMOKE_CMD+=(--recipe-cache /results/recipe-cache)
     fi
     if [ "$FULL_WARMUP" -eq 1 ]; then
@@ -251,7 +272,7 @@ else
     if [ -n "$MOUNTED" ]; then RESULTS="$MOUNTED"; fi
 fi
 
-mkdir -p "$RESULTS/$RUN_ID"
+mkdir -p "$RESULTS/$RUN_ID/habana_logs" "$RESULTS/habana_logs"  # HABANA_LOGS of the check, and of the container
 CONSOLE_LOG="$RESULTS/$RUN_ID/console.log"
 say() {
     echo "$@" | tee -a "$CONSOLE_LOG"
@@ -260,7 +281,18 @@ say() {
 INSTALLED=0
 if [ "$NEW" -eq 1 ]; then
     say "container $NAME: starting"
-    "${RUN_CMD[@]}" >/dev/null
+    if ! "${RUN_CMD[@]}" >/dev/null; then
+        # --init needs Docker's docker-init binary on the host; a host without it leaves a created,
+        # never started container behind. Try once more without the flag: any other cause fails
+        # again here, with Docker's own message.
+        say "container $NAME: the start failed; trying once more without --init"
+        docker rm -f "$NAME" >/dev/null 2>&1 || true
+        NO_INIT_CMD=()
+        for arg in "${RUN_CMD[@]}"; do
+            [ "$arg" = "--init" ] || NO_INIT_CMD+=("$arg")
+        done
+        "${NO_INIT_CMD[@]}" >/dev/null
+    fi
 elif docker exec "$NAME" test -f "$MARKER"; then
     INSTALLED=1
 fi
@@ -283,21 +315,77 @@ else
     say "container $NAME: reusing the installed stack (--reinstall after a change under plugin/, --fresh for a new container)"
 fi
 
-# Ctrl-C ends the docker client, not the process in the container: stop the check there, so the
-# tiny server and its workers release the cards.
-on_interrupt() {
-    docker exec "$NAME" pkill -INT -f tools.flash_next.rental.tiny_smoke >/dev/null 2>&1 || true
-    echo "interrupted: asked the check in $NAME to stop its server" >&2
-    exit 130
-}
-trap on_interrupt INT TERM
-set +e
-"${SMOKE_CMD[@]}" 2>&1 | tee -a "$CONSOLE_LOG"
-RC=${PIPESTATUS[0]}
-set -e
-trap - INT TERM
+# A signal to this script does not reach the check in the container: Ctrl-C and a dropped SSH
+# session end the docker client at most, and the tiny server would keep all cards. on_signal stops
+# the check there (SIGINT: it stops its server and waits for the workers), waits until it is gone,
+# and after STOP_WAIT_S seconds stops the whole container instead, so nothing can keep the cards.
+STOP_WAIT_S="${FN_SMOKE_STOP_WAIT_S:-90}"
+RUN_PID=""
 
-say "results: $RESULTS/$RUN_ID (summary.json, <mode>/server0.log, console.log)"
+# True while the check runs in the container.
+check_running() {
+    docker exec "$NAME" pgrep -f tools.flash_next.rental.tiny_smoke >/dev/null 2>&1
+}
+
+# The docker client and tee end when the check does. Give them 15 s to copy its last lines into
+# console.log, then end what is left of them.
+wait_client() {
+    local left=15
+    if [ -z "$RUN_PID" ]; then
+        return 0
+    fi
+    while kill -0 "$RUN_PID" 2>/dev/null; do
+        if [ "$left" -le 0 ]; then
+            pkill -P "$RUN_PID" 2>/dev/null
+            kill "$RUN_PID" 2>/dev/null
+            break
+        fi
+        sleep 1
+        left=$((left - 1))
+    done
+    wait "$RUN_PID" 2>/dev/null
+}
+
+# on_signal NAME EXIT_CODE — Ctrl-C, SIGTERM, or SIGHUP from a dropped SSH session.
+on_signal() {
+    local left="$STOP_WAIT_S"
+    trap '' INT TERM HUP PIPE
+    set +e
+    say "interrupted by SIG$1: asked the check in $NAME to stop its server (at most $STOP_WAIT_S s)"
+    docker exec "$NAME" pkill -INT -f tools.flash_next.rental.tiny_smoke >/dev/null 2>&1
+    while check_running; do
+        if [ "$left" -le 0 ]; then
+            say "the check did not stop in $STOP_WAIT_S s: stopping container $NAME so nothing keeps the cards (the next call starts a new container and installs again)"
+            docker stop -t 10 "$NAME" >/dev/null 2>&1
+            break
+        fi
+        sleep 1
+        left=$((left - 1))
+    done
+    wait_client
+    say "results so far: $RESULTS/$RUN_ID"
+    exit "$2"
+}
+trap 'on_signal INT 130' INT
+trap 'on_signal TERM 143' TERM
+trap 'on_signal HUP 129' HUP
+set +e
+# The check runs in the background and the script waits for it with `wait`, which a signal
+# interrupts at once (a foreground command would hold the trap back until the check ends).
+(
+    # The docker client and tee ignore Ctrl-C and a dropped terminal: on_signal stops the check, and
+    # they go on copying its last lines into console.log until it is gone.
+    trap '' INT HUP
+    "${SMOKE_CMD[@]}" 2>&1 | tee -a "$CONSOLE_LOG"
+    exit "${PIPESTATUS[0]}"
+) &
+RUN_PID=$!
+wait "$RUN_PID"
+RC=$?
+set -e
+trap - INT TERM HUP
+
+say "results: $RESULTS/$RUN_ID (summary.json, <mode>/server0.log, console.log, habana_logs/)"
 say "container $NAME is still running, the stack installed and the cards free: sudo docker exec -it $NAME bash"
 say "run again: sudo bash $0 (a few minutes). Remove it when done: sudo docker rm -f $NAME"
 exit "$RC"

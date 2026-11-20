@@ -441,7 +441,7 @@ dry_run() {
     printf '%s\n' \
         "docker run --rm --runtime=habana -e HABANA_VISIBLE_DEVICES=all $IMAGE hl-smi -Q index,name -f csv,noheader | grep -c .  # must equal CARDS"
     echo
-    echo "summary, then: bash run_rental.sh --model /models/Qwen3.8-Flash-Next-FP8"
+    echo "summary, then the next steps: run_rental.sh --download-only, tiny_smoke.sh, run_rental.sh --quick-gates"
 }
 
 # --- steps --------------------------------------------------------------------
@@ -742,9 +742,12 @@ summary() {
     printf '%-20s %s\n' "free at $MOUNT" "${free_gb:-?} GB"
     printf '%-20s %s\n' "data disk" "${DATA_DISK:-none}"
     echo
-    echo "next: bash run_rental.sh --model /models/Qwen3.8-Flash-Next-FP8"
-    echo "  (add --download if the checkpoint is not on the node)"
-    echo "run run_rental.sh as root, or add your user to the docker group."
+    echo "next, in the cheapest order (run sheet: Cheapest session order):"
+    echo "  1. bash run_rental.sh --model /models/Qwen3.8-Flash-Next-FP8 --download-only"
+    echo "     (the checkpoint, detached; skip it when the checkpoint is on the node)"
+    echo "  2. meanwhile: bash tiny_smoke.sh --gdn pytorch, then bash tiny_smoke.sh --gdn fused"
+    echo "  3. inside tmux: bash run_rental.sh --model /models/Qwen3.8-Flash-Next-FP8 --quick-gates"
+    echo "run them as root, or add your user to the docker group."
 }
 
 main() {

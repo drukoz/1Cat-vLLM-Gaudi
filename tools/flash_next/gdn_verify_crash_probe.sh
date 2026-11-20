@@ -7,6 +7,12 @@
 # crashing thread's backtrace. Run it inside the rental container; `--dry-run` and
 # `--classify` also work on the Mac (bash 3.2) and touch no card, gdb, cmake or python.
 #
+# pytest runs with `-s`: its capture would swallow what the graph compiler writes to
+# stderr, and that is the only place its own error message appears. When gdb is absent
+# and cannot be installed, every check still runs, without gdb: the log then holds the
+# same output and the Python stack of the fault handler (also for a check that hits the
+# time limit, which is ended with SIGABRT for that), and the summary quotes that stack.
+#
 # usage: gdn_verify_crash_probe.sh [--dry-run] OUT_DIR
 #        gdn_verify_crash_probe.sh --classify LOG_FILE EXIT_CODE
 set -uo pipefail
@@ -27,11 +33,16 @@ classify() {
         printf 'crashed:%s\n' "$sig"
         return 0
     fi
-    if [ "$rc" = "139" ] || [ "$rc" = "134" ]; then
-        printf 'crashed:exit%s\n' "$rc"
-        return 0
-    fi
-    last=$(grep -E '^[0-9]+ (passed|failed|skipped|error)' "$log" 2>/dev/null | tail -1 || true)
+    # without gdb the exit code is the signal: SIGILL, SIGABRT, SIGBUS, SIGFPE, SIGSEGV
+    case "$rc" in
+        132 | 134 | 135 | 136 | 139)
+            printf 'crashed:exit%s\n' "$rc"
+            return 0
+            ;;
+    esac
+    # pytest's last summary ("1 failed, 2 passed in 3.21s"). With -s, text a library wrote without
+    # a newline can sit on the same line in front of it, so the match is not tied to the line start.
+    last=$(grep -E -o '[0-9]+ (passed|failed|skipped|error)[a-z, 0-9]* in [0-9.]+s' "$log" 2>/dev/null | tail -1 || true)
     case "$last" in
         *failed*|*error*|*skipped*) printf 'failed\n'; return 0 ;;
     esac
@@ -94,7 +105,7 @@ if [ "$DRY" = "1" ]; then
     while [ $i -lt ${#NAMES[@]} ]; do
         lib=$(kernel_placeholder)
         if [ "${LIBS[$i]}" = "strip" ]; then lib="$STRIP_LIB"; fi
-        printf 'run %s: PT_HPU_LAZY_MODE=%s GDN_FUSED_GAUDI_KERNEL_LIBRARY=%s %s --args %s -X faulthandler -m pytest -q -p no:cacheprovider -rs %s\n' \
+        printf 'run %s: PT_HPU_LAZY_MODE=%s GDN_FUSED_GAUDI_KERNEL_LIBRARY=%s PYTHONFAULTHANDLER=1 %s --args %s -X faulthandler -m pytest -q -p no:cacheprovider -rs -s %s\n' \
             "${NAMES[$i]}" "${LAZYS[$i]}" "$lib" "$(gdb_tail)" "$py_display" "${NODES[$i]}"
         i=$((i + 1))
     done
@@ -199,35 +210,44 @@ fi
 run_one() {
     local name="$1" lazy="$2" lib="$3" node="$4" rc verdict log
     log="$OUT_DIR/$name.log"
+    # -s (no capture) on both paths: the graph compiler's stderr must reach the log.
     if [ "$GDB_OK" = "1" ]; then
         (
             cd "$PLUGIN_ROOT" || exit 2
             env PYTHONPATH="$PLUGIN_ROOT" PT_HPU_LAZY_MODE="$lazy" \
                 GDN_FUSED_GAUDI_KERNEL_LIBRARY="$lib" GDN_FUSED_GAUDI_NATIVE_LIBRARY="$NATIVE_LIB" \
-                HABANA_LOGS="$OUT_DIR/$name.habana_logs" \
+                HABANA_LOGS="$OUT_DIR/$name.habana_logs" PYTHONFAULTHANDLER=1 \
                 timeout -k 10 "$PROBE_TIMEOUT_S" gdb -q -batch -nx \
                 -ex "set pagination off" -ex "set confirm off" -ex "set disable-randomization off" \
                 -ex "handle SIGPIPE nostop noprint pass" -ex "handle SIGUSR1 nostop noprint pass" \
                 -ex "handle SIGUSR2 nostop noprint pass" \
                 -ex run -ex "bt 40" -ex "info threads" -ex "thread apply all bt 25" -ex "info sharedlibrary" -ex kill \
-                --args "$(command -v "$PYTHON")" -X faulthandler -m pytest -q -p no:cacheprovider -rs "$node"
+                --args "$(command -v "$PYTHON")" -X faulthandler -m pytest -q -p no:cacheprovider -rs -s "$node"
         ) > "$log" 2>&1
         rc=$?
     else
+        # No gdb: at the time limit the check gets SIGABRT, which makes the fault handler write the
+        # Python stack of every thread before the process dies (no core file: the limit is set to 0).
         (
             cd "$PLUGIN_ROOT" || exit 2
+            ulimit -c 0 2>/dev/null
             env PYTHONPATH="$PLUGIN_ROOT" PT_HPU_LAZY_MODE="$lazy" \
                 GDN_FUSED_GAUDI_KERNEL_LIBRARY="$lib" GDN_FUSED_GAUDI_NATIVE_LIBRARY="$NATIVE_LIB" \
-                HABANA_LOGS="$OUT_DIR/$name.habana_logs" \
-                timeout -k 10 "$PROBE_TIMEOUT_S" "$PYTHON" -X faulthandler -m pytest -q -p no:cacheprovider -rs "$node"
+                HABANA_LOGS="$OUT_DIR/$name.habana_logs" PYTHONFAULTHANDLER=1 \
+                timeout -s ABRT -k 10 "$PROBE_TIMEOUT_S" "$PYTHON" -X faulthandler -m pytest -q -p no:cacheprovider -rs -s "$node"
         ) > "$log" 2>&1
         rc=$?
     fi
     verdict=$(classify "$log" "$rc")
     printf '%s: %s\n' "$name" "$verdict" >> "$SUMMARY"
     case "$verdict" in
-        crashed:*)
-            grep -m1 -A 16 'received signal' "$log" 2>/dev/null | sed 's/^/    /' >> "$SUMMARY" || true
+        crashed:* | timed_out)
+            if grep -q 'received signal' "$log" 2>/dev/null; then
+                grep -m1 -A 16 'received signal' "$log" 2>/dev/null | sed 's/^/    /' >> "$SUMMARY" || true
+            else
+                # no gdb backtrace: the Python stack the fault handler wrote stands in for it
+                grep -m1 -A 16 'Fatal Python error' "$log" 2>/dev/null | sed 's/^/    /' >> "$SUMMARY" || true
+            fi
             ;;
     esac
     LAST_VERDICT="$verdict"
