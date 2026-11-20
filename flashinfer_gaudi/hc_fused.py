@@ -109,18 +109,24 @@ def _owned(x: torch.Tensor) -> torch.Tensor:
 
 # Which activations are copied before an op (the ``copy_mode`` of the wrappers below; the layer passes its
 # VLLM_HPU_HC_FUSED_COPY_MODE). A view must never reach a custom op (card job 00043, 2026-11-20: 7 of 7 view
-# cases raised with the accumulation thread off), but only a tensor that is handed to the layer can be one:
+# cases raised with the accumulation thread off), and there is no fallback when one does: in lazy mode an op is
+# only recorded when it is called, the refusal comes when the graph is launched, outside the layer's try (the
+# first servers that did this died). But only a tensor that is handed to the layer can be a view:
 #   COPY_ALL           every activation (the default; what ran on the cards on 2026-11-20)
 #   COPY_HANDED_IN     not the tensors the hyper-connection itself makes inside the call: the norm output and
 #                      the outputs of its two GEMMs. The residual, the block output and the injection are copied.
-#   COPY_BLOCK_OUTPUT  only the block output (an attention or MoE block may return a view of its result) and
-#                      hc_norm's input. The residual and the injection must then be op outputs, as the target
-#                      model's layer chain makes them (test_fewer_owned_copies_change_no_bit_and_hand_no_op_a_view).
-#                      There is no fallback for a caller that hands in a view: in lazy mode the op is only
-#                      recorded when it is called, and the refusal comes when the graph is launched, outside the
-#                      layer's try (the first servers that did this died).
+#   COPY_BLOCK_OUTPUT  as COPY_HANDED_IN, and no copy of a residual or an injection that is the very tensor a
+#                      fused hyper-connection op returned (the ops mark their outputs, ``_FUSED_OUTPUT``): the
+#                      target model's layers chain them that way, so one copy per hyper-connection is left, the
+#                      block output's (an attention or MoE block may return a view of its result). Anything
+#                      else that is handed in is copied as before: the first hidden state, a residual that went
+#                      through another op, the MTP draft layer's ``flatten`` view of its input, an injection
+#                      of a layer on the torch path (a ``split`` view).
 COPY_ALL, COPY_HANDED_IN, COPY_BLOCK_OUTPUT = 0, 1, 2
 COPY_MODES = (COPY_ALL, COPY_HANDED_IN, COPY_BLOCK_OUTPUT)
+# The attribute a wrapper sets on the tensors its op returns (modes 1 and 2 only). It lives on the Python object:
+# a view, a slice or the result of any other op is another object and does not have it.
+_FUSED_OUTPUT = "_hc_fused_output"
 
 
 def _made_here(x: torch.Tensor, copy_mode: int) -> torch.Tensor:
@@ -129,47 +135,63 @@ def _made_here(x: torch.Tensor, copy_mode: int) -> torch.Tensor:
 
 
 def _chained(x: torch.Tensor, copy_mode: int) -> torch.Tensor:
-    """The residual stream or the injection: a fused op's output wherever the model's layers chain them."""
-    return x if copy_mode == COPY_BLOCK_OUTPUT else _owned(x)
+    """The residual stream or the injection: no copy only of a fused op's own output, and only in mode 2."""
+    if copy_mode == COPY_BLOCK_OUTPUT and getattr(x, _FUSED_OUTPUT, False):
+        return x
+    return _owned(x)
+
+
+def _marked(out, copy_mode: int):
+    """``out`` (a tensor or a tuple of tensors an op returned), marked as fused outputs in modes 1 and 2."""
+    if copy_mode != COPY_ALL:
+        for tensor in (out if isinstance(out, tuple) else (out, )):
+            setattr(tensor, _FUSED_OUTPUT, True)
+    return out
 
 
 def hc_norm(x: torch.Tensor, norm_weight: torch.Tensor, eps: float, hc_count: int, *,
             copy_mode: int = COPY_ALL) -> torch.Tensor:
     """Grouped Gemma RMSNorm of the multi-stream residual ``[T, hc_count * H]``."""
-    return torch.ops.flashinfer_gaudi.hc_norm(_owned(x), norm_weight, float(eps), int(hc_count))
+    return _marked(torch.ops.flashinfer_gaudi.hc_norm(_chained(x, copy_mode), norm_weight, float(eps), int(hc_count)),
+                   copy_mode)
 
 
 def hc_silu(down: torch.Tensor, hc_count: int, *, copy_mode: int = COPY_ALL) -> torch.Tensor:
     """``silu(down / hc_count)`` of the down GEMM output ``[T, R]`` (final mixer)."""
-    return torch.ops.flashinfer_gaudi.hc_silu(_made_here(down, copy_mode), int(hc_count))
+    return _marked(torch.ops.flashinfer_gaudi.hc_silu(_made_here(down, copy_mode), int(hc_count)), copy_mode)
 
 
 def hc_silu_split(down: torch.Tensor, hc_count: int, lora_rank: int, *,
                   copy_mode: int = COPY_ALL) -> tuple[torch.Tensor, torch.Tensor]:
     """``(silu(down[:, :R] / hc_count), down[:, R:R + hc_count])`` of the merged down+inject GEMM output."""
-    return torch.ops.flashinfer_gaudi.hc_silu_split(_made_here(down, copy_mode), int(hc_count), int(lora_rank))
+    return _marked(
+        torch.ops.flashinfer_gaudi.hc_silu_split(_made_here(down, copy_mode), int(hc_count), int(lora_rank)),
+        copy_mode)
 
 
 def hc_gate_mix(xn: torch.Tensor, gate: torch.Tensor, hc_count: int, *, copy_mode: int = COPY_ALL) -> torch.Tensor:
     """Sigmoid gate and gated mean over the streams: the block input ``[T, H]``."""
-    return torch.ops.flashinfer_gaudi.hc_gate_mix(_made_here(xn, copy_mode), _made_here(gate, copy_mode),
-                                                  int(hc_count))
+    return _marked(
+        torch.ops.flashinfer_gaudi.hc_gate_mix(_made_here(xn, copy_mode), _made_here(gate, copy_mode), int(hc_count)),
+        copy_mode)
 
 
 def hc_combine(residual: torch.Tensor, block_output: torch.Tensor, injection: torch.Tensor, hc_count: int, *,
                copy_mode: int = COPY_ALL) -> torch.Tensor:
     """``residual + block_output * 2 * sigmoid(injection / hc_count)`` per stream."""
-    return torch.ops.flashinfer_gaudi.hc_combine(_chained(residual, copy_mode), _owned(block_output),
-                                                 _chained(injection, copy_mode), int(hc_count))
+    return _marked(
+        torch.ops.flashinfer_gaudi.hc_combine(_chained(residual, copy_mode), _owned(block_output),
+                                              _chained(injection, copy_mode), int(hc_count)), copy_mode)
 
 
 def hc_combine_norm(residual: torch.Tensor, block_output: torch.Tensor, injection: torch.Tensor,
                     norm_weight: torch.Tensor, eps: float, hc_count: int, *,
                     copy_mode: int = COPY_ALL) -> tuple[torch.Tensor, torch.Tensor]:
     """The combine, rounded to the input dtype, and the grouped Gemma RMSNorm of the rounded result."""
-    return torch.ops.flashinfer_gaudi.hc_combine_norm(_chained(residual, copy_mode), _owned(block_output),
-                                                      _chained(injection, copy_mode), norm_weight, float(eps),
-                                                      int(hc_count))
+    return _marked(
+        torch.ops.flashinfer_gaudi.hc_combine_norm(_chained(residual, copy_mode), _owned(block_output),
+                                                   _chained(injection, copy_mode), norm_weight, float(eps),
+                                                   int(hc_count)), copy_mode)
 
 
 _DISPATCH_KEYS_BY_DEVICE_TYPE = {"cpu": "CPU", "hpu": "HPU"}

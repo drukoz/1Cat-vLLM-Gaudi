@@ -350,22 +350,25 @@ come from `hc_fused_ops*.so`, and a process without that extension has no kernel
 `tests/unit_tests/hc_fused/hc_ops.py`, which adds the oracle as the CPU kernels.
 
 **Owned copies (`VLLM_HPU_HC_FUSED_COPY_MODE`).** A custom op takes no view (card job 00043: every view raised,
-also with the accumulation thread off), so the wrappers copy activations (`_owned`). Mode 0, the default, copies
-every one: six copies per `combine_and_mix` (residual, block output, injection; the down GEMM output; the norm
-output and the up GEMM output), twelve per decoder layer next to its six fused ops, about 580 graph nodes per
-decode step of the 48-layer model, three of the six of width `4H`. Only a tensor that is handed to the layer can
-be a view. Mode 1 leaves out the three the hyper-connection makes inside the call (its norm output and its two GEMM
-outputs). Mode 2 copies only the block output (a MoE block returns `final_hidden_states.view(orig_shape)`) and a
-lone norm's input: the residual and the injection are op outputs in the target model's layer chain (the previous
-hyper-connection's outputs, `hidden_states + ple(...)`, the repeated embedding). A caller that hands in a view all
-the same has no fallback: in lazy mode an op is only recorded when it is called, the refusal comes when the graph
-is launched, outside the layer's `try`, and the step fails (the first servers that passed views died). So mode 2
-is for the paths a test has shown to pass no view; the MTP draft layer is not among them yet. The values do not change
-(`test_copy_mode_leaves_out_copies_and_changes_no_bit`; over the whole tiny model
-`test_fewer_owned_copies_change_no_bit_and_hand_no_op_a_view`: 53, 26 and 10 copies per forward of the 4-layer
-model in modes 0, 1 and 2, and no fused op is given a view in any mode). Not yet run on a card: that a pending
-GEMM output or fused-op output needs no copy is what `probe_view_inputs.py` asks (line `OP OUTPUTS`) and what a
-served run with the mode shows (no `is off for` line).
+also with the accumulation thread off), and a view that reaches one fails the step: in lazy mode an op is only
+recorded when it is called, the refusal comes when the graph is launched, outside the layer's `try` (the first
+servers that passed views died). So the wrappers copy activations (`_owned`). Mode 0, the default, copies every
+one: six copies per `combine_and_mix` (residual, block output, injection; the down GEMM output; the norm output and
+the up GEMM output), twelve per decoder layer next to its six fused ops, about 580 graph nodes per decode step of
+the 48-layer model, three of the six of width `4H`. Only a tensor that is handed to the layer can be a view. Mode 1
+leaves out the three the hyper-connection makes inside the call (its norm output and its two GEMM outputs). Mode 2
+also leaves out a residual or an injection that is the very tensor a fused hyper-connection op returned: the
+wrappers mark their outputs (`_FUSED_OUTPUT`, an attribute of the Python object, which a view, a slice or another
+op's result does not have), and the model's layers hand those objects on unchanged, so one copy per
+hyper-connection is left, the block output's (a MoE block returns `final_hidden_states.reshape(orig_shape)`).
+Whatever else is handed in is copied as in mode 1: the repeated embedding, the residual after the PLE layer's add,
+the MTP draft layer's `flatten` view of its input. The values do not change
+(`test_copy_mode_leaves_out_copies_and_changes_no_bit` on a chain of two calls,
+`test_no_copy_mode_hands_a_fused_op_a_view` with views of the residual, the injection and the block output; over
+the whole tiny model `test_fewer_owned_copies_change_no_bit_and_hand_no_op_a_view`: 53, 26 and 12 copies per
+forward of the 4-layer model in modes 0, 1 and 2, and no fused op is given a view in any mode). Not yet run on a
+card: that a pending GEMM output or fused-op output needs no copy is what `probe_view_inputs.py` asks (line `OP
+OUTPUTS`), what `probe_hc_copies.py` times per mode, and what a served run with the mode shows.
 
 ### 2. Layer (`vllm_gaudi/models/qwen4_exp/hyperconnection.py`)
 

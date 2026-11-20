@@ -1956,13 +1956,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
 
     # (Declared here because tests pin GDN_CORE_VERIFY, HC_FUSED, MOE_GLUE and MOE_GLUE_MERGE_GATE_UP as
     # neighbours.) With VLLM_HPU_HC_FUSED=1 only: which activations get an owned copy before a fused
-    # hyper-connection op (a custom HPU op is never given a view: card job 00043, 2026-11-20). 0 = every
-    # activation, six copies per hyper-connection (default); 1 = not the tensors the hyper-connection makes
-    # inside the call (its norm output and its two GEMM outputs), three copies; 2 = only the block output, one
-    # copy: the residual stream and the injection must then be op outputs, which they are in the target
-    # model's layer chain. A caller that hands in a view all the same gets no fallback (in lazy mode the
-    # refusal comes when the graph is launched, not when the op is called), so 2 is for the paths a test has
-    # shown to pass no view. Any other value is 0. Read once per layer at construction. Not yet run on a card.
+    # hyper-connection op (a custom HPU op is never given a view: card job 00043, 2026-11-20, and a view that
+    # reaches one fails the step, there is no fallback). 0 = every activation, six copies per hyper-connection
+    # (default); 1 = not the tensors the hyper-connection makes inside the call (its norm output and its two
+    # GEMM outputs), three copies; 2 = as 1, and no copy of a residual or an injection that is the very tensor
+    # a fused hyper-connection op returned, which is how the model's layers chain them: one copy, the block
+    # output's. Whatever else a caller hands in (a view, another op's result) is copied as before. Any other
+    # value is 0. Read once per layer at construction. Not yet run on a card.
     "VLLM_HPU_HC_FUSED_COPY_MODE":
     lambda: int(os.environ.get("VLLM_HPU_HC_FUSED_COPY_MODE", "0")),
 

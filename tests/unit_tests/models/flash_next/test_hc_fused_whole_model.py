@@ -148,9 +148,12 @@ def test_fewer_owned_copies_change_no_bit_and_hand_no_op_a_view(tiny_checkpoint,
         assert [name for name, requested, ok, logged in layers if not (requested and ok is True and not logged)] == []
     assert lines == []
     base_out, base_ops, base_counter = runs["0"]
-    # mode 0 copies every activation: norm 1, combine 3, combine_norm 3, silu and silu_split 1, gate_mix 2
-    per_forward = {"0": 2 * 1 + 1 * 3 + 7 * 3 + 9 * 1 + 9 * 2, "1": 2 * 1 + 1 * 3 + 7 * 3, "2": 2 * 1 + 1 * 1 + 7 * 1}
-    assert per_forward == {"0": 53, "1": 26, "2": 10}
+    # mode 0 copies every activation: norm 1, combine 3, combine_norm 3, silu and silu_split 1, gate_mix 2.
+    # Mode 2 copies the block outputs (1 + 7) and what no fused op made: the input of the two lone norms (the
+    # repeated embedding, and the residual after the PLE layer's add) and the residual those two layers pass on
+    # to their MLP hyper-connection unchanged.
+    per_forward = {"0": 2 * 1 + 1 * 3 + 7 * 3 + 9 * 1 + 9 * 2, "1": 2 * 1 + 1 * 3 + 7 * 3, "2": 2 + (1 + 7) + 2}
+    assert per_forward == {"0": 53, "1": 26, "2": 12}
     for mode, (outputs, ops, counter) in runs.items():
         assert ops == base_ops
         assert dict(counter.views) == {}, f"mode {mode}: fused ops were given views"

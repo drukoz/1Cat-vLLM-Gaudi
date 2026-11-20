@@ -150,21 +150,22 @@ thread off); see `docs/design/flash-next/hc-fused.md` and
 `VLLM_HPU_HC_FUSED_COPY_MODE` (integer, default `0`) applies only with
 `VLLM_HPU_HC_FUSED=1`. A custom HPU op is never given a view (on a card every
 view raised `Empty tensor optional ... Strided Params Has Value: 1`, also with
-the accumulation thread off), so the fused ops get owned copies of their
-activations. `0` copies every activation: six copies per hyper-connection
+the accumulation thread off, and the refusal comes when the graph is launched:
+the step fails, a layer cannot fall back), so the fused ops get owned copies of
+their activations. `0` copies every activation: six copies per hyper-connection
 (residual, block output and injection for the combine, the down GEMM output for
 the silu, the norm output and the up GEMM output for the gated mix), about 580
 graph nodes per decode step of the 48-layer model. `1` leaves out the three
 tensors the hyper-connection makes inside the call (its norm output and its two
-GEMM outputs), which are op outputs and never views. `2` copies only the block
-output (an attention or MoE block may return a view of its result) and the
-input of a lone norm: the residual stream and the injection must then be op
-outputs, which they are in the target model's layer chain (a CPU test over
-the whole tiny model holds this). A caller that hands in a view all the same
-gets no fallback: in lazy mode the op is only recorded when it is called, and
-the refusal comes when the graph is launched, outside the layer's `try`, so
-the step fails. Any other value is `0`. The flag is read once per layer at
-construction. The values are the same in every mode. Not yet run on a card.
+GEMM outputs), which are op outputs and never views. `2` also leaves out a
+residual or an injection that is the very tensor a fused hyper-connection op
+returned (the ops mark their outputs), which is how the model's layers chain
+them: one copy per hyper-connection is left, the block output's (an attention
+or MoE block may return a view of its result). Whatever else a caller hands in
+is copied as in mode `1`: the first hidden state, a residual that went through
+another op, the MTP draft layer's `flatten` view of its input. Any other value
+is `0`. The flag is read once per layer at construction. The values are the
+same in every mode. Not yet run on a card.
 
 `VLLM_HPU_MOE_GLUE` selects the path of the element-wise ops of the Flash-Next
 MoE block as an integer. `0` (default) keeps the torch path. `1` computes the

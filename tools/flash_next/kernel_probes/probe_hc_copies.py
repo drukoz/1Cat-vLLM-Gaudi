@@ -17,7 +17,8 @@ A chain of K hyper-connections as a decoder layer wires them (vllm_gaudi/models/
     block_output    = linear(block_input, W_block).view(-1, H)            a block's output: a GEMM result, viewed
 
 The wrappers of flashinfer_gaudi.hc_fused copy, per hyper-connection: mode 0 all six activations, mode 1 three
-(residual, block output, injection), mode 2 one (the block output). Per mode and row count (1, 32, 128):
+(residual, block output, injection), mode 2 one (the block output; the first of the K also copies the residual and
+the injection it is handed, which no fused op made). Per mode and row count (1, 32, 128):
   * parity: the chain's last residual against mode 0's, bit for bit (the ops and their inputs are the same);
   * time: the device-bound time per hyper-connection, (mark_step + synchronize) / K, the median of the iterations,
     and the host time to issue the K hyper-connections.
