@@ -12,9 +12,8 @@ chosen by batch size only, and the MTP drafter's per-step metadata follows the s
   sparse QSA, the recurrent state pool, prefix caching) gives the same tokens and bit-identical logits with
   the flag on and off, for plain decode and for k = 3 verification steps (oracle drafts with forced
   rejections, through the n-gram method, which needs no draft model), and the tokens are the HF reference's;
-* every decode step of one batch size has one graph signature with the flag on (the dense path has one per
-  block bucket);
-* the step's host-to-device copies drop by the three buffers.
+* ``test_decode_metadata_graphs.py``: one decode graph per batch size, three fewer copies per step, the
+  refusal under dense QSA.
 """
 
 from tests.unit_tests.models.flash_next import engine_harness as eh  # first: installs the Gaudi runtime stand-ins
@@ -269,48 +268,3 @@ def test_k3_verification_tokens_and_logits_match_the_dense_buffers(tiny_checkpoi
     dense = _serve(tiny_checkpoint, reference, 0, spec_k=3)
     assert dense[2].query_widths.count(4) >= 4, f"too few k = 3 verification steps: {dense[2].query_widths}"
     _assert_same_run(dense, _serve(tiny_checkpoint, reference, 1, spec_k=3))
-
-
-def _two_contexts(tiny_checkpoint, flag: int) -> dict:
-    """Four short and then four long requests decoding at batch size four: decode signatures by input shape."""
-    rng = random.Random(9)
-    options = eh.Options(max_num_seqs=4, max_model_len=4096, env={FLAG: str(flag)})
-    with eh.open_engine(tiny_checkpoint, options) as engine:
-        recorder = _Recorder(engine)
-        for length in (40, 700):
-            for index in range(4):
-                engine.add(f"len{length}-{index}", [rng.randrange(1000, 200000) for _ in range(length + index)],
-                           max_tokens=3)
-            engine.run()
-        signatures: dict = {}
-        for shape, signature in recorder.decode_signatures:
-            signatures.setdefault(shape, set()).add(signature)
-        return signatures
-
-
-def test_one_decode_graph_per_batch_size(tiny_checkpoint):
-    dense = _two_contexts(tiny_checkpoint, 0)
-    sparse = _two_contexts(tiny_checkpoint, 1)
-    assert set(dense) == set(sparse)
-    assert any(len(signatures) > 1 for signatures in dense.values()), "the dense path should split by block bucket"
-    assert all(len(signatures) == 1 for signatures in sparse.values()), sparse
-
-
-@pytest.mark.parametrize("rows", [1, 32])
-def test_decode_step_copies_three_fewer_tensors(tiny_checkpoint, rows):
-    from tests.unit_tests.models.flash_next.test_engine_step_budget import (BASELINE_H2D_COPIES, BASELINE_HOST_READS,
-                                                                            decode_step_counts)
-
-    dense = decode_step_counts(tiny_checkpoint, rows)
-    sparse = decode_step_counts(tiny_checkpoint, rows, env={FLAG: "1"})
-    assert dense["h2d_copies"] == BASELINE_H2D_COPIES
-    assert sparse["h2d_copies"] == BASELINE_H2D_COPIES - 3, sparse["sites"]
-    assert sparse["host_reads"] == BASELINE_HOST_READS
-    assert sparse["h2d_bytes"] < dense["h2d_bytes"]
-
-
-def test_flag_is_refused_under_dense_qsa(tiny_checkpoint):
-    """Dense QSA reads the paged-attention buffers: with the flag on the runner keeps building them."""
-    options = eh.Options(max_num_seqs=2, env={FLAG: "1", "VLLM_HPU_FLASH_NEXT_QSA_MODE": "0"})
-    with eh.open_engine(tiny_checkpoint, options) as engine:
-        assert engine.runner.flash_next_sparse_decode_metadata() is False
