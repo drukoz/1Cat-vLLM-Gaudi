@@ -52,6 +52,7 @@ def test_components_gaps_and_launches(tmp_path):
     assert abs(res["collective_gap_ms"]["gdn"] - 6.0 / 1e3) < 1e-9  # 10..16 us after the GDN node, HCL inside
     assert abs(res["small_gap_ms"]["gdn"] - 2.0 / 1e3) < 1e-9  # 18..20 us after the fused node (given to gdn)
     assert res["launches"] == 1.0 and abs(res["launch_ms"] - 0.2) < 1e-9
+    assert res["nodes"]["gdn"] == 2.0 and res["nodes"]["moe_experts"] == 1.0 and res["nodes"]["moe_prep"] == 1.0
     no = tc.analyze(_trace()["traceEvents"], assign=False)
     assert abs(no["exclusive_ms"]["unattributed"] - 2.0 / 1e3) < 1e-9
 

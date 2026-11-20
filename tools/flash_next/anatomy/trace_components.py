@@ -14,6 +14,8 @@ Per decode step (the ``step_timing:step`` ranges of the step timer) it prints:
 * the compute engines' idle gaps: those an HCL event overlaps (the compute engines wait for an all-reduce: its
   transfer, its peers, and at one stream the host launch of the next graph) and the others, by size; gaps under
   200 us go to the component whose node ran just before (its per-node overhead);
+* device nodes per component: events of one node name that overlap in time are one execution (a TPC node runs on
+  many engines at once); layers share recipes, so a name recurs once per layer;
 * host: graph launches (``ExecuteCachedGraph``) per step, their host time and spread, the device-to-host read-back.
 
 Components from the module path: ``linear_attn`` -> gdn; ``self_attn/sparse_attn`` -> qsa_attention;
@@ -40,6 +42,7 @@ QSA_PROJ = ("qkv_proj", "o_proj", "index_qk_proj", "bmm", "rotary_emb", "q_norm"
 ORDER = ("hc", "gdn", "qsa_indexer", "qsa_attention", "qsa_proj", "moe_router", "moe_prep", "moe_experts", "moe_shared",
          "ple", "embed", "logits", "layer_other", "unattributed", "collective")
 SMALL_GAP_US = 200.0
+NODE_JOIN_US = 1.0  # events of one node name closer than this are one execution on several engines
 
 
 def component(path: str) -> str | None:
@@ -132,7 +135,8 @@ def analyze(events: list, assign: bool = True, name: str = "") -> dict:
         cls = engine_class(threads.get((ev.get("pid"), ev.get("tid")), ""))
         start = float(ev["ts"])
         comp = "collective" if cls == "HCL" else component(event_path(ev))
-        recs.append([start, start + float(ev.get("dur", 0.0)), comp, cls])
+        key = (ev.get("args") or {}).get("EventName") or ev.get("name", "")
+        recs.append([start, start + float(ev.get("dur", 0.0)), comp, cls, key])
     recs.sort(key=lambda r: r[0])
     last, n_unattr, unattr = "unattributed", 0, 0.0
     for r in recs:
@@ -161,6 +165,19 @@ def analyze(events: list, assign: bool = True, name: str = "") -> dict:
     work = defaultdict(Counter)
     for r in recs:
         work[r[2]][r[3]] += r[1] - r[0]
+    nodes = Counter()
+    by_key = defaultdict(list)
+    for r in recs:
+        if r[3] != "HCL":
+            by_key[r[4]].append(r)
+    for rows in by_key.values():
+        end = None
+        for r in sorted(rows, key=lambda x: x[0]):
+            if end is None or r[0] > end + NODE_JOIN_US:
+                nodes[r[2]] += 1
+                end = r[1]
+            else:
+                end = max(end, r[1])
     # idle gaps of the compute engines (all but HCL)
     merged = []
     for r in recs:
@@ -202,6 +219,7 @@ def analyze(events: list, assign: bool = True, name: str = "") -> dict:
         "busy_ms": busy / per,
         "exclusive_ms": {c: v / per for c, v in excl.items()},
         "engine_ms": {c: {k: v / per for k, v in w.items()} for c, w in work.items()},
+        "nodes": {c: v / n for c, v in nodes.items()},
         "unattributed_events": n_unattr / n,
         "unattributed_engine_ms": unattr / per,
         "compute_busy_ms": sum(m[1] - m[0] for m in merged) / per,
@@ -226,14 +244,15 @@ def report(res: dict) -> str:
                                  res["launch_ms"], "/".join("%.0f" % x for x in res["launch_us_p10_p50_p90_max"]),
                                  res["d2h_ms"], res["unattributed_events"], res["unattributed_engine_ms"]),
            "| component | device ms (exclusive) | + idle gaps < 200 us after it | + all-reduce gaps after it | "
-           "TPC engine-ms | MME engine-ms | DMA engine-ms | HCL engine-ms |",
-           "|---|---|---|---|---|---|---|---|"]
+           "device nodes | TPC engine-ms | MME engine-ms | DMA engine-ms | HCL engine-ms |",
+           "|---|---|---|---|---|---|---|---|---|"]
     for c in names:
         w = res["engine_ms"].get(c, {})
-        out.append("| %s | %.2f | %.2f | %.2f | %.2f | %.2f | %.2f | %.2f |" % (
-            c, ex.get(c, 0.0), sg.get(c, 0.0), cg.get(c, 0.0), w.get("TPC", 0.0), w.get("MME", 0.0), w.get("DMA", 0.0),
-            w.get("HCL", 0.0)))
-    out.append("| sum | %.2f | %.2f | %.2f | | | | |" % (sum(ex.values()), sum(sg.values()), sum(cg.values())))
+        out.append("| %s | %.2f | %.2f | %.2f | %.0f | %.2f | %.2f | %.2f | %.2f |" % (
+            c, ex.get(c, 0.0), sg.get(c, 0.0), cg.get(c, 0.0), res["nodes"].get(c, 0.0), w.get("TPC", 0.0),
+            w.get("MME", 0.0), w.get("DMA", 0.0), w.get("HCL", 0.0)))
+    out.append("| sum | %.2f | %.2f | %.2f | %.0f | | | | |" % (sum(ex.values()), sum(sg.values()), sum(cg.values()),
+                                                         sum(res["nodes"].values())))
     out.append("compute engines busy %.2f ms; idle under all-reduces %.2f ms in %.0f gaps; other idle %s" % (
         res["compute_busy_ms"], sum(cg.values()), sum(res["collective_gaps"].values()),
         ", ".join("%s %.2f ms" % kv for kv in sorted(res["other_gap_ms"].items()))))
