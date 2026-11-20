@@ -28,9 +28,18 @@ result. Parts:
            than block_topk = 512, so the top-k selects) for 1, 4 and 32 rows, and at 64 blocks (a short prompt);
   pattern  top-k, argmax, max, sort and searchsorted ids: read as int64 (the control), narrowed in the graph, and
            the narrowed ids as the next op's input (index_select, embedding);
-  fix      what could replace the narrowing without a second graph.
+  fix      what could replace the narrowing without a second graph, on plain scores and on 00038's construct;
+  boundary where the narrowing breaks. Job 00038 had it wrong at [16, 512] softmax probabilities with k = 10 and at
+           [16, 16] with k = 2; the sparse-QSA selection at [8, 32768] plain fp32 scores with k = 512 came out
+           right on a card (qsa-fused, jobs 00062 / 00063). So it depends on the shape or on what makes top-k's
+           input: top-k of host-made fp32 scores, of an in-graph softmax of fp32 logits and of an in-graph softmax
+           (dtype=float32) of bf16 logits, each narrowed in the graph, over rows 1, 2, 16, 32 x columns 16, 512,
+           2048, 32768 x k 2, 10, 64, 512; and at four shapes the other constructs (the whole routing of 00038
+           with and without its in-place division of the values, a multiply as the producer, bf16 scores, the
+           QSA selection). Rows that tie at the cut on the CPU are left out of a case's verdict.
 
-Lines `PROBE narrow <part> <case>: RIGHT | WRONG (...) | ERROR (...)`, then three VERDICT lines.
+Lines `PROBE narrow <part> <case>: RIGHT | WRONG (...) | ERROR (...)`, a BOUNDARY matrix (one letter per row
+count: R right, W wrong, E error), then four VERDICT lines.
 """
 import argparse
 import importlib.util
@@ -71,17 +80,29 @@ def backend():
 
 
 def sparse_ops():
-    """The plugin's qsa_sparse_ops.py by path: it imports only math and torch, and nothing of vLLM is loaded."""
-    spec = importlib.util.spec_from_file_location("probe_qsa_sparse_ops", SPARSE_OPS)
+    """The plugin's qsa_sparse_ops.py by path: it imports only math and torch, and nothing of vLLM is loaded.
+
+    Looked up in the tree of this file, then in the working folder (a farm job runs in its tree)."""
+    relative = Path("vllm_gaudi") / "models" / "qwen4_exp" / "qsa_sparse_ops.py"
+    path = next((c for c in (SPARSE_OPS, Path.cwd() / relative) if c.is_file()), SPARSE_OPS)
+    spec = importlib.util.spec_from_file_location("probe_qsa_sparse_ops", path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
 
 
-def describe(torch, got, want, sets):
-    """('RIGHT' | 'WRONG', detail) for a result of a case against the CPU's."""
+def describe(torch, got, want, sets, clear=None):
+    """('RIGHT' | 'WRONG', detail) for a result of a case against the CPU's.
+
+    ``clear``: a bool mask of the rows that count (the others tie at the cut: either set is right)."""
     if tuple(got.shape) != tuple(want.shape):
         return "WRONG", f"shape {tuple(got.shape)}, the CPU's {tuple(want.shape)}"
+    if clear is not None:
+        if not bool(clear.any()):
+            return "RIGHT", "every row ties at the cut: nothing to compare"
+        tied = int((~clear).sum())
+        state, detail = describe(torch, got[clear], want[clear], sets)
+        return state, detail + (f"; {tied} rows that tie at the cut left out" if tied else "")
     if got.is_floating_point() or want.is_floating_point():
         same = torch.isclose(got.float(), want.float(), rtol=1e-2, atol=5e-2)
         rows = same.reshape(same.shape[0], -1).all(dim=1)
@@ -119,20 +140,20 @@ def main():
         f"PT_HPU_LAZY_ACC_PAR_MODE={os.environ.get('PT_HPU_LAZY_ACC_PAR_MODE')}")
     results = {}
 
-    def case(part, name, fn, inputs, sets=False):
-        """Run fn(*inputs) on the CPU and on DEVICE (one lazy graph) and compare."""
+    def case(part, name, fn, inputs, sets=False, clear=None, quiet=False):
+        """Run fn(*inputs) on the CPU and on DEVICE (one lazy graph) and compare; returns the state."""
         key = f"{part} {name}"
         try:
             want = fn(*inputs)
         except Exception as error:  # noqa: BLE001 - a probe reports every failure
             results[key] = {"state": "ERROR", "detail": f"on the CPU: {error!r}"}
             say(f"{key}: ERROR on the CPU: {error!r}")
-            return
+            return "ERROR"
         try:
             device_inputs = [t.to(DEVICE) for t in inputs]
             flush()
             got = fn(*device_inputs).cpu()
-            state, detail = describe(torch, got, want, sets)
+            state, detail = describe(torch, got, want, sets, clear)
         except Exception as error:  # noqa: BLE001
             state, detail = "ERROR", " ".join(repr(error).split())[:300]
             if os.environ.get("PROBE_TRACEBACK"):
@@ -142,7 +163,9 @@ def main():
         except Exception as error:  # noqa: BLE001
             detail += f"; the flush after it raised {error!r}"[:200]
         results[key] = {"state": state, "detail": detail}
-        say(f"{key}: {state} ({detail})")
+        if not quiet or state != "RIGHT":
+            say(f"{key}: {state} ({detail})")
+        return state
 
     g = torch.Generator().manual_seed(20261120)
 
@@ -227,6 +250,99 @@ def main():
     for name, (fn, inputs, sets) in fixes.items():
         case("fix", name, fn, inputs, sets=sets)
 
+    # ---- 00038's construct: the routing of the MoE torch path, its ids narrowed in the graph ----
+    def clear_rows(probabilities, k):
+        """The rows whose k-th and (k+1)-th largest values differ (all rows when k is every column)."""
+        if k >= probabilities.shape[1]:
+            return torch.ones(probabilities.shape[0], dtype=torch.bool)
+        ordered = torch.sort(probabilities.float(), dim=1, descending=True).values
+        return ordered[:, k - 1] != ordered[:, k]
+
+    def softmax32(logits):
+        return F.softmax(logits, dim=1, dtype=torch.float32)
+
+    def route(logits, k, divide=True):
+        """torch_route of probe_moe_route.py (HPUUnquantizedFusedMoEMethod.apply_monolithic), then the narrowing."""
+        weights, ids = torch.topk(softmax32(logits), k, dim=-1)
+        if divide:
+            weights /= weights.sum(dim=-1, keepdim=True)
+        weights = weights.to(logits.dtype)
+        return ids.to(torch.int64).to(torch.int32)
+
+    def router_logits(rows, columns, dtype):
+        return (torch.randn(rows, columns, generator=g) * 3.0).to(dtype)
+
+    bf16 = torch.bfloat16
+    logits_38 = router_logits(16, 512, bf16)
+    clear_38 = clear_rows(softmax32(logits_38), 10)
+    fixes_38 = {
+        "00038's routing, ids read as int64 (control)":
+        lambda x: torch.topk(softmax32(x), 10, dim=-1).indices,
+        "00038's routing, ids .to(int32) (what failed)": lambda x: route(x, 10),
+        "00038's routing: ids * 1, then .to(int32)":
+        lambda x: (torch.topk(softmax32(x), 10, dim=-1).indices * 1).to(torch.int32),
+        "00038's routing: ids.clone(), then .to(int32)":
+        lambda x: torch.topk(softmax32(x), 10, dim=-1).indices.clone().to(torch.int32),
+        "00038's routing: through float32":
+        lambda x: torch.topk(softmax32(x), 10, dim=-1).indices.to(torch.float32).to(torch.int32),
+        "00038's routing: ids .to(int32) as the next op's input (embedding)":
+        lambda x, t: F.embedding(route(x, 10).clamp(0, 4095), t),
+    }
+    for name, fn in fixes_38.items():
+        inputs = (logits_38, table) if "embedding" in name else (logits_38, )
+        case("fix", name, fn, inputs, sets="embedding" not in name, clear=clear_38)
+
+    # ---- boundary: where the narrowing breaks ----
+    grid_rows, grid_columns, grid_k = (1, 2, 16, 32), (16, 512, 2048, 32768), (2, 10, 64, 512)
+    producers = {
+        "host fp32 scores": (lambda x, k: torch.topk(x, k, dim=-1).indices.to(torch.int32), torch.float32, False),
+        "softmax of fp32 logits": (lambda x, k: torch.topk(F.softmax(x, dim=1), k, dim=-1).indices.to(torch.int32),
+                                   torch.float32, True),
+        "softmax(dtype=float32) of bf16 logits":
+        (lambda x, k: torch.topk(softmax32(x), k, dim=-1).indices.to(torch.int32), bf16, True),
+    }
+    matrix = {}
+    for producer, (fn, dtype, is_softmax) in producers.items():
+        for columns in grid_columns:
+            for k in grid_k:
+                if k > columns:
+                    continue
+                letters = ""
+                for rows in grid_rows:
+                    x = (router_logits(rows, columns, dtype)
+                         if is_softmax else torch.rand(rows, columns, generator=g) * 8.0)
+                    clear = clear_rows(softmax32(x) if is_softmax else x, k)
+                    state = case("boundary", f"{producer}, rows {rows} columns {columns} k {k}",
+                                 lambda t, fn=fn, k=k: fn(t, k), (x, ), sets=True, clear=clear, quiet=True)
+                    letters += state[0]
+                matrix[f"{producer} | columns {columns:5d} k {k:3d}"] = letters
+    others = {
+        "00038's routing with the in-place division": (lambda x, k: route(x, k), bf16),
+        "00038's routing without the division": (lambda x, k: route(x, k, divide=False), bf16),
+        "a multiply as the producer": (lambda x, k: torch.topk(x * 1.0, k, dim=-1).indices.to(torch.int32),
+                                       torch.float32),
+        "bf16 scores": (lambda x, k: torch.topk(x, k, dim=-1).indices.to(torch.int32), bf16),
+        "the QSA selection (masked_fill, top-k, .to(int32), masked_fill)":
+        (lambda x, k: (lambda pair: pair[1].to(torch.int32).masked_fill(pair[0] == float("-inf"), -1))(torch.topk(
+            x.masked_fill(torch.arange(x.shape[1], device=x.device)[None, :] >= x.shape[1] - 3, float("-inf")), k,
+            dim=-1)), torch.float32),
+    }
+    for name, (fn, dtype) in others.items():
+        letters = ""
+        for rows, columns, k in ((16, 512, 10), (16, 16, 2), (4, 2048, 512), (8, 32768, 512)):
+            x = router_logits(rows, columns, dtype)
+            reference = softmax32(x) if "routing" in name else x.float()
+            if "QSA" in name:
+                reference = reference.masked_fill(torch.arange(columns)[None, :] >= columns - 3, float("-inf"))
+            state = case("boundary", f"{name}, rows {rows} columns {columns} k {k}", lambda t, fn=fn, k=k: fn(t, k),
+                         (x, ), sets=True, clear=clear_rows(reference, k), quiet=True)
+            letters += state[0]
+        matrix[f"{name} | [16,512] k10, [16,16] k2, [4,2048] k512, [8,32768] k512"] = letters
+    say(f"BOUNDARY one letter per row count {grid_rows} (R right, W wrong, E error); the last five lines: one "
+        f"letter per shape")
+    for key, letters in matrix.items():
+        say(f"BOUNDARY {key}: {letters}")
+
     # ---- verdicts ----
     def states(prefix):
         return {key: value["state"] for key, value in results.items() if key.startswith(prefix)}
@@ -244,10 +360,16 @@ def main():
     bad = [f"{key[len('fix '):]} ({state})" for key, state in fix.items() if state != "RIGHT"]
     line3 = (f"replacements RIGHT on this device: {'; '.join(right) or 'none'} || not right: "
              f"{'; '.join(bad) or 'none'}")
-    for name, line in (("select_blocks", line1), ("narrowing", line2), ("fixes", line3)):
+    boundary = states("boundary ")
+    wrong = sorted(key[len("boundary "):] for key, state in boundary.items() if state != "RIGHT")
+    line4 = (f"{len(wrong)} of {len(boundary)} boundary cases are not the CPU's" +
+             (": none" if not wrong else ": " + "; ".join(wrong[:12]) + (" ..." if len(wrong) > 12 else "")) +
+             " (the BOUNDARY lines above hold the whole matrix)")
+    for name, line in (("select_blocks", line1), ("narrowing", line2), ("fixes", line3), ("boundary", line4)):
         print(f"VERDICT {name}: {line}", flush=True)
     (args.out / "index_narrowing.json").write_text(
-        json.dumps({"device": DEVICE, "results": results, "verdicts": [line1, line2, line3]}, indent=1) + "\n")
+        json.dumps({"device": DEVICE, "results": results, "matrix": matrix,
+                    "verdicts": [line1, line2, line3, line4]}, indent=1) + "\n")
     return 0
 
 

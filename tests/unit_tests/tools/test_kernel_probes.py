@@ -74,11 +74,14 @@ def test_index_narrowing_probe_is_right_on_cpu(tmp_path):
     states = ("RIGHT", "WRONG", "ERROR")
     cases = [line for line in out.splitlines()
              if line.startswith("PROBE narrow") and any(f": {state} (" in line for state in states)]
-    assert len(cases) == 32, cases  # 8 served, 12 pattern, 12 fix
+    assert len(cases) == 38, cases  # 8 served, 12 pattern, 18 fix; a boundary case prints only when it is not RIGHT
     assert all(": RIGHT (" in line for line in cases), [line for line in cases if ": RIGHT (" not in line]
     assert "VERDICT select_blocks: select_blocks on the card: RIGHT in every case" in out
+    assert "VERDICT boundary: 0 of 188 boundary cases are not the CPU's" in out
+    matrix = [line for line in out.splitlines() if "] BOUNDARY " in line and " | " in line]
+    assert len(matrix) == 47 and all(line.endswith(": RRRR") for line in matrix), matrix
     result = json.loads((tmp_path / "narrow" / "index_narrowing.json").read_text())
-    assert len(result["results"]) == 32 and len(result["verdicts"]) == 3
+    assert len(result["results"]) == 38 + 188 and len(result["verdicts"]) == 4 and len(result["matrix"]) == 47
 
 
 def test_hc_copies_probe_modes_are_bit_identical_on_cpu(tmp_path):
