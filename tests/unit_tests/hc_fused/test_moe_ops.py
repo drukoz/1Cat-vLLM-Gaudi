@@ -6,6 +6,10 @@ HPU kernels come from the ``hc_fused_ops`` extension, and a CPU process has no k
 ``moe_ops.py`` (this folder) is that module plus the torch oracle registered as the CPU kernels, the
 stand-in the CPU tests run the ops through.  No vLLM, no toolchain.  The HPU kernels are tested on a
 card by ``test_moe_hpu_op.py``.
+
+The stand-in is the torch path as the CPU computes it.  For three ops that is the kernel's oracle; for
+``moe_row_quant`` it is not, because a card divides a bf16 tensor by ``FP8_MAX`` differently
+(``moe_reference.py``, ``test_moe_card_arithmetic.py``).
 """
 
 import subprocess
@@ -15,7 +19,7 @@ from pathlib import Path
 import pytest
 import torch
 
-from tests.unit_tests.hc_fused import moe_ops
+from tests.unit_tests.hc_fused import moe_ops, moe_reference
 from tests.unit_tests.hc_fused.moe_case import (GUIDS, INPUT_ORDER, OP_NAME, OUTPUT_DTYPE, OUTPUT_ORDER, SIM_CASES,
                                                 expected, make_inputs, output_shapes, scalars)
 
@@ -45,12 +49,20 @@ def test_guids_are_the_kernel_library_names():
     assert moe_ops.GUIDS == {OP_NAME[kind]: guid for kind, guid in GUIDS.items()}
 
 
+def _torch_path_on_cpu(case, inputs):
+    """What the CPU kernel returns: the kernel's oracle, except where the card's arithmetic is not the CPU's."""
+    if case.kind == "row_quant":
+        return dict(zip(OUTPUT_ORDER[case.kind], moe_reference.moe_row_quant_cpu_reference(inputs["x"],
+                                                                                           *scalars(case))))
+    return expected(case, inputs)
+
+
 @pytest.mark.parametrize("case", SMALL, ids=IDS)
-def test_cpu_kernel_is_the_oracle(case):
+def test_cpu_kernel_is_the_torch_path_on_cpu(case):
     inputs = make_inputs(case)
     before = {name: tensor.clone() for name, tensor in inputs.items()}
     got = _call(case, inputs)
-    exp = expected(case, inputs)
+    exp = _torch_path_on_cpu(case, inputs)
     assert len(got) == len(OUTPUT_ORDER[case.kind])
     for tensor, name in zip(got, OUTPUT_ORDER[case.kind]):
         assert tensor.dtype == OUTPUT_DTYPE[name] and torch.equal(_bits(tensor), _bits(exp[name])), name

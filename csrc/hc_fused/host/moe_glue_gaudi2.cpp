@@ -160,6 +160,17 @@ void MapDimension(TensorAccessPattern& pattern, unsigned tensorDim, uint64_t a, 
     pattern.mapping[tensorDim].end_b = static_cast<float>(endB);
 }
 
+// An fp32 value rounded to the nearest bf16 (ties to even), as fp32. For finite values.
+float RoundToBf16(float value)
+{
+    uint32_t bits;
+    std::memcpy(&bits, &value, sizeof(bits));
+    bits += 0x7FFFu + ((bits >> 16) & 1u);
+    bits &= 0xFFFF0000u;
+    std::memcpy(&value, &bits, sizeof(value));
+    return value;
+}
+
 // {columns, tokens} tensor of which the point `token` reads or writes columns [first, last] of its row.
 void MapRow(TensorAccessPattern& pattern, uint64_t first, uint64_t last)
 {
@@ -274,7 +285,12 @@ GlueCodeReturn Instantiate(const KernelInfo& kernel, HabanaKernelParams* params,
     args.experts = scalar.experts;
     args.top_k = scalar.top_k;
     args.gate_column = scalar.gate_column;
-    args.inv_fp8_max = kernel.kind == Kind::RowQuant ? 1.0f / scalar.fp8_max : 0.0f;
+    // row_quant: the reciprocal of fp8_max, rounded to bf16 (0x1.12p-8 for 240). The torch path this
+    // kernel replaces divides a bf16 tensor by FP8_MAX, and a Gaudi2 card computes that as a product with
+    // the reciprocal rounded to bf16, not as a quotient. The kernel has to return the card's scale: with
+    // the unrounded reciprocal its scale was CPU torch's, one bf16 step below the card's in two rows of
+    // three (first card run, 2026-11-20; tests/unit_tests/hc_fused/hpu_arithmetic.py).
+    args.inv_fp8_max = kernel.kind == Kind::RowQuant ? RoundToBf16(1.0f / scalar.fp8_max) : 0.0f;
     instance->kernel.paramsNr = sizeof(MoeGlueKernelArgs) / sizeof(uint32_t);
     std::memcpy(instance->kernel.scalarParams, &args, sizeof(args));
 

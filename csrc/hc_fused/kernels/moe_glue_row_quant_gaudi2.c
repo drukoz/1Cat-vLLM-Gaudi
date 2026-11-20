@@ -5,15 +5,19 @@
 //
 //   x          {hidden, tokens} bf16
 //   x_fp8_out  {hidden, tokens} fp8 (1-4-3)   fp8(bf16(x * inverse))
-//   scale_out  {1, tokens} fp32               scale = bf16(bf16(max|x| + 1e-8) / fp8_max)
+//   scale_out  {1, tokens} fp32               scale = bf16(bf16(max|x| + 1e-8) * inv_fp8_max)
 //                                             inverse = bf16(1 / scale)
 //
-// Rounding points: the torch path does all of this on bf16 tensors, so the sum, the quotient, the
-// reciprocal and the product are each rounded to bf16 (round-half-to-even). The quotient is taken
-// as a product with 1 / fp8_max, computed on the host; rounded to bf16 it is the quotient for
-// every bf16 row maximum (simulator case row_quant_every_amax). The cast rounds to nearest even
-// and clips to the largest fp8 value, the conversion the card-proven
-// csrc/deepseek_v4/kernels/deepseek_v41_dynamic_quant_bf16_gaudi2.c uses.
+// Rounding points: the torch path does all of this on bf16 tensors, so the sum, the scale, the
+// reciprocal and the product are each rounded to bf16 (round-half-to-even). The torch path writes
+// the scale as a division by FP8_MAX. A Gaudi2 card computes that division as a product with the
+// reciprocal rounded to bf16, and so does this kernel: inv_fp8_max is bf16(1 / fp8_max), 0x1.12p-8
+// for 240, rounded on the host. CPU torch divides; its scale is this one or one bf16 step below
+// it, and a kernel with CPU torch's scale differed from the plugin's dynamic_quant on the card in
+// two rows of three (first card run, 2026-11-20). The product of two bf16 values is exact in fp32,
+// so the scale is rounded once. The cast rounds to nearest even and clips to the largest fp8
+// value, the conversion csrc/deepseek_v4/kernels/deepseek_v41_dynamic_quant_bf16_gaudi2.c uses;
+// that kernel multiplies the row maximum by (float)(bf16)(1.0f / 240.0f) for the same reason.
 //
 // One index-space point is one token (dim 0 = token). Pass 1 takes the row maximum, pass 2 reads
 // the row again and writes the fp8 values.
