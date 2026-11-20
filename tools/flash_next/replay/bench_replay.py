@@ -41,6 +41,7 @@ Exit code 0 when every rank finished every process, 2 otherwise. Needs only torc
 from __future__ import annotations
 
 import argparse
+import collections
 import inspect
 import json
 import os
@@ -59,7 +60,13 @@ DEFAULT_LAYERS = 48
 DEFAULT_ROWS = (1, 32, 128)
 COMPILE_FULL_ROWS = (1, 32)
 EXIT_GRACE_S = 20.0
-LAZY_REGIMES = ("lazy", "lazy_layer", "lazy_coll", "replay", "replay_layer", "replay_coll")
+LAZY_REGIMES = ("lazy", "lazy_layer", "lazy_coll", "replay", "replay_layer", "replay_coll", "graph_raw",
+                "replay_async", "replay_meta")
+# replay_meta passes, besides the input, a namedtuple of META_TENSORS int32 tensors (half [rows, META_COLS], half
+# [rows, 1]) and two scalars as a keyword, like the runner's trimmed decode metadata, so the wrapper hashes and
+# copies them every call.
+META_TENSORS = 20
+META_COLS = 1024
 EAGER_REGIMES = ("compile_full", "compile_layer")
 # The bridge sources whose text decides how a replay runs (read on the card, dumped once by rank 0).
 BRIDGE_MODULES = ("habana_frameworks.torch.hpu.graphs", "habana_frameworks.torch.hpu")
@@ -228,6 +235,49 @@ class Rank:
 
         return reduce
 
+    def meta_inputs(self, rows: int, count: int):
+        """Namedtuples shaped like the runner's trimmed decode metadata: META_TENSORS int32 tensors and scalars."""
+        torch = self.torch
+        fields = ["t%d" % i for i in range(META_TENSORS)] + ["is_prompt", "block_size"]
+        meta_type = collections.namedtuple("BenchMetadata", fields)
+        metas = []
+        for k in range(count):
+            tensors = [
+                torch.full((rows, META_COLS if i % 2 == 0 else 1), k + i, dtype=torch.int32).to(self.device)
+                for i in range(META_TENSORS)
+            ]
+            metas.append(meta_type(*tensors, False, 128))
+        return metas
+
+    def raw_graph(self, step, example):
+        """A direct HPUGraph of step with one static input: the replay without the wrapper's hash and lookup."""
+        static_in = example.clone()
+        if self.htorch is None:  # self-test: no graph, the same call shape
+
+            def call_cpu(x):
+                static_in.copy_(x)
+                return step(static_in)
+
+            return call_cpu
+        hpu = self.htorch.hpu
+        step(static_in)  # compile the recipes once outside the capture, as a warmup would
+        self.mark_step()
+        self.synchronize()
+        graph = hpu.HPUGraph()
+        stream = hpu.Stream()
+        with hpu.stream(stream):
+            graph.capture_begin()
+            static_out = step(static_in)
+            graph.capture_end()
+        self.synchronize()
+
+        def call(x):
+            static_in.copy_(x)
+            graph.replay()
+            return static_out
+
+        return call
+
     def inputs(self, rows: int, count: int = 4):
         torch = self.torch
         gen = torch.Generator().manual_seed(1000 + rows)
@@ -269,14 +319,33 @@ class Rank:
             return body.forward(x, reduce, cut, cut_coll)
 
         inputs = self.inputs(rows)
+        torch = self.torch
         if regime.startswith("lazy"):
 
             def call(x):
                 out = step(x)
                 self.mark_step()
                 return out
+        elif regime == "graph_raw":
+            call = self.raw_graph(step, inputs[0])
+        elif regime == "replay_meta":
+            metas = self.meta_inputs(rows, len(inputs))
+            inputs = list(zip(inputs, metas))
+
+            class MetaStep(torch.nn.Module):
+
+                def forward(self, x, meta=None):
+                    # Read every metadata tensor once (as the layers read theirs), keep the value unchanged.
+                    touch = sum(getattr(meta, name)[:, :1].sum() for name in meta._fields if name.startswith("t"))
+                    return step(x + (touch * 0).to(x.dtype))
+
+            module = MetaStep()
+            if self.htorch is not None:
+                module = self.htorch.hpu.wrap_in_hpu_graph(module, disable_tensor_cache=True)
+
+            def call(pair):
+                return module(pair[0], meta=pair[1])
         else:
-            torch = self.torch
 
             class Step(torch.nn.Module):
 
@@ -285,7 +354,8 @@ class Rank:
 
             module = Step()
             if self.htorch is not None:
-                module = self.htorch.hpu.wrap_in_hpu_graph(module, disable_tensor_cache=True)
+                module = self.htorch.hpu.wrap_in_hpu_graph(module, asynchronous=(regime == "replay_async"),
+                                                           disable_tensor_cache=True)
             call = module
         record = self.timed(call, inputs, repeats, warmup=3)
         record.update({"case": regime, "rows": rows, "collectives": collectives, "layers": body.layers,
@@ -494,6 +564,14 @@ def derive(merged: list) -> list:
                 line["cut_ms_each_with_collectives"] = (with_c - base_with) / cuts
             if None not in (base_without, without) and case.endswith("_layer"):
                 line["cut_ms_each_without_collectives"] = (without - base_without) / cuts
+        if case in ("graph_raw", "replay_async", "replay_meta"):
+            # Against the plain wrapper on the same body: the wrapper's own per-call cost (graph_raw), what an
+            # asynchronous replay changes, and what hashing and copying a decode-metadata-sized input adds.
+            replay_with, replay_call, _ = total("replay", rows, True)
+            if None not in (replay_with, with_c):
+                line["vs_replay_total_ms"] = with_c - replay_with
+            if None not in (replay_call, call_with):
+                line["vs_replay_call_ms"] = call_with - replay_call
         lines.append(line)
     return lines
 
@@ -509,10 +587,13 @@ def print_summary(merged: list, derived: list, ranks: int, echo=print) -> None:
              (entry["case"], entry["rows"], entry["collectives"], _fmt(entry.get("total_p50_max_rank_ms")),
               _fmt(entry.get("call_p50_max_rank_ms")), _fmt(entry.get("first_ms"), 1)))
     for line in derived:
-        echo("   %-14s rows %3d: one all-reduce %s ms; one cut %s ms (with coll) / %s ms (without); host share %s" %
+        echo("   %-14s rows %3d: one all-reduce %s ms; one cut %s ms (with coll) / %s ms (without); host share %s%s" %
              (line["case"], line["rows"], _fmt(line.get("all_reduce_ms_each"), 4),
               _fmt(line.get("cut_ms_each_with_collectives"), 4), _fmt(line.get("cut_ms_each_without_collectives"), 4),
-              _fmt(line.get("host_call_share"), 2)))
+              _fmt(line.get("host_call_share"), 2),
+              ("; against replay: total %s ms, call %s ms" %
+               (_fmt(line.get("vs_replay_total_ms"), 4), _fmt(line.get("vs_replay_call_ms"), 4)))
+              if "vs_replay_total_ms" in line or "vs_replay_call_ms" in line else ""))
 
 
 def run_ranks(args, process: str, echo=print) -> dict:

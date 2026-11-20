@@ -67,6 +67,34 @@ def test_derive_counts_a_cut_before_every_collective_for_coll_regimes():
     assert lines[("lazy_coll", 32)]["cut_ms_each_with_collectives"] == pytest.approx(0.03)
 
 
+def test_derive_compares_raw_graph_async_and_metadata_with_the_wrapper():
+    merged = [
+        _entry("replay", 32, True, 6.0, call=0.5),
+        _entry("graph_raw", 32, True, 5.7, call=0.3),
+        _entry("replay_meta", 32, True, 6.9, call=1.1),
+        _entry("replay_async", 32, True, 6.0, call=0.05),
+    ]
+    lines = {(line["case"], line["rows"]): line for line in bench.derive(merged)}
+    assert lines[("graph_raw", 32)]["vs_replay_total_ms"] == pytest.approx(-0.3)
+    assert lines[("graph_raw", 32)]["vs_replay_call_ms"] == pytest.approx(-0.2)
+    assert lines[("replay_meta", 32)]["vs_replay_total_ms"] == pytest.approx(0.9)
+    assert lines[("replay_async", 32)]["vs_replay_call_ms"] == pytest.approx(-0.45)
+    assert "vs_replay_total_ms" not in lines[("replay", 32)]
+
+
+def test_meta_inputs_look_like_trimmed_metadata():
+    rank = bench.Rank.__new__(bench.Rank)
+    rank.torch, rank.device = torch, "cpu"
+    metas = rank.meta_inputs(4, 2)
+    assert len(metas) == 2
+    meta = metas[1]
+    tensors = [getattr(meta, f) for f in meta._fields if f.startswith("t")]
+    assert len(tensors) == bench.META_TENSORS
+    assert all(t.dtype == torch.int32 for t in tensors)
+    assert tensors[0].shape == (4, bench.META_COLS) and tensors[1].shape == (4, 1)
+    assert meta.is_prompt is False and meta.block_size == 128
+
+
 def test_merge_takes_the_slowest_rank():
     record = {"case": "replay", "rows": 1, "collectives": True, "layers": 48,
               "call_ms": {"p50": 0.2}, "total_ms": {"p50": 5.0}}
