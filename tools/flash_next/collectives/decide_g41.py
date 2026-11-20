@@ -61,6 +61,13 @@ def main(argv):
                   + ", ".join(f"{r}: {pts[r]:.1f}" for r in rows))
     for n, table in tables.items():
         for regime in ("lazy", "replay", "replay_async"):
+            logits, pairs = table.get((regime, "tail_logits")), table.get((regime, "tail_pairs"))
+            if logits and pairs:
+                print(f"ranks {n} {regime}: the logits all-gather against the (value, id) all-gather, us per call: "
+                      + ", ".join(f"{r} rows: {logits[r]:.0f} against {pairs[r]:.0f}" for r in sorted(logits) if r in pairs))
+                result.setdefault(str(n), {}).setdefault(regime, {})["logits_gather_saves_us"] = {
+                    str(r): logits[r] - pairs[r] for r in sorted(logits) if r in pairs}
+        for regime in ("lazy", "replay", "replay_async"):
             ar, ag = table.get((regime, "all_reduce")), table.get((regime, "gather_sum"))
             if not ar or not ag:
                 continue
