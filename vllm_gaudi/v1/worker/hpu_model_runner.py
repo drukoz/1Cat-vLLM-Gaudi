@@ -5180,7 +5180,11 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                     load_rows = []
                     store_rows = []
                     for group_idx in range(len(self.input_batch.block_table.block_tables)):
-                        if group_idx in self._compact_gdn_group_ids:
+                        # The attention group's rows are KV blocks (kernel blocks of attn_block_size tokens), not
+                        # state blocks: no layer reads its lattice row, and a request with fewer kernel blocks than
+                        # 1 + k (one 512-token block holds four at k >= 4) failed the null-block check.
+                        if group_idx in self._compact_gdn_group_ids or not isinstance(
+                                self.kv_cache_config.kv_cache_groups[group_idx].kv_cache_spec, MambaSpec):
                             load_rows.append(load_state_indices_cpu[group_idx])
                             store_rows.append(store_state_indices_cpu[group_idx])
                             continue
@@ -6478,9 +6482,14 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         decode_data, dummy_decode_input_data_across_dp = decode_input_data
         prefill_sampled_token_ids = []
         prefill_sampled_requests = []
+        # One entry per prefill batch for the drafter: its sampled tokens, or None for a chunk that does not
+        # complete its prompt (no logits, nothing sampled). prefill_sampled_token_ids skips those chunks.
+        prefill_sampled_by_batch: list[Optional[torch.Tensor]] = []
         decode_sampled_token_ids = []
         decode_sampled_requests = []
         device_prepared_dflash_drafts = None
+        # A step whose only work is prefill chunks that complete no prompt samples nothing.
+        sampling_metadata = None
         # Logprobs tracking: collect (req_ids, logprobs_tensors) segments
         # from each sampling call to combine at the end.
         logprobs_segments: list[tuple[list[str], LogprobsTensors | None]] = []
@@ -6572,6 +6581,9 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                             prefill_sampled_token_ids.append(sampler_output.sampled_token_ids.flatten())
                             prefill_sampled_requests.extend(logits_requests)
                             logprobs_segments.append((list(logits_requests), sampler_output.logprobs_tensors))
+                        prefill_sampled_by_batch.append(prefill_sampled_token_ids[-1])
+                    else:
+                        prefill_sampled_by_batch.append(None)
                 if self.is_driver_worker and self.profiler.enabled:
                     # Stop recording 'execute_model_generic' event
                     self.profiler.end()
@@ -6834,7 +6846,10 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             }
             # For the output, postprocessed_sampled_token_ids will be filled during serialization
         else:
-            prefill_sampled_token_ids_device = prefill_sampled_token_ids
+            # The drafter indexes its prefill tokens by prefill batch: a chunk that completes no prompt has None
+            # there (structured output samples every prefill row together, after the loop).
+            prefill_sampled_token_ids_device = (prefill_sampled_token_ids
+                                                if self.use_structured_output else prefill_sampled_by_batch)
             # From this point onward, all operations are done on CPU.
             # We already have tokens. Let's copy the data to
             # CPU as is, and then discard padded tokens.
@@ -9810,6 +9825,16 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                 for idx, (req_id, prompt_len, token_ids, position_ids, attn_metadata, logits_indices, logits_requests,
                           _ple_inputs) in enumerate(zip(*shallow_tuple(prefill_data))):
                     if idx >= len(prefill_sampled_token_ids_tensor):
+                        continue
+                    if prefill_sampled_token_ids_tensor[idx] is None:
+                        # A chunk that completes no prompt sampled nothing; its requests are still prefilling, and
+                        # the scheduler drops a prefilling request's drafts. Zero rows keep the draft rows in the
+                        # input batch's request order (take_draft_token_ids pairs them by position).
+                        draft_token_ids_prefill.append(
+                            torch.zeros((len(req_id), self.speculative_config.num_speculative_tokens),
+                                        dtype=torch.int64,
+                                        device=self.device))
+                        prefill_batch_start_idx += len(req_id)
                         continue
                     _draft_token_ids = self.propose_eagle_prefill(
                         prefill_sampled_token_ids_tensor,

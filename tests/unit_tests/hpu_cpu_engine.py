@@ -458,6 +458,7 @@ def main(argv: list[str] | None = None) -> int:
                         "(install_oracle_drafts)")
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--seed", type=int, default=None, help="per-request seed of a sampled run")
+    parser.add_argument("--logprobs", type=int, default=None, help="record the top-N logprobs of every generated token")
     args = parser.parse_args(argv)
 
     install()
@@ -487,7 +488,7 @@ def main(argv: list[str] | None = None) -> int:
     source = json.loads(Path(args.prompts or Path(args.ckpt) / "reference.json").read_text(encoding="utf-8"))
     prompts = sorted((list(p["prompt_ids"]) for p in source["prompts"]), key=len)
     params = SamplingParams(temperature=args.temperature, max_tokens=args.max_tokens, detokenize=False,
-                            seed=args.seed)
+                            seed=args.seed, logprobs=args.logprobs)
     guard = make_index_guard()
     streams = []
     with guard:
@@ -495,7 +496,11 @@ def main(argv: list[str] | None = None) -> int:
         for batch in batches:
             outputs = llm.generate([{"prompt_token_ids": prompt} for prompt in batch], params, use_tqdm=False)
             for prompt, output in zip(batch, outputs):
-                streams.append({"prompt_ids": prompt, "generated_ids": list(output.outputs[0].token_ids)})
+                stream = {"prompt_ids": prompt, "generated_ids": list(output.outputs[0].token_ids)}
+                if args.logprobs:
+                    stream["top_logprobs"] = [{str(t): float(lp.logprob) for t, lp in step.items()}
+                                              for step in (output.outputs[0].logprobs or [])]
+                streams.append(stream)
     record = {"k": args.k,
               "prefix_caching": not args.no_prefix_caching,
               "concurrent": bool(args.concurrent),

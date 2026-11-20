@@ -29,12 +29,16 @@ import pytest
 from tests.unit_tests import hpu_cpu_engine
 
 K = 3
+# The tiny model's random weights give a flat distribution (logits about 0.4): its best two logits are often one
+# bfloat16 step apart (0.002). A speculative row computed with other shapes may take the second one there, the
+# near-tie the tiny gate already tolerates against the HF reference; after it the streams are unrelated.
+NEAR_TIE = 0.0045
 
 
 @pytest.fixture(scope="module")
 def engine_runs(tiny_checkpoint, tmp_path_factory):
     out = tmp_path_factory.mktemp("engine_mtp")
-    base = hpu_cpu_engine.run(tiny_checkpoint, out / "k0.json")
+    base = hpu_cpu_engine.run(tiny_checkpoint, out / "k0.json", "--logprobs", "2")
     spec = hpu_cpu_engine.run(tiny_checkpoint, out / "k3.json", "--k", str(K))
     return {"dir": out, "base": base, "spec": spec, "ckpt": Path(tiny_checkpoint)}
 
@@ -43,19 +47,65 @@ def _streams(record: dict) -> dict:
     return {tuple(p["prompt_ids"]): p["generated_ids"] for p in record["prompts"]}
 
 
-def _oracle_run(engine_runs: dict, accept: list[int], *options: str) -> dict:
-    name = "accept_" + "".join(str(a) for a in accept) + "".join(o.strip("-")[:3] for o in options)
+def first_difference(base_prompt: dict, tokens: list[int]) -> int | None:
+    """The first token where ``tokens`` leaves the base stream (None: equal). Fails unless the base's best two
+    logprobs are within NEAR_TIE there and ``tokens`` took the second one."""
+    want = base_prompt["generated_ids"]
+    diff = next((i for i, (a, b) in enumerate(zip(tokens, want)) if a != b), None)
+    if diff is None:
+        assert len(tokens) == len(want), (len(tokens), len(want))
+        return None
+    top = sorted(base_prompt["top_logprobs"][diff].items(), key=lambda item: -item[1])
+    margin = top[0][1] - top[1][1]
+    assert margin <= NEAR_TIE and int(top[1][0]) == tokens[diff], (
+        f"prompt of {len(base_prompt['prompt_ids'])} tokens leaves the non-speculative stream at token {diff}: "
+        f"got {tokens[diff]}, want {want[diff]} (best two {top[:2]}, margin {margin:.4f})")
+    return diff
+
+
+def assert_same_streams(base: dict, run: dict) -> dict:
+    """Every prompt's stream equals the base's up to a near-tie; returns {prompt: first difference or None}."""
+    by_prompt = {tuple(p["prompt_ids"]): p for p in base["prompts"]}
+    streams = _streams(run)
+    assert streams.keys() == by_prompt.keys() and len(streams) >= 4
+    return {prompt: first_difference(by_prompt[prompt], tokens) for prompt, tokens in streams.items()}
+
+
+def _oracle_run(engine_runs: dict, accept: list[int], *options: str, k: int = K) -> dict:
+    name = f"k{k}_accept_" + "".join(str(a) for a in accept) + "".join(o.strip("-")[:3] for o in options)
     path = engine_runs["dir"] / f"{name}.oracle.json"
     path.write_text(json.dumps({"streams": engine_runs["base"]["prompts"], "accept": accept}), encoding="utf-8")
-    return hpu_cpu_engine.run(engine_runs["ckpt"], engine_runs["dir"] / f"{name}.json", "--k", str(K), "--oracle",
+    return hpu_cpu_engine.run(engine_runs["ckpt"], engine_runs["dir"] / f"{name}.json", "--k", str(k), "--oracle",
                               str(path), *options)
 
 
+def _check_oracle(engine_runs: dict, run: dict, accept: list[int], k: int) -> None:
+    """The stream is the base's (up to a near-tie) and every verification committed the forced count plus one."""
+    diffs = {len(prompt): d for prompt, d in assert_same_streams(engine_runs["base"], run).items()}
+    max_tokens = len(engine_runs["base"]["prompts"][0]["generated_ids"])
+    by_req = defaultdict(list)
+    for entry in run["oracle"]:
+        by_req[entry["req"]].append(entry)
+    checked = 0
+    for entries in by_req.values():
+        diff = diffs[entries[0]["prompt_len"]]
+        for before, after in zip(entries, entries[1:]):
+            if before["n_out"] + k + 1 > max_tokens:  # the scheduler cuts the drafts at max_tokens
+                continue
+            if diff is not None and before["n_out"] + k >= diff:  # past a near-tie the oracle drafts are wrong
+                continue
+            assert after["n_out"] - before["n_out"] == before["accept"] + 1, (before, after)
+            checked += 1
+    assert checked >= len(by_req)
+    # the decode batches load from the accepted counts of the step before
+    loaded = {a for step in run["decode_steps"] if step["num_accepted"] for a in step["num_accepted"] if a > 0}
+    assert loaded and loaded <= {a + 1 for a in accept}
+    assert max(r for step in run["decode_steps"] for r in step["rows"]) == 1 + k
+
+
 def test_k3_gives_the_tokens_of_the_engine_without_speculation(engine_runs):
-    base, spec = _streams(engine_runs["base"]), _streams(engine_runs["spec"])
-    assert base.keys() == spec.keys() and len(base) >= 4
-    for prompt, tokens in base.items():
-        assert spec[prompt] == tokens, f"prompt of {len(prompt)} tokens"
+    diffs = assert_same_streams(engine_runs["base"], engine_runs["spec"])
+    assert sum(d is None for d in diffs.values()) >= len(diffs) - 1  # at most one near-tie on the tiny model
     assert engine_runs["spec"]["prefix_caching"] is True
 
 
@@ -97,38 +147,26 @@ def test_the_first_draft_after_a_prefill_is_the_reference_mtp_argmax(engine_runs
 @pytest.mark.parametrize("accept", [[K], [0, 1, 2, 3], [2, 0, 3, 1]], ids=["all", "rising", "mixed"])
 def test_oracle_drafts_are_accepted_exactly_and_keep_the_stream(engine_runs, accept):
     run = engine_runs.get("oracle_all") if accept == [K] else None
-    run = run or _oracle_run(engine_runs, accept)
-    base = _streams(engine_runs["base"])
-    for prompt, tokens in _streams(run).items():
-        assert tokens == base[prompt], f"prompt of {len(prompt)} tokens, accept {accept}"
-    max_tokens = len(next(iter(base.values())))
-    by_req = defaultdict(list)
-    for entry in run["oracle"]:
-        by_req[entry["req"]].append(entry)
-    checked = 0
-    for entries in by_req.values():
-        for before, after in zip(entries, entries[1:]):
-            if before["n_out"] + K + 1 > max_tokens:  # the scheduler cuts the drafts at max_tokens
-                continue
-            assert after["n_out"] - before["n_out"] == before["accept"] + 1, (before, after)
-            checked += 1
-    assert checked >= len(by_req)
-    # the decode batches load from the accepted counts of the step before
-    loaded = {a for step in run["decode_steps"] if step["num_accepted"] for a in step["num_accepted"] if a > 0}
-    assert loaded and loaded <= {a + 1 for a in accept}
+    _check_oracle(engine_runs, run or _oracle_run(engine_runs, accept), accept, K)
+
+
+@pytest.mark.parametrize("k", [4, 5], ids=["k4", "k5"])
+def test_oracle_drafts_at_the_sizes_above_the_recipe(engine_runs, k):
+    # k + 1 lattice entries exceed the kernel blocks of a request's first block (two per 256-token block here, four
+    # per 512-token block on the card): the attention group's rows must stay out of the lattice check.
+    accept = list(range(k, -1, -1))
+    _check_oracle(engine_runs, _oracle_run(engine_runs, accept, k=k), accept, k)
 
 
 def test_oracle_drafts_with_the_fused_kernels_reference_ops(engine_runs):
     # VLLM_HPU_GDN_CORE_DECODE / _VERIFY and VLLM_HPU_HC_FUSED run their Python reference kernels on CPU: the
     # speculative step through the code that calls the fused ops (lattice -> verify op, the HC fused path).
     env = {"VLLM_HPU_GDN_CORE_DECODE": "1", "VLLM_HPU_GDN_CORE_VERIFY": "1", "VLLM_HPU_HC_FUSED": "1"}
-    fused_base = hpu_cpu_engine.run(engine_runs["ckpt"], engine_runs["dir"] / "fused_k0.json", env=env)
+    fused_base = hpu_cpu_engine.run(engine_runs["ckpt"], engine_runs["dir"] / "fused_k0.json", "--logprobs", "2",
+                                    env=env)
     path = engine_runs["dir"] / "fused.oracle.json"
     path.write_text(json.dumps({"streams": fused_base["prompts"], "accept": [2, 0, 3, 1]}), encoding="utf-8")
     run = hpu_cpu_engine.run(engine_runs["ckpt"], engine_runs["dir"] / "fused.json", "--k", str(K), "--oracle",
                              str(path), env=env)
-    base = _streams(fused_base)
-    for prompt, tokens in _streams(run).items():
-        assert tokens == base[prompt], f"prompt of {len(prompt)} tokens"
-    assert max(len(set(step["rows"])) for step in run["decode_steps"]) >= 1
+    assert_same_streams(fused_base, run)
     assert max(r for step in run["decode_steps"] for r in step["rows"]) == 1 + K
