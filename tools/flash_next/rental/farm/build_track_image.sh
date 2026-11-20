@@ -5,8 +5,12 @@
 # track: the farm's base image (farm-base:latest, the toolchain and vLLM at the engine pin) with the
 # track's plugin and its native kernels installed by the commit's own container_entry.sh
 # --install-only, and the tiny checkpoint of the commit built in /tmp/fn-smoke-ckpt. A job from that
-# commit then starts in seconds. Needs no card: the build container has no habana runtime, at most
-# FARM_BUILD_CPUS cores (default 24) and runs niced, so it can run next to card jobs. One build per
+# commit then starts in seconds. Needs no card: the build container has no habana runtime, runs niced
+# and only on the CPUs kept for image builds (`cardq.sh cpus --build`: the top CPU of each module's share,
+# which no job container gets; FARM_BUILD_CPUSET overrides it; on a small host without such a set, at
+# most FARM_BUILD_CPUS cores, default 24), so it can run next to card jobs and never on their CPUs. Every
+# build writes a START and an END line to ~/farm/q/builds.log (the queue names the builds that ran during
+# a job in the job's end line). One build per
 # track at a time (a lock) and at most FARM_IMAGE_SLOTS builds on the node (default 3), so builds do not
 # crowd the host side of card jobs; a second call for a commit that has its image returns at once. Keeps the
 # newest FARM_KEEP_IMAGES images of the track (default 3) and removes older ones that no container uses and
@@ -85,11 +89,21 @@ while [ -z "$slot" ]; do
 done
 
 started="$(date -u +%s)"
-echo "build_track_image: $TAG from $BASE: installing the plugin of $BUNDLE (about three minutes) [$(date -u +%Y-%m-%dT%H:%M:%SZ)]"
+BUILD_CPUSET="${FARM_BUILD_CPUSET-$(CARDQ_NCARDS="${CARDQ_NCARDS_TOTAL:-8}" bash "$FARM/cardq.sh" cpus --build 2>/dev/null || true)}"
+cpu_args=(--cpus "$CPUS")
+if [ -n "$BUILD_CPUSET" ]; then cpu_args=(--cpuset-cpus "$BUILD_CPUSET"); fi
+BUILDS_LOG="${CARDQ_DIR:-$FARM/q}/builds.log"
+mkdir -p "$(dirname "$BUILDS_LOG")" 2>/dev/null || true
+echo "START $started $track $sha" >>"$BUILDS_LOG" 2>/dev/null || true
+echo "build_track_image: $TAG from $BASE: installing the plugin of $BUNDLE (about three minutes; CPUs ${BUILD_CPUSET:-any $CPUS}) [$(date -u +%Y-%m-%dT%H:%M:%SZ)]"
 $DOCKER rm -f "$NAME" >/dev/null 2>&1 || true
-cleanup() { $DOCKER rm -f "$NAME" >/dev/null 2>&1 || true; }
+cleanup() {
+    local rc=$?
+    $DOCKER rm -f "$NAME" >/dev/null 2>&1 || true
+    echo "END $(date -u +%s) $track $sha $rc" >>"$BUILDS_LOG" 2>/dev/null || true
+}
 trap cleanup EXIT
-$DOCKER run -d --name "$NAME" --label "farm.image-build=$track" --cpus "$CPUS" --net=host \
+$DOCKER run -d --name "$NAME" --label "farm.image-build=$track" "${cpu_args[@]}" --net=host \
     -e PYTHONUNBUFFERED=1 -e PYTHONDONTWRITEBYTECODE=1 \
     -v "$BUNDLE:/bundle" -v "$LOG_DIR:/results" "$BASE" sleep infinity >/dev/null
 if ! $DOCKER exec "$NAME" nice -n 10 bash /bundle/plugin/tools/flash_next/rental/container_entry.sh \
@@ -112,24 +126,46 @@ $DOCKER tag "$TAG" "farm-$track:latest"
 echo "IMAGE-READY $TAG ($(($(date -u +%s) - started)) s, tiny checkpoint $tiny)"
 
 # job_runs_from SHA12: 0 when a waiting or running job of the track in the card queue names that commit
-# (farm job|tiny|serve write "farm_job.sh --sha SHA12"; a script of its own may name the image).
+# (farm job|tiny|serve write "farm_job.sh --sha SHA12"; a script of its own may name the image), or, while
+# the track has such a job at all, when a script file of the track's own folders names it (a job that reads
+# its steps from ~/farm/<track>/job/arm.sh when it starts).
 job_runs_from() {
-    local d st
+    local d st active=0
     for d in "${CARDQ_DIR:-$FARM/q}"/jobs/*/; do
         [ -f "${d}cmd.sh" ] || continue
         st="$(head -n 1 "${d}state" 2>/dev/null || true)"
         case "$st" in waiting | running) ;; *) continue ;; esac
         [ "$(head -n 1 "${d}track" 2>/dev/null || true)" = "$track" ] || continue
+        active=1
         if grep -q -e "--sha $1" -e "farm-$track:$1" "${d}cmd.sh" 2>/dev/null; then return 0; fi
     done
+    if [ "$active" -eq 1 ]; then
+        if find "$FARM/$track" -maxdepth 2 -type f \( -name '*.sh' -o -name '*.txt' \) -size -1024k \
+            -not -path "$FARM/$track/b/*" -not -path "$FARM/$track/results/*" -not -path "$FARM/$track/images/*" \
+            -not -path "$FARM/$track/rental/*" -exec grep -l -e "$1" {} + 2>/dev/null | grep -q .; then
+            return 0
+        fi
+    fi
     return 1
 }
 
-# The newest KEEP images of the track stay; an older one goes only when no container uses it and no
-# waiting or running job runs from it (that job would rebuild it at its start, holding its cards for the
-# three minutes). Never fails the build.
+# drop_bundle SHA12: the unpacked bundle of a commit whose image is gone (about 270 MB each; a build wrote
+# into it as root, so with sudo). Only ever ~/farm/<track>/b/<12 hex digits>.
+drop_bundle() {
+    local dir="$FARM/$track/b/$1"
+    case "$1" in *[!0123456789abcdef]* | '') return 0 ;; esac
+    [ "${#1}" -eq 12 ] && [ -d "$dir" ] || return 0
+    if [ "$(basename "$(readlink "$FARM/$track/current" 2>/dev/null || true)")" = "$1" ]; then return 0; fi
+    ${FARM_SUDO-sudo -n} rm -rf "$dir" 2>/dev/null || rm -rf "$dir" 2>/dev/null || true
+    if [ ! -d "$dir" ]; then echo "build_track_image: removed the bundle of $track at $1"; fi
+}
+
+# The newest KEEP images of the track stay; an older one goes, with its bundle, only when no container uses
+# it and no waiting or running job runs from it (that job would rebuild it at its start, holding its cards
+# for the three minutes). A bundle whose image is gone already goes under the same rule. Never fails the
+# build.
 prune() {
-    local n=0 old
+    local n=0 old b
     $DOCKER images "farm-$track" --format '{{.Tag}} {{.CreatedAt}}' 2>/dev/null | grep -v '^latest ' \
         | sort -k2,3r | while read -r old _; do
         n=$((n + 1))
@@ -141,7 +177,15 @@ prune() {
         fi
         if $DOCKER rmi "farm-$track:$old" >/dev/null 2>&1; then
             echo "build_track_image: removed the old image farm-$track:$old"
+            drop_bundle "$old"
         fi
+    done
+    for b in "$FARM/$track"/b/*/; do
+        [ -d "$b" ] || continue
+        old="$(basename "$b")"
+        if [ "$old" = "$sha" ] || $DOCKER image inspect "farm-$track:$old" >/dev/null 2>&1; then continue; fi
+        if job_runs_from "$old"; then continue; fi
+        drop_bundle "$old"
     done
 }
 prune || true

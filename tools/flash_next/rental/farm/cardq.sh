@@ -21,6 +21,8 @@
 #   cardq.sh ledger                  one line per ended job: track, cards, start, end, seconds
 #   cardq.sh health                  the habanalabs kernel lines since boot per card and class, and the
 #                                    jobs that had some
+#   cardq.sh cpus MODULES|--all|--build   the CPUs of those modules' jobs (0,1,2,3), of an all-card job,
+#                                    or of image builds, as a --cpuset-cpus value
 #   cardq.sh bump --by coord ID [WHY]  (the coordinator only) move a waiting job to the front
 #   cardq.sh bump --by coord ID --before OTHER [WHY]   ... or right before the waiting job OTHER
 #   cardq.sh bump --by coord ID --after OTHER [WHY]    ... or right behind it (the same wave, when cards allow)
@@ -50,7 +52,18 @@
 # A job runs detached from the SSH connection (setsid, nohup) in its own session and process group,
 # with CARDQ_JOB, CARDQ_TRACK, CARDQ_NAME, CARDQ_CARDS (the granted cards, for example 3,4,5,6),
 # CARDQ_MODULES (their module ids, ascending: the HABANA_VISIBLE_MODULES a container of these cards
-# sees), CARDQ_NCARDS, CARDQ_PORT_BASE (100 free ports from there), CARDQ_DEADLINE and CARDQ_JOB_DIR set.
+# sees), CARDQ_CPUS (the CPUs of those modules, for --cpuset-cpus), CARDQ_NCARDS, CARDQ_PORT_BASE (100
+# free ports from there), CARDQ_DEADLINE and CARDQ_JOB_DIR set.
+#
+# CPUs. The host's CPUs are split evenly over the modules (module m: CPUs m x P to (m + 1) x P - 1, P =
+# CPUs / cards). The top CARDQ_BUILD_CPUS_PER_MODULE (default 1) of each share are for image builds, which
+# run next to card jobs, and the rest is the module's jobs' (CARDQ_CPUS, `cardq.sh cpus`): a decode step is
+# bound by one host thread per worker, so a build must not sit on a job's CPUs. A host with fewer than 4
+# CPUs per module gets no sets.
+#
+# Node load. A job's log and the ledger's last column tell how busy the node was while it ran: the highest
+# 1-minute load average, the three at its end, the busy CPUs on average, the image builds that ran during
+# it ($Q/builds.log, written by build_track_image.sh) and the jobs beside it.
 # At the maximum hold, or on cancel, the process group gets SIGTERM and, CARDQ_GRACE_S seconds
 # later, SIGKILL. When a job ends, whatever is left of its process group is killed and every
 # container labelled cardq.job=<id> is removed; a job that held every card and did not end by itself
@@ -329,11 +342,150 @@ sup_alive() {
 }
 
 ledger() {
-    # ledger ID TRACK NAME SPEC CARDS SUBMITTED START END SECONDS RC REASON
+    # ledger ID TRACK NAME SPEC CARDS SUBMITTED START END SECONDS RC REASON [NODE]
     if [ ! -s "$Q/ledger.tsv" ]; then
-        printf 'id\ttrack\tname\twanted\tcards\tsubmitted\tstart\tend\tseconds\trc\treason\n' >>"$Q/ledger.tsv"
+        printf 'id\ttrack\tname\twanted\tcards\tsubmitted\tstart\tend\tseconds\trc\treason\tnode\n' >>"$Q/ledger.tsv"
     fi
-    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$@" >>"$Q/ledger.tsv"
+    if [ $# -ge 12 ] && [ -n "${12}" ]; then
+        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$@" >>"$Q/ledger.tsv"
+    else
+        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "${@:1:11}" >>"$Q/ledger.tsv"
+    fi
+}
+
+# ------------------------------------------------------------------ CPUs and node load
+
+# host_cpus: the number of CPUs of the host in R (CARDQ_HOST_CPUS wins), 0 when unknown.
+host_cpus() {
+    R="${CARDQ_HOST_CPUS:-}"
+    if [ -z "$R" ]; then R="$(nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || echo 0)"; fi
+    case "$R" in '' | *[!0-9]*) R=0 ;; esac
+}
+
+# cpus_of WHAT: the --cpuset-cpus value in R: for "build" the CPUs of image builds, else for the modules
+# "M M M" the CPUs of their jobs (see the header). "" when the host has fewer than 4 CPUs per module.
+cpus_of() {
+    local what="$1" per keep m lo hi out=""
+    keep="${CARDQ_BUILD_CPUS_PER_MODULE:-1}"
+    case "$keep" in '' | *[!0-9]*) keep=1 ;; esac
+    host_cpus
+    per=$((R / NC))
+    R=""
+    if [ "$per" -lt 4 ] || [ "$keep" -ge "$per" ]; then return 0; fi
+    if [ "$what" = build ]; then
+        if [ "$keep" -eq 0 ]; then return 0; fi
+        for ((m = 0; m < NC; m++)); do
+            lo=$(((m + 1) * per - keep))
+            hi=$(((m + 1) * per - 1))
+            if [ "$lo" -eq "$hi" ]; then out="$out${out:+,}$lo"; else out="$out${out:+,}$lo-$hi"; fi
+        done
+    else
+        for m in $what; do
+            out="$out${out:+,}$((m * per))-$(((m + 1) * per - 1 - keep))"
+        done
+    fi
+    R="$out"
+}
+
+cmd_cpus() {
+    local m list=""
+    case "${1:-}" in
+        --build) cpus_of build ;;
+        --all)
+            for ((m = 0; m < NC; m++)); do list="$list $m"; done
+            cpus_of "${list# }"
+            ;;
+        '' | *[!0-9,]* | ,* | *, | *,,*) die "usage: cardq.sh cpus MODULES|--all|--build (MODULES: module ids such as 0,1,2,3)" ;;
+        *)
+            for m in ${1//,/ }; do
+                if [ "$((10#$m))" -ge "$NC" ]; then die "cpus: there is no module $m (modules 0..$((NC - 1)))"; fi
+                list="$list $((10#$m))"
+            done
+            cpus_of "${list# }"
+            ;;
+    esac
+    if [ -n "$R" ]; then printf '%s\n' "$R"; fi
+}
+
+# load_now: the three load averages in R ("" where there is no /proc/loadavg).
+load_now() {
+    local f="${CARDQ_LOADAVG_FILE:-/proc/loadavg}" a b c
+    R=""
+    if [ -r "$f" ] && read -r a b c _ <"$f" 2>/dev/null; then R="$a $b $c"; fi
+}
+
+# stat_now: "BUSY TOTAL" jiffies of all CPUs since boot in R ("" where there is no /proc/stat).
+stat_now() {
+    local f="${CARDQ_STAT_FILE:-/proc/stat}" tag u n s i w q sq st
+    R=""
+    if [ -r "$f" ] && read -r tag u n s i w q sq st _ <"$f" 2>/dev/null && [ "$tag" = cpu ]; then
+        case "$u$n$s$i${w:-0}${q:-0}${sq:-0}${st:-0}" in *[!0-9]*) return 0 ;; esac
+        R="$((u + n + s + ${q:-0} + ${sq:-0} + ${st:-0})) $((u + n + s + i + ${w:-0} + ${q:-0} + ${sq:-0} + ${st:-0}))"
+    fi
+}
+
+# node_info DIR START END: how busy the node was during the job, as a log line in NODE_LINE and a ledger
+# column in NODE_COL ("" where the host gives no numbers).
+NODE_LINE=""
+NODE_COL=""
+node_info() {
+    local d="$1" start="$2" end="$3" max now3 busy="" s0 s1 n builds="" nb=0 beside="" o ost oend os id me="${1##*/}"
+    NODE_LINE=""
+    NODE_COL=""
+    load_now
+    now3="$R"
+    [ -n "$now3" ] || return 0
+    rd "$d/loadmax"
+    max="${R:-${now3%% *}}"
+    rd "$d/stat_start"
+    s0="$R"
+    stat_now
+    s1="$R"
+    host_cpus
+    n="$R"
+    if [ -n "$s0" ] && [ -n "$s1" ] && [ "$n" -gt 0 ] && [ "${s1##* }" -gt "${s0##* }" ]; then
+        busy="$(awk -v b0="${s0%% *}" -v t0="${s0##* }" -v b1="${s1%% *}" -v t1="${s1##* }" -v n="$n" \
+            'BEGIN { printf "%.1f", n * (b1 - b0) / (t1 - t0) }')"
+    fi
+    if [ -s "$Q/builds.log" ]; then
+        builds="$(awk -v a="$start" -v b="$end" '
+            $1 == "START" { t[$3 " " $4] = $2; open[$3 " " $4] = 1; order[++k] = $3 " " $4 }
+            $1 == "END" { e[$3 " " $4] = $2; open[$3 " " $4] = 0 }
+            END {
+                for (i = 1; i <= k; i++) {
+                    x = order[i]
+                    if (seen[x]++) continue
+                    if (t[x] <= b && (open[x] || e[x] >= a)) { n++; if (n <= 5) s = s (s == "" ? "" : ", ") x }
+                }
+                if (n > 5) s = s ", ..."
+                print n + 0 "|" s
+            }' "$Q/builds.log" 2>/dev/null)" || builds=""
+        nb="${builds%%|*}"
+        builds="${builds#*|}"
+        case "$nb" in '' | *[!0-9]*) nb=0 ;; esac
+    fi
+    for o in "$Q"/jobs/*/; do
+        o="${o%/}"
+        id="${o##*/}"
+        [ "$id" != "$me" ] || continue
+        rd "$o/start"
+        os="$R"
+        case "$os" in '' | *[!0-9]*) continue ;; esac
+        [ "$os" -le "$end" ] || continue
+        rd "$o/state"
+        ost="$R"
+        rd "$o/end"
+        oend="$R"
+        if [ "$ost" = running ] || { [ -n "$oend" ] && [ "$oend" -ge "$start" ]; }; then beside="$beside${beside:+ }$id"; fi
+    done
+    NODE_LINE="load average (1 min) highest $max, at the end $now3"
+    NODE_COL="load max $max end ${now3// //}"
+    if [ -n "$busy" ]; then
+        NODE_LINE="$NODE_LINE; $busy of $n CPUs busy on average"
+        NODE_COL="$NODE_COL; busy $busy/$n"
+    fi
+    NODE_LINE="$NODE_LINE; image builds: $nb${builds:+ ($builds)}; jobs beside it: ${beside:-none}"
+    NODE_COL="$NODE_COL; builds $nb; beside ${beside:-none}"
 }
 
 # ------------------------------------------------------------------ choosing cards
@@ -906,10 +1058,21 @@ sweep_containers() {
 # supervisor is gone. It holds the card locks too, so they outlive a killed supervisor until the
 # job is stopped.
 watchdog() {
-    local sup="$1" deadline="$2" why="" now waited=0
+    local sup="$1" deadline="$2" why="" now waited=0 top=-1 one
     while :; do
         sleep "$POLL_S"
         if [ -e "$JOB_DIR/done" ]; then exit 0; fi
+        load_now # the highest 1-minute load average while the job runs, for its end line
+        one="${R%% *}"
+        case "$one" in
+            *[!0-9.]* | '' | *.*.*) ;;
+            *.[0-9][0-9])
+                if [ "$((10#${one/./}))" -gt "$top" ]; then
+                    top="$((10#${one/./}))"
+                    put "$JOB_DIR/loadmax" "$one"
+                fi
+                ;;
+        esac
         now="$(date -u +%s)"
         if [ -e "$JOB_DIR/cancel" ]; then
             why=cancelled
@@ -1118,6 +1281,8 @@ cmd_run() {
             put "$d/modules" "$modules"
             uptime_now
             if [ -n "$R" ]; then put "$d/uptime_start" "$R"; fi
+            stat_now
+            if [ -n "$R" ]; then put "$d/stat_start" "$R"; fi
             put "$d/cards" "$cards"
             put "$d/start" "$start"
             put "$d/deadline" "$deadline"
@@ -1142,6 +1307,8 @@ cmd_run() {
     lowest="${PICK%% *}"
     export CARDQ_JOB="$id" CARDQ_TRACK="$track" CARDQ_NAME="$name" CARDQ_CARDS="$cards" CARDQ_NCARDS="$n"
     export CARDQ_MODULES="$modules"
+    cpus_of "${modules//,/ }"
+    export CARDQ_CPUS="$R"
     export CARDQ_DEADLINE="$deadline" CARDQ_JOB_DIR="$d" CARDQ_PORT_BASE=$((PORT_BASE + 100 * lowest))
     {
         echo "cardq: job $id (track $track, name $name) on cards $cards (modules $modules) from $(iso "$start"), waited $(dur $((start - sub)))"
@@ -1174,13 +1341,15 @@ cmd_run() {
         if [ "$HEALTH_BAD" -eq 1 ]; then reason="$reason; habanalabs ERROR: $HEALTH"; else reason="$reason; habanalabs: $HEALTH"; fi
     fi
     now="$(date -u +%s)"
+    node_info "$d" "$start" "$now"
+    if [ -n "$NODE_LINE" ]; then echo "cardq: node during the job: $NODE_LINE" >>"$d/log"; fi
     echo "cardq: job $id ended at $(iso "$now"): exit code $rc, $((now - start)) s on cards $cards, $reason" >>"$d/log"
     qlock
     put "$d/reason" "$reason"
     put "$d/rc" "$rc"
     put "$d/end" "$now"
     put "$d/state" ended
-    ledger "$id" "$track" "$name" "$spec" "$cards" "$(iso "$sub")" "$(iso "$start")" "$(iso "$now")" $((now - start)) "$rc" "$reason"
+    ledger "$id" "$track" "$name" "$spec" "$cards" "$(iso "$sub")" "$(iso "$start")" "$(iso "$now")" $((now - start)) "$rc" "$reason" "$NODE_COL"
     # The cards are unlocked under the queue lock, in the same step as the state change: nobody may
     # see an ended job whose cards are still locked. Unlocked by hand, because a sleep the watchdog
     # left behind still has the descriptors open for a moment.
@@ -1595,7 +1764,7 @@ cmd_ledger() {
 }
 
 usage() {
-    sed -n '3,31p' "$SELF" | sed 's/^# \{0,1\}//'
+    sed -n '3,33p' "$SELF" | sed 's/^# \{0,1\}//'
 }
 
 if [ "$(id -u)" -eq 0 ] && [ "${CARDQ_ALLOW_ROOT:-0}" != 1 ]; then
@@ -1631,6 +1800,10 @@ case "${1:-}" in
     health)
         shift
         cmd_health "$@"
+        ;;
+    cpus)
+        shift
+        cmd_cpus "$@"
         ;;
     bump)
         shift

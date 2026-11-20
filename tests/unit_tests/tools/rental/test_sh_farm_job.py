@@ -5,6 +5,7 @@ the track's synced commit. `docker` is a stand-in that records its calls. Runs o
 
 import os
 import shlex
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -37,6 +38,7 @@ class Node:
         (self.farm / "kf" / "current").symlink_to("b/" + SHA)
         (self.farm / "q").mkdir()
         (self.farm / "q" / "module_map").write_text("3,0,1,6,7,4,5,2\n")
+        shutil.copy(FARM_JOB.parent / "cardq.sh", self.farm / "cardq.sh")  # the CPU sets are the queue's rule
         (self.farm / "build_track_image.sh").write_text(
             '#!/bin/bash\necho "build $*" >> "$FAKE_DOCKER_LOG"\ntouch "$FAKE_STATE/image-farm-$1:$2"\n')
         self.docker = tmp_path / "docker"
@@ -155,22 +157,29 @@ def test_a_missing_other_image_is_an_error(node):
     assert proc.returncode == 2 and "no image nothere:1" in proc.stderr
 
 
-def test_a_part_of_the_node_gets_its_modules_share_of_the_cpus(node):
+def test_a_container_gets_its_modules_share_of_the_cpus_without_the_build_cpus(node):
+    # 152 CPUs, 8 cards: 19 per module, the top one of each for image builds (cardq.sh cpus)
     words = node.dry("--", "true", FARM_HOST_CPUS="152")  # cards 0,1,2,7 = modules 0-3
-    assert words[words.index("--cpuset-cpus") + 1] == "0-18,19-37,38-56,57-75"
+    assert words[words.index("--cpuset-cpus") + 1] == "0-17,19-36,38-55,57-74"
     assert not any(e.startswith("OMP_NUM_THREADS") for e in envs(words))  # vLLM sizes its threads by the set
     words = node.dry("--cards", "3,4,5,6", "--", "true", FARM_HOST_CPUS="152", CARDQ_CARDS="0,1,2,3,4,5,6,7",
                      CARDQ_MODULES="0,1,2,3,4,5,6,7", CARDQ_NCARDS="8")
-    assert words[words.index("--cpuset-cpus") + 1] == "76-94,95-113,114-132,133-151"
+    assert words[words.index("--cpuset-cpus") + 1] == "76-93,95-112,114-131,133-150"
     words = node.dry("--cards", "1", "--env", "OMP_NUM_THREADS=4", "--", "true", FARM_HOST_CPUS="152",
                      CARDQ_CARDS="0,1,2,3,4,5,6,7", CARDQ_MODULES="0,1,2,3,4,5,6,7", CARDQ_NCARDS="8")
-    assert words[words.index("--cpuset-cpus") + 1] == "0-18"  # card 1 is module 0
+    assert words[words.index("--cpuset-cpus") + 1] == "0-17"  # card 1 is module 0
     assert "OMP_NUM_THREADS=4" in envs(words)  # a job's own --env is passed on
+    # CARDQ_NCARDS is the job's card count here (4), not the node's: the split is still by the node's 8 cards
+    words = node.dry("--cards", "7", "--", "true", FARM_HOST_CPUS="152")
+    assert words[words.index("--cpuset-cpus") + 1] == "38-55"  # card 7 is module 2
 
 
-def test_a_job_of_all_cards_or_with_all_cpus_keeps_the_whole_host(node):
+def test_a_job_of_all_cards_leaves_the_build_cpus_out_and_all_cpus_keeps_the_whole_host(node):
     all8 = dict(FARM_HOST_CPUS="152", CARDQ_CARDS="0,1,2,3,4,5,6,7", CARDQ_MODULES="0,1,2,3,4,5,6,7", CARDQ_NCARDS="8")
     words = node.dry("--", "true", **all8)
-    assert "--cpuset-cpus" not in words and not any(e.startswith("OMP_NUM_THREADS") for e in envs(words))
+    assert words[words.index("--cpuset-cpus") + 1] == "0-17,19-36,38-55,57-74,76-93,95-112,114-131,133-150"
+    assert not any(e.startswith("OMP_NUM_THREADS") for e in envs(words))
     words = node.dry("--all-cpus", "--", "true", FARM_HOST_CPUS="152")
+    assert "--cpuset-cpus" not in words
+    words = node.dry("--", "true", FARM_HOST_CPUS="16")  # a small host: no sets
     assert "--cpuset-cpus" not in words

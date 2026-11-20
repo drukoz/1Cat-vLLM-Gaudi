@@ -206,7 +206,7 @@ def test_a_job_runs_detached_with_its_cards_and_is_recorded(farm):
     assert "exit code 0" in log and log.rstrip().endswith("ok")
     ledger = farm.cq("ledger").stdout.splitlines()
     assert ledger[0].split("\t") == ["id", "track", "name", "wanted", "cards", "submitted", "start", "end",
-                                     "seconds", "rc", "reason"]
+                                     "seconds", "rc", "reason", "node"]
     row = ledger[1].split("\t")
     assert row[:5] == ["00001", "kernel-fixes", "hc-op", "0,1", "0,1"] and row[9:] == ["0", "ok"]
     assert row[6].endswith("Z") and row[7].endswith("Z") and row[8].isdigit()
@@ -894,6 +894,73 @@ def test_health_lists_the_kernel_lines_since_boot_per_card_and_class(farm):
     out = farm.cq("health", FAKE_DMESG_MORE="[ 1006.000000] habanalabs 0000:0c:00.0: Device heartbeat failed!").stdout
     assert "card 2 (module 1, 0000:0c:00.0): 1 lines: 1 ERROR (first: Device heartbeat failed!)" in out
     assert "CARD ERROR" in out
+
+
+def test_cpus_gives_each_module_its_share_and_keeps_one_cpu_per_module_for_image_builds(farm):
+    # A 1-stream decode step is bound by one host thread per worker. Image builds run next to card jobs, so
+    # they get CPUs of their own (the top CPU of each module's share) and jobs get the rest.
+    def cpus(*args, **env):
+        proc = farm.cq("cpus", *args, CARDQ_HOST_CPUS="152", **env)
+        assert proc.returncode == 0, proc.stderr
+        return proc.stdout.strip()
+
+    assert cpus("0,1,2,3") == "0-17,19-36,38-55,57-74"
+    assert cpus("4") == "76-93"
+    assert cpus("--all") == "0-17,19-36,38-55,57-74,76-93,95-112,114-131,133-150"
+    assert cpus("--build") == "18,37,56,75,94,113,132,151"
+    assert cpus("6,7", CARDQ_BUILD_CPUS_PER_MODULE="0") == "114-132,133-151"
+    assert cpus("--build", CARDQ_BUILD_CPUS_PER_MODULE="0") == ""
+    assert cpus("--build", CARDQ_BUILD_CPUS_PER_MODULE="2") == "17-18,36-37,55-56,74-75,93-94,112-113,131-132,150-151"
+    small = farm.cq("cpus", "0", CARDQ_HOST_CPUS="16")  # two CPUs per module: no sets on a small host
+    assert small.returncode == 0 and small.stdout.strip() == ""
+    proc = farm.cq("cpus", "8", CARDQ_HOST_CPUS="152")
+    assert proc.returncode != 0 and "module" in proc.stderr
+
+
+def test_a_job_is_told_the_cpus_of_its_cards(farm):
+    farm.env.update(CARDQ_MODULE_MAP=NODE_MAP, CARDQ_HOST_CPUS="152")
+    job = farm.submit("any:4", 'echo "cpus=$CARDQ_CPUS"\n')  # cards 0,1,2,7 = modules 0-3
+    assert farm.wait(job).returncode == 0
+    assert "cpus=0-17,19-36,38-55,57-74" in farm.cq("log", job).stdout
+    job = farm.submit("all", 'echo "cpus=$CARDQ_CPUS"\n')
+    assert farm.wait(job).returncode == 0
+    assert "cpus=0-17,19-36,38-55,57-74,76-93,95-112,114-131,133-150" in farm.cq("log", job).stdout
+
+
+def test_the_end_line_and_the_ledger_tell_how_busy_the_node_was(farm):
+    # A slow number must be told from a loaded node: the highest load average while the job ran, the busy CPUs
+    # on average, the image builds that ran during it and the jobs beside it.
+    load, stat = farm.tmp / "loadavg", farm.tmp / "stat"
+    load.write_text("12.00 10.00 9.00 3/900 123\n")
+    stat.write_text("cpu  1000 0 1000 8000 0 0 0 0 0 0\ncpu0 1 1 1 1\n")
+    farm.env.update(CARDQ_LOADAVG_FILE=str(load), CARDQ_STAT_FILE=str(stat), CARDQ_HOST_CPUS="152")
+    farm.q.mkdir(parents=True, exist_ok=True)
+    now = int(time.time())
+    (farm.q / "builds.log").write_text(
+        "START %d kf 111111111111\nEND %d kf 111111111111 0\n" % (now - 900, now - 700)  # over before the job
+        + "START %d qsa-fused c96e63ce4932\n" % (now - 5))  # still running when the job ends
+    other = farm.block("0")
+    assert farm.until(lambda: farm.file(other, "state") == "running")
+    job = farm.block("1")
+    assert farm.until(lambda: farm.file(job, "state") == "running")
+    load.write_text("147.61 100.00 80.00 3/900 124\n")
+    assert farm.until(lambda: farm.file(job, "loadmax") == "147.61")
+    with open(farm.q / "builds.log", "a") as f:
+        f.write("START %d prefill 59914e3c00c6\nEND %d prefill 59914e3c00c6 0\n" % (int(time.time()), int(time.time())))
+    load.write_text("34.20 60.10 71.00 3/900 125\n")
+    stat.write_text("cpu  3000 0 2000 15000 0 0 0 0 0 0\ncpu0 1 1 1 1\n")  # 3000 of 10000 new jiffies busy
+    farm.release(job)
+    assert farm.wait(job).returncode == 0
+    log = farm.cq("log", job).stdout
+    assert ("cardq: node during the job: load average (1 min) highest 147.61, at the end 34.20 60.10 71.00; "
+            "45.6 of 152 CPUs busy on average; image builds: 2 (qsa-fused c96e63ce4932, prefill 59914e3c00c6); "
+            "jobs beside it: %s" % other) in log
+    row = [ln.split("\t") for ln in farm.cq("ledger").stdout.splitlines() if ln.startswith(job)][0]
+    assert row[10] == "ok"
+    assert row[11] == "load max 147.61 end 34.20/60.10/71.00; busy 45.6/152; builds 2; beside %s" % other
+    assert farm.cq("ledger").stdout.splitlines()[0].split("\t")[11] == "node"
+    farm.release(other)
+    assert farm.wait(other).returncode == 0
 
 
 def test_without_kernel_lines_since_the_start_the_reason_stays_ok(farm):

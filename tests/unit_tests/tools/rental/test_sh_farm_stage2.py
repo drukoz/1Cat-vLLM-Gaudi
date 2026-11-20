@@ -368,12 +368,63 @@ def test_old_images_go_but_never_the_image_of_a_job_that_waits(rig):
     have = sorted(p.name.split(":")[1] for p in rig.state.glob("image-farm-kf:*") if not p.name.endswith(":latest"))
     assert have == sorted([first, shas[-2], shas[-1]])  # the two newest, and the one the waiting job runs from
     assert "kept for a waiting or running job: farm-kf:%s" % first in proc.stdout
+    # a bundle goes with its image (270 MB each on the node: 45 of them in two hours filled 12 GB)
+    bundles = sorted(p.name for p in (rig.node / "farm" / "kf" / "b").iterdir())
+    assert bundles == sorted([first, shas[-2], shas[-1]])
     # the job has ended: the next sync lets its image go
     (waiting / "state").write_text("ended\n")
     shas.append(_commit(rig, "last"))
     assert rig.farm("sync", "kf", FARM_KEEP_IMAGES="2").returncode == 0
     have = sorted(p.name.split(":")[1] for p in rig.state.glob("image-farm-kf:*") if not p.name.endswith(":latest"))
     assert have == sorted(shas[-2:])
+    assert sorted(p.name for p in (rig.node / "farm" / "kf" / "b").iterdir()) == sorted(shas[-2:])
+
+
+def test_a_commit_named_in_a_tracks_own_job_script_keeps_its_image_and_bundle(rig):
+    # Some jobs read their steps from a file of the track when they start (~/farm/<track>/job/arm.sh): the
+    # commit that file names must stay although no cmd.sh names it.
+    first = rig.sha
+    assert rig.farm("sync", "kf", FARM_KEEP_IMAGES="1").returncode == 0
+    job_dir = rig.node / "farm" / "kf" / "job"
+    job_dir.mkdir()
+    (job_dir / "arm.sh").write_text("exec ~/farm/farm_job.sh --sha %s -- bash /farm/serve_probe.sh\n" % first)
+    waiting = rig.node / "farm" / "q" / "jobs" / "00009"
+    waiting.mkdir(parents=True)
+    (waiting / "state").write_text("waiting\n")
+    (waiting / "track").write_text("kf\n")
+    (waiting / "cmd.sh").write_text('bash "$HOME/farm/kf/job/arm.sh" off\n')
+    shas = [first] + [_commit(rig, "s%d" % i) for i in range(1)]
+    assert rig.farm("sync", "kf", FARM_KEEP_IMAGES="1").returncode == 0
+    shas.append(_commit(rig, "s2"))
+    proc = rig.farm("sync", "kf", FARM_KEEP_IMAGES="1")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    have = sorted(p.name.split(":")[1] for p in rig.state.glob("image-farm-kf:*") if not p.name.endswith(":latest"))
+    assert have == sorted([first, shas[-1]])
+    # the bundle of the commit that was `current` while this build ran stays one sync longer
+    assert sorted(p.name for p in (rig.node / "farm" / "kf" / "b").iterdir()) == sorted([first, shas[-2], shas[-1]])
+    # no job of the track waits or runs any more: the file's commit goes with the next sync
+    (waiting / "state").write_text("ended\n")
+    shas.append(_commit(rig, "s3"))
+    assert rig.farm("sync", "kf", FARM_KEEP_IMAGES="1").returncode == 0
+    have = sorted(p.name.split(":")[1] for p in rig.state.glob("image-farm-kf:*") if not p.name.endswith(":latest"))
+    assert have == [shas[-1]]
+    assert sorted(p.name for p in (rig.node / "farm" / "kf" / "b").iterdir()) == sorted(shas[-2:])
+
+
+def test_an_image_build_runs_on_the_build_cpus_and_is_written_to_the_builds_log(rig):
+    proc = rig.farm("sync", "kf", CARDQ_HOST_CPUS="152")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    run = [ln for ln in (rig.state / "docker.log").read_text().splitlines() if ln.startswith("run -d --name farm-img-kf")]
+    assert len(run) == 1 and "--cpuset-cpus 18,37,56,75,94,113,132,151" in run[0] and "--cpus " not in run[0]
+    log = (rig.node / "farm" / "q" / "builds.log").read_text().split()
+    assert log[0] == "START" and log[2:4] == ["kf", rig.sha]
+    assert log[4] == "END" and log[6:9] == ["kf", rig.sha, "0"] and int(log[5]) >= int(log[1])
+    # a host with too few CPUs for a build set: the old limit by count
+    sha2 = _commit(rig, "second")
+    proc = rig.farm("sync", "kf", CARDQ_HOST_CPUS="16")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    run = [ln for ln in (rig.state / "docker.log").read_text().splitlines() if ln.startswith("run -d --name farm-img-kf-%s" % sha2)]
+    assert len(run) == 1 and "--cpus 24" in run[0] and "--cpuset-cpus" not in run[0]
 
 
 def test_image_builds_wait_for_a_free_node_slot(rig):
