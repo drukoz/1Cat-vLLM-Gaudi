@@ -284,7 +284,7 @@ def _validate_flash_next_speculative_config(vllm_config: VllmConfig) -> None:
     if not 1 <= speculative_config.num_speculative_tokens <= 5:
         raise ValueError("Flash-Next MTP on HPU runs 1 to 5 speculative tokens (the recipe is 3)")
     global _SPEC_GREEDY_ONLY, _SPECULATIVE_SERVER
-    _SPEC_GREEDY_ONLY = int(gaudi_envs.VLLM_HPU_SPEC_SAMPLED_VERIFY) != 1
+    _SPEC_GREEDY_ONLY = int(gaudi_envs.VLLM_HPU_SPEC_SAMPLED_VERIFY) not in (1, 2)
     _SPECULATIVE_SERVER = True
 
 

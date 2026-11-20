@@ -187,7 +187,15 @@ this flag a sampled request stopped the worker. `1` verifies the drafts of
 sampled requests by speculative sampling in torch (accept the draft with the
 target's probability of it after temperature, top-k and top-p; on a rejection
 draw from the target with the draft removed), exact in distribution;
-`vllm_gaudi/v1/sample/hpu_rejection_sampler.py`, `sampled_rejection_sample`.
+`vllm_gaudi/v1/sample/hpu_rejection_sampler.py`, `sampled_rejection_sample`. `2` does
+the same over the 64 largest logits of every verification and bonus row
+(`vllm_gaudi/v1/sample/hpu_candidate_verify.py`): with `top_k` at most 64 (the
+checkpoint's default is 20) the target distribution lives on those, so the step needs
+one `topk` over the vocabulary instead of vLLM's sort, softmax and noise over it; ids
+come from an fp32 id table (no top-k index leaves the graph) and the noise from the
+host, seeded alike on every rank. A step with a seeded request, logprobs or a `top_k`
+outside 1..64 takes the exact path of `1`; a greedy request of a mixed batch runs as
+`top_k` 1.
 
 `VLLM_HPU_MTP_DRAFT_LOOP` selects how the Flash-Next MTP draft loop gets the
 positions of its steps 1 to k-1, as an integer. `0` (default) reads them back

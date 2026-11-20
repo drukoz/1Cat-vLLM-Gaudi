@@ -388,4 +388,5 @@ class HpuFlashNextMtpProposer(HpuEagleProposer):
             return vocab_parallel.vocab_parallel_argmax(self.model, hidden_states), None
         logits = self.model.compute_logits(hidden_states)
         top_ids = None if self.draft_rank_stats is None else logits.topk(DRAFT_RANK_TOP, dim=-1).indices
+        # draft_argmax: arg max, or int32 ids from an fp32 id table with VLLM_HPU_MTP_DRAFT_IDS=1 (card rule 9).
         return draft_argmax(logits), top_ids

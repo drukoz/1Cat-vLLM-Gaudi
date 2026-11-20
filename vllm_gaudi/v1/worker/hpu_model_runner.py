@@ -6822,6 +6822,50 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
     # VLLM_HPU_MTP_TIMING=1: the speculative step's timer (mtp_step_timer.py). A class default, so a runner built
     # without __init__ (unit tests) is untimed.
     _mtp_step_timer = None
+    # VLLM_HPU_SPEC_SAMPLED_VERIFY=2: the host noise generator of the candidate verification (seeded alike on every
+    # rank at its first use, so every rank draws the same tokens) and the refusals already logged.
+    _candidate_noise = None
+    _candidate_refusals_logged: Optional[set] = None
+    _candidate_verify_steps = 0  # steps verified over candidates (the CPU engine rehearsal reads it)
+
+    def _candidate_verify(self, logits_device: torch.Tensor, spec_decode_metadata,
+                          sampling_metadata: SamplingMetadata, request_ids: list[str]) -> Optional[torch.Tensor]:
+        """VLLM_HPU_SPEC_SAMPLED_VERIFY=2: a verification step with sampled requests over the top candidates of its
+        rows (hpu_candidate_verify.py), ``[batch, k + 1]`` int32 tokens; None when the step does not qualify (a
+        seeded request, logprobs, top_k outside 1..64), which then takes the exact path of ``=1``."""
+        from vllm_gaudi.v1.sample import hpu_candidate_verify as candidate_verify
+        from vllm_gaudi.v1.sample.hpu_rejection_sampler import PLACEHOLDER_TOKEN_ID
+
+        batch = int(spec_decode_metadata.bonus_logits_indices.shape[0])
+        params = [self.requests[req_id].sampling_params for req_id in request_ids]
+        if not params or len(params) > batch or any(p is None for p in params):
+            return None
+        params = params + [params[0]] * (batch - len(params))  # the padded batch repeats its first request
+        temperatures = [float(p.temperature) for p in params]
+        top_ks = [int(p.top_k) for p in params]
+        top_ps = [float(p.top_p) for p in params]
+        reason = candidate_verify.refusal(temperatures, top_ks, top_ps,
+                                          seeded=any(p.seed is not None for p in params),
+                                          logprobs=sampling_metadata.max_num_logprobs is not None)
+        if reason is not None:
+            if self._candidate_refusals_logged is None:
+                self._candidate_refusals_logged = set()
+            if reason not in self._candidate_refusals_logged:
+                self._candidate_refusals_logged.add(reason)
+                logger.info("VLLM_HPU_SPEC_SAMPLED_VERIFY=2: a step with %s takes the exact sampled verification",
+                            reason)
+            return None
+        if self._candidate_noise is None:
+            self._candidate_noise = torch.Generator().manual_seed(candidate_verify.NOISE_SEED)
+        max_draft = int(spec_decode_metadata.target_logits_indices.shape[0]) // batch
+        inputs = candidate_verify.host_inputs(temperatures, top_ks, top_ps, max_draft, self._candidate_noise)
+        self._candidate_verify_steps += 1
+        return candidate_verify.candidate_rejection_sample(logits_device, spec_decode_metadata.target_logits_indices,
+                                                           spec_decode_metadata.bonus_logits_indices,
+                                                           spec_decode_metadata.draft_token_ids,
+                                                           spec_decode_metadata.cu_num_draft_tokens,
+                                                           inputs.to(logits_device.device, non_blocking=True),
+                                                           PLACEHOLDER_TOKEN_ID)
 
     @torch.inference_mode()
     def sample_tokens(self, grammar_output: "GrammarOutput | None") -> ModelRunnerOutput | AsyncModelRunnerOutput:
@@ -7148,11 +7192,20 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                     elif fused_sampled_token_ids is not None:
                         # Greedy verification from the arg max of every row: no sampler pass over logits.
                         sampler_output, sampling_metadata = None, None
+                    elif spec_decode_metadata is not None:
+                        # The rejection sampler samples the bonus rows itself, so only the sampling metadata here
+                        # (no discarded sampler pass): one row per request of the padded batch, its bonus row, as
+                        # that sampler pass and the sampled verification read it (idea-sweep I07). Padded to the
+                        # logits' 1 + k rows per request, a sampled request's temperature did not fit its row.
+                        htorch.core.mark_step()
+                        sampling_metadata = self._prepare_sampling(batch_changed, pd_info.decode_req_ids,
+                                                                   int(spec_decode_metadata.bonus_logits_indices.shape[0]))
+                        htorch.core.mark_step()
+                        sampler_output = None
                     else:
-                        sampler_output, sampling_metadata = self._run_sampling(
-                            batch_changed, logits_device if spec_decode_metadata is None else
-                            logits_device[spec_decode_metadata.bonus_logits_indices], pd_info.decode_req_ids,
-                            logits_device.shape[0])
+                        sampler_output, sampling_metadata = self._run_sampling(batch_changed, logits_device,
+                                                                               pd_info.decode_req_ids,
+                                                                               logits_device.shape[0])
 
                     if spec_decode_metadata is None:
                         assert sampler_output is not None
@@ -7191,6 +7244,12 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                                     spec_decode_metadata.bonus_logits_indices,
                                     spec_decode_metadata.cu_num_draft_tokens,
                                 )
+                        if (sampled_token_ids is None and sampling_metadata is not None
+                                and not sampling_metadata.all_greedy
+                                and int(gaudi_envs.VLLM_HPU_SPEC_SAMPLED_VERIFY) == 2):
+                            # Sampled verification over candidates (idea-sweep I07); None: the exact path below.
+                            sampled_token_ids = self._candidate_verify(logits_device, spec_decode_metadata,
+                                                                       sampling_metadata, pd_info.decode_req_ids)
                         if sampled_token_ids is None:
                             sampler_output = self.rejection_sampler(
                                 spec_decode_metadata,

@@ -315,8 +315,9 @@ def test_a_sampled_request_on_a_speculative_server_is_refused(speculative_server
     speculative_server.HpuPlatform.validate_request(None, _params(0.0))  # greedy: served
 
 
-def test_a_sampled_request_is_served_with_the_flag(speculative_server, monkeypatch):
-    monkeypatch.setenv("VLLM_HPU_SPEC_SAMPLED_VERIFY", "1")
+@pytest.mark.parametrize("mode", ["1", "2"])  # 2: over candidates, the exact path for the steps it refuses
+def test_a_sampled_request_is_served_with_the_flag(speculative_server, monkeypatch, mode):
+    monkeypatch.setenv("VLLM_HPU_SPEC_SAMPLED_VERIFY", mode)
     _validate_flash_next_speculative_config(_spec_config())
     speculative_server.HpuPlatform.validate_request(None, _params(0.7))
 

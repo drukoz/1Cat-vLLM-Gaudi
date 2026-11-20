@@ -263,6 +263,7 @@ minutes instead of a full run:
 | `--reinstall` | install the stack again in the same container; needed after any change under `plugin/` (the servers run the installed plugin, not the source tree) |
 | `--fresh` | remove the container first: new install, new tiny checkpoint |
 | `--gdn LIST` | the modes to serve, in order (default `pytorch,fused`); the third mode, `hc`, runs only when named (`--gdn hc`, `--gdn pytorch,fused,hc`), and so do the fourth, `moe` (`--gdn moe`), and the fifth, `qsa` (`--gdn qsa`) |
+| `--spec K` | after each mode, its speculative mode `<mode>+mtpK` (the MTP layer drafts K tokens, 1 to 5): the tokens are compared with the reference and with the same mode without speculation, and the acceptance length is printed; rungs, in order: the fused verification op (`VLLM_HPU_GDN_CORE_VERIFY=1`), the torch verification, no speculation |
 | `--full-warmup` | run the real bucket warmup (about 15 minutes per mode); the default skips it, see above |
 | `--health-timeout S` | seconds to wait for a server to get healthy, passed to the check (default 1800) |
 | `--env KEY=VALUE` | extra server environment variable, repeatable; applied after the mode's own flags, so it can override them (a `KEY` without `=` is a usage error) |

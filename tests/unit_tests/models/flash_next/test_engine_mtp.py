@@ -200,6 +200,21 @@ def test_sampled_requests_through_the_speculative_engine(engine_runs):
     assert max(r for step in run["decode_steps"] for r in step["rows"]) == 1 + K
 
 
+def test_sampled_requests_over_candidates(engine_runs):
+    # VLLM_HPU_SPEC_SAMPLED_VERIFY=2 with the checkpoint's default sampling (temperature 1.0, top_k 20, top_p 0.95):
+    # the verification steps take the candidate path (hpu_candidate_verify.py), with its host noise and its fp32 id
+    # table, and every stream gets its tokens.
+    env = {"VLLM_HPU_SPEC_SAMPLED_VERIFY": "2"}
+    run = hpu_cpu_engine.run(engine_runs["ckpt"], engine_runs["dir"] / "sampled_candidates.json", "--k", str(K),
+                             "--temperature", "1.0", "--top-k", "20", "--top-p", "0.95", "--max-tokens", "8",
+                             env=env)
+    for prompt in run["prompts"]:
+        assert len(prompt["generated_ids"]) == 8
+        assert all(0 <= t < 248320 for t in prompt["generated_ids"])
+    assert max(r for step in run["decode_steps"] for r in step["rows"]) == 1 + K
+    assert run["runner"]["candidate_verify_steps"] > 0
+
+
 def test_a_sampled_request_is_refused_without_the_flag(engine_runs):
     with pytest.raises(RuntimeError, match="VLLM_HPU_SPEC_SAMPLED_VERIFY=1"):
         hpu_cpu_engine.run(engine_runs["ckpt"], engine_runs["dir"] / "sampled_refused.json", "--k", str(K),
