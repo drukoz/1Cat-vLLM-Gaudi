@@ -154,3 +154,22 @@ def test_split_block_is_logged_once_per_scheduler(monkeypatch, caplog):
     lines = [r.getMessage() for r in caplog.records if "VLLM_HPU_PREFIX_ALIGN_SPLIT" in r.getMessage()]
     assert len(lines) == 1, lines
     assert "128" in lines[0] and "896" in lines[0]
+
+
+def test_block_aligned_prompts_need_the_prompt_end_keep_as_well(monkeypatch):
+    """A prompt of a whole number of blocks keeps its replay boundary one block before its end: with the aligned
+    split alone its next turn still misses (or hits a block short); VLLM_HPU_PREFIX_KEEP_PROMPT_END=1 keeps the state
+    after exactly N tokens, so the next turn starts behind the whole prompt."""
+    for tp, n in ((4, 28_672), (8, 32_768), (8, 34_304)):
+        cached = {}
+        for keep in ("0", "1"):
+            monkeypatch.setenv("VLLM_HPU_PREFIX_KEEP_PROMPT_END", keep)
+            sim = _sim(monkeypatch, tp=tp, flag=True)
+            prompt = h.own_tokens(3, n, salt=11)
+            sim.add("cold", prompt, max_tokens=8)
+            sim.run_until_finished(["cold"], 5000)
+            sim.add("turn", prompt + sim.outputs["cold"] + h.own_tokens(4, 500, salt=11), max_tokens=8)
+            sim.run_until_finished(["turn"], 5000)
+            assert sim.violations == []
+            cached[keep] = sim.admissions["turn"].cached_tokens
+        assert cached["0"] < n and cached["1"] == n, (tp, n, cached)
