@@ -45,7 +45,7 @@ def test_mask_is_the_min_tokens_rule():
 
 def test_stop_id_rows():
     ids, active = min_tokens_stop_ids([[5, 2], None, [9]], 4)
-    assert ids.dtype == torch.int32 and ids.shape == (4, STOP_ID_WIDTH)
+    assert ids.dtype == torch.int64 and ids.shape == (4, STOP_ID_WIDTH)  # host-made int64: no cast in the graph
     assert ids[0].tolist() == [2, 5] + [5] * (STOP_ID_WIDTH - 2)
     assert ids[1].tolist() == [0] * STOP_ID_WIDTH and ids[3].tolist() == [0] * STOP_ID_WIDTH
     assert active.tolist() == [True, False, True, False]
@@ -134,7 +134,8 @@ def test_a_stop_token_before_min_tokens_is_masked(tiny_checkpoint, reference):
         if "stop_ids" in kwargs:
             masked_steps += 1
             want = mask_stop_tokens(want, kwargs["stop_ids"], kwargs["stop_rows"])
-        assert torch.equal(sampled.flatten(), want.argmax(dim=-1).to(torch.int32))
+        assert sampled.dtype == torch.int64  # the sync path: ids leave the graph as argmax makes them
+        assert torch.equal(sampled.flatten(), want.argmax(dim=-1))
     assert masked_steps == len(paths.fused_steps) > 0
     # the mask changed the third token: unmasked, the model picks the stop token there
     third_logits = paths.fused_steps[1][0]

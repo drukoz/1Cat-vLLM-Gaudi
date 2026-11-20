@@ -1769,18 +1769,31 @@ class HpuModelAdapter(torch.nn.Module, HpuKVConnectorModelRunnerMixin):
         hidden_states = hidden_states[logits_indices]
         return hidden_states, self.model.compute_logits(hidden_states)
 
-    def select_compute_logits_and_greedy(self, hidden_states, logits_indices, stop_ids=None, stop_rows=None):
+    def select_compute_logits_and_greedy(self,
+                                         hidden_states,
+                                         logits_indices,
+                                         stop_ids=None,
+                                         stop_rows=None,
+                                         narrow_ids=True):
         """Keep the LM head and plain-greedy argmax in one compiled region.
 
         ``stop_ids`` / ``stop_rows`` (``v1/sample/fused_greedy.py``): the stop tokens of the rows still below
-        their ``min_tokens``, masked to ``-inf`` before the argmax."""
+        their ``min_tokens``, masked to ``-inf`` before the argmax.
+
+        ``narrow_ids=False`` returns the arg max ids as int64, as the op makes them: the caller reads them to the
+        host and narrows there. The runner asks for that whenever the ids are not needed on the device (no async
+        scheduling), so the region has no integer cast (card rule 9: ``torch.topk`` ids narrowed to int32 in the
+        graph that made them came back wrong; for ``argmax`` the same narrowing runs in vLLM's sampler on every
+        step, but it is not card-checked in this region)."""
         hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
         hidden_states = hidden_states[logits_indices]
         logits = self.model.compute_logits(hidden_states).to(torch.float32)
         if stop_ids is not None:
             logits = mask_stop_tokens(logits, stop_ids, stop_rows)
         sampled_token_ids = logits.argmax(dim=-1)
-        return hidden_states, sampled_token_ids.to(torch.int32).unsqueeze(-1)
+        if narrow_ids:
+            sampled_token_ids = sampled_token_ids.to(torch.int32)
+        return hidden_states, sampled_token_ids.unsqueeze(-1)
 
     def combine_hidden_states(self, *args, **kwargs):
         return self.model.combine_hidden_states(*args, **kwargs)
@@ -5851,8 +5864,10 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                     stop_kwargs = dict(stop_ids=async_h2d_copy(greedy_stop_ids[0], device=self.device),
                                        stop_rows=async_h2d_copy(greedy_stop_ids[1].to(torch.int32),
                                                                 device=self.device))
+                # The sync path reads the ids to the host right after the step: int64 out of the graph, narrowed
+                # there. Async scheduling keeps them on the device as int32 for the next step's inputs.
                 hidden_states, fused_sampled_token_ids = self.model.select_compute_logits_and_greedy(
-                    hidden_states, logits_indices, **stop_kwargs)
+                    hidden_states, logits_indices, narrow_ids=bool(self.use_async_scheduling), **stop_kwargs)
                 logits = None
             else:
                 hidden_states, logits = self.model.select_and_compute_logits(hidden_states, logits_indices)
