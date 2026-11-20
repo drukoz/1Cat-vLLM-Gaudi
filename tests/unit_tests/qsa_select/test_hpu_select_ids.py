@@ -103,15 +103,14 @@ def test_oracle_and_cpu_agree(decode8):
 
 
 def test_select_blocks_on_the_card(decode8):
-    """The plugin's ``select_blocks`` (as configured) on host-made scores: host read and in-graph consumer."""
-    from vllm_gaudi.models.qwen4_exp.qsa_sparse_ops import TOPK_IDS_MODE, expand_selection, select_blocks
+    """The plugin's ``select_blocks`` on host-made scores: host read and in-graph consumer."""
+    from vllm_gaudi.models.qwen4_exp.qsa_sparse_ops import expand_selection, select_blocks
     case, want = decode8
     scores, visible = sc.host_scores(case)
     dev = sc.on_device(case, DEVICE)
     selected = expand_selection(select_blocks(scores.to(DEVICE), visible.to(DEVICE), sc.TOPK), dev.positions, sc.RATIO)
     probe = sc.consumer(selected, dev.md.block_table, dev.slot_values)
     entry = verdict(case, {"consumer": probe.cpu(), "selected": selected.cpu()}, want)
-    entry["topk_ids_mode"] = TOPK_IDS_MODE
     record("plugin/select_blocks", entry)
     assert entry["ok"], entry
 

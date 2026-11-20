@@ -8,9 +8,10 @@ Two things no test covered before 2026-11-20:
   select_case.py``): mode 0 (the default path), mode 1 (request-major keys) and mode 1 sharded by request, on
   plain decode rows and on the verification lattice;
 * the card's behaviour found by kernel-fixes' job 00038: ``torch.topk``'s int64 ids, narrowed with
-  ``.to(torch.int32)`` in the same lazy graph, come back as every second id of the table with the second half
-  out of range. ``CardIds`` models that on the CPU; with it ``select_blocks`` must still select the right blocks,
-  and the cast it replaced must not (which shows the model would catch the old line).
+  ``.to(torch.int32)`` in the same lazy graph, came back as every second id of the table with the second half
+  out of range (a ``[16, 512]`` input, ``k = 10``; at the QSA shapes the cast was right on the card, jobs 00062
+  and 00063). ``CardIds`` models the defect on the CPU; with it ``select_blocks`` must still select the right
+  blocks, and the cast it replaced must not (which shows the model would catch the old line).
 
 The same case runs on a card in ``tests/unit_tests/qsa_select/test_hpu_select_ids.py``.
 """
@@ -136,24 +137,32 @@ def card_topk(monkeypatch):
     monkeypatch.setattr(torch, "topk", topk)
 
 
-def host_selection(case, narrow_mode, monkeypatch):
-    monkeypatch.setattr(qsa_sparse_ops, "TOPK_IDS_MODE", narrow_mode)
+CASTS = {
+    "cast": lambda idx, n: idx.to(torch.int32),  # the line select_blocks had before 2026-11-20
+    "through_fp32": lambda idx, n: idx.to(torch.float32).to(torch.int32),
+}
+
+
+def host_selection(case, narrow=None, monkeypatch=None):
+    """``select_blocks`` on the case's scores; ``narrow`` replaces ``topk_ids_int32`` with one of ``CASTS``."""
+    if narrow is not None:
+        monkeypatch.setattr(qsa_sparse_ops, "topk_ids_int32", CASTS[narrow])
     scores, visible = sc.host_scores(case)
     blocks = select_blocks(scores, visible, sc.TOPK).as_subclass(torch.Tensor)
     return {"selected": expand_selection(blocks.clamp(max=sc.N_KEYS - 1), case.positions, sc.RATIO)}
 
 
-def test_select_blocks_is_right_on_a_device_that_casts_like_the_card(card_topk, monkeypatch):
+def test_select_blocks_is_right_on_a_device_that_casts_like_the_card(card_topk):
     case = sc.build_case("decode8")
-    cmp = sc.compare(case, host_selection(case, 0, monkeypatch))
+    cmp = sc.compare(case, host_selection(case))
     assert cmp["ok"], cmp
 
 
-@pytest.mark.parametrize("narrow_mode", [1, 2])
-def test_the_model_catches_a_cast_of_the_ids(card_topk, monkeypatch, narrow_mode):
-    """The cast forms (the line before 2026-11-20, and a cast through fp32) select wrongly under the model."""
+@pytest.mark.parametrize("narrow", sorted(CASTS))
+def test_the_model_catches_a_cast_of_the_ids(card_topk, monkeypatch, narrow):
+    """A cast of the ids (the line before 2026-11-20, or a cast through fp32) selects wrongly under the model."""
     case = sc.build_case("decode8")
-    cmp = sc.compare(case, host_selection(case, narrow_mode, monkeypatch))
+    cmp = sc.compare(case, host_selection(case, narrow, monkeypatch))
     assert len(cmp["selected_wrong_rows"]) >= 6, cmp
 
 

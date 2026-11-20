@@ -19,14 +19,8 @@ projection outputs, and the tests compare against the HF module on CPU.
 """
 
 import math
-import os
 
 import torch
-
-# How ``select_blocks`` turns top-k's int64 ids into int32 (card rule 9, see ``topk_ids_int32``): 0 = a gather
-# from an int32 ``arange`` (default), 1 = the cast ``idx.to(torch.int32)`` (the form before 2026-11-20), 2 = a cast
-# through fp32. A diagnostic switch for the card check of 2026-11-20 (``tests/unit_tests/qsa_select``), read once.
-TOPK_IDS_MODE = int(os.environ.get("VLLM_HPU_QSA_TOPK_IDS", "0") or 0)
 
 
 def ring_rows(compress_ratio: int, num_speculative_tokens: int) -> int:
@@ -110,15 +104,13 @@ def topk_ids_int32(idx: torch.Tensor, n: int) -> torch.Tensor:
     """The int64 ids ``torch.topk`` returned over ``n`` columns, as int32 of the same shape, without a cast.
 
     Card rule 9 (kernel-fixes job 00038, 2026-11-20): on a Gaudi card ``topk(...).indices.to(torch.int32)``
-    in the same lazy graph returns every second id and reads past the end of the table (the cast reads
-    8-byte elements from ids the bridge holds as 4 bytes). Here the ids are only ever an index: the
-    result is a gather from an int32 ``arange(n)``, so no node converts the ids' type. The values are
-    those of ``idx.to(torch.int32)`` on a device that casts correctly.
+    in the same lazy graph came back as every second id, the second half out of range, for a ``[16, 512]``
+    input with ``k = 10`` (the cast read 8-byte elements from ids the bridge holds as 4 bytes). At this
+    function's shapes (``[rows, 32768]``, ``k = 512``) the cast was right on the card (jobs 00062 and 00063,
+    ``tests/unit_tests/qsa_select/test_hpu_select_ids.py``), and so is this form, which does not depend on
+    what triggers the defect: the ids are only ever an index, the result is a gather from an int32
+    ``arange(n)``, and no node converts the ids' type.
     """
-    if TOPK_IDS_MODE == 1:
-        return idx.to(torch.int32)
-    if TOPK_IDS_MODE == 2:
-        return idx.to(torch.float32).to(torch.int32)
     cols = torch.arange(n, dtype=torch.int32, device=idx.device)
     return cols.index_select(0, idx.reshape(-1)).view(idx.shape)
 
