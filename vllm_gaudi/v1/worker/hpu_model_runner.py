@@ -1901,10 +1901,22 @@ def _mark_unbacked_dim0(tensor: torch.Tensor):
     torch._dynamo.decorators.mark_unbacked(tensor, 0)
 
 
+def _hpu_graph_wrap_kwargs() -> dict:
+    """The ``wrap_in_hpu_graph`` arguments of the model's graph.
+
+    ``VLLM_HPU_GRAPH_ASYNC_REPLAY=1`` adds ``asynchronous=True``: the replay is queued and the forward returns,
+    instead of the caller's thread issuing every captured recipe and collective before it returns.
+    """
+    kwargs = {"disable_tensor_cache": True}
+    if gaudi_envs.VLLM_HPU_GRAPH_ASYNC_REPLAY:
+        kwargs["asynchronous"] = True
+    return kwargs
+
+
 def _maybe_wrap_in_hpu_graph(*args, **kwargs):
-    return htorch.hpu.wrap_in_hpu_graph(HpuModelAdapter(
-        *args, **kwargs), disable_tensor_cache=True) if htorch.utils.internal.is_lazy() else HpuModelAdapter(
-            *args, **kwargs)
+    return htorch.hpu.wrap_in_hpu_graph(HpuModelAdapter(*args, **kwargs), **
+                                        _hpu_graph_wrap_kwargs()) if htorch.utils.internal.is_lazy() else HpuModelAdapter(
+                                            *args, **kwargs)
 
 
 def subtuple(obj: object, typename: str, to_copy: list[str], to_override: Optional[dict[str, object]] = None):

@@ -537,6 +537,7 @@ if TYPE_CHECKING:
     VLLM_HPU_MOE_GLUE: int = 0  # 0 torch MoE glue (default), 1 the fused MoE glue kernels
     VLLM_HPU_COLLECTIVE_MARK_STEP: int = 1  # 1 (default) mark_step() before every HPU collective, 0 none
     VLLM_HPU_DECODE_CUT_INTERVAL: int = 0  # 0 (default) decode keeps the per-layer cuts, N cut every N-th layer
+    VLLM_HPU_GRAPH_ASYNC_REPLAY: int = 0  # 0 (default) the model's HPU graph replays synchronously, 1 asynchronously
     VLLM_HPU_RECURRENT_STATE_POOL: int = 0  # RecurrentStatePoolMode: 0 off, 1 pool
     VLLM_HPU_RECURRENT_STATE_POOL_SLOTS: int = 0  # resolved by the hook; positive overrides the formula
     VLLM_HPU_RECURRENT_STATE_POOL_CACHE_SLOTS: int = 512  # retained prefix states added to the live need
@@ -1931,6 +1932,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # VLLM_CONFIG_HIDDEN_LAYERS. docs/design/flash-next/native-replay.md.
     "VLLM_HPU_DECODE_CUT_INTERVAL":
     lambda: int(os.environ.get("VLLM_HPU_DECODE_CUT_INTERVAL", "0")),
+
+    # The model's HPU graph (wrap_in_hpu_graph in lazy mode): 0 (default) replays synchronously, the caller's
+    # thread issuing every captured recipe and collective before the forward returns; 1 passes asynchronous=True,
+    # so the forward returns once the replay is queued and the logits and sampler ops are issued meanwhile.
+    # docs/design/flash-next/native-replay.md.
+    "VLLM_HPU_GRAPH_ASYNC_REPLAY":
+    lambda: int(os.environ.get("VLLM_HPU_GRAPH_ASYNC_REPLAY", "0")),
 
     # Recurrent (GDN / short-conv) state pool: 0 (default) keeps today's
     # one-recurrent-slot-per-attention-block-id allocation, 1 gives the
