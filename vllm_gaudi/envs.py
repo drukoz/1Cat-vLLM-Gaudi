@@ -529,6 +529,8 @@ if TYPE_CHECKING:
     VLLM_HPU_FUSED_GREEDY_LOGITS: bool = False
     VLLM_HPU_FLASH_NEXT_QSA_MODE: int = 0
     VLLM_HPU_FLASH_NEXT_QSA_PREFILL_TILE: int = 2048
+    VLLM_HPU_QSA_FUSED: int = 0  # QsaFusedMode: 0 torch QSA decode (default), 1 torch data flow, 2 TPC kernels
+    VLLM_HPU_QSA_INDEXER_SHARD: int = 0  # QsaShardMode: 0 replicated decode indexer (default), 1 by request
     VLLM_HPU_GDN_CORE_DECODE: int = 1  # GdnCoreDecodeMode: 1 fused (default), 0 off, 2 recurrence
     VLLM_HPU_GDN_CORE_DECODE_DEBUG: int = 0  # GdnCoreDecodeDebug: 0 off, 1 check slot indices every step (host sync)
     VLLM_HPU_GDN_CORE_VERIFY: int = 0  # GdnCoreVerifyMode: 0 off (default), 1 fused verification steps
@@ -1869,6 +1871,24 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # 262K bf16 bias plane at 1 GiB, under FusedSDPA's 2^31-byte stride limit.
     "VLLM_HPU_FLASH_NEXT_QSA_PREFILL_TILE":
     lambda: int(os.environ.get("VLLM_HPU_FLASH_NEXT_QSA_PREFILL_TILE", "2048")),
+
+    # Flash-Next sparse QSA decode (QsaFusedMode, vllm_gaudi/models/qwen4_exp/qsa_fused_path.py).
+    # 0 (default) = the torch path. 1 = the restructured torch data flow: the indexer scores each
+    # request's compressed keys once for all its rows (one whole-block gather per request, not one
+    # [rows, N] gather per row) and the attention folds the grouped query heads into the GEMM instead
+    # of repeating K and V. 2 = mode 1 plus the TPC kernels of flashinfer_gaudi.qsa_fused (each piece
+    # falls back to its mode-1 torch form with one log line). Any other value is 0. Read once per
+    # layer at construction; see docs/design/flash-next/qsa-fused.md.
+    "VLLM_HPU_QSA_FUSED":
+    lambda: int(os.environ.get("VLLM_HPU_QSA_FUSED", "0")),
+
+    # Flash-Next sparse QSA decode indexer across the TP ranks (QsaShardMode), with
+    # VLLM_HPU_QSA_FUSED >= 1 only. 0 (default) = replicated: every rank scores every row. 1 = by
+    # request: rank r scores requests [r * bs / tp, (r + 1) * bs / tp) and one all-gather of the int32
+    # block selections per QSA layer gives every rank the same selection; a decode bucket whose batch
+    # is not a multiple of the TP size stays replicated. Any other value is 0.
+    "VLLM_HPU_QSA_INDEXER_SHARD":
+    lambda: int(os.environ.get("VLLM_HPU_QSA_INDEXER_SHARD", "0")),
 
     # Flash-Next GDN decode through the fused core op (flashinfer_gaudi.gdn_core_decode).
     # 1 (default) = fused, 0 = off (the torch path), 2 = recurrence only (a bisect tool).

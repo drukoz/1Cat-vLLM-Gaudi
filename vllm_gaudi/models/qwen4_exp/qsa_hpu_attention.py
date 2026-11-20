@@ -126,6 +126,37 @@ def sparse_decode_attention(query: torch.Tensor, key_cache: torch.Tensor, value_
     return out.reshape(bs, num_heads * head_dim)
 
 
+def sparse_decode_attention_grouped(query: torch.Tensor, key_cache: torch.Tensor, value_cache: torch.Tensor,
+                                    slots: torch.Tensor, valid: torch.Tensor, num_heads: int, num_kv_heads: int,
+                                    head_dim: int, scale: float) -> torch.Tensor:
+    """``sparse_decode_attention`` with the query heads of each KV head in the GEMM's ``M`` dimension.
+
+    Same inputs and result. The gathered ``[bs, W, KV, D]`` rows are not repeated for the
+    ``G = num_heads // num_kv_heads`` query heads of a KV head: ``q`` is viewed as ``[bs, KV, G, D]``
+    and multiplied with ``k`` as ``[bs, KV, D, W]`` (``[bs, KV, G, W]`` scores), the probabilities with
+    ``v`` as ``[bs, KV, W, D]``. Query head ``h`` uses KV head ``h // G``, as ``repeat_interleave`` does.
+    With one KV head per rank (Flash-Next at TP8, TP4 and TP2) the K and V operands are plain views of
+    the gathered rows (I21, G5-1; the grouped form of ``extension/ops.py`` ``flat_pa``).
+    """
+    bs, width = slots.shape
+    groups = num_heads // num_kv_heads
+    flat = slots.reshape(-1)
+    k = key_cache.index_select(0, flat).view(bs, width, num_kv_heads, head_dim)
+    v = value_cache.index_select(0, flat).view(bs, width, num_kv_heads, head_dim)
+    if num_kv_heads == 1:
+        k, v = k.view(bs, 1, width, head_dim), v.view(bs, 1, width, head_dim)
+    else:
+        k, v = k.transpose(1, 2), v.transpose(1, 2)
+    q = query.view(bs, num_kv_heads, groups, head_dim)
+    # [bs, KV, G, D] @ [bs, KV, D, W] -> [bs, KV, G, W]
+    scores = torch.matmul(q, k.transpose(-1, -2)) * scale
+    scores = scores.masked_fill(~valid.view(bs, 1, 1, width), float("-inf"))
+    probs = torch.softmax(scores.float(), dim=-1).to(query.dtype)
+    # [bs, KV, G, W] @ [bs, KV, W, D] -> [bs, KV, G, D] -> [bs, H * D]
+    out = torch.matmul(probs, v)
+    return out.reshape(bs, num_heads * head_dim)
+
+
 class HpuQsaSparseAttention(torch.nn.Module):
     """Sparse QSA attention over the indexer's selection, wrapping an Attention.
 
@@ -145,6 +176,9 @@ class HpuQsaSparseAttention(torch.nn.Module):
         self.num_heads = int(impl.num_heads)
         self.num_kv_heads = int(impl.num_kv_heads)
         self.head_dim = int(impl.head_size)
+        # VLLM_HPU_QSA_FUSED >= 1: the grouped decode attention (no K/V repeat); read once.
+        from vllm_gaudi.models.qwen4_exp.qsa_fused_path import QsaFusedMode, qsa_fused_mode
+        self.grouped_decode = qsa_fused_mode() is not QsaFusedMode.OFF
 
     def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, selected: torch.Tensor,
                 positions: torch.Tensor, md) -> torch.Tensor:
@@ -211,13 +245,18 @@ class HpuQsaSparseAttention(torch.nn.Module):
             out = torch.cat(out_tiles, dim=1)
             return out.reshape(tokens, num_heads * head_dim)
 
+        from vllm_gaudi.models.qwen4_exp.qsa_fused_path import QsaDecodeSelection
+        if isinstance(selected, QsaDecodeSelection):  # mode 2: the slots and flags come from qsa_index_emit
+            out = sparse_decode_attention_grouped(q, key_cache, value_cache, selected.slots, selected.valid != 0,
+                                                  num_heads, num_kv_heads, head_dim, impl.scale)
+            return out.reshape(q.shape[0], num_heads * head_dim)
         slots = decode_selected_slots(selected, md.block_table, int(md.block_size))
         # A row with no selected position (a padding row of the batch under M-RoPE: position -1)
         # attends to its gathered pad-block rows instead of to nothing: the softmax of an all
         # -inf row is NaN.
         valid = (selected >= 0) | rows_without_selection(selected)
-        out = sparse_decode_attention(q, key_cache, value_cache, slots, valid, num_heads, num_kv_heads, head_dim,
-                                      impl.scale)
+        attend = sparse_decode_attention_grouped if self.grouped_decode else sparse_decode_attention
+        out = attend(q, key_cache, value_cache, slots, valid, num_heads, num_kv_heads, head_dim, impl.scale)
         return out.reshape(q.shape[0], num_heads * head_dim)
 
 
@@ -227,4 +266,5 @@ __all__ = [
     "prefill_selection_bias",
     "rows_without_selection",
     "sparse_decode_attention",
+    "sparse_decode_attention_grouped",
 ]
