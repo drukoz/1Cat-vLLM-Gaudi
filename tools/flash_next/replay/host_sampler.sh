@@ -137,14 +137,20 @@ note "threads.txt written"
 # stays short, and a frame in another library ends the backtrace there.
 : >"$OUT/stacks.txt"
 taken=0
+began="$(date +%s)"
+BUDGET_S="${SAMPLER_BUDGET_S:-60}" # the samples together take at most this long: the job's cards wait meanwhile
 for i in $(seq 1 "$STACKS"); do
     if loop_done; then
         note "loop ended after $taken stacks"
         break
     fi
+    if [ $(($(date +%s) - began)) -ge "$BUDGET_S" ]; then
+        note "$BUDGET_S s of sampling used after $taken stacks: no more"
+        break
+    fi
     {
         echo "=== sample $i $(date -u +%H:%M:%S.%N | cut -c1-12)"
-        $SUDO timeout 40 gdb -nx -batch \
+        $SUDO timeout 20 gdb -nx -batch \
             -iex "set auto-solib-add off" -iex "set sysroot /proc/$PID/root" -iex "set pagination off" \
             -iex "set print thread-events off" \
             -p "$PID" \
@@ -159,12 +165,12 @@ for i in $(seq 1 "$STACKS"); do
     sleep 0.15
 done
 note "stacks.txt: $taken samples"
-# One more sample with the symbols of every library (a slower attach, at most 45 s): the whole stack of each
+# One more sample with the symbols of every library (a slower attach, at most 35 s): the whole stack of each
 # thread, for the samples above whose backtrace ends at a library without symbols.
-if ! loop_done; then
+if ! loop_done && [ $(($(date +%s) - began)) -lt $((BUDGET_S + 20)) ]; then
     {
         echo "=== full sample $(date -u +%H:%M:%S.%N | cut -c1-12)"
-        $SUDO timeout 45 gdb -nx -batch -iex "set sysroot /proc/$PID/root" -iex "set pagination off" \
+        $SUDO timeout 35 gdb -nx -batch -iex "set sysroot /proc/$PID/root" -iex "set pagination off" \
             -iex "set print thread-events off" -p "$PID" -ex "thread apply all bt 48" 2>&1 \
             | grep -v -E '^\[New LWP|^warning: (Could not load|.*separate debug)|^Reading symbols|^\(No debugging'
     } >"$OUT/stacks_full.txt" 2>&1
