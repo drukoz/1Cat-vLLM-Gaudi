@@ -322,6 +322,47 @@ def fmt(value):
     return "-" if value is None else ("%.3f" % value)
 
 
+# The id checks, in the order their verdicts are printed (card rule 9 first).
+VERDICTS = (
+    ("sampler", "argmax ids narrowed to int32 in the same graph (vLLM's sampler, the fused greedy region)"),
+    ("sampler_int64", "argmax ids read back as int64"),
+    ("sampler_cast_second_graph", "argmax ids narrowed to int32 in a second graph"),
+    ("topk_cast_same_graph", "topk ids narrowed to int32 in the same graph (rule 9's pattern)"),
+    ("topk_int64", "topk ids read back as int64"),
+    ("topk_cast_second_graph", "topk ids narrowed to int32 in a second graph"),
+    ("fused_mask_int64_index", "min_tokens mask (gather, where, scatter) with a host-made int64 index"),
+    ("fused_mask_int32_widened", "min_tokens mask with a host-made int32 index widened to int64 in the graph"),
+    ("table_int32_widened", "host-made int32 block table widened to int64 in the graph, then gather"),
+    ("table_int64", "host-made int64 block table, gather"),
+    ("table_gather_narrowed", "gathered int64 ids narrowed to int32 in the same graph"),
+)
+
+
+def print_verdicts(records) -> None:
+    """One line per id check: OK at which rows, WRONG at which (with the first ids got and wanted)."""
+    by_case = {}
+    for record in records:
+        if record.get("case") != "env":
+            by_case.setdefault(record["case"], []).append(record)
+    print("")
+    for name, what in VERDICTS:
+        rows = by_case.get(name, [])
+        good = [str(r["rows"]) for r in rows if r.get("ok") is True]
+        bad = [r for r in rows if r.get("ok") is not True]
+        if not rows:
+            print("VERDICT %s: NOT RUN" % what)
+        elif not bad:
+            print("VERDICT %s: OK against the CPU at rows %s" % (what, ",".join(good)))
+        else:
+            first = bad[0]
+            detail = first.get("error") or "%s of the ids differ, got %s want %s" % (
+                first.get("wrong"), first.get("got"), first.get("want"))
+            print("VERDICT %s: WRONG at rows %s%s; at rows %d: %s" % (
+                what, ",".join(str(r["rows"]) for r in bad), (" (OK at rows %s)" % ",".join(good)) if good else "",
+                first["rows"], detail[:300]))
+    print("", flush=True)
+
+
 def parent(args) -> int:
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -332,10 +373,13 @@ def parent(args) -> int:
     if args.no_head:
         base.append("--no-head")
     # One process per pass (the bridge reads its variables when it loads, and a case that kills its process
-    # must not take the others with it): the cases that are known ops first, then vLLM's index_put_ mask, then
-    # every case once more with the bridge's fallback log.
+    # must not take the others with it): the id checks first, a few iterations each, and their verdicts printed
+    # at once; then the timed cases, then vLLM's index_put_ mask, then every case once more with the bridge's
+    # fallback log.
     risky = "min_tokens_index_put,min_tokens_index_put_empty"
-    passes = [("timing", ["--repeats", str(args.repeats), "--skip", risky], {}),
+    passes = [("ids", ["--repeats", "2", "--warm", "1", "--only", ",".join(name for name, _ in VERDICTS),
+                       "--no-head"], {}),
+              ("timing", ["--repeats", str(args.repeats), "--skip", risky], {}),
               ("index_put", ["--repeats", str(args.repeats), "--only", risky, "--no-head"], {}),
               ("fallback", ["--repeats", "2", "--rows", "8", "--no-head"],
                {"LOG_LEVEL_PT_FALLBACK": "1", "ENABLE_CONSOLE": "true"})]
@@ -352,9 +396,16 @@ def parent(args) -> int:
                 code = 124
         text = log_path.read_text(errors="replace")
         print("pass %s: exit %d, %.0f s, log %s" % (label, code, time.time() - started, log_path), flush=True)
-        if label != "fallback":
-            if label == "timing":
+        if label == "ids":
+            id_records = [json.loads(line[len(TAG):]) for line in text.splitlines() if line.startswith(TAG)]
+            (out_dir / "sampling_ops_ids.json").write_text(json.dumps(id_records, indent=1))
+            print_verdicts(id_records)
+            if code != 0:
+                print(text[-3000:])
                 rc = code
+        elif label != "fallback":
+            if label == "timing":
+                rc = rc or code
             records += [json.loads(line[len(TAG):]) for line in text.splitlines() if line.startswith(TAG)
                         and not (records and '"case": "env"' in line)]
             if code != 0:
