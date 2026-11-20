@@ -214,6 +214,26 @@ def visible_blocks(positions: torch.Tensor, compress_ratio: int) -> torch.Tensor
     return ((positions + 1) // compress_ratio).to(torch.int64)
 
 
+TOPK_IDS_MODE = 0  # the plugin's switch of the same name; the references use the default form
+
+
+def topk_ids_int32(idx: torch.Tensor, n: int) -> torch.Tensor:
+    """The int64 ids ``torch.topk`` returned over ``n`` columns, as int32 of the same shape, without a cast.
+
+    Card rule 9 (kernel-fixes job 00038, 2026-11-20): on a Gaudi card ``topk(...).indices.to(torch.int32)``
+    in the same lazy graph returns every second id and reads past the end of the table (the cast reads
+    8-byte elements from ids the bridge holds as 4 bytes). Here the ids are only ever an index: the
+    result is a gather from an int32 ``arange(n)``, so no node converts the ids' type. The values are
+    those of ``idx.to(torch.int32)`` on a device that casts correctly.
+    """
+    if TOPK_IDS_MODE == 1:
+        return idx.to(torch.int32)
+    if TOPK_IDS_MODE == 2:
+        return idx.to(torch.float32).to(torch.int32)
+    cols = torch.arange(n, dtype=torch.int32, device=idx.device)
+    return cols.index_select(0, idx.reshape(-1)).view(idx.shape)
+
+
 def select_blocks(scores: torch.Tensor, visible: torch.Tensor, block_topk: int) -> torch.Tensor:
     """Top-k blocks: ``scores`` ``[T, N]`` fp32, ``visible`` ``[T]`` int64 ->
     int32 ``[T, block_topk]`` block indices, -1 padded.
@@ -221,14 +241,15 @@ def select_blocks(scores: torch.Tensor, visible: torch.Tensor, block_topk: int) 
     Columns ``n >= visible[t]`` are masked to -inf, ``k = min(block_topk, N)``
     and ``topk(k, dim=-1)``; entries whose value is -inf become -1, and the
     width is padded to ``block_topk`` with -1. The set per row equals HF's
-    ``topk(min(block_topk, nc))``.
+    ``topk(min(block_topk, nc))``. The ids become int32 through ``topk_ids_int32``,
+    never through a cast (card rule 9).
     """
     t, n = scores.shape
     k = min(block_topk, n)
     cols = torch.arange(n, device=scores.device)
     masked = scores.masked_fill(cols[None, :] >= visible[:, None], float("-inf"))
     vals, idx = torch.topk(masked, k, dim=-1)
-    picked = idx.to(torch.int32).masked_fill(vals == float("-inf"), -1)
+    picked = topk_ids_int32(idx, n).masked_fill(vals == float("-inf"), -1)
     if k < block_topk:
         pad = torch.full((t, block_topk - k), -1, dtype=torch.int32, device=scores.device)
         picked = torch.cat((picked, pad), dim=1)
@@ -280,6 +301,7 @@ def decode_selected_slots(selected: torch.Tensor, block_table: torch.Tensor, blo
 
 
 COPIED = ("gemma_rms_norm", "rope_neox_partial", "index_queries", "compress_block_keys", "visible_blocks",
+          "topk_ids_int32",
           "select_blocks", "expand_selection", "rows_without_selection", "decode_selected_slots")
 
 __all__ = ["COPIED", "qsa_index_emit_ref", "qsa_index_prepare_ref", "qsa_index_select_ref", "qsa_index_threshold_ref",

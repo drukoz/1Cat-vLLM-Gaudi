@@ -19,8 +19,14 @@ projection outputs, and the tests compare against the HF module on CPU.
 """
 
 import math
+import os
 
 import torch
+
+# How ``select_blocks`` turns top-k's int64 ids into int32 (card rule 9, see ``topk_ids_int32``): 0 = a gather
+# from an int32 ``arange`` (default), 1 = the cast ``idx.to(torch.int32)`` (the form before 2026-11-20), 2 = a cast
+# through fp32. A diagnostic switch for the card check of 2026-11-20 (``tests/unit_tests/qsa_select``), read once.
+TOPK_IDS_MODE = int(os.environ.get("VLLM_HPU_QSA_TOPK_IDS", "0") or 0)
 
 
 def ring_rows(compress_ratio: int, num_speculative_tokens: int) -> int:
@@ -100,6 +106,23 @@ def score_blocks(q: torch.Tensor, keys: torch.Tensor) -> torch.Tensor:
     return scores.sum(dim=1) / math.sqrt(q.shape[-1])
 
 
+def topk_ids_int32(idx: torch.Tensor, n: int) -> torch.Tensor:
+    """The int64 ids ``torch.topk`` returned over ``n`` columns, as int32 of the same shape, without a cast.
+
+    Card rule 9 (kernel-fixes job 00038, 2026-11-20): on a Gaudi card ``topk(...).indices.to(torch.int32)``
+    in the same lazy graph returns every second id and reads past the end of the table (the cast reads
+    8-byte elements from ids the bridge holds as 4 bytes). Here the ids are only ever an index: the
+    result is a gather from an int32 ``arange(n)``, so no node converts the ids' type. The values are
+    those of ``idx.to(torch.int32)`` on a device that casts correctly.
+    """
+    if TOPK_IDS_MODE == 1:
+        return idx.to(torch.int32)
+    if TOPK_IDS_MODE == 2:
+        return idx.to(torch.float32).to(torch.int32)
+    cols = torch.arange(n, dtype=torch.int32, device=idx.device)
+    return cols.index_select(0, idx.reshape(-1)).view(idx.shape)
+
+
 def select_blocks(scores: torch.Tensor, visible: torch.Tensor, block_topk: int) -> torch.Tensor:
     """Top-k blocks: ``scores`` ``[T, N]`` fp32, ``visible`` ``[T]`` int64 ->
     int32 ``[T, block_topk]`` block indices, -1 padded.
@@ -107,14 +130,15 @@ def select_blocks(scores: torch.Tensor, visible: torch.Tensor, block_topk: int) 
     Columns ``n >= visible[t]`` are masked to -inf, ``k = min(block_topk, N)``
     and ``topk(k, dim=-1)``; entries whose value is -inf become -1, and the
     width is padded to ``block_topk`` with -1. The set per row equals HF's
-    ``topk(min(block_topk, nc))``.
+    ``topk(min(block_topk, nc))``. The ids become int32 through ``topk_ids_int32``,
+    never through a cast (card rule 9).
     """
     t, n = scores.shape
     k = min(block_topk, n)
     cols = torch.arange(n, device=scores.device)
     masked = scores.masked_fill(cols[None, :] >= visible[:, None], float("-inf"))
     vals, idx = torch.topk(masked, k, dim=-1)
-    picked = idx.to(torch.int32).masked_fill(vals == float("-inf"), -1)
+    picked = topk_ids_int32(idx, n).masked_fill(vals == float("-inf"), -1)
     if k < block_topk:
         pad = torch.full((t, block_topk - k), -1, dtype=torch.int32, device=scores.device)
         picked = torch.cat((picked, pad), dim=1)
