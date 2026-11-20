@@ -49,11 +49,15 @@ def test_sharded_equals_replicated(tp, case):
         assert np.array_equal(r["replicated"][rows], ref), f"rank {r['rank']}: mode 1 replicated != mode 0"
         assert np.array_equal(r["sharded"][rows], ref), f"rank {r['rank']}: mode 1 sharded != mode 0"
         assert np.array_equal(r["sharded"], results[0]["sharded"]), f"rank {r['rank']} holds another selection"
+        assert np.array_equal(r["sharded_fp32"], r["sharded"]), f"rank {r['rank']}: the fp32 packet changed a selection"
         assert np.array_equal(r["sharded_cache"], results[0]["sharded_cache"]), "the cache writes differ by rank"
         assert r["mode0_collectives"] == [] and r["replicated_collectives"] == []
         shards = tp > 1 and bs % tp == 0
         if shards:
             assert r["sharded_collectives"] == [("all_gather", (bs // tp * t_cols, TOPK), "torch.int32")], (
                 r["sharded_collectives"])
+            assert r["sharded_fp32_collectives"] == [("all_gather", (bs // tp * t_cols, TOPK), "torch.float32")], (
+                r["sharded_fp32_collectives"])
         else:
             assert r["sharded_collectives"] == [], r["sharded_collectives"]
+            assert r["sharded_fp32_collectives"] == [], r["sharded_fp32_collectives"]

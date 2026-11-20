@@ -81,7 +81,9 @@ win. Any other value is `0`. See `docs/design/flash-next/qsa-fused.md`.
 scores every decode row on every TP rank; `1` scores each rank's share of the
 requests and all-gathers the int32 block selections once per QSA layer, so every rank
 holds the same selection. A decode bucket whose batch is not a multiple of the TP size
-stays replicated. Any other value is `0`.
+stays replicated. `2` is `1` with the selections sent as fp32 (exact: block ids are
+below 2^24), the dtype of every other collective of the served model. Any other value
+is `0`.
 
 `VLLM_HPU_QSA_TABLE_WIDTH` sets the columns of the Flash-Next sparse QSA decode block
 table. `0` (default) is `ceil(max_model_len / block_size)`, fixed per engine: the

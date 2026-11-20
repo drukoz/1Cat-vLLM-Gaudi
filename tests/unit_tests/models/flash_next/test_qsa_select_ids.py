@@ -36,13 +36,14 @@ def test_long_context_selection_is_the_oracle(name, mode):
     assert cmp["ok"], cmp
 
 
+@pytest.mark.parametrize("shard", [1, 2])
 @pytest.mark.parametrize("name,world", [("decode8", 4), ("decode8", 8), ("lattice4", 4), ("lattice4", 2)])
-def test_sharded_long_context_selection_is_the_oracle(name, world):
+def test_sharded_long_context_selection_is_the_oracle(name, world, shard):
     case = sc.build_case(name)
     want = sc.oracle(case)
     rows = 0
     for rank in range(world):
-        cmp = sc.compare(case, sc.decode_selection(case, "cpu", 1, 1, (rank, world)), want)
+        cmp = sc.compare(case, sc.decode_selection(case, "cpu", 1, shard, (rank, world)), want)
         rows += cmp["rows"]
         assert cmp["ok"], (rank, cmp)
     assert rows == len(sc.real_rows(case))

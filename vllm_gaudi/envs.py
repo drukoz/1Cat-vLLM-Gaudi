@@ -530,7 +530,7 @@ if TYPE_CHECKING:
     VLLM_HPU_FLASH_NEXT_QSA_MODE: int = 0
     VLLM_HPU_FLASH_NEXT_QSA_PREFILL_TILE: int = 2048
     VLLM_HPU_QSA_FUSED: int = 0  # QsaFusedMode: 0 torch (default), 1 torch data flow, 2 TPC kernels, 3 + top-k kernels
-    VLLM_HPU_QSA_INDEXER_SHARD: int = 0  # QsaShardMode: 0 replicated decode indexer (default), 1 by request
+    VLLM_HPU_QSA_INDEXER_SHARD: int = 0  # QsaShardMode: 0 replicated (default), 1 by request (int32), 2 by request (fp32)
     VLLM_HPU_QSA_TABLE_WIDTH: int = 0  # decode block-table columns: 0 the engine's longest context (default), 1 the batch's
     VLLM_HPU_GDN_CORE_DECODE: int = 1  # GdnCoreDecodeMode: 1 fused (default), 0 off, 2 recurrence
     VLLM_HPU_GDN_CORE_DECODE_DEBUG: int = 0  # GdnCoreDecodeDebug: 0 off, 1 check slot indices every step (host sync)
@@ -1894,7 +1894,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # VLLM_HPU_QSA_FUSED >= 1 only. 0 (default) = replicated: every rank scores every row. 1 = by
     # request: rank r scores requests [r * bs / tp, (r + 1) * bs / tp) and one all-gather of the int32
     # block selections per QSA layer gives every rank the same selection; a decode bucket whose batch
-    # is not a multiple of the TP size stays replicated. Any other value is 0.
+    # is not a multiple of the TP size stays replicated. 2 = the same with the selections sent as fp32
+    # (exact: block ids are below 2**24), the dtype of every other collective of the served model.
+    # Any other value is 0.
     "VLLM_HPU_QSA_INDEXER_SHARD":
     lambda: int(os.environ.get("VLLM_HPU_QSA_INDEXER_SHARD", "0")),
 

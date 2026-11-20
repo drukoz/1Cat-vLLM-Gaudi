@@ -233,7 +233,7 @@ def decode_selection(case: SimpleNamespace, device, mode: int, shard: int = 0, r
     if rank_world:
         if len(sink) != 1:
             raise RuntimeError(f"the bucket did not shard: {len(sink)} all-gathers")
-        local = sink[0]  # [share rows, topk] block ids of this rank's requests
+        local = sink[0].to(torch.int32)  # [share rows, topk] block ids of this rank's requests (int32 or fp32 packet)
         first_row = rank_world[0] * int(local.shape[0])
         mine = torch.arange(first_row, first_row + int(local.shape[0]), dtype=torch.int32, device=local.device)
         selected = expand_selection(local, dev.positions.index_select(0, mine), RATIO)

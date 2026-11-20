@@ -188,7 +188,8 @@ def shard_select_rank(rank: int, tp: int, case: str, seed: int) -> dict:
     out = {}
     for name, mode, shard in (("mode0", QsaFusedMode.OFF, QsaShardMode.REPLICATED),
                               ("replicated", QsaFusedMode.TORCH, QsaShardMode.REPLICATED),
-                              ("sharded", QsaFusedMode.TORCH, QsaShardMode.BY_REQUEST)):
+                              ("sharded", QsaFusedMode.TORCH, QsaShardMode.BY_REQUEST),
+                              ("sharded_fp32", QsaFusedMode.TORCH, QsaShardMode.BY_REQUEST_FP32)):
         indexer.compressed_key_cache.copy_(snap[0])
         indexer._key_ring_flat.copy_(snap[1])
         indexer.fused_mode, indexer.shard_mode = mode, shard

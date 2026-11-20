@@ -14,9 +14,10 @@ repeat the same work. Mode 1 (``QsaFusedMode.TORCH``) changes the data flow, not
   ``T = bs * T_cols`` rows, scored as one ``[bs, T_cols * H, D] @ [bs, D, N]`` product. Exact: a
   row's visible columns ``n < (p + 1) // ratio`` lie on pages its own table shares with the longest
   one; every other column is masked before the top-k (``select_blocks``). No ``[T, N]`` index.
-* **by request across the TP ranks (I18, ``VLLM_HPU_QSA_INDEXER_SHARD=1``).** Rank ``r`` scores
-  requests ``[r * bs / tp, (r + 1) * bs / tp)`` only; one all-gather of the int32 ``[rows, topk]``
-  block selections per layer gives every rank the same selection (the one its owner computed). The
+* **by request across the TP ranks (I18, ``VLLM_HPU_QSA_INDEXER_SHARD=1`` or ``2``).** Rank ``r`` scores
+  requests ``[r * bs / tp, (r + 1) * bs / tp)`` only; one all-gather of the ``[rows, topk]`` block
+  selections per layer (int32 with 1, fp32 with 2: the ids are exact in both, and every other
+  collective of the served model is a float one) gives every rank the same selection. The
   cache writes stay replicated (every rank keeps complete caches; the request-to-rank map follows
   the batch order of each step). A bucket whose ``bs`` is not a multiple of ``tp`` stays replicated.
 * **grouped attention (I21, G5-1).** ``sparse_decode_attention_grouped`` scores the ``G`` query
@@ -54,10 +55,11 @@ class QsaFusedMode(enum.IntEnum):
 
 
 class QsaShardMode(enum.IntEnum):
-    """``VLLM_HPU_QSA_INDEXER_SHARD`` (next free: 2)."""
+    """``VLLM_HPU_QSA_INDEXER_SHARD`` (next free: 3)."""
 
     REPLICATED = 0
-    BY_REQUEST = 1
+    BY_REQUEST = 1  # the selections cross the ranks as int32
+    BY_REQUEST_FP32 = 2  # as fp32 (ids below 2**24 and -1 are exact): the dtype of the served model's other collectives
 
 
 def qsa_fused_mode() -> QsaFusedMode:
@@ -143,7 +145,7 @@ def shard_requests(bs: int, shard: QsaShardMode) -> tuple[int, int, int]:
     A bucket shards only when ``bs`` is a multiple of the TP size and the TP size is above 1: every
     rank then gives the all-gather the same ``[per_rank * T_cols, topk]`` shape.
     """
-    if shard is not QsaShardMode.BY_REQUEST:
+    if shard is QsaShardMode.REPLICATED:
         return 0, 1, bs
     rank, world = tp_rank_and_size()
     if world <= 1 or bs % world:
@@ -209,7 +211,10 @@ def select_blocks_request_major(q: torch.Tensor, positions: torch.Tensor, block_
         local = topk_kernels(scores, owned(pos32_mine), ratio, topk)
     else:
         local = select_blocks(scores, visible_mine, topk)  # [per * T_cols, topk]
-    gathered = all_gather_rows(local)
+    if shard is QsaShardMode.BY_REQUEST_FP32:
+        gathered = all_gather_rows(local.to(torch.float32)).to(torch.int32)
+    else:
+        gathered = all_gather_rows(local)
     if int(gathered.shape[0]) != T:
         raise RuntimeError(f"QSA sharded indexer gathered {int(gathered.shape[0])} rows for {T}")
     return gathered
