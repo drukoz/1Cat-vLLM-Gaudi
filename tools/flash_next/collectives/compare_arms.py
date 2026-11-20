@@ -6,9 +6,11 @@
 
 Each folder holds the ``scaling.json`` of probe_ab.py. Per arm and level: the median ms per token (the stream's
 decode span, compile pauses included), the steady ms per token (the median gap between streamed chunks) and the
-total tokens per second. Per arm against the base, per level and round: how many streams produced the same text,
-and the share of the text before the first difference (a wrong token id parts at once; an exact bf16 tie broken
-another way parts late and rarely). Stdlib only.
+total tokens per second. Per arm against the base: how many lone requests (PROBE_SERIAL_PROMPTS, one request at
+a time) produced the same text, which is the test of a cut; then per level and round how many streams did, and
+the share of the text before the first difference. The text of a stream in a batch changes with the batch around
+it (job 00021: two 32-stream rounds of one server differ), so for batched rounds the floor is an arm against its
+own second round, printed last. Stdlib only.
 """
 import json
 import sys
@@ -56,7 +58,8 @@ def main(argv):
     if len(args) < 1:
         print(__doc__)
         return 2
-    arms = {Path(a).name: rounds(load(a)) for a in args}
+    loaded = {Path(a).name: load(a) for a in args}
+    arms = {name: rounds(data) for name, data in loaded.items()}
     names = list(arms)
     result = {"arms": {}, "texts": {}}
     for name in names:
@@ -70,7 +73,26 @@ def main(argv):
             print(f"{name:40s} N={n:<3d} round {rep}: ms/token p50 {line['ms_per_token_p50']:.2f}, steady "
                   f"{line['steady_ms_per_token_p50']:.2f}, total {line['aggregate_tok_s'] or 0:.1f} tok/s, "
                   f"longest pause {line['pause_s_max']:.2f} s, {line['ok']} streams ok")
+    for name in names:  # the round with the server's default sampling (PROBE_SAMPLED_ROUND), when the arm has one
+        for level in (loaded.get(name) or {}).get("sampled", []):
+            if level.get("ok"):
+                result["arms"].setdefault(name, {})["sampled:%d" % level["streams"]] = {
+                    k: level.get(k) for k in ("ms_per_token_p50", "steady_ms_per_token_p50", "aggregate_tok_s", "ok")}
+                print(f"{name:40s} N={level['streams']:<3d} sampled (server default): ms/token p50 "
+                      f"{level['ms_per_token_p50']:.2f}, steady {level['steady_ms_per_token_p50']:.2f}, total "
+                      f"{level['aggregate_tok_s'] or 0:.1f} tok/s, {level['ok']} streams ok")
+            else:
+                print(f"{name:40s} N={level.get('streams')} sampled (server default): FAILED {level.get('error_samples')}")
     base = names[0]
+    for name in names[1:]:  # lone requests first: the texts that must be equal
+        mine = {m.get("prompt_index"): (m.get("texts") or [None])[0] for m in (loaded.get(name) or {}).get("serial", [])}
+        ref = {m.get("prompt_index"): (m.get("texts") or [None])[0] for m in (loaded.get(base) or {}).get("serial", [])}
+        keys = sorted(k for k in set(mine) & set(ref) if mine[k] is not None and ref[k] is not None)
+        if keys:
+            rep = text_report({"texts": [ref[k] for k in keys]}, {"texts": [mine[k] for k in keys]})
+            result["texts"].setdefault(name, {})["serial"] = rep
+            print(f"texts {name} against {base}, lone requests: {rep['identical']}/{rep['streams']} identical; "
+                  f"common prefix min {rep['common_prefix_min']}, median {rep['common_prefix_median']}")
     for name in names[1:]:
         for key in sorted(set(arms[base]) & set(arms[name])):
             rep = text_report(arms[base][key], arms[name][key])

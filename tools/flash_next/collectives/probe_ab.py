@@ -18,6 +18,7 @@ Stdlib only. Usage:
 import argparse
 import http.client
 import json
+import os
 import statistics
 import sys
 import threading
@@ -44,13 +45,17 @@ def prompt_for(i, ctx_tokens=0):
     return "Stream %d notes: " % i + " ".join(filler) + "\n\n" + head
 
 
-def one_stream(host, port, model, prompt, ntok, out, idx, barrier, timeout_s):
-    body = json.dumps({
+def one_stream(host, port, model, prompt, ntok, out, idx, barrier, timeout_s, sampled=False):
+    req = {
         # No min_tokens: a request with min_tokens gets the MinTokens logits processor, which keeps it out of the
         # runner's greedy region (and so out of VLLM_HPU_VOCAB_PARALLEL_LOGITS); ignore_eos alone gives ntok tokens.
         "model": model, "prompt": prompt, "max_tokens": ntok, "ignore_eos": True,
         "temperature": 0, "stream": True, "stream_options": {"include_usage": True},
-    })
+    }
+    if sampled:  # what a client that sets no sampling parameter gets: the checkpoint's generation_config
+        del req["temperature"]  # (Flash-Next: do_sample, temperature 1.0, top_k 20, top_p 0.95)
+        req["seed"] = 1000 + idx
+    body = json.dumps(req)
     rec = {"status": None, "t0": None, "times": [], "ntoks": [], "usage": None, "err": None, "text": []}
     try:
         barrier.wait()
@@ -88,12 +93,12 @@ def one_stream(host, port, model, prompt, ntok, out, idx, barrier, timeout_s):
     out[idx] = rec
 
 
-def run_round(args, n, ntok, ctx_tokens=0):
+def run_round(args, n, ntok, ctx_tokens=0, sampled=False, first=0):
     out = [None] * n
     barrier = threading.Barrier(n)
     threads = [threading.Thread(target=one_stream,
-                                args=(args.host, args.port, args.model, prompt_for(i, ctx_tokens), ntok, out, i,
-                                      barrier, args.timeout), daemon=True) for i in range(n)]
+                                args=(args.host, args.port, args.model, prompt_for(first + i, ctx_tokens), ntok, out,
+                                      i, barrier, args.timeout, sampled), daemon=True) for i in range(n)]
     t_start = time.perf_counter()
     for t in threads:
         t.start()
@@ -118,8 +123,8 @@ def run_round(args, n, ntok, ctx_tokens=0):
                     "ttft_s": r["times"][0] - r["t0"], "ms_per_token": 1000.0 * span / max(1, comp - 1),
                     "completion_tokens": comp, "prompt_tokens": prompt_toks, "chunks": len(r["times"]),
                     "first": r["times"][0], "last": r["times"][-1]})
-    res = {"streams": n, "tokens": ntok, "ctx_tokens": ctx_tokens, "ok": len(per), "errors": errors,
-           "wall_s": wall, "texts": ["".join(r["text"]) if r else None for r in out]}
+    res = {"streams": n, "tokens": ntok, "ctx_tokens": ctx_tokens, "sampled": bool(sampled), "ok": len(per),
+           "errors": errors, "wall_s": wall, "texts": ["".join(r["text"]) if r else None for r in out]}
     if per:
         ms = sorted(p["ms_per_token"] for p in per)
         tt = sorted(p["ttft_s"] for p in per)
@@ -159,9 +164,14 @@ def main():
     ap.add_argument("--ctx", default="", help="N:TOKENS, one more measured round with long prompts")
     ap.add_argument("--timeout", type=float, default=1800.0)
     ap.add_argument("--out", default="scaling.json")
+    ap.add_argument("--sampled-round", action="store_true",
+                    help="one more warm and measured round at the top level with the server's default sampling "
+                         "(no temperature in the request); also PROBE_SAMPLED_ROUND=1")
     args = ap.parse_args()
+    if os.environ.get("PROBE_SAMPLED_ROUND", "") == "1":
+        args.sampled_round = True
     levels = [int(x) for x in args.levels.split(",") if x]
-    results = {"levels": [], "ctx": []}
+    results = {"levels": [], "ctx": [], "sampled": [], "serial": []}
 
     def save():
         with open(args.out, "w") as f:
@@ -194,6 +204,36 @@ def main():
         if not w.get("ok"):
             print("stopping: the warm round at N=%d failed: %s" % (n, w.get("error_samples")), flush=True)
             break
+    serial = int(os.environ.get("PROBE_SERIAL_PROMPTS", "0") or 0)
+    if serial > 0 and levels:
+        # One request at a time, a different prompt each: the greedy text of a lone request is reproducible (that of
+        # a request in a batch is not: it changes with the batch around it), so these texts are the token-for-token
+        # test of two arms.
+        for j in range(serial):
+            m = run_round(args, 1, args.tokens, first=100 + j)
+            m["prompt_index"] = 100 + j
+            results["serial"].append(m)
+            save()
+            print("SERIAL prompt %d ok=%d err=%d steady ms/tok=%s text=%r" % (
+                100 + j, m["ok"], m["errors"], ("%.2f" % m["steady_ms_per_token_p50"]) if m.get("ok") else "-",
+                ((m.get("texts") or [""])[0] or "")[:70]), flush=True)
+    if args.sampled_round and levels:
+        # The general sampler path at the top level: no probe at temperature 0 runs it. Its text differs from run
+        # to run and from arm to arm; only its ms per token is read.
+        n = levels[-1]
+        w = run_round(args, n, args.warm_tokens, sampled=True)
+        m = run_round(args, n, args.tokens, sampled=True)
+        m["warm"] = {k: w.get(k) for k in ("ok", "errors", "wall_s", "ms_per_token_p50")}
+        results["sampled"].append(m)
+        save()
+        if m.get("ok"):
+            greedy = [x for x in results["levels"] if x["streams"] == n and x.get("ok")]
+            ref = min(x["steady_ms_per_token_p50"] for x in greedy) if greedy else float("nan")
+            print("SAMPLED N=%-3d server-default sampling: ms/tok p50=%.2f, steady ms/tok p50=%.2f (greedy: %.2f), "
+                  "aggregate=%.1f tok/s, ok=%d err=%d" % (n, m["ms_per_token_p50"], m["steady_ms_per_token_p50"], ref,
+                                                          m["aggregate_tok_s"] or 0, m["ok"], m["errors"]), flush=True)
+        else:
+            print("SAMPLED N=%d FAILED: %s (warm: %s)" % (n, m.get("error_samples"), w.get("error_samples")), flush=True)
     if args.ctx:
         n, ctx = (int(x) for x in args.ctx.split(":"))
         w = run_round(args, n, args.warm_tokens, ctx)

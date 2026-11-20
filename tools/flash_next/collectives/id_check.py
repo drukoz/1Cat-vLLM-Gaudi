@@ -14,7 +14,11 @@ graph, at 1, 2, 5, 32 and 128 rows, and compares the ids with the CPU's:
   region), ``argmax`` then ``.int()`` (the MTP draft loop), ``argmax`` read as int64, narrowed after a
   ``mark_step``, cast to fp32, ``max(dim).indices``, ``topk`` then int32 (the measured failing pattern: the
   control that this check sees rule 9), ``topk`` ids as they are, cast to fp32, read out of an fp32 id table with
-  ``torch.gather``, and ``vocab_parallel_topk``.
+  ``torch.gather``, and ``vocab_parallel_topk``;
+* the same narrowed ids with their consumer inside the graph (``*_embed``): the ids go through the
+  vocabulary-parallel embedding's mask arithmetic and a lookup in a table whose row ``i`` holds ``i``, and only the
+  looked-up rows are read back. They say whether a wrong narrowing is seen by the graph itself or only by a read
+  to the host (``argmax_int_embed``: the MTP draft loop; ``topk_int32_embed``: the QSA block selection's shape).
 
 Every row has one largest logit at a known column (and, in the tied data set, a second column with the same
 value: the lowest id must win in the serving cases; what the card's own arg max returns for a tie is reported).
@@ -157,6 +161,23 @@ def child(args):
         index = torch.topk(real(x), TOP, dim=-1).indices
         return torch.gather(id_table(x.shape[0]), -1, index).to(torch.int32)
 
+    # Consumers inside the graph: an embedding table whose row i is (i, i, i, i), so the looked-up row names the
+    # id the lookup saw. Nothing but that row is read to the host.
+    id_rows = torch.arange(count, dtype=torch.float32).unsqueeze(1).repeat(1, 4).to(device)
+
+    def masked_lookup(ids):
+        """The vocabulary-parallel embedding's ops on ``ids`` (its mask arithmetic, ``.long()``, the lookup), for
+        a shard that owns every id: what the MTP draft loop's ``.int()`` ids go through."""
+        from vllm.model_executor.layers.vocab_parallel_embedding import get_masked_input_and_mask
+        masked, _ = get_masked_input_and_mask(ids, 0, count, 0, count, count)
+        return torch.nn.functional.embedding(masked.long(), id_rows)
+
+    def argmax_int_embed(x):  # hpu_flash_next_mtp.py: argmax, .int(), .view(-1, 1), the embedding of the next pass
+        return masked_lookup(x.narrow(-1, 0, count).argmax(dim=-1).int().view(-1, 1))[:, 0, 0]
+
+    def topk_int32_embed(x):  # qsa_sparse_ops.select_blocks: topk, .to(int32), integer arithmetic, a lookup
+        return masked_lookup(torch.topk(real(x), TOP, dim=-1).indices.to(torch.int32))[..., 0]
+
     # name: (function of the device logits, what it returns: "g" global arg max, "l" this shard's arg max as a
     # local column, "L" the same as a global id, "t" local top-4 columns, "T" global top-4 ids, needs a collective)
     cases = {
@@ -174,6 +195,11 @@ def child(args):
         "topk_to_fp32": (lambda x: torch.topk(real(x), TOP, dim=-1).indices.to(torch.float32) + float(start), "T",
                          False),
         "topk_gather_fp32": (topk_gather_fp32, "T", False),
+        "argmax_int_embed": (argmax_int_embed, "l", False),
+        "argmax_embed": (lambda x: torch.nn.functional.embedding(real(x).argmax(dim=-1), id_rows)[:, 0], "l", False),
+        "topk_int32_embed": (topk_int32_embed, "t", False),
+        "topk_embed": (lambda x: torch.nn.functional.embedding(torch.topk(real(x), TOP, dim=-1).indices,
+                                                                id_rows)[..., 0], "t", False),
     }
     if args.selftest:  # the detector itself: what rule 9 does to [rows] ids (element i holds the true element 2 * i)
 
