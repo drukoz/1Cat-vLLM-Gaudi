@@ -198,6 +198,22 @@ def pin_cpus(rank: int, mode: str, allowed=None, total=None, modules=None) -> tu
     return cpus, None
 
 
+def host_load() -> dict:
+    """The host's load when a case ends: the 1-minute average and the runnable tasks right now (/proc/loadavg).
+
+    Host times are only comparable between cases that ran under a similar load: other jobs' servers and image
+    builds use the same CPUs.
+    """
+    load = {}
+    try:
+        load["avg1"] = os.getloadavg()[0]
+        with open("/proc/loadavg", encoding="ascii") as fh:
+            load["runnable"] = int(fh.read().split()[3].split("/")[0])
+    except (OSError, ValueError, IndexError, AttributeError):
+        pass
+    return load
+
+
 def emit(record: dict) -> None:
     print(RESULT_TAG + json.dumps(record), flush=True)
 
@@ -559,7 +575,8 @@ class Rank:
                         "thread_sys_ms": _median([1e3 * v for v in sys_totals]),
                         "thread_voluntary_switches": _median(switches),
                         # the CPUs the calling thread was seen on after the calls, and how often it had moved
-                        "cpus_seen": sorted(seen_cpus), "cpu_moves": moves}}
+                        "cpus_seen": sorted(seen_cpus), "cpu_moves": moves},
+                "host_load": host_load()}
 
     # ------------------------------------------------------------------------------- lazy process
     def lazy_case(self, regime: str, rows: int, collectives: bool, repeats: int) -> dict:
