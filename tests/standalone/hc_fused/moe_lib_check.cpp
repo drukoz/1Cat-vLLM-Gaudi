@@ -284,8 +284,10 @@ void CheckRowQuant()
     {
         Node node = RowQuantNode();
         Expect(node.Instantiate(), GLUE_SUCCESS, "row_quant/instantiate");
+        // The reciprocal is rounded to bf16, 0x1.12p-8: a card divides a bf16 tensor by 240 as a product
+        // with this constant (first card run, 2026-11-20), and the kernel must give the card's scale.
         Report(node.instance.indexSpaceRank == 1 && node.instance.indexSpaceGeometry[0] == 3 &&
-                   node.Args().inv_fp8_max == 1.0f / 240.0f,
+                   node.Args().inv_fp8_max == 0x1.12p-8f && node.Args().inv_fp8_max != 1.0f / 240.0f,
                "row_quant/index_space_and_args");
         Report(RowIs(node.inPatterns[0], 0, 2559) && RowIs(node.outPatterns[0], 0, 2559) &&
                    RowIs(node.outPatterns[1], 0, 0) && node.HasElf(),

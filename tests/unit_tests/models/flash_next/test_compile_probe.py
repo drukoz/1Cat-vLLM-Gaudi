@@ -74,6 +74,10 @@ def test_cpu_probe_can_skip_the_host_ngram_id_rows(tiny_checkpoint, tmp_path, mo
 def test_hpu_probe_refuses_without_lazy_mode(tmp_path, monkeypatch, capsys):
     """--device hpu without PT_HPU_LAZY_MODE=1 exits 2 with the message, importing no HPU code."""
     monkeypatch.delenv(compile_probe.LAZY_MODE_FLAG, raising=False)
+    # Other test modules of the same pytest process may have imported the HPU stubs already. Hide them for the call
+    # (monkeypatch puts them back at teardown), so the last assertion sees only imports made by main() itself.
+    for name in [m for m in sys.modules if m == "habana_frameworks" or m.startswith("habana_frameworks.")]:
+        monkeypatch.delitem(sys.modules, name)
     rc = compile_probe.main([
         "--ckpt",
         str(tmp_path / "no-checkpoint-needed"),

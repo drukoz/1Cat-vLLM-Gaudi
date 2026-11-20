@@ -1215,6 +1215,45 @@ def test_plain_greedy_fusion_is_strictly_gated(monkeypatch):
     assert not runner._can_fuse_plain_greedy_sampling(["req"])
 
 
+def test_vocab_parallel_logits_opens_the_greedy_region_for_flash_next_mtp(monkeypatch):
+    """VLLM_HPU_VOCAB_PARALLEL_LOGITS=1: plain greedy decode and greedy Flash-Next MTP verification get the arg max
+    region (no logits all-gather); any other speculation, sampling or logprobs keep the general path."""
+    runner = object.__new__(HPUModelRunner)
+    runner.speculative_config = None
+    runner.use_structured_output = False
+    runner.input_batch = SimpleNamespace(logitsprocs=SimpleNamespace(non_argmax_invariant=[]))
+    runner.requests = {"req": SimpleNamespace(sampling_params=SamplingParams(temperature=0.0))}
+    monkeypatch.setenv("VLLM_HPU_FUSED_GREEDY_LOGITS", "false")
+    monkeypatch.setenv("VLLM_HPU_VOCAB_PARALLEL_LOGITS", "0")
+    assert not runner._can_fuse_plain_greedy_sampling(["req"])
+    monkeypatch.setenv("VLLM_HPU_VOCAB_PARALLEL_LOGITS", "1")
+    assert runner._can_fuse_plain_greedy_sampling(["req"])
+
+    flash_next_mtp = SimpleNamespace(method="mtp",
+                                     draft_model_config=SimpleNamespace(hf_config=SimpleNamespace(
+                                         architectures=["Qwen4ExpMTP"])))
+    runner.speculative_config = flash_next_mtp
+    assert runner._can_fuse_plain_greedy_sampling(["req"])
+    runner.requests["req"].sampling_params = SamplingParams(temperature=0.0, logprobs=1)
+    assert not runner._can_fuse_plain_greedy_sampling(["req"])
+    runner.requests["req"].sampling_params = SamplingParams(temperature=0.7)
+    assert not runner._can_fuse_plain_greedy_sampling(["req"])
+    runner.requests["req"].sampling_params = SamplingParams(temperature=0.0)
+
+    runner.speculative_config = SimpleNamespace(method="eagle3", draft_model_config=None)
+    assert not runner._can_fuse_plain_greedy_sampling(["req"])
+    # the fused greedy region alone never covers speculation
+    runner.speculative_config = flash_next_mtp
+    monkeypatch.setenv("VLLM_HPU_VOCAB_PARALLEL_LOGITS", "0")
+    monkeypatch.setenv("VLLM_HPU_FUSED_GREEDY_LOGITS", "true")
+    assert not runner._can_fuse_plain_greedy_sampling(["req"])
+    # any other value of the flag is off
+    monkeypatch.setenv("VLLM_HPU_FUSED_GREEDY_LOGITS", "false")
+    monkeypatch.setenv("VLLM_HPU_VOCAB_PARALLEL_LOGITS", "3")
+    runner.speculative_config = None
+    assert not runner._can_fuse_plain_greedy_sampling(["req"])
+
+
 def test_dflash_plain_decode_loads_accepted_checkpoint_and_stores_base():
     runner = object.__new__(HPUModelRunner)
     runner._compact_gdn_group_ids = {0, 1}

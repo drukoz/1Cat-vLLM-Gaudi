@@ -7,6 +7,7 @@ import ctypes
 import glob
 import importlib
 import os
+import sys
 import threading
 from enum import IntEnum
 from pathlib import Path
@@ -46,6 +47,8 @@ HC_FUSED_SCHEMA_MODULE = "flashinfer_gaudi.hc_fused"  # defines the six op schem
 # The MoE glue ops are implemented by the same extension, so importing the module above imports this one too.
 MOE_GLUE_SCHEMA_MODULE = "flashinfer_gaudi.moe_glue"
 COMBINED_MEMBERS_ENV = "FLASHINFER_GAUDI_COMBINED_MEMBERS"  # csrc/kernel_db_adapter/adapter.cpp (host tests)
+LAZY_ACC_PAR_ENV = "PT_HPU_LAZY_ACC_PAR_MODE"  # the lazy bridge's accumulation thread: 1 (its default) on, 0 off
+ALLOW_LAZY_ACC_THREAD_ENV = "FLASHINFER_GAUDI_ALLOW_LAZY_ACC_THREAD"  # "1": load custom ops next to that thread
 
 
 class KernelDbState(IntEnum):
@@ -261,6 +264,48 @@ def load_gdn_fused_extension() -> bool:
         return True
 
 
+def lazy_bridge_loaded() -> bool:
+    """True when the Habana PyTorch bridge is imported in this process and runs in lazy mode.
+
+    A custom-op extension binds to the bridge's plugin library, so the bridge is imported before a loader
+    here can load one; a process without it has no HPU op to protect.
+    """
+    bridge = sys.modules.get("habana_frameworks.torch")
+    if bridge is None:
+        return False
+    try:
+        return bool(bridge.utils.internal.is_lazy())
+    except Exception:  # noqa: BLE001 - a bridge that cannot be asked: the variable that selects the mode decides
+        return os.environ.get("PT_HPU_LAZY_MODE", "1").strip() != "0"
+
+
+def lazy_accumulation_reason() -> str | None:
+    """Why a custom HPU op must not run in this process, or None.
+
+    In lazy mode with ``PT_HPU_LAZY_ACC_PAR_MODE=1`` (the bridge's default) the bridge builds the graph nodes
+    of queued ops on a second thread, while ``UserCustomOpDescriptor::execute`` builds the node of a custom op
+    at once on the calling thread. An input whose producer is still queued is then wired as a graph input
+    that never gets data, and the graph fails when it runs. Measured on a Gaudi2 node on 2026-11-20 (bridge
+    1.24.1): the hyper-connection card test failed 6 and 7 of 90 tests at 1, a different set each run, and
+    passed 90 of 90 at 0 (``docs/design/flash-next/native-extensions.md``, "Custom ops and the lazy
+    accumulation thread"). The second thread is read off the failing graphs and the effect of the variable;
+    the bridge's source is not public. Only the exact value 0 counts as off.
+    ``FLASHINFER_GAUDI_ALLOW_LAZY_ACC_THREAD=1`` lifts the refusal for the probes and control runs that
+    reproduce the failure on purpose.
+    """
+    if os.environ.get(ALLOW_LAZY_ACC_THREAD_ENV, "").strip() == "1" or not lazy_bridge_loaded():
+        return None
+    value = os.environ.get(LAZY_ACC_PAR_ENV)
+    if value is not None and value.strip() == "0":
+        return None
+    shown = "unset (the bridge's default is 1)" if value is None else repr(value)
+    return (f"{LAZY_ACC_PAR_ENV} is {shown}: the lazy Habana bridge then builds queued ops on a second thread, and a "
+            f"custom op called while the producer of one of its inputs is still queued takes that input as a graph "
+            f"input without data. The graph fails when it runs, in a different place each time ('Empty tensor "
+            f"optional', 'ValidateSyncInputTensors tensor_data is empty'; Gaudi 1.24.1). Start the process with "
+            f"{LAZY_ACC_PAR_ENV}=0; the fused kernels are not loaded without it.")
+
+
 def _hc_fused_error(message: str) -> None:
     """Record one fused hyper-connection loader failure in the shared list and in the HC-only list."""
     _LOAD_ERRORS.append(message)
@@ -300,9 +345,10 @@ def combined_db_serves_hc_fused(combined: Path | str, kernel_db: str) -> bool:
 def _load_hc_fused_locked() -> bool:
     """The one attempt of ``load_hc_fused_extension`` (the caller holds ``_LOAD_LOCK``).
 
-    The order is what makes the fallback safe: both files exist; then the kernel database is registered for
-    the graph compiler; only then the schemas are imported and the extension, which registers the HPU kernels,
-    is loaded. A failure at any step leaves the ops without an HPU kernel, and the layers then run torch.
+    The order is what makes the fallback safe: both files exist; the bridge can run a custom op
+    (``lazy_accumulation_reason``); then the kernel database is registered for the graph compiler; only then
+    the schemas are imported and the extension, which registers the HPU kernels, is loaded. A failure at any
+    step leaves the ops without an HPU kernel, and the layers then run torch.
     """
     package_lib = Path(__file__).resolve().parent / "lib"
     kernel_db = os.environ.get(HC_FUSED_KERNEL_LIBRARY_ENV, "") or str(package_lib / HC_FUSED_KERNEL_DB)
@@ -316,6 +362,12 @@ def _load_hc_fused_locked() -> bool:
             _hc_fused_error(f"{path}: file does not exist")
             missing = True
     if missing:
+        return False
+    # Before anything is registered: a lazy bridge with its accumulation thread on cannot run a custom op
+    # reliably, and a process without the kernels runs the torch path.
+    reason = lazy_accumulation_reason()
+    if reason:
+        _hc_fused_error(reason)
         return False
     # The rules of the fused GDN library: the combined database when it can be the single
     # GC_KERNEL_PATH file, otherwise first in the colon list, which is refused next to a recipe
