@@ -137,18 +137,19 @@ def chat(args, content: str, ntok: int) -> dict:
                      "chat_template_kwargs": {"enable_thinking": False}}}
 
 
-def run_round(args, label: str, requests: list, ntok: int) -> dict:
+def run_round(args, label: str, requests: list, ntok: int, timeout_s: float | None = None) -> dict:
     """``len(requests)`` concurrent streams; the metrics of coord/decode_scaling.py plus texts and cached tokens."""
     n = len(requests)
     out = [None] * n
     barrier = threading.Barrier(n)
-    threads = [threading.Thread(target=one_stream, args=(args, requests[i], out, i, barrier, args.timeout),
+    timeout_s = args.timeout if timeout_s is None else timeout_s
+    threads = [threading.Thread(target=one_stream, args=(args, requests[i], out, i, barrier, timeout_s),
                                 daemon=True) for i in range(n)]
     t_start = time.perf_counter()
     for t in threads:
         t.start()
     for t in threads:
-        t.join(args.timeout + 60)
+        t.join(timeout_s + 60)
     wall = time.perf_counter() - t_start
     per, errors, texts = [], 0, []
     for r in out:
@@ -252,6 +253,8 @@ def main() -> int:
     ap.add_argument("--docs", default="docs/design/flash-next", help="folder of the documents of the long prompt")
     ap.add_argument("--deadline", type=float, default=0.0, help="epoch seconds by which the probe must have ended")
     ap.add_argument("--timeout", type=float, default=1500.0)
+    ap.add_argument("--short-timeout", type=float, default=420.0,
+                    help="per-request limit of the short rounds (a hung server ends the probe, not the job's hold)")
     ap.add_argument("--out", default="qsa_ab.json")
     args = ap.parse_args()
     levels = [int(x) for x in args.levels.split(",") if x]
@@ -280,7 +283,7 @@ def main() -> int:
         if skip("short N=%d" % n, 150):
             break
         warm = run_round(args, "warm-short", [completion(args, short_prompt(i), args.warm_tokens) for i in range(n)],
-                         args.warm_tokens)
+                         args.warm_tokens, args.short_timeout)
         say("warm  " + line(warm))
         if not warm.get("ok"):
             results["levels"].append(warm)
@@ -288,7 +291,7 @@ def main() -> int:
             break
         for rep in range(args.repeat_top if n == levels[-1] else 1):
             res = run_round(args, "short", [completion(args, short_prompt(i), args.tokens) for i in range(n)],
-                            args.tokens)
+                            args.tokens, args.short_timeout)
             res["rep"] = rep
             res["warm"] = {k: warm.get(k) for k in ("ok", "errors", "wall_s", "ms_per_token_p50")}
             results["levels"].append(res)

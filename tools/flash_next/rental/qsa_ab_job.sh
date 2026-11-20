@@ -155,55 +155,105 @@ on_signal() {
 trap 'on_signal INT 130' INT
 trap 'on_signal TERM 143' TERM
 
-STARTED="$(date -u +%s)"
-setsid "${SERVE[@]}" >server0.log 2>&1 &
-SP=$!
-say "step 2: server starting (tp $TP, expert parallel, port $PORT, VLLM_HPU_QSA_TOPK_IDS=$TOPK_IDS)"
-while :; do
-    if "$PY" -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:$PORT/health', timeout=5)" 2>/dev/null; then
-        break
-    fi
-    if ! kill -0 "$SP" 2>/dev/null; then
-        say "SERVER-DIED after $(($(date -u +%s) - STARTED)) s"
-        grep -nE "Error|Traceback|error:" server0.log | tail -n 25 | cut -c1-400
-        tail -n 25 server0.log | cut -c1-400
-        wait "$SP" 2>/dev/null
-        exit 3
-    fi
-    if [ "$(left)" -lt 420 ]; then
-        say "SERVER-TIMEOUT: not healthy after $(($(date -u +%s) - STARTED)) s, $(left) s to the deadline"
-        tail -n 30 server0.log | cut -c1-300
-        stop_server
-        exit 4
-    fi
-    sleep 5
-done
-say "SERVER-HEALTHY after $(($(date -u +%s) - STARTED)) s"
-grep -E "Maximum concurrency|QSA fused" server0.log | tail -n 6 | cut -c1-300
-
-# ---------------------------------------------------------------- 3. the probe
 RESERVE=150 # stopping the server, the summary
 if [ "$ARM" = mode1 ]; then RESERVE=420; fi # and the kernel op test
-probe() {
-    "$PY" "$PROBE" --port "$PORT" --model fn --out "$OUT/qsa_ab.json" \
-        --levels "$LEVELS" --tokens "$TOKENS" --ctx "$CTX" --docs "$TREE/docs/design/flash-next" \
-        --deadline "$((DEADLINE - RESERVE))" 2>&1 | tee probe.log
-    return "${PIPESTATUS[0]}"
+
+# serve_and_probe TAG: start the server (log server<TAG>.log), wait until it is healthy, run the probe
+# (qsa_ab<TAG>.json, probe<TAG>.log), stop the server. Returns 0 the probe ran, 3 the server died before it was
+# healthy, 4 it was not healthy in time, 5 the probe failed. RUN_OK=1 when every round of the probe had all its
+# streams and the server was still alive at the end.
+RUN_OK=0
+serve_and_probe() {
+    local tag="$1" started log="server$1.log" json="qsa_ab$1.json" rc
+    RUN_OK=0
+    started="$(date -u +%s)"
+    setsid "${SERVE[@]}" >"$log" 2>&1 &
+    SP=$!
+    say "server starting (tp $TP, expert parallel, port $PORT, VLLM_HPU_QSA_TOPK_IDS=$TOPK_IDS," \
+        "VLLM_HPU_QSA_FUSED=${VLLM_HPU_QSA_FUSED:-0} VLLM_HPU_QSA_INDEXER_SHARD=${VLLM_HPU_QSA_INDEXER_SHARD:-0}), log $log"
+    while :; do
+        if "$PY" -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:$PORT/health', timeout=5)" 2>/dev/null; then
+            break
+        fi
+        if ! kill -0 "$SP" 2>/dev/null; then
+            say "SERVER-DIED after $(($(date -u +%s) - started)) s"
+            grep -nE "Error|Traceback|error:" "$log" | tail -n 25 | cut -c1-400
+            tail -n 25 "$log" | cut -c1-400
+            wait "$SP" 2>/dev/null
+            SP=""
+            return 3
+        fi
+        if [ "$(left)" -lt 420 ]; then
+            say "SERVER-TIMEOUT: not healthy after $(($(date -u +%s) - started)) s, $(left) s to the deadline"
+            tail -n 30 "$log" | cut -c1-300
+            stop_server
+            return 4
+        fi
+        sleep 5
+    done
+    say "SERVER-HEALTHY after $(($(date -u +%s) - started)) s"
+    grep -E "Maximum concurrency|QSA fused" "$log" | tail -n 6 | cut -c1-300
+    probe() {
+        "$PY" "$PROBE" --port "$PORT" --model fn --out "$OUT/$json" \
+            --levels "$LEVELS" --tokens "$TOKENS" --ctx "$CTX" --docs "$TREE/docs/design/flash-next" \
+            --deadline "$((DEADLINE - RESERVE))" 2>&1 | tee "probe$tag.log"
+        return "${PIPESTATUS[0]}"
+    }
+    probe &
+    CHILD=$!
+    wait "$CHILD"
+    rc=$?
+    CHILD=""
+    say "PROBE-RC $rc"
+    local alive=1
+    kill -0 "$SP" 2>/dev/null || alive=0
+    if [ "$alive" -eq 0 ]; then
+        say "THE SERVER DIED DURING THE PROBE"
+        grep -nE "Error|Traceback|error:" "$log" | tail -n 20 | cut -c1-400
+    fi
+    grep -E "generation throughput" "$log" | tail -n 4 | cut -c1-300
+    say "fallback/off lines in the server log: $(grep -ciE "fallback|is off for|has no HPU kernel|kernels are not loaded" "$log")"
+    grep -hE "is off for|kernels are not loaded|Traceback" "$log" | sort | uniq -c | head -n 6 | cut -c1-300
+    say "decode configurations compiled at run time: $(grep -o "Configuration: ('decode'[^)]*)" "$log" | sort -u | wc -l)," \
+        "prompt configurations: $(grep -o "Configuration: ('prompt'[^)]*)" "$log" | sort -u | wc -l)"
+    stop_server
+    RUN_OK="$("$PY" - "$OUT/$json" "$alive" <<'PY'
+import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+except Exception:
+    print(0)
+    sys.exit(0)
+rounds = d.get("levels", []) + d.get("long", [])
+bad = [r for r in rounds if not r.get("ok") or r.get("errors")]
+print(1 if rounds and not bad and sys.argv[2] == "1" else 0)
+PY
+)"
+    if [ "$rc" -ne 0 ]; then return 5; fi
+    return 0
 }
-probe &
-CHILD=$!
-wait "$CHILD"
-PROBE_RC=$?
-CHILD=""
-say "PROBE-RC $PROBE_RC"
-grep -E "generation throughput" server0.log | tail -n 4 | cut -c1-300
-say "fallback/off lines in the server log: $(grep -ciE "fallback|is off for|has no HPU kernel|kernels are not loaded" server0.log)"
-grep -hE "is off for|kernels are not loaded|Traceback" server0.log | sort | uniq -c | head -n 6 | cut -c1-300
-say "decode configurations compiled at run time: $(grep -o "Configuration: ('decode'[^)]*)" server0.log | sort -u | wc -l)," \
-    "prompt configurations: $(grep -o "Configuration: ('prompt'[^)]*)" server0.log | sort -u | wc -l)"
-stop_server
-RC=0
-if [ "$PROBE_RC" -ne 0 ]; then RC=5; fi
+
+say "step 2 and 3: the server and the probe"
+serve_and_probe ""
+RC=$?
+# The request-sharded indexer on its first run in a served model: when its server dies or a round loses streams,
+# the arm runs once more without it (mode 1 replicated), so the arm still gives the request-major and grouped
+# attention numbers.
+if [ "$RUN_OK" != 1 ] && [ "${VLLM_HPU_QSA_INDEXER_SHARD:-0}" = 1 ] && [ "${QSA_AB_NO_RETRY:-0}" != 1 ]; then
+    if [ "$(left)" -ge 1080 ]; then
+        say "FALLBACK: the run with VLLM_HPU_QSA_INDEXER_SHARD=1 did not complete (exit $RC): once more with it at 0"
+        export VLLM_HPU_QSA_INDEXER_SHARD=0
+        sleep 10
+        serve_and_probe "_noshard"
+        RC=$?
+    else
+        say "NO FALLBACK RUN: $(left) s to the deadline (1080 s wanted)"
+    fi
+fi
+if [ "$RC" -eq 3 ] || [ "$RC" -eq 4 ]; then
+    say "DONE (exit $RC)"
+    exit "$RC"
+fi
 
 # ---------------------------------------------------------------- 4. the kernels' card test (arm mode1)
 if [ "$ARM" = mode1 ] && [ "${QSA_AB_SKIP_OPS:-0}" != 1 ]; then
