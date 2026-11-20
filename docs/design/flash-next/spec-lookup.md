@@ -10,7 +10,7 @@ repository is under `/Volumes/Storage/Claude/gaudi-work/reports/spec-lookup/` (`
 
 ## Handoff (if this agent stops)
 
-State at **2026-11-20 20:15 UTC**. Branch head: the commit that holds this text, pushed. It contains
+State at **2026-11-20 20:22 UTC**. Branch head: the commit that holds this text, pushed. It contains
 mtp-card-ready through `f1aa2292` (both card fixes of job 00021, the int64 conv index, the MTP step timer) and
 the program head `1b28bbff`.
 
@@ -20,7 +20,8 @@ the program head `1b28bbff`.
 |---|---|---|
 | 00086 `tiny2-ngram3-oracle` (any:2, 10 min) | tiny model: baseline, then n-gram k = 3 with prefix caching and the rehearsal oracle | waiting, bumped by the coordinator to the tail of the 1-card wave (bound 21:09 UTC); runs commit `628d9716` |
 | 00087 `tiny2-ngram8-search` (any:2, 14 min) | tiny model: baseline, n-gram k = 8 with the oracle, n-gram k = 3 with vLLM's own search | the same (bound 21:14 UTC) |
-| 00107 `tiny2-mtp3-lookup-oracle2` (any:2, 12 min) | tiny model: baseline, then MTP k = 3 + the lookup hook with the oracle, three passes (hybrid, lookup-only, MTP alone) | waiting; submitted 20:12 UTC from `e121d61b` in place of 00097 (whose commit lacked mtp-card-ready's second fix `9d013a36` and would have died at the first draft); the coordinator was asked at 20:13 UTC to bump it like 00097; its detached `farm job` command copies the results (`reports/spec-lookup/card/submit-tiny2-mtp3-lookup-oracle2.log`) |
+| 00107 `tiny2-mtp3-lookup-oracle2` (any:2, 12 min) | tiny model: baseline, then MTP k = 3 + the lookup hook with the oracle, three passes (hybrid, lookup-only, MTP alone); torch GDN verification | waiting, bumped by the coordinator (bound 21:20 UTC); runs commit `e121d61b` |
+| `tiny2-mtp3-lookup-fused` (any:2, 12 min) | the same with the fused GDN verification op (`VLLM_HPU_GDN_CORE_VERIFY=1`), the path the MTP track runs on the card: the first accepted drafts through that op | submitted 20:17 UTC from `f0e2b5dd` (id in `reports/spec-lookup/card/submit-tiny2-mtp3-lookup-fused.log`); end of the queue until the coordinator bumps it |
 | 00095 `real4-nospec-edit-prose` (any:4, 28 min) | real model without speculation: the edit, prose, whole-answer and large-file rounds (section 6) | waiting in 00029's place (bound 02:34 UTC, realistically hours earlier); runs commit `c13d1b97` |
 
 The local `farm job` commands that submitted 00086, 00087 and 00095 were killed with the agent's shell at 20:05
@@ -45,6 +46,7 @@ step carries at 32 streams (the tool prints both), and
 | n-gram lookup with prefix caching through the real engine (scheduler, HPU worker and runner, tiny model): ragged oracle drafts with tampered ones (every accepted count 0..3, empty drafts, 11 widened steps, 3 block-completion commits, 440 tokens compared), full acceptance across 256-token block boundaries, vLLM's own `NgramProposer`, prefix caching off, k = 8 (every accepted count 0..8, 21 widened steps), the mutation without the widening breaks | `tests/unit_tests/models/flash_next/test_lookup_engine.py`: **8 passed** in 1,156 s on the tree of `3d536265` (this branch + mtp-card-ready `9722b888`), log `reports/spec-lookup/logs/m1_test_lookup_engine.log` |
 | The lookup + MTP hybrid through the same engine (lookup rows padded with -1 and MTP rows in the same streams, lossless up to a bf16 near-tie) | the same run: `test_hybrid_lookup_beside_mtp_with_prefix_caching` passed (it was skipped before the merge: the MTP engine did not start) |
 | Hybrid proposer, its modes, the per-request mode, the per-load log line, the rehearsal oracle | `tests/unit_tests/worker/test_flash_next_lookup.py` 19 passed (head) |
+| The rehearsal oracle through the real engine, as the card jobs use it (the file named in the environment): the n-gram server (356 tokens compared, 108 oracle drafts of which 28 tampered, every accepted count 0..3, 30 widened steps, 2 block-completion commits) and the hybrid (lookup rows 108, 225 drafts accepted over 105 verified rows, MTP rows 68) | `tests/unit_tests/models/flash_next/test_lookup_oracle_engine.py` 2 passed in 209 s on `c809b15e` + the test, log `reports/spec-lookup/logs/m7_test_lookup_oracle_engine.log` |
 | Verification width helpers | `tests/unit_tests/worker/test_verify_width.py` 12 passed |
 | Platform: n-gram with prefix caching served, k limits `{"mtp": 5, "ngram": 8}` | `tests/unit_tests/test_flash_next_platform.py` 75 passed (head) |
 | Card job tools | `tests/unit_tests/tools/rental/test_lookup_probe.py` 11 passed, `test_lookup_tiny.py` 9 passed, `test_spec_probe.py` 13 passed (head) |
@@ -68,12 +70,15 @@ step carries at 32 streams (the tool prints both), and
 
 **Pending, in order**
 
-1. **Read the tiny rehearsals** (00086, 00087) and report them (above). If a configuration fails: the traceback
-   is in `reports/spec-lookup/card/<id>-<name>/<config>/server0.log`; `lookup_tiny.json` has every stream.
-   Then the hybrid's rehearsal, which needs nothing new:
+1. **Read the tiny rehearsals** (00086, 00087, 00107, the fused one) and report them (above). If a
+   configuration fails: the traceback is in `reports/spec-lookup/card/<id>-<name>/<config>/server0.log`;
+   `lookup_tiny.json` has every stream. The n-gram rehearsals and 00107 verify with the torch GDN recurrence
+   (`VLLM_HPU_GDN_CORE_VERIFY=0`), which no card run has exercised yet (the MTP track's passes used the fused
+   op); n-gram k = 8 has no other path (9 rows are more than the op's 6). If the torch path fails on the card,
+   the n-gram server at k <= 5 can still run with the op: rehearse it with
    ```bash
    F=/Volumes/Storage/Claude/gaudi-work/bin/farm
-   $F job spec-lookup tiny2-mtp3-lookup any:2 12m --no-model -- python tools/flash_next/rental/lookup_tiny.py --configs mtp3-lookup
+   $F job spec-lookup tiny2-ngram3-fused any:2 10m --no-model -- python tools/flash_next/rental/lookup_tiny.py --configs ngram3-fused
    ```
 2. **Real-model speculative jobs, TP4 + EP4** (section 6 has the rounds), each after its tiny rehearsal passed.
    One of them can still take the other half of 00029's place until 21:20 UTC (`--replaces 00029`; the
@@ -81,9 +86,11 @@ step carries at 32 streams (the tool prints both), and
    ```bash
    $F job spec-lookup real4-ngram8 any:4 30m --replaces 00029 -- bash tools/flash_next/rental/lookup_serve.sh \
        --label ngram8 --ngram 8 --rounds edit:32:384:-,prose:32:256:-,edit:1:384:-,prose:1:256:-,editl:8:512:-
-   $F job spec-lookup real4-mtp3-lookup any:4 30m -- bash tools/flash_next/rental/lookup_serve.sh \
+   $F job spec-lookup real4-mtp3-lookup any:4 30m --env VLLM_HPU_GDN_CORE_VERIFY=1 -- bash tools/flash_next/rental/lookup_serve.sh \
        --label mtp3lookup --mtp 3 --lookup 1 --rounds edit:32:384:0,edit:32:384:1,edit:32:384:2,prose:32:256:0,prose:32:256:1,edit:1:384:0,edit:1:384:1,edit:1:384:2,prose:1:256:0,prose:1:256:1,editl:8:512:0,editl:8:512:1
    ```
+   (`VLLM_HPU_GDN_CORE_VERIFY=1` for the MTP server: the fused verification op is what the MTP track proved on
+   the real model; the n-gram server at k = 8 keeps the torch recurrence.)
    Reread CARD.md before each submit. Results: `probe.json`, `probe.log`, `server0.log`; compare texts across
    jobs with `python3 tools/flash_next/rental/lookup_probe.py --compare A/probe.json B/probe.json ...`.
 3. **Numbers to section 7 and to the coordinator** (SendMessage to `main`): accepted tokens per step, ms per
@@ -259,4 +266,9 @@ None yet (2026-11-20 19:50 UTC).
   scheduler.py` `_mamba_block_aligned_split`, `last_cache_position = num_tokens - num_tokens % block_size`,
   minus one block with `use_eagle_block_drop`. Without `VLLM_HPU_MTP_CHUNK_KV=1` the draft layer has no KV for
   those blocks (VERIFIED in the scheduler code; the effect on acceptance is not measured).
-- mtp-card-ready: `causal_conv1d_pytorch.py:498` needs a long index for `index_copy_` on CPU (see the handoff).
+- mtp-card-ready: `causal_conv1d_pytorch.py:498` needed a long index for `index_copy_` on CPU (fixed in their
+  `9d013a36`).
+- Every track: an INFO line of a logger named `vllm_gaudi.<module>` (`init_logger(__name__)`) reaches no handler
+  on a server: vLLM configures only the `vllm` logger. Job 00021's server log has no INFO line of
+  `hpu_flash_next_mtp.py` or `flash_next_mtp_steps.py` (VERIFIED: "the draft runs with the target's plain RoPE"
+  is absent). Use `vllm_gaudi.extension.logger.logger()` (the `vllm` logger) for lines a card log must show.
