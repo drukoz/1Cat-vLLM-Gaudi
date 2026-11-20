@@ -96,6 +96,17 @@ step, and the plain step after one, through
 (`GDN core verify ... is off for <layer>: <reason>`) and runs the torch path.
 It stays off until the rental's gate G1b has checked the op on a card.
 
+`VLLM_HPU_SPEC_SAMPLED_VERIFY` decides what a Flash-Next MTP server does with a
+sampled request (temperature above 0, which the checkpoint's
+`generation_config.json` makes the default for a request that sets none), as an
+integer. `0` (default) refuses it at request validation with an error naming
+this flag: the HPU rejection sampler verifies greedy requests only, and before
+this flag a sampled request stopped the worker. `1` verifies the drafts of
+sampled requests by speculative sampling in torch (accept the draft with the
+target's probability of it after temperature, top-k and top-p; on a rejection
+draw from the target with the draft removed), exact in distribution;
+`vllm_gaudi/v1/sample/hpu_rejection_sampler.py`, `sampled_rejection_sample`.
+
 `VLLM_HPU_HC_FUSED` selects the path of the Flash-Next hyper-connections as an
 integer. `0` (default) keeps the torch path. `1` runs the element-wise parts of
 every hyper-connection (the grouped norm, the silu with the injection split, the

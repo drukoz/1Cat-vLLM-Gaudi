@@ -286,3 +286,43 @@ def test_spec_none_passes(monkeypatch):
     config = _spec_config()
     config.speculative_config = None
     _validate_flash_next_speculative_config(config)
+
+
+# ---- sampled requests on a speculative server (idea-sweep I07): refused unless VLLM_HPU_SPEC_SAMPLED_VERIFY=1
+
+
+@pytest.fixture
+def speculative_server(monkeypatch):
+    import vllm_gaudi.platform as platform_module
+
+    monkeypatch.setattr(platform_module, "_SPEC_GREEDY_ONLY", False)
+    monkeypatch.setenv("VLLM_COMPACT_GDN", "1")
+    return platform_module
+
+
+def _params(temperature):
+    from vllm import SamplingParams
+
+    return SamplingParams(temperature=temperature, max_tokens=4)
+
+
+def test_a_sampled_request_on_a_speculative_server_is_refused(speculative_server, monkeypatch):
+    monkeypatch.setenv("VLLM_HPU_SPEC_SAMPLED_VERIFY", "0")
+    _validate_flash_next_speculative_config(_spec_config())
+    with pytest.raises(ValueError, match="VLLM_HPU_SPEC_SAMPLED_VERIFY=1"):
+        speculative_server.HpuPlatform.validate_request(None, _params(1.0))
+    speculative_server.HpuPlatform.validate_request(None, _params(0.0))  # greedy: served
+
+
+def test_a_sampled_request_is_served_with_the_flag(speculative_server, monkeypatch):
+    monkeypatch.setenv("VLLM_HPU_SPEC_SAMPLED_VERIFY", "1")
+    _validate_flash_next_speculative_config(_spec_config())
+    speculative_server.HpuPlatform.validate_request(None, _params(0.7))
+
+
+def test_a_server_without_speculation_serves_sampled_requests(speculative_server, monkeypatch):
+    monkeypatch.setenv("VLLM_HPU_SPEC_SAMPLED_VERIFY", "0")
+    config = _spec_config()
+    config.speculative_config = None
+    _validate_flash_next_speculative_config(config)
+    speculative_server.HpuPlatform.validate_request(None, _params(1.0))
