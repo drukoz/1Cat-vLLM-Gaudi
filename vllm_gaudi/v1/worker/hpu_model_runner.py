@@ -34,6 +34,7 @@ from vllm_gaudi.extension.profiler import (HabanaHighLevelProfiler, HabanaMemory
                                            format_bytes, setup_profiler)
 from vllm_gaudi.extension.runtime import clear_config, finalize_config, get_config
 from vllm_gaudi.extension.utils import align_and_pad, pad_list, with_default
+from vllm_gaudi.extension import step_timing
 from vllm_gaudi.extension.debug import init_debug_logger
 from vllm_gaudi.v1.core.recurrent_state_pool import pool_pad_block_id, pool_slots_from_env, pool_tensor_slots
 from vllm_gaudi.v1.worker.hpu_dp_utils import set_hpu_dp_metadata
@@ -712,9 +713,13 @@ class AsyncHPUModelRunnerOutput(AsyncModelRunnerOutput):
         """
 
         # Release the device tensor once the copy has completed
+        step_timer = step_timing.TIMER
+        wait_started = time.perf_counter_ns() if step_timer is not None else 0
         self._async_copy_ready_event.synchronize()
 
         valid_sampled_token_ids = self._sampled_token_ids_cpu.tolist()
+        if step_timer is not None:
+            step_timer.add_async("async_wait", time.perf_counter_ns() - wait_started)
         del self._sampled_token_ids
         for i in self._invalid_req_indices:
             if i < len(valid_sampled_token_ids):
@@ -2045,6 +2050,9 @@ def with_thread_limits():
 
 
 class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
+    # VLLM_HPU_STEP_TIMING: the worker's step timer. A class default, so that a runner built without
+    # __init__ (unit tests) is untimed.
+    step_timer = None
 
     def __init__(
         self,
@@ -2420,6 +2428,8 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         # High-level profiler
         self.profiler = HabanaHighLevelProfiler()
         self.profiler_counter_helper = HabanaProfilerCounterHelper()
+        # VLLM_HPU_STEP_TIMING: the worker's step timer, None when the flag is 0 (the default).
+        self.step_timer = step_timing.TIMER
 
         self.debug_fwd = init_debug_logger('fwd')
 
@@ -5725,6 +5735,10 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                 logits_indices.detach().cpu().tolist(),
             )
 
+        step_timer = self.step_timer
+        if step_timer is not None:
+            step_timer.lap("setup")
+            step_timer.phase = "forward"
         with self.profiler.record_event('internal', model_event_name):
             # Keep Python class-state mutation outside the compiled model.
             # Full-graph Dynamo cannot trace setattr on LoraMask, while doing
@@ -5737,6 +5751,9 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                                                inputs_embeds=inputs_embeds,
                                                model_mm_kwargs=model_mm_kwargs,
                                                **additional_kwargs)
+        if step_timer is not None:
+            step_timer.lap("forward")
+            step_timer.phase = "logits"
         if quality_debug and isinstance(hidden_states, torch.Tensor):
             hidden_flat = hidden_states.reshape(-1, hidden_states.shape[-1]).float()
             hidden_norms = torch.linalg.vector_norm(hidden_flat, dim=-1)
@@ -5774,6 +5791,8 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             else:
                 hidden_states, logits = self.model.select_and_compute_logits(hidden_states, logits_indices)
                 fused_sampled_token_ids = None
+        if step_timer is not None:
+            step_timer.lap("logits")
         return non_flattened_hidden_states, aux_hidden_states, \
             hidden_states, logits, fused_sampled_token_ids
 
@@ -6122,10 +6141,16 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                       request_ids: Optional[list[str]] = None,
                       pad_to: Optional[int] = None,
                       logits_requests=None) -> tuple[torch.Tensor, SamplingMetadata]:
+        step_timer = self.step_timer
         htorch.core.mark_step()
         sampling_metadata = self._prepare_sampling(batch_changed, request_ids, pad_to, logits_requests)
         sampler_output = self.sampler(logits=logits_device, sampling_metadata=sampling_metadata)
+        if step_timer is not None:
+            step_timer.lap("sample")
         htorch.core.mark_step()
+        if step_timer is not None:
+            step_timer.lap("launch_sample")
+            step_timer.device_wait("device_sample")
         return sampler_output, sampling_metadata
 
     def _pool(
@@ -6496,9 +6521,19 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         num_reqs = num_decodes + num_prefills
         if self.use_async_scheduling:
             self.invalid_req_indices: list[int] = []
+        step_timer = None if warmup_mode else self.step_timer
+        if step_timer is not None:
+            step_timer.lap("setup")
+            if num_prefills == 0:
+                step_kind = "verify" if scheduler_output.scheduled_spec_decode_tokens else "decode"
+            else:
+                step_kind = "prefill" if num_decodes == 0 else "mixed"
+            step_timer.tag(step_kind, num_reqs, scheduler_output.total_num_scheduled_tokens)
         with self.profiler.record_event('internal', 'prepare_input_tensors'):
             prefill_input_data, decode_input_data = self._prepare_inputs(scheduler_output, num_prefills, num_decodes,
                                                                          warmup_mode)
+        if step_timer is not None:
+            step_timer.lap("prepare")
         prefill_data, \
             dummy_prefill_input_data_batches_across_dp = prefill_input_data
         num_pad_prefill_batch_across_dp = \
@@ -6567,7 +6602,11 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                 self.event_start = self.profiler.get_timestamp_us()
                 self.profiler.start("internal", "prefill")
 
+                if step_timer is not None:
+                    step_timer.lap("setup")
                 htorch.core.mark_step()
+                if step_timer is not None:
+                    step_timer.lap("launch_inputs")
                 non_flattened_hidden_states, aux_hidden_states, \
                     sample_hidden_states, logits_device, _ = \
                     self._execute_model_generic(
@@ -6580,6 +6619,9 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                         warmup_mode=warmup_mode,
                         ple_inputs=ple_inputs)
                 htorch.core.mark_step()
+                if step_timer is not None:
+                    step_timer.lap("launch_model")
+                    step_timer.device_wait("device_forward")
                 non_flattened_hidden_states_prefills.append(non_flattened_hidden_states)
                 # Collect prefill hidden states for prompt logprobs.
                 # req_id is a list of request IDs in this prefill batch.
@@ -6653,7 +6695,12 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             self.event_start = self.profiler.get_timestamp_us()
             self.profiler.start("internal", "decode")
             fuse_greedy_sampling = self._can_fuse_plain_greedy_sampling(pd_info.decode_req_ids)
+            if step_timer is not None:
+                step_timer.lap("setup")
+                step_timer.bucket(decode_data.token_ids.size(0))
             htorch.core.mark_step()
+            if step_timer is not None:
+                step_timer.lap("launch_inputs")
             non_flattened_hidden_states, aux_hidden_states, \
                 sample_hidden_states, logits_device, fused_sampled_token_ids = \
                     self._execute_model_generic(
@@ -6668,6 +6715,9 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                 fuse_greedy_sampling=fuse_greedy_sampling,
                 ple_inputs=decode_data.ple_inputs)
             htorch.core.mark_step()
+            if step_timer is not None:
+                step_timer.lap("launch_model")
+                step_timer.device_wait("device_forward")
 
             if self.use_structured_output:
                 assert logits_device is not None
@@ -6764,11 +6814,15 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                                     num_decodes,
                                     decode_data,
                                 )
+                        if step_timer is not None:
+                            step_timer.lap("sample")
                         decode_sampled_token_ids = \
                             self.rejection_sampler.parse_output(
                                 sampled_token_ids,
                                 self.input_batch.vocab_size,
                         )
+                        if step_timer is not None:
+                            step_timer.lap("wait")  # the first host read of this step's device results
                         if isinstance(decode_sampled_token_ids, tuple):
                             decode_sampled_token_ids, _ = decode_sampled_token_ids
                         # Trim output in case of dummy padding
@@ -6897,11 +6951,15 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             # We already have tokens. Let's copy the data to
             # CPU as is, and then discard padded tokens.
             with self.profiler.record_event('internal', "sampler_postprocessing"):
+                if step_timer is not None:
+                    step_timer.lap("post")
                 prefill_sampled_token_ids = [tensor.cpu() for tensor in prefill_sampled_token_ids]
                 if spec_decode_num_tokens is not None:
                     decode_sampled_token_ids = [tensor.cpu() for tensor in decode_sampled_token_ids]
                 else:
                     decode_sampled_token_ids = [tensor.cpu()[:num_decodes] for tensor in decode_sampled_token_ids]
+                if step_timer is not None:
+                    step_timer.lap("wait")  # the host read of the sampled tokens: the device finishes the step here
                 if decode_sampled_token_ids + prefill_sampled_token_ids:
                     sampled_token_ids_list = torch.cat(decode_sampled_token_ids + prefill_sampled_token_ids).tolist()
                 else:
@@ -6971,6 +7029,8 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             if device_prepared_dflash_drafts is not None:
                 self._draft_token_ids = device_prepared_dflash_drafts
             else:
+                if step_timer is not None:
+                    step_timer.lap("post")
                 mtp_step_timer = None if warmup_mode else self._mtp_step_timer
                 if mtp_step_timer is not None:
                     mtp_step_timer.draft_start(
@@ -6987,6 +7047,8 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                         prefill_data if num_prefills > 0 else None, decode_data if num_decodes > 0 else None)
                 if mtp_step_timer is not None:
                     mtp_step_timer.draft_end()
+                if step_timer is not None:
+                    step_timer.lap("draft")
         ################## Spec Decode end ##################
 
         # Create output.
@@ -7147,6 +7209,11 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                             get_target_layer_suffix_list(model_config.model_type if model_config is not None else None),
                             hidden_layer_markstep_interval)
         torch.hpu.synchronize()
+        # VLLM_HPU_STEP_TIMING_COMPONENTS (default 0): mode 3 of the step timer measures every model component
+        # on its own when the forward runs in Python (--enforce-eager).
+        if self.step_timer is not None and gaudi_envs.VLLM_HPU_STEP_TIMING_COMPONENTS:
+            logger.info("step timing: component cuts %s", step_timing.install_component_cuts(self.step_timer,
+                                                                                          self.model))
         if self.is_pooling_model:
             self.set_causal_option(self.model)
 

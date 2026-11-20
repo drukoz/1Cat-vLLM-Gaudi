@@ -899,6 +899,24 @@ def _patch_inc_quantization_config() -> None:
     register_quantization_config("inc")(_FakeINCConfig)
 
 
+def _patch_engine_core_step_timing() -> None:
+    """VLLM_HPU_STEP_TIMING: time the engine core's step in the process that runs it.
+
+    ``EngineCore.__init__`` calls ``load_general_plugins`` first, so the wrapped ``step`` is in place before the
+    engine binds its step function. With the flag at 0 (the default) nothing is patched.
+    """
+    from vllm_gaudi.extension import step_timing
+
+    try:
+        if step_timing.env_settings()[0] == step_timing.MODE_OFF:
+            return
+        from vllm.logger import init_logger
+
+        step_timing.install_engine_step_timing(log=init_logger("vllm_gaudi.step_timing").info)
+    except Exception:  # noqa: BLE001 - a timer must never keep the engine from starting
+        return
+
+
 def apply() -> None:
     """Install all HPU runtime monkey-patches."""
     # --- torch.accelerator.empty_cache ---
@@ -941,6 +959,7 @@ def apply() -> None:
         _patch_free_blocks()
         _patch_sdpa_attention_forward()
         _patch_inc_quantization_config()
+        _patch_engine_core_step_timing()
 
     _plugins_mod.load_general_plugins = _load_general_with_hpu_patches
 

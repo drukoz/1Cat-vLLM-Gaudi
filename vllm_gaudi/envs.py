@@ -549,6 +549,10 @@ if TYPE_CHECKING:
     VLLM_HPU_MTP_REPLICATED_FC: int = 0  # 0 the MTP fc linears shard and all-gather (default), 1 unsharded
     VLLM_HPU_PLE_TABLE_RIDER: int = 0  # 0 the PLE table rows get their own all-reduce (default), 1 on the embedding's
     VLLM_HPU_ALL_REDUCE_AS_GATHER_ROWS: int = 0  # all-reduces of at most N rows run as all-gather + local sum; 0 never
+    VLLM_HPU_STEP_TIMING: int = 0  # StepTimingMode: 0 off (default), 1 spans, 2 sync counters, 3 device waits
+    VLLM_HPU_STEP_TIMING_COMPONENTS: int = 0  # 0 (default) none, 1 mode 3 also waits around every model component
+    VLLM_HPU_STEP_TIMING_EVERY: int = 100  # steps per log line and JSON record of the step timer
+    VLLM_HPU_STEP_TIMING_DIR: str = ""  # folder of the step timer's JSON files ("" = the working directory)
     VLLM_HPU_RECURRENT_STATE_POOL: int = 0  # RecurrentStatePoolMode: 0 off, 1 pool
     VLLM_HPU_RECURRENT_STATE_POOL_SLOTS: int = 0  # resolved by the hook; positive overrides the formula
     VLLM_HPU_RECURRENT_STATE_POOL_CACHE_SLOTS: int = 512  # retained prefix states added to the live need
@@ -2034,6 +2038,30 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # less than the two phases of an all-reduce (C4 without the kernel). Not yet run on a card.
     "VLLM_HPU_ALL_REDUCE_AS_GATHER_ROWS":
     lambda: int(os.environ.get("VLLM_HPU_ALL_REDUCE_AS_GATHER_ROWS", "0")),
+    # Step timer of the HPU worker, model runner and engine core (vllm_gaudi/extension/step_timing.py).
+    # 0 (default) = off: no timer exists and nothing is timed, patched or written. 1 = the host spans of
+    # every step (input preparation, the forward call, the launches, sampling, the wait for the device,
+    # the engine's turn between steps), tagged with the step kind and the row count, plus the collectives
+    # per step. 2 = 1 and the debug counters of host synchronisation points (.item(), .cpu(), .tolist(),
+    # copies between host and device, mark_step calls) with their source lines. 3 = 1 with a wait for the
+    # device around every collective and after the forward and the sampler, which gives the device time
+    # of every segment (the step itself is slower in this mode). Any other value is 0 (there is no mode 4:
+    # its op counting hung a TP8 server, job 00013). A process started with a nonzero value rereads
+    # <dir>/step_timing.mode (one integer) when a step starts after two idle seconds.
+    "VLLM_HPU_STEP_TIMING":
+    lambda: int(os.environ.get("VLLM_HPU_STEP_TIMING", "0")),
+    # 1 = mode 3 of the step timer also waits for the device where a model component starts and ends
+    # (hyper-connection, GDN, QSA indexer and attention, MoE and its expert op, PLE), so each component's
+    # device, collective and host time is measured on its own. For a server without HPU graphs
+    # (--enforce-eager): a replayed graph runs no Python. 0 (default) = the model is not touched.
+    "VLLM_HPU_STEP_TIMING_COMPONENTS":
+    lambda: int(os.environ.get("VLLM_HPU_STEP_TIMING_COMPONENTS", "0")),
+    # Steps of one kind and row count per log line and JSON record of the step timer.
+    "VLLM_HPU_STEP_TIMING_EVERY":
+    lambda: int(os.environ.get("VLLM_HPU_STEP_TIMING_EVERY", "100")),
+    # Folder of the step timer's files (step_timing_<role>_r<rank>_<pid>.jsonl); "" is the working directory.
+    "VLLM_HPU_STEP_TIMING_DIR":
+    lambda: os.environ.get("VLLM_HPU_STEP_TIMING_DIR", ""),
 
     # Recurrent (GDN / short-conv) state pool: 0 (default) keeps today's
     # one-recurrent-slot-per-attention-block-id allocation, 1 gives the
