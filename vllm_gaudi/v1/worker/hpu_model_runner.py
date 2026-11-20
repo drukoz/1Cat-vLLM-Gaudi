@@ -9213,12 +9213,15 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
                 if not _needs_raw_buffer(kv_cache_tensor):
                     continue
-                # Pad by one dummy block sized to THIS tensor's spec. Its
-                # coalesced layers share one (standard Mamba2) spec; group 0 may
-                # be a smaller attention spec in hybrid models and under-pad the
-                # buffer, letting the last as_strided view run past the end.
+                # One page of THIS tensor's spec per block, plus one dummy block:
+                # exactly what the as_strided views below address (num_blocks + 1
+                # blocks, strided by the spec's page). KVCacheTensor.size is the
+                # engine's whole backing allocation (num_blocks * bytes_per_block,
+                # PR #51718): with a wider group next to it (Flash-Next: 12
+                # attention layers per block, one PLE layer) it is that many
+                # times what this buffer needs.
                 raw_spec = _layer_spec[kv_cache_tensor.layers[0]]
-                size = kv_cache_tensor.size + raw_spec.page_size_bytes
+                size = (kv_cache_config.num_blocks + 1) * raw_spec.page_size_bytes
                 tensor = torch.zeros(size // 2, dtype=torch.bfloat16, device=self.device)
                 for layer_name in kv_cache_tensor.layers:
                     kv_caches[layer_name] = tensor

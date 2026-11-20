@@ -732,6 +732,10 @@ class HpuPlatform(Platform):
 
     @classmethod
     def register_custom_kv_cache_specs(cls, vllm_config):
+        # The engine core calls this right before it groups the layers' KV cache specs and sizes the block
+        # pool: keep every attention layer in the one group whose block table the HPU runner reads.
+        from vllm_gaudi.v1.core.recurrent_state_pool import install_hpu_kv_cache_grouping
+        install_hpu_kv_cache_grouping()
         if gaudi_envs.VLLM_HPU_DSV41_PREPARED_SHARDS:
             from vllm_gaudi.ops.deepseek_v41_state import register_state_spec
             register_state_spec(vllm_config)
