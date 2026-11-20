@@ -11,7 +11,7 @@ This track's harness refuses report files outside the repository, so the handoff
 
 ## Handoff (if this agent stops)
 
-Last update: **2026-11-20 20:15 UTC**. Branch `feat/flash-next-gaudi-engine-step`. Scratch files, probes and
+Last update: **2026-11-20 20:25 UTC**. Branch `feat/flash-next-gaudi-engine-step`. Scratch files, probes and
 card results: `/Volumes/Storage/Claude/gaudi-work/reports/engine-step/` (`probes/`, `card_job/` = submit logs,
 `card/` = fetched results, `logs/` = CPU test and gate logs, `merge-wt/` = a second worktree, see below).
 
@@ -21,26 +21,28 @@ Four things are built, default off, CPU-proven and **never run on a card**: I01
 (`VLLM_HPU_FLASH_NEXT_DECODE_METADATA=1`), I05 (`VLLM_HPU_FUSED_GREEDY_LOGITS=1` with `min_tokens`), the switch
 file for an A/B on one server (`VLLM_HPU_RUNTIME_SWITCH_FILE`) and sampled steps over candidates
 (`VLLM_HPU_CANDIDATE_SAMPLING=1`, section 7). The program branch (1b28bbff, PR 12 and PR 13) is merged into this
-branch as commit `1aa017aa` **in the second worktree `reports/engine-step/merge-wt` (branch
-`engine-step-merge-wip`)**; its gate runs (`logs/gate_merge_1aa017aa.log`). The first card A/B (jobs 00030 and
-00031) produced no number (section 2). Two card jobs wait: 00093 (one card) and 00094 (the A/B).
+branch (merge commit `1aa017aa`, head `9bf1920f` plus documents, pushed); **the merge into the program branch
+waits for the gate**, which has been queued behind other tracks' gates since 20:09 UTC
+(`logs/gate_merge_1aa017aa.log`). The first card A/B (jobs 00030 and 00031) produced no number (section 2). Two
+card jobs wait: 00093 (one card) and 00110 (the A/B on the merged tree).
 
 ### If you take over, in this order
 
-1. `tail logs/gate_merge_1aa017aa.log`: when it ends with `gate exit 0`, fast-forward the track branch and push:
-   `git -C /Volumes/Storage/Claude/gaudi-work/wt/engine-step merge --ff-only engine-step-merge-wip && git -C /Volumes/Storage/Claude/gaudi-work/wt/engine-step push origin feat/flash-next-gaudi-engine-step`
-   (the main worktree must have no test running on it), then `gh pr create --base feat/flash-next-gaudi` and
-   `gh pr merge --merge` (protocol in BRIEF.md). A red file: read its log in the folder the gate names, fix in
-   `merge-wt`, commit there, rerun `bin/gate /Volumes/Storage/Claude/gaudi-work/reports/engine-step/merge-wt --tools`.
-2. Replace the A/B job with the merged tree while it still waits (`bin/farm status | grep engine-step`):
-   `bin/farm job engine-step real4-ab3 any:4 36m --replaces 00094 -- bash tools/flash_next/engine_step/serve_long_probe.sh`
-   (it runs the committed HEAD of `wt/engine-step`, so do step 1's fast-forward first).
-3. When 00093 lands: its `VERDICT` lines and the sampler times at 32 rows go to the coordinator (`main`),
+1. `tail -5 /Volumes/Storage/Claude/gaudi-work/reports/engine-step/logs/gate_merge_1aa017aa.log`. It runs on the
+   second worktree `reports/engine-step/merge-wt` (branch `engine-step-merge-wip`, kept equal to the track
+   branch). When it ends with `gate exit 0`: from `wt/engine-step`, `gh pr create --base feat/flash-next-gaudi`
+   and `gh pr merge --merge` (protocol in BRIEF.md), then tell the coordinator and mtp-card-ready
+   (`a9b3d340daef67cce`) that the flags are on the program branch. If the log is missing its last line or the
+   process is gone, rerun `bin/gate /Volumes/Storage/Claude/gaudi-work/wt/engine-step --tools` (one gate at a
+   time on this Mac: it waits for the lock). A red file: read its log in the folder the gate names, fix, commit,
+   rerun.
+2. When 00093 lands: its `VERDICT` lines and the sampler times at 32 rows go to the coordinator (`main`),
    collectives (`a79e802bb464d68fd`) and mtp-card-ready (`a9b3d340daef67cce`) with SendMessage, and into
    section 9.
-4. Tell mtp-card-ready and the coordinator when the flags are on the program branch: mtp-card-ready measures
-   I01 under MTP with its own server (`VLLM_HPU_MTP_TIMING=1`, the `passN_meta` laps) by adding
-   `VLLM_HPU_FLASH_NEXT_DECODE_METADATA=1` to one arm; no extra job of this track is needed for that.
+3. When 00110 lands: section 9 and the coordinator (see the table).
+4. I01 under MTP needs no job of this track: once the flags are on the program branch, mtp-card-ready adds
+   `VLLM_HPU_FLASH_NEXT_DECODE_METADATA=1` to one of its MTP arms and reads the `passN_meta` laps of its
+   `VLLM_HPU_MTP_TIMING=1` (agreed with that track at 20:20 UTC).
 
 ### Card jobs
 
@@ -48,7 +50,7 @@ branch as commit `1aa017aa` **in the second worktree `reports/engine-step/merge-
 |---|---|---|---|
 | 00030, 00031 | first A/B pair, two TP4 + EP4 servers at once | cancelled by engine-step at 18:41:20 and 18:42:56 UTC during the checkpoint load; no numbers (section 2) | nothing |
 | **00093** `hpu-ids-sampler-tiny-flags` (any:1, 14 min, commit `383288c5`), bumped by the coordinator into the single-card wave (expected 20:20 to 21:30 UTC) | `tools/flash_next/engine_step/hpu_sampling_ops.py`: `VERDICT` lines first (arg max and top-k ids narrowed in the same graph, in a second graph, read as int64; the stop-id mask; the block-table gather; the sampled paths), then times of the sampler stage at 1, 8, 16, 32 rows (greedy, vLLM's sampled path and its parts, sampling over 64 candidates), vLLM's `index_put_` mask, the bridge's fallback lines; then the tiny model at TP = 1 card with I01 and I05 on against the CPU reference | waiting | step 3 above; if the tiny model fails with the flags and passes without, I01 or I05 breaks on a card: read `tiny-flags/hc/server0.log` before the A/B runs |
-| **00094** `real4-i01-i05-ab2` (any:4, 36 min, commit `383288c5`, place of 19:07:58 UTC) | one TP4 + EP4 server, `serve_long_probe.sh`: arms base / both / i01 / i05 through the switch file, 32 streams at a short context and over a shared 120,832-token prefix. **To be replaced by the merged tree (step 2): that probe also measures sampled rounds (vLLM's sampler against the candidate region).** | waiting | `card/<id>-*/probe.log`: the `SUMMARY` block (steady ms per token per arm and kind, each arm against base), `TEXTS text1` (must be 1 of 1), `TASK`, `SAME`, `SWITCH` (worker lines above 0), `SEED`, `NOTE` lines; into section 9 and to the coordinator |
+| **00110** `real4-ab3-greedy-sampled-long` (any:4, 36 min, commit `9bf1920f` = the merged tree; replaced 00094 <- 00061, place of 19:07:58 UTC; the queue's worst case has it starting at 03:35 UTC, after the cut-off: the coordinator was asked at 20:21 UTC whether it bumps it) | one TP4 + EP4 server, `serve_long_probe.sh`, flags flipped through the switch file: 32 greedy streams base / both at a short context (twice each, in turn); 32 SAMPLED streams (no temperature) under vLLM's sampler; base / both over a shared 120,832-token prefix; sampled under the candidate region (arm `cand`, twice each in turn) and a seeded request twice; then i01 and i05 alone, min_tokens, and last a seeded request through vLLM's sampler (it may end the server) | waiting | `card/00110-*/probe.log`: the `SUMMARY` block (steady ms per token per arm and kind, each arm against base; `sampled base` against `short base` is what sampling costs today), `TEXTS text1` (must be 1 of 1), `TASK`, `SAME`, `SWITCH` (worker lines above 0), `SEED`, `NOTE` lines; into section 9 and to the coordinator |
 
 After any job: `bin/farm ledger | grep -w engine-step`, then `bin/farm fetch engine-step <id> <id>-<name>` if
 `reports/engine-step/card/` lacks it. The node ends about 04:00 UTC on 2026-11-21 and loses everything; a job not
