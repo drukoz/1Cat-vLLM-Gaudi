@@ -296,6 +296,7 @@ def speculative_server(monkeypatch):
     import vllm_gaudi.platform as platform_module
 
     monkeypatch.setattr(platform_module, "_SPEC_GREEDY_ONLY", False)
+    monkeypatch.setattr(platform_module, "_SPECULATIVE_SERVER", False)
     monkeypatch.setenv("VLLM_COMPACT_GDN", "1")
     return platform_module
 
@@ -326,3 +327,21 @@ def test_a_server_without_speculation_serves_sampled_requests(speculative_server
     config.speculative_config = None
     _validate_flash_next_speculative_config(config)
     speculative_server.HpuPlatform.validate_request(None, _params(1.0))
+
+
+@pytest.mark.parametrize("field,value", [("presence_penalty", 0.5), ("frequency_penalty", 0.2),
+                                         ("repetition_penalty", 1.1), ("allowed_token_ids", [1, 2])])
+def test_penalties_and_token_masks_are_refused_on_a_speculative_server(speculative_server, monkeypatch, field, value):
+    from vllm import SamplingParams
+
+    monkeypatch.setenv("VLLM_HPU_SPEC_SAMPLED_VERIFY", "1")
+    _validate_flash_next_speculative_config(_spec_config())
+    with pytest.raises(ValueError, match=field):
+        speculative_server.HpuPlatform.validate_request(None, SamplingParams(temperature=0.0, **{field: value}))
+    speculative_server.HpuPlatform.validate_request(None, SamplingParams(temperature=0.0))
+
+
+def test_penalties_are_served_without_speculation(speculative_server):
+    from vllm import SamplingParams
+
+    speculative_server.HpuPlatform.validate_request(None, SamplingParams(temperature=0.0, repetition_penalty=1.1))
