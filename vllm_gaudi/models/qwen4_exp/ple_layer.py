@@ -343,8 +343,11 @@ class HpuQwen4ExpPLELayer(Qwen4ExpPLELayer):
 
     def ngram_ids(self, input_ids: torch.Tensor, query_start_loc: torch.Tensor,
                   ngram_context: torch.Tensor) -> torch.Tensor:
-        """The n-gram ids of this call, ``[num_tokens, heads]``, from the arguments ``forward`` gets."""
-        input_ids = input_ids.reshape(-1)
+        """The n-gram ids of this call, ``[num_tokens, heads]``, from ``forward``'s arguments (``input_ids`` flat).
+
+        Exactly the ops ``forward`` dispatched for them before it called this (``test_ple_host_ngram_ids.py`` pins
+        that sequence), so nothing is reshaped here.
+        """
         if ngram_context.dim() == 3:
             # VLLM_HPU_PLE_HOST_NGRAM_IDS=1: the runner computed the ids on the host and they arrive in the
             # ``ngram_context`` slot (see ``_host_ngram_ids``); none of the id computation ops run.
