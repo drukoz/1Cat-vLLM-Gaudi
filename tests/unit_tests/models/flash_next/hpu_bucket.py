@@ -32,6 +32,9 @@ pad state row. The positions come in the runner's two layouts:
   builds ``MRotaryEmbedding`` (:func:`use_mrope_rotary` swaps it in) and the runner sends ``[3, N]`` positions
   with ``-1`` on every padding token, in prompts and in decode steps.
 
+:func:`runner_ple_kwargs` turns a batch's two PLE inputs into what the runner sends for the current value of
+``VLLM_HPU_PLE_HOST_NGRAM_IDS`` (with ``1``: the n-gram ids hashed on the host, as ``ple_ngram_ids``).
+
 Layout of one test sequence (the convention of ``cpu_model.prefill_metadata``): token position ``p`` lives in
 attention slot ``p`` (kernel block ``p // block_size``). The LAST kernel block is the pad block and the LAST
 state row is the pad state row, as on a card (``num_blocks + 1`` rows, ``_PAD_BLOCK_ID`` / ``_MAMBA_PAD_BLOCK_ID``).
@@ -45,6 +48,8 @@ from types import ModuleType, SimpleNamespace
 import torch
 from vllm.model_executor.layers.rotary_embedding import get_rope
 
+from vllm_gaudi import envs as gaudi_envs
+from vllm_gaudi.models.qwen4_exp.ple_ops import HOST_NGRAM_IDS_KWARG, collect_ngram_host_tables, host_ngram_ids
 from vllm_gaudi.models.qwen4_exp.qsa import HpuQwen4ExpQSAAttention
 from vllm_gaudi.models.qwen4_exp.qsa_hpu_attention import HpuQsaSparseAttention
 
@@ -222,6 +227,22 @@ def clamp_rotary_padding(model: torch.nn.Module, monkeypatch) -> None:
             return _kernel(positions.long().clamp_min(0).flatten(), query, key, **kwargs)
 
         monkeypatch.setattr(rotary, "_forward_method", forward)
+
+
+def runner_ple_kwargs(model: torch.nn.Module, input_ids: torch.Tensor, ple: dict) -> dict:
+    """The PLE model inputs of one call as the HPU runner sends them, for either value of the flag.
+
+    ``VLLM_HPU_PLE_HOST_NGRAM_IDS=0`` (default): ``ple`` unchanged (``query_start_loc``, ``ngram_context``). With
+    ``1`` the runner computes the n-gram ids on the host, from the batch's token ids as it holds them (the ``-1``
+    padding of a prompt bucket included), and sends them as ``ple_ngram_ids`` in place of ``ngram_context``
+    (``HPUModelRunner._with_host_ngram_ids`` and ``_ple_forward_kwargs`` in ``hpu_model_runner.py``;
+    ``tests/unit_tests/worker/test_flash_next_host_ngram.py`` runs those two).
+    """
+    if int(gaudi_envs.VLLM_HPU_PLE_HOST_NGRAM_IDS) != 1:
+        return dict(ple)
+    tables = collect_ngram_host_tables(model)
+    ready = host_ngram_ids(tables, input_ids, ple["query_start_loc"], ple["ngram_context"])
+    return {"query_start_loc": ple["query_start_loc"], HOST_NGRAM_IDS_KWARG: ready}
 
 
 def bucket_prefill(token_ids,

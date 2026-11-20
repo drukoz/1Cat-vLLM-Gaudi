@@ -26,6 +26,7 @@ from vllm.model_executor.models.registry import ModelRegistry
 from vllm.sequence import IntermediateTensors
 from vllm_gaudi.models.qwen4_exp.hyperconnection import HpuGatedResidual
 from vllm_gaudi.models.qwen4_exp.mtp import mtp_aux_hidden
+from vllm_gaudi.models.qwen4_exp.ple_ops import HOST_NGRAM_IDS_KWARG
 from vllm_gaudi.models.qwen4_exp.qsa import HpuQwen4ExpQSAAttention
 
 FLASH_NEXT_ARCHS = ("Qwen4ExpForConditionalGeneration", "Qwen4ExpForCausalLM")
@@ -62,6 +63,12 @@ class _MtpTargetOutputs:
         # The runner schedules [-1] for an empty n-gram draft (always rejected); id 0 keeps ids in embedding range.
         if input_ids is not None:
             input_ids = input_ids.clamp(min=0)
+        # VLLM_HPU_PLE_HOST_NGRAM_IDS=1: the runner sends the PLE n-gram ids it computed on the host (int32
+        # [ple_layers, T, heads]). The engine hands ngram_context to every PLE layer unchanged and forwards no other
+        # input, so the ready ids travel in that argument; HpuQwen4ExpPLELayer.forward tells them by their rank.
+        ple_ngram_ids = kwargs.pop(HOST_NGRAM_IDS_KWARG, None)
+        if ple_ngram_ids is not None:
+            kwargs["ngram_context"] = ple_ngram_ids
         hidden = super().forward(input_ids, positions, intermediate_tensors, inputs_embeds, **kwargs)
         if self._hpu_mtp_outputs and isinstance(hidden, torch.Tensor):
             return hidden, [mtp_aux_hidden(hidden, self.get_mtp_target_hidden_states())]

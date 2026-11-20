@@ -4407,6 +4407,98 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             eos_token_id = eos_token_id[0]
         return int(eos_token_id), int(hf_text_config.ngram_size)
 
+    @staticmethod
+    def _ple_token_rows(rows, padded_batch_size: int, num_tokens: int) -> Optional[np.ndarray]:
+        """A prompt bucket's token ids as the model input holds them: int64 ``[padded_batch_size, num_tokens]``.
+
+        ``rows`` are the bucket's token-id lists, one per request (``contents.token_ids``; ``align_and_pad`` may
+        already have padded them in place with ``-1``). Whatever a row does not fill, and every row without a
+        request, is 0: the model clamps the ``-1`` padding to id 0. ``None`` when the rows are not one request
+        per bucket row (merged prefill packs several requests into one row).
+        """
+        if len(rows) > padded_batch_size or any(len(row) > num_tokens for row in rows):
+            return None
+        tokens = np.zeros((padded_batch_size, num_tokens), dtype=np.int64)
+        for index, row in enumerate(rows):
+            tokens[index, :len(row)] = row
+        return tokens
+
+    def _ple_host_ngram_tables(self):
+        """The PLE hash tables for ``host_ngram_ids``, or ``None`` when the ids stay on the device.
+
+        ``VLLM_HPU_PLE_HOST_NGRAM_IDS=1`` moves the n-gram id computation of every Flash-Next forward out of the
+        graph: the runner hashes the batch's token ids on the host. That needs every token id of the batch on
+        the host when the batch is built, which holds for prompt buckets, chunks, decode steps and speculative
+        verification steps alike (the drafts come back through the scheduler) as long as async scheduling is
+        off; under async scheduling a decode step's ids are written on the device from the previous step's
+        samples (``_prepare_input_ids``). The decision is taken once, from the configuration, and logged.
+        """
+        if int(gaudi_envs.VLLM_HPU_PLE_HOST_NGRAM_IDS) != 1:
+            return None
+        resolved = getattr(self, "_ple_host_ngram_resolved", None)
+        if resolved is None:
+            tables = None
+            if self.use_async_scheduling:
+                reason = "async scheduling keeps the sampled token ids on the device"
+            else:
+                from vllm_gaudi.models.qwen4_exp.ple_ops import collect_ngram_host_tables
+                try:
+                    tables = collect_ngram_host_tables(self.model)
+                    reason = None if tables is not None else "the model has no PLE layer with host hash tables"
+                except ValueError as exc:  # PLE layers the ids tensor cannot address
+                    reason = str(exc)
+            if reason is None:
+                logger.info("PLE n-gram ids are computed on the host (VLLM_HPU_PLE_HOST_NGRAM_IDS=1): %d PLE layer(s), "
+                            "%d ids per token", tables.num_layers, tables.ngram_heads)
+            else:
+                logger.warning("VLLM_HPU_PLE_HOST_NGRAM_IDS=1 has no effect: %s; the PLE n-gram ids are computed on "
+                               "the device", reason)
+            resolved = self._ple_host_ngram_resolved = (tables, )
+        return resolved[0]
+
+    def _with_host_ngram_ids(self, ple_inputs, token_ids):
+        """``ple_inputs`` plus the n-gram ids computed on the host, when the flag is on and this batch allows it.
+
+        ``ple_inputs`` is ``(query_start_loc, ngram_context)`` (``build_ple_inputs``) and ``token_ids`` the batch's
+        padded token ids on the CPU, exactly as the model input holds them (a tensor or array of any shape, read
+        row-major; ``-1`` padding included). Returns ``(query_start_loc, ngram_context, ngram_ids)`` with
+        ``ngram_ids`` int32 ``[ple_layers, padded_batch_size * num_tokens, heads]``, a shape fixed by the bucket;
+        ``_ple_forward_kwargs`` sends it as the model input ``ple_ngram_ids``. Returns ``ple_inputs`` unchanged
+        (the device path, for this call only) when the flag is off, when ``_ple_host_ngram_tables`` says so, or
+        when ``token_ids`` is ``None`` or does not hold one id per scheduled position (logged once). Nothing is
+        read from the device.
+        """
+        tables = self._ple_host_ngram_tables()
+        if tables is None:
+            return ple_inputs
+        query_start_loc, ngram_context = ple_inputs[0], ple_inputs[1]
+        num_ids = -1 if token_ids is None else int(np.prod(tuple(token_ids.shape)))
+        if num_ids != int(query_start_loc[-1]):
+            if not getattr(self, "_ple_host_ngram_layout_logged", False):
+                self._ple_host_ngram_layout_logged = True
+                logger.warning("VLLM_HPU_PLE_HOST_NGRAM_IDS=1: a batch whose token ids are not one padded row per "
+                               "request (merged prefill) computes its PLE n-gram ids on the device")
+            return ple_inputs
+        from vllm_gaudi.models.qwen4_exp.ple_ops import host_ngram_ids
+        return query_start_loc, ngram_context, host_ngram_ids(tables, token_ids, query_start_loc, ngram_context)
+
+    @staticmethod
+    def _ple_forward_kwargs(ple_inputs, device) -> dict:
+        """The Flash-Next PLE model inputs of one forward (models with ``requires_raw_input_tokens``).
+
+        ``(query_start_loc, ngram_context)`` goes out under those two names. With the host n-gram ids as a third
+        element (``_with_host_ngram_ids``) the ids go out as ``ple_ngram_ids`` and the context is not sent: the
+        model puts the ids where the PLE layers expect the context (``_MtpTargetOutputs.forward``). All are int32
+        tensors, hashed by their metadata, with one shape per bucket.
+        """
+        kwargs = {"query_start_loc": async_h2d_copy(ple_inputs[0], dtype=torch.int32, device=device)}
+        if len(ple_inputs) > 2:
+            from vllm_gaudi.models.qwen4_exp.ple_ops import HOST_NGRAM_IDS_KWARG
+            kwargs[HOST_NGRAM_IDS_KWARG] = async_h2d_copy(ple_inputs[2], dtype=torch.int32, device=device)
+        else:
+            kwargs["ngram_context"] = async_h2d_copy(ple_inputs[1], dtype=torch.int32, device=device)
+        return kwargs
+
     def _form_prefill_batch(self, contents):
         if len(contents.req_ids) == 0:
             return PrefillInputData()
@@ -4765,6 +4857,10 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                     eos_token_id,
                     ngram_size,
                 )
+            if self._ple_host_ngram_tables() is not None:
+                # VLLM_HPU_PLE_HOST_NGRAM_IDS=1: hash the bucket's token ids here instead of in the graph.
+                ple_inputs = self._with_host_ngram_ids(
+                    ple_inputs, self._ple_token_rows(contents.token_ids, target_bs, target_seq))
         return PrefillInputData(request_ids=[req_ids],
                                 prompt_lens=[query_lens],
                                 token_ids=[token_ids],
@@ -5290,6 +5386,9 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                 eos_token_id,
                 ngram_size,
             )
+            # VLLM_HPU_PLE_HOST_NGRAM_IDS=1: token_ids is the CPU copy of the step's input ids ([padded_batch_size *
+            # num_tokens] row-major), speculative drafts included; hash it here instead of in the graph.
+            ple_inputs = self._with_host_ngram_ids(ple_inputs, token_ids)
 
         return DecodeInputData(num_decodes=num_decodes,
                                token_ids=token_ids_device,
@@ -5590,8 +5689,7 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             additional_kwargs.update({"model_has_chunked_attention": True})
         if ple_inputs is not None:
             # Flash-Next PLE layer kwargs (models with requires_raw_input_tokens).
-            additional_kwargs["query_start_loc"] = async_h2d_copy(ple_inputs[0], dtype=torch.int32, device=self.device)
-            additional_kwargs["ngram_context"] = async_h2d_copy(ple_inputs[1], dtype=torch.int32, device=self.device)
+            additional_kwargs.update(self._ple_forward_kwargs(ple_inputs, self.device))
         trimmed_attn_metadata = attn_metadata if framework_attn_metadata else trim_attn_metadata(attn_metadata)
         if self.is_driver_worker:
             model_event_name = ("model_forward_"
@@ -6671,6 +6769,10 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                 dummy_ple = dummy_ple_inputs(dummy_decode_input_data_across_dp.token_ids.size(0),
                                              dummy_decode_input_data_across_dp.token_ids.size(1), eos_token_id,
                                              ngram_size)
+                # A dummy batch's outputs are discarded: with VLLM_HPU_PLE_HOST_NGRAM_IDS=1 it carries the ids of
+                # an all-zero batch, so its graph inputs have the shapes of a real decode batch.
+                dummy_ple = self._with_host_ngram_ids(
+                    dummy_ple, np.zeros(tuple(dummy_decode_input_data_across_dp.token_ids.shape), dtype=np.int64))
             _, _, _, dummy_logits_device, _ = self._execute_model_generic(
                 dummy_decode_input_data_across_dp.token_ids,
                 dummy_decode_input_data_across_dp.position_ids,

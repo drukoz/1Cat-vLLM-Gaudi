@@ -19,6 +19,11 @@ exactly the way the fork's GDN layer reads its SSM state. Under MTP
 speculative decode (M3) it also runs verification and transition steps from
 the state lattice, rolling the conv history back by ``num_accepted_tokens``
 and storing ``history + candidates`` the way the fork's GDN conv update does.
+
+With ``VLLM_HPU_PLE_HOST_NGRAM_IDS=1`` the runner computes the n-gram ids on the
+host (``ple_ops.host_ngram_ids``) and the layer receives them ready, in the
+``ngram_context`` argument (``HpuQwen4ExpPLELayer._host_ngram_ids``): the id
+computation of ``compute_ngram_ids`` then does not run in the graph.
 """
 
 import torch
@@ -277,9 +282,14 @@ class HpuQwen4ExpPLELayer(Qwen4ExpPLELayer):
                 f"token length, got {input_ids.shape[0]} and "
                 f"{hidden_states.shape[0]}"
             )
-        # The custom op's torch branch returns the ids and never fills the
-        # preallocated buffer, so call the pure-torch path and use its return.
-        ngram_ids = self.ple_embedding.compute_ngram_ids(input_ids, query_start_loc, ngram_context)
+        if ngram_context.dim() == 3:
+            # VLLM_HPU_PLE_HOST_NGRAM_IDS=1: the runner computed the ids on the host and they arrive in the
+            # ``ngram_context`` slot (see ``_host_ngram_ids``); none of the id computation ops run.
+            ngram_ids = self._host_ngram_ids(ngram_context, input_ids.shape[0])
+        else:
+            # The custom op's torch branch returns the ids and never fills the
+            # preallocated buffer, so call the pure-torch path and use its return.
+            ngram_ids = self.ple_embedding.compute_ngram_ids(input_ids, query_start_loc, ngram_context)
         embeddings = self.ple_embedding.ngram_embedding(ngram_ids).flatten(-2)
         embeddings = self._dequantize_embeddings(embeddings, hidden_states.dtype)
         kv, _ = self.kv_proj(embeddings)
@@ -295,6 +305,23 @@ class HpuQwen4ExpPLELayer(Qwen4ExpPLELayer):
         )
         out = self._hpu_short_conv(gated, normed)
         return out.view(orig_shape)
+
+    def _host_ngram_ids(self, ready_ids: torch.Tensor, num_tokens: int) -> torch.Tensor:
+        """This layer's row of the n-gram ids the runner computed on the host: ``[num_tokens, heads]``.
+
+        ``ready_ids`` is ``ple_ops.host_ngram_ids``'s int32 ``[ple_layers, num_tokens, heads]`` (row ``i`` belongs
+        to the layer with ``ple_dense_layer_id == i``), sent as the model input ``ple_ngram_ids``. The engine
+        hands exactly one per-batch tensor to every PLE layer unchanged, ``ngram_context``, so
+        ``_MtpTargetOutputs.forward`` puts the ready ids in that argument and ``forward`` tells them from a
+        context (``[num_reqs, ngram_size - 1]``) by their rank: a shape, so the choice is part of the graph's
+        input hash and nothing is read from the device. The shape must fit this call exactly; a wrong one is an
+        error, never a silently wrong embedding row. ``.long()`` keeps the lookup's input as the device path's.
+        """
+        expected = (num_tokens, self.ple_embedding.ngram_heads)
+        if ready_ids.shape[0] <= self.ple_dense_layer_id or tuple(ready_ids.shape[1:]) != expected:
+            raise ValueError(f"host n-gram ids must be [ple_layers > {self.ple_dense_layer_id}, {expected[0]}, "
+                             f"{expected[1]}] for this PLE call, got {tuple(ready_ids.shape)}")
+        return ready_ids[self.ple_dense_layer_id].long()
 
     def _state_indices(self, md: object, name: str) -> torch.Tensor | None:
         """Resolve one ``[num_groups, bs(, 1)]`` state-index tensor for this layer's group."""

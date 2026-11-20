@@ -16,6 +16,9 @@ HPU without them:
 - int32-only n-gram hash (RUK-3116): ``ple_ngram_ids_int32`` reproduces the engine's int64 n-gram hash
   (``vllm/models/qwen4_exp/nvidia/ple_layer.py:426-440``) with 5-bit limb arithmetic on int32 tensors only, so it runs
   on the Gaudi lazy bridge, which narrows every int64 device tensor to int32.
+- n-gram ids on the host (``VLLM_HPU_PLE_HOST_NGRAM_IDS=1``): ``host_ngram_ids`` computes the same ids in numpy
+  from the batch's token ids where the runner builds the batch, for every PLE layer at once
+  (``collect_ngram_host_tables``), so the id computation leaves the HPU graphs.
 
 Every tensor is 2-D and token-major (``[T, ...]``): callers flatten the batch. The math is done in fp32 and the
 outputs are cast back to the input dtype.
@@ -23,7 +26,9 @@ outputs are cast back to the input dtype.
 
 import math
 from collections.abc import Sequence
+from dataclasses import dataclass
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 
@@ -312,3 +317,142 @@ def ple_ngram_ids_int32(tokens: Sequence[torch.Tensor], multiplier_limbs: torch.
         ids = torch.remainder(terms.sum(-1, dtype=torch.int32), size[None, :])
         blocks.append(ids + head_offsets[start:end][None, :])
     return torch.cat(blocks, dim=-1)
+
+
+# The model input that carries the host-computed n-gram ids (VLLM_HPU_PLE_HOST_NGRAM_IDS=1): the runner sends it,
+# ``_MtpTargetOutputs.forward`` hands it to the PLE layers.
+HOST_NGRAM_IDS_KWARG = "ple_ngram_ids"
+
+
+@dataclass(frozen=True)
+class NgramHostTables:
+    """The n-gram hash tables of every PLE layer of one model, on the host, for :func:`host_ngram_ids`.
+
+    Row ``i`` of the three int64 arrays is the PLE layer with ``ple_dense_layer_id == i``: ``multipliers``
+    ``[layers, ngram_size]``, ``sizes`` and ``offsets`` ``[layers, (ngram_size - 1) * heads_per_ngram]``, the heads
+    ordered as in the engine (bigram heads first). The values are the ones ``HpuQwen4ExpNGramEmbedding`` checked
+    with :func:`check_ngram_hash_bounds` and mirrors into its int32 limb buffers.
+    """
+
+    eos_token_id: int
+    heads_per_ngram: int
+    multipliers: np.ndarray
+    sizes: np.ndarray
+    offsets: np.ndarray
+
+    @property
+    def num_layers(self) -> int:
+        return int(self.multipliers.shape[0])
+
+    @property
+    def ngram_size(self) -> int:
+        return int(self.multipliers.shape[1])
+
+    @property
+    def ngram_heads(self) -> int:
+        return int(self.sizes.shape[1])
+
+
+def collect_ngram_host_tables(model: torch.nn.Module) -> NgramHostTables | None:
+    """The host hash tables of the PLE layers under ``model``, or ``None`` when it has none.
+
+    A PLE layer is a module with a ``ple_dense_layer_id`` and a ``ple_embedding`` that keeps its tables on the host
+    (``hash_multipliers``, ``hash_head_sizes``, ``hash_head_offsets``: ``HpuQwen4ExpNGramEmbedding``). Call it
+    after the weights are loaded: a checkpoint replaces the seed's tables. Raises ``ValueError`` when the dense
+    ids are not ``0 .. layers - 1`` or the layers disagree on the n-gram geometry or the EOS id.
+    """
+    layers = {}
+    for module in model.modules():
+        embedding = getattr(module, "ple_embedding", None)
+        if embedding is None or not hasattr(module, "ple_dense_layer_id") or not hasattr(embedding, "hash_multipliers"):
+            continue
+        dense_id = int(module.ple_dense_layer_id)
+        if dense_id in layers:
+            raise ValueError(f"two PLE layers share ple_dense_layer_id {dense_id}")
+        layers[dense_id] = embedding
+    if not layers:
+        return None
+    if sorted(layers) != list(range(len(layers))):
+        raise ValueError(f"PLE dense layer ids {sorted(layers)} are not 0..{len(layers) - 1}")
+    ordered = [layers[index] for index in range(len(layers))]
+    geometry = {(int(e.eos_token_id), int(e.ngram_size), int(e.heads_per_ngram)) for e in ordered}
+    if len(geometry) != 1:
+        raise ValueError(f"PLE layers disagree on (eos_token_id, ngram_size, heads_per_ngram): {sorted(geometry)}")
+    eos_token_id, _, heads_per_ngram = next(iter(geometry))
+    return NgramHostTables(
+        eos_token_id=eos_token_id,
+        heads_per_ngram=heads_per_ngram,
+        multipliers=np.array([e.hash_multipliers for e in ordered], dtype=np.int64),
+        sizes=np.array([e.hash_head_sizes for e in ordered], dtype=np.int64),
+        offsets=np.array([e.hash_head_offsets for e in ordered], dtype=np.int64),
+    )
+
+
+def _host_int64(values: torch.Tensor | np.ndarray) -> np.ndarray:
+    if isinstance(values, torch.Tensor):
+        values = values.detach().cpu().numpy()
+    return np.asarray(values).astype(np.int64, copy=False)
+
+
+def host_ngram_ids(tables: NgramHostTables, input_ids: torch.Tensor | np.ndarray,
+                   query_start_loc: torch.Tensor | np.ndarray,
+                   ngram_context: torch.Tensor | np.ndarray) -> torch.Tensor:
+    """The PLE n-gram ids of one model call, computed on the host: int32 ``[layers, num_tokens, heads]``.
+
+    Takes what ``HpuQwen4ExpNGramEmbedding.compute_ngram_ids`` takes, as CPU tensors or arrays: ``input_ids`` (any
+    shape, read row-major as the flat ``[num_tokens]`` batch), ``query_start_loc`` ``[num_reqs + 1]`` (starts at 0,
+    non-decreasing) and ``ngram_context`` ``[>= num_reqs, ngram_size - 1]``. Row ``i`` of the result equals the ids
+    PLE layer ``i`` computes on the device, and the engine's int64 hash, for every token:
+
+    - the request of a token and its column come from ``query_start_loc`` exactly as the engine's ``searchsorted``
+      gives them (tokens past the last start continue the last request);
+    - the token ``k`` back is the row's own token when the column is at least ``k``, else ``ngram_context``;
+      it is replaced by EOS when any of the ``k`` tokens before the current one is EOS (the engine's
+      ``_shift_precompute`` / ``_shift_apply`` cut);
+    - the hash is the engine's: the int64 products ``token * multiplier`` XORed cumulatively, each n-gram order
+      reduced modulo its heads' sizes plus their offsets. numpy int64 multiplies wrap as torch's do, and for ids
+      below the vocabulary size nothing wraps (``check_ngram_hash_bounds``), which is where the device's int32 limb
+      arithmetic is exact too.
+
+    Ids below 0 are hashed as id 0: the runner pads a prompt bucket with ``-1`` and schedules ``-1`` for an empty
+    draft, and the model forward clamps both to 0 before the PLE layer sees them. Vectorised over the tokens (no
+    Python loop over tokens or requests); pure numpy, so it runs where the batch is built.
+    """
+    tokens = np.maximum(_host_int64(input_ids).reshape(-1), 0)
+    starts = _host_int64(query_start_loc).reshape(-1)
+    context = _host_int64(ngram_context)
+    num_reqs = starts.size - 1
+    width = tables.ngram_size - 1
+    if num_reqs < 1 or context.ndim != 2 or context.shape[0] < num_reqs or context.shape[1] != width:
+        raise ValueError(f"host n-gram ids need query_start_loc [num_reqs + 1] and ngram_context [>= num_reqs, "
+                         f"{width}], got {starts.shape} and {context.shape}")
+    if starts[0] != 0 or bool((starts[1:] < starts[:-1]).any()):
+        raise ValueError(f"host n-gram ids need a query_start_loc that starts at 0 and never decreases, got "
+                         f"{starts.tolist()}")
+
+    num_tokens = tokens.size
+    positions = np.arange(num_tokens, dtype=np.int64)
+    requests = np.minimum(np.searchsorted(starts, positions, side="right") - 1, num_reqs - 1)
+    columns = positions - starts[requests]
+    eos = tables.eos_token_id
+
+    shifted = [tokens]
+    cut = np.zeros(num_tokens, dtype=bool)
+    for back in range(1, width + 1):
+        in_row = columns >= back
+        previous = np.where(in_row, tokens[np.maximum(positions - back, 0)],
+                            context[requests, np.clip(columns + width - back, 0, width - 1)])
+        cut = cut | (previous == eos)
+        shifted.append(np.where(cut, eos, previous))
+
+    per_ngram = tables.heads_per_ngram
+    ids = np.empty((tables.num_layers, num_tokens, tables.ngram_heads), dtype=np.int32)
+    for layer in range(tables.num_layers):
+        multipliers = tables.multipliers[layer]
+        mixed = shifted[0] * multipliers[0]
+        for index in range(1, tables.ngram_size):
+            mixed = mixed ^ (shifted[index] * multipliers[index])
+            heads = slice((index - 1) * per_ngram, index * per_ngram)
+            reduced = np.remainder(mixed[:, None], tables.sizes[layer, heads])
+            ids[layer, :, heads] = reduced + tables.offsets[layer, heads]
+    return torch.from_numpy(ids)
