@@ -166,9 +166,10 @@ plan_q() {
 # The timer rounds of one server. Mode 4 (dispatched ops) is not among them: in job 00013 its 23rd one-stream step
 # never returned (sample_tokens RPC timeout after 300 s, the engine died) and took the rest of the job along.
 # One :min round only: on HPU the min_tokens mask never runs (engine-step, hpu_input_batch.py:554-562), the round
-# confirms it. The rounds tagged perf are for a sampler on the node (perf record of the workers); mode 3 on a
-# replayed graph splits the wait into the forward's device time and the sampler's.
-S_PHASES="warm:1,8,32:128;1:1,8,32:128;1:32:128:min;1:32,8,1:128:tag=perf;3:32,8,1:64;2:32:24"
+# confirms it. The rounds tagged perf and strace are for a sampler on the node (perf record of the workers, the
+# system calls of the rank-0 worker: reports/step-anatomy/perf/watch.sh); mode 3 on a replayed graph splits the wait
+# into the forward's device time and the sampler's.
+S_PHASES="warm:1,8,32:128;1:1,8,32:128;1:32:128:min;1:32,8,1:128:tag=perf;1:1:128:tag=strace;3:32,8,1:64;2:32:24"
 # Decode at longer contexts (target-model prediction 1): 8 streams with about 4,000- and 16,000-token prompts; the
 # warm round fills the prefix cache, so the measured round decodes almost at once.
 C_PHASES="warm:8:64:ctx=4000;1:8:64:ctx=4000;warm:8:64:ctx=16000;1:8:64:ctx=16000"

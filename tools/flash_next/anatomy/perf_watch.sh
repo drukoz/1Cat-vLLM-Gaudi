@@ -1,0 +1,89 @@
+#!/bin/bash
+# SPDX-License-Identifier: Apache-2.0
+#
+# perf_watch.sh JOB_ID: on the rented node, sample the vLLM workers of a farm job with perf while its probe runs
+# the rounds tagged "perf" (anatomy_probe.py prints "round start phase 1 N=<n> ... tag=perf" before each round),
+# and count the system calls of the rank-0 worker during the rounds tagged "strace". It only reads the job: perf
+# and strace attach to the job's own worker processes from the host (the container has no privilege for either);
+# everything it writes is under ~/farm/<track>/. Start it before the job starts; it waits for the job:
+#
+#   nohup ~/farm/step-anatomy/perf/watch.sh 00069 > /dev/null 2>&1 &
+#
+# perf is not installed on the node: unpack it once into ~/farm/<track>/perf/root with
+#   cd ~/farm/<track>/perf && apt-get download linux-tools-$(uname -r) linux-tools-$(uname -r | sed 's/-generic//') \
+#       && for d in *.deb; do dpkg -x "$d" root; done
+# Output: ~/farm/<track>/results/perf-<JOB_ID>/<server>-N<n>.{data,dso.txt,sym.txt,tid.txt,calls.txt} and
+# <server>-N<n>-strace.{count.txt,calls.txt}; fetch with `farm fetch <track> <JOB_ID> perf-<JOB_ID>`.
+JOB="$1"
+T=$HOME/farm/${WATCH_TRACK:-step-anatomy}
+P=$(ls "$T"/perf/root/usr/lib/linux-tools-*/perf 2>/dev/null | head -n 1)
+BD=$T/perf/buildid
+OUT=$T/results/perf-$JOB
+JD=${WATCH_JD:-$HOME/farm/q/jobs/$JOB}  # WATCH_JD: a stand-in job folder (a test of this script)
+mkdir -p "$OUT" "$BD"
+log() { echo "$(date -u +%H:%M:%S) $*" >> "$OUT/watch.log"; }
+log "watching job $JOB"
+# wait until the job runs (at most 6 h), then until its results folder exists
+for _ in $(seq 1 4320); do
+    st=$(cat "$JD/state" 2>/dev/null)
+    [ "$st" = running ] && break
+    [ "$st" = ended ] && { log "job ended before it ran"; exit 0; }
+    sleep 5
+done
+RUN=$(ls -d "$T"/results/"$JOB"-* 2>/dev/null | head -n 1)
+for _ in $(seq 1 120); do [ -n "$RUN" ] && break; sleep 2; RUN=$(ls -d "$T"/results/"$JOB"-* 2>/dev/null | head -n 1); done
+log "run folder: $RUN"
+reports() {  # reports FILE LABEL: the text reports, while the container (and so its binaries) still exists
+    local f="$1"
+    sudo -n "$P" --buildid-dir "$BD" report -i "$f.data" --stdio --no-children -g none --sort pid,dso --percent-limit 0.2 2>/dev/null | grep -v "^$" | head -n 150 > "$f.dso.txt"
+    sudo -n "$P" --buildid-dir "$BD" report -i "$f.data" --stdio --no-children -g none --sort dso,sym --percent-limit 0.15 2>/dev/null | grep -v "^$" | head -n 220 > "$f.sym.txt"
+    sudo -n "$P" --buildid-dir "$BD" report -i "$f.data" --stdio --no-children -g none --sort pid,tid,dso --percent-limit 0.3 2>/dev/null | grep -v "^$" | head -n 200 > "$f.tid.txt"
+    sudo -n "$P" --buildid-dir "$BD" report -i "$f.data" --stdio --children -g caller,0.5,callee --sort sym --percent-limit 2 2>/dev/null | grep -v "^$" | head -n 400 > "$f.calls.txt"
+    sudo -n chown -R "$(id -un):" "$OUT" 2>/dev/null
+    log "$2: reports written ($(wc -l < "$f.sym.txt") symbol lines)"
+}
+sample() {  # sample SERVER N: perf record of every worker of the job's container
+    local server="$1" n="$2" delay dur pids f
+    case "$n" in 1) delay=0.9; dur=3 ;; 8) delay=1.6; dur=3.5 ;; *) delay=3.8; dur=5 ;; esac
+    sleep "$delay"
+    pids=$(sudo -n docker top "farm-$JOB" -eo pid,args 2>/dev/null | awk '/VLLM::Worker/ {print $1}' | paste -sd, -)
+    [ -n "$pids" ] || { log "$server N=$n: no worker processes"; return; }
+    f="$OUT/$server-N$n"
+    log "$server N=$n: perf record $dur s of pids $pids"
+    sudo -n "$P" --buildid-dir "$BD" record -F 999 -g -p "$pids" -o "$f.data" -- sleep "$dur" > "$f.record.log" 2>&1
+    sudo -n docker top "farm-$JOB" -eo pid,tid,pcpu,comm,args 2>/dev/null | cut -c1-150 > "$f.procs.txt"
+    reports "$f" "$server N=$n" &
+}
+trace_calls() {  # trace_calls SERVER N: system calls of the rank-0 worker (strace slows it: its own tagged round)
+    local server="$1" n="$2" pid f
+    sleep 0.9
+    pid=$(sudo -n docker top "farm-$JOB" -eo pid,args 2>/dev/null | awk '/VLLM::Worker_TP0/ {print $1; exit}')
+    [ -n "$pid" ] || { log "$server N=$n: no rank-0 worker"; return; }
+    f="$OUT/$server-N$n-strace"
+    log "$server N=$n: strace of pid $pid"
+    sudo -n timeout 2.5 strace -f -c -p "$pid" -o "$f.count.txt" > /dev/null 2>&1
+    sudo -n timeout 0.4 strace -f -tt -T -p "$pid" -o "$f.calls.txt" > /dev/null 2>&1
+    sudo -n chown -R "$(id -un):" "$OUT" 2>/dev/null
+    log "$server N=$n: strace written ($(wc -l < "$f.calls.txt" 2>/dev/null) call lines)"
+}
+SEEN="$OUT/seen.txt"; : > "$SEEN"
+while :; do
+    st=$(cat "$JD/state" 2>/dev/null)
+    for plog in "$RUN"/*/probe.log; do
+        [ -f "$plog" ] || continue
+        server=$(basename "$(dirname "$plog")")
+        # every "round start ... tag=perf" line not handled yet (line number as its key)
+        grep -n "^round start phase .* tag=\(perf\|strace\)" "$plog" 2>/dev/null | while IFS= read -r hit; do
+            key="$server:${hit%%:*}"
+            grep -qxF "$key" "$SEEN" && continue
+            echo "$key" >> "$SEEN"
+            n=$(echo "$hit" | sed -n 's/.* N=\([0-9]*\) .*/\1/p')
+            case "$hit" in *tag=strace*) trace_calls "$server" "$n" ;; *) sample "$server" "$n" ;; esac
+        done
+    done
+    [ "$st" = running ] || break
+    sleep 0.3
+done
+wait
+sudo -n chown -R "$(id -un):" "$OUT" 2>/dev/null
+log "job state $st: done"
