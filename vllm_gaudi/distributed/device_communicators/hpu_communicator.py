@@ -11,6 +11,7 @@ from vllm.distributed.parallel_state import GroupCoordinator, get_dp_group, get_
 
 import habana_frameworks.torch as htorch  # noqa: F401
 
+from vllm_gaudi.extension import step_timing
 from vllm_gaudi.v1.worker.hpu_dp_utils import get_hpu_dp_metadata
 
 
@@ -50,9 +51,15 @@ class HpuCommunicator(DeviceCommunicatorBase):
         # occurring when PT_HPU_ENABLE_LAZY_COLLECTIVES=true env var is used
         # (which is required for tensor parallel HPUGraph inference)
         # VLLM_HPU_COLLECTIVE_MARK_STEP=0 leaves it out, to measure the step without the graph cut.
+        step_timer = step_timing.TIMER  # VLLM_HPU_STEP_TIMING: None when the flag is 0
+        timed = step_timer is not None and step_timer.active
+        if timed:
+            token = step_timer.collective_begin()
         if gaudi_envs.VLLM_HPU_COLLECTIVE_MARK_STEP:
             htorch.core.mark_step()
         dist.all_reduce(input_, group=self.device_group)
+        if timed:
+            step_timer.collective_end(token, "all_reduce", input_)
         return input_
 
     def all_gather(self, input_: torch.Tensor, dim: int = -1) -> torch.Tensor:
@@ -69,6 +76,10 @@ class HpuCommunicator(DeviceCommunicatorBase):
         output_tensor = torch.empty(output_size, dtype=input_.dtype, device=input_.device)
         # All-gather.
         from vllm_gaudi import envs as gaudi_envs
+        step_timer = step_timing.TIMER  # VLLM_HPU_STEP_TIMING: None when the flag is 0
+        timed = step_timer is not None and step_timer.active
+        if timed:
+            token = step_timer.collective_begin()
         if gaudi_envs.VLLM_HPU_COLLECTIVE_MARK_STEP:
             htorch.core.mark_step()
         dist.all_gather_into_tensor(output_tensor, input_, group=self.device_group)
@@ -77,6 +88,8 @@ class HpuCommunicator(DeviceCommunicatorBase):
         output_tensor = output_tensor.movedim(0, dim)
         output_tensor = output_tensor.reshape(input_size[:dim] + (world_size * input_size[dim], ) +
                                               input_size[dim + 1:])
+        if timed:
+            step_timer.collective_end(token, "all_gather", output_tensor)
         return output_tensor
 
     def dispatch(
