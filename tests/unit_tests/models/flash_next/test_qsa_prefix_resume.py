@@ -191,3 +191,44 @@ def test_resumed_request_in_other_blocks(prefix, suffix, mode):
         row_b = _phys_slot(g * RATIO, prefix) // RATIO
         assert torch.equal(resumed.compressed_key_cache[row_b].view(torch.int16),
                            full.compressed_key_cache[g].view(torch.int16)), f"block {g} (row {row_b})"
+
+
+@pytest.mark.parametrize("mode", [QsaFusedMode.OFF, QsaFusedMode.TORCH], ids=["mode0", "mode1"])
+@pytest.mark.parametrize("prefix,suffix", [(896, 203), (512, 202)], ids=["P896+203", "P512+202"])
+def test_resumed_prefix_then_mtp_verification_steps(prefix, suffix, mode):
+    """MTP k = 3: the ring of 8 rows, and verification steps of 4 rows right after the resumed prefill."""
+    k, ring_rows, steps = 3, 8, 3
+    total = prefix + suffix
+    seed = 3000 + total
+    gen = torch.Generator().manual_seed(seed + 2)
+    n = total + steps * (k + 1)
+    hidden = torch.randn(n, 128, generator=gen).to(torch.bfloat16)
+    positions = torch.arange(n, dtype=torch.int64)
+    table = rope_table(MAX_MODEL_LEN).to(torch.bfloat16)
+    csa = lambda p: table[p.clamp_min(0)].chunk(2, dim=-1)  # noqa: E731
+
+    def indexer():
+        idx = build_indexer(seed, torch.bfloat16)
+        idx.block_topk = TOPK_BLOCKS
+        idx.output_width = TOPK_BLOCKS * RATIO + RATIO - 1
+        bind_random_caches(idx, ring_rows, torch.Generator().manual_seed(seed + 1), torch.bfloat16)
+        idx.fused_mode = mode
+        return idx
+
+    full, resumed = indexer(), indexer()
+    with torch.no_grad():
+        sel_full = full.select(hidden[:total], positions[:total], csa, prefill_metadata(total, SLOT_FULL))
+        resumed.select(hidden[:prefix], positions[:prefix], csa, prefill_metadata(prefix, SLOT_A))
+        md_b = prefill_metadata(total - prefix, load_slot=SLOT_STALE, store_slot=SLOT_B, has_initial_state=True,
+                                context_len=prefix, block_size=BLOCK)
+        sel_b = resumed.select(hidden[prefix:total], positions[prefix:total], csa, md_b)
+        assert torch.equal(sel_b, sel_full[prefix:total])
+        for s in range(steps):
+            p = total + s * (k + 1)
+            h, pos = hidden[p:p + k + 1], positions[p:p + k + 1]
+            a = full.select(h, pos, csa, decode_metadata(SLOT_FULL, p, BLOCK, MB, num_tokens=k + 1))
+            b = resumed.select(h, pos, csa, decode_metadata(SLOT_B, p, BLOCK, MB, num_tokens=k + 1))
+            assert torch.equal(a, b), f"verification step {s}"
+    rows = n // RATIO
+    assert torch.equal(resumed.compressed_key_cache[:rows].view(torch.int16),
+                       full.compressed_key_cache[:rows].view(torch.int16))
