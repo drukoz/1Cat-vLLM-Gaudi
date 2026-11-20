@@ -1,10 +1,13 @@
 # One arm of a prefill A/B. Every arm sends the same prompts (the nonces) and keeps 8 greedy tokens per request.
+# The 32,768-token lines come first: a 2,048-token chunk at 120K context needs about 3.3 GB of attention scores
+# per QSA layer at TP4 (6 heads x 2,048 x 133K, bf16), close to the memory left there, so a server that dies
+# in c120k has already given its 32K numbers.
 # c32k, c120k: a cold prompt twice (pass 1 compiles the buckets it meets, pass 2 is the warm number). c120k then
 # sends its second prompt again with 64, 512 and 2,048 new tokens, twice (a next turn: a prefix hit and a short
 # prefill at 120K context; the first round compiles those buckets, the second is the warm number).
 c32k --plan baseline --cold-tokens 32768 --repeat 2 --warm-tokens "" --concurrent "" --turn2-tokens 0 --shared-prefix 0 --canaries 0 --case-max-tokens 8 --return-ids --nonce arm-32k
-c120k --plan baseline --cold-tokens 122880 --repeat 2 --warm-tokens 64,512,2048,64,512,2048 --concurrent "" --turn2-tokens 0 --shared-prefix 0 --canaries 0 --case-max-tokens 8 --return-ids --nonce arm-120k
 # streams: 4 streams decode while one 32,768-token prompt, then four 16,384-token prompts at once, are prefilled.
 streams --plan baseline --cold-tokens 32768 --repeat 1 --warm-tokens "" --concurrent 4 --concurrent-tokens 16384 --turn2-tokens 0 --shared-prefix 0 --canaries 4 --nonce arm-streams
 # multi: four 32,768-token prompts at once, nothing decoding.
 multi --plan baseline --cold-tokens "" --concurrent 4 --concurrent-tokens 32768 --turn2-tokens 0 --shared-prefix 0 --canaries 0 --case-max-tokens 8 --return-ids --nonce arm-multi
+c120k --plan baseline --cold-tokens 122880 --repeat 2 --warm-tokens 64,512,2048,64,512,2048 --concurrent "" --turn2-tokens 0 --shared-prefix 0 --canaries 0 --case-max-tokens 8 --return-ids --nonce arm-120k

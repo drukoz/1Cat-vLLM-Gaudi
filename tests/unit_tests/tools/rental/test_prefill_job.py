@@ -161,4 +161,4 @@ def test_the_committed_plans_parse_and_never_repeat_a_cold_prompt():
         assert len(set(names)) == len(names), plan.name
         # the nonce salts a line's prompts: two lines with one nonce would send the same "cold" prompt twice
         assert len(set(nonces)) == len(nonces) and None not in nonces, plan.name
-        assert names[:4] == ["c32k", "c120k", "streams", "multi"], plan.name  # every arm starts with the same lines
+        assert names[:4] == ["c32k", "streams", "multi", "c120k"], plan.name  # every arm starts with the same lines
