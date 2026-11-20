@@ -95,10 +95,15 @@ def _hc_combine_norm_fake(residual, block_output, injection, norm_weight, eps, h
 def _owned(x: torch.Tensor) -> torch.Tensor:
     """``x`` as a contiguous tensor that is not a view.
 
-    The Habana lazy bridge cannot hand a view to a custom op: the first servers that called custom ops
-    on views died with "ValidateSyncInputTensors tensor_data is empty ... Strided Params Has Value: 1"
-    (rental 2026-11-20). The activations a layer passes are often views (a reshape of the block output,
-    the model's first hidden state), so each one is copied; the weights are parameters and are not.
+    The first servers that called custom ops on views died with "ValidateSyncInputTensors tensor_data is
+    empty ... Strided Params Has Value: 1" (rental 2026-11-20), and the activations a layer passes are often
+    views (a reshape of the block output, the model's first hidden state), so each one is copied; the weights
+    are parameters and are not.
+
+    Whether the bridge really cannot hand a view to a custom op is not known. Those servers ran with the
+    bridge's accumulation thread on, where an op called behind queued ops fails with the same error whatever
+    its inputs are (``flashinfer_gaudi._native.lazy_accumulation_reason``), and the copy did not cure that. No
+    view has been tried with the thread off. Until one has, on a card, the copy stays: one per activation.
     """
     return x.clone(memory_format=torch.contiguous_format)
 
