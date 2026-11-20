@@ -467,6 +467,7 @@ if TYPE_CHECKING:
     VLLM_GDN_FUSED_STATE_MATMUL: bool = False
     VLLM_GDN_DEFERRED_OUTPUT_ADD: bool = False
     VLLM_GDN_RECURSIVE_SOLVER_BASE: int = 0
+    VLLM_GDN_RECURSIVE_SOLVER_REFINE: int = 0  # Newton steps after the recursive inverse; 0 none (default)
     VLLM_GDN_COMPACT_REPEATED_KKT: bool = False
     VLLM_GDN_COMPACT_REPEATED_LOCAL_ATTN: bool = False
     VLLM_GDN_COMPILED_QK_L2NORM: bool = False
@@ -1748,6 +1749,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Zero disables the path; a positive power of two selects the base size.
     "VLLM_GDN_RECURSIVE_SOLVER_BASE":
     lambda: int(os.environ.get("VLLM_GDN_RECURSIVE_SOLVER_BASE", "0")),
+    # Newton steps X <- X (2I - L X) after the recursive block inverse (base above > 0); 0 (default) none.
+    # One step restores the 14-step accuracy on ill-conditioned chunks (read at import of hpu_gdn_pytorch).
+    "VLLM_GDN_RECURSIVE_SOLVER_REFINE":
+    lambda: int(os.environ.get("VLLM_GDN_RECURSIVE_SOLVER_REFINE", "0")),
 
     # Compute the GDN K @ K^T product only for unique key heads, then
     # broadcast it across repeated value-head groups.
