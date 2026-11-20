@@ -170,7 +170,7 @@ def moe_row_quant_cpu_reference(x: torch.Tensor,
 
 
 def moe_silu_mul_reference(gate_up: torch.Tensor, first_column: int = 0) -> torch.Tensor:
-    """``moe_silu_mul``: ``[T, first_column + 2 * D] -> [T, D]``, the torch code on the columns from ``first_column`` on.
+    """``moe_silu_mul``: ``[T, first_column + 2 * D] -> [T, D]``, the torch code on the columns from ``first_column``.
 
     ``first_column`` is 0 for the gate_up GEMM output; with that GEMM merged into the gate GEMM it is the
     first column after the router logits and the shared-gate logit.

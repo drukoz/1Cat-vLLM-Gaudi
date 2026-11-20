@@ -90,10 +90,8 @@ def describe(torch, got, want, sets):
         return "WRONG", f"{int(rows.sum())} of {rows.numel()} rows are the CPU's values"
     g, w = got.long(), want.long()
     g2, w2 = g.reshape(g.shape[0], -1), w.reshape(w.shape[0], -1)
-    if sets:
-        rows = (torch.sort(g2, dim=1).values == torch.sort(w2, dim=1).values).all(dim=1)
-    else:
-        rows = (g2 == w2).all(dim=1)
+    same = (torch.sort(g2, dim=1).values == torch.sort(w2, dim=1).values) if sets else (g2 == w2)
+    rows = same.all(dim=1)
     if bool(rows.all()):
         return "RIGHT", f"{rows.numel()} of {rows.numel()} rows" + (" (as sets)" if sets else "")
     flat_g, flat_w = g.flatten(), w.flatten()

@@ -26,6 +26,7 @@ Last line: "VERDICT hc-copies: ..." with the microseconds per hyper-connection o
 48-layer model has 97.
 """
 import argparse
+import contextlib
 import json
 import os
 import sys
@@ -166,10 +167,8 @@ def main():
                 text = " ".join(str(error).split())[:400]
                 results[key] = dict(rows=rows, mode=mode, error=f"{type(error).__name__}: {text}")
                 say(f"rows {rows:4d} mode {mode}: RAISED {type(error).__name__}: {text}")
-                try:
+                with contextlib.suppress(Exception):  # the leftover graph is the one that just failed
                     flush()
-                except Exception:  # noqa: BLE001 - the leftover graph is the one that just failed
-                    pass
     (a.out / "hc_copies.json").write_text(json.dumps(results, indent=1) + "\n")
     parts = []
     for rows in ROWS:

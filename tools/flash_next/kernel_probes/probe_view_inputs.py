@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+# ruff: noqa: UP031, SIM105
 """probe_view_inputs.py: with the accumulation thread off (PT_HPU_LAZY_ACC_PAR_MODE=0), can a custom HPU op take a
 view as its input, and does it then read the right rows?
 

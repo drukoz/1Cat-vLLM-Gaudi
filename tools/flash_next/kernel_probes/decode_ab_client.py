@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
+# ruff: noqa: UP031, SIM905  (kept close to coord/decode_scaling.py, which this file follows line by line)
 """Decode A/B client: the coordinator's decode scaling probe (coord/decode_scaling.py of 2026-11-20, same rounds,
 same prompts, same scaling.json) with two changes for an A/B of a flag between two servers.
 
@@ -236,7 +237,6 @@ def main():
             json.dump(texts, f, indent=1)
 
     for n in levels:
-        t = time.time()
         w = run_round(args, n, args.warm_tokens)
         keep("warm", w)
         print("warm  N=%-3d ok=%d err=%d wall=%.1fs ms/tok p50=%s" % (
