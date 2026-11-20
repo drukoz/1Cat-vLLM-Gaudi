@@ -16,23 +16,40 @@
 # 1 and 32 streams (I10 / G4-2). Q = one server, one short phase (a check of this script's plumbing). T = the
 # profiler capture with the Habana SDK in API-controlled mode (HABANA_PROFILE=1 and a profiler configuration file).
 #
-# Every server: /results/<label>/{server0.log, probe.json, timing/step_timing_*.jsonl, versions.txt}.
+# Every server: $RESULTS/<label>/{server0.log, probe.json, timing/step_timing_*.jsonl, versions.txt}.
 set -u
 
 PLAN="${1:-A}"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROBE="$HERE/anatomy_probe.py"
-PORT="${ANATOMY_PORT:-8100}"
+# Stage 1 (CARD.md stage 1: own docker run, the bundle mounted at /bundle, results at /results, 8 cards) or stage 2
+# (`farm job`: the plugin installed in the job's image, results in $FARM_OUT, the job's cards and port base).
+if [ -n "${FARM_OUT:-}" ]; then
+    STAGE=2
+    RESULTS="$FARM_OUT"
+    PORT="${ANATOMY_PORT:-${FARM_PORT_BASE:-8100}}"
+    TP="${FARM_NCARDS:-8}"
+else
+    STAGE=1
+    RESULTS=/results
+    PORT="${ANATOMY_PORT:-8100}"
+    TP=8
+fi
 MODEL="${ANATOMY_MODEL:-/models/Qwen3.8-Flash-Next-FP8}"
 ENTRY=/bundle/plugin/tools/flash_next/rental/container_entry.sh
-cd /results || exit 2
+mkdir -p "$RESULTS" && cd "$RESULTS" || exit 2
 
 say() { echo "anatomy: $* [$(date -u +%H:%M:%S)]"; }
 
 install_stack() {
+    if [ "$STAGE" -eq 2 ]; then
+        python3 -c "from vllm_gaudi.extension import step_timing; print('stage 2: the image has the plugin;', step_timing.__file__)" \
+            || { say "the job's image has no step timer"; exit 3; }
+        return 0
+    fi
     say "install from the bundle ($(cat /bundle/BUNDLE.txt 2>/dev/null | tr '\n' ' ' | cut -c1-200))"
-    if ! bash "$ENTRY" --install-only --results /results --run-id install > /results/install.log 2>&1; then
-        say "INSTALL FAILED"; tail -n 30 /results/install.log; exit 3
+    if ! bash "$ENTRY" --install-only --results "$RESULTS" --run-id install > "$RESULTS/install.log" 2>&1; then
+        say "INSTALL FAILED"; tail -n 30 "$RESULTS/install.log"; exit 3
     fi
     python3 -c "import vllm, vllm_gaudi, os; print('vllm', vllm.__version__, 'vllm_gaudi', os.path.dirname(vllm_gaudi.__file__))"
     python3 -c "from vllm_gaudi.extension import step_timing; print('step timer module:', step_timing.__file__)" \
@@ -45,7 +62,7 @@ base_env() {
     export PT_HPU_LAZY_MODE=1 PT_HPU_LAZY_ACC_PAR_MODE=0 VLLM_HPU_FLASH_NEXT_QSA_MODE=1
     export VLLM_HPU_RECURRENT_STATE_POOL=1 VLLM_HPU_GDN_CORE_DECODE=1 VLLM_HPU_HC_FUSED=1
     export VLLM_HPU_PLE_HOST_NGRAM_IDS=1 VLLM_HPU_COLLECTIVE_MARK_STEP=0 VLLM_SKIP_WARMUP=true
-    export HABANA_VISIBLE_MODULES=0,1,2,3,4,5,6,7
+    [ "$STAGE" -eq 1 ] && export HABANA_VISIBLE_MODULES=0,1,2,3,4,5,6,7  # stage 2: the job's own modules
     unset HABANA_PROFILE HABANA_PROF_CONFIG VLLM_CONFIG_HIDDEN_LAYERS VLLM_TORCH_PROFILER_DIR VLLM_HPU_FUSED_GREEDY_LOGITS
 }
 
@@ -66,7 +83,7 @@ trap stop_server EXIT
 serve() {
     local label="$1" phases="$2" trace="$3"
     shift 3
-    local out="/results/$label" t0 rc
+    local out="$RESULTS/$label" t0 rc
     mkdir -p "$out/timing"
     cd "$out" || return 2
     export VLLM_HPU_STEP_TIMING="${VLLM_HPU_STEP_TIMING:-1}" VLLM_HPU_STEP_TIMING_DIR="$out/timing"
@@ -76,7 +93,7 @@ serve() {
       env | grep -E '^(VLLM_|PT_HPU|HABANA_|FLASHINFER)' | sort; } > versions.txt
     say "$label: starting the server"
     vllm serve "$MODEL" --served-model-name fn --host 127.0.0.1 --port "$PORT" \
-        --tensor-parallel-size 8 --enable-expert-parallel --max-model-len 131072 --max-num-seqs 32 \
+        --tensor-parallel-size "$TP" --enable-expert-parallel --max-model-len 131072 --max-num-seqs 32 \
         --enable-prefix-caching --language-model-only --trust-remote-code --gpu-memory-utilization 0.92 \
         --max-num-batched-tokens 8192 --long-prefill-token-threshold 2048 --enable-prompt-tokens-details "$@" \
         > server0.log 2>&1 &
@@ -90,10 +107,10 @@ serve() {
             say "$label: SERVER-DIED after $(( $(date +%s) - t0 )) s"
             grep -nE "Error|Traceback|error:" server0.log | tail -n 25 | cut -c1-400
             tail -n 20 server0.log | cut -c1-400
-            SP=""; cd /results; return 3
+            SP=""; cd "$RESULTS" || exit 2; return 3
         fi
         if [ $(( $(date +%s) - t0 )) -ge 1800 ]; then
-            say "$label: SERVER-TIMEOUT"; tail -n 20 server0.log | cut -c1-300; stop_server; cd /results; return 4
+            say "$label: SERVER-TIMEOUT"; tail -n 20 server0.log | cut -c1-300; stop_server; cd "$RESULTS" || exit 2; return 4
         fi
         sleep 5
     done
@@ -113,7 +130,7 @@ serve() {
     stop_server
     ls -la "$out/timing" | tail -n 20
     du -sh "$out"/* 2>/dev/null | sort -h | tail -n 8
-    cd /results
+    cd "$RESULTS" || exit 2
     return "$rc"
 }
 
@@ -141,8 +158,8 @@ plan_a() {
     # The capture rounds are as long as the warm rounds (160 tokens): no bucket compiles inside a capture, and
     # every stream still decodes for seconds after the capture starts.
     PROBE_EXTRA="--trace-tokens 160" serve a2-trace "warm:32,1:160;1:32,1:96" "32,1" \
-        --profiler-config '{"profiler": "torch", "torch_profiler_dir": "/results/a2-trace/trace", "torch_profiler_with_stack": false, "torch_profiler_use_gzip": true, "torch_profiler_record_shapes": false}'
-    ls -la /results/a2-trace/trace 2>/dev/null | head -n 20
+        --profiler-config '{"profiler": "torch", "torch_profiler_dir": "'"$RESULTS"'/a2-trace/trace", "torch_profiler_with_stack": false, "torch_profiler_use_gzip": true, "torch_profiler_record_shapes": false}'
+    ls -la $RESULTS/a2-trace/trace 2>/dev/null | head -n 20
 }
 
 plan_t() {
@@ -150,8 +167,8 @@ plan_t() {
     # started disabled, hardware trace in the profiler-API phase: the configuration of tools/run_deepseek_v41.py),
     # for a run where profile_api_light gave no device events.
     base_env
-    mkdir -p /results/t-trace
-    cat > /results/t-trace/prof-config.json <<'JSON'
+    mkdir -p $RESULTS/t-trace
+    cat > $RESULTS/t-trace/prof-config.json <<'JSON'
 {"Plugins": [
  {"enable": true, "lib": "libhost_profiler.so", "name": "HostProfiler",
   "values": {"api_group": {"HCCL": {"value": true}, "HLTHUNK": {"value": true}, "SYNAPSE": {"value": true}},
@@ -160,10 +177,10 @@ plan_t() {
   "values": {"generalOptions": {"profilePhase": {"value": "profileApi"}, "traceBufferSize": {"value": "0x80000000"}},
              "parseOptions": {"addFuserMetadata": {"value": false}, "showNullDescs": {"value": false}}}}]}
 JSON
-    export HABANA_PROFILE=1 HABANA_PROF_CONFIG=/results/t-trace/prof-config.json
+    export HABANA_PROFILE=1 HABANA_PROF_CONFIG=$RESULTS/t-trace/prof-config.json
     PROBE_EXTRA="--trace-tokens 160" serve t-trace "warm:32,1:160" "32,1" \
-        --profiler-config '{"profiler": "torch", "torch_profiler_dir": "/results/t-trace/trace", "torch_profiler_with_stack": false, "torch_profiler_use_gzip": true, "torch_profiler_record_shapes": false}'
-    ls -la /results/t-trace/trace 2>/dev/null | head -n 20
+        --profiler-config '{"profiler": "torch", "torch_profiler_dir": "'"$RESULTS"'/t-trace/trace", "torch_profiler_with_stack": false, "torch_profiler_use_gzip": true, "torch_profiler_record_shapes": false}'
+    ls -la $RESULTS/t-trace/trace 2>/dev/null | head -n 20
 }
 
 plan_b() {
@@ -175,16 +192,16 @@ plan_b() {
     local pids=()
     say "MME row sweep on cards 0-4, lazy-op cases (mode 0) on card 5"
     PT_HPU_LAZY_MODE=1 PT_HPU_LAZY_ACC_PAR_MODE=0 timeout 900 \
-        python3 "$HERE/bench_mme_rows.py" --cards 0,1,2,3,4 --out /results/mme_rows.json > /results/mme_rows.log 2>&1 &
+        python3 "$HERE/bench_mme_rows.py" --cards 0,1,2,3,4 --out $RESULTS/mme_rows.json > $RESULTS/mme_rows.log 2>&1 &
     pids+=($!)
     HABANA_VISIBLE_MODULES=5 timeout 700 python3 "$HERE/bench_lazy_ops.py" --acc-modes 0 \
-        --out /results/lazy_ops_mode0.json > /results/lazy_ops_mode0.log 2>&1 &
+        --out $RESULTS/lazy_ops_mode0.json > $RESULTS/lazy_ops_mode0.log 2>&1 &
     pids+=($!)
     for pid in "${pids[@]}"; do wait "$pid"; done
     pkill -9 -f "bench_(mme_rows|lazy_ops).py" 2>/dev/null
     say "one-card benches done"
-    tail -n 45 /results/mme_rows.log 2>/dev/null | cut -c1-250
-    tail -n 30 /results/lazy_ops_mode0.log 2>/dev/null | cut -c1-250
+    tail -n 45 $RESULTS/mme_rows.log 2>/dev/null | cut -c1-250
+    tail -n 30 $RESULTS/lazy_ops_mode0.log 2>/dev/null | cut -c1-250
     # I10 / G4-2: the per-decoder-layer mark_step every 4 layers (default every layer). A bigger recipe compiles
     # far longer (00009: 1,000 ops 14 s, 3,000 ops 135 s), so 4 first; 12 only when the job has time left.
     base_env
