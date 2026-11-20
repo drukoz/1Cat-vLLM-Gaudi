@@ -536,6 +536,9 @@ if TYPE_CHECKING:
     VLLM_HPU_HC_FUSED: int = 0  # 0 torch hyper-connections (default), 1 the fused hyper-connection kernels
     VLLM_HPU_MOE_GLUE: int = 0  # 0 torch MoE glue (default), 1 the fused MoE glue kernels
     VLLM_HPU_COLLECTIVE_MARK_STEP: int = 1  # 1 (default) mark_step() before every HPU collective, 0 none
+    VLLM_HPU_FLASH_NEXT_SPEC_LOOKUP: int = 0  # SpecLookupMode: 0 off (MTP drafts), 1 hybrid, 2 lookup only
+    VLLM_HPU_FLASH_NEXT_LOOKUP_MIN_NGRAM: int = 3  # hybrid lookup: shortest suffix n-gram matched
+    VLLM_HPU_FLASH_NEXT_LOOKUP_MAX_NGRAM: int = 8  # hybrid lookup: longest suffix n-gram matched
     VLLM_HPU_RECURRENT_STATE_POOL: int = 0  # RecurrentStatePoolMode: 0 off, 1 pool
     VLLM_HPU_RECURRENT_STATE_POOL_SLOTS: int = 0  # resolved by the hook; positive overrides the formula
     VLLM_HPU_RECURRENT_STATE_POOL_CACHE_SLOTS: int = 512  # retained prefix states added to the live need
@@ -1922,6 +1925,21 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # so 99 graph cuts; only use it when the served tokens still match a reference (tiny_smoke.sh --env).
     "VLLM_HPU_COLLECTIVE_MARK_STEP":
     lambda: int(os.environ.get("VLLM_HPU_COLLECTIVE_MARK_STEP", "1")),
+
+    # Flash-Next speculation: prompt lookup beside the MTP drafter (vllm_gaudi/v1/spec_decode/flash_next_lookup.py).
+    # 0 (default) = the MTP drafts, the lookup hook is not installed. 1 = hybrid: with the MTP method, a decode request
+    # whose last n tokens (n from VLLM_HPU_FLASH_NEXT_LOOKUP_MAX_NGRAM down to VLLM_HPU_FLASH_NEXT_LOOKUP_MIN_NGRAM)
+    # occur earlier in its prompt or output gets the continuation after the earliest occurrence of the longest
+    # match (vLLM's n-gram search; up to k tokens, padded with the empty draft -1 to k) instead of the MTP drafts;
+    # the MTP drafter still runs every step. 2 = lookup only (the continuation, else k empty drafts), for
+    # measurements. With 1 or 2 a request may pick its own mode with vllm_xargs {"spec_lookup": 0, 1 or 2}. Any
+    # other value is 0.
+    "VLLM_HPU_FLASH_NEXT_SPEC_LOOKUP":
+    lambda: int(os.environ.get("VLLM_HPU_FLASH_NEXT_SPEC_LOOKUP", "0")),
+    "VLLM_HPU_FLASH_NEXT_LOOKUP_MIN_NGRAM":
+    lambda: int(os.environ.get("VLLM_HPU_FLASH_NEXT_LOOKUP_MIN_NGRAM", "3")),
+    "VLLM_HPU_FLASH_NEXT_LOOKUP_MAX_NGRAM":
+    lambda: int(os.environ.get("VLLM_HPU_FLASH_NEXT_LOOKUP_MAX_NGRAM", "8")),
 
     # Recurrent (GDN / short-conv) state pool: 0 (default) keeps today's
     # one-recurrent-slot-per-attention-block-id allocation, 1 gives the

@@ -2315,6 +2315,17 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                 raise ValueError("Unknown speculative decoding method: "
                                  f"{self.speculative_config.method}")
             self.rejection_sampler = RejectionSampler(self.sampler)
+        # Flash-Next prompt lookup beside the MTP drafter (VLLM_HPU_FLASH_NEXT_SPEC_LOOKUP=1, flash_next_lookup.py).
+        self._spec_lookup = None
+        if self.speculative_config is not None and is_flash_next_mtp(self.speculative_config):
+            from vllm_gaudi.v1.spec_decode.flash_next_lookup import HybridLookup, SpecLookupMode, lookup_mode
+
+            if lookup_mode() != SpecLookupMode.OFF:
+                self._spec_lookup = HybridLookup.from_env(self.speculative_config.num_speculative_tokens,
+                                                          self.model_config.max_model_len)
+                logger.info("Flash-Next speculation: lookup beside MTP on (default mode %s, n-gram %d..%d, k = %d)",
+                            self._spec_lookup.default_mode.name, self._spec_lookup.min_ngram,
+                            self._spec_lookup.max_ngram, self._spec_lookup.k)
 
         # Keep in int64 to avoid overflow with long context
         self.max_num_reqs = self.scheduler_config.max_num_seqs
@@ -9841,6 +9852,17 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                     draft_token_ids = torch.cat(draft_token_ids_prefill, dim=0)
                 else:
                     draft_token_ids = torch.cat([draft_token_ids] + draft_token_ids_prefill, dim=0)
+
+            spec_lookup = getattr(self, "_spec_lookup", None)
+            if spec_lookup is not None and draft_token_ids is not None:
+                # Lookup + MTP hybrid: per request, the n-gram continuation replaces the MTP drafts (host lists;
+                # take_draft_token_ids reads the MTP tensor back to the host anyway).
+                k = self.speculative_config.num_speculative_tokens
+                extra_args = [getattr(getattr(self.requests.get(r), "sampling_params", None), "extra_args", None)
+                              for r in self.input_batch.req_ids]
+                return spec_lookup.merge(draft_token_ids.reshape(-1, k).tolist(), self.input_batch.req_ids,
+                                         self.input_batch.token_ids_cpu, self.input_batch.num_tokens_no_spec,
+                                         sampled_token_ids, num_decodes or 0, extra_args)
 
             # Early exit if there is only one draft token to be generated.
             # [batch_size, 1]

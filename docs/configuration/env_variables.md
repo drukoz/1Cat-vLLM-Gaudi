@@ -140,6 +140,24 @@ leaves the choice open. With `0` nothing is loaded, registered or logged. The
 kernels pass the Gaudi2 instruction simulator and have not run on a card; see
 `docs/design/flash-next/hc-fused.md` ("MoE glue kernels").
 
+`VLLM_HPU_FLASH_NEXT_SPEC_LOOKUP` puts prompt lookup beside the Flash-Next MTP
+drafter, as an integer. `0` (default) installs nothing: the MTP drafts are
+verified. `1` (hybrid) keeps the MTP drafter running every step and then, per
+decode request, replaces its `k` drafts by the n-gram continuation when the
+request's last n tokens (n from `VLLM_HPU_FLASH_NEXT_LOOKUP_MAX_NGRAM`, default
+`8`, down to `VLLM_HPU_FLASH_NEXT_LOOKUP_MIN_NGRAM`, default `3`; a 2-token match
+is too often wrong in prose to replace an MTP draft) occur earlier
+in its prompt or output (vLLM's n-gram search: the earliest occurrence of the
+longest match, up to `k` tokens, padded to `k` with the empty draft `-1`, which
+is never accepted). `2` (lookup only) verifies the lookup continuation, or `k`
+empty drafts, for measuring what lookup alone accepts with the MTP shapes. With
+`1` or `2` a request can choose its own mode with `vllm_xargs`
+`{"spec_lookup": 0 | 1 | 2}`. The verification rows keep the MTP shapes (`1 + k`
+wide), so the HPU graphs are the MTP graphs; the MTP drafter's own caches are
+written as with MTP alone. The server logs the rows and accepted drafts of each
+source every 200 steps (`Flash-Next lookup hybrid: ...`). Any other value is
+`0`. Requires the `mtp` method; not yet run on a card.
+
 `VLLM_HPU_RECURRENT_STATE_POOL` selects the allocation mode for the recurrent
 (GDN / short-conv) state slots as an integer. `0` (default) keeps today's
 allocation, one recurrent state slot per attention block id. `1` gives the
