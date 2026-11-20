@@ -107,6 +107,14 @@ target's probability of it after temperature, top-k and top-p; on a rejection
 draw from the target with the draft removed), exact in distribution;
 `vllm_gaudi/v1/sample/hpu_rejection_sampler.py`, `sampled_rejection_sample`.
 
+`VLLM_HPU_MTP_DRAFT_LOOP` selects how the Flash-Next MTP draft loop gets the
+positions of its steps 1 to k-1, as an integer. `0` (default) reads them back
+from the device after draft step 0, a host sync in the middle of the draft. `1`
+takes them from the runner's host books (the position of each request's last
+accepted token, `num_tokens_no_spec - 2` once the step's tokens are counted),
+so the host builds the next step's metadata while the device runs draft step 0;
+the drafts are the same.
+
 `VLLM_HPU_HC_FUSED` selects the path of the Flash-Next hyper-connections as an
 integer. `0` (default) keeps the torch path. `1` runs the element-wise parts of
 every hyper-connection (the grouped norm, the silu with the injection split, the

@@ -71,12 +71,13 @@ def assert_same_streams(base: dict, run: dict) -> dict:
     return {prompt: first_difference(by_prompt[prompt], tokens) for prompt, tokens in streams.items()}
 
 
-def _oracle_run(engine_runs: dict, accept: list[int], *options: str, k: int = K) -> dict:
-    name = f"k{k}_accept_" + "".join(str(a) for a in accept) + "".join(o.strip("-")[:3] for o in options)
+def _oracle_run(engine_runs: dict, accept: list[int], *options: str, k: int = K, env: dict | None = None,
+                tag: str = "") -> dict:
+    name = f"k{k}_accept_" + "".join(str(a) for a in accept) + "".join(o.strip("-")[:3] for o in options) + tag
     path = engine_runs["dir"] / f"{name}.oracle.json"
     path.write_text(json.dumps({"streams": engine_runs["base"]["prompts"], "accept": accept}), encoding="utf-8")
     return hpu_cpu_engine.run(engine_runs["ckpt"], engine_runs["dir"] / f"{name}.json", "--k", str(k), "--oracle",
-                              str(path), *options)
+                              str(path), *options, env=env)
 
 
 def _check_oracle(engine_runs: dict, run: dict, accept: list[int], k: int) -> None:
@@ -147,7 +148,19 @@ def test_the_first_draft_after_a_prefill_is_the_reference_mtp_argmax(engine_runs
 @pytest.mark.parametrize("accept", [[K], [0, 1, 2, 3], [2, 0, 3, 1]], ids=["all", "rising", "mixed"])
 def test_oracle_drafts_are_accepted_exactly_and_keep_the_stream(engine_runs, accept):
     run = engine_runs.get("oracle_all") if accept == [K] else None
-    _check_oracle(engine_runs, run or _oracle_run(engine_runs, accept), accept, K)
+    run = run or _oracle_run(engine_runs, accept)
+    engine_runs["oracle_" + "".join(str(a) for a in accept)] = run
+    _check_oracle(engine_runs, run, accept, K)
+
+
+def test_host_book_draft_positions_give_the_same_drafts(engine_runs):
+    # VLLM_HPU_MTP_DRAFT_LOOP=1 (idea-sweep I02): the draft loop takes its positions from the runner's host books
+    # instead of reading them back from the device; every draft and every token must be the same.
+    accept = [2, 0, 3, 1]
+    device = engine_runs.get("oracle_2031") or _oracle_run(engine_runs, accept)
+    host = _oracle_run(engine_runs, accept, env={"VLLM_HPU_MTP_DRAFT_LOOP": "1"}, tag="_host")
+    assert [e["drafter"] for e in host["oracle"]] == [e["drafter"] for e in device["oracle"]]
+    assert [p["generated_ids"] for p in host["prompts"]] == [p["generated_ids"] for p in device["prompts"]]
 
 
 @pytest.mark.parametrize("k", [4, 5], ids=["k4", "k5"])
@@ -170,3 +183,21 @@ def test_oracle_drafts_with_the_fused_kernels_reference_ops(engine_runs):
                              str(path), env=env)
     assert_same_streams(fused_base, run)
     assert max(r for step in run["decode_steps"] for r in step["rows"]) == 1 + K
+
+
+def test_sampled_requests_through_the_speculative_engine(engine_runs):
+    # temperature 1.0 with a seed per request: the engine's RejectionSampler runs the HPU sampled path
+    # (apply_sampling_constraints with the torch expand, sampled_rejection_sample); a seeded run repeats itself.
+    env = {"VLLM_HPU_SPEC_SAMPLED_VERIFY": "1"}
+    runs = [hpu_cpu_engine.run(engine_runs["ckpt"], engine_runs["dir"] / f"sampled_{i}.json", "--k", str(K),
+                               "--temperature", "1.0", "--seed", "7", "--max-tokens", "8", env=env) for i in range(2)]
+    for prompt_a, prompt_b in zip(runs[0]["prompts"], runs[1]["prompts"]):
+        assert len(prompt_a["generated_ids"]) == 8
+        assert prompt_a["generated_ids"] == prompt_b["generated_ids"]
+    assert max(r for step in runs[0]["decode_steps"] for r in step["rows"]) == 1 + K
+
+
+def test_a_sampled_request_is_refused_without_the_flag(engine_runs):
+    with pytest.raises(RuntimeError, match="VLLM_HPU_SPEC_SAMPLED_VERIFY=1"):
+        hpu_cpu_engine.run(engine_runs["ckpt"], engine_runs["dir"] / "sampled_refused.json", "--k", str(K),
+                           "--temperature", "1.0", "--max-tokens", "4", env={"VLLM_HPU_SPEC_SAMPLED_VERIFY": "0"})

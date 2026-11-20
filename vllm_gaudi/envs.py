@@ -533,6 +533,7 @@ if TYPE_CHECKING:
     VLLM_HPU_GDN_CORE_DECODE_DEBUG: int = 0  # GdnCoreDecodeDebug: 0 off, 1 check slot indices every step (host sync)
     VLLM_HPU_GDN_CORE_VERIFY: int = 0  # GdnCoreVerifyMode: 0 off (default), 1 fused verification steps
     VLLM_HPU_SPEC_SAMPLED_VERIFY: int = 0  # 0 speculation serves greedy requests only (default), 1 also sampled
+    VLLM_HPU_MTP_DRAFT_LOOP: int = 0  # 0 draft positions read back from the device (default), 1 host books
     VLLM_HPU_PLE_HOST_NGRAM_IDS: int = 0  # 0 PLE n-gram ids computed in the graph (default), 1 on the host
     VLLM_HPU_HC_FUSED: int = 0  # 0 torch hyper-connections (default), 1 the fused hyper-connection kernels
     VLLM_HPU_MOE_GLUE: int = 0  # 0 torch MoE glue (default), 1 the fused MoE glue kernels
@@ -1896,6 +1897,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # by speculative sampling in torch, exact in distribution (hpu_rejection_sampler.sampled_rejection_sample).
     "VLLM_HPU_SPEC_SAMPLED_VERIFY":
     lambda: int(os.environ.get("VLLM_HPU_SPEC_SAMPLED_VERIFY", "0")),
+
+    # The Flash-Next MTP draft loop (idea-sweep I02). 0 (default) = the base positions of the draft steps 1..k-1
+    # are read back from the device after draft step 0 (a host sync in the middle of the draft). 1 = the runner
+    # gives them from its host books (num_tokens_no_spec - 2 per request), so the host builds the next step's
+    # metadata while the device runs draft step 0.
+    "VLLM_HPU_MTP_DRAFT_LOOP":
+    lambda: int(os.environ.get("VLLM_HPU_MTP_DRAFT_LOOP", "0")),
 
     # Flash-Next PLE n-gram ids. 0 (default) = every forward computes them on the device (token
     # packing, searchsorted, the EOS shift scan, the int32 limb hash). 1 = the runner computes the
