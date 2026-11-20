@@ -354,3 +354,91 @@ change in each module.
 | 2 | `VLLM_HPU_DECODE_CUT_INTERVAL` (default 0): decode and verification forwards cut after every N-th decoder layer instead of every `VLLM_CONFIG_HIDDEN_LAYERS`-th; prompt forwards unchanged. Hooks are only re-registered when the flag is set, so 0 is the old code path | `tests/unit_tests/worker/test_decode_cut_interval.py` (11 tests) | token parity on the tiny model (job 00027, `tiny_smoke.sh --gdn hc --env VLLM_HPU_DECODE_CUT_INTERVAL=1000`); the real-model decode effect of the same graph shape is step-anatomy's `VLLM_CONFIG_HIDDEN_LAYERS` 48/4 A/B (00016) | committed `021f9bf6` |
 | 3 | Replay-entry regimes in the benchmark: `graph_raw` (direct `HPUGraph`, no input hash), `replay_async`, `replay_meta` (20 int32 tensors and 2 scalars as a namedtuple keyword, like the trimmed decode metadata) | gloo self-test; `test_bench_replay.py` (8 tests) | job 00027 step A | committed `aef003f4` |
 | 4 | Only if 00012/00027 show the replay entry or the tail costs about 1 ms or more per step: a direct `HPUGraph` per decode bucket over persistent input buffers (with engine-step's D3) and the logits tail captured with the forward | CPU: same logits and tokens with and without, graph keys unchanged | real model at 1 and 32 streams | decided by the measurements |
+| 5 | `VLLM_HPU_GRAPH_ASYNC_REPLAY` (default 0): the model's HPU graph wrapped with `asynchronous=True`, so the forward returns once the replay is queued | `tests/unit_tests/worker/test_hpu_graph_async_replay.py` (4 tests) | job 00027: bench `replay_tail` against `replay_async_tail`, the async-equals-sync token check, and tiny-model parity with the flag on | committed `6966226e` |
+| 6 | Bench regimes for grouped collectives (`replay_par2`, `replay_fused2`, `replay_coalesce`), a sampler tail, a torch.profiler trace of a replay, the knob names of the bridge and HCL | `test_bench_replay.py` (11 tests); gloo self-test | job 00027 step A | committed `d85d9730`, `e2726c41` |
+
+## Handoff (if this agent stops)
+
+State at 2026-11-20 19:00 UTC. Branch `feat/flash-next-gaudi-native-replay` (worktree
+`/Volumes/Storage/Claude/gaudi-work/wt/native-replay`), pushed to `origin`; nothing merged into
+`feat/flash-next-gaudi` yet. No uncommitted change in the repository. Outside it (track folder
+`/Volumes/Storage/Claude/gaudi-work/reports/native-replay/`): `late/job.sh` (the script job 00027 runs, also on the
+node), `probes/const_ops.py` and its JSON (section 7.3), `logs/` (CPU test logs), `card/` (card results).
+
+### Done and verified
+
+- Decode replays a stock HPU graph; the replay issues every recipe and collective from the calling thread. Measured
+  at TP8 (job 00012, `card/replay-bench-r8/`): 130-195 us per all-reduce, 45-90 us per extra recipe, host held for
+  73-93 % of a replay with collectives; compile mode no cheaper (section 7.2). Decode-step decomposition and the
+  target arithmetic: sections 0 and 5.
+- The fork's native replay and prepared/pre-posted HCCL paths do not transfer (eager mode only, patched
+  Bridge/Synapse/HCL, 2 or 4 ranks, 128-consumer plan cap): section 3, all claims with file:line.
+- `VLLM_HPU_DECODE_CUT_INTERVAL` (commit `021f9bf6`) and `VLLM_HPU_GRAPH_ASYNC_REPLAY` (`6966226e`), both default 0,
+  CPU tests green: `tests/unit_tests/worker/test_decode_cut_interval.py` (11),
+  `tests/unit_tests/worker/test_hpu_graph_async_replay.py` (4), `tests/unit_tests/tools/test_bench_replay.py` (11),
+  `tests/unit_tests/tools/rental` (745 passed together with the first two files).
+- Common gate (`tests/unit_tests/models/flash_next`, `tests/unit_tests/test_flash_next_platform.py`): the same
+  failures on this branch as on a clean export of the program head e238f84, among them
+  `test_compile_probe.py::test_hpu_probe_refuses_without_lazy_mode` (it asserts `habana_frameworks` is not in
+  `sys.modules`, which other gate modules put there at collection; passes alone). A run of the gate in three groups
+  with failure lists is in `reports/native-replay/logs/gate_b6966_{A,B,C,D}.log`
+  (`bash <scratchpad>/gate_groups.sh <worktree> <tag>`; the script is also described in section 8 of this file's
+  history: three `pytest -q -rf` processes over the 49 flash_next files, the platform test last).
+- Device incident: module 0 (accel1, PCI 0000:0b:00.0) logged "unexpected user error interrupt" at 17:48 and
+  18:20 UTC (job 00012's rank 0 was killed by "Synapse detected a device critical error ... [No progress error]"
+  during the `replay_coll` regime at 128 rows); reported to the coordinator. Do not run `replay_coll` again.
+
+### Queued card jobs and what to do with each result
+
+1. **00027** `tiny-nocut-parity-replay-entry` (`all`, 35 min hold; submitted stage-1 style with `bin/farm submit`).
+   It runs `~/farm/native-replay/late/job.sh` (md5 `486aae64967f80c201f5c0c2942afa23`) with the bundle
+   `~/farm/native-replay/late/bundle.tar.gz` (commit `6966226e`, md5 `3136612fe2c2cc874af6c9cb9652d1ab`). Fetch
+   after it ends: `bin/farm wait 00027; bin/farm fetch native-replay 00027 late2` (results in
+   `reports/native-replay/card/late2/`). Steps and readings:
+   - Step A, `bench/bench.log` and `bench/replay_entry_r8.json` (8 ranks, rows 1 and 32):
+     `replay_async_tail` against `replay_tail` (the `vs_total_ms` field): if the asynchronous replay saves 0.3 ms
+     or more per call and the `check` record says `"async_tokens_equal_sync": true`, run a real-model A/B of
+     `VLLM_HPU_GRAPH_ASYNC_REPLAY` (below); else leave it at 0 and write the numbers into section 7.
+     `replay_fused2` against `replay_par2`: if one stacked call costs about half of two calls, the cost is per call
+     (group the independent embedding and PLE-table all-reduces; tell the collectives track); if about equal, it
+     is per byte. `replay_coalesce`: an error record means HCCL has no coalescing in lazy replay.
+     `graph_raw` and `replay_meta` against `replay`: the wrapper's own cost and the metadata hash/copy cost per call
+     (step 4 of section 8 is worth building only if their sum is about 1 ms or more).
+     `bench/trace/replay_rows1_rank{0,1}.json.gz` (Chrome trace, open in Perfetto): during `replay_call_*`, is the
+     host thread busy issuing between collectives, or waiting (gaps)? That is the coordinator's question about the
+     host path inside `replayV3`. `bench/knobs.txt`: the `PT_HPU_*`/`HCCL_*`/`HCL_*` names compiled into the bridge
+     and HCL, to look for a setting that changes how a replay issues collectives.
+   - Step B, `tiny-nocut/summary.json` and `tiny-nocut/console.log`: the tiny model at TP8 with
+     `VLLM_HPU_DECODE_CUT_INTERVAL=1000` and `VLLM_HPU_GRAPH_ASYNC_REPLAY=1`. PASSED (tokens match the CPU
+     reference) proves both flags for token parity.
+   - `dmesg-before.txt` / `dmesg-after.txt`: new `habanalabs` lines mean a device error during the job: report it.
+2. **00053** `tiny-tp4-decode-nocut` (`any:4`, 20 min hold; `bin/farm tiny native-replay tiny-tp4-decode-nocut any:4
+   20m --env VLLM_HPU_DECODE_CUT_INTERVAL=1000 --env VLLM_HPU_COLLECTIVE_MARK_STEP=0 --env
+   VLLM_HPU_PLE_HOST_NGRAM_IDS=1 --gdn hc`, image `farm-native-replay:d85d97303a6a`). The submitting command
+   copies the results to `reports/native-replay/card/00053-tiny-tp4-decode-nocut/` when it ends; if that command is
+   gone, `bin/farm wait 00053; bin/farm fetch native-replay 00053 00053-tiny-tp4-decode-nocut`. PASSED = token
+   parity of the cut flag at TP4. If 00027 step B fails and 00053 passes, the asynchronous replay is the suspect.
+
+### Pending subtasks, in order
+
+1. **Merge the cut-interval flag** once 00053 or 00027 step B passes (coordinator's condition). Protocol:
+   `cd /Volumes/Storage/Claude/gaudi-work/wt/native-replay && git fetch origin && git merge origin/feat/flash-next-gaudi`,
+   rerun `tests/unit_tests/worker/test_decode_cut_interval.py tests/unit_tests/worker/test_hpu_graph_async_replay.py
+   tests/unit_tests/tools/test_bench_replay.py tests/unit_tests/tools/rental` (first, in that order) and the common
+   gate (compare its failures with a clean export of the program head, as above), then `git push`,
+   `gh pr create --base feat/flash-next-gaudi --title "Replay benchmark, decode graphs without per-layer cuts, and the native-replay design" --body-file <body>`
+   and `gh pr merge --merge`. A body without raw numbers is drafted in the scratchpad
+   (`pr_native_replay_1.md`); AGENTS.md forbids absolute performance numbers in PR text.
+2. **Asynchronous replay** (`VLLM_HPU_GRAPH_ASYNC_REPLAY`): read 00027 step A and B as above. If both are
+   positive, a real-model A/B on two module groups: `bin/farm serve native-replay real4-async0 any:4 40m --levels
+   1,32 --tokens 128` and `bin/farm serve native-replay real4-async1 any:4 40m --env VLLM_HPU_GRAPH_ASYNC_REPLAY=1
+   --levels 1,32 --tokens 128` (commit first; compare `scaling.json`). Merge the flag only with parity and a gain.
+3. **Per-collective host path inside `replayV3`**: the bridge's Python ends at `_hpu_C.replayV3`
+   (`card/replay-bench-r8/bridge_src/habana_frameworks_torch_hpu_graphs.py:635-770`); the C++ is not in the image as
+   source. Read the 00027 trace and knob list; if the host is waiting rather than issuing, the per-collective cost is
+   device/HCL latency and fewer ranks (E1) or a one-step algorithm helps; if it is issuing, only fewer calls or a
+   native (pre-posted) collective path helps.
+4. **Grouped or coalesced collectives**: read `replay_fused2`/`replay_coalesce` in 00027. In a Flash-Next step only
+   the embedding and PLE-table all-reduces are independent of each other; all layer all-reduces depend on the one
+   before. So grouping can save at most one call per step; its value is as evidence for the per-call cost model.
+5. **Write each result into section 7 of this file** and keep section 0 (the decision) consistent with it.
