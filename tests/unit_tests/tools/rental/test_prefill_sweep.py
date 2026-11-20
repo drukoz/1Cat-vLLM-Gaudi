@@ -423,3 +423,67 @@ def test_a_second_run_reuses_the_conversations_and_sends_new_turns(server, tmp_p
     # the first turns were cached by run one (all but the last block: a prompt's last token is always computed)
     assert [r["cached_tokens"] for r in two[0]["requests"]] == [1536, 1536]
     assert all(r["uncached_tokens"] >= 512 for r in two[1]["requests"])  # its turns are new
+
+
+class _FakeStream:
+    """A /v1/completions response that streams ``chunks`` (already framed as ``data: ...`` lines)."""
+
+    status = 200
+
+    def __init__(self, chunks):
+        self._chunks = chunks
+
+        async def iter_any():
+            for chunk in self._chunks:
+                yield chunk
+
+        self.content = type("Content", (), {"iter_any": staticmethod(iter_any)})()
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+
+class _FakeSession:
+    def __init__(self, chunks):
+        self.chunks = chunks
+        self.payloads = []
+
+    def post(self, url, json):
+        self.payloads.append(json)
+        return _FakeStream(self.chunks)
+
+
+def _token_chunk(n: int) -> bytes:
+    return ("data: " + json.dumps({"choices": [{"text": "x", "token_ids": [n]}],
+                                   "usage": {"prompt_tokens": 8, "completion_tokens": n}}) + "\n").encode()
+
+
+def test_a_stream_that_ends_short_is_an_error_row():
+    """00014: 28 setup streams of a dying server ended without a token and were counted as successes."""
+    for produced, status in ((0, 4), (1, 4), (4, 0)):
+        session = _FakeSession([_token_chunk(n) for n in range(1, produced + 1)] + [b"data: [DONE]\n"])
+        record = ps.new_record("x", 8)
+        asyncio.run(ps.stream_completion(session, "http://fake", ps.completion_payload("m", [1] * 8, 4), record))
+        assert record["status"] == status, (produced, record)
+        if status:
+            assert f"{produced} of 4" in record["error"]
+
+
+def test_warm_salted_sends_the_turn_again_without_prefix_hits(server, tmp_path):
+    code, report, _ = run_tool(server, tmp_path, "--plan", "baseline", "--cold-tokens", "2048", "--warm-tokens", "64",
+                               "--warm-salted", "--concurrent", "", "--turn2-tokens", "0", "--shared-prefix", "0",
+                               "--canaries", "0", "--case-max-tokens", "4")
+    assert code == 0
+    cases = by_case(report)
+    salted = [name for name in cases if name.endswith("salted")]
+    assert len(salted) == 1, list(cases)
+    warm = next(name for name in cases if name.startswith("warm ") and not name.endswith("salted"))
+    assert cases[warm]["requests"][0]["token_ids"] and cases[salted[0]]["requests"][0]["token_ids"]
+    assert cases[salted[0]]["same_tokens_as"] == warm
+    assert cases[salted[0]]["tokens_equal"] in (True, False)
+    sent = [r for r in server.requests if r["max_tokens"] == 4]
+    assert "cache_salt" in sent[-1]["fields"] and "cache_salt" not in sent[-2]["fields"]
+    assert ps.completion_payload("m", [1], 2, cache_salt="s")["cache_salt"] == "s"

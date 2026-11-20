@@ -216,6 +216,12 @@ async def stream_completion(session: aiohttp.ClientSession, url: str, payload: d
     except (asyncio.TimeoutError, aiohttp.ClientError, OSError) as exc:
         record["status"] = 2
         record["error"] = "%s: %s" % (type(exc).__name__, exc)
+    wanted = int(payload.get("max_tokens") or 0)
+    if record["status"] == 0 and payload.get("ignore_eos") and record["output_tokens"] < wanted:
+        # ignore_eos gives exactly max_tokens: a stream that ended before is a server that dropped it (00014: the
+        # engine died and 28 streams ended without a token, which the setup row then counted as served)
+        record["status"] = 4
+        record["error"] = "the stream ended after %d of %d tokens" % (record["output_tokens"], wanted)
     return record
 
 
@@ -251,7 +257,8 @@ def _consume_chunk(obj: dict, record: dict) -> None:
         record["t_last"] = now
 
 
-def completion_payload(model: str, prompt_ids: list[int], max_tokens: int, return_ids: bool = False) -> dict:
+def completion_payload(model: str, prompt_ids: list[int], max_tokens: int, return_ids: bool = False,
+                       cache_salt: Optional[str] = None) -> dict:
     """Exactly ``max_tokens`` greedy tokens: ``ignore_eos`` gives the length, no ``min_tokens`` (module text)."""
     payload = {
         "model": model,
@@ -265,6 +272,8 @@ def completion_payload(model: str, prompt_ids: list[int], max_tokens: int, retur
     }
     if return_ids:
         payload["return_token_ids"] = True
+    if cache_salt:
+        payload["cache_salt"] = cache_salt  # vLLM: a salted request shares no prefix-cache block with others
     return payload
 
 
@@ -435,7 +444,8 @@ class Runner:
         await asyncio.gather(*tasks, return_exceptions=True)
 
     async def run_case(self, case: str, prompts: list[tuple[str, list[int]]], max_tokens: int = 0,
-                       return_ids: bool = False, canaries: bool = True) -> dict:
+                       return_ids: bool = False, canaries: bool = True, cache_salt: Optional[str] = None,
+                       extra: Optional[dict] = None) -> dict:
         """Send ``prompts`` together and wait for them; with canary streams decoding around them.
 
         ``max_tokens`` 0 means ``--case-max-tokens``; ``--return-ids`` asks every case for its token ids.
@@ -450,7 +460,8 @@ class Runner:
         records = [new_record(name, len(ids)) for name, ids in prompts]
         t_send = time.time()
         await asyncio.gather(*[
-            stream_completion(self._session, self.url, completion_payload(self.model, ids, max_tokens, return_ids),
+            stream_completion(self._session, self.url,
+                              completion_payload(self.model, ids, max_tokens, return_ids, cache_salt=cache_salt),
                               record) for (_, ids), record in zip(prompts, records)
         ])
         firsts = [r["t_first"] for r in records if r["t_first"] is not None]
@@ -473,7 +484,8 @@ class Runner:
                 "requests": len(rows),
                 "uncached_tokens": uncached,
                 "seconds_to_last_first_token": span,
-                "prefill_tokens_per_s": (uncached / span) if span > 0 and firsts else None,
+                "prefill_tokens_per_s": ((uncached / span) if span > 0 and firsts
+                                         and all(r["status"] == 0 for r in rows) else None),
                 "errors": sum(1 for r in rows if r["status"] != 0),
             },
             "canaries": (summarize_canaries(canary_records, t_ready, t_send, t_first_all, t_stop)
@@ -481,6 +493,7 @@ class Runner:
             "metrics_delta": {k: (None if before.get(k) is None or after.get(k) is None else after[k] - before[k])
                               for k in METRIC_NAMES},
         }
+        result.update(extra or {})
         self.rows.append(result)
         self._cases_file.write(json.dumps(result) + "\n")
         self._cases_file.flush()
@@ -501,7 +514,25 @@ class Runner:
 
     async def warm(self, base_prompt: list[int], extra: int) -> dict:
         prompt = base_prompt + self.corpus.take(extra, f"warm-{len(base_prompt)}-{extra}-{len(self.rows)}")
-        return await self.run_case(f"warm {len(base_prompt)}+{extra}", [("warm", prompt)])
+        name = f"warm {len(base_prompt)}+{extra}"
+        salted = self.args.warm_salted
+        result = await self.run_case(name, [("warm", prompt)], return_ids=salted)
+        if salted:
+            # the same turn again with a cache salt: computed from token 0 without any prefix hit, so its greedy
+            # tokens are what the turn must give; a prefix hit that read a wrong recurrent state gives others
+            first = result["_records"][0]["token_ids"]
+            again = await self.run_case(f"{name} salted", [("salted", prompt)], return_ids=True,
+                                        cache_salt=f"fresh-{self.corpus.nonce}-{len(self.rows)}",
+                                        extra={"same_tokens_as": name})
+            second = again["_records"][0]["token_ids"]
+            equal = bool(first) and first == second
+            again["tokens_equal"] = equal
+            self.rows[-1]["tokens_equal"] = equal
+            common = next((i for i, (x, y) in enumerate(zip(first, second)) if x != y), min(len(first), len(second)))
+            print("SALTED %s: tokens %s (%d of %d equal from the start; cached %s then %s)" % (
+                name, "SAME" if equal else "DIFF", common, len(first),
+                result["requests"][0].get("cached_tokens"), again["requests"][0].get("cached_tokens")), flush=True)
+        return result
 
     async def turn2(self, tokens: int, generated: int, extra: int = 40) -> dict:
         prompt = self.corpus.cold(tokens)
@@ -874,6 +905,9 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     p.add_argument("--settle-seconds", type=float, default=3.0, help="canary-only time before and after a case")
     p.add_argument("--case-max-tokens", type=int, default=1,
                    help="tokens generated per case request (greedy); more than 1 gives an output to compare")
+    p.add_argument("--warm-salted", action="store_true",
+                   help="send every warm turn a second time with a cache_salt (no prefix hit) and compare the greedy "
+                   "tokens: a prefix hit that read a wrong recurrent state shows as DIFF")
     p.add_argument("--return-ids", action="store_true",
                    help="ask every case for its token ids and keep the first %d in each row" % 64)
     p.add_argument("--request-timeout", type=float, default=3600.0)
