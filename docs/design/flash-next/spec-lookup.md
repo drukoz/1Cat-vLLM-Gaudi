@@ -10,7 +10,7 @@ repository is under `/Volumes/Storage/Claude/gaudi-work/reports/spec-lookup/` (`
 
 ## Handoff (if this agent stops)
 
-State at **2026-11-20 20:10 UTC**. Branch head: the commit that holds this text, pushed. It contains
+State at **2026-11-20 20:15 UTC**. Branch head: the commit that holds this text, pushed. It contains
 mtp-card-ready through `f1aa2292` (both card fixes of job 00021, the int64 conv index, the MTP step timer) and
 the program head `1b28bbff`.
 
@@ -20,7 +20,7 @@ the program head `1b28bbff`.
 |---|---|---|
 | 00086 `tiny2-ngram3-oracle` (any:2, 10 min) | tiny model: baseline, then n-gram k = 3 with prefix caching and the rehearsal oracle | waiting, bumped by the coordinator to the tail of the 1-card wave (bound 21:09 UTC); runs commit `628d9716` |
 | 00087 `tiny2-ngram8-search` (any:2, 14 min) | tiny model: baseline, n-gram k = 8 with the oracle, n-gram k = 3 with vLLM's own search | the same (bound 21:14 UTC) |
-| `tiny2-mtp3-lookup-oracle2` (any:2, 12 min, `--replaces 00097`) | tiny model: baseline, then MTP k = 3 + the lookup hook with the oracle, three passes (hybrid, lookup-only, MTP alone) | resubmitted 20:08 UTC from `e121d61b` (00097 ran a commit without mtp-card-ready's second fix `9d013a36` and would have died at the first draft); the id is in `reports/spec-lookup/card/submit-tiny2-mtp3-lookup-oracle2.log`; 00097 had a bump, the replacement needs the coordinator's again |
+| 00107 `tiny2-mtp3-lookup-oracle2` (any:2, 12 min) | tiny model: baseline, then MTP k = 3 + the lookup hook with the oracle, three passes (hybrid, lookup-only, MTP alone) | waiting; submitted 20:12 UTC from `e121d61b` in place of 00097 (whose commit lacked mtp-card-ready's second fix `9d013a36` and would have died at the first draft); the coordinator was asked at 20:13 UTC to bump it like 00097; its detached `farm job` command copies the results (`reports/spec-lookup/card/submit-tiny2-mtp3-lookup-oracle2.log`) |
 | 00095 `real4-nospec-edit-prose` (any:4, 28 min) | real model without speculation: the edit, prose, whole-answer and large-file rounds (section 6) | waiting in 00029's place (bound 02:34 UTC, realistically hours earlier); runs commit `c13d1b97` |
 
 The local `farm job` commands that submitted 00086, 00087 and 00095 were killed with the agent's shell at 20:05
