@@ -43,8 +43,9 @@ from vllm_gaudi.v1.worker.flash_next_inputs import (build_block_table, build_ple
 from vllm_gaudi.v1.worker.flash_next_decode_metadata import (compact_state_indices, fill_pad_slots,
                                                              request_block_table, sparse_decode_metadata_refusal)
 from vllm_gaudi.v1.sample.fused_greedy import STOP_ID_WIDTH, mask_stop_tokens, min_tokens_stop_ids
-from vllm_gaudi.v1.sample.candidate_sampling import (candidate_parameters, candidate_refusal, sample_candidates,
-                                                     take_candidates)
+from vllm_gaudi.v1.sample.candidate_sampling import (CANDIDATES, candidate_parameters, candidate_refusal,
+                                                     sample_candidates)
+from vllm_gaudi.v1.sample.topk_ids import topk_with_ids
 from vllm_gaudi.v1.worker.runtime_switches import RuntimeSwitchFile
 from vllm_gaudi.v1.worker.recurrent_commit import (apply_align_precopy, boundary_commits, commit_conv, commit_ssm,
                                                    self_commit_requests)
@@ -1808,15 +1809,22 @@ class HpuModelAdapter(torch.nn.Module, HpuKVConnectorModelRunnerMixin):
         with the host's ``params`` (temperature, top_p, greedy flag, noise) and ``top_k_index``. ``mixed``: the
         batch has greedy rows, which take the arg max over the whole row as in vLLM's sampler. ``stop_ids`` /
         ``stop_rows``: the min_tokens mask of ``fused_greedy.py``, applied before the candidates are taken.
-        Returns the selected hidden states and the token ids, int64 ``[rows, 1]`` as the ops make them (no
-        integer cast in the graph: card rule 9)."""
+        Returns the selected hidden states and the token ids, int32 ``[rows, 1]``.
+
+        Ids (card evidence in ``v1/sample/topk_ids.py``): the candidates' ids are read out of an fp32 id table
+        with the top-k indices (``vocab_parallel.top_k``, ``topk_with_ids``), never cast or read back as data.
+        With ``VLLM_HPU_VOCAB_PARALLEL_LOGITS=2`` each rank takes the top ``CANDIDATES`` of its vocabulary shard
+        and the ranks all-gather ``[rows, 2 * CANDIDATES]`` fp32 instead of the logits. A greedy row of a mixed
+        batch takes ``vocab_parallel.first_maximum`` of the candidates: the lowest id of the largest logit, the
+        arg max of the whole row."""
         hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
         hidden_states = hidden_states[logits_indices]
-        logits = self.model.compute_logits(hidden_states).to(torch.float32)
-        if stop_ids is not None:
-            logits = mask_stop_tokens(logits, stop_ids, stop_rows)
-        greedy_ids = logits.argmax(dim=-1, keepdim=True) if mixed else None
-        values, ids = take_candidates(logits)
+        if stop_ids is None:
+            values, ids = vocab_parallel.top_k(self.model, hidden_states, CANDIDATES)
+        else:  # a row below its min_tokens: the mask is written into the gathered logits
+            logits = mask_stop_tokens(self.model.compute_logits(hidden_states).to(torch.float32), stop_ids, stop_rows)
+            values, ids = topk_with_ids(logits, CANDIDATES)
+        greedy_ids = vocab_parallel.first_maximum(values, ids) if mixed else None
         return hidden_states, sample_candidates(values, ids, params, top_k_index, greedy_ids)
 
     def combine_hidden_states(self, *args, **kwargs):
@@ -6029,13 +6037,15 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
     ) -> LogprobsTensors:
         # Keep the HPU prompt-logprobs path local to vllm-gaudi and avoid
         # upstream symbolic batch markers that Habana compilation cannot lower.
-        topk_logprobs, topk_indices = torch.topk(logprobs, num_prompt_logprobs, dim=-1)
+        # The top-k ids come out of an fp32 id table (v1/sample/topk_ids.py): top-k indices are never cast or
+        # read back as data on the card. The prompt's own ids are host-made, so their int32 cast is safe.
+        topk_logprobs, topk_ids = topk_with_ids(logprobs, num_prompt_logprobs)
 
         token_ids = token_ids.unsqueeze(-1)
         token_logprobs = logprobs.gather(-1, token_ids)
         token_ranks = (logprobs >= token_logprobs).sum(-1)
 
-        indices = torch.cat((token_ids, topk_indices), dim=1).to(torch.int32)
+        indices = torch.cat((token_ids.to(torch.int32), topk_ids), dim=1)
         combined_logprobs = torch.cat((token_logprobs, topk_logprobs), dim=1)
 
         return LogprobsTensors(indices, combined_logprobs, token_ranks)

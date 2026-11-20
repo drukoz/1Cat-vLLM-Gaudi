@@ -105,7 +105,7 @@ def test_sampled_requests_draw_in_the_logits_region(tiny_checkpoint, reference):
     assert steps.general == sum(1 for greedy, _ in steps.gate if greedy)
     checked = 0
     for logits, tokens, params, top_k_index in steps.draws:
-        assert tokens.dtype == torch.int64 and tokens.shape == (logits.shape[0], 1)
+        assert tokens.dtype == torch.int32 and tokens.shape == (logits.shape[0], 1)  # ids from an fp32 id table
         greedy_rows = params[:, 2] != 0
         want = vllm_probs(logits, params[:, 0], (top_k_index.view(-1) + 1).to(torch.int32), params[:, 1])
         values, ids = take_candidates(logits)

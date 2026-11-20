@@ -32,9 +32,11 @@ request's row from its own generator. So the device needs no random op, and what
 noise only.
 
 Shapes are fixed per batch bucket and every op is one the card runs elsewhere (top-k, gather with a host-made
-int64 index, masked fill, softmax, cumulative sum, a concatenation of slices, arg max). Integer ids (card rule
-9): the candidates' ids stay int64 as ``topk`` makes them, the index of the k-th column is made on the host as
-int64, and nothing is narrowed in the graph; the runner reads the sampled ids back as int64.
+int64 index, masked fill, softmax, cumulative sum, a concatenation of slices, arg max). Integer ids: in the
+runner's region (``HpuModelAdapter.select_compute_logits_and_sample``) the candidates' ids are read out of an fp32
+id table with the top-k indices (``vocab_parallel.top_k``, ``topk_ids.topk_with_ids``: top-k indices are never
+cast or read back as data on the card), so the drawn ids are int32; the index of the k-th column is made on the
+host as int64. ``take_candidates`` (int64 ids as ``topk`` makes them) is the CPU oracle of the tests.
 
 Pure functions: this module imports only ``torch``.
 """
@@ -51,7 +53,8 @@ GREEDY_TEMPERATURE = 1e-5  # vLLM's _SAMPLING_EPS: below it a request is greedy
 
 def take_candidates(logits: torch.Tensor, candidates: int = CANDIDATES) -> tuple[torch.Tensor, torch.Tensor]:
     """``(values fp32 [rows, C], ids int64 [rows, C])``: the ``C`` largest logits of every row, largest first,
-    and their token ids. The one call a vocabulary-parallel top-k replaces."""
+    and their token ids as ``topk`` makes them: the CPU oracle. On the card the region takes ``vocab_parallel.top_k``
+    (int32 ids out of an fp32 id table) instead."""
     values, ids = logits.to(torch.float32).topk(candidates, dim=-1)
     return values, ids
 
@@ -80,11 +83,12 @@ def sample_candidates(values: torch.Tensor,
                       params: torch.Tensor,
                       top_k_index: torch.Tensor,
                       greedy_ids: Optional[torch.Tensor] = None) -> torch.Tensor:
-    """The sampled token ids, int64 ``[rows, 1]``.
+    """The sampled token ids ``[rows, 1]`` in the dtype of ``ids``.
 
-    ``values`` / ``ids`` from ``take_candidates``; ``params`` / ``top_k_index`` from ``candidate_parameters``.
-    ``greedy_ids`` (int64 ``[rows, 1]``, the arg max over the whole row) is given for a batch that has greedy
-    rows: those rows return it, as vLLM's sampler does for a mixed batch.
+    ``values`` / ``ids`` from ``vocab_parallel.top_k`` (int32 ids) or ``take_candidates`` (int64); ``params`` /
+    ``top_k_index`` from ``candidate_parameters``. ``greedy_ids`` (``[rows, 1]`` in the dtype of ``ids``, the arg
+    max over the whole row) is given for a batch that has greedy rows: those rows return it, as vLLM's sampler
+    does for a mixed batch.
     """
     probs = candidate_probs(values, params[:, 0], top_k_index, params[:, 1])
     choice = (probs / params[:, PARAM_COLUMNS:]).argmax(dim=-1, keepdim=True)
