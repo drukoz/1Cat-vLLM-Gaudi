@@ -6,7 +6,7 @@ This file is the track's report. The harness of the track's agents does not writ
 
 ## Handoff (if this agent stops)
 
-Last update: 2026-11-20 23:37 UTC (fourth agent of the track, Opus 5.5, started 23:15 UTC). Coordinator's rule
+Last update: 2026-11-20 23:50 UTC (fourth agent of the track, Opus 5.5, started 23:15 UTC). Coordinator's rule
 for tonight (BRIEF 23:21): card evidence first, no pull request before 04:00 UTC; push the branch after each green
 step and tell the coordinator the commit and the flags (the integration track builds from this branch).
 
@@ -17,7 +17,13 @@ rows) while a draft pass Fd is small (4.4 / 6.0 / 10.7 ms). Acceptance holds at 
 per position). The open questions are what the QSA data-flow change and the kernel-fixes flags do to Ft at 128
 rows, whether k = 1 beats k = 3 at 32 streams, and what sampled verification (I07) costs: jobs 00126 / 00127.
 
-**Branch** (pushed: `origin/feat/flash-next-gaudi-mtp-card-ready` = `13d7393a`):
+**Branch** (pushed: `origin/feat/flash-next-gaudi-mtp-card-ready` = `1f2dc38e` and this handoff):
+- `1f2dc38e` I07 fast path: `VLLM_HPU_SPEC_SAMPLED_VERIFY=2`, sampled verification over the top-64 candidates of
+  every verification and bonus row (`vllm_gaudi/v1/sample/hpu_candidate_verify.py`, hook
+  `HPUModelRunner._candidate_verify`); steps with a seeded request, logprobs or top_k outside 1..64 take the exact
+  path (`=1`). `tools/flash_next/candidate_verify_bench.py`: both paths on one card. CPU: 10 + 14 sampler tests,
+  60 platform tests, the CPU engine with `=2` and top_k 20 verifies over candidates (4 engine tests passed,
+  `reports/mtp-card-ready/cpu4/engine_mtp-cand.log`). Never ran on a card yet (job below).
 - `6a0a046e` spec_scaling.py + mtp_real_card.sh (the previous agent's uncommitted probe, 18 tests passed).
 - `fc43e7de` merge of the program head `938dada4` (PR #13, #14), clean; `697bffed` merge of
   `origin/feat/flash-next-gaudi-qsa-fused` (`a5f837ca`), clean; `26d9ee1a` merge of
@@ -53,12 +59,13 @@ rows, whether k = 1 beats k = 3 at 32 streams, and what sampled verification (I0
   rung ran (the fused one, `VLLM_HPU_GDN_CORE_VERIFY=1`).
 
 **Pending, in order**
-1. Read 00126 / 00127 when they end; numbers to the coordinator and into "Card results" below.
-2. I07 fast path (`VLLM_HPU_SPEC_SAMPLED_VERIFY=2`): sampled verification over the top-64 candidates of every
-   verification and bonus row (engine-step's `candidate_probs` without the int64 gather; ids from an fp32 id table
-   as collectives' `vocab_parallel.top_k` makes them, so no top-k index is read back to the host as data, BRIEF
-   23:23), host-made noise from a generator seeded alike on every rank; eligible when every request has
-   1 <= top_k <= 64, no seed, no logprobs; otherwise today's exact path (`=1`). Then a card arm against `=1`.
+1. Read 00126 / 00127 when they end (they start after the integration track's 00128, by 00:19 UTC at the latest);
+   numbers to the coordinator (per arm and level: ms per step, tokens per step, ms per token, tok/s per stream,
+   Ft / Fd, acceptance per position, hl-smi peak; k = 1 against k = 3 at 32 streams) and into "Card results".
+2. I07 fast path on the card: the 1-card bench job (`cand-verify-bench`, below), then a real-model arm with
+   `VLLM_HPU_SPEC_SAMPLED_VERIFY=2` (sampled rounds at 1 and 32 streams) against 00126's `=1` sampled rounds:
+   `mtp_arms.sh 'cand|K||--levels 32 --tokens 256 --repeat-top 1 --sampled-levels 1,32'` with 00126's flags,
+   `VLLM_HPU_SPEC_SAMPLED_VERIFY=2` and K the best k at 32 streams.
 3. k from arithmetic (`tools/flash_next/mtp_k_choice.py`): E(k) = 1 + r1 + ... + rk with the unconditional
    per-position rates; cost Ft(rows(k)) + k Fd. k = 4 / 5 only where Fd stays small against Ft (1 stream).
 4. Pull request after 04:00 UTC: gate (`bin/gate <worktree> --tools`) on a snapshot, PR to
