@@ -323,3 +323,12 @@ def test_request_timeout_is_reported_as_an_error_row(tmp_path):
     row = ps.request_row(record)
     assert row["ttft_s"] is None and row["prefill_tokens_per_s"] is None
     assert time.time() - record["t_send"] < 30
+
+
+def test_case_max_tokens_and_return_ids_record_the_greedy_output(server, tmp_path):
+    code, report, _ = run_tool(server, tmp_path, "--plan", "ladder", "--ladder", "2048", "--canaries", "0",
+                               "--case-max-tokens", "4", "--return-ids")
+    assert code == 0
+    request = by_case(report)["cold 2048"]["requests"][0]
+    assert request["output_tokens"] == 4
+    assert len(request["token_ids"]) == 4

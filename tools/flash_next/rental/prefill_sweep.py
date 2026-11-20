@@ -61,6 +61,7 @@ TOKENIZE_TIMEOUT_S = 120.0
 SALT_TOKENS = 16
 KNOBS_SETTLE_S = 0.8  # the engine polls the knobs file every 0.25 s
 SYNTHETIC_ID_RANGE = (1000, 60000)  # ordinary vocabulary ids, far from the special tokens at the top
+RECORDED_TOKEN_IDS = 64  # output token ids kept per request row (--return-ids)
 
 PLANS = ("baseline", "ladder", "sweep", "pacing")
 DEFAULT_SETTINGS = "8192:2048,8192:8192,16384:4096,16384:16384,32768:8192,32768:32768,65536:16384,65536:0"
@@ -331,6 +332,8 @@ def request_row(record: dict) -> dict:
     row["uncached_tokens"] = prompt - cached
     row["ttft_s"] = None if record["t_first"] is None else record["t_first"] - record["t_send"]
     row["prefill_tokens_per_s"] = (None if not row["ttft_s"] else row["uncached_tokens"] / row["ttft_s"])
+    if record["token_ids"]:
+        row["token_ids"] = record["token_ids"][:RECORDED_TOKEN_IDS]  # greedy output, to compare two servers
     return row
 
 
@@ -405,9 +408,14 @@ class Runner:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
 
-    async def run_case(self, case: str, prompts: list[tuple[str, list[int]]], max_tokens: int = 1,
+    async def run_case(self, case: str, prompts: list[tuple[str, list[int]]], max_tokens: int = 0,
                        return_ids: bool = False, canaries: bool = True) -> dict:
-        """Send ``prompts`` together and wait for them; with canary streams decoding around them."""
+        """Send ``prompts`` together and wait for them; with canary streams decoding around them.
+
+        ``max_tokens`` 0 means ``--case-max-tokens``; ``--return-ids`` asks every case for its token ids.
+        """
+        max_tokens = max_tokens or self.args.case_max_tokens
+        return_ids = return_ids or self.args.return_ids
         before = self.metrics()
         canary_records, canary_tasks, t_ready = ([], [], time.time())
         if canaries and self.args.canaries > 0:
@@ -664,6 +672,10 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     p.add_argument("--canary-max-tokens", type=int, default=60000)
     p.add_argument("--canary-warm-tokens", type=int, default=8, help="tokens a canary must have produced first")
     p.add_argument("--settle-seconds", type=float, default=3.0, help="canary-only time before and after a case")
+    p.add_argument("--case-max-tokens", type=int, default=1,
+                   help="tokens generated per case request (greedy); more than 1 gives an output to compare")
+    p.add_argument("--return-ids", action="store_true",
+                   help="ask every case for its token ids and keep the first %d in each row" % 64)
     p.add_argument("--request-timeout", type=float, default=3600.0)
     p.add_argument("--synthetic-ids", action="store_true", help="pseudo-random token ids, no /tokenize call")
     p.add_argument("--corpus-tokens", type=int, default=400000)
