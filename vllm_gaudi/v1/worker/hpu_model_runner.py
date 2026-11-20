@@ -47,6 +47,7 @@ from vllm_gaudi.v1.worker.recurrent_spec import (accepted_counts, load_checkpoin
                                                  recurrent_spec_enabled, state_slots_per_request,
                                                  verification_state_width)
 from vllm_gaudi.v1.spec_decode.flash_next_mtp_steps import is_flash_next_mtp
+from vllm_gaudi.distributed import vocab_parallel
 from vllm_gaudi.platform import is_flash_next_model
 
 from vllm.v1.attention.backend import AttentionBackend, AttentionType, CommonAttentionMetadata
@@ -1770,9 +1771,10 @@ class HpuModelAdapter(torch.nn.Module, HpuKVConnectorModelRunnerMixin):
         """Keep the LM head and plain-greedy argmax in one compiled region."""
         hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
         hidden_states = hidden_states[logits_indices]
-        logits = self.model.compute_logits(hidden_states)
-        sampled_token_ids = logits.to(torch.float32).argmax(dim=-1)
-        return hidden_states, sampled_token_ids.to(torch.int32).unsqueeze(-1)
+        # compute_logits (the all-gather) and the arg max of its fp32 conversion; with
+        # VLLM_HPU_VOCAB_PARALLEL_LOGITS >= 1 each rank reduces its vocabulary shard first.
+        sampled_token_ids = vocab_parallel.top_tokens(self.model, hidden_states)
+        return hidden_states, sampled_token_ids.unsqueeze(-1)
 
     def combine_hidden_states(self, *args, **kwargs):
         return self.model.combine_hidden_states(*args, **kwargs)
@@ -6067,9 +6069,16 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
 
     def _can_fuse_plain_greedy_sampling(self, request_ids: list[str]) -> bool:
         """Whether argmax can safely run in the compiled LM-head region."""
-        if not gaudi_envs.VLLM_HPU_FUSED_GREEDY_LOGITS:
+        # VLLM_HPU_VOCAB_PARALLEL_LOGITS >= 1 asks for the arg max without the logits all-gather: the same
+        # region, for the same plain greedy requests, and also for the greedy verification of a Flash-Next
+        # MTP step (the rejection sampler needs the arg max of every verification row and nothing else).
+        vocab_parallel_on = vocab_parallel.mode() != vocab_parallel.VocabParallelMode.OFF
+        if not (gaudi_envs.VLLM_HPU_FUSED_GREEDY_LOGITS or vocab_parallel_on):
             return False
-        if not request_ids or self.speculative_config is not None or self.use_structured_output:
+        if not request_ids or self.use_structured_output:
+            return False
+        if self.speculative_config is not None and not (vocab_parallel_on
+                                                        and is_flash_next_mtp(self.speculative_config)):
             return False
 
         # Built-in min-tokens and logit-bias processors are covered by the
@@ -6636,11 +6645,16 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                 assert logits_device is not None
                 logits_decode.append(logits_device[:num_decodes])
                 decode_sampled_requests.extend(self.input_batch.req_ids[:num_decodes])
-            elif fused_sampled_token_ids is not None:
+            elif fused_sampled_token_ids is not None and decode_data.spec_decode_metadata is None:
                 decode_sampled_token_ids.append(fused_sampled_token_ids.flatten())
                 decode_sampled_requests.extend(self.input_batch.req_ids[:num_decodes])
+                if self._recurrent_spec:
+                    # A plain target step, as in the sampler branch below: the next verification
+                    # starts from checkpoint 0.
+                    for req_id in self.input_batch.req_ids[:num_decodes]:
+                        self._gdn_num_accepted_by_req[req_id] = 1
             else:
-                assert logits_device is not None
+                assert logits_device is not None or fused_sampled_token_ids is not None
                 with self.profiler.record_event('internal', "sampler"):
                     ##### Sampling Start #####
                     spec_decode_metadata = decode_data.spec_decode_metadata
@@ -6658,6 +6672,9 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                         )
                         htorch.core.mark_step()
                         sampler_output = None
+                    elif fused_sampled_token_ids is not None:
+                        # Greedy verification from the arg max of every row: no sampler pass over logits.
+                        sampler_output, sampling_metadata = None, None
                     else:
                         sampler_output, sampling_metadata = self._run_sampling(
                             batch_changed, logits_device if spec_decode_metadata is None else
@@ -6679,6 +6696,16 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                     else:
                         # Handling spec decode sampling.
                         sampled_token_ids = None
+                        if fused_sampled_token_ids is not None:
+                            from vllm_gaudi.v1.sample.hpu_greedy_verify import greedy_rejection_sample_from_tokens
+
+                            sampled_token_ids = greedy_rejection_sample_from_tokens(
+                                fused_sampled_token_ids.flatten(),
+                                spec_decode_metadata.draft_token_ids,
+                                spec_decode_metadata.target_logits_indices,
+                                spec_decode_metadata.bonus_logits_indices,
+                                spec_decode_metadata.cu_num_draft_tokens,
+                            )
                         if is_dflash_spec and not self.rejection_sampler.synthetic_mode:
                             from vllm_gaudi.v1.sample.hpu_rejection_sampler import (
                                 _dflash2_greedy_fastpath_supported, )
