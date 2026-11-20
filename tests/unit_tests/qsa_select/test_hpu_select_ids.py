@@ -165,6 +165,23 @@ def test_the_cast_and_the_candidates(decode8):
         entry["rows"] = len(sc.real_rows(case))
         results[name] = entry
         record(f"variant/{name}", entry)
+    # Job 00038's own read: the narrowed ids are the graph's output (nothing consumes them in the graph), against
+    # the int64 ids of the same top-k computed again in a graph of its own.
+    for name in ("cast", "gather_arange"):
+        try:
+            s, v = scores.to(DEVICE), visible.to(DEVICE)
+            cols = torch.arange(sc.N_KEYS, device=s.device)
+            vals, idx = torch.topk(s.masked_fill(cols[None, :] >= v[:, None], float("-inf")), sc.TOPK, dim=-1)
+            direct = narrow(name, idx, vals, sc.N_KEYS).cpu()
+            wide_vals, wide = torch.topk(s.masked_fill(cols[None, :] >= v[:, None], float("-inf")), sc.TOPK, dim=-1)
+            wide, real = wide.cpu(), wide_vals.cpu() > float("-inf")  # the order among masked columns is not compared
+            differ = (direct.to(torch.int64) != wide.to(torch.int64)) & real
+            record(f"variant/{name}_direct_read", {
+                "elements": int(real.sum()), "differ": int(differ.sum()), "rows_wrong": int(differ.any(1).sum()),
+                "rows": int(wide.shape[0]), "in_range": bool(((direct >= 0) & (direct < sc.N_KEYS)).all()),
+                "got": direct[0, :6].tolist(), "want": wide[0, :6].tolist()})
+        except Exception as exc:  # noqa: BLE001
+            record(f"variant/{name}_direct_read", {"raised": f"{type(exc).__name__}: {str(exc)[:300]}"})
     # The second-graph form of job 00038: the ids are read first (as int64), then narrowed in a new graph.
     try:
         dev = sc.on_device(case, DEVICE)

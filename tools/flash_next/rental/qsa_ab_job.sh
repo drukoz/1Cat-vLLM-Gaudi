@@ -74,10 +74,14 @@ mode = 0
 if not (d.get("plugin/select_blocks", {}).get("ok") or right("gather_arange")):
     mode = 1 if right("cast") else (2 if right("via_fp32") else 0)
 rows = cast.get("rows")
-print("%d|RULE9 VERDICT: the cast topk(...).indices.to(int32) in one graph: host read wrong on %s of %s rows, "
-      "in-graph consumer wrong on %s of %s rows%s; forms right in the graph: %s; forms wrong in the graph: %s; the "
-      "plugin as it is (a gather from an int32 arange): %s; the server runs VLLM_HPU_QSA_TOPK_IDS=%d" % (
-          mode, cast.get("host_read_wrong_rows", cast.get("host_read_raised")), rows,
+direct = d.get("variant/cast_direct_read", {})
+print("%d|RULE9 VERDICT: the cast topk(...).indices.to(int32) in one graph: read directly as the graph's output "
+      "(job 00038's read) %s of %s ids differ; as select_blocks uses it (mask, expansion) the host read is wrong on "
+      "%s of %s rows and the in-graph consumer on %s of %s rows%s; forms right in the graph: %s; forms wrong in the "
+      "graph: %s; the plugin as it is (a gather from an int32 arange): %s; the server runs "
+      "VLLM_HPU_QSA_TOPK_IDS=%d" % (
+          mode, direct.get("differ", direct.get("raised")), direct.get("elements"),
+          cast.get("host_read_wrong_rows", cast.get("host_read_raised")), rows,
           cast.get("in_graph_consumer_wrong_rows", cast.get("in_graph_consumer_raised")), rows,
           (" (" + cast["host_read_detail"] + ")") if cast.get("host_read_detail") else "",
           ",".join(n for n in names if right(n)) or "none", ",".join(n for n in names if not right(n)) or "none",
