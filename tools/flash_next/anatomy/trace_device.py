@@ -149,14 +149,25 @@ def analyze(data: dict, steps: int | None = None, burst_gap_ms: float = 1.0, min
     if current is not None:
         bursts.append(current)
     long_bursts = [b for b in bursts if (b[1] - b[0]) >= min_burst_ms * 1e3]
-    n_steps = steps or max(1, len(long_bursts))
+    # The step timer's profiler ranges (VLLM_HPU_STEP_TIMING >= 1): one "step_timing:step" per step, its kind and
+    # row count in a "step_timing:<kind>:<rows>" range inside it.
+    markers = [(s0, e0) for s0, e0, ev in host if ev.get("name") == "step_timing:step"]
+    kinds = Counter(str(ev.get("name"))[len("step_timing:"):] for _, _, ev in host
+                    if str(ev.get("name", "")).startswith("step_timing:") and ev.get("name") != "step_timing:step")
+    if steps:
+        n_steps, steps_from = steps, "argument"
+    elif markers:
+        n_steps, steps_from = len(markers), "step timer ranges"
+    else:
+        n_steps, steps_from = max(1, len(long_bursts)), "bursts"
     comm_only = total(merge(by_class.get("COMM", []))) - sum(
         total(clip(compute, a, b)) for a, b in merge(by_class.get("COMM", [])))
     span = hi - lo
     result.update({
         "window_ms": span / 1e3,
         "steps": n_steps,
-        "steps_from": "argument" if steps else "bursts",
+        "steps_from": steps_from,
+        "step_kinds": dict(kinds),
         "per_step_ms": {
             "window": span / 1e3 / n_steps,
             "busy_any": total(everything) / 1e3 / n_steps,

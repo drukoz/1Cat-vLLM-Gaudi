@@ -466,3 +466,30 @@ def test_the_plugin_documents_the_three_variables():
     for name in ("VLLM_HPU_STEP_TIMING", "VLLM_HPU_STEP_TIMING_EVERY", "VLLM_HPU_STEP_TIMING_DIR"):
         assert name in envs.environment_variables
     assert envs.environment_variables["VLLM_HPU_STEP_TIMING"]() in (0, 1, 2, 3, 4)
+
+
+def test_profiler_markers_cut_the_trace_into_steps(tmp_path):
+    """While a torch profiler records, every timed step is a range ``step_timing:step`` with its kind and rows."""
+    import torch
+
+    timer = StepTimer("worker", rank=0, mode=step_timing.MODE_SPANS, every=1000, out_dir=str(tmp_path))
+    timer.begin_step()  # no profiler: no marker
+    timer.tag("decode", 2, 2)
+    timer.end_step()
+    with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU]) as prof:
+        for rows in (4, 4, 8):
+            timer.begin_step()
+            timer.tag("decode", rows, rows)
+            torch.ones(3) + 1
+            timer.lap("forward")
+            timer.end_step()
+        timer.begin_step()  # a step that never ends: the next one closes its range
+        timer.begin_step()
+        timer.discard_step()
+    names = [event.name for event in prof.events()]
+    assert names.count("step_timing:step") == 5
+    assert names.count("step_timing:decode:4") == 2 and names.count("step_timing:decode:8") == 1
+    assert timer._marker is None
+    timer.begin_step()  # the profiler stopped: no marker again
+    assert timer._marker is None
+    timer.discard_step()

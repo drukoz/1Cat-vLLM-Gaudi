@@ -60,3 +60,16 @@ def test_steps_argument_and_gzip_and_cli(tmp_path):
 def test_no_device_events_is_an_error():
     res = trace_device.analyze({"traceEvents": [{"ph": "X", "pid": 1, "tid": 1, "name": "a", "ts": 0, "dur": 1}]})
     assert "error" in res
+
+
+def test_step_timer_ranges_set_the_step_count():
+    data = _trace(steps=3)
+    for k in range(5):  # five timed steps on the host, two of them decode at 32 rows
+        data["traceEvents"].append({"ph": "X", "pid": 1, "tid": 1, "name": "step_timing:step", "ts": 100.0 * k,
+                                    "dur": 50.0})
+    for k in range(2):
+        data["traceEvents"].append({"ph": "X", "pid": 1, "tid": 1, "name": "step_timing:decode:32",
+                                    "ts": 100.0 * k + 1, "dur": 0.0})
+    res = trace_device.analyze(data)
+    assert res["steps"] == 5 and res["steps_from"] == "step timer ranges"
+    assert res["step_kinds"] == {"decode:32": 2}

@@ -33,6 +33,10 @@ calls) | ``setup`` | ``prepare`` | ``launch_inputs`` | ``forward`` | ``logits`` 
 
 A process whose timer exists rereads ``<dir>/step_timing.mode`` (one integer) whenever a step starts after an idle
 gap of two seconds, so one server can serve several modes without a restart: write the file while no request runs.
+
+While a torch profiler records (``/start_profile``), every timed step of a process is also a profiler range named
+``step_timing:step``, and its kind and row count a zero-length range ``step_timing:<kind>:<rows>`` inside it, so a
+device trace can be cut into steps exactly (``tools/flash_next/anatomy/trace_device.py``).
 """
 
 from __future__ import annotations
@@ -218,6 +222,8 @@ class StepTimer:
         self._warned = set()
         self._write_failed = False
         self.phase = "forward"  # the host span a collective's preceding accumulation belongs to
+        self._marker = None  # the open profiler range of the step, while a torch profiler records
+        self._profiler_on = _MISSING  # torch.autograd._profiler_enabled, looked up at the first step
         self.path = os.path.join(self.out_dir, "step_timing_%s_r%d_%d.jsonl" % (role, self.rank, self.pid))
         if self.mode == MODE_COUNTERS:
             self._install_counters()
@@ -265,6 +271,7 @@ class StepTimer:
             self._gap = None
         else:
             self._gap = now - self._t_end
+        self._close_marker()  # a step that never ended (an exception) leaves no range open
         if self.mode == MODE_OFF:
             self._open = self.active = False
             return
@@ -278,6 +285,43 @@ class StepTimer:
         self._segments = []
         self._op_names = {}
         self.phase = "forward"
+        self._open_marker()
+
+    # ------------------------------------------------------------------------------- profiler markers
+    def _profiling(self) -> bool:
+        probe = self._profiler_on
+        if probe is _MISSING:
+            try:
+                import torch
+                probe = torch.autograd._profiler_enabled
+            except Exception:  # noqa: BLE001 - no torch, no markers
+                probe = None
+            self._profiler_on = probe
+        if probe is None:
+            return False
+        try:
+            return bool(probe())
+        except Exception:  # noqa: BLE001
+            return False
+
+    def _open_marker(self) -> None:
+        if self._marker is not None or not self._profiling():
+            return
+        try:
+            import torch
+            marker = torch.profiler.record_function("step_timing:step")
+            marker.__enter__()
+            self._marker = marker
+        except Exception:  # noqa: BLE001 - a marker is never worth a step
+            self._marker = None
+
+    def _close_marker(self) -> None:
+        marker, self._marker = self._marker, None
+        if marker is not None:
+            try:
+                marker.__exit__(None, None, None)
+            except Exception:  # noqa: BLE001
+                pass
 
     def lap(self, name: str) -> None:
         """The time since the last boundary of the open step belongs to span ``name``."""
@@ -308,6 +352,13 @@ class StepTimer:
             self._tags = (kind, int(rows))
             if tokens is not None:
                 self._counts["tokens"] = int(tokens)
+            if self._marker is not None:
+                try:
+                    import torch
+                    with torch.profiler.record_function("step_timing:%s:%d" % (kind, int(rows))):
+                        pass
+                except Exception:  # noqa: BLE001
+                    pass
 
     def bucket(self, rows: int) -> None:
         if self._open:
@@ -318,6 +369,7 @@ class StepTimer:
         if self._open:
             self._open = self.active = False
             self._t_end = self._clock()
+            self._close_marker()
 
     def end_step(self, final_span: str = "post") -> None:
         """Close the open step; what is left since the last boundary belongs to ``final_span``. A step that was
@@ -325,6 +377,7 @@ class StepTimer:
         if not self._open:
             return
         now = self._clock()
+        self._close_marker()
         spans = self._spans
         spans[final_span] = spans.get(final_span, 0) + now - self._t_last
         total = now - self._t_begin
