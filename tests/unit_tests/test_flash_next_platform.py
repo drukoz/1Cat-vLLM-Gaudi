@@ -225,11 +225,11 @@ def test_spec_compact_gdn_off_raises(monkeypatch):
 
 def test_spec_too_many_tokens_raises(monkeypatch):
     monkeypatch.setenv("VLLM_COMPACT_GDN", "1")
-    with pytest.raises(ValueError, match="1 to 4 speculative tokens"):
+    with pytest.raises(ValueError, match="1 to 5 speculative tokens"):
         _validate_flash_next_speculative_config(_spec_config(k=7))
 
 
-SUPPORTED_SIZES = (1, 2, 3, 4)  # MTP
+SUPPORTED_SIZES = (1, 2, 3, 4, 5)  # MTP
 NGRAM_SUPPORTED_SIZES = tuple(range(1, 9))
 SERVER_KINDS = [("mtp", ("Qwen4ExpMTP", ), False), ("mtp", ("Qwen4ExpMTP", ), True), ("ngram", (), False),
                 ("ngram", (), True)]
@@ -237,7 +237,7 @@ SERVER_KIND_IDS = ["mtp", "mtp_prefix_caching", "ngram", "ngram_prefix_caching"]
 # (method, draft architectures, prefix caching, k) of every served size and of the sizes just outside the range
 SERVED = [(m, a, pc, k) for (m, a, pc) in SERVER_KINDS
           for k in (NGRAM_SUPPORTED_SIZES if m == "ngram" else SUPPORTED_SIZES)]
-REFUSED = [(m, a, pc, k) for (m, a, pc) in SERVER_KINDS for k in ((0, 9, 10, 16) if m == "ngram" else (0, 5, 6, 7))]
+REFUSED = [(m, a, pc, k) for (m, a, pc) in SERVER_KINDS for k in ((0, 9, 10, 16) if m == "ngram" else (0, 6, 7))]
 
 
 def _validate_size(monkeypatch, method, draft_archs, prefix_caching, k):
@@ -253,14 +253,14 @@ def test_spec_supported_sizes_pass(monkeypatch, method, draft_archs, prefix_cach
 
 @pytest.mark.parametrize("method,draft_archs,prefix_caching,k", REFUSED)
 def test_spec_sizes_outside_the_supported_range_raise(monkeypatch, method, draft_archs, prefix_caching, k):
-    limit = 8 if method == "ngram" else 4
+    limit = 8 if method == "ngram" else 5
     with pytest.raises(ValueError, match=f"1 to {limit} speculative tokens"):
         _validate_size(monkeypatch, method, draft_archs, prefix_caching, k)
 
 
 def test_spec_bound_against_the_sizes_the_cpu_tests_run(monkeypatch):
-    """The validator accepts 1 to 4. The CPU tests run 3, 4 and, ahead of the validator, 5, the largest
-    lattice the fused verify kernel takes (1 + k = 6 nodes); a size they call served must be accepted."""
+    """The validator accepts 1 to 5: 5 is the largest lattice the fused verify kernel takes (1 + k = 6 nodes),
+    and the CPU tests run 3, 4 and 5; a size they call served must be accepted."""
     from flashinfer_gaudi.gdn_core_verify import GDN_CORE_VERIFY_MAX_NODES
     from tests.unit_tests.flash_next_spec_sizes import PROVEN_NOT_SERVED, RECIPE_K, SPEC_SIZES
 
@@ -273,7 +273,8 @@ def test_spec_bound_against_the_sizes_the_cpu_tests_run(monkeypatch):
 
     assert [k for k in range(0, 12) if accepted(k)] == list(SUPPORTED_SIZES)
     assert [k for k in SPEC_SIZES if accepted(k)] == [k for k in SPEC_SIZES if k not in PROVEN_NOT_SERVED]
-    assert max(SPEC_SIZES) == GDN_CORE_VERIFY_MAX_NODES - 1
+    assert max(SPEC_SIZES) == GDN_CORE_VERIFY_MAX_NODES - 1 == max(SUPPORTED_SIZES)
+    assert PROVEN_NOT_SERVED == ()
     assert RECIPE_K == 3 and RECIPE_K in SUPPORTED_SIZES
 
 
@@ -292,3 +293,62 @@ def test_spec_none_passes(monkeypatch):
     config = _spec_config()
     config.speculative_config = None
     _validate_flash_next_speculative_config(config)
+
+
+# ---- sampled requests on a speculative server (idea-sweep I07): refused unless VLLM_HPU_SPEC_SAMPLED_VERIFY=1
+
+
+@pytest.fixture
+def speculative_server(monkeypatch):
+    import vllm_gaudi.platform as platform_module
+
+    monkeypatch.setattr(platform_module, "_SPEC_GREEDY_ONLY", False)
+    monkeypatch.setattr(platform_module, "_SPECULATIVE_SERVER", False)
+    monkeypatch.setenv("VLLM_COMPACT_GDN", "1")
+    return platform_module
+
+
+def _params(temperature):
+    from vllm import SamplingParams
+
+    return SamplingParams(temperature=temperature, max_tokens=4)
+
+
+def test_a_sampled_request_on_a_speculative_server_is_refused(speculative_server, monkeypatch):
+    monkeypatch.setenv("VLLM_HPU_SPEC_SAMPLED_VERIFY", "0")
+    _validate_flash_next_speculative_config(_spec_config())
+    with pytest.raises(ValueError, match="VLLM_HPU_SPEC_SAMPLED_VERIFY=1"):
+        speculative_server.HpuPlatform.validate_request(None, _params(1.0))
+    speculative_server.HpuPlatform.validate_request(None, _params(0.0))  # greedy: served
+
+
+def test_a_sampled_request_is_served_with_the_flag(speculative_server, monkeypatch):
+    monkeypatch.setenv("VLLM_HPU_SPEC_SAMPLED_VERIFY", "1")
+    _validate_flash_next_speculative_config(_spec_config())
+    speculative_server.HpuPlatform.validate_request(None, _params(0.7))
+
+
+def test_a_server_without_speculation_serves_sampled_requests(speculative_server, monkeypatch):
+    monkeypatch.setenv("VLLM_HPU_SPEC_SAMPLED_VERIFY", "0")
+    config = _spec_config()
+    config.speculative_config = None
+    _validate_flash_next_speculative_config(config)
+    speculative_server.HpuPlatform.validate_request(None, _params(1.0))
+
+
+@pytest.mark.parametrize("field,value", [("presence_penalty", 0.5), ("frequency_penalty", 0.2),
+                                         ("repetition_penalty", 1.1), ("allowed_token_ids", [1, 2])])
+def test_penalties_and_token_masks_are_refused_on_a_speculative_server(speculative_server, monkeypatch, field, value):
+    from vllm import SamplingParams
+
+    monkeypatch.setenv("VLLM_HPU_SPEC_SAMPLED_VERIFY", "1")
+    _validate_flash_next_speculative_config(_spec_config())
+    with pytest.raises(ValueError, match=field):
+        speculative_server.HpuPlatform.validate_request(None, SamplingParams(temperature=0.0, **{field: value}))
+    speculative_server.HpuPlatform.validate_request(None, SamplingParams(temperature=0.0))
+
+
+def test_penalties_are_served_without_speculation(speculative_server):
+    from vllm import SamplingParams
+
+    speculative_server.HpuPlatform.validate_request(None, SamplingParams(temperature=0.0, repetition_penalty=1.1))

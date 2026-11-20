@@ -60,6 +60,7 @@ usage() {
     echo "  --reinstall     install the stack again in the existing container (after a change under plugin/)"
     echo "  --fresh         remove the container first: new install, new tiny checkpoint"
     echo "  --full-warmup   run the real bucket warmup (about 15 minutes per mode); the default skips it"
+    echo "  --spec K        after each mode, its speculative mode <mode>+mtpK: the MTP layer drafts K tokens; the tokens are compared with the reference and with the mode without speculation, the acceptance length is printed; rungs: the fused verification op, the torch verification, no speculation"
     echo "  --health-timeout S  seconds to wait for the server to get healthy (default in the check: 1800)"
     echo "  --env KEY=VALUE extra server environment variable, repeatable; applied after the mode's own flags"
     echo "  --no-recipe-cache   give no server the compiled-recipe cache under /results/recipe-cache (by default the pytorch mode's server gets it, and the fused mode's with the combined kernel database)"
@@ -76,6 +77,7 @@ FRESH=0
 DRY_RUN=0
 FULL_WARMUP=0
 HEALTH_TIMEOUT=""
+SPEC=""
 NO_RECIPE_CACHE=0
 NO_COMBINED_DB=0
 EXTRA_ENV=()
@@ -109,6 +111,10 @@ while [ $# -gt 0 ]; do
         --full-warmup)
             FULL_WARMUP=1
             shift
+            ;;
+        --spec)
+            SPEC="$2"
+            shift 2
             ;;
         --health-timeout)
             HEALTH_TIMEOUT="$2"
@@ -209,6 +215,9 @@ build_commands() {
     fi
     if [ "$FULL_WARMUP" -eq 1 ]; then
         SMOKE_CMD+=(--full-warmup)
+    fi
+    if [ -n "$SPEC" ]; then
+        SMOKE_CMD+=(--spec "$SPEC")
     fi
     if [ -n "$HEALTH_TIMEOUT" ]; then
         SMOKE_CMD+=(--health-timeout "$HEALTH_TIMEOUT")
