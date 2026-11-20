@@ -9849,8 +9849,12 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                     prefill_batch_start_idx += len(req_id)
 
                 if draft_token_ids is None:
+                    if not draft_token_ids_prefill:
+                        # Every prefill batch of this step is a chunk that did not finish its prompt: nothing was
+                        # sampled, so nothing is drafted (torch.cat of no tensors raises).
+                        return [[] for _ in self.input_batch.req_ids]
                     draft_token_ids = torch.cat(draft_token_ids_prefill, dim=0)
-                else:
+                elif draft_token_ids_prefill:
                     draft_token_ids = torch.cat([draft_token_ids] + draft_token_ids_prefill, dim=0)
 
             spec_lookup = getattr(self, "_spec_lookup", None)
