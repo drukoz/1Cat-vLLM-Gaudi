@@ -48,8 +48,38 @@ def _uses_lmcache_connector() -> bool:
     return False
 
 
+_LAZY_ACC_PAR_ENV = "PT_HPU_LAZY_ACC_PAR_MODE"  # flashinfer_gaudi._native.LAZY_ACC_PAR_ENV
+_FUSED_CUSTOM_OP_FLAGS = ("VLLM_HPU_HC_FUSED", "VLLM_HPU_MOE_GLUE")  # both load the hc_fused_ops extension
+
+
+def _default_serial_lazy_accumulation(environ=None) -> str | None:
+    """With the fused hyper-connection or MoE glue kernels requested, default PT_HPU_LAZY_ACC_PAR_MODE to 0.
+
+    A custom HPU op is not safe next to the lazy bridge's accumulation thread
+    (``flashinfer_gaudi._native.lazy_accumulation_reason``), and the bridge may read the variable as soon as
+    it is imported. So this runs first in ``register``, before the platform module imports the bridge, in the
+    process that starts the workers; they inherit the value. Returns "0" when it set the variable and None
+    when it did nothing: neither flag is exactly 1, the process is eager (``PT_HPU_LAZY_MODE=0``), or the
+    variable is already set. A value the user set is never replaced; a lazy process that keeps the thread on
+    gets no fused kernels from the loader.
+    """
+    environ = os.environ if environ is None else environ
+    requested = False
+    for flag in _FUSED_CUSTOM_OP_FLAGS:
+        try:
+            requested = requested or int(environ.get(flag, "0")) == 1
+        except ValueError:
+            pass
+    if not requested or environ.get("PT_HPU_LAZY_MODE", "1").strip() == "0" or _LAZY_ACC_PAR_ENV in environ:
+        return None
+    environ[_LAZY_ACC_PAR_ENV] = "0"
+    return "0"
+
+
 def register():
     """Register the HPU platform."""
+    # Before the platform module imports the Habana bridge.
+    _default_serial_lazy_accumulation()
     # Import lazily so that `import vllm_gaudi` (performed by vLLM's plugin
     # loader to obtain this `register` callable) does not pull in
     # `vllm_gaudi.platform` -> `vllm` at package-import time. Importing `vllm`

@@ -53,6 +53,7 @@ from vllm_gaudi.v1.worker.recurrent_spec import (accepted_counts, load_checkpoin
                                                  recurrent_spec_enabled, state_slots_per_request,
                                                  verification_state_width)
 from vllm_gaudi.v1.spec_decode.flash_next_mtp_steps import is_flash_next_mtp
+from vllm_gaudi.distributed import vocab_parallel
 from vllm_gaudi.platform import is_flash_next_model
 
 from vllm.v1.attention.backend import AttentionBackend, AttentionType, CommonAttentionMetadata
@@ -1772,31 +1773,26 @@ class HpuModelAdapter(torch.nn.Module, HpuKVConnectorModelRunnerMixin):
         hidden_states = hidden_states[logits_indices]
         return hidden_states, self.model.compute_logits(hidden_states)
 
-    def select_compute_logits_and_greedy(self,
-                                         hidden_states,
-                                         logits_indices,
-                                         stop_ids=None,
-                                         stop_rows=None,
-                                         narrow_ids=True):
-        """Keep the LM head and plain-greedy argmax in one compiled region.
+    def select_compute_logits_and_greedy(self, hidden_states, logits_indices, stop_ids=None, stop_rows=None):
+        """Keep the LM head and plain-greedy argmax in one compiled region. Token ids int32 ``[rows, 1]``.
 
         ``stop_ids`` / ``stop_rows`` (``v1/sample/fused_greedy.py``): the stop tokens of the rows still below
-        their ``min_tokens``, masked to ``-inf`` before the argmax.
+        their ``min_tokens``, masked to ``-inf`` before the argmax. That step gathers the logits whatever
+        ``VLLM_HPU_VOCAB_PARALLEL_LOGITS`` says (the mask is written into them).
 
-        ``narrow_ids=False`` returns the arg max ids as int64, as the op makes them: the caller reads them to the
-        host and narrows there. The runner asks for that whenever the ids are not needed on the device (no async
-        scheduling), so the region has no integer cast (card rule 9: ``torch.topk`` ids narrowed to int32 in the
-        graph that made them came back wrong; for ``argmax`` the same narrowing runs in vLLM's sampler on every
-        step, but it is not card-checked in this region)."""
+        The arg max ids are narrowed to int32 in this graph, as in ``vocab_parallel.top_tokens`` and in vLLM's
+        sampler: for ``argmax`` that is sound on the card (job 00021's texts at 8 and 32 rows), unlike for
+        ``torch.topk`` ids (card rule 9)."""
         hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
         hidden_states = hidden_states[logits_indices]
-        logits = self.model.compute_logits(hidden_states).to(torch.float32)
-        if stop_ids is not None:
-            logits = mask_stop_tokens(logits, stop_ids, stop_rows)
-        sampled_token_ids = logits.argmax(dim=-1)
-        if narrow_ids:
-            sampled_token_ids = sampled_token_ids.to(torch.int32)
-        return hidden_states, sampled_token_ids.unsqueeze(-1)
+        if stop_ids is None:
+            # compute_logits (the all-gather) and the arg max of its fp32 conversion; with
+            # VLLM_HPU_VOCAB_PARALLEL_LOGITS >= 1 each rank reduces its vocabulary shard first.
+            sampled_token_ids = vocab_parallel.top_tokens(self.model, hidden_states)
+            return hidden_states, sampled_token_ids.unsqueeze(-1)
+        # A row below its min_tokens: the mask is written into the gathered logits.
+        logits = mask_stop_tokens(self.model.compute_logits(hidden_states).to(torch.float32), stop_ids, stop_rows)
+        return hidden_states, logits.argmax(dim=-1).to(torch.int32).unsqueeze(-1)
 
     def select_compute_logits_and_sample(self,
                                          hidden_states,
@@ -5896,10 +5892,8 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                     stop_kwargs = dict(stop_ids=async_h2d_copy(greedy_stop_ids[0], device=self.device),
                                        stop_rows=async_h2d_copy(greedy_stop_ids[1].to(torch.int32),
                                                                 device=self.device))
-                # The sync path reads the ids to the host right after the step: int64 out of the graph, narrowed
-                # there. Async scheduling keeps them on the device as int32 for the next step's inputs.
                 hidden_states, fused_sampled_token_ids = self.model.select_compute_logits_and_greedy(
-                    hidden_states, logits_indices, narrow_ids=bool(self.use_async_scheduling), **stop_kwargs)
+                    hidden_states, logits_indices, **stop_kwargs)
                 logits = None
             elif candidate_sampling is not None:
                 # The sampled step over candidates (candidate_sampling.py): two small copies to the device.
@@ -6224,9 +6218,16 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
 
     def _can_fuse_plain_greedy_sampling(self, request_ids: list[str]) -> bool:
         """Whether argmax can safely run in the compiled LM-head region."""
-        if not gaudi_envs.VLLM_HPU_FUSED_GREEDY_LOGITS:
+        # VLLM_HPU_VOCAB_PARALLEL_LOGITS >= 1 asks for the arg max without the logits all-gather: the same
+        # region, for the same plain greedy requests, and also for the greedy verification of a Flash-Next
+        # MTP step (the rejection sampler needs the arg max of every verification row and nothing else).
+        vocab_parallel_on = vocab_parallel.mode() != vocab_parallel.VocabParallelMode.OFF
+        if not (gaudi_envs.VLLM_HPU_FUSED_GREEDY_LOGITS or vocab_parallel_on):
             return False
-        if not request_ids or self.speculative_config is not None or self.use_structured_output:
+        if not request_ids or self.use_structured_output:
+            return False
+        if self.speculative_config is not None and not (vocab_parallel_on
+                                                        and is_flash_next_mtp(self.speculative_config)):
             return False
 
         # Built-in min-tokens and logit-bias processors are covered by the
@@ -6241,8 +6242,10 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             sampling_params = self.requests[request_id].sampling_params
             if sampling_params is None or sampling_params.sampling_type != SamplingType.GREEDY:
                 return False
-            # min_tokens runs in the fused region (fused_greedy.py) for up to STOP_ID_WIDTH stop ids.
-            if sampling_params.min_tokens != 0 and len(sampling_params.all_stop_token_ids) > STOP_ID_WIDTH:
+            # min_tokens runs in the fused region (fused_greedy.py) for up to STOP_ID_WIDTH stop ids, but not
+            # over the verification rows of a speculative step (the mask has one row per request).
+            if sampling_params.min_tokens != 0 and (self.speculative_config is not None
+                                                    or len(sampling_params.all_stop_token_ids) > STOP_ID_WIDTH):
                 return False
             if (sampling_params.logprobs is not None or sampling_params.logprob_token_ids or sampling_params.logit_bias
                     or sampling_params.allowed_token_ids or sampling_params.bad_words_token_ids
@@ -6894,11 +6897,16 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                 assert logits_device is not None
                 logits_decode.append(logits_device[:num_decodes])
                 decode_sampled_requests.extend(self.input_batch.req_ids[:num_decodes])
-            elif fused_sampled_token_ids is not None:
+            elif fused_sampled_token_ids is not None and decode_data.spec_decode_metadata is None:
                 decode_sampled_token_ids.append(fused_sampled_token_ids.flatten())
                 decode_sampled_requests.extend(self.input_batch.req_ids[:num_decodes])
+                if self._recurrent_spec:
+                    # A plain target step, as in the sampler branch below: the next verification
+                    # starts from checkpoint 0.
+                    for req_id in self.input_batch.req_ids[:num_decodes]:
+                        self._gdn_num_accepted_by_req[req_id] = 1
             else:
-                assert logits_device is not None
+                assert logits_device is not None or fused_sampled_token_ids is not None
                 with self.profiler.record_event('internal', "sampler"):
                     ##### Sampling Start #####
                     spec_decode_metadata = decode_data.spec_decode_metadata
@@ -6916,6 +6924,9 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                         )
                         htorch.core.mark_step()
                         sampler_output = None
+                    elif fused_sampled_token_ids is not None:
+                        # Greedy verification from the arg max of every row: no sampler pass over logits.
+                        sampler_output, sampling_metadata = None, None
                     else:
                         sampler_output, sampling_metadata = self._run_sampling(
                             batch_changed, logits_device if spec_decode_metadata is None else
@@ -6937,6 +6948,16 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                     else:
                         # Handling spec decode sampling.
                         sampled_token_ids = None
+                        if fused_sampled_token_ids is not None:
+                            from vllm_gaudi.v1.sample.hpu_greedy_verify import greedy_rejection_sample_from_tokens
+
+                            sampled_token_ids = greedy_rejection_sample_from_tokens(
+                                fused_sampled_token_ids.flatten(),
+                                spec_decode_metadata.draft_token_ids,
+                                spec_decode_metadata.target_logits_indices,
+                                spec_decode_metadata.bonus_logits_indices,
+                                spec_decode_metadata.cu_num_draft_tokens,
+                            )
                         if is_dflash_spec and not self.rejection_sampler.synthetic_mode:
                             from vllm_gaudi.v1.sample.hpu_rejection_sampler import (
                                 _dflash2_greedy_fastpath_supported, )

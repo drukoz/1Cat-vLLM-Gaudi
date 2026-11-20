@@ -432,10 +432,9 @@ class StubModel(torch.nn.Module):
     def select_and_compute_logits(self, hidden_states, logits_indices):
         return hidden_states[logits_indices], self._logits(logits_indices)
 
-    def select_compute_logits_and_greedy(self, hidden_states, logits_indices, stop_ids=None, stop_rows=None,
-                                         narrow_ids=True):
-        ids = self._logits(logits_indices).argmax(dim=-1)
-        return hidden_states[logits_indices], (ids.to(torch.int32) if narrow_ids else ids).unsqueeze(-1)
+    def select_compute_logits_and_greedy(self, hidden_states, logits_indices, stop_ids=None, stop_rows=None):
+        logits = self._logits(logits_indices)
+        return hidden_states[logits_indices], logits.argmax(dim=-1).to(torch.int32).unsqueeze(-1)
 
     def select_compute_logits_and_sample(self, hidden_states, logits_indices, params, top_k_index, mixed,
                                          stop_ids=None, stop_rows=None):

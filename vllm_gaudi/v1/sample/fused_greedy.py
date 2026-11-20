@@ -19,10 +19,10 @@ The ``width`` is fixed per server (``STOP_ID_WIDTH``), so the region has one sha
 
 Integer ids and the card (rule 9, 2026-11-20: ``torch.topk`` ids narrowed to int32 in the graph that made them
 came back wrong): the stop ids are made on the host as int64, the dtype ``gather`` and ``scatter`` take, and are
-used as they are, so the region has no integer cast of its own; the runner reads the arg max ids back as int64
-and narrows them on the host unless async scheduling needs them on the device
-(``HpuModelAdapter.select_compute_logits_and_greedy``). ``tools/flash_next/engine_step/hpu_sampling_ops.py``
-checks every such pattern on one card against the CPU.
+used as they are, so the mask has no integer cast. The arg max ids are narrowed to int32 in the graph, as in
+vLLM's sampler and in ``vocab_parallel.top_tokens`` (sound for ``argmax`` on the card: job 00021's texts at 8 and
+32 rows). ``tools/flash_next/engine_step/hpu_sampling_ops.py`` checks every such pattern on one card against
+the CPU.
 """
 
 from typing import Optional, Sequence
