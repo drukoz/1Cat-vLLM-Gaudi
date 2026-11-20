@@ -44,8 +44,10 @@ WORDS = ("lighthouse keeper harbour storm lantern rope gull tide anchor compass 
 TEXT_CHARS = 400
 
 
-def prompt_for(i: int, ctx_tokens: int = 0) -> str:
-    """The coordinator's probe prompts (``coord/decode_scaling.py``): the same stream index gives the same prompt."""
+def prompt_for(i: int, ctx_tokens: int = 0, salt: str = "") -> str:
+    """The coordinator's probe prompts (``coord/decode_scaling.py``): the same stream index gives the same prompt.
+    A long prompt starts with ``salt`` (the round's label): its warm and measured rounds share no prefix, so no
+    round reads another's prefix cache (at TP4 a hit can read the GDN state of another position, BRIEF 23:46)."""
     head = "Stream %d. Write a long, detailed story about a %s named %s who finds a %s. Begin:" % (
         i, WORDS[i % len(WORDS)], WORDS[(i * 7 + 3) % len(WORDS)].title(), WORDS[(i * 3 + 5) % len(WORDS)])
     if ctx_tokens <= 0:
@@ -55,7 +57,7 @@ def prompt_for(i: int, ctx_tokens: int = 0) -> str:
         filler.append(WORDS[(i + k * 11) % len(WORDS)])
         count += 1.3
         k += 1
-    return "Stream %d notes: " % i + " ".join(filler) + "\n\n" + head
+    return "%sStream %d notes: " % (salt, i) + " ".join(filler) + "\n\n" + head
 
 
 def one_stream(host, port, model, prompt, ntok, out, idx, barrier, timeout_s, sampled):
@@ -102,12 +104,12 @@ def one_stream(host, port, model, prompt, ntok, out, idx, barrier, timeout_s, sa
     out[idx] = record
 
 
-def run_round(args, n: int, ntok: int, ctx_tokens: int = 0, sampled: bool = False) -> dict:
+def run_round(args, n: int, ntok: int, ctx_tokens: int = 0, sampled: bool = False, salt: str = "") -> dict:
     out = [None] * n
     barrier = threading.Barrier(n)
-    threads = [threading.Thread(target=one_stream, args=(args.host, args.port, args.model, prompt_for(i, ctx_tokens),
-                                                         ntok, out, i, barrier, args.timeout, sampled), daemon=True)
-               for i in range(n)]
+    threads = [threading.Thread(target=one_stream,
+                                args=(args.host, args.port, args.model, prompt_for(i, ctx_tokens, salt), ntok, out, i,
+                                      barrier, args.timeout, sampled), daemon=True) for i in range(n)]
     started = time.perf_counter()
     for thread in threads:
         thread.start()
@@ -160,9 +162,10 @@ def counters(base: str):
         return None
 
 
-def measured(args, base: str, label: str, n: int, ntok: int, ctx_tokens: int = 0, sampled: bool = False) -> dict:
+def measured(args, base: str, label: str, n: int, ntok: int, ctx_tokens: int = 0, sampled: bool = False,
+             salt: str = "") -> dict:
     before = counters(base)
-    record = run_round(args, n, ntok, ctx_tokens, sampled)
+    record = run_round(args, n, ntok, ctx_tokens, sampled, salt)
     record["spec"] = spec_probe.spec_summary(spec_probe.counters_delta(before, counters(base)))
     record["label"] = label
     return record
@@ -214,7 +217,7 @@ def main(argv: list[str] | None = None) -> int:
             json.dump(results, handle, indent=1)
 
     def rounds(key: str, label: str, n: int, repeats: int, ctx_tokens: int = 0, sampled: bool = False) -> bool:
-        warm = measured(args, base, "warm", n, args.warm_tokens, ctx_tokens, sampled)
+        warm = measured(args, base, "warm", n, args.warm_tokens, ctx_tokens, sampled, salt="Warm. ")
         length = (warm.get("spec") or {}).get("acceptance_length")
         print("warm  N=%-3d %s ok=%d err=%d wall=%.1fs acceptance=%s" % (
             n, label, warm["ok"], warm["errors"], warm["wall_s"], ("%.2f" % length) if length else "-"), flush=True)
@@ -224,7 +227,7 @@ def main(argv: list[str] | None = None) -> int:
             print("%-5s N=%-3d the warm round failed: %s" % (label, n, warm.get("error_samples")), flush=True)
             return False
         for rep in range(repeats):
-            record = measured(args, base, label, n, args.tokens, ctx_tokens, sampled)
+            record = measured(args, base, label, n, args.tokens, ctx_tokens, sampled, salt="%s %d. " % (label, rep))
             record["rep"] = rep
             record["warm"] = {key2: warm.get(key2) for key2 in ("ok", "errors", "wall_s")}
             record["warm_spec"] = warm.get("spec")

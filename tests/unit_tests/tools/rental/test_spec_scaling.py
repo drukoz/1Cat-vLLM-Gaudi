@@ -223,3 +223,15 @@ def test_the_arms_script_runs_every_arm_in_its_folder_and_a_fallback_after_a_dea
     assert "k=0" in seen_k0 and "args=-- --levels 1\n" in seen_k0 and "ARM_A" not in seen_k0
     assert not (out / "k0-fallback").exists()
     assert "arm k3 rc=3" in done.stdout and "arm k3-fallback rc=0" in done.stdout and "done, exit 0" in done.stdout
+
+
+def test_long_prompts_of_two_rounds_share_no_prefix_and_short_prompts_stay_the_coordinators(stand_in, tmp_path):
+    start, _ = stand_in
+    port, requests = start()
+    probe(tmp_path, port, "--levels", "1", "--repeat-top", "1", "--ctx", "2:200")
+    short = [r["prompt"] for r in requests if len(r["prompt"]) < 200]
+    assert short and all(p.startswith("Stream 0. Write a long, detailed story") for p in short)
+    long_prompts = [r["prompt"] for r in requests if len(r["prompt"]) >= 200]
+    assert len(long_prompts) == 4  # the warm and the measured round of two streams
+    assert len({p[:12] for p in long_prompts}) == 2 and len(set(long_prompts)) == 4
+    assert {p.split("Stream")[0] for p in long_prompts} == {"Warm. ", "CTX 0. "}
