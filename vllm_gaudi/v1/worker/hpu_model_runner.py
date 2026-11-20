@@ -9528,10 +9528,12 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         shapes = None
         for module in qsa_layers:
             kc = kv_caches[module.attn.layer_name][0]
+            # The ring is the flat table [slots * rows, D]: the layer writes it with index_copy_ on the
+            # tensor itself (a write through a view of a three-axis ring does not compile on a card).
             comp, ring = allocate_side_caches(kc.shape[0], gdn_rows, int(config.indexer_compress_ratio),
-                                              int(config.indexer_head_dim), spec_tokens, kc.device)
+                                              int(config.indexer_head_dim), spec_tokens, kc.device, flat_ring=True)
             module.indexer.compressed_key_cache = comp
-            module.indexer.key_ring = ring
+            module.indexer.bind_key_ring(ring, ring.shape[0] // gdn_rows)
             total_bytes += comp.numel() * comp.element_size() + ring.numel() * ring.element_size()
             shapes = (tuple(comp.shape), tuple(ring.shape))
         if qsa_layers:

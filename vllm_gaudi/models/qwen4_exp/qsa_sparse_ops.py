@@ -164,19 +164,29 @@ def compressed_row_slots(slot_mapping: torch.Tensor, compress_ratio: int) -> tor
     return slot_mapping // compress_ratio
 
 
-def ring_write(ring: torch.Tensor, slot: torch.Tensor, positions: torch.Tensor, raw_k: torch.Tensor) -> None:
-    """Write raw keys into the ring (in place): ``ring`` ``[S, R, D]`` (contiguous),
-    ``slot`` ``[bs]`` int64, ``positions`` ``[bs]`` int64, ``raw_k`` ``[bs, D]``:
-    ``ring.view(-1, D).index_copy_(0, slot * R + positions % R, raw_k)``, the
-    flat-index form of writing the two-axis row ``(slot, positions % R)`` (the
-    HPU-compilable gather/write form; no multi-index write).
+def ring_write(ring: torch.Tensor, slot: torch.Tensor, positions: torch.Tensor, raw_k: torch.Tensor,
+               rows: int | None = None) -> None:
+    """Write raw keys into the ring (in place), row ``(slot, positions % R)`` of each entry.
+
+    ``ring`` is the flat table ``[S * R, D]`` with ``rows = R`` (what the HPU layer binds), or
+    ``[S, R, D]`` (contiguous). ``slot`` ``[bs]`` int64, ``positions`` ``[bs]`` int64, ``raw_k``
+    ``[bs, D]``. The flat table is written with one ``index_copy_`` on the tensor itself at
+    ``slot * R + positions % R``. That is the form a card compiles: the same write through
+    ``ring.view(-1, D)`` of a three-axis ring becomes a strided insert and stopped the graph
+    compiler ("Empty tensor optional ... Strided Params Has Value: 0", rental 2026-11-20). The
+    three-axis form stays for callers off the card.
     """
+    if ring.dim() == 2:
+        if rows is None:
+            raise ValueError("a flat ring [S * R, D] needs rows=R")
+        ring.index_copy_(0, slot * rows + positions % rows, raw_k.to(ring.dtype))
+        return
     ring.view(-1, ring.shape[2]).index_copy_(0, slot * ring.shape[1] + positions % ring.shape[1],
                                              raw_k.to(ring.dtype))
 
 
 def ring_block_rows(ring: torch.Tensor, slot: torch.Tensor, positions: torch.Tensor, raw_k: torch.Tensor,
-                    compress_ratio: int) -> torch.Tensor:
+                    compress_ratio: int, rows: int | None = None) -> torch.Tensor:
     """The ``ratio`` raw keys of the blocks that the tokens at ``positions``
     (``positions % ratio == ratio - 1``) complete.
 
@@ -188,9 +198,14 @@ def ring_block_rows(ring: torch.Tensor, slot: torch.Tensor, positions: torch.Ten
     dtype. Rows whose position does not complete a block are garbage and the
     caller ignores them.
     """
-    r = ring.shape[1]
+    if ring.dim() == 2:  # the flat table [S * R, D] the HPU layer binds: read without a view (see ring_write)
+        if rows is None:
+            raise ValueError("a flat ring [S * R, D] needs rows=R")
+        r, flat = rows, ring
+    else:
+        r, flat = ring.shape[1], ring.view(-1, ring.shape[2])
     rows = [
-        ring.view(-1, ring.shape[2]).index_select(0, slot * r + (positions - (compress_ratio - 1) + j) % r)
+        flat.index_select(0, slot * r + (positions - (compress_ratio - 1) + j) % r)
         for j in range(compress_ratio - 1)
     ]
     rows.append(raw_k)

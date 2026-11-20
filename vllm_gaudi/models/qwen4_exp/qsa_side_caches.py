@@ -93,16 +93,21 @@ def allocate_side_caches(
     num_speculative_tokens: int,
     device,
     dtype: torch.dtype = torch.bfloat16,
+    flat_ring: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Zero-init (compressed_key_cache, key_ring) with the shapes above."""
+    """Zero-init (compressed_key_cache, key_ring) with the shapes above.
+
+    ``flat_ring=True`` gives the ring as the flat table ``[gdn_state_rows * rows, index_head_dim]``:
+    the HPU layer writes it with ``index_copy_`` on the tensor itself (``HpuQsaIndexer.bind_key_ring``),
+    because an in-place write through a view of the three-axis ring does not compile on a card.
+    """
     compressed = torch.zeros(
         compressed_cache_shape(key_cache_rows, compress_ratio, index_head_dim),
         dtype=dtype,
         device=device,
     )
-    ring = torch.zeros(
-        ring_shape(gdn_state_rows, ring_rows(compress_ratio, num_speculative_tokens), index_head_dim),
-        dtype=dtype,
-        device=device,
-    )
+    shape = ring_shape(gdn_state_rows, ring_rows(compress_ratio, num_speculative_tokens), index_head_dim)
+    if flat_ring:
+        shape = (shape[0] * shape[1], shape[2])
+    ring = torch.zeros(shape, dtype=dtype, device=device)
     return compressed, ring

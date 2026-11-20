@@ -273,14 +273,16 @@ def test_op_count_of_one_decode_step_call(world1, vllm_ctx, flag_on):
     hidden, block, injection = _inputs(module, 1)
 
     _, fused, total, gemm = _run(lambda: module.combine_and_mix(hidden, block, injection))
-    assert sum(fused.values()) == 3 and total - gemm == 3
+    # three fused ops, plus one copy of each of their six activation inputs (a custom HPU op cannot be
+    # given a view: flashinfer_gaudi.hc_fused._owned)
+    assert sum(fused.values()) == 3 and total - gemm == 3 + 6
     module.hc_fused_requested = False
     _, _, torch_total, torch_gemm = _run(lambda: module.combine_and_mix(hidden, block, injection))
     assert torch_gemm == gemm  # the GEMMs are the same ops in both paths
     assert torch_total - torch_gemm >= 40
     module.hc_fused_requested = True
     _, fused, total, gemm = _run(lambda: module.combine(hidden, block, injection))
-    assert fused == {"hc_combine": 1} and total == 1 and gemm == 0
+    assert fused == {"hc_combine": 1} and total == 1 + 3 and gemm == 0  # the op and its three input copies
 
 
 # ----- the wiring, through a stand-in that records and validates -------------------------------------------------

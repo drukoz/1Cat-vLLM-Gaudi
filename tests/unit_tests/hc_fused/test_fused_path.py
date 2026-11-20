@@ -198,15 +198,18 @@ def test_op_count_before_and_after(world1, vllm_ctx):
         "flashinfer_gaudi::hc_silu_split": 1,
         "flashinfer_gaudi::hc_gate_mix": 1,
     }
-    assert dict(counts["combine"]["fused"]) == {"flashinfer_gaudi::hc_combine": 1}
-    # The GEMMs are the same ops in both paths; everything else collapses to the three fused ops.
+    # Every activation is copied before its op (aten::clone): a custom HPU op cannot be given a view
+    # (flashinfer_gaudi.hc_fused._owned, found on a card on 2026-11-20). One copy per tensor input.
+    assert dict(counts["combine"]["fused"]) == {"flashinfer_gaudi::hc_combine": 1, "aten::clone": 3}
+    # The GEMMs are the same ops in both paths; everything else collapses to the three fused ops and
+    # the copies of their inputs (combine_norm 3, silu_split 1, gate_mix 2; norm 1 in place of 3).
     gemm = {name: n for name, n in torch_cm.items() if name in GEMM_OPS}
     assert gemm == {name: n for name, n in fused_cm.items() if name in GEMM_OPS}
-    assert sum(fused_cm.values()) - sum(gemm.values()) == 3
-    assert sum(fused_mix_ops.values()) - sum(gemm.values()) == 3
+    assert sum(fused_cm.values()) - sum(gemm.values()) == 3 + 6
+    assert sum(fused_mix_ops.values()) - sum(gemm.values()) == 3 + 4
     assert sum(torch_cm.values()) - sum(gemm.values()) >= 40
     # A decoder layer runs combine_and_mix twice (attention and MLP hyper-connection).
     per_layer_before = 2 * (sum(torch_cm.values()) - sum(gemm.values()))
     per_layer_after = 2 * (sum(fused_cm.values()) - sum(gemm.values()))
     print(f"HCOPS per layer (2 x combine_and_mix, GEMMs excluded): before={per_layer_before} after={per_layer_after}")
-    assert per_layer_after == 6
+    assert per_layer_after == 6 + 12  # the fused ops, plus the copies of their activation inputs
