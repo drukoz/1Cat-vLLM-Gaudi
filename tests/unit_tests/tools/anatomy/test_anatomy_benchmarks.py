@@ -81,3 +81,26 @@ def test_parents_kill_their_children_on_sigterm():
         while _pid_alive(child_pid) and time.time() < deadline:
             time.sleep(0.05)
         assert not _pid_alive(child_pid), module
+
+
+def test_bench_lazy_ops_budget_skips_graphs_but_keeps_the_cheap_cases(tmp_path):
+    """A child out of budget skips the graph cases (reported, the fits then fail the run) and still measures the
+    cuts, mark_step, copies and the LM head, which run first."""
+    out = tmp_path / "lazy_ops.json"
+    proc = _run("bench_lazy_ops.py", "--selftest", "--quick", "--acc-modes", "0", "--child-budget", "0",
+                "--out", str(out))
+    assert proc.returncode == 2, proc.stdout[-2000:]
+    records = json.loads(out.read_text())["runs"][0]["records"]
+    graphs = [r for r in records if r["case"] == "graph"]
+    assert graphs and all(r.get("skipped") == "budget" for r in graphs)
+    assert {"cuts", "mark_empty", "h2d", "d2h", "head", "done"} <= {r["case"] for r in records}
+    assert "SKIPPED (predicted compile" in proc.stdout
+
+
+def test_bench_lazy_ops_recipe_cache_replaces_the_uncached_mode_0_run(tmp_path):
+    out = tmp_path / "lazy_ops.json"
+    proc = _run("bench_lazy_ops.py", "--selftest", "--quick", "--acc-modes", "0,1", "--recipe-cache",
+                str(tmp_path / "cache"), "--out", str(out))
+    assert proc.returncode == 0, proc.stdout[-2000:]
+    labels = [run["label"] for run in json.loads(out.read_text())["runs"]]
+    assert labels == ["acc0-cache-cold", "acc0-cache-warm", "acc1"]

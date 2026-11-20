@@ -6,7 +6,7 @@ A Flash-Next decode step is one lazy graph of several thousand ops that the host
 script measures the fixed costs of that mechanism with graphs whose device work is negligible, so the times are
 the bridge's and the runtime's own:
 
-* ``graph``  a graph of N ops (N from 100 to 10,000), two families: ``chain`` (``v = v * c + d``) and ``mix``
+* ``graph``  a graph of N ops (N from 100 to 3,000), two families: ``chain`` (``v = v * c + d``) and ``mix``
   (layer-like blocks: cast, grouped norm, two small GEMMs, SiLU, a gate, a residual add, with their own
   weights). Per iteration: ``issue`` (Python issues the ops: graph accumulation), ``mark`` (``mark_step()``:
   the graph is closed, looked up or compiled, and launched), ``wait`` (``torch.hpu.synchronize()``), ``read``
@@ -18,9 +18,11 @@ the bridge's and the runtime's own:
 * ``head``   the per-rank LM head GEMM (2560 to 31,040) and an argmax over 248,320 logits at 1, 8 and 32 rows:
   the device work of "logits and greedy sampling" on one card.
 
-Every measurement runs in a child process per bridge setting: ``PT_HPU_LAZY_ACC_PAR_MODE`` 0 and 1, and with a
-recipe cache on disk (cold, then warm) when ``--recipe-cache DIR`` is given. The bridge reads these variables
-when it is loaded, so they cannot be changed inside one process.
+Every measurement runs in a child process per bridge setting: ``PT_HPU_LAZY_ACC_PAR_MODE`` 0 and 1; with
+``--recipe-cache DIR`` mode 0 runs with a recipe cache on disk instead (cold, the full measurement, then warm: the
+loads). The bridge reads these variables when it is loaded, so they cannot be changed inside one process. Each child
+runs the cheap cases first and then the graphs by ascending size, and skips a graph whose compile (predicted from the
+last one, quadratic in ops) would not fit in its ``--child-budget``: by default the whole run fits 15 minutes.
 
 Run on a Gaudi2 node, in the container that has ``habana_frameworks``, with one free card::
 
@@ -52,12 +54,17 @@ HIDDEN = 2560
 VOCAB = 248320
 TP_SHARD = VOCAB // 8  # the logits columns one rank of TP8 computes
 MIX_PROJ = 64
-DEFAULT_SIZES = (100, 300, 1000, 3000, 10000)
+DEFAULT_SIZES = (100, 300, 1000, 3000)
+# A cold compile grows about as ops^2 above 300 ops (job 00009: 0.44 s at 100, 13.7 s at 1,000, 131 s at 3,000).
+# Before each graph case the child predicts its compile from the family's last one (quadratic in ops) and skips the
+# case when it would not fit in the child's budget (--child-budget); the cheap cases run first.
+DEFAULT_CHILD_BUDGET_S = 270.0
+COMPILE_GUESS_S = 0.5  # the first-iteration time of a 100-op graph, before any is measured
 SELFTEST_SIZES = (100, 300)
 DEFAULT_ROWS = (1, 32)
 ROWS_PROBE_N = 1000  # the graph size at which the other row counts are measured
-CUT_OPS = 1200
-CUT_SEGMENTS = (1, 2, 4, 12, 50, 100)
+CUT_OPS = 600  # one graph of 600 ops compiles in about 5 s cold; 1,200 took about 20
+CUT_SEGMENTS = (1, 2, 4, 12, 50)
 HEAD_ROWS = (1, 8, 32)
 FAMILIES = ("chain", "mix")
 
@@ -470,16 +477,9 @@ def child_main(args) -> int:
             "selftest": selftest,
         })
         rows_list = list(args.rows)
-        for family in args.families:
-            for n_ops in args.sizes:
-                for rows in rows_list:
-                    if rows != rows_list[0] and n_ops != args.rows_probe_n:
-                        continue
-                    emit(bench_graph(be, family, n_ops, rows, False, args.quick))
-        if "mix" in args.families and args.rows_probe_n in args.sizes:
-            # the same graph with one set of weights for every block: does the launch depend on the graph inputs?
-            emit(bench_graph(be, "mix", args.rows_probe_n, rows_list[0], True, args.quick))
-        if not args.graphs_only:
+        started = _now()
+        budget = float(args.child_budget)
+        if not args.graphs_only:  # the cheap cases first: a budget that runs out leaves them measured
             for segments in CUT_SEGMENTS:
                 emit(bench_cuts(be, CUT_OPS if not selftest else 240, segments, args.quick))
             emit(bench_mark_empty(be))
@@ -487,6 +487,34 @@ def child_main(args) -> int:
             emit(bench_d2h(be, args.quick))
             for rows in HEAD_ROWS:
                 emit(bench_head(be, rows, args.quick))
+        last_first_s = {}  # family -> (ops, first-iteration seconds) of its last graph case
+
+        def fits(family, n_ops):
+            ops, seconds = last_first_s.get(family, (100, COMPILE_GUESS_S))
+            predicted = seconds * max(1.0, (n_ops / float(ops)))**2
+            return _now() - started + predicted <= budget, predicted
+
+        def graph_case(family, n_ops, rows, shared):
+            ok, predicted = fits(family, n_ops)
+            if not ok:
+                emit({"case": "graph", "family": family, "ops": n_ops, "rows": rows, "weights":
+                      "shared" if shared else "own", "skipped": "budget", "predicted_first_s": round(predicted, 1),
+                      "elapsed_s": round(_now() - started, 1), "budget_s": budget})
+                return
+            record = bench_graph(be, family, n_ops, rows, shared, args.quick)
+            last_first_s[family] = (record["ops"], record["first_ms"]["total"] / 1e3)
+            emit(record)
+
+        # Sizes ascending, the families side by side, so a budget that runs out cuts the largest graphs only.
+        for n_ops in args.sizes:
+            for family in args.families:
+                for rows in rows_list:
+                    if rows != rows_list[0] and n_ops != args.rows_probe_n:
+                        continue
+                    graph_case(family, n_ops, rows, False)
+            if "mix" in args.families and n_ops == args.rows_probe_n:
+                # the same graph with one set of weights for every block: does the launch depend on the graph inputs?
+                graph_case("mix", n_ops, rows_list[0], True)
         emit({"case": "done"})
         return 0
     except BaseException as exc:  # noqa: BLE001 - the parent reports it next to the results it already has
@@ -564,6 +592,10 @@ def _fmt(value, digits=3):
 def describe(record: dict) -> str:
     """One console line for one result record."""
     case = record.get("case")
+    if case == "graph" and record.get("skipped"):
+        return "graph %-5s ops %5d rows %2d: SKIPPED (predicted compile %.0f s, %.0f of %.0f s used)" % (
+            record["family"], record["ops"], record["rows"], record["predicted_first_s"], record["elapsed_s"],
+            record["budget_s"])
     if case == "graph":
         steady, first = record["steady_ms"], record["first_ms"]
         return ("graph %-5s ops %5d rows %2d weights %-6s: issue %s mark %s wait %s read %s total %s ms (p50); "
@@ -603,7 +635,7 @@ def describe(record: dict) -> str:
 def fits(records: list) -> dict:
     """Per family: the linear fits over the graph size of the steady medians (first row count, own weights)."""
     out = {}
-    graphs = [r for r in records if r.get("case") == "graph" and r.get("weights") == "own"]
+    graphs = [r for r in records if r.get("case") == "graph" and r.get("weights") == "own" and not r.get("skipped")]
     if not graphs:
         return out
     base_rows = graphs[0]["rows"]
@@ -680,11 +712,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--families", default=",".join(FAMILIES))
     parser.add_argument("--acc-modes", default="0,1", help="values of %s to measure (default 0,1)" % ACC_FLAG)
     parser.add_argument("--recipe-cache", default=None, metavar="DIR",
-                        help="also measure with a recipe cache on disk under DIR (a cold run, then a warm one)")
+                        help="measure mode 0 with a recipe cache on disk under DIR: a cold run (the decisive one, "
+                        "it writes the cache) and a warm one (graphs only: the load from the cache), in place of "
+                        "mode 0 without a cache")
     parser.add_argument("--recipe-cache-mb", type=int, default=4096)
     parser.add_argument("--recipe-cache-all-modes", action="store_true",
                         help="the recipe-cache runs for every accumulation mode (default: mode 0 only)")
-    parser.add_argument("--child-timeout", type=float, default=420.0, metavar="S")
+    parser.add_argument("--child-timeout", type=float, default=None, metavar="S",
+                        help="kill a child after S seconds (default: its budget + 180)")
+    parser.add_argument("--child-budget", type=float, default=DEFAULT_CHILD_BUDGET_S, metavar="S",
+                        help="seconds a child may spend; a graph case whose predicted compile does not fit is "
+                        "skipped (default %.0f: three children fit a 15-minute card slot)" % DEFAULT_CHILD_BUDGET_S)
     parser.add_argument("--quick", action="store_true", help="few iterations (a smoke run)")
     parser.add_argument("--graphs-only", action="store_true", help="only the graph cases")
     parser.add_argument("--selftest", action="store_true", help="CPU tensors, no bridge: checks this script only")
@@ -712,24 +750,28 @@ def main(argv=None) -> int:
         child_args.append("--selftest")
     if args.graphs_only:
         child_args.append("--graphs-only")
+    child_args += ["--child-budget", str(args.child_budget)]
+    child_timeout = args.child_timeout if args.child_timeout is not None else args.child_budget + 180.0
 
     plan = []  # (label, acc mode, recipe cache folder or None, extra child args)
     modes = [m.strip() for m in args.acc_modes.split(",") if m.strip()]
+    cache_modes = (modes if args.recipe_cache_all_modes else modes[:1]) if args.recipe_cache else []
     for mode in modes:
-        plan.append(("acc%s" % mode, mode, None, []))
-    if args.recipe_cache:
-        cache_modes = modes if args.recipe_cache_all_modes else modes[:1]
-        for mode in cache_modes:
+        if mode in cache_modes:
+            # A cold run with a recipe cache compiles as a run without one (job 00009: the same steady times), so
+            # it replaces it: the cold run is the mode's full measurement, the warm run times the loads.
             folder = os.path.join(args.recipe_cache, "acc%s-%d" % (mode, os.getpid()))
             os.makedirs(folder, exist_ok=True)
-            plan.append(("acc%s-cache-cold" % mode, mode, folder, ["--graphs-only"]))
+            plan.append(("acc%s-cache-cold" % mode, mode, folder, []))
             plan.append(("acc%s-cache-warm" % mode, mode, folder, ["--graphs-only"]))
+        else:
+            plan.append(("acc%s" % mode, mode, None, []))
 
     runs, summaries = [], []
     for label, mode, folder, extra in plan:
         print("-- child %s: %s=%s, recipe cache %s" % (label, ACC_FLAG, mode, folder or "off"), flush=True)
         run = run_child(label, child_environment(mode, folder, args.recipe_cache_mb),
-                        child_args + [a for a in extra if a not in child_args], args.child_timeout)
+                        child_args + [a for a in extra if a not in child_args], child_timeout)
         runs.append(run)
         if not any(r.get("case") == "done" for r in run["records"]):
             print("   child %s did not finish (exit %s, timed out %s); last output:" %
@@ -748,10 +790,12 @@ def main(argv=None) -> int:
             json.dump({"tool": "bench_lazy_ops", "selftest": args.selftest, "sizes": sizes, "runs": runs,
                        "summaries": summaries}, fh, indent=1)
         print("wrote %s" % args.out)
+    # The decisive child is the first (mode 0, cold): it must finish, with two graph sizes per family at least (a
+    # fit); sizes skipped for the budget are reported, not failures.
     decisive = summaries[0] if summaries else None
-    wanted = len(sizes) * len(args.families)
-    got = 0 if decisive is None else sum(len(entry["sizes"]) for entry in decisive["fits"].values())
-    return 0 if decisive is not None and got >= wanted else 2
+    if decisive is None or not decisive["complete"]:
+        return 2
+    return 0 if all(len(entry["sizes"]) >= 2 for entry in decisive["fits"].values()) and decisive["fits"] else 2
 
 
 if __name__ == "__main__":
