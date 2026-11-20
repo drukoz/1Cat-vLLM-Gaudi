@@ -40,6 +40,9 @@ from vllm_gaudi.v1.worker.hpu_dp_utils import set_hpu_dp_metadata
 from vllm_gaudi.v1.worker.gdn_state_layout import has_contiguous_dflash_checkpoints
 from vllm_gaudi.v1.worker.flash_next_inputs import (build_block_table, build_ple_inputs, dummy_ple_inputs,
                                                     model_requires_block_table, model_requires_raw_input_tokens)
+from vllm_gaudi.v1.worker.flash_next_decode_metadata import (fill_pad_slots, request_block_table,
+                                                             sparse_decode_metadata_refusal)
+from vllm_gaudi.v1.sample.fused_greedy import STOP_ID_WIDTH, mask_stop_tokens, min_tokens_stop_ids
 from vllm_gaudi.v1.worker.recurrent_commit import (apply_align_precopy, boundary_commits, commit_conv, commit_ssm,
                                                    self_commit_requests)
 from vllm_gaudi.v1.worker.recurrent_lattice import align_lattices
@@ -1766,12 +1769,17 @@ class HpuModelAdapter(torch.nn.Module, HpuKVConnectorModelRunnerMixin):
         hidden_states = hidden_states[logits_indices]
         return hidden_states, self.model.compute_logits(hidden_states)
 
-    def select_compute_logits_and_greedy(self, hidden_states, logits_indices):
-        """Keep the LM head and plain-greedy argmax in one compiled region."""
+    def select_compute_logits_and_greedy(self, hidden_states, logits_indices, stop_ids=None, stop_rows=None):
+        """Keep the LM head and plain-greedy argmax in one compiled region.
+
+        ``stop_ids`` / ``stop_rows`` (``v1/sample/fused_greedy.py``): the stop tokens of the rows still below
+        their ``min_tokens``, masked to ``-inf`` before the argmax."""
         hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
         hidden_states = hidden_states[logits_indices]
-        logits = self.model.compute_logits(hidden_states)
-        sampled_token_ids = logits.to(torch.float32).argmax(dim=-1)
+        logits = self.model.compute_logits(hidden_states).to(torch.float32)
+        if stop_ids is not None:
+            logits = mask_stop_tokens(logits, stop_ids, stop_rows)
+        sampled_token_ids = logits.argmax(dim=-1)
         return hidden_states, sampled_token_ids.to(torch.int32).unsqueeze(-1)
 
     def combine_hidden_states(self, *args, **kwargs):
@@ -2437,6 +2445,41 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             return [[self._resolve_block(b) for b in bl] for bl in block_table_list]
 
         return self.defragmenter.resolve_all(block_table_list)
+
+    def flash_next_sparse_decode_metadata(self) -> bool:
+        """VLLM_HPU_FLASH_NEXT_DECODE_METADATA=1 and usable: decode steps (and the MTP drafter's) build no dense
+        paged-attention buffers (``flash_next_decode_metadata``). Decided at the first decode step, when the
+        model, the drafter and the sparse QSA wrappers exist; a refusal is logged once."""
+        decided = getattr(self, '_sparse_decode_md', None)
+        if decided is not None:
+            return decided
+        flag = int(gaudi_envs.VLLM_HPU_FLASH_NEXT_DECODE_METADATA)
+        if flag == 0:
+            self._sparse_decode_md = False
+            return False
+        from vllm_gaudi.models.qwen4_exp.qsa import QsaMode
+        layers = qsa_modules(getattr(self.model, 'model', self.model),
+                             getattr(getattr(self, 'drafter', None), 'model', None))
+        dense = sum(1 for layer in layers if getattr(layer, 'qsa_mode', None) is not QsaMode.SPARSE
+                    or getattr(layer, 'sparse_attn', None) is None)
+        defragmenter = getattr(self, 'defragmenter', None)
+        reason = sparse_decode_metadata_refusal(
+            flag=flag,
+            needs_block_table=bool(getattr(self, '_needs_block_table', False)),
+            qsa_sparse=int(gaudi_envs.VLLM_HPU_FLASH_NEXT_QSA_MODE) == int(QsaMode.SPARSE),
+            framework_layout=bool(self.use_framework_kv_cache_layout),
+            sliding_window=bool(self.interleaved_sliding_window),
+            chunked_attention=bool(self.model_has_chunked_attention),
+            defragmenter_enabled=bool(defragmenter is not None and defragmenter.enabled),
+            speculative_method=getattr(self.speculative_config, 'method', None),
+            dense_qsa_layers=dense)
+        self._sparse_decode_md = reason is None
+        if reason is None:
+            logger.info("Flash-Next sparse-QSA decode metadata: no paged-attention buffers in decode steps "
+                        "(%d QSA layers)", len(layers))
+        else:
+            logger.warning("VLLM_HPU_FLASH_NEXT_DECODE_METADATA=%d is off for this server: %s", flag, reason)
+        return self._sparse_decode_md
 
     def _set_cache_block_capacity(self, scheduler_blocks: int, attention_kernel_blocks: int) -> None:
         """Keep scheduler-page and attention-kernel block units separate."""
@@ -4932,10 +4975,13 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         num_blocks = ((query_ends + decode_block_size - 1) // decode_block_size).astype(np.int32).tolist()
         # Spec decode to use seed buckets to get padded batch size
         seek_buckets = bool(num_tokens > 1)
+        # Flash-Next sparse QSA: no dense paged-attention buffers, so no input shape follows the block count.
+        sparse_md = gaudi_envs.VLLM_HPU_FLASH_NEXT_DECODE_METADATA == 1 and self.flash_next_sparse_decode_metadata()
 
         # PAD FOR STATIC SHAPES.
         padded_batch_size: int
-        padded_batch_size = self.bucketing_manager.find_decode_bucket(num_decodes, sum(num_blocks), seek_buckets)[0]
+        padded_batch_size = self.bucketing_manager.find_decode_bucket(num_decodes, 0 if sparse_md else sum(num_blocks),
+                                                                      seek_buckets)[0]
 
         # dp aware padding
         padded_batch_size += self.get_dp_padding(padded_batch_size)
@@ -4944,7 +4990,7 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         num_tokens_per_req = num_tokens_per_req + [0] * (padded_batch_size - num_decodes)
 
         block_tables_list = []
-        for i, n in enumerate(num_blocks):
+        for i, n in enumerate([] if sparse_md else num_blocks):
             seq_block_table = block_table_cpu_tensor[i, :n].tolist()
             assert len(seq_block_table) == n
             query_len = int(num_tokens_per_req[i])
@@ -5025,7 +5071,8 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         block_number[:num_decodes] = torch.gather(input=block_table_cpu_tensor,
                                                   dim=1,
                                                   index=(index // decode_block_size))
-        block_number.apply_(self._resolve_block)
+        if not sparse_md:  # sparse_md implies the defragmenter is off: resolving is the identity
+            block_number.apply_(self._resolve_block)
 
         block_offsets = padded_index % decode_block_size
         slot_mapping = block_number * decode_block_size + block_offsets
@@ -5034,7 +5081,9 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         slot_mapping = slot_mapping[:padded_batch_size]
         pad_slot_base = self._PAD_BLOCK_ID * decode_block_size
         dummy_slots = itertools.cycle(range(pad_slot_base, pad_slot_base + decode_block_size))
-        for request_index, query_len in enumerate(num_tokens_per_req):
+        if sparse_md:
+            fill_pad_slots(slot_mapping, num_tokens_per_req, pad_slot_base, decode_block_size)
+        for request_index, query_len in enumerate([] if sparse_md else num_tokens_per_req):
             if query_len < num_tokens:
                 # Ragged speculative requests also contain padding *inside*
                 # a live request row. Never insert those tokens at position 0
@@ -5073,21 +5122,28 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         logits_indices[:num_decodes] = query_start_loc_cpu[1:num_decodes + 1] - 1
 
         positions_device = async_h2d_copy(positions, dtype=position_dtype, device=self.device)
-        block_tables_list = self._resolve_all_blocks(block_tables_list)
+        if sparse_md:
+            # One row per request (the pages of its last scheduled token), repeated over its verification rows.
+            block_table_cpu = request_block_table(block_table_cpu_tensor, num_blocks, num_tokens,
+                                                  padded_batch_size * num_tokens, self._block_table_max_blocks,
+                                                  self._PAD_BLOCK_ID)
+            block_list = block_groups = block_usage = None
+        else:
+            block_tables_list = self._resolve_all_blocks(block_tables_list)
 
-        block_table_cpu = None
-        if getattr(self, '_needs_block_table', False):
-            block_table_cpu = build_block_table(block_tables_list, padded_batch_size * num_tokens,
-                                                self._block_table_max_blocks, self._PAD_BLOCK_ID)
+            block_table_cpu = None
+            if getattr(self, '_needs_block_table', False):
+                block_table_cpu = build_block_table(block_tables_list, padded_batch_size * num_tokens,
+                                                    self._block_table_max_blocks, self._PAD_BLOCK_ID)
 
-        # CONTEXT_LENS [batch_size]
-        block_list, block_groups, block_usage = \
-            self.get_habana_paged_attn_buffers(
-                block_tables_list,
-                slot_mapping.tolist(),
-                padded_batch_size * num_tokens,
-                block_size=decode_block_size,
-            )
+            # CONTEXT_LENS [batch_size]
+            block_list, block_groups, block_usage = \
+                self.get_habana_paged_attn_buffers(
+                    block_tables_list,
+                    slot_mapping.tolist(),
+                    padded_batch_size * num_tokens,
+                    block_size=decode_block_size,
+                )
 
         if self.interleaved_sliding_window:
             sliding_block_size = (self.sliding_window // decode_block_size)
@@ -5278,9 +5334,9 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             recurrent_boundary = None
 
         # CPU<>HPU sync *should not* happen here.
-        block_list_device = async_h2d_copy(block_list, device=self.device)
-        block_usage_device = async_h2d_copy(block_usage, device=self.device)
-        block_groups_device = async_h2d_copy(block_groups, device=self.device)
+        block_list_device = async_h2d_copy(block_list, device=self.device) if block_list is not None else None
+        block_usage_device = async_h2d_copy(block_usage, device=self.device) if block_usage is not None else None
+        block_groups_device = async_h2d_copy(block_groups, device=self.device) if block_groups is not None else None
         block_table_device = async_h2d_copy(block_table_cpu, device=self.device) \
             if block_table_cpu is not None else None
         slot_mapping_device = async_h2d_copy(slot_mapping, device=self.device)
@@ -5657,7 +5713,8 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                                inputs_embeds=None,
                                model_mm_kwargs=None,
                                fuse_greedy_sampling=False,
-                               ple_inputs=None):
+                               ple_inputs=None,
+                               greedy_stop_ids=None):
         # FORWARD.
         batch_size = token_ids.size(0)
         framework_attn_metadata = isinstance(attn_metadata, Mapping)
@@ -5750,10 +5807,13 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                                                      f'seq{seq_len}_ctx'
                                                      f'{num_blocks}')):
             if fuse_greedy_sampling:
+                stop_kwargs = {}
+                if greedy_stop_ids is not None:  # min_tokens of the rows below it (fused_greedy.py)
+                    stop_kwargs = dict(stop_ids=async_h2d_copy(greedy_stop_ids[0], device=self.device),
+                                       stop_rows=async_h2d_copy(greedy_stop_ids[1].to(torch.int32),
+                                                                device=self.device))
                 hidden_states, fused_sampled_token_ids = self.model.select_compute_logits_and_greedy(
-                    hidden_states,
-                    logits_indices,
-                )
+                    hidden_states, logits_indices, **stop_kwargs)
                 logits = None
             else:
                 hidden_states, logits = self.model.select_and_compute_logits(hidden_states, logits_indices)
@@ -6084,14 +6144,27 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             sampling_params = self.requests[request_id].sampling_params
             if sampling_params is None or sampling_params.sampling_type != SamplingType.GREEDY:
                 return False
-            if (sampling_params.logprobs is not None or sampling_params.logprob_token_ids
-                    or sampling_params.min_tokens != 0 or sampling_params.logit_bias
+            # min_tokens runs in the fused region (fused_greedy.py) for up to STOP_ID_WIDTH stop ids.
+            if sampling_params.min_tokens != 0 and len(sampling_params.all_stop_token_ids) > STOP_ID_WIDTH:
+                return False
+            if (sampling_params.logprobs is not None or sampling_params.logprob_token_ids or sampling_params.logit_bias
                     or sampling_params.allowed_token_ids or sampling_params.bad_words_token_ids
                     or sampling_params.presence_penalty != 0.0 or sampling_params.frequency_penalty != 0.0
                     or sampling_params.repetition_penalty != 1.0 or sampling_params.thinking_token_budget is not None
                     or sampling_params.extra_args or sampling_params.trace_decode_token_ids is not None):
                 return False
         return True
+
+    def _fused_greedy_stop_ids(self, request_ids: list[str], rows: int):
+        """The fused region's min_tokens mask for this step's rows (``fused_greedy.min_tokens_stop_ids``): the
+        stop ids of every request with fewer than ``min_tokens`` output tokens. ``None`` when none has."""
+        stops = []
+        for request_id in request_ids:
+            state = self.requests[request_id]
+            params = state.sampling_params
+            below = params.min_tokens and len(state.output_token_ids) < params.min_tokens
+            stops.append(params.all_stop_token_ids if below else None)
+        return min_tokens_stop_ids(stops, rows)
 
     def _run_sampling(self,
                       batch_changed: bool,
@@ -6616,6 +6689,9 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             self.event_start = self.profiler.get_timestamp_us()
             self.profiler.start("internal", "decode")
             fuse_greedy_sampling = self._can_fuse_plain_greedy_sampling(pd_info.decode_req_ids)
+            greedy_stop_ids = (self._fused_greedy_stop_ids(pd_info.decode_req_ids,
+                                                           int(decode_data.logits_indices.shape[0]))
+                               if fuse_greedy_sampling else None)
             htorch.core.mark_step()
             non_flattened_hidden_states, aux_hidden_states, \
                 sample_hidden_states, logits_device, fused_sampled_token_ids = \
@@ -6629,7 +6705,8 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                 lora_mask,
                 warmup_mode=warmup_mode,
                 fuse_greedy_sampling=fuse_greedy_sampling,
-                ple_inputs=decode_data.ple_inputs)
+                ple_inputs=decode_data.ple_inputs,
+                greedy_stop_ids=greedy_stop_ids)
             htorch.core.mark_step()
 
             if self.use_structured_output:
@@ -10701,7 +10778,10 @@ class HPUAttentionMetadataProcessor:
                 attn_metadata = self._set_attn_bias_for_chunked_attention(attn_metadata, batch_size, seq_len,
                                                                           attention_chunk_size, device, dtype)
         else:
-            attn_metadata = self._set_block_mapping(attn_metadata, batch_size, device, dtype)
+            # A Flash-Next sparse-QSA decode (VLLM_HPU_FLASH_NEXT_DECODE_METADATA=1) carries no paged-attention
+            # buffers: nothing reads a block mapping or a block bias.
+            if attn_metadata.block_groups is not None:
+                attn_metadata = self._set_block_mapping(attn_metadata, batch_size, device, dtype)
             if model_has_chunked_attention:
                 attn_metadata = self._set_block_mapping(attn_metadata,
                                                         batch_size,

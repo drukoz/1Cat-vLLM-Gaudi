@@ -68,6 +68,7 @@ from vllm.v1.request import Request  # noqa: E402
 
 import vllm_gaudi.models.qwen4_exp as flash_next  # noqa: E402
 import vllm_gaudi.patches as hpu_patches  # noqa: E402
+import vllm_gaudi.v1.sample.hpu_rejection_sampler  # noqa: E402, F401  (register_ops installs it in every server)
 import vllm_gaudi.v1.worker.hpu_input_batch as input_batch_module  # noqa: E402
 import vllm_gaudi.v1.worker.hpu_model_runner as runner_module  # noqa: E402
 from vllm_gaudi.models.qwen4_exp.qsa import HpuQwen4ExpQSAAttention  # noqa: E402
@@ -83,7 +84,7 @@ ENV_VARS = ("VLLM_HPU_RECURRENT_STATE_POOL", "VLLM_HPU_RECURRENT_STATE_POOL_SLOT
             "VLLM_HPU_RECURRENT_STATE_POOL_CACHE_SLOTS", "VLLM_COMPACT_GDN", "VLLM_HPU_FLASH_NEXT_QSA_MODE",
             "VLLM_USE_HYBRID_CACHE", "VLLM_USE_NAIVE_MAMBA_CACHE_SHARING", "VLLM_SKIP_WARMUP",
             "VLLM_HPU_PLE_HOST_NGRAM_IDS", "VLLM_HPU_FUSED_GREEDY_LOGITS", "VLLM_DISABLE_SHARED_EXPERTS_STREAM",
-            "VLLM_DEFRAG_WITH_GRAPHS")
+            "VLLM_DEFRAG_WITH_GRAPHS", "VLLM_HPU_FLASH_NEXT_DECODE_METADATA")
 
 DEVICE = torch.device("cpu")
 _OPEN = False
@@ -375,6 +376,21 @@ def _cpu_h2d_copy(counters: Counters, mark: bool):
     return async_h2d_copy
 
 
+def _cpu_tensor_to():
+    """``Tensor.to`` with the device ``"hpu"`` sent to the CPU (the verification step moves its sampled tokens
+    with ``.to("hpu", non_blocking=True)``)."""
+    real_to = torch.Tensor.to
+
+    def to(self, *args, **kwargs):
+        if args and (args[0] == "hpu" or (isinstance(args[0], torch.device) and args[0].type == "hpu")):
+            args = ("cpu", ) + args[1:]
+        if kwargs.get("device") == "hpu":
+            kwargs["device"] = "cpu"
+        return real_to(self, *args, **kwargs)
+
+    return to
+
+
 def _cpu_h2d_update(counters: Counters):
 
     def async_h2d_update(source, dest, indices, device=None):
@@ -415,7 +431,7 @@ class StubModel(torch.nn.Module):
     def select_and_compute_logits(self, hidden_states, logits_indices):
         return hidden_states[logits_indices], self._logits(logits_indices)
 
-    def select_compute_logits_and_greedy(self, hidden_states, logits_indices):
+    def select_compute_logits_and_greedy(self, hidden_states, logits_indices, stop_ids=None, stop_rows=None):
         logits = self._logits(logits_indices)
         return hidden_states[logits_indices], logits.argmax(dim=-1).to(torch.int32).unsqueeze(-1)
 
@@ -547,6 +563,7 @@ def open_engine(ckpt_dir: Path | None, options: Options | None = None):
         stack.enter_context(patch.object(input_batch_module, "async_h2d_copy", _cpu_h2d_copy(counters, False)))
         stack.enter_context(patch.object(input_batch_module, "async_h2d_update", _cpu_h2d_update(counters)))
         stack.enter_context(patch.object(runner_module, "is_fake_hpu", lambda: True))
+        stack.enter_context(patch.object(torch.Tensor, "to", _cpu_tensor_to()))
         stack.enter_context(patch.object(runner_module, "get_attn_backend", lambda *a, **k: HPUAttentionBackendV1))
         stack.enter_context(patch.object(runner_module.htorch.utils.internal, "is_lazy", lambda: False))
         stack.enter_context(set_current_vllm_config(vllm_config))

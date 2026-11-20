@@ -59,6 +59,19 @@ selection, added in M2): `HpuQsaIndexer.select` picks the attended
 positions per query and attention runs only over them. Sparse prefill needs a
 4-aligned context. MTP verification steps (M3) score their draft rows on the sparse path too.
 
+`VLLM_HPU_FLASH_NEXT_DECODE_METADATA` (integer, default `0`) applies only with sparse QSA
+(`VLLM_HPU_FLASH_NEXT_QSA_MODE=1`). A sparse-QSA decode or verification step reads only the
+per-request `block_table` and the `slot_mapping` of the attention metadata. `0` still builds the
+dense paged-attention buffers of every decode step (`block_list`, `block_groups`, `block_usage`,
+and in the graph the `block_mapping` one-hot and `attn_bias`), as for any model. `1` does not build
+them: the block table is one row per request (numpy, repeated over its verification rows), block
+ids are not resolved (the defragmenter is off for this model), the decode bucket depends on the
+batch size only (one decode graph per batch size instead of one per block bucket), and the MTP
+drafter's per-step metadata follows the same rules. A runner that cannot use it (another model,
+dense QSA, the defragmenter on, a draft method other than MTP or n-gram) logs the reason once and
+keeps the dense buffers. CPU-checked (bit-identical tokens and logits on the whole serving loop,
+decode and k = 3 verification); not yet checked on a card.
+
 `VLLM_HPU_GDN_CORE_DECODE` selects the GDN decode core path as an integer.
 `1` (default) is fused: every non-speculative decode step runs through the
 fused core op `torch.ops.flashinfer_gaudi.gdn_core_decode` (conv, gates,
@@ -396,7 +409,7 @@ prepared-model entrypoint and disabled in the generic entrypoint.
 | `VLLM_HPU_GDN_PADDED_DIRECT_STATE` | Opts partially filled decode buckets into the direct-state path. Requires FlashInfer GDN and direct state to be enabled, a contiguous active-slot prefix, and every padding slot to be free. Paused requests retain their slots and are never used as padding. Prefix caching and multi-token decode retain the general path. | `false` |
 | `VLLM_HPU_CGUID_DYNAMIC_QUANT` | Uses Gaudi's fused scale-calculation CGUID for decode-sized per-token dynamic FP8 quantization. Large prefill matrices retain the existing reduction path to preserve its numerical behavior. When unset, this follows `VLLM_HPU_FLASHINFER_GDN`. | `false` (`true` with FlashInfer GDN) |
 | `VLLM_HPU_CGUID_DYNAMIC_QUANT_MAX_ROWS` | Maximum flattened row count eligible for CGUID dynamic quantization. Keep this below the smallest prefill token bucket; increasing it can change prefill graph fusion. | `32` |
-| `VLLM_HPU_FUSED_GREEDY_LOGITS` | Fuses hidden-state selection, the LM-head projection, FP32 conversion, and argmax into one compiled decode region for plain greedy requests. Requests using logprobs, penalties, token masks, logit processors, structured output, or speculative decoding retain the general sampler path. | `false` |
+| `VLLM_HPU_FUSED_GREEDY_LOGITS` | Fuses hidden-state selection, the LM-head projection, FP32 conversion, and argmax into one compiled decode region for plain greedy requests. A request with `min_tokens` (up to 8 stop ids) decodes there too: until it has `min_tokens` output tokens its stop ids get `-inf` before the argmax through a fixed-shape mask. Requests using logprobs, penalties, token masks, other logit processors, structured output, or speculative decoding retain the general sampler path. | `false` |
 | `FLASHINFER_GAUDI_BACKEND` | Selects `auto`, `native`, `public`, `bridge`, or `pytorch`. Strict policies (`native/public/bridge`) require the entire operation to be native. The SiLU candidate supports `native/public`; GDN strict calls reject the remaining torch prologue/reference graph. Native availability does not imply performance qualification. | `auto` |
 | `FLASHINFER_GAUDI_STATE_DTYPE` | Selects the requested recurrent-state precision. `fp32` is the production default; `bf16` remains experimental until model-quality validation succeeds. | `fp32` |
 | `FLASHINFER_GAUDI_NATIVE_LIBRARY` | Optional path-list of native host-extension libraries to load. Packaged libraries are discovered automatically. | unset |

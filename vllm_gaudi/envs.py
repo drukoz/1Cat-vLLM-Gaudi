@@ -529,6 +529,7 @@ if TYPE_CHECKING:
     VLLM_HPU_FUSED_GREEDY_LOGITS: bool = False
     VLLM_HPU_FLASH_NEXT_QSA_MODE: int = 0
     VLLM_HPU_FLASH_NEXT_QSA_PREFILL_TILE: int = 2048
+    VLLM_HPU_FLASH_NEXT_DECODE_METADATA: int = 0  # 0 dense paged-attention buffers (default), 1 sparse-QSA only
     VLLM_HPU_GDN_CORE_DECODE: int = 1  # GdnCoreDecodeMode: 1 fused (default), 0 off, 2 recurrence
     VLLM_HPU_GDN_CORE_DECODE_DEBUG: int = 0  # GdnCoreDecodeDebug: 0 off, 1 check slot indices every step (host sync)
     VLLM_HPU_GDN_CORE_VERIFY: int = 0  # GdnCoreVerifyMode: 0 off (default), 1 fused verification steps
@@ -1869,6 +1870,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # 262K bf16 bias plane at 1 GiB, under FusedSDPA's 2^31-byte stride limit.
     "VLLM_HPU_FLASH_NEXT_QSA_PREFILL_TILE":
     lambda: int(os.environ.get("VLLM_HPU_FLASH_NEXT_QSA_PREFILL_TILE", "2048")),
+
+    # Flash-Next decode metadata under sparse QSA (VLLM_HPU_FLASH_NEXT_QSA_MODE=1). 0 (default) = a decode or
+    # verification step builds the dense paged-attention buffers (block_list, block_groups, block_usage and,
+    # in the graph, block_mapping and attn_bias) like any model. 1 = it does not build them, since sparse QSA
+    # decode reads only block_table and slot_mapping: one block-table row per request built with numpy, no
+    # identity block resolve, the decode bucket chosen by batch size only, and the same for the MTP drafter's
+    # per-step metadata (v1/worker/flash_next_decode_metadata.py). A runner that cannot use it (another model,
+    # dense QSA, defragmenter on, ...) logs the reason once and keeps the dense buffers. Any other value is 0.
+    "VLLM_HPU_FLASH_NEXT_DECODE_METADATA":
+    lambda: int(os.environ.get("VLLM_HPU_FLASH_NEXT_DECODE_METADATA", "0")),
 
     # Flash-Next GDN decode through the fused core op (flashinfer_gaudi.gdn_core_decode).
     # 1 (default) = fused, 0 = off (the torch path), 2 = recurrence only (a bisect tool).
