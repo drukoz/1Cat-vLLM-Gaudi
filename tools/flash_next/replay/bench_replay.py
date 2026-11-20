@@ -473,6 +473,47 @@ class Rank:
                        "all_reduces": 2 * body.layers if collectives else 0, "backend": backend})
         return record
 
+    def trace_replay(self, trace_dir: str, rows: int, calls: int) -> dict:
+        """A few replays of the body with its all-reduces under torch.profiler (CPU and HPU) on ranks 0 and 1.
+
+        Every rank replays (the collectives need all of them); ranks 0 and 1 record and write a Chrome trace, which
+        shows what the host thread does during a replay: issuing launches and collectives, or waiting on them.
+        """
+        import contextlib
+        torch = self.torch
+        body = self.body
+
+        class Step(torch.nn.Module):
+
+            def forward(inner, x):  # noqa: N805 - the body, not the module, holds the state
+                return body.forward(x, self.inplace_reduce)
+
+        module = Step()
+        if self.htorch is not None:
+            module = self.htorch.hpu.wrap_in_hpu_graph(module, disable_tensor_cache=True)
+        inputs = self.inputs(rows)
+        for i in range(3):
+            module(inputs[i % len(inputs)])
+        self.synchronize()
+        self.barrier()
+        record = self.rank in (0, 1)
+        activities = [torch.profiler.ProfilerActivity.CPU]
+        if self.htorch is not None:
+            activities.append(torch.profiler.ProfilerActivity.HPU)
+        profiler = torch.profiler.profile(activities=activities) if record else contextlib.nullcontext()
+        with profiler as prof:
+            for i in range(calls):
+                with torch.profiler.record_function("replay_call_%d" % i):
+                    module(inputs[i % len(inputs)])
+                with torch.profiler.record_function("replay_sync_%d" % i):
+                    self.synchronize()
+        path = None
+        if record:
+            os.makedirs(trace_dir, exist_ok=True)
+            path = os.path.join(trace_dir, "replay_rows%d_rank%d.json" % (rows, self.rank))
+            prof.export_chrome_trace(path)
+        return {"case": "trace", "rows": rows, "calls": calls, "path": path}
+
     def check_values(self) -> dict:
         """The replayed body gives the lazy body's numbers (one input, 1 row, with collectives)."""
         torch = self.torch
@@ -577,6 +618,13 @@ def rank_main(args) -> int:
                             pass
                     record["rank"] = args.rank
                     emit(record)
+        if args.trace_dir and args.process == "lazy":
+            try:
+                record = rank.trace_replay(args.trace_dir, args.trace_rows, args.trace_calls)
+            except Exception as exc:  # noqa: BLE001 - the timings still stand
+                record = {"case": "trace", "error": "%s: %s" % (type(exc).__name__, str(exc)[:500])}
+            record["rank"] = args.rank
+            emit(record)
         rank.barrier()
         emit({"case": "done", "rank": args.rank})
         sys.stdout.flush()
@@ -723,6 +771,9 @@ def run_ranks(args, process: str, echo=print) -> dict:
                "--compile-full-rows", ",".join(str(r) for r in args.compile_full_rows)]
         if args.dump_dir:
             cmd += ["--dump-dir", os.path.abspath(args.dump_dir)]
+        if args.trace_dir:
+            cmd += ["--trace-dir", os.path.abspath(args.trace_dir), "--trace-rows", str(args.trace_rows),
+                    "--trace-calls", str(args.trace_calls)]
         if args.selftest:
             cmd.append("--selftest")
         if args.quick:
@@ -775,6 +826,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--processes", default="lazy,eager", help="which process kinds to run (default both)")
     parser.add_argument("--regimes", default=",".join(LAZY_REGIMES + EAGER_REGIMES))
     parser.add_argument("--dump-dir", default=None, help="rank 0 writes the bridge's HPU-graph sources here")
+    parser.add_argument("--trace-dir", default=None,
+                        help="ranks 0 and 1 write a torch.profiler trace of a few replays (with collectives) here")
+    parser.add_argument("--trace-rows", type=int, default=1)
+    parser.add_argument("--trace-calls", type=int, default=5)
     parser.add_argument("--out", default=None, help="write every result to this JSON file")
     parser.add_argument("--timeout", type=float, default=900.0, metavar="S", help="per process kind (default 900)")
     parser.add_argument("--quick", action="store_true", help="few repeats (a smoke run)")
