@@ -835,6 +835,20 @@ TINY_ERROR_TEXT_LIMIT = 300
 TINY_NOT_SENT = "not sent: an earlier prompt timed out"
 
 
+TINY_NEAR_TIE_MARGIN = 0.002  # logits; one bfloat16 step for values in [0.25, 0.5)
+
+
+def _tiny_near_tie(prompt: dict, got: list, exp: list, first_diff) -> float | None:
+    """The reference's logit margin when a full-length answer differs from the first token on and that
+    first token is the reference's second choice within TINY_NEAR_TIE_MARGIN of its first; else None."""
+    top5 = prompt.get("last_prefill_top5") or {}
+    ids, logits = top5.get("ids") or [], top5.get("logits") or []
+    if first_diff != 0 or not got or len(got) != len(exp) or len(ids) < 2 or len(logits) < 2 or got[0] != ids[1]:
+        return None
+    margin = float(logits[0]) - float(logits[1])
+    return round(margin, 6) if 0.0 <= margin <= TINY_NEAR_TIE_MARGIN else None
+
+
 def tiny_compare(base_url: str, reference_path: Path) -> tuple[GateStatus, dict]:
     """Stage 2a: the served tiny checkpoint must reproduce reference.json 16/16 on every prompt.
 
@@ -851,6 +865,7 @@ def tiny_compare(base_url: str, reference_path: Path) -> tuple[GateStatus, dict]
         prompts = sorted(enumerate(reference["prompts"]), key=lambda item: len(item[1]["prompt_ids"]))
         details["n_prompts"] = len(prompts)
         failed = []  # (prompt_tokens, what went wrong), in the order sent
+        near_ties = 0  # prompts where the card took the reference's other first token of a tie
         timed_out = False
         for i, p in prompts:
             entry: dict = {"index": i, "prompt_tokens": len(p["prompt_ids"])}
@@ -868,7 +883,8 @@ def tiny_compare(base_url: str, reference_path: Path) -> tuple[GateStatus, dict]
                         "temperature": 0,
                         "return_token_ids": True,
                     }, HTTP_TIMEOUT_S)
-                got = (resp.get("choices") or [{}])[0].get("token_ids") or []
+                choice = (resp.get("choices") or [{}])[0]
+                got = choice.get("token_ids") or []
             except Exception as e:  # noqa: BLE001 - one prompt's failure is recorded, the others still run
                 timed_out = isinstance(e, TimeoutError)
                 # _post_json's own texts ("HTTP 400 from ...", "request to ... timed out") need no type name
@@ -883,9 +899,26 @@ def tiny_compare(base_url: str, reference_path: Path) -> tuple[GateStatus, dict]
                 first_diff = min(len(got), len(exp))
             full = got == exp
             entry.update(match=match, expected=len(exp), first_diff=first_diff, full_match=full)
-            if not full:
+            near_tie = _tiny_near_tie(p, got, exp, first_diff)
+            if near_tie is not None:
+                # The reference itself is undecided at the first token: its best two logits are closer
+                # than one bfloat16 step, so a card that picks the other one is not wrong (on 2026-11-20
+                # two of six reference prompts had margins of 0.0 and 0.0009). Recorded, not failed.
+                entry.update(near_tie=True, near_tie_margin=near_tie, got=got[:TINY_MAX_TOKENS],
+                             want=exp[:TINY_MAX_TOKENS])
+                near_ties += 1
+            elif not full:
+                # What the server really answered: an empty answer, a near-tie (the first token is another
+                # of the reference's top-5 ids for that position) and a wrong model all read "0 of 16
+                # tokens match, first difference at token 0" otherwise.
+                top5 = ((p.get("last_prefill_top5") or {}).get("ids") or [])
+                entry.update(got=got[:TINY_MAX_TOKENS], got_tokens=len(got), want=exp[:TINY_MAX_TOKENS],
+                             finish_reason=choice.get("finish_reason"),
+                             first_token_reference_rank=(top5.index(got[0]) if got and got[0] in top5 else None))
                 failed.append((entry["prompt_tokens"],
-                               "%d of %d tokens match, first difference at token %s" % (match, len(exp), first_diff)))
+                               "%d of %d tokens match, first difference at token %s (the server sent %d tokens)" %
+                               (match, len(exp), first_diff, len(got))))
+        details["near_ties"] = near_ties
         if failed:
             details["reason"] = "%d of %d prompts failed; the shortest failing prompt has %d tokens: %s" % (
                 len(failed), len(prompts), failed[0][0], failed[0][1])

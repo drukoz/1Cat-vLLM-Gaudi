@@ -430,7 +430,14 @@ def test_tiny_compare_mismatch(tmp_path, fake_api):
     assert details["prompts"][1]["match"] == 15
     assert details["prompts"][1]["first_diff"] == 15
     assert details["reason"] == ("1 of 2 prompts failed; the shortest failing prompt has 7 tokens: "
-                                 "15 of 16 tokens match, first difference at token 15")
+                                 "15 of 16 tokens match, first difference at token 15 (the server sent 16 tokens)")
+    # a failing prompt keeps what the server really sent: an empty answer, a near-tie and a wrong model
+    # all read "0 of 16 tokens match" otherwise
+    bad = details["prompts"][1]
+    assert bad["got_tokens"] == 16 and len(bad["got"]) == 16 and len(bad["want"]) == 16
+    assert bad["got"][:15] == bad["want"][:15] and bad["got"][15] != bad["want"][15]
+    assert "finish_reason" in bad and "first_token_reference_rank" in bad
+    assert "got" not in details["prompts"][0]  # a matching prompt stays as it was
 
 
 def test_tiny_compare_server_down(tmp_path):
@@ -754,3 +761,44 @@ def test_card_tests_missing_interpreter_never_raises(tmp_path, monkeypatch):
     status, details = gates.card_tests(tmp_path, tmp_path / "card", python=str(tmp_path / "no-such-interpreter"))
     assert status is GateStatus.FAILED
     assert "FileNotFoundError" in details["error"]
+
+
+def _near_tie_reference(tmp_path, margin):
+    prompts = [{"prompt_ids": [1], "generated_ids": [10 + j for j in range(16)],
+                "last_prefill_top5": {"ids": [10, 99, 98, 97, 96],
+                                      "logits": [0.3, 0.3 - margin, 0.2, 0.1, 0.0]}}]
+    path = tmp_path / "reference.json"
+    path.write_text(json.dumps({"prompts": prompts}), encoding="utf-8")
+    return path
+
+
+def test_tiny_compare_accepts_the_other_token_of_a_reference_tie(tmp_path, monkeypatch):
+    """Rental 2026-11-20: two reference prompts had first-token margins of 0.0 and 0.0009 logits; the
+    card took the second choice and every later token differed. That is a tie, not a wrong model."""
+    other = [99] + [500 + j for j in range(15)]
+    monkeypatch.setattr(gates, "_post_json", lambda *a, **k: {"choices": [{"token_ids": other,
+                                                                             "finish_reason": "length"}]})
+    status, details = gates.tiny_compare("http://x", _near_tie_reference(tmp_path, 0.0009))
+    assert status is GateStatus.PASSED, details
+    assert details["near_ties"] == 1
+    entry = details["prompts"][0]
+    assert entry["near_tie"] is True and entry["near_tie_margin"] == pytest.approx(0.0009)
+    assert entry["full_match"] is False and entry["got"] == other
+
+
+@pytest.mark.parametrize("margin, first", [(0.01, 99), (0.0009, 98), (0.0009, 12345)])
+def test_tiny_compare_still_fails_what_is_not_a_tie(tmp_path, monkeypatch, margin, first):
+    """A clear reference margin, the third choice, or a token outside the top five stay failures."""
+    other = [first] + [500 + j for j in range(15)]
+    monkeypatch.setattr(gates, "_post_json", lambda *a, **k: {"choices": [{"token_ids": other,
+                                                                             "finish_reason": "length"}]})
+    status, details = gates.tiny_compare("http://x", _near_tie_reference(tmp_path, margin))
+    assert status is GateStatus.FAILED
+    assert details["near_ties"] == 0 and "near_tie" not in details["prompts"][0]
+
+
+def test_tiny_compare_a_short_answer_is_never_a_tie(tmp_path, monkeypatch):
+    monkeypatch.setattr(gates, "_post_json", lambda *a, **k: {"choices": [{"token_ids": [99],
+                                                                             "finish_reason": "stop"}]})
+    status, _ = gates.tiny_compare("http://x", _near_tie_reference(tmp_path, 0.0))
+    assert status is GateStatus.FAILED

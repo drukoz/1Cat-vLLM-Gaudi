@@ -344,7 +344,7 @@ def test_wrong_tokens_are_a_failure(fakes, monkeypatch):
     assert entry["status"] == "failed"
     # the reason's wording changed with the per-prompt record: it names the shortest failing prompt
     assert entry["reason"] == ("2 of 2 prompts failed; the shortest failing prompt has 1 tokens: "
-                               "15 of 16 tokens match, first difference at token 3")
+                               "15 of 16 tokens match, first difference at token 3 (the server sent 16 tokens)")
 
 
 def test_fused_mode_fails_when_the_server_fell_back_to_the_torch_path(fakes, monkeypatch):

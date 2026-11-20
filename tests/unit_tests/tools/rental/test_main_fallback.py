@@ -169,7 +169,9 @@ def test_tiny_gate_failing_twice_fails_the_gate(fused_node, monkeypatch):
     assert "the shortest failing prompt has 1 tokens" in status["reason"]
     details = read_json(tiny / "details.json")
     assert details["combined_kernel_db_disabled_by"] == "tiny"
-    assert len(runner.builds) == 2  # exactly one rerun
+    # one rerun without the database, one on the PyTorch GDN path (the last fallback of a fused run)
+    assert len(runner.builds) == 3
+    assert details["gdn_fused_disabled_by"] == "tiny" and (tiny / "attempt-gdn-fused").is_dir()
 
 
 def test_tiny_gate_does_not_rerun_without_the_combined_database(fused_node, monkeypatch):
@@ -177,7 +179,11 @@ def test_tiny_gate_does_not_rerun_without_the_combined_database(fused_node, monk
     runner = fused_node(False, FAKE_SERVER)  # not installed
     assert runner.run_gate("tiny") is False
     assert not (runner.run_dir / "tiny" / "attempt-combined").exists()
-    assert len(runner.builds) == 1
+    # one more attempt: the last fallback of a fused run is the PyTorch GDN path (attempt-gdn-fused)
+    assert (runner.run_dir / "tiny" / "attempt-gdn-fused").is_dir()
+    assert len(runner.builds) == 2
+    assert runner.gdn_mode == gates.GDN_MODE_PYTORCH and runner.gdn_fused_disabled_by == "tiny"
+    assert runner.variant_server_env({})[gates.GDN_MODE_ENV] == "0"  # every later server
     assert runner.combined_db_disabled_by is None
 
     runner = fused_node(True, FAKE_SERVER)  # installed, but G1b turned the fused kernel off: never loaded

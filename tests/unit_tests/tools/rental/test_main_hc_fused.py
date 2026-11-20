@@ -462,7 +462,7 @@ def test_tiny_gate_failing_with_and_without_the_kernels_fails_the_gate(fused_nod
     tiny = runner.run_dir / "tiny"
     assert (tiny / "attempt-hc-fused").is_dir()
     assert read_json(tiny / "status.json")["status"] == int(GateStatus.FAILED)
-    assert len(runner.builds) == 2  # exactly one rerun for the kernels
+    assert len(runner.builds) == 3  # one rerun for the kernels, one on the PyTorch GDN path (the last fallback)
     # the kernels were not shown to be at fault, but they stay off: the proven path is what goes on
     assert runner.hc_fused_on() is False
     assert hc_line(runner) == "- HC fused: off (the tiny gate failed with it)"
