@@ -531,7 +531,7 @@ class Runner:
             for repeat in range(a.repeat):
                 await self.cold(a.sweep_tokens, tag="" if a.repeat == 1 else f" pass {repeat + 1}")
             for count in a.sweep_concurrent:
-                await self.concurrent(count, a.sweep_tokens)
+                await self.concurrent(count, a.sweep_concurrent_tokens or a.sweep_tokens)
         await self.set_knobs("server", {})
 
     async def plan_pacing(self) -> None:
@@ -665,6 +665,8 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
                    help="pacing: share_percent:slice_tokens pairs, share 100 = pacing off")
     p.add_argument("--sweep-tokens", type=int, default=32000, help="sweep and pacing: cold prompt size")
     p.add_argument("--sweep-concurrent", type=_int_list, default=[4])
+    p.add_argument("--sweep-concurrent-tokens", type=int, default=0,
+                   help="sweep: prompt size of the concurrent requests (0 = --sweep-tokens)")
     p.add_argument("--repeat", type=int, default=1,
                    help="cold passes per size; with 2 the first pass compiles the graphs and the second measures")
     p.add_argument("--canaries", type=int, default=2, help="streams already decoding during each case (0 = none)")

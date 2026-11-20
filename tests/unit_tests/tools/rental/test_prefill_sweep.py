@@ -332,3 +332,13 @@ def test_case_max_tokens_and_return_ids_record_the_greedy_output(server, tmp_pat
     request = by_case(report)["cold 2048"]["requests"][0]
     assert request["output_tokens"] == 4
     assert len(request["token_ids"]) == 4
+
+
+def test_sweep_concurrent_requests_take_their_own_size(server, tmp_path):
+    code, report, _ = run_tool(server, tmp_path, "--plan", "sweep", "--knobs-file", str(server.knobs), "--settings",
+                               "8192:8192", "--sweep-tokens", "4096", "--sweep-concurrent", "2",
+                               "--sweep-concurrent-tokens", "1024", "--canaries", "0")
+    assert code == 0
+    together = by_case(report)["concurrent 2x1024"]
+    assert together["aggregate"]["uncached_tokens"] == 2 * 1024
+    assert by_case(report)["cold 4096"]["requests"][0]["uncached_tokens"] == 4096
