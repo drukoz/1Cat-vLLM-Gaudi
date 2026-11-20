@@ -19,7 +19,7 @@ import torch  # noqa: E402
 from vllm.sampling_params import SamplingType  # noqa: E402
 from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p_pytorch  # noqa: E402
 
-from vllm_gaudi.v1.sample.candidate_sampling import PARAM_COLUMNS  # noqa: E402
+from vllm_gaudi.v1.sample.candidate_sampling import PARAM_COLUMNS, candidate_probs, take_candidates  # noqa: E402
 
 pytestmark = pytest.mark.skipif(not eh.hpu_cpu_stubs.STUBBED, reason="CPU-only: needs the stubbed Gaudi runtime")
 
@@ -108,13 +108,22 @@ def test_sampled_requests_draw_in_the_logits_region(tiny_checkpoint, reference):
         assert tokens.dtype == torch.int64 and tokens.shape == (logits.shape[0], 1)
         greedy_rows = params[:, 2] != 0
         want = vllm_probs(logits, params[:, 0], (top_k_index.view(-1) + 1).to(torch.int32), params[:, 1])
-        drawn = want.gather(1, tokens)
+        values, ids = take_candidates(logits)
+        own = torch.zeros_like(want).scatter_add_(1, ids, candidate_probs(values, params[:, 0], top_k_index,
+                                                                         params[:, 1]))
         for row in range(logits.shape[0]):
+            token = int(tokens[row])
             if greedy_rows[row]:
-                assert int(tokens[row]) == int(logits[row].float().argmax())
-            else:
-                assert float(drawn[row]) > 0.0, "a token vLLM's sampler could not draw"
-                checked += 1
+                assert token == int(logits[row].float().argmax())
+                continue
+            assert float(own[row, token]) > 0.0, "a token outside the region's own kept set"
+            # vLLM could draw it too, or (the tiny model's bf16 logits tie often) a token tied with it: when the
+            # top-p cut falls inside a group of equal logits, which of them stay follows the order of equal
+            # values, vLLM's sort or top-k (test_candidate_sampling.py holds the count and the probabilities).
+            kept_by_vllm = logits[row].float()[want[row] > 0]
+            assert bool((kept_by_vllm == logits[row, token].float()).any()), "a token vLLM's sampler could not draw"
+            assert int((own[row] > 0).sum()) == int((want[row] > 0).sum())
+            checked += 1
         assert params.shape[1] > PARAM_COLUMNS and bool((params[:, PARAM_COLUMNS:] >= 0).all())
     assert checked > 0
 
