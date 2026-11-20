@@ -678,6 +678,108 @@ def add_rmsnorm_quant_op() -> Callable | None:
     return _ADD_RMSNORM_QUANT_OP
 
 
+# ---------------------------------------------------------------------------------------------------------
+# The fused QSA decode kernels (VLLM_HPU_QSA_FUSED=2): libqsa_fused_gaudi2.so + qsa_fused_ops*.so, loaded by the
+# rules of the fused hyper-connection kernels above. docs/design/flash-next/qsa-fused.md.
+# ---------------------------------------------------------------------------------------------------------
+QSA_FUSED_KERNEL_DB = "libqsa_fused_gaudi2.so"  # an optional member of the combined kernel database
+QSA_FUSED_KERNEL_LIBRARY_ENV = "QSA_FUSED_GAUDI_KERNEL_LIBRARY"  # its path, when it is not in the package's lib/
+QSA_FUSED_NATIVE_LIBRARY_ENV = "QSA_FUSED_GAUDI_NATIVE_LIBRARY"  # the path of qsa_fused_ops*.so, same rule
+QSA_FUSED_EXTENSION_GLOB = "qsa_fused_ops*.so"
+QSA_FUSED_SCHEMA_MODULE = "flashinfer_gaudi.qsa_fused"  # defines the two op schemas; imported only with the flag at 2
+_QSA_FUSED_LOADED: bool | None = None  # None = not attempted
+_QSA_FUSED_ERRORS: list[str] = []
+_QSA_FUSED_LOCK = threading.Lock()
+
+
+def _qsa_fused_error(message: str) -> None:
+    _LOAD_ERRORS.append(message)
+    _QSA_FUSED_ERRORS.append(message)
+
+
+def qsa_fused_extension_errors() -> tuple[str, ...]:
+    """Why ``load_qsa_fused_extension`` failed (empty when it loaded or was never called)."""
+    return tuple(_QSA_FUSED_ERRORS)
+
+
+def qsa_fused_extension_loaded() -> bool | None:
+    """The result of ``load_qsa_fused_extension``; None when it was never called (``VLLM_HPU_QSA_FUSED`` is not 2)."""
+    return _QSA_FUSED_LOADED
+
+
+def combined_db_serves_qsa_fused(combined: Path | str, kernel_db: str) -> bool:
+    """True when the combined kernel database `combined` forwards the GUIDs of `kernel_db` (as for hc_fused)."""
+    override = os.environ.get(COMBINED_MEMBERS_ENV, "")
+    if override:
+        return os.path.abspath(kernel_db) in [os.path.abspath(entry) for entry in override.split(":") if entry]
+    path = Path(os.path.abspath(kernel_db))
+    if path.name != QSA_FUSED_KERNEL_DB or path.parent != Path(os.path.abspath(combined)).parent:
+        return False
+    try:
+        return QSA_FUSED_KERNEL_DB.encode() in Path(combined).read_bytes()
+    except OSError:
+        return False
+
+
+def _load_qsa_fused_locked() -> bool:
+    """The one attempt of ``load_qsa_fused_extension``: files, kernel database, schemas, then the extension."""
+    package_lib = Path(__file__).resolve().parent / "lib"
+    kernel_db = os.environ.get(QSA_FUSED_KERNEL_LIBRARY_ENV, "") or str(package_lib / QSA_FUSED_KERNEL_DB)
+    extension = os.environ.get(QSA_FUSED_NATIVE_LIBRARY_ENV, "")
+    if not extension:
+        matches = sorted(glob.glob(str(package_lib / QSA_FUSED_EXTENSION_GLOB)))
+        extension = matches[0] if matches else str(package_lib / QSA_FUSED_EXTENSION_GLOB)
+    missing = False
+    for path in (kernel_db, extension):
+        if not os.path.isfile(path):
+            _qsa_fused_error(f"{path}: file does not exist")
+            missing = True
+    if missing:
+        return False
+    combined = _combined_kernel_db_path()
+    serves = combined is not None and combined_db_serves_qsa_fused(combined, kernel_db)
+    if not (serves and _activate_combined_kernel_db()):
+        reason = _prepend_kernel_database(kernel_db)
+        if reason:
+            if combined is not None and not serves:
+                reason += (f" The combined kernel database {combined} does not serve {QSA_FUSED_KERNEL_DB}: rebuild "
+                           f"it with tools/build_flashinfer_gaudi.py --combined-only after building the library.")
+            _qsa_fused_error(reason)
+            return False
+    try:
+        importlib.import_module(QSA_FUSED_SCHEMA_MODULE)
+    except Exception as exc:  # pragma: no cover - the schema module is part of this package
+        _qsa_fused_error(f"{QSA_FUSED_SCHEMA_MODULE}: {type(exc).__name__}: {exc}")
+        return False
+    try:
+        torch.ops.load_library(extension)
+    except Exception as exc:
+        _qsa_fused_error(f"{extension}: {_exception_text(exc)}")
+        return False
+    _LOADED_PATHS.append(extension)
+    return True
+
+
+def load_qsa_fused_extension() -> bool:
+    """Register libqsa_fused_gaudi2.so and load qsa_fused_ops*.so once; True when loaded. Never raises.
+
+    Called only with ``VLLM_HPU_QSA_FUSED=2``, before the first HPU op of the process (SynapseAI reads
+    ``GC_KERNEL_PATH`` when its graph compiler starts). ``qsa_fused_extension_errors`` says why it returned False.
+    """
+    global _QSA_FUSED_LOADED
+    if _QSA_FUSED_LOADED is not None:
+        return _QSA_FUSED_LOADED
+    with _QSA_FUSED_LOCK:
+        if _QSA_FUSED_LOADED is None:
+            try:
+                with _LOAD_LOCK:
+                    _QSA_FUSED_LOADED = _load_qsa_fused_locked()
+            except Exception as exc:  # noqa: BLE001 - an optional kernel never stops a process
+                _qsa_fused_error(f"load_qsa_fused_extension: {_exception_text(exc)}")
+                _QSA_FUSED_LOADED = False
+        return _QSA_FUSED_LOADED
+
+
 # SynapseAI reads GC_KERNEL_PATH when its graph compiler is initialized. Set
 # the packaged kernel database path as soon as this lightweight loader module
 # is imported; the PyTorch registration extension itself remains lazy.

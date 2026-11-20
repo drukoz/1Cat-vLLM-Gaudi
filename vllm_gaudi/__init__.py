@@ -221,6 +221,31 @@ def _load_moe_glue_if_requested(flag: int, warn=None) -> bool | None:
     return loaded
 
 
+def _load_qsa_fused_if_requested(flag: int, warn=None) -> bool | None:
+    """With VLLM_HPU_QSA_FUSED=2, load the fused QSA decode kernels and warn once when they are not usable.
+
+    Returns the loader's result, or ``None`` when the flag is not 2: then nothing is imported, loaded or logged.
+    Before warmup, for the reason of the hyper-connection loader (GC_KERNEL_PATH). The loader never raises; the
+    QSA layers then run the mode-1 torch data flow (qsa_fused_path).
+    """
+    if flag != 2:
+        return None
+    from flashinfer_gaudi._native import load_qsa_fused_extension, qsa_fused_extension_errors
+
+    loaded = load_qsa_fused_extension()
+    if not loaded and _hpu_visible():
+        reason = "; ".join(qsa_fused_extension_errors()) or "no error recorded"
+        message = (f"QSA fused (VLLM_HPU_QSA_FUSED={int(flag)}) has no HPU kernel: the qsa_fused_ops extension did "
+                   f"not load ({reason}); the QSA layers run the torch data flow of mode 1. Build it with "
+                   "tools/build_flashinfer_gaudi.py --qsa-fused-only, or set VLLM_HPU_QSA_FUSED=1.")
+        if warn is None:
+            from vllm.logger import init_logger
+
+            warn = init_logger(__name__).warning
+        warn(message)
+    return loaded
+
+
 def register_ops():
     """Register custom PluggableLayers for the HPU platform"""
     from flashinfer_gaudi import load_native_extensions
@@ -249,6 +274,8 @@ def register_ops():
     _load_hc_fused_if_requested(_gaudi_envs.VLLM_HPU_HC_FUSED)
     # The fused MoE glue kernels, only with VLLM_HPU_MOE_GLUE=1 (default 0: nothing happens here).
     _load_moe_glue_if_requested(_gaudi_envs.VLLM_HPU_MOE_GLUE)
+    # The fused QSA decode kernels, only with VLLM_HPU_QSA_FUSED=2 (default 0: nothing happens here).
+    _load_qsa_fused_if_requested(_gaudi_envs.VLLM_HPU_QSA_FUSED)
     # One line per process with what the loader decided (state, GC_KERNEL_PATH, combined database, errors):
     # the server log then shows which kernel database every worker really runs.
     from flashinfer_gaudi._native import kernel_database_status
