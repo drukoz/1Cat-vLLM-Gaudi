@@ -8,7 +8,8 @@
 # one server: N streams at a short context and over a shared long prefix served from the prefix cache, base and
 # flag-on rounds in turn), counts the switches the workers logged and the decode graphs compiled at run time,
 # stops the server. Options go to the probe: --prefix TOKENS (default 120832), --streams N (default 32),
-# --tokens N (default 128), --arms LIST (default both,i01,i05), --budget SECONDS, --no-long.
+# --tokens N (default 128), --arms LIST (default both,i01,i05), --budget SECONDS, --no-long, --candvp,
+# --logprobs-check. hl-smi's device memory goes to hlsmi.log every 15 s.
 set -u
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 OUT="${FARM_OUT:-/results/serve}"
@@ -36,7 +37,14 @@ setsid vllm serve /models/Qwen3.8-Flash-Next-FP8 --served-model-name fn --host 1
     --max-num-batched-tokens 8192 --long-prefill-token-threshold 2048 --enable-prompt-tokens-details \
     > server0.log 2>&1 &
 SP=$!
+# Device memory every 15 s (coordinator, 23:50 UTC: graphs made at run time can exhaust it; PT_DEVMEM lines).
+HLSMI=""
+if command -v hl-smi >/dev/null 2>&1; then
+    ( while :; do echo "$(date -u +%H:%M:%S) $(hl-smi --query-aip=index,memory.used,memory.total --format=csv,noheader 2>/dev/null | tr '\n' ';')"; sleep 15; done ) > hlsmi.log 2>&1 &
+    HLSMI=$!
+fi
 stop_server() {
+    [ -n "$HLSMI" ] && kill "$HLSMI" 2>/dev/null
     kill -TERM -- "-$SP" 2>/dev/null
     for _ in $(seq 1 18); do kill -0 "$SP" 2>/dev/null || return 0; sleep 5; done
     kill -KILL -- "-$SP" 2>/dev/null
@@ -72,6 +80,7 @@ grep -h "Runtime switch file\|sparse-QSA decode metadata\|is off for this server
 echo "decode configurations compiled at run time: $(grep -o "Configuration: ('decode'[^)]*)" server0.log | sort -u | wc -l)"
 grep -o "Configuration: ('decode'[^)]*)" server0.log | sort | uniq -c | head -40
 grep -ciE "fallback|is off for|has no HPU kernel" server0.log | xargs echo "fallback/off lines:"
-grep -hiE "is off for|Traceback" server0.log | head -5 | cut -c1-300
+grep -hiE "is off for|Traceback|PT_DEVMEM|OverflowError" server0.log | head -8 | cut -c1-300
+[ -s hlsmi.log ] && { echo "device memory, first and last sample:"; head -n 1 hlsmi.log; tail -n 1 hlsmi.log; }
 stop_server
 [ "$RC" -eq 0 ] || exit 5
