@@ -1,15 +1,21 @@
-# One arm of a prefill A/B. Every arm sends the same prompts (the nonces) and keeps 8 greedy tokens per request.
+# One arm of a prefill A/B (TP4 + EP4: scheduler block 896 tokens). Every arm sends the same prompts (the nonces).
 # The 32,768-token lines come first: a 2,048-token chunk at 120K context needs about 3.3 GB of attention scores
 # per QSA layer at TP4 (6 heads x 2,048 x 133K, bf16), close to the memory left there, so a server that dies
-# in c120k has already given its 32K numbers.
-# c32k, c120k: a cold prompt twice (pass 1 compiles the buckets it meets, pass 2 is the warm number). c120k then
-# sends its second prompt again with 64, 512 and 2,048 new tokens, twice (a next turn: a prefix hit and a short
-# prefill at 120K context; the first round compiles those buckets, the second is the warm number).
+# in c120k has already given its other numbers.
+# c32k: a cold 32,768-token prompt twice (pass 1 compiles the buckets it meets, pass 2 is the warm number).
 c32k --plan baseline --cold-tokens 32768 --repeat 2 --warm-tokens "" --concurrent "" --turn2-tokens 0 --shared-prefix 0 --canaries 0 --case-max-tokens 8 --return-ids --nonce arm-32k
+# suffix: 32 conversations of 8,192 tokens (the setup row: 32 cold prompts at once), then every one sends turn
+# after turn for 40 s: 892 new tokens + its 4 output tokens = one 896-token block per turn, so every turn
+# prefills exactly 1,024 uncached tokens after a prefix hit, in one forward of one bucket (1024 x ctx 123).
+# The first round is 32 suffixes at once (step-anatomy's case: time to first token = the prompt forwards queue).
+suffix --plan agents --agents 32 --agent-context 8192 --agent-new-tokens 892 --agent-output 4 --agent-seconds 40 --canaries 0 --nonce arm-suffix
 # streams: 4 streams decode while one 32,768-token prompt, then four 16,384-token prompts at once, are prefilled.
 streams --plan baseline --cold-tokens 32768 --repeat 1 --warm-tokens "" --concurrent 4 --concurrent-tokens 16384 --turn2-tokens 0 --shared-prefix 0 --canaries 4 --nonce arm-streams
-# multi: four 32,768-token prompts at once, nothing decoding.
-multi --plan baseline --cold-tokens "" --concurrent 4 --concurrent-tokens 32768 --turn2-tokens 0 --shared-prefix 0 --canaries 0 --case-max-tokens 8 --return-ids --nonce arm-multi
+# c120k: a cold 122,880-token prompt twice, then its second prompt again with 64, 512 and 2,048 new tokens,
+# twice (a next turn at 120K: a prefix hit and a short prefill; round 1 compiles those buckets, round 2 is warm).
 c120k --plan baseline --cold-tokens 122880 --repeat 2 --warm-tokens 64,512,2048,64,512,2048 --concurrent "" --turn2-tokens 0 --shared-prefix 0 --canaries 0 --case-max-tokens 8 --return-ids --nonce arm-120k
-# rtgraphs: prompt HPU graphs switched on in the running server (the workers' runtime knob), the same shapes again.
+# rtsuffix: prompt HPU graphs switched on in the running server (the workers' runtime knob), then the suffix
+# loop again on the same conversations (the setup is a prefix hit): graphs off against on in one server.
+rtsuffix --knobs-file /tmp/prefill_knobs.json --knobs '{"prompt_graph_max_tokens": 140000}' --label "graphs (runtime knob)" --plan agents --agents 32 --agent-context 8192 --agent-new-tokens 892 --agent-output 4 --agent-seconds 40 --canaries 0 --nonce arm-suffix
+# rtgraphs: the cold prompts again under the runtime knob.
 rtgraphs --knobs-file /tmp/prefill_knobs.json --knobs '{"prompt_graph_max_tokens": 140000}' --label "graphs (runtime knob)" --plan baseline --cold-tokens 32768,122880 --repeat 2 --warm-tokens "" --concurrent "" --turn2-tokens 0 --shared-prefix 0 --canaries 0 --case-max-tokens 8 --return-ids --nonce arm-rtgraphs

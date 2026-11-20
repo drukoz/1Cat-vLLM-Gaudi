@@ -160,5 +160,7 @@ def test_the_committed_plans_parse_and_never_repeat_a_cold_prompt():
             assert not changes or args.knobs_file == "/tmp/prefill_knobs.json"
         assert len(set(names)) == len(names), plan.name
         # the nonce salts a line's prompts: two lines with one nonce would send the same "cold" prompt twice
-        assert len(set(nonces)) == len(nonces) and None not in nonces, plan.name
-        assert names[:4] == ["c32k", "streams", "multi", "c120k"], plan.name  # every arm starts with the same lines
+        # (the two suffix loops share theirs on purpose: the second goes on with the first one's conversations)
+        once = [n for n in nonces if n != "arm-suffix"]
+        assert len(set(once)) == len(once) and None not in nonces, plan.name
+        assert names[:4] == ["c32k", "suffix", "streams", "c120k"], plan.name  # every arm starts with the same lines
