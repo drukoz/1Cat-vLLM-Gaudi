@@ -20,8 +20,11 @@ graph, at 1, 2, 5, 32 and 128 rows, and compares the ids with the CPU's:
   looked-up rows are read back. They say whether a wrong narrowing is seen by the graph itself or only by a read
   to the host (``argmax_int_embed``: the MTP draft loop; ``topk_int32_embed``: the QSA block selection's shape).
 
-Every row has one largest logit at a known column (and, in the tied data set, a second column with the same
-value: the lowest id must win in the serving cases; what the card's own arg max returns for a tie is reported).
+Every shard has its 64 largest logits at known columns, all different (and, in the tied data set, the largest
+twice: the lowest id must win in the serving cases; what the card's own arg max returns for a tie is reported),
+so every top-k up to 64 has one answer. The top-k cases run once per ``--top`` value (default 20 and 64: a
+sampled request's top-k and the candidates per rank) and are named ``case@k``. ``stage2_topk_gather@k`` and
+``first_maximum@k`` take what the all-gather of 8 ranks' candidates hands on, ``[rows, 8k]`` values and ids.
 
     python3 tools/flash_next/collectives/id_check.py                 # one card (the job's visible card)
     python3 tools/flash_next/collectives/id_check.py --ranks 8       # one process per card, hccl
@@ -43,9 +46,9 @@ from types import SimpleNamespace
 TAG = "IDCHECK "
 SHARD_WIDTH = 31040  # one rank's vocabulary shard at TP8 (248,320 / 8)
 PADDING = 13  # zero-logit padding columns at the end of a shard (cut off by the vocabulary-parallel reduction)
-PLANTED = (100.0, 90.0, 80.0, 70.0)  # bf16-exact, far above the noise: the four largest logits of every row
-LOCAL = (50.0, 49.0, 48.0, 47.0)  # the four largest logits of a shard that holds none of PLANTED
-TOP = 4
+KNOWN = 64  # the largest logits that are planted, distinct: every top-k up to 64 has one answer
+PLANTED = tuple(163.0 - j for j in range(KNOWN))  # bf16-exact, above everything: the largest logits of every row
+LOCAL = tuple(63.5 - 0.5 * j for j in range(KNOWN))  # the largest logits of a shard, below PLANTED, above the noise
 SERVING = ("vp_argmax", "fp32_ids_row")
 
 
@@ -53,33 +56,49 @@ def make_logits(torch, rows, world, width, count, seed, tied):
     """The logits of every rank as one CPU tensor ``[rows, world * width]`` bf16 (rank ``r`` owns the columns
     ``[r * width, (r + 1) * width)``; its last ``width - count`` columns are padding, 0.0).
 
-    Noise within +-30. In the upper half of the real columns, at four distinct global ids per row, PLANTED (the
-    four largest logits of the row; with ``tied`` a second PLANTED[0] at a fifth id). In the lower half of every
-    shard LOCAL (and with ``tied`` a second LOCAL[0]), so that the four largest logits of every shard are known
-    and distinct too.
+    Noise within +-30. In the upper half of the real columns, at KNOWN distinct global ids per row, PLANTED (the
+    largest logits of the row; with ``tied`` a second PLANTED[0] at one more id). In the lower half of every shard
+    LOCAL (and with ``tied`` a second LOCAL[0]), so that the KNOWN largest logits of every shard are known and
+    distinct too.
     """
     gen = torch.Generator().manual_seed(seed)
     x = (torch.randn(rows, world * width, generator=gen) * 4.0).clamp_(-30.0, 30.0)
     row_index = torch.arange(rows)
     half = count // 2
-    stride = half // 7 + 1
+    stride = (half - 1) // (KNOWN + 1)  # KNOWN + 1 columns, stride apart, never wrap onto each other
+    assert stride >= 1, "a shard needs more than %d real columns" % (2 * (KNOWN + 2))
+    steps = torch.arange(KNOWN + 1).view(1, -1)
     for r in range(world):  # padding, then the local values in the lower half of the shard
         x[:, r * width + count:(r + 1) * width] = 0.0
         first = torch.randint(0, half, (rows, 1), generator=gen)
-        columns = (first + torch.arange(5).view(1, 5) * stride) % half
+        columns = (first + steps * stride) % half
         for j, value in enumerate(LOCAL):
             x[row_index, r * width + columns[:, j]] = value
         if tied:
-            x[row_index, r * width + columns[:, 4]] = LOCAL[0]
+            x[row_index, r * width + columns[:, KNOWN]] = LOCAL[0]
     # the global values: slot g of the world * (count - half) upper-half columns is rank g // n, column half + g % n
     n = count - half
-    stride = (world * n) // 7 + 1
+    stride = (world * n - 1) // (KNOWN + 1)
     first = torch.randint(0, world * n, (rows, 1), generator=gen)
-    slots = (first + torch.arange(5).view(1, 5) * stride) % (world * n)
+    slots = (first + steps * stride) % (world * n)
     for j, value in enumerate(PLANTED + ((PLANTED[0], ) if tied else ())):
         slot = slots[:, j]
         x[row_index, (slot // n) * width + half + slot % n] = value
     return x.to(torch.bfloat16)
+
+
+def make_candidates(torch, rows, k, seed, tied):
+    """``[rows, 2, 8 * k]`` fp32 on the CPU: what 8 ranks' gathered candidates look like. Row 0 of the middle
+    dimension holds distinct values (with ``tied`` the largest twice), row 1 distinct global token ids."""
+    gen = torch.Generator().manual_seed(seed)
+    n = 8 * k
+    values = torch.stack([torch.randperm(n, generator=gen).float() * 0.25 - 50.0 for _ in range(rows)])
+    ids = torch.stack([torch.randperm(248320, generator=gen)[:n].float() for _ in range(rows)])
+    if tied:
+        best = values.argmax(dim=-1)
+        other = (best + n // 2) % n
+        values[torch.arange(rows), other] = values[torch.arange(rows), best]
+    return torch.stack((values, ids), dim=1)
 
 
 def child(args):
@@ -157,10 +176,6 @@ def child(args):
         mark()
         return ids.to(torch.int32)
 
-    def topk_gather_fp32(x):
-        index = torch.topk(real(x), TOP, dim=-1).indices
-        return torch.gather(id_table(x.shape[0]), -1, index).to(torch.int32)
-
     # Consumers inside the graph: an embedding table whose row i is (i, i, i, i), so the looked-up row names the
     # id the lookup saw. Nothing but that row is read to the host.
     id_rows = torch.arange(count, dtype=torch.float32).unsqueeze(1).repeat(1, 4).to(device)
@@ -175,14 +190,13 @@ def child(args):
     def argmax_int_embed(x):  # hpu_flash_next_mtp.py: argmax, .int(), .view(-1, 1), the embedding of the next pass
         return masked_lookup(x.narrow(-1, 0, count).argmax(dim=-1).int().view(-1, 1))[:, 0, 0]
 
-    def topk_int32_embed(x):  # qsa_sparse_ops.select_blocks: topk, .to(int32), integer arithmetic, a lookup
-        return masked_lookup(torch.topk(real(x), TOP, dim=-1).indices.to(torch.int32))[..., 0]
-
-    # name: (function of the device logits, what it returns: "g" global arg max, "l" this shard's arg max as a
-    # local column, "L" the same as a global id, "t" local top-4 columns, "T" global top-4 ids, needs a collective)
+    # name: (function of the device input, what it returns, needs a collective). The input is this rank's logits
+    # [rows, width] bf16, except for the kinds "s" and "m" (gathered candidates [rows, 2, 8k] fp32). Kinds: "g"
+    # the global arg max, "G" the global top k ids, "l" this shard's arg max as a local column, "L" the same as a
+    # global id, "t" its top k as local columns, "T" as global ids, "s" the top k ids of the candidates, "m" the
+    # lowest id among the candidates' largest values.
     cases = {
         "vp_argmax": (lambda x: vp.vocab_parallel_argmax(owner, x), "g", True),
-        "vp_topk": (lambda x: vp.vocab_parallel_topk(owner, x, TOP)[1], "G", True),
         "fp32_ids_row": (fp32_ids_row, "L", False),
         "argmax_to_int32": (lambda x: real(x).argmax(dim=-1).to(torch.int32).unsqueeze(-1), "l", False),
         "argmax_int": (lambda x: x.narrow(-1, 0, count).argmax(dim=-1).int().view(-1, 1), "l", False),
@@ -190,17 +204,47 @@ def child(args):
         "argmax_two_graphs": (argmax_two_graphs, "l", False),
         "argmax_to_fp32": (lambda x: real(x).argmax(dim=-1).to(torch.float32), "l", False),
         "max_dim_to_int32": (lambda x: real(x).max(dim=-1).indices.to(torch.int32), "l", False),
-        "topk_to_int32": (lambda x: torch.topk(real(x), TOP, dim=-1).indices.to(torch.int32), "t", False),
-        "topk_int64": (lambda x: torch.topk(real(x), TOP, dim=-1).indices, "t", False),
-        "topk_to_fp32": (lambda x: torch.topk(real(x), TOP, dim=-1).indices.to(torch.float32) + float(start), "T",
-                         False),
-        "topk_gather_fp32": (topk_gather_fp32, "T", False),
         "argmax_int_embed": (argmax_int_embed, "l", False),
         "argmax_embed": (lambda x: torch.nn.functional.embedding(real(x).argmax(dim=-1), id_rows)[:, 0], "l", False),
-        "topk_int32_embed": (topk_int32_embed, "t", False),
-        "topk_embed": (lambda x: torch.nn.functional.embedding(torch.topk(real(x), TOP, dim=-1).indices,
-                                                                id_rows)[..., 0], "t", False),
     }
+    case_top = {}  # the k of a case with one
+
+    def add_top_cases(k):
+        def topk_gather_fp32(x):  # vocab_parallel_candidates' ids: an fp32 id table read with the indices as they are
+            index = torch.topk(real(x), k, dim=-1).indices
+            return torch.gather(id_table(x.shape[0]), -1, index).to(torch.int32)
+
+        def topk_int32_embed(x):  # qsa_sparse_ops.select_blocks: topk, .to(int32), integer arithmetic, a lookup
+            return masked_lookup(torch.topk(real(x), k, dim=-1).indices.to(torch.int32))[..., 0]
+
+        def stage2_topk_gather(x):  # vocab_parallel_topk after the all-gather: [rows, 8k] candidates, their top k
+            values, ids = x.select(1, 0), x.select(1, 1)
+            chosen = torch.topk(values, k, dim=-1).indices
+            return torch.gather(ids, -1, chosen).to(torch.int32)
+
+        def first_maximum(x):  # the greedy pick of a sampled step's candidates, ids int32 as top_k returns them
+            return vp.first_maximum(x.select(1, 0), x.select(1, 1).to(torch.int32))
+
+        more = {
+            "vp_topk": (lambda x: vp.vocab_parallel_topk(owner, x, k)[1], "G", True),
+            "topk_to_int32": (lambda x: torch.topk(real(x), k, dim=-1).indices.to(torch.int32), "t", False),
+            "topk_int64": (lambda x: torch.topk(real(x), k, dim=-1).indices, "t", False),
+            "topk_to_fp32": (lambda x: torch.topk(real(x), k, dim=-1).indices.to(torch.float32) + float(start), "T",
+                             False),
+            "topk_gather_fp32": (topk_gather_fp32, "T", False),
+            "topk_int32_embed": (topk_int32_embed, "t", False),
+            "topk_embed": (lambda x: torch.nn.functional.embedding(torch.topk(real(x), k, dim=-1).indices,
+                                                                    id_rows)[..., 0], "t", False),
+            "stage2_topk_gather": (stage2_topk_gather, "s", False),
+        }
+        if hasattr(vp, "first_maximum"):
+            more["first_maximum"] = (first_maximum, "m", False)
+        for name, case in more.items():
+            cases["%s@%d" % (name, k)] = case
+            case_top["%s@%d" % (name, k)] = k
+
+    for k in args.top:
+        add_top_cases(k)
     if args.selftest:  # the detector itself: what rule 9 does to [rows] ids (element i holds the true element 2 * i)
 
         def rule9_emulated(x):
@@ -208,7 +252,14 @@ def child(args):
             return torch.cat((ids[0::2], torch.full((ids.shape[0] // 2, ), 2**31 - 1, dtype=ids.dtype)))
 
         cases["selftest_rule9"] = (rule9_emulated, "l", False)
-    wanted = [c for c in args.cases if c in cases] if args.cases else list(cases)
+    # --cases names a case with or without its "@k". Order: the serving cases, the forms this track's top-k uses,
+    # the other top-k forms, the arg max forms, the consumers: a time budget cuts from the end.
+    order = ("vp_argmax", "fp32_ids_row", "vp_topk", "topk_gather_fp32", "stage2_topk_gather", "first_maximum",
+             "topk_to_int32", "topk_to_fp32", "topk_int64", "argmax_to_int32", "argmax_int", "argmax_int64",
+             "argmax_two_graphs", "argmax_to_fp32", "max_dim_to_int32", "argmax_int_embed", "argmax_embed",
+             "topk_int32_embed", "topk_embed")
+    wanted = [c for c in cases if not args.cases or c in args.cases or c.split("@")[0] in args.cases]
+    wanted.sort(key=lambda c: order.index(c.split("@")[0]) if c.split("@")[0] in order else len(order))
 
     class Wrapped(torch.nn.Module):
 
@@ -219,17 +270,24 @@ def child(args):
         def forward(self, x):
             return self.fn(x)
 
-    def expected(kind, full_cpu, tied):
-        """The CPU's ids for ``kind`` from the whole logits ``[rows, world * width]`` (every rank builds them)."""
+    def expected(kind, full_cpu, k):
+        """The CPU's ids for ``kind``: from the whole logits ``[rows, world * width]`` (every rank builds them), or
+        for the kinds "s" and "m" from the candidates ``[rows, 2, 8k]``."""
+        if kind in ("s", "m"):
+            values, ids = full_cpu[:, 0], full_cpu[:, 1]
+            if kind == "s":
+                return torch.gather(ids, -1, torch.topk(values, k, dim=-1).indices).long()
+            best = values.amax(dim=-1, keepdim=True)  # the lowest id among the largest values
+            return torch.where(values == best, ids, torch.full_like(ids, float(2**30))).amin(dim=-1).long()
         shards = [full_cpu[:, r * width:r * width + count].to(torch.float32) for r in range(world)]
         if kind in ("g", "G"):
             whole = torch.cat(shards, dim=-1)  # global id = rank * count + column
-            return whole.argmax(dim=-1) if kind == "g" else torch.topk(whole, TOP, dim=-1).indices
+            return whole.argmax(dim=-1) if kind == "g" else torch.topk(whole, k, dim=-1).indices
         mine = shards[args.rank]
         if kind in ("l", "L"):
             ids = mine.argmax(dim=-1)  # the first of equal values: the lowest column
             return ids + (start if kind == "L" else 0)
-        ids = torch.topk(mine, TOP, dim=-1).indices
+        ids = torch.topk(mine, k, dim=-1).indices
         return ids + (start if kind == "T" else 0)
 
     def compare(got, want, tied, kind):
@@ -239,7 +297,7 @@ def child(args):
         if got.shape != want.shape:
             rec.update(ok=False, note="shape %s, expected %s" % (list(got.shape), list(want.shape)))
             return rec
-        if tied and kind in ("t", "T", "G"):  # two equal largest values: their order in a top-k is not defined
+        if tied and kind in ("t", "T", "G", "s"):  # two equal largest values: their order in a top-k is not defined
             got, want = got.sort(dim=-1).values, want.sort(dim=-1).values
         equal_rows = int((got == want).all(dim=-1).sum())
         rec.update(ok=equal_rows == want.shape[0], equal_rows=equal_rows, rows=want.shape[0])
@@ -272,13 +330,18 @@ def child(args):
             results = []
             for _ in range(calls):  # a replay gets new inputs on every call
                 seed += 1
-                full = make_logits(torch, rows, world, width, count, seed, tied)
-                x = full[:, args.rank * width:(args.rank + 1) * width].contiguous().to(device)
+                k = case_top.get(name, 1)
+                if kind in ("s", "m"):  # the candidates of 8 ranks, made on the host
+                    full = make_candidates(torch, rows, k, seed, tied)
+                    x = full.to(device)
+                else:
+                    full = make_logits(torch, rows, world, width, count, seed, tied)
+                    x = full[:, args.rank * width:(args.rank + 1) * width].contiguous().to(device)
                 mark()
                 sync()
                 got = module(x)
                 mark()
-                results.append(compare(got, expected(kind, full, tied), tied, kind))
+                results.append(compare(got, expected(kind, full, k), tied, kind))
             rec.update(results[-1])
             rec["ok"] = all(r.get("ok") for r in results)
             rec["calls_ok"] = [bool(r.get("ok")) for r in results]
@@ -352,7 +415,8 @@ def main():
     ap.add_argument("--ranks", type=int, default=1)
     ap.add_argument("--rows", default="1,2,5,32,128")
     ap.add_argument("--width", type=int, default=SHARD_WIDTH, help="columns of one rank's logits (with %d padding)" % PADDING)
-    ap.add_argument("--cases", default="", help="comma-separated case names (default: all)")
+    ap.add_argument("--cases", default="", help="comma-separated case names, with or without @k (default: all)")
+    ap.add_argument("--top", default="20,64", help="the k of the top-k cases (at most %d each)" % KNOWN)
     ap.add_argument("--budget-s", type=float, default=360.0, help="local probes are skipped after this many seconds")
     ap.add_argument("--out", default="")
     ap.add_argument("--selftest", action="store_true")
@@ -365,6 +429,9 @@ def main():
     args = ap.parse_args()
     args.rows = [int(r) for r in str(args.rows).split(",") if r]
     args.cases = [c for c in str(args.cases).split(",") if c]
+    args.top = [int(k) for k in str(args.top).split(",") if k]
+    if any(k < 1 or k > KNOWN for k in args.top):
+        ap.error("--top takes values from 1 to %d" % KNOWN)
     if args.child:
         return child(args)
     if args.selftest:
@@ -386,7 +453,8 @@ def main():
     for rank in range(args.ranks):
         cmd = [sys.executable, os.path.abspath(__file__), "--child", "--rank", str(rank), "--ranks", str(args.ranks),
                "--init", "file://" + os.path.join(workdir, "init"), "--rows", ",".join(map(str, args.rows)),
-               "--width", str(args.width), "--budget-s", str(args.budget_s), "--cases", ",".join(args.cases)]
+               "--width", str(args.width), "--budget-s", str(args.budget_s), "--cases", ",".join(args.cases),
+               "--top", ",".join(map(str, args.top))]
         if args.selftest:
             cmd.append("--selftest")
         log = open(os.path.join(logdir, "idcheck_rank%d.log" % rank), "w")
