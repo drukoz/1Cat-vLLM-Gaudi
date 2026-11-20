@@ -12,6 +12,8 @@
 #   threads.txt      CPU time and context switches of every thread of the process over a 2 s window
 #                    (/proc/PID/task/*/stat and status): which threads work during replays, in user or
 #                    system time, and which sleep and wake (voluntary switches)
+#   threads_all.txt  the same window for every rank's process of this run (which thread of which rank works:
+#                    the ranks need not do the same)
 #   stacks.txt       STACKS (default 12) native stacks of every thread (gdb, attach and detach each time;
 #                    only the symbols of the Habana libraries, the bridge and libc are loaded): where the
 #                    calling thread is inside replayV3, launch or collective, and in which library
@@ -72,9 +74,9 @@ fi
 note "rank 0: host pid $PID (in the container: $INNER), $(find "/proc/$PID/task" -mindepth 1 -maxdepth 1 2>/dev/null | wc -l) threads"
 
 # 1. CPU time per thread over a window. /proc/PID/task/TID/stat: fields 14 and 15 after the name are utime, stime.
-snapshot() {
-    local t vol invol
-    for t in /proc/"$PID"/task/*; do
+snapshot() {  # snapshot [PID]: one line per thread of the process (default: rank 0's)
+    local t vol invol pid="${1:-$PID}"
+    for t in /proc/"$pid"/task/*; do
         [ -r "$t/stat" ] || continue
         vol="$(awk '/^voluntary_ctxt_switches:/ {print $2}' "$t/status" 2>/dev/null)"
         invol="$(awk '/^nonvoluntary_ctxt_switches:/ {print $2}' "$t/status" 2>/dev/null)"
@@ -85,11 +87,36 @@ snapshot() {
     done
 }
 TICK="$(getconf CLK_TCK 2>/dev/null || echo 100)"
+# Every rank's process of this run: "rank pid" (the same command line test as for rank 0).
+RANKS=""
+for p in $(pgrep -f -- 'bench_replay.py --child --process lazy --rank ' 2>/dev/null); do
+    case "$(cat "/proc/$p/comm" 2>/dev/null)" in python*) ;; *) continue ;; esac
+    cmd="$(tr '\0' ' ' <"/proc/$p/cmdline" 2>/dev/null)"
+    if [ -n "${SAMPLER_MATCH:-}" ] && ! printf '%s' "$cmd" | grep -q -F -- "$SAMPLER_MATCH"; then continue; fi
+    r="$(printf '%s' "$cmd" | sed -n 's/.*--rank \([0-9][0-9]*\) .*/\1/p')"
+    [ -n "$r" ] && RANKS="$RANKS $r:$p"
+done
+for rp in $RANKS; do snapshot "${rp#*:}" >"$OUT/.all_a_${rp#*:}"; done
 snapshot >"$OUT/.threads_a"
 t_a="$(date +%s.%N)"
 sleep 2
 snapshot >"$OUT/.threads_b"
 t_b="$(date +%s.%N)"
+for rp in $RANKS; do snapshot "${rp#*:}" >"$OUT/.all_b_${rp#*:}"; done
+{
+    echo "# per rank: threads that ran in the window (tid user_ms system_ms voluntary_switches involuntary_switches name); the first tid of a rank is its calling thread when it ran"
+    for rp in $RANKS; do
+        r="${rp%%:*}"
+        echo "rank $r pid ${rp#*:}"
+        awk -v tick="$TICK" -v main="${rp#*:}" 'NR == FNR { u[$1] = $2; s[$1] = $3; v[$1] = $4; w[$1] = $5; next }
+            ($1 in u) { du = ($2 - u[$1]) * 1000 / tick; ds = ($3 - s[$1]) * 1000 / tick;
+                        name = $6; for (i = 7; i <= NF; i++) name = name " " $i;
+                        if (du + ds > 0 || $1 == main)
+                            printf "  %s %d %d %d %d %s%s\n", $1, du, ds, $4 - v[$1], $5 - w[$1], name, ($1 == main ? " (calling thread)" : "") }' \
+            "$OUT/.all_a_${rp#*:}" "$OUT/.all_b_${rp#*:}" | sort -k2,2nr -k3,3nr | head -n 8
+        rm -f "$OUT/.all_a_${rp#*:}" "$OUT/.all_b_${rp#*:}"
+    done
+} >"$OUT/threads_all.txt" 2>/dev/null
 {
     echo "# pid $PID, window $(echo "$t_b - $t_a" | bc 2>/dev/null || echo 2) s, clock tick 1/$TICK s; loop ended before the window closed: $(loop_done && echo yes || echo no)"
     echo "# tid user_ms system_ms voluntary_switches involuntary_switches name   (threads that ran or switched in the window)"
