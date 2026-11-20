@@ -13,8 +13,8 @@
 # Plans: A = timer anatomy (modes 1, 4, 2, 3 at 1, 8, 32 streams), then a second server with the torch profiler
 # (HPU activities) and one capture of steady decode steps at 32 and at 1 stream. B = the one-card MME row sweep
 # (G1-1) and the small lazy-op cases side by side, then VLLM_CONFIG_HIDDEN_LAYERS 4 (and 12 with time left) at
-# 1 and 32 streams (I10 / G4-2). Q = a short CPU-free dry
-# check of this script's plumbing (one server, one phase), for a first card contact.
+# 1 and 32 streams (I10 / G4-2). Q = one server, one short phase (a check of this script's plumbing). T = the
+# profiler capture with the Habana SDK in API-controlled mode (HABANA_PROFILE=1 and a profiler configuration file).
 #
 # Every server: /results/<label>/{server0.log, probe.json, timing/step_timing_*.jsonl, versions.txt}.
 set -u
@@ -142,6 +142,27 @@ plan_a() {
     ls -la /results/a2-trace/trace 2>/dev/null | head -n 20
 }
 
+plan_t() {
+    # T: the profiler capture again with the Habana SDK in API-controlled mode (HABANA_PROFILE=1, host profiler
+    # started disabled, hardware trace in the profiler-API phase: the configuration of tools/run_deepseek_v41.py),
+    # for a run where profile_api_light gave no device events.
+    base_env
+    mkdir -p /results/t-trace
+    cat > /results/t-trace/prof-config.json <<'JSON'
+{"Plugins": [
+ {"enable": true, "lib": "libhost_profiler.so", "name": "HostProfiler",
+  "values": {"api_group": {"HCCL": {"value": true}, "HLTHUNK": {"value": true}, "SYNAPSE": {"value": true}},
+             "start_disabled": {"value": true}}},
+ {"enable": true, "lib": "libhw_trace.so", "name": "HwTrace",
+  "values": {"generalOptions": {"profilePhase": {"value": "profileApi"}, "traceBufferSize": {"value": "0x80000000"}},
+             "parseOptions": {"addFuserMetadata": {"value": false}, "showNullDescs": {"value": false}}}}]}
+JSON
+    export HABANA_PROFILE=1 HABANA_PROF_CONFIG=/results/t-trace/prof-config.json
+    serve t-trace "warm:32,1:96" "32,1" \
+        --profiler-config '{"profiler": "torch", "torch_profiler_dir": "/results/t-trace/trace", "torch_profiler_with_stack": false, "torch_profiler_use_gzip": true, "torch_profiler_record_shapes": false}'
+    ls -la /results/t-trace/trace 2>/dev/null | head -n 20
+}
+
 plan_b() {
     # G1-1 while no server holds the cards: one case per card on cards 0-4; on card 5 the lazy-op cases that
     # job 00009 lost (its 3,000- and 10,000-op graphs compile for minutes and time its children out).
@@ -183,6 +204,7 @@ case "$PLAN" in
     A) plan_a ;;
     B) plan_b ;;
     Q) plan_q ;;
+    T) plan_t ;;
     *) say "unknown plan $PLAN"; exit 2 ;;
 esac
 say "plan $PLAN done"
