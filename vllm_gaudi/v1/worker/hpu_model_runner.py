@@ -892,6 +892,10 @@ def _forward_is_decode() -> bool:
     return getattr(metadata, "is_prompt", None) is False
 
 
+# The kinds of forward (decode True, prompt False) whose cut interval this process has logged once.
+_DECODE_CUT_LOGGED: set[bool] = set()
+
+
 def modify_model_layers(module: torch.nn.Module, suffix_list: list[str], n=1, counter=None, decode_n=0):
     """Currently add mark_step at the end of specified layers.
 
@@ -908,7 +912,13 @@ def modify_model_layers(module: torch.nn.Module, suffix_list: list[str], n=1, co
     def interval_hook(index):
 
         def hook(module, args, output):
-            if index % (decode_n if _forward_is_decode() else n) == 0:
+            decode = _forward_is_decode()
+            if index == 1 and decode not in _DECODE_CUT_LOGGED:
+                # Once per process and kind, on the first layer: the server log shows the flag took effect.
+                _DECODE_CUT_LOGGED.add(decode)
+                logger.info("VLLM_HPU_DECODE_CUT_INTERVAL=%d: a %s forward cuts after every %d-th decoder layer",
+                            decode_n, "decode" if decode else "prompt", decode_n if decode else n)
+            if index % (decode_n if decode else n) == 0:
                 htorch.core.mark_step()
             return output
 
@@ -1910,6 +1920,7 @@ def _hpu_graph_wrap_kwargs() -> dict:
     kwargs = {"disable_tensor_cache": True}
     if gaudi_envs.VLLM_HPU_GRAPH_ASYNC_REPLAY:
         kwargs["asynchronous"] = True
+        logger.info("VLLM_HPU_GRAPH_ASYNC_REPLAY=1: the model's HPU graph replays asynchronously")
     return kwargs
 
 

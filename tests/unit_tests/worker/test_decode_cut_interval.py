@@ -128,3 +128,27 @@ def test_load_model_passes_the_flag_to_the_hook_installer():
     import inspect
     source = inspect.getsource(runner.HPUModelRunner.load_model)
     assert "decode_n=gaudi_envs.VLLM_HPU_DECODE_CUT_INTERVAL" in source
+
+
+def test_the_interval_of_each_kind_of_forward_is_logged_once(cuts, monkeypatch):
+    """The server log names the interval a decode and a prompt forward got, once per process and kind."""
+    lines = []
+    monkeypatch.setattr(runner, "_DECODE_CUT_LOGGED", set())
+    monkeypatch.setattr(runner.logger, "info", lambda msg, *args: lines.append(msg % args))
+    model = _hooked(1, 1000)
+    _run(model, False)
+    _run(model, False)
+    _run(model, True)
+    assert lines == [
+        "VLLM_HPU_DECODE_CUT_INTERVAL=1000: a decode forward cuts after every 1000-th decoder layer",
+        "VLLM_HPU_DECODE_CUT_INTERVAL=1000: a prompt forward cuts after every 1-th decoder layer",
+    ]
+
+
+def test_nothing_is_logged_with_the_flag_at_zero(cuts, monkeypatch):
+    lines = []
+    monkeypatch.setattr(runner, "_DECODE_CUT_LOGGED", set())
+    monkeypatch.setattr(runner.logger, "info", lambda msg, *args: lines.append(msg % args))
+    model = _hooked(1, 0)
+    _run(model, False)
+    assert lines == []
