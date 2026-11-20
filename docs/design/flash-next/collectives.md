@@ -348,6 +348,14 @@ error or a compile pause explains it; check both `server0.log`). Also read the `
 `SAMPLED` lines (the sampled round runs neither the region nor the arg max: the same in both arms but for the
 rider's one all-reduce). Cancel the pair if it has not started by about 03:00 UTC.
 
+At 23:43 UTC the queue had moved: the pair "starts by 03:45 / 03:52 UTC at the latest" (after the integration
+headline 00128 and new jobs), i.e. in the worst case after the coordinator's 03:30 harvest; prefill's 00109
+(all cards) waits behind it. The coordinator was asked at 23:45 UTC whether to cancel the pair in favour of 00109
+(this track's recommendation: cancel; its question moves to the first job of the next rental). Engine-step's
+**00131** `real4-ab4-short-candvp` (ahead of the pair) runs `VLLM_HPU_CANDIDATE_SAMPLING=1` with
+`VLLM_HPU_VOCAB_PARALLEL_LOGITS=2` on the real model at TP4 (its `candvp` arm against `cand`): the served test of
+this track's top-k head and of the logits all-gather it removes from a sampled step. Read its result when it ends.
+
 Pending, in order:
 
 1. When the pair ends: compare the arms (above), write the result into section 6, tell the coordinator (`main`)
