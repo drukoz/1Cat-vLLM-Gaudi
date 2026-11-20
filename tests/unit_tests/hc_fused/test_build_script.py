@@ -287,3 +287,64 @@ def test_the_sources_the_step_builds_are_in_the_tree():
     assert (REPO_ROOT / "csrc" / "hc_fused" / "CMakeLists.txt").is_file()
     assert (REPO_ROOT / "csrc" / "hc_fused" / "pytorch" / "setup.py").is_file()
     assert "hc_fused_gaudi2" in (REPO_ROOT / "csrc" / "hc_fused" / "CMakeLists.txt").read_text(encoding="utf-8")
+
+
+# ---- the MoE glue kernels of the same library ---------------------------------------------------
+MOE_KERNELS = ("moe_glue_route_gaudi2", "moe_glue_silu_mul_gaudi2", "moe_glue_combine_gaudi2",
+               "moe_glue_row_quant_gaudi2")
+
+
+def _build_with_cache(monkeypatch, tmp_path, cache: str | None):
+    """build_hc_fused with stub commands; the CMake step leaves `cache` as its CMakeCache.txt (None: no file)."""
+    out = tmp_path / "out"
+    out.mkdir()
+    build = tmp_path / "build"
+
+    def fake_run(command, cwd):
+        if command[:2] == ["cmake", "--build"]:
+            folder = Path(command[2])
+            folder.mkdir(parents=True, exist_ok=True)
+            (folder / HC_KERNEL_DB).write_bytes(b"elf")
+            if cache is not None:
+                (folder / "CMakeCache.txt").write_text(cache, encoding="utf-8")
+        if "build_ext" in command:
+            (Path(command[command.index("--build-lib") + 1]) / HC_EXTENSION).write_bytes(b"elf")
+
+    monkeypatch.setattr(bfg, "_run", fake_run)
+    monkeypatch.setattr(bfg, "check_kernel_library", lambda path: 10)
+    return bfg.build_hc_fused(REPO_ROOT, build, out), out
+
+
+def test_the_step_names_the_moe_glue_kernels_it_built(monkeypatch, tmp_path, capsys):
+    """The MoE glue kernels are in the hyper-connection library: the step builds them and says which."""
+    cache = "CMAKE_BUILD_TYPE:STRING=Release\nHC_FUSED_MOE_GLUE_BUILT:INTERNAL=" + ";".join(MOE_KERNELS) + "\n"
+    extension, out = _build_with_cache(monkeypatch, tmp_path, cache)
+    assert extension == out / HC_EXTENSION
+    printed = capsys.readouterr().out
+    assert "MoE glue kernels in libhc_fused_gaudi2.so: " + ", ".join(MOE_KERNELS) in printed
+    assert "missing" not in printed
+    assert bfg.MOE_GLUE_KERNELS == MOE_KERNELS
+
+
+def test_a_moe_glue_kernel_that_did_not_compile_is_named_and_the_build_goes_on(monkeypatch, tmp_path, capsys):
+    """CMake left the routing kernel out (it did not compile): the library and the extension are still installed."""
+    cache = "HC_FUSED_MOE_GLUE_BUILT:INTERNAL=" + ";".join(MOE_KERNELS[1:]) + "\n"
+    extension, out = _build_with_cache(monkeypatch, tmp_path, cache)
+    assert extension == out / HC_EXTENSION and (out / HC_KERNEL_DB).is_file()
+    printed = capsys.readouterr().out
+    assert "MoE glue kernels missing from libhc_fused_gaudi2.so: moe_glue_route_gaudi2" in printed
+    assert "VLLM_HPU_MOE_GLUE=1" in printed and "torch path" in printed
+
+
+@pytest.mark.parametrize("cache", [None, "CMAKE_BUILD_TYPE:STRING=Release\n", "HC_FUSED_MOE_GLUE_BUILT:INTERNAL=\n"])
+def test_a_library_without_moe_glue_kernels_is_still_a_good_build(monkeypatch, tmp_path, capsys, cache):
+    extension, out = _build_with_cache(monkeypatch, tmp_path, cache)
+    assert extension == out / HC_EXTENSION
+    assert "MoE glue kernels missing from libhc_fused_gaudi2.so: " + ", ".join(MOE_KERNELS) in capsys.readouterr().out
+
+
+def test_the_moe_glue_kernel_names_are_the_cmake_projects():
+    text = (REPO_ROOT / "csrc" / "hc_fused" / "CMakeLists.txt").read_text(encoding="utf-8")
+    for kernel in bfg.MOE_GLUE_KERNELS:
+        assert f"    {kernel}" in text and (REPO_ROOT / "csrc" / "hc_fused" / "kernels" / f"{kernel}.c").is_file()
+    assert "HC_FUSED_MOE_GLUE_BUILT" in text

@@ -62,6 +62,7 @@ const char* dtype_name(c10::ScalarType dtype) {
         case at::kFloat: return "f32";
         case at::kBFloat16: return "bf16";
         case at::kInt: return "i32";
+        case at::ScalarType::Float8_e4m3fn: return "f8";
         default: return "other";
     }
 }

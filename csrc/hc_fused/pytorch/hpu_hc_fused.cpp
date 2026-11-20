@@ -28,6 +28,17 @@ constexpr auto kCombineNormSchema = "flashinfer_gaudi::hc_combine_norm";
 constexpr int64_t kVectorLanes = kHcFusedVectorLanes;
 constexpr int64_t kMaxStreams = 64;
 
+// The MoE glue ops of the same extension (schemas and fake kernels: flashinfer_gaudi/moe_glue.py,
+// imported by the same loader before this library is loaded). Schemas, in argument order:
+//   moe_route(Tensor gates, int experts, int top_k) -> (Tensor, Tensor)       int32 ids, bf16 weights
+//   moe_silu_mul(Tensor gate_up) -> Tensor
+//   moe_combine(Tensor shared, Tensor gates, Tensor routed, int gate_column) -> Tensor
+//   moe_row_quant(Tensor x, float fp8_max) -> (Tensor, Tensor)                fp8 values, fp32 scale
+constexpr auto kMoeRouteSchema = "flashinfer_gaudi::moe_route";
+constexpr auto kMoeSiluMulSchema = "flashinfer_gaudi::moe_silu_mul";
+constexpr auto kMoeCombineSchema = "flashinfer_gaudi::moe_combine";
+constexpr auto kMoeRowQuantSchema = "flashinfer_gaudi::moe_row_quant";
+
 // A [tokens, columns] activation: 2-D, bf16, contiguous, not empty.
 void check_matrix(const at::Tensor& tensor, const char* name) {
     TORCH_CHECK(tensor.scalar_type() == at::kBFloat16, "HC fused ", name, " must be bf16");
@@ -215,6 +226,108 @@ const bool combine_norm_registered = [] {
     return true;
 }();
 
+// ---- MoE glue ops: validation, output metadata and node parameters ---------------------------
+void validate_moe_route(const at::Tensor& gates, int64_t experts, int64_t top_k) {
+    check_matrix(gates, "gates");
+    TORCH_CHECK(top_k >= 1 && top_k <= kMoeGlueMaxTopK, "MoE glue top_k must be in [1, ", kMoeGlueMaxTopK, "]");
+    TORCH_CHECK(experts >= top_k && experts <= kMoeGlueMaxExperts && experts <= gates.size(1),
+                "MoE glue experts must be at least top_k, at most ", kMoeGlueMaxExperts,
+                " and at most the columns of gates");
+}
+
+void validate_moe_silu_mul(const at::Tensor& gate_up) {
+    check_matrix(gate_up, "gate_up");
+    TORCH_CHECK(gate_up.size(1) % 2 == 0, "MoE glue gate_up must have an even number of columns");
+}
+
+void validate_moe_combine(const at::Tensor& shared, const at::Tensor& gates, const at::Tensor& routed,
+                          int64_t gate_column) {
+    check_matrix(shared, "shared");
+    TORCH_CHECK(shared.size(1) % kVectorLanes == 0, "MoE glue hidden size must be a multiple of ", kVectorLanes,
+                " (one TPC vector), got ", shared.size(1));
+    check_matrix(gates, "gates");
+    TORCH_CHECK(gates.size(0) == shared.size(0), "MoE glue gates must have the rows of shared");
+    TORCH_CHECK(gate_column >= 0 && gate_column < gates.size(1), "MoE glue gate_column must be a column of gates");
+    check_matrix(routed, "routed");
+    TORCH_CHECK(routed.sizes() == shared.sizes(), "MoE glue routed must have the shape of shared");
+    check_same_device(shared, gates, "gates");
+    check_same_device(shared, routed, "routed");
+}
+
+void validate_moe_row_quant(const at::Tensor& x, double fp8_max) {
+    check_matrix(x, "x");
+    TORCH_CHECK(x.size(1) % kVectorLanes == 0, "MoE glue hidden size must be a multiple of ", kVectorLanes,
+                " (one TPC vector), got ", x.size(1));
+    TORCH_CHECK(static_cast<float>(fp8_max) == kMoeGlueFp8Max, "MoE glue fp8_max must be ", kMoeGlueFp8Max,
+                " (the Gaudi2 fp8 range), got ", fp8_max);
+}
+
+std::shared_ptr<void> moe_node_params(size_t& size, int64_t experts, int64_t top_k, int64_t gate_column,
+                                      double fp8_max) {
+    size = sizeof(MoeGlueParams);
+    return std::make_shared<MoeGlueParams>(MoeGlueParams{static_cast<int32_t>(experts), static_cast<int32_t>(top_k),
+                                                         static_cast<int32_t>(gate_column),
+                                                         static_cast<float>(fp8_max)});
+}
+
+const bool moe_route_registered = [] {
+    habana::custom_op::registerUserCustomOp(
+        kMoeRouteSchema, kMoeGlueRouteGuid,
+        [](const at::Stack& stack) {
+            const auto& gates = stack.at(0).toTensor();
+            const int64_t top_k = stack.at(2).toInt();
+            validate_moe_route(gates, stack.at(1).toInt(), top_k);
+            return habana::PartialOutputMetaDataVector{
+                habana::PartialOutputMetaData{at::kInt, {gates.size(0), top_k}}, bf16_output({gates.size(0), top_k})};
+        },
+        [](const at::Stack& stack, size_t& size) -> std::shared_ptr<void> {
+            return moe_node_params(size, stack.at(1).toInt(), stack.at(2).toInt(), 0, 0.0);
+        });
+    return true;
+}();
+
+const bool moe_silu_mul_registered = [] {
+    habana::custom_op::registerUserCustomOp(
+        kMoeSiluMulSchema, kMoeGlueSiluMulGuid,
+        [](const at::Stack& stack) {
+            const auto& gate_up = stack.at(0).toTensor();
+            validate_moe_silu_mul(gate_up);
+            return habana::PartialOutputMetaDataVector{bf16_output({gate_up.size(0), gate_up.size(1) / 2})};
+        },
+        [](const at::Stack&, size_t& size) -> std::shared_ptr<void> { return moe_node_params(size, 0, 0, 0, 0.0); });
+    return true;
+}();
+
+const bool moe_combine_registered = [] {
+    habana::custom_op::registerUserCustomOp(
+        kMoeCombineSchema, kMoeGlueCombineGuid,
+        [](const at::Stack& stack) {
+            const auto& shared = stack.at(0).toTensor();
+            validate_moe_combine(shared, stack.at(1).toTensor(), stack.at(2).toTensor(), stack.at(3).toInt());
+            return habana::PartialOutputMetaDataVector{bf16_output(shared.sizes().vec())};
+        },
+        [](const at::Stack& stack, size_t& size) -> std::shared_ptr<void> {
+            return moe_node_params(size, 0, 0, stack.at(3).toInt(), 0.0);
+        });
+    return true;
+}();
+
+const bool moe_row_quant_registered = [] {
+    habana::custom_op::registerUserCustomOp(
+        kMoeRowQuantSchema, kMoeGlueRowQuantGuid,
+        [](const at::Stack& stack) {
+            const auto& x = stack.at(0).toTensor();
+            validate_moe_row_quant(x, stack.at(1).toDouble());
+            return habana::PartialOutputMetaDataVector{
+                habana::PartialOutputMetaData{at::ScalarType::Float8_e4m3fn, x.sizes().vec()},
+                habana::PartialOutputMetaData{at::kFloat, {x.size(0), 1}}};
+        },
+        [](const at::Stack& stack, size_t& size) -> std::shared_ptr<void> {
+            return moe_node_params(size, 0, 0, 0, stack.at(1).toDouble());
+        });
+    return true;
+}();
+
 std::vector<at::Tensor> execute(const char* schema, const at::Tensor& first, std::vector<c10::IValue> inputs,
                                 size_t outputs) {
     TORCH_CHECK(first.device().type() == c10::DeviceType::HPU, "HC fused ops require HPU inputs");
@@ -266,9 +379,40 @@ std::tuple<at::Tensor, at::Tensor> run_combine_norm(const at::Tensor& residual, 
                                  {residual, block_output, injection, norm_weight, eps, hc_count}, 2);
     return std::make_tuple(outputs.at(0), outputs.at(1));
 }
+
+std::tuple<at::Tensor, at::Tensor> run_moe_route(const at::Tensor& gates, int64_t experts, int64_t top_k) {
+    validate_moe_route(gates, experts, top_k);
+    TORCH_CHECK(moe_route_registered);
+    const auto outputs = execute(kMoeRouteSchema, gates, {gates, experts, top_k}, 2);
+    return std::make_tuple(outputs.at(0), outputs.at(1));
+}
+
+at::Tensor run_moe_silu_mul(const at::Tensor& gate_up) {
+    validate_moe_silu_mul(gate_up);
+    TORCH_CHECK(moe_silu_mul_registered);
+    return execute(kMoeSiluMulSchema, gate_up, {gate_up}, 1).at(0);
+}
+
+at::Tensor run_moe_combine(const at::Tensor& shared, const at::Tensor& gates, const at::Tensor& routed,
+                           int64_t gate_column) {
+    validate_moe_combine(shared, gates, routed, gate_column);
+    TORCH_CHECK(moe_combine_registered);
+    return execute(kMoeCombineSchema, shared, {shared, gates, routed, gate_column}, 1).at(0);
+}
+
+std::tuple<at::Tensor, at::Tensor> run_moe_row_quant(const at::Tensor& x, double fp8_max) {
+    validate_moe_row_quant(x, fp8_max);
+    TORCH_CHECK(moe_row_quant_registered);
+    const auto outputs = execute(kMoeRowQuantSchema, x, {x, fp8_max}, 2);
+    return std::make_tuple(outputs.at(0), outputs.at(1));
+}
 }  // namespace
 
 TORCH_LIBRARY_IMPL(flashinfer_gaudi, HPU, m) {
+    m.impl("moe_route", run_moe_route);
+    m.impl("moe_silu_mul", run_moe_silu_mul);
+    m.impl("moe_combine", run_moe_combine);
+    m.impl("moe_row_quant", run_moe_row_quant);
     m.impl("hc_norm", run_norm);
     m.impl("hc_silu", run_silu);
     m.impl("hc_silu_split", run_silu_split);

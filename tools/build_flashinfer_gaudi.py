@@ -142,11 +142,41 @@ def check_kernel_library(path: Path) -> int:
     return count.value
 
 
+# The MoE glue kernels of csrc/hc_fused (VLLM_HPU_MOE_GLUE): part of libhc_fused_gaudi2.so, each optional.
+MOE_GLUE_KERNELS = ("moe_glue_route_gaudi2", "moe_glue_silu_mul_gaudi2", "moe_glue_combine_gaudi2",
+                    "moe_glue_row_quant_gaudi2")
+
+
+def report_moe_glue_kernels(cmake_build: Path) -> tuple[str, ...]:
+    """Print which MoE glue kernels CMake built into libhc_fused_gaudi2.so; the kernels that are missing.
+
+    csrc/hc_fused/CMakeLists.txt tries the compile of each MoE glue kernel at configure time and leaves one
+    that does not compile out of the library (HC_FUSED_MOE_GLUE_BUILT in CMakeCache.txt). That is not a
+    failed build: the hyper-connection kernels are complete, and a server with VLLM_HPU_MOE_GLUE=1 then
+    runs the torch path of its MoE blocks and says so.
+    """
+    built: tuple[str, ...] = ()
+    cache = cmake_build / "CMakeCache.txt"
+    if cache.is_file():
+        for line in cache.read_text(encoding="utf-8", errors="replace").splitlines():
+            if line.startswith("HC_FUSED_MOE_GLUE_BUILT:"):
+                built = tuple(name for name in line.split("=", 1)[1].split(";") if name)
+    missing = tuple(name for name in MOE_GLUE_KERNELS if name not in built)
+    if built:
+        print("MoE glue kernels in libhc_fused_gaudi2.so: " + ", ".join(built))
+    if missing:
+        print("MoE glue kernels missing from libhc_fused_gaudi2.so: " + ", ".join(missing) +
+              " (they did not compile or were switched off; with VLLM_HPU_MOE_GLUE=1 the MoE blocks run the "
+              "torch path)")
+    return missing
+
+
 def build_hc_fused(repository_root: Path, build_root: Path, output_dir: Path) -> Path:
     """Build the fused hyper-connection kernel database and its HPU op extension into output_dir.
 
     The same two steps as build_gdn_fused (CMake for libhc_fused_gaudi2.so, setuptools for hc_fused_ops*.so),
-    then check_kernel_library on the installed kernel database.
+    then check_kernel_library on the installed kernel database. The library also carries the MoE glue
+    kernels; report_moe_glue_kernels says which of them were built.
     """
     source_root = repository_root / "csrc" / "hc_fused"
     cmake_build = build_root / "hc_fused_kernel_db"
@@ -189,6 +219,7 @@ def build_hc_fused(repository_root: Path, build_root: Path, output_dir: Path) ->
     if len(matches) != 1:
         raise FileNotFoundError(f"Expected one hc_fused_ops extension in {output_dir}, found {matches}.")
     check_kernel_library(kernel_db)
+    report_moe_glue_kernels(cmake_build)
     return matches[0]
 
 

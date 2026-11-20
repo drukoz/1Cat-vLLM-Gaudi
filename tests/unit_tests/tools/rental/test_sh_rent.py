@@ -319,6 +319,7 @@ echo "tiny smoke: PASSED ($mode)"
 
 BUNDLE_RUN_RENTAL = r"""#!/usr/bin/env bash
 # --hc-fused
+# --moe-glue
 ctl="$FAKE_NODE/ctl"
 { echo CALL; for a in "$@"; do printf '%s\n' "$a"; done; } >>"$FAKE_NODE/log/run_rental"
 model=""; id=""; dl=0
@@ -675,6 +676,26 @@ def test_usage_errors(rig):
     assert rig.entries() == []
 
 
+def test_usage_errors_name_the_four_smoke_modes(rig):
+    proc = rig.run("--smoke-modes", "pytorch,turbo")
+    assert proc.returncode == 2 and "unknown mode 'turbo' (the modes: pytorch, fused, hc, moe)" in proc.out
+    proc = rig.run("--continue-after-smoke-failure", "moe,pytorch")
+    assert proc.returncode == 2 and "--continue-after-smoke-failure takes fused, hc and moe only" in proc.out
+    assert "nothing overrides it (got 'moe,pytorch')" in proc.out
+    assert rig.entries() == []
+
+
+def test_usage_names_the_moe_mode_and_the_moe_glue_switch():
+    proc = subprocess.run([BASH, str(SCRIPT), "--help"], capture_output=True, text=True, timeout=60)
+    assert proc.returncode == 0, proc.stderr
+    lines = proc.stdout.splitlines()
+    hc, moe = ("  --%s         pass --%s to run_rental.sh" % (name, name) for name in ("hc-fused", "moe-glue"))
+    assert hc in lines and moe in lines and lines.index(moe) == lines.index(hc) + 1
+    modes = [line for line in lines if line.startswith("  --smoke-modes LIST ")]
+    assert len(modes) == 1 and modes[0].endswith("one call each: pytorch, fused, hc, moe (default: pytorch,fused)")
+    assert "start the run although these modes failed: fused, hc, moe (never pytorch)" in proc.stdout
+
+
 # ----------------------------------------------------------------------------- dry run
 
 
@@ -735,6 +756,42 @@ def test_dry_run_run_arguments(rig):
     for owned in ("--run-id", "--model", "--download-only", "--dry-run"):
         proc = rig.run("--dry-run", "--run-arg", owned)
         assert proc.returncode == 2, owned
+
+
+def test_dry_run_run_arguments_with_the_moe_glue(rig):
+    check = '[dry-run] remote: grep -q -e %s "$R/run_rental.sh"   # the bundle must know the option'
+
+    def dry_run(*switches):
+        out = _ok(rig.run("--dry-run", "--variants", "A,B,C", "--no-quick-gates", *switches, "--run-arg",
+                          "--server-timeout", "--run-arg", "2400", "--run-arg", "--no-warm-pass")).stdout
+        lines = [ln for ln in out.splitlines() if "run_rental.sh" in ln and "--run-id" in ln]
+        assert len(lines) == 1 and "--download-only" not in lines[0] and "--quick-gates" not in lines[0]
+        return out, lines[0].rstrip()
+
+    out, line = dry_run("--moe-glue")
+    assert line.endswith("--variants A,B,C --moe-glue --server-timeout 2400 --no-warm-pass")
+    assert check % "--moe-glue" in out and "--hc-fused" not in out  # each switch is its own
+    for switches in (("--hc-fused", "--moe-glue"), ("--moe-glue", "--hc-fused")):  # one order for run_rental.sh
+        out, line = dry_run(*switches)
+        assert line.endswith("--variants A,B,C --hc-fused --moe-glue --server-timeout 2400 --no-warm-pass"), switches
+        assert out.index(check % "--hc-fused") < out.index(check % "--moe-glue") < out.index(line), switches
+    out, line = dry_run("--hc-fused")
+    assert check % "--hc-fused" in out and "--moe-glue" not in out  # not implied by the other switch
+    out, line = dry_run()
+    assert "--moe-glue" not in out and "--hc-fused" not in out and "the bundle must know" not in out  # off by default
+    assert rig.entries() == []
+
+
+def test_dry_run_names_the_moe_mode(rig):
+    out = _ok(rig.run("--dry-run", "--smoke-modes", "pytorch,fused,hc,moe")).stdout
+    jobs = re.findall(r"the detached job '(smoke-\w+)' .*tiny_smoke\.sh --gdn (\w+) --run-id smoke-UTC-(\w+)", out)
+    assert jobs == [("smoke-" + mode, mode, mode) for mode in ("pytorch", "fused", "hc", "moe")]
+    assert "(the fused, hc and moe modes can be overridden, the pytorch mode never)" in out
+    names = "for n in host smoke-pytorch smoke-fused smoke-hc smoke-moe run; do"
+    assert names in out  # the job states stage 1 asks for
+    assert names in _ok(rig.run("--dry-run", "--status")).stdout
+    assert "--gdn moe" not in _ok(rig.run("--dry-run")).stdout  # not a default mode
+    assert rig.entries() == []
 
 
 # ----------------------------------------------------------------------------- a whole session
@@ -1177,6 +1234,58 @@ def test_the_hc_mode_is_passed_on_and_can_be_overridden(rig):
     assert "job smoke-hc: ended 1" in _ok(rig.run("--status")).stdout
 
 
+def test_the_moe_mode_is_passed_on_and_can_be_overridden(rig):
+    rig.flag("smoke-fail-moe")
+    proc = rig.run("--smoke-modes", "pytorch,fused,moe", "--moe-glue")
+    assert proc.returncode == 1 and rig.runs() == [], proc.out
+    assert [c[:2] for c in rig.node_calls("tiny_smoke")] == [["--gdn", "pytorch"], ["--gdn", "fused"], ["--gdn", "moe"]]
+    assert "stage 5/8 smoke: FAILED (the moe mode failed" in proc.out
+    assert "a failed moe mode means the run would go on with the torch path of the MoE blocks" in proc.out
+    assert "--continue-after-smoke-failure moe" in proc.out
+    assert "torch hyper-connections" not in proc.out  # the hint of the mode that failed, not of its sibling
+    over = _ok(rig.run("--smoke-modes", "pytorch,fused,moe", "--moe-glue", "--continue-after-smoke-failure",
+                       "fused,moe"))
+    assert [c[1] for c in rig.node_calls("tiny_smoke")] == ["pytorch", "fused", "moe"]
+    assert rig.runs()[0][-1] == "--moe-glue" and "FAILED and overridden: moe" in over.stdout
+    assert "the torch path of the MoE blocks for moe (its own gates decide)" in over.stdout
+    assert "the torch hyper-connections for hc" in over.stdout  # the note still names the other two
+    jobs = [line for line in over.stdout.splitlines() if line.startswith("jobs on the node: ")]
+    assert len(jobs) == 1 and "smoke-moe ended 1" in jobs[0]  # stage 1 asks the node for this job too
+    assert "job smoke-moe: ended 1" in _ok(rig.run("--status")).stdout
+
+
+def test_the_four_smoke_modes_run_in_order_and_both_switches_reach_the_run(rig):
+    proc = _ok(rig.run("--smoke-modes", "pytorch,fused,hc,moe", "--moe-glue", "--hc-fused"))
+    modes = ["pytorch", "fused", "hc", "moe"]
+    assert [c[:2] for c in rig.node_calls("tiny_smoke")] == [["--gdn", mode] for mode in modes]  # one call each
+    assert len(rig.runs()) == 1
+    assert rig.runs()[0][4:] == ["--quick-gates", "--variants", "A,C", "--hc-fused", "--moe-glue"]
+    assert "stage 5/8 smoke: ok" in proc.stdout and "stage 7/8 run: ok" in proc.stdout
+    smoke_dirs = sorted(p.name.rsplit("-", 1)[1] for p in (rig.session / "results").glob("smoke-*") if p.is_dir())
+    assert smoke_dirs == sorted(modes)
+    status = _ok(rig.run("--status")).stdout
+    for mode in modes:
+        assert "job smoke-%s: ended 0" % mode in status, mode
+
+
+def test_a_running_moe_smoke_job_is_attached_to_not_started_twice(rig):
+    rig.flag("smoke-hold")
+    proc = rig.start("--smoke-modes", "moe")
+    rig.wait_for(proc, "container fn-smoke: starting")
+    proc.send_signal(signal.SIGINT)
+    assert proc.wait(timeout=30) == 130
+    assert rig.job_alive("smoke-moe")
+    again = rig.start("--smoke-modes", "moe")
+    rig.wait_for(again, "job smoke-moe: already running on the node: attaching")
+    rig.unflag("smoke-hold")
+    assert again.wait(timeout=60) == 0, again.out_path.read_text()
+    text = again.out_path.read_text()
+    assert "jobs on the node: host ended 0, smoke-moe running" in text
+    assert "the job 'smoke-moe' is running on the node, and its bundle is left alone" in text
+    assert [c[1] for c in rig.node_calls("tiny_smoke")] == ["moe"]
+    assert rig.state()["smoke_moe"].startswith("passed:%s:smoke-" % SHA) and len(rig.runs()) == 1
+
+
 def test_smoke_modes_and_skip_smoke(rig):
     proc = _ok(rig.run("--smoke-modes", "fused", "--smoke-arg", "--no-combined-kernel-db"))
     assert [c[:2] for c in rig.node_calls("tiny_smoke")] == [["--gdn", "fused"]]
@@ -1226,6 +1335,40 @@ def test_hc_fused_needs_a_bundle_that_knows_it(rig):
     proc = rig.run(*args, "--skip-smoke", "--hc-fused", plain=True)
     assert proc.returncode == 1 and "--hc-fused" in proc.out and "stage 7/8 run: FAILED" in proc.out
     assert rig.runs() == []
+    # the two messages, word for word (the check for --moe-glue prints the same two with its own name)
+    assert "stage 7/8 run: FAILED (--hc-fused: the run_rental.sh of the bundle on the node does not" in proc.out
+    assert "(a commit with --hc-fused in run_rental.sh), or run the same command without --hc-fused." in proc.out
+
+
+@pytest.mark.parametrize("switches, passed", [
+    (("--moe-glue", ), ["--moe-glue"]),
+    (("--moe-glue", "--hc-fused"), ["--hc-fused", "--moe-glue"]),  # one order for run_rental.sh, whatever it is here
+])
+def test_the_moe_glue_reaches_run_rental_after_the_hc_fused(rig, switches, passed):
+    _ok(rig.run("--skip-smoke", "--variants", "A", "--no-quick-gates", *switches, "--run-arg", "--server-timeout",
+                "--run-arg", "2400"))
+    run = rig.runs()[0]
+    assert run[4:] == ["--variants", "A", *passed, "--server-timeout", "2400"]
+
+
+def test_moe_glue_needs_a_bundle_that_knows_it(rig):
+    """The check is per option: a bundle that knows --hc-fused and not --moe-glue stops only a --moe-glue run."""
+    assert "# --hc-fused\n# --moe-glue\n" in BUNDLE_RUN_RENTAL  # what the bundle of the other tests knows
+    stage = rig.tmp / "old-stage"
+    old = rig.make_bundle(rig.tmp / "old.tar.gz", SHA, stage=stage)
+    (stage / "run_rental.sh").write_text(BUNDLE_RUN_RENTAL.replace("# --moe-glue\n", ""))
+    with tarfile.open(old, "w:gz") as tar:
+        for name in ("BUNDLE.txt", "run_rental.sh", "prepare_host.sh", "tiny_smoke.sh", "plugin", "vllm"):
+            tar.add(stage / name, arcname=name)
+    args = [a if a != str(rig.bundle) else str(old) for a in rig.argv()[2:]]
+    for switches in (("--moe-glue", ), ("--hc-fused", "--moe-glue")):
+        proc = rig.run(*args, "--skip-smoke", *switches, plain=True)
+        assert proc.returncode == 1 and rig.runs() == [], proc.out
+        assert "stage 7/8 run: FAILED (--moe-glue: the run_rental.sh of the bundle on the node does not" in proc.out
+        assert "(a commit with --moe-glue in run_rental.sh), or run the same command without --moe-glue." in proc.out
+        assert "--hc-fused: the run_rental.sh" not in proc.out and "without --hc-fused" not in proc.out, switches
+    _ok(rig.run(*args, "--skip-smoke", "--hc-fused", plain=True))  # the option it knows is not held back
+    assert len(rig.runs()) == 1 and rig.runs()[0][-1] == "--hc-fused"
 
 
 def test_paths_with_spaces_and_quotes_survive(tmp_path):
@@ -1565,3 +1708,14 @@ def test_the_page_says_what_the_command_does():
         assert message in page and message in script, message
     assert ">>> FIRST TOKEN >>> variant A server0: first token after" in page and ">>> FIRST TOKEN >>> " in script
     assert "Only the provider's console stops the billing" in page
+
+
+def test_the_page_names_the_moe_mode_and_the_moe_glue_switch():
+    page = (REPO_ROOT / "docs" / "design" / "flash-next" / "run-sheets" / "one-command.md").read_text(encoding="utf-8")
+    smoke = [line for line in page.splitlines() if line.startswith("| 5 smoke |")]
+    assert len(smoke) == 1
+    assert "`--smoke-modes pytorch,fused,hc`" in smoke[0] and "`--hc-fused`" in smoke[0]  # as before
+    assert "`--smoke-modes pytorch,fused,moe`" in smoke[0] and "`--moe-glue`" in smoke[0]
+    assert "the MoE glue mode" in smoke[0]
+    failed = [line for line in page.splitlines() if line.startswith("| `stage 5/8 smoke: FAILED (the <mode> mode")]
+    assert len(failed) == 1 and "`fused`" in failed[0] and "`hc`" in failed[0] and "`moe`" in failed[0]

@@ -13,7 +13,10 @@ the decode kernel on and keeps the verify op off, and fails when the server log 
 to the torch decode path; `hc` is `fused` plus the fused hyper-connection kernels (`VLLM_HPU_HC_FUSED=1`),
 and also fails when the log says a hyper-connection ran the torch path ("HC fused ... is off for", or the
 startup line "HC fused ... has no HPU kernel"). `hc` is not in the default list: `--gdn pytorch,fused,hc`
-or `--gdn hc` selects it. Each mode writes `<out>/<mode>/server0.log` and `details.json`;
+or `--gdn hc` selects it. `moe` is `fused` plus the MoE glue kernels (`VLLM_HPU_MOE_GLUE=1`), and also
+fails when the log says a MoE block ran the torch path ("MoE glue ... is off for", or the startup line
+"MoE glue ... has no HPU kernel"). It is not in the default list either: `--gdn moe` or
+`--gdn pytorch,fused,hc,moe` selects it. Each mode writes `<out>/<mode>/server0.log` and `details.json`;
 `<out>/summary.json` holds one entry per mode. The exit code is 0 only when every requested mode passed.
 A mode whose tokens match also records `decode_ms_per_token` (printed on a line of its own after the
 PASSED line): the shortest reference prompt generated with 16 tokens and with 1 token, best of three
@@ -30,13 +33,13 @@ flags, so it can override anything. The health wait defaults to 1800 s.
 
 `--recipe-cache DIR` gives the compiled-recipe cache to the servers that may carry it
 (`serve.recipe_cache_env`): the `pytorch` mode's, and every server once the combined kernel database
-is installed and not switched off (`FLASHINFER_GAUDI_COMBINED_KERNEL_DB=0`). The `fused` and `hc` modes
-run without it otherwise: their kernel databases must be registered in `GC_KERNEL_PATH`, and the Habana
+is installed and not switched off (`FLASHINFER_GAUDI_COMBINED_KERNEL_DB=0`). The `fused`, `hc` and `moe`
+modes run without it otherwise: their kernel databases must be registered in `GC_KERNEL_PATH`, and the Habana
 bridge accepts only one kernel library there next to a recipe cache. The cache lives in the per-bundle
 subfolder the run uses, `DIR/<first 12 characters of the plugin commit>` (`unknown` without a commit).
 
 Runs on Python 3.10 with the standard library only, from the plugin root of the bundle:
-`python -m tools.flash_next.rental.tiny_smoke --out DIR [--ckpt DIR] [--gdn pytorch,fused[,hc]] [--port N]
+`python -m tools.flash_next.rental.tiny_smoke --out DIR [--ckpt DIR] [--gdn pytorch,fused[,hc][,moe]] [--port N]
 [--health-timeout S] [--full-warmup] [--recipe-cache DIR] [--recipe-cache-mb N] [--env KEY=VALUE]`.
 `--ckpt` names a folder the checkpoint is built in once and reused from then on (default: `<out>/ckpt`,
 built every time); a folder built with other settings (another GDN head dim, generator or fixture: the
@@ -62,9 +65,13 @@ GDN_MODES = {
 # `hc`: the fused mode plus the fused hyper-connection kernels. Not a default mode: the kernels have not
 # run in a server yet, and the two default modes are the ones the run's gates depend on.
 GDN_MODES["hc"] = dict(GDN_MODES["fused"], **{gates.HC_FUSED_ENV: "1"})
+# `moe`: the fused mode plus the MoE glue kernels (the same library as the hyper-connection kernels, its
+# own flag). Not a default mode either: the two default modes are the ones the run's gates depend on.
+GDN_MODES["moe"] = dict(GDN_MODES["fused"], **{gates.MOE_GLUE_ENV: "1"})
 DEFAULT_MODES = "pytorch,fused"
-DECODE_KERNEL_MODES = ("fused", "hc")  # fail when a GDN layer ran the torch decode path
+DECODE_KERNEL_MODES = ("fused", "hc", "moe")  # fail when a GDN layer ran the torch decode path
 HC_KERNEL_MODES = ("hc", )  # fail when a hyper-connection ran the torch path
+MOE_KERNEL_MODES = ("moe", )  # fail when a MoE block ran the torch path
 HEALTH_TIMEOUT_S = 1800.0
 DECODE_TIMING_REPEATS = 3
 DECODE_TIMING_TIMEOUT_S = 120.0  # per request; the graphs are compiled by the comparison that ran before
@@ -200,6 +207,13 @@ def run_mode(mode: str, ckpt: Path, out_dir: Path, port: int, health_timeout_s: 
                 entry["reason"] = ("the fused hyper-connection kernels did not run: %d log line(s) say a layer "
                                    "used the torch path" % len(fallback))
                 entry["fallback_lines"] = fallback[:MAX_LINES]
+        if status is GateStatus.PASSED and mode in MOE_KERNEL_MODES:
+            fallback = gates.moe_fallback_lines(log_text)
+            if fallback:
+                status = GateStatus.FAILED
+                entry["reason"] = ("the MoE glue kernels did not run: %d log line(s) say a layer used the torch "
+                                   "path" % len(fallback))
+                entry["fallback_lines"] = fallback[:MAX_LINES]
         if status is not GateStatus.PASSED:
             entry["errors"] = error_lines(log_text)
     entry["status"] = status.name.lower()
@@ -238,8 +252,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--out", required=True, help="results folder of this call")
     parser.add_argument("--ckpt", default=None, help="checkpoint folder, built once and reused (default: OUT/ckpt)")
     parser.add_argument("--gdn", default=DEFAULT_MODES,
-                        help="comma-separated modes: pytorch, fused, hc (default: %(default)s; hc is fused plus "
-                        "the fused hyper-connection kernels, VLLM_HPU_HC_FUSED=1)")
+                        help="comma-separated modes: pytorch, fused, hc, moe (default: %(default)s; hc is fused "
+                        "plus the fused hyper-connection kernels, VLLM_HPU_HC_FUSED=1; moe is fused plus the MoE "
+                        "glue kernels, VLLM_HPU_MOE_GLUE=1)")
     parser.add_argument("--port", type=int, default=orchestrator.TINY_PORT)
     parser.add_argument("--health-timeout", type=float, default=HEALTH_TIMEOUT_S, metavar="S")
     parser.add_argument("--full-warmup", action="store_true",

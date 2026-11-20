@@ -8,9 +8,11 @@ checks, then the verify op's checks, and the GDN decode and verify
 modes every later server must use, with one rerun without the combined
 kernel database when the decode checks fail through it), the fused
 hyper-connection kernels' card test that the orchestrator runs right
-after it (`hc_fused`, recorded in G1b's details), tiny TP8 token
-agreement, capacity from the startup line, the first token of a started
-server, and coherence with a 120K-token needle.
+after it (`hc_fused`, recorded in G1b's details) and the MoE glue
+kernels' card test after that one (`moe_glue`, the same library, recorded
+the same way), tiny TP8 token agreement, capacity from the startup line,
+the first token of a started server, and coherence with a 120K-token
+needle.
 Every gate returns ``(GateStatus, details)`` and never raises for an
 expected failure: the exception text goes into ``details["error"]``.
 Python 3.10 standard library only.
@@ -354,10 +356,16 @@ GDN_MODE_ENV = "VLLM_HPU_GDN_CORE_DECODE"
 GDN_VERIFY_ENV = "VLLM_HPU_GDN_CORE_VERIFY"
 GDN_LAZY_ENV = "PT_HPU_LAZY_MODE"  # the Habana bridge mode: "1" lazy (the servers), "0" eager (torch.compile)
 GDN_VERIFY_OP_TEST = "tests/unit_tests/gdn_core_decode/test_hpu_verify_op.py"
-# The lines a server writes when a fused kernel did not run: the fused GDN ops' and the fused
-# hyper-connection kernels' ("HC fused (VLLM_HPU_HC_FUSED=1) has no HPU kernel", "... is off for <layer>").
-GDN_FALLBACK_RE = re.compile(r"has no HPU kernel|GDN core (decode|verify) .* is off for|HC fused .* is off for")
+# The lines a server writes when a fused kernel did not run: the fused GDN ops', the fused
+# hyper-connection kernels' ("HC fused (VLLM_HPU_HC_FUSED=1) has no HPU kernel", "... is off for <layer>")
+# and the MoE glue kernels' ("MoE glue (VLLM_HPU_MOE_GLUE=1) has no HPU kernel", "... is off for <layer>").
+GDN_FALLBACK_RE = re.compile(r"has no HPU kernel|GDN core (decode|verify) .* is off for|HC fused .* is off for|"
+                             r"MoE glue .* is off for")
 HC_FALLBACK_RE = re.compile(r"HC fused .* (is off for|has no HPU kernel)")
+MOE_FALLBACK_RE = re.compile(r"MoE glue .* (is off for|has no HPU kernel)")
+FALLBACK_GDN = "gdn"
+FALLBACK_HC = "hc"
+FALLBACK_MOE = "moe"
 GDN_OP_TIMEOUT_S = 600.0       # test_hpu_op.py and test_hpu_verify_op.py (about 16x the card's 37 s)
 GDN_CRASH_PROBE = "tools/flash_next/gdn_verify_crash_probe.sh"
 GDN_CRASH_PROBE_TIMEOUT_S = 4500.0  # the probe's worst case: apt 600 s + cmake 1800 s + six runs of 310 s = 4260 s
@@ -711,13 +719,29 @@ def fused_gdn(plugin_root: Path, out_dir: Path, python: str = sys.executable, sk
 
 def gdn_fallback_lines(log_text: str) -> list[str]:
     """The lines of a server log that match GDN_FALLBACK_RE, stripped, in order: every line that says a
-    fused kernel (GDN decode, GDN verify, hyper-connection) did not run."""
+    fused kernel (GDN decode, GDN verify, hyper-connection, MoE glue) did not run."""
     return [ln.strip() for ln in (log_text or "").splitlines() if GDN_FALLBACK_RE.search(ln)]
+
+
+def fallback_family(line: str) -> str:
+    """Whose line a fallback line is: FALLBACK_HC (the fused hyper-connection kernels), FALLBACK_MOE (the
+    MoE glue kernels) or FALLBACK_GDN (anything else). Every line has exactly one family: a line that
+    names two (a reason that quotes the other kernels' line) belongs to the one whose message starts
+    first."""
+    hc, moe = HC_FALLBACK_RE.search(line), MOE_FALLBACK_RE.search(line)
+    if hc and moe:
+        return FALLBACK_HC if hc.start() < moe.start() else FALLBACK_MOE
+    return FALLBACK_HC if hc else FALLBACK_MOE if moe else FALLBACK_GDN
 
 
 def hc_fallback_lines(log_text: str) -> list[str]:
     """The lines of `gdn_fallback_lines` that are about the fused hyper-connection kernels."""
-    return [ln for ln in gdn_fallback_lines(log_text) if HC_FALLBACK_RE.search(ln)]
+    return [ln for ln in gdn_fallback_lines(log_text) if fallback_family(ln) == FALLBACK_HC]
+
+
+def moe_fallback_lines(log_text: str) -> list[str]:
+    """The lines of `gdn_fallback_lines` that are about the MoE glue kernels."""
+    return [ln for ln in gdn_fallback_lines(log_text) if fallback_family(ln) == FALLBACK_MOE]
 
 
 HC_FUSED_ENV = "VLLM_HPU_HC_FUSED"
@@ -728,10 +752,21 @@ HC_KERNEL_LIB = "libhc_fused_gaudi2.so"
 HC_OPS_GLOB = "hc_fused_ops*.so"
 HC_KERNEL_LIBRARY_ENV = "HC_FUSED_GAUDI_KERNEL_LIBRARY"
 HC_NATIVE_LIBRARY_ENV = "HC_FUSED_GAUDI_NATIVE_LIBRARY"
+HC_NOT_INSTALLED = "the fused hyper-connection library is not installed: "
+# The statuses of a kernel card test (the hyper-connection kernels' and the MoE glue kernels').
 HC_PASSED = "passed"
 HC_FAILED = "failed"
 HC_SKIPPED = "skipped"
 HC_NOT_RUN = "not_run"
+
+# The MoE glue kernels live in the library and the op extension of the fused hyper-connection kernels
+# (HC_KERNEL_LIB, HC_OPS_GLOB, found through the same two variables): only the flag, the test file, its
+# log and its limit are their own.
+MOE_GLUE_ENV = "VLLM_HPU_MOE_GLUE"
+MOE_OP_TEST = "tests/unit_tests/hc_fused/test_moe_hpu_op.py"
+MOE_OP_LOG = "moe_hpu_op.log"
+MOE_OP_TIMEOUT_S = 900.0  # about 90 cases, two of them large
+MOE_NOT_INSTALLED = "the library of the MoE glue kernels (the fused hyper-connection library) is not installed: "
 
 
 def hc_fused(plugin_root: Path, out_dir: Path, python: str = sys.executable, skip: str = None,
@@ -753,7 +788,32 @@ def hc_fused(plugin_root: Path, out_dir: Path, python: str = sys.executable, ski
     gate status, and nothing here reads or changes what G1b decided about the fused GDN kernel. The
     orchestrator turns the kernels on for the servers only when the operator asked and this passed.
     Never raises."""
+    return _kernel_card_test(plugin_root, out_dir, python, skip, combined_db_off, HC_OP_TEST, HC_OP_LOG,
+                             HC_OP_TIMEOUT_S, HC_NOT_INSTALLED)
+
+
+def moe_glue(plugin_root: Path, out_dir: Path, python: str = sys.executable, skip: str = None,
+             combined_db_off: bool = False) -> dict:
+    """The MoE glue kernels' card test, run by the orchestrator right after the hyper-connection kernels'
+    (`hc_fused`) and recorded as G1b's details["moe_glue"].
+
+    The same step with MOE_OP_TEST, its own limit MOE_OP_TIMEOUT_S and its own log out_dir/MOE_OP_LOG,
+    next to HC_OP_LOG: the kernels are in the hyper-connection library and op extension, so the installed
+    files, the variables that name them and every rule of `hc_fused` are the same, and so are the
+    returned keys and statuses ("passed", "failed", "skipped", "not_run"; a skip inside the test file
+    is a failure, a test file that is not in the bundle is "not_run"). Recorded only: the orchestrator
+    turns the kernels on for the servers only when the operator asked and this passed. Never raises."""
+    return _kernel_card_test(plugin_root, out_dir, python, skip, combined_db_off, MOE_OP_TEST, MOE_OP_LOG,
+                             MOE_OP_TIMEOUT_S, MOE_NOT_INSTALLED)
+
+
+def _kernel_card_test(plugin_root: Path, out_dir: Path, python: str, skip: str, combined_db_off: bool, op_test: str,
+                      op_log: str, timeout_s: float, not_installed: str) -> dict:
+    """One card test of the kernels in the fused hyper-connection library: what `hc_fused` and `moe_glue`
+    do, for the test file `op_test`, the log `op_log`, the limit `timeout_s` and the words `not_installed`
+    that open the reason when the library is missing. Neither plugin flag reaches the test. Never raises."""
     started = time.monotonic()
+    test_name = Path(op_test).name
     result: dict = {"status": HC_NOT_RUN, "reason": "", "hpu_op": None}
     if skip:
         result.update(status=HC_SKIPPED, reason=skip)
@@ -761,13 +821,12 @@ def hc_fused(plugin_root: Path, out_dir: Path, python: str = sys.executable, ski
     try:
         plugin_root = Path(plugin_root)
         out_dir = Path(out_dir)
-        if not (plugin_root / HC_OP_TEST).is_file():
-            result["reason"] = "%s is not in the bundle" % HC_OP_TEST
+        if not (plugin_root / op_test).is_file():
+            result["reason"] = "%s is not in the bundle" % op_test
             return result
         out_dir.mkdir(parents=True, exist_ok=True)
 
         # the installed library folder, as G1b finds it (the bundle's source tree has an empty lib/)
-        not_installed = "the fused hyper-connection library is not installed: "
         lookup = run_step([str(python), "-c", GDN_LIB_LOOKUP_CODE], tempfile.gettempdir(), BUILD_TIMEOUT_S)
         if lookup.returncode != 0:
             result.update(status=HC_SKIPPED, reason=not_installed + "the interpreter exited %d: %s" %
@@ -791,7 +850,8 @@ def hc_fused(plugin_root: Path, out_dir: Path, python: str = sys.executable, ski
         if (lib_dir / GDN_KERNEL_LIB).is_file():
             env["GDN_FUSED_GAUDI_KERNEL_LIBRARY"] = str(lib_dir / GDN_KERNEL_LIB)
         env[GDN_LAZY_ENV] = "1"  # the bridge mode of every server
-        env.pop(HC_FUSED_ENV, None)  # the test loads the kernels itself
+        for flag in (HC_FUSED_ENV, MOE_GLUE_ENV):  # the test loads the kernels itself
+            env.pop(flag, None)
         env.pop(serve.RECIPE_CACHE_ENV, None)  # a recipe cache would block the colon-list registration
         if combined_db_off:
             env[serve.COMBINED_KERNEL_DB_ENV] = "0"
@@ -801,30 +861,29 @@ def hc_fused(plugin_root: Path, out_dir: Path, python: str = sys.executable, ski
             result["combined_kernel_db"] = COMBINED_DB_SWITCHED_OFF
         else:
             result["combined_kernel_db"] = COMBINED_DB_ACTIVE
-        result["log"] = HC_OP_LOG
+        result["log"] = op_log
 
-        cmd = [str(python), "-m", "pytest", "-q", "-rs", "-p", "no:cacheprovider", HC_OP_TEST]
+        cmd = [str(python), "-m", "pytest", "-q", "-rs", "-p", "no:cacheprovider", op_test]
         timed_out = False
         try:
-            proc = run_step(cmd, plugin_root, HC_OP_TIMEOUT_S, env)
+            proc = run_step(cmd, plugin_root, timeout_s, env)
             exit_code, text = proc.returncode, (proc.stdout or "") + (proc.stderr or "")
         except subprocess.TimeoutExpired as e:
             timed_out, exit_code, text = True, None, (e.output or "") + (e.stderr or "")
-        with open(out_dir / HC_OP_LOG, "w", encoding="utf-8") as f:
+        with open(out_dir / op_log, "w", encoding="utf-8") as f:
             f.write(text)
         counts = _gdn_pytest_summary(text)
         result["hpu_op"] = {"exit": exit_code, "passed": counts["passed"], "skipped": counts["skipped"],
                             "failed": counts["failed"], "error": counts["error"], "timed_out": timed_out}
         result["failed_tests"] = [ln for ln in text.splitlines() if ln.startswith("FAILED ")]
         if timed_out:
-            result.update(status=HC_FAILED, reason="test_hpu_op.py did not finish in %s s" % HC_OP_TIMEOUT_S)
+            result.update(status=HC_FAILED, reason="%s did not finish in %s s" % (test_name, timeout_s))
         elif (exit_code == 0 and counts["passed"] > 0 and counts["skipped"] == 0 and counts["failed"] == 0
               and counts["error"] == 0):
             result["status"] = HC_PASSED
         else:  # a module skip means the extension or its kernel database did not load: a failure
             skipped_only = counts["skipped"] > 0 and counts["failed"] == 0 and counts["error"] == 0
-            result.update(status=HC_FAILED,
-                          reason="test_hpu_op.py skipped" if skipped_only else "test_hpu_op.py failed")
+            result.update(status=HC_FAILED, reason="%s %s" % (test_name, "skipped" if skipped_only else "failed"))
     except Exception as e:  # noqa: BLE001 - recorded only: it never raises
         result.update(status=HC_NOT_RUN, reason="%s: %s" % (type(e).__name__, e))
     result["seconds"] = time.monotonic() - started

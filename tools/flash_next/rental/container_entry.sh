@@ -19,10 +19,10 @@ usage() {
     echo "       [--variants LIST] [--with-profile] [--from PHASE] [--download] [--skip-install]"
     echo "       [--full-warmup] [--server-timeout S] [--recipe-cache DIR] [--no-warm-pass]"
     echo "       [--quick-gates] [--no-verify-probe] [--load-read-timeout S] [--warm-request-timeout S]"
-    echo "       [--hc-fused]"
+    echo "       [--hc-fused] [--moe-glue]"
     echo "       $(basename "${BASH_SOURCE[0]}") --install-only [--results DIR] [--run-id ID]"
-    echo "  --quick-gates, --no-verify-probe, --load-read-timeout S, --warm-request-timeout S and"
-    echo "  --hc-fused are handed to the orchestrator unchanged (python -m tools.flash_next.rental.main --help)."
+    echo "  --quick-gates, --no-verify-probe, --load-read-timeout S, --warm-request-timeout S, --hc-fused and"
+    echo "  --moe-glue are handed to the orchestrator unchanged (python -m tools.flash_next.rental.main --help)."
 }
 
 need_value() {
@@ -57,6 +57,7 @@ NO_VERIFY_PROBE=0
 LOAD_READ_TIMEOUT=""
 WARM_REQUEST_TIMEOUT=""
 HC_FUSED=0
+MOE_GLUE=0
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -129,6 +130,10 @@ while [ $# -gt 0 ]; do
             ;;
         --hc-fused)
             HC_FUSED=1
+            shift
+            ;;
+        --moe-glue)
+            MOE_GLUE=1
             shift
             ;;
         --load-read-timeout)
@@ -334,7 +339,7 @@ if [ "$SKIP_INSTALL" -eq 0 ]; then
     # One NATIVE value for the three native builds. The fused hyper-connection library is always built
     # with the others (a failed build of it removes only its own two files and the install goes on);
     # whether a server uses it is the orchestrator's decision (--hc-fused and the card test), not this
-    # script's.
+    # script's. The MoE glue kernels are in that library too: nothing more is built for --moe-glue.
     install_step 2 "plugin (vllm-gaudi)" env VLLM_TARGET_DEVICE=hpu \
         VLLM_GAUDI_BUILD_FLASHINFER="$NATIVE" VLLM_GAUDI_BUILD_GDN_FUSED="$NATIVE" \
         VLLM_GAUDI_BUILD_HC_FUSED="$NATIVE" \
@@ -384,6 +389,7 @@ if [ "$NO_VERIFY_PROBE" -eq 1 ]; then MAIN_ARGS+=(--no-verify-probe); fi
 if [ -n "$LOAD_READ_TIMEOUT" ]; then MAIN_ARGS+=(--load-read-timeout "$LOAD_READ_TIMEOUT"); fi
 if [ -n "$WARM_REQUEST_TIMEOUT" ]; then MAIN_ARGS+=(--warm-request-timeout "$WARM_REQUEST_TIMEOUT"); fi
 if [ "$HC_FUSED" -eq 1 ]; then MAIN_ARGS+=(--hc-fused); fi
+if [ "$MOE_GLUE" -eq 1 ]; then MAIN_ARGS+=(--moe-glue); fi
 if [ "$NO_WARM_PASS" -eq 1 ]; then MAIN_ARGS+=(--no-warm-pass); fi
 
 phase "orchestrator (python -m tools.flash_next.rental.main)"

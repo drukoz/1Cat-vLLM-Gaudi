@@ -116,6 +116,30 @@ path`) and runs the torch path. With `0` the kernels are not loaded and their
 ops are not registered. The kernels pass the Gaudi2 instruction simulator and
 have not run on a card; see `docs/design/flash-next/hc-fused.md`.
 
+`VLLM_HPU_MOE_GLUE` selects the path of the element-wise ops of the Flash-Next
+MoE block as an integer. `0` (default) keeps the torch path. `1` computes the
+router logits and the shared-gate logit with one merged GEMM (the weight is
+built once at load) and runs the routing (softmax, top-k, renormalization), the
+shared expert's SiLU-multiply, the per-row FP8 quantization of the routed
+experts' input and the shared-gate multiply with the final add through four
+fused TPC kernels, `torch.ops.flashinfer_gaudi.moe_route`, `moe_silu_mul`,
+`moe_row_quant` and `moe_combine`; the GEMMs and the vendor expert op are
+unchanged. Any other value is the torch path. The flag is read once per MoE
+block at construction. The kernels are part of the hyper-connection library
+(`libhc_fused_gaudi2.so`, `hc_fused_ops*.so`), so they are built, installed
+and located like it (previous paragraph); a kernel that did not compile is left
+out of the library. When they are not usable the plugin logs one warning at
+startup (`MoE glue (VLLM_HPU_MOE_GLUE=1) has no HPU kernel: ...`). A block whose
+kernels are missing, or whose configuration or input they do not take (not 2-D
+bfloat16 and contiguous, a hidden size that is not a multiple of 128, grouped
+or custom routing, data- or sequence-parallel MoE, block-FP8 experts), logs one
+warning (`MoE glue (VLLM_HPU_MOE_GLUE=1) is off for <layer>: <reason>; using
+the torch path`) and runs the torch path. Among experts with equal router
+logits the routing kernel takes the lowest expert id, where `torch.topk`
+leaves the choice open. With `0` nothing is loaded, registered or logged. The
+kernels pass the Gaudi2 instruction simulator and have not run on a card; see
+`docs/design/flash-next/hc-fused.md` ("MoE glue kernels").
+
 `VLLM_HPU_RECURRENT_STATE_POOL` selects the allocation mode for the recurrent
 (GDN / short-conv) state slots as an integer. `0` (default) keeps today's
 allocation, one recurrent state slot per attention block id. `1` gives the

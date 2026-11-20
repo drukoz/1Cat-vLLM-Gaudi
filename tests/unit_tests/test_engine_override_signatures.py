@@ -50,6 +50,8 @@ PAIRS = [
      "vllm_gaudi.ops.hpu_fused_moe:_patched_default_moe_runner_forward"),
     ("vllm.model_executor.layers.fused_moe.config:FusedMoEConfig.__post_init__",
      "vllm_gaudi.ops.hpu_fused_moe:_patched_moe_config_post_init"),
+    ("vllm.model_executor.layers.fused_moe.runner.moe_runner:MoERunner.__init__",
+     "vllm_gaudi.ops.hpu_fused_moe:_patched_default_moe_runner_init"),
 ]
 
 # Child process: imports only vLLM (no vllm_gaudi, no stub) and prints the

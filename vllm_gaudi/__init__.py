@@ -185,6 +185,42 @@ def _load_hc_fused_if_requested(flag: int, warn=None) -> bool | None:
     return loaded
 
 
+def _warn_moe_glue_without_kernel(flag: int, loaded: bool, on_hpu: bool, errors, warn=None) -> str | None:
+    """Warn once at plugin start when VLLM_HPU_MOE_GLUE=1 runs without an HPU kernel.
+
+    Returns the logged message, or ``None`` when nothing was logged: the flag is off, the kernels loaded,
+    or no HPU. ``warn`` defaults to the vLLM logger's ``warning``.
+    """
+    if not flag or loaded or not on_hpu:
+        return None
+    reason = "; ".join(errors) if errors else "no error recorded"
+    message = (f"MoE glue (VLLM_HPU_MOE_GLUE={int(flag)}) has no HPU kernel: the kernels of the hc_fused_ops "
+               f"extension are not usable ({reason}); every MoE block runs the torch path. Build them with "
+               "tools/build_flashinfer_gaudi.py --hc-fused-only, or set VLLM_HPU_MOE_GLUE=0.")
+    if warn is None:
+        from vllm.logger import init_logger
+
+        warn = init_logger(__name__).warning
+    warn(message)
+    return message
+
+
+def _load_moe_glue_if_requested(flag: int, warn=None) -> bool | None:
+    """With VLLM_HPU_MOE_GLUE=1, load the fused MoE glue kernels and warn once when they are not usable.
+
+    Returns the loader's result, or ``None`` when the flag is not 1: then nothing is imported, loaded or logged.
+    The kernels are in the hyper-connection kernel library, so this must run before warmup for the same reason
+    as that loader (GC_KERNEL_PATH is read when the graph compiler starts). The loader never raises.
+    """
+    if flag != 1:
+        return None
+    from flashinfer_gaudi._native import load_moe_glue_extension, moe_glue_extension_errors
+
+    loaded = load_moe_glue_extension()
+    _warn_moe_glue_without_kernel(flag, loaded, _hpu_visible(), moe_glue_extension_errors(), warn=warn)
+    return loaded
+
+
 def register_ops():
     """Register custom PluggableLayers for the HPU platform"""
     from flashinfer_gaudi import load_native_extensions
@@ -211,6 +247,8 @@ def register_ops():
         _warn_gdn_core_verify_without_kernel(verify_mode, decode_mode, loaded, on_hpu, errors)
     # The fused hyper-connection kernels, only with VLLM_HPU_HC_FUSED=1 (default 0: nothing happens here).
     _load_hc_fused_if_requested(_gaudi_envs.VLLM_HPU_HC_FUSED)
+    # The fused MoE glue kernels, only with VLLM_HPU_MOE_GLUE=1 (default 0: nothing happens here).
+    _load_moe_glue_if_requested(_gaudi_envs.VLLM_HPU_MOE_GLUE)
     # One line per process with what the loader decided (state, GC_KERNEL_PATH, combined database, errors):
     # the server log then shows which kernel database every worker really runs.
     from flashinfer_gaudi._native import kernel_database_status

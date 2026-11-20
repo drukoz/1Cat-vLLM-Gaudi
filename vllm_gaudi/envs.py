@@ -534,6 +534,7 @@ if TYPE_CHECKING:
     VLLM_HPU_GDN_CORE_VERIFY: int = 0  # GdnCoreVerifyMode: 0 off (default), 1 fused verification steps
     VLLM_HPU_PLE_HOST_NGRAM_IDS: int = 0  # 0 PLE n-gram ids computed in the graph (default), 1 on the host
     VLLM_HPU_HC_FUSED: int = 0  # 0 torch hyper-connections (default), 1 the fused hyper-connection kernels
+    VLLM_HPU_MOE_GLUE: int = 0  # 0 torch MoE glue (default), 1 the fused MoE glue kernels
     VLLM_HPU_COLLECTIVE_MARK_STEP: int = 1  # 1 (default) mark_step() before every HPU collective, 0 none
     VLLM_HPU_RECURRENT_STATE_POOL: int = 0  # RecurrentStatePoolMode: 0 off, 1 pool
     VLLM_HPU_RECURRENT_STATE_POOL_SLOTS: int = 0  # resolved by the hook; positive overrides the formula
@@ -1904,6 +1905,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # path. Not yet proven in a served model; see docs/design/flash-next/hc-fused.md.
     "VLLM_HPU_HC_FUSED":
     lambda: int(os.environ.get("VLLM_HPU_HC_FUSED", "0")),
+
+    # Element-wise glue of the Flash-Next MoE block (routing softmax/top-k/renormalization, the shared
+    # expert's SiLU-multiply, the per-row FP8 quantization of the routed experts' input, the shared-gate
+    # multiply and the final add) as four TPC kernels of the hyper-connection kernel library, around one
+    # merged gate GEMM: 0 = torch path (default), 1 = fused; any other value is the torch path. Read once
+    # per MoE block at construction. A block whose kernels are not loaded, or whose configuration or input
+    # the kernels do not take, logs one line and runs the torch path. Not yet proven on a card; see
+    # docs/design/flash-next/hc-fused.md ("MoE glue kernels").
+    "VLLM_HPU_MOE_GLUE":
+    lambda: int(os.environ.get("VLLM_HPU_MOE_GLUE", "0")),
 
     # The htorch.core.mark_step() that HpuCommunicator issues before every all-reduce and all-gather
     # (a workaround for a Habana bridge bug with PT_HPU_ENABLE_LAZY_COLLECTIVES). 1 (default) keeps it.

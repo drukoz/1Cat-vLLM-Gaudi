@@ -66,6 +66,9 @@ def gate_calls(monkeypatch):
 
     monkeypatch.setattr(gates, "fused_gdn", fused_gdn)
     monkeypatch.setattr(gates, "hc_fused", hc_fused)
+    # The MoE glue kernels' card test follows this one in G1b (test_main_moe_glue.py): never the real step here.
+    monkeypatch.setattr(gates, "moe_glue", lambda *args, **kwargs: {"status": "not_run", "reason": "not in these tests",
+                                                                    "hpu_op": None})
     return calls, answers
 
 
@@ -169,7 +172,8 @@ def test_a_failed_g1b_does_not_stop_the_card_test(fused_node, gate_calls):
     assert calls["hc"][0]["combined_db_off"] is True
     details = read_json(runner.run_dir / "fused_gdn" / "details.json")
     assert details["mode"] == 0 and details["reason"] == "test_hpu_op.py failed (exit 1)"
-    assert details["env"] == {"VLLM_HPU_GDN_CORE_DECODE": "0", "VLLM_HPU_GDN_CORE_VERIFY": "0", HC: "1"}
+    assert details["env"] == {"VLLM_HPU_GDN_CORE_DECODE": "0", "VLLM_HPU_GDN_CORE_VERIFY": "0", HC: "1",
+                              gates.MOE_GLUE_ENV: "0"}  # the MoE glue flag is explicit too (not asked for here)
     assert read_json(runner.run_dir / "fused_gdn" / "status.json")["status"] == int(GateStatus.FAILED)
     assert runner.hc_fused_on() is True
 

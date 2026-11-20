@@ -92,6 +92,24 @@ it, the adapter opens it as a member and lists its six GUIDs, which no graph use
 | Build | `VLLM_GAUDI_BUILD_HC_FUSED=1` at install time, or `tools/build_flashinfer_gaudi.py --hc-fused-only`; a failed build removes its own two files only |
 | Card test | `tests/unit_tests/hc_fused/test_hpu_op.py`, run inside rental gate G1b (`gates.hc_fused`) |
 
+
+## The MoE glue kernels (`VLLM_HPU_MOE_GLUE`)
+
+Four more kernels of the hyper-connection library ([hc-fused.md](hc-fused.md), "MoE glue kernels"): no file of
+their own. With the flag at 0 (the default) `vllm_gaudi.register_ops` does not call their loader, the four
+`flashinfer_gaudi::moe_*` schemas are not defined (unless `VLLM_HPU_HC_FUSED=1` loads the shared extension, which
+implements them), no MoE block gets a state object or a merged gate weight, and the status line has no key for them.
+
+| | |
+|---|---|
+| Flag | `VLLM_HPU_MOE_GLUE` (0 default, 1 fused), read once per MoE block at construction |
+| Files | `libhc_fused_gaudi2.so` and `hc_fused_ops*.so`: the hyper-connection files, their path overrides and their `GC_KERNEL_PATH` rules |
+| Loader | `flashinfer_gaudi._native.load_moe_glue_extension()` = `load_hc_fused_extension()`, then `kernel_library_guids()` asks the library which of the four MoE GUIDs it serves; `moe_glue_extension_errors()`, `moe_glue_extension_loaded()`, `moe_glue_missing_kernels()`; status key `moe_glue_loaded`, present only when the loader was called (`hc_fused_loaded` is then set too) |
+| Build | the hyper-connection step. Each MoE kernel is optional: `csrc/hc_fused/CMakeLists.txt` leaves out one that does not compile, and the step prints `MoE glue kernels in libhc_fused_gaudi2.so: ...` and, when some are missing, `MoE glue kernels missing from ...` |
+| Messages | once at startup `MoE glue (VLLM_HPU_MOE_GLUE=1) has no HPU kernel: ...`; one line per block `MoE glue (VLLM_HPU_MOE_GLUE=1) is off for <layer>: <reason>; using the torch path` |
+| Card test | `tests/unit_tests/hc_fused/test_moe_hpu_op.py`, run inside rental gate G1b after the hyper-connection one (`gates.moe_glue`) |
+| Combined kernel database | nothing to do: the library is already a member, and the adapter forwards whatever GUIDs it lists |
+
 ## Run sheet lines for the next rental
 
 In the container, from the plugin checkout (`cd /bundle/plugin`), after the install (gate G1).
@@ -192,7 +210,8 @@ JSON-serializable data; it loads nothing and changes nothing:
 | `combined_active` | `True` only when this loader activated the combined file and `GC_KERNEL_PATH` is still exactly that file |
 | `combined_kernel_db` | the combined file this loader activated, or `None` |
 | `gdn_fused_loaded` | the result of `load_gdn_fused_extension()`, `None` when it was never called |
-| `hc_fused_loaded` | the result of `load_hc_fused_extension()`, `None` when it was never called (every process without `VLLM_HPU_HC_FUSED=1`) |
+| `hc_fused_loaded` | the result of `load_hc_fused_extension()`, `None` when it was never called (every process without `VLLM_HPU_HC_FUSED=1` and without `VLLM_HPU_MOE_GLUE=1`) |
+| `moe_glue_loaded` | the result of `load_moe_glue_extension()`; the key is absent when it was never called (every process without `VLLM_HPU_MOE_GLUE=1`) |
 | `load_errors` | every recorded loader error, in order |
 
 It cannot see inside the combined file: the members are opened by that file inside SynapseAI (next section), and a

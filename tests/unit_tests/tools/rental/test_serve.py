@@ -366,6 +366,30 @@ class TestRecipeCacheEnv:
         assert serve.recipe_cache_env("/rc/abc123456789", 4096, env, combined_db=True) == (
             {"PT_HPU_RECIPE_CACHE_CONFIG": "/rc/abc123456789,false,4096"}, "/rc/abc123456789")
 
+    def test_the_moe_glue_flag_loads_the_fused_library_like_the_hc_flag(self):
+        """VLLM_HPU_MOE_GLUE=1 loads the library of the fused hyper-connection kernels (the MoE glue
+        kernels live in it), so the server registers a kernel database of its own: no recipe cache, unless
+        through the combined kernel database. A missing key or "0" is the plugin default, off."""
+        cache = ({"PT_HPU_RECIPE_CACHE_CONFIG": "/rc/abc123456789,false,16384"}, "/rc/abc123456789")
+        off = ({}, serve.RECIPE_CACHE_OFF_REASON)
+        moe_on = dict(self.PYTORCH_GDN, VLLM_HPU_MOE_GLUE="1")
+        assert serve.recipe_cache_env("/rc/abc123456789", 16384, dict(self.PYTORCH_GDN, VLLM_HPU_MOE_GLUE="0")) == cache
+        assert serve.recipe_cache_env("/rc/abc123456789", 16384, moe_on) == off
+        assert serve.recipe_cache_env("/rc/abc123456789", 16384, dict(moe_on, VLLM_HPU_HC_FUSED="0")) == off
+        assert serve.recipe_cache_env("/rc/abc123456789", 16384, dict(moe_on, VLLM_HPU_HC_FUSED="1")) == off
+        assert serve.recipe_cache_env("/rc/abc123456789", 16384, moe_on, combined_db=True) == cache
+        assert serve.recipe_cache_env(None, 16384, moe_on) == ({}, "none")
+
+    def test_the_hc_flag_alone_still_counts(self):
+        hc_on = dict(self.PYTORCH_GDN, VLLM_HPU_HC_FUSED="1", VLLM_HPU_MOE_GLUE="0")
+        assert serve.recipe_cache_env("/rc/abc123456789", 16384, hc_on) == ({}, serve.RECIPE_CACHE_OFF_REASON)
+        assert serve.recipe_cache_env("/rc/abc123456789", 16384, hc_on, combined_db=True)[0] != {}
+
+    def test_the_reason_names_every_library_a_server_may_register(self):
+        reason = serve.RECIPE_CACHE_OFF_REASON
+        assert reason.startswith("off: ") and "GC_KERNEL_PATH" in reason
+        assert "fused GDN kernel" in reason and "hyper-connection" in reason and "MoE glue" in reason
+
 
 def test_error_lines_keeps_the_last_distinct_errors():
     log = "\n".join([

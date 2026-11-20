@@ -15,6 +15,13 @@ test runs right after G1b's own steps and is recorded in G1b's details; it never
 the GDN flags. The servers get the kernels only when the operator asked and the card test passed, every
 other server gets an explicit VLLM_HPU_HC_FUSED=0, and a tiny gate that fails with the kernels runs once
 more without them. The manifest's `hc_fused` and the summary's `HC fused:` line record the outcome.
+
+`--moe-glue` asks for the MoE glue kernels (VLLM_HPU_MOE_GLUE=1, off by default; they live in the
+hyper-connection library) in the same way: their card test runs right after the hyper-connection one and
+is recorded in G1b's details, the servers get them only when the operator asked and that test passed, and
+every other server gets an explicit VLLM_HPU_MOE_GLUE=0. The tiny gate's retry is one for both: a gate
+that fails with either kind of kernels runs once more without both. The manifest's `moe_glue` and the
+summary's `MoE glue:` line record the outcome.
 """
 
 from __future__ import annotations
@@ -66,7 +73,9 @@ TINY_DEFAULT_MODEL_LEN = 4096
 TINY_ATTEMPT_COMBINED = "attempt-combined"
 TINY_ATTEMPT_HC_FUSED = "attempt-hc-fused"
 TINY_ATTEMPT_GDN_FUSED = "attempt-gdn-fused"
+TINY_ATTEMPT_MOE_GLUE = "attempt-moe-glue"
 HC_QUICK_SKIP_REASON = "--quick-gates without --hc-fused"
+MOE_QUICK_SKIP_REASON = "--quick-gates without --moe-glue"
 LOAD_TIMEOUT_S = 5400.0
 LOAD_REQUEST_TIMEOUT_S = 1800.0
 LOAD_STAGGER_S = 60.0
@@ -398,13 +407,18 @@ def gdn_summary_lines(run_dir, variant_ids) -> list:
         if not path.is_file():
             continue
         found = [ln for ln in path.read_text(encoding="utf-8").splitlines() if ln.strip()]
-        hc_count = sum(1 for ln in found if gates.HC_FALLBACK_RE.search(ln))
-        count = len(found) - hc_count
+        families = [gates.fallback_family(ln) for ln in found]  # each line counts once, for one family
+        hc_count = families.count(gates.FALLBACK_HC)
+        moe_count = families.count(gates.FALLBACK_MOE)
+        count = len(found) - hc_count - moe_count
         if count:
             lines.append("GDN fallback lines in %s: %d (the kernel did not run on every layer)" % (vid, count))
         if hc_count:
             lines.append("HC fused fallback lines in %s: %d (the hyper-connection kernels did not run on every "
                          "layer)" % (vid, hc_count))
+        if moe_count:
+            lines.append("MoE glue fallback lines in %s: %d (the MoE glue kernels did not run on every layer)" %
+                         (vid, moe_count))
     toolchain = read_json(run_dir / "toolchain.json")  # written by container_entry.sh before the build
     if isinstance(toolchain, dict):
         lines.append("Native kernels: %s (tpc-clang: %s; habanalabs-tools: %s)" % (
@@ -461,6 +475,11 @@ class Runner:
         self.hc_fused_reason = None
         self.hc_fused_disabled_by = None
         self.gdn_fused_disabled_by = None  # "tiny" when the tiny gate only passed on the PyTorch GDN path
+        # The MoE glue kernels, the same three things: --moe-glue, their card test in G1b, and "tiny".
+        self.moe_glue_requested = bool(args.moe_glue)
+        self.moe_glue_status = None
+        self.moe_glue_reason = None
+        self.moe_glue_disabled_by = None
         self.skip_warmup = not args.full_warmup
         self.warm_pass = not args.no_warm_pass
         self.server_timeout_s = float(args.server_timeout)
@@ -507,6 +526,7 @@ class Runner:
             self.restore_gdn()
             self.restore_combined_db(manifest)
             self.restore_hc_fused(manifest)
+            self.restore_moe_glue(manifest)
         else:
             self.run_dir.mkdir(parents=True, exist_ok=True)
             self.bundle_commit = bundle_commit()
@@ -592,6 +612,7 @@ class Runner:
         self.announce(name, status, reason, seconds, errors, details.get("log") or [])
         if name == "fused_gdn" and not self.stub:
             self.announce_hc_fused(phase_dir, details.get("hc_fused"))
+            self.announce_moe_glue(phase_dir, details.get("moe_glue"))
         if status in (GateStatus.FAILED, GateStatus.TIMED_OUT):
             self.failure_evidence(name)
         if name in ("fused_gdn", "card_tests"):
@@ -619,6 +640,18 @@ class Runner:
         print(line, flush=True)
         if status == gates.HC_FAILED and hc_fused.get("log"):
             print("    log: %s" % (phase_dir / hc_fused["log"]), flush=True)
+
+    def announce_moe_glue(self, phase_dir: Path, moe_glue) -> None:
+        """One more console line after the hyper-connection one: the MoE glue kernels' card test and what
+        the servers get."""
+        moe_glue = moe_glue if isinstance(moe_glue, dict) else {}
+        status = moe_glue.get("status") or gates.HC_NOT_RUN
+        reason = moe_glue.get("reason")
+        line = "fused_gdn: MoE glue kernels' card test %s%s; MoE glue: %s" % (
+            status, " (%s)" % reason if reason else "", self.moe_glue_outcome())
+        print(line, flush=True)
+        if status == gates.HC_FAILED and moe_glue.get("log"):
+            print("    log: %s" % (phase_dir / moe_glue["log"]), flush=True)
 
     def failure_evidence(self, phase: str) -> None:
         """pip-freeze.txt and a fresh hl-smi.txt in the run folder (not in stub mode: no card, no stack)."""
@@ -656,10 +689,12 @@ class Runner:
 
     def gate_fused_gdn(self, phase_dir: Path):
         self.hc_fused_disabled_by = None  # a rerun of the gates decides again
+        self.moe_glue_disabled_by = None
         if self.stub:
             status = GateStatus.SKIPPED
             details = {"mode": None, "env": {}, "reason": "stub mode"}
             hc_fused = {"status": gates.HC_NOT_RUN, "reason": "stub mode", "hpu_op": None}
+            moe_glue = {"status": gates.HC_NOT_RUN, "reason": "stub mode", "hpu_op": None}
         else:
             if self.combined_db_disabled_by in ("g1b", "tiny"):
                 self.combined_db_disabled_by = None  # a rerun of the gates decides again
@@ -676,15 +711,21 @@ class Runner:
                     "reason": "%s: %s" % (type(exc).__name__, exc),
                 }
             hc_fused = self.check_hc_fused(phase_dir, details)
-        # The hyper-connection kernels' card test is recorded next to G1b's own result; `status`, the
-        # GDN mode and the GDN flags above are final and nothing below changes them.
+            moe_glue = self.check_moe_glue(phase_dir, details)
+        # The hyper-connection kernels' card test and the MoE glue kernels' are recorded next to G1b's own
+        # result; `status`, the GDN mode and the GDN flags above are final and nothing below changes them.
         hc_fused["requested"] = self.hc_fused_requested
         details["hc_fused"] = hc_fused
         self.hc_fused_status = hc_fused.get("status")
         self.hc_fused_reason = hc_fused.get("reason")
+        moe_glue["requested"] = self.moe_glue_requested
+        details["moe_glue"] = moe_glue
+        self.moe_glue_status = moe_glue.get("status")
+        self.moe_glue_reason = moe_glue.get("reason")
         if not self.stub:
             details["env"] = dict(details.get("env") or {})
             details["env"][gates.HC_FUSED_ENV] = "1" if self.hc_fused_on() else "0"
+            details["env"][gates.MOE_GLUE_ENV] = "1" if self.moe_glue_on() else "0"
         self.gdn_env = dict(details.get("env") or {})
         self.gdn_mode = details.get("mode")
         self.gdn_reason = details.get("reason")
@@ -700,11 +741,22 @@ class Runner:
         request its result is recorded only, with it the result decides a kernel. It runs without the
         combined kernel database when this run's servers will not load that database either. Never raises."""
         skip = HC_QUICK_SKIP_REASON if self.quick_gates and not self.hc_fused_requested else None
+        return self.kernel_card_test(gates.hc_fused, phase_dir, gdn_details, skip)
+
+    def check_moe_glue(self, phase_dir: Path, gdn_details: dict) -> dict:
+        """The MoE glue kernels' card test, right after the hyper-connection one (gates.moe_glue), under
+        the same rules: skipped only with --quick-gates and without --moe-glue. Never raises."""
+        skip = MOE_QUICK_SKIP_REASON if self.quick_gates and not self.moe_glue_requested else None
+        return self.kernel_card_test(gates.moe_glue, phase_dir, gdn_details, skip)
+
+    def kernel_card_test(self, card_test, phase_dir: Path, gdn_details: dict, skip) -> dict:
+        """One card test of G1b's recorded-only kernels (`card_test` is gates.hc_fused or gates.moe_glue):
+        without the combined kernel database when this run's servers will not load it. Never raises."""
         combined_db_off = not (gdn_details.get("combined_kernel_db") == gates.COMBINED_DB_ACTIVE and
                                gdn_details.get("mode") == gates.GDN_MODE_FUSED)
         try:
-            return dict(gates.hc_fused(repo_root(), phase_dir, sys.executable, skip=skip,
-                                       combined_db_off=combined_db_off))
+            return dict(card_test(repo_root(), phase_dir, sys.executable, skip=skip,
+                                  combined_db_off=combined_db_off))
         except Exception as exc:  # noqa: BLE001 - recorded only
             return {"status": gates.HC_NOT_RUN, "reason": "%s: %s" % (type(exc).__name__, exc), "hpu_op": None}
 
@@ -714,18 +766,34 @@ class Runner:
         return (self.hc_fused_requested and self.hc_fused_status == gates.HC_PASSED and
                 self.hc_fused_disabled_by is None)
 
+    def moe_glue_on(self) -> bool:
+        """True when this run's servers get VLLM_HPU_MOE_GLUE=1: the operator asked (--moe-glue), the card
+        test in G1b passed, and the tiny gate did not fail with the kernels."""
+        return (self.moe_glue_requested and self.moe_glue_status == gates.HC_PASSED and
+                self.moe_glue_disabled_by is None)
+
     def hc_fused_outcome(self) -> str:
         """"on", or "off (<why>)": the manifest's hc_fused.outcome and the summary's `HC fused:` line."""
-        if not self.hc_fused_requested:
+        return self.kernel_outcome(self.hc_fused_requested, self.hc_fused_status, self.hc_fused_reason,
+                                   self.hc_fused_disabled_by)
+
+    def moe_glue_outcome(self) -> str:
+        """"on", or "off (<why>)": the manifest's moe_glue.outcome and the summary's `MoE glue:` line."""
+        return self.kernel_outcome(self.moe_glue_requested, self.moe_glue_status, self.moe_glue_reason,
+                                   self.moe_glue_disabled_by)
+
+    def kernel_outcome(self, requested: bool, status, reason, disabled_by) -> str:
+        """The outcome words of one kind of kernels, from its request, its card test and who took it out."""
+        if not requested:
             return "off (not requested)"
-        if self.hc_fused_disabled_by == "tiny":
+        if disabled_by == "tiny":
             passed = self.variant_status("tiny") == int(GateStatus.PASSED)
             return "off (the tiny gate failed with it%s)" % (" and passed without" if passed else "")
-        if self.hc_fused_status == gates.HC_PASSED:
+        if status == gates.HC_PASSED:
             return "on"
-        if self.hc_fused_status is None:
+        if status is None:
             return "off (the card test has not run)"
-        return "off (%s)" % (self.hc_fused_reason or self.hc_fused_status)
+        return "off (%s)" % (reason or status)
 
     def gate_tiny(self, phase_dir: Path):
         """G2 with every fallback. After the newest pieces (``gate_tiny_kernels``), the fused GDN decode
@@ -753,7 +821,8 @@ class Runner:
         earlier = details
         status, details, _ = self.tiny_attempt(phase_dir)
         for key in ("combined_kernel_db", "combined_kernel_db_disabled_by", "attempt_combined", "hc_fused",
-                    "hc_fused_disabled_by", "attempt_hc_fused"):  # what the earlier fallbacks decided
+                    "hc_fused_disabled_by", "attempt_hc_fused", "moe_glue", "moe_glue_disabled_by",
+                    "attempt_moe_glue"):  # what the earlier fallbacks decided
             if key in earlier:
                 details.setdefault(key, earlier[key])
         details["gdn_fused_disabled_by"] = "tiny"
@@ -762,8 +831,11 @@ class Runner:
 
     def gate_tiny_kernels(self, phase_dir: Path):
         """G2. When the gate fails or times out with a server that ran the fused hyper-connection
-        kernels (--hc-fused), the attempt is kept under tiny/attempt-hc-fused/, the kernels are switched
-        off for the rest of the run and the gate runs once more. When it (still) fails or times out with
+        kernels (--hc-fused), the MoE glue kernels (--moe-glue) or both, the attempt is kept (under
+        tiny/attempt-hc-fused/ when only the hyper-connection kernels were on, under
+        tiny/attempt-moe-glue/ when the MoE glue kernels were on, alone or not), every kind that was on
+        is switched off for the rest of the run and the gate runs once more: one retry without both
+        kinds, never one retry for each. When it (still) fails or times out with
         a server that loaded the combined kernel database (first hardware run of the adapter in a full
         server), the attempt is kept under tiny/attempt-combined/, the database is switched off for the
         rest of the run and the gate runs once more (RUK-3248). The newest piece goes first."""
@@ -773,26 +845,41 @@ class Runner:
             self.combined_db_disabled_by = None  # a rerun of the gate decides again
         if self.hc_fused_disabled_by == "tiny":
             self.hc_fused_disabled_by = None
+        if self.moe_glue_disabled_by == "tiny":
+            self.moe_glue_disabled_by = None
         failed = (GateStatus.FAILED, GateStatus.TIMED_OUT)
-        hc_attempt = None
+        kept = {}  # the kinds of kernels this gate switched off ("hc_fused", "moe_glue"), see note_kernel_attempt
         combined = self.combined_db_active()
         t0 = time.time()
         status, details, server_ran = self.tiny_attempt(phase_dir)
         details["combined_kernel_db"] = combined
-        details["hc_fused"] = self.hc_fused_on()
-        if details["hc_fused"] and server_ran and status in failed:
-            hc_attempt = self.keep_tiny_attempt(phase_dir, status, details, time.time() - t0, TINY_ATTEMPT_HC_FUSED)
-            self.hc_fused_disabled_by = "tiny"
+        hc_on, moe_on = self.hc_fused_on(), self.moe_glue_on()
+        details["hc_fused"] = hc_on
+        details["moe_glue"] = moe_on
+        if (hc_on or moe_on) and server_ran and status in failed:
+            name = TINY_ATTEMPT_MOE_GLUE if moe_on else TINY_ATTEMPT_HC_FUSED
+            attempt = self.keep_tiny_attempt(phase_dir, status, details, time.time() - t0, name)
+            what, flags = [], []
+            if hc_on:
+                self.hc_fused_disabled_by = "tiny"
+                kept["hc_fused"] = None if moe_on else attempt  # one attempt, recorded once: under its folder's kind
+                what.append("the fused hyper-connection kernels")
+                flags.append("%s=0" % gates.HC_FUSED_ENV)
+            if moe_on:
+                self.moe_glue_disabled_by = "tiny"
+                kept["moe_glue"] = attempt
+                what.append("the MoE glue kernels")
+                flags.append("%s=0" % gates.MOE_GLUE_ENV)
             self.write_manifest()
-            print("tiny: %s with the fused hyper-connection kernels (%s); kept under %s, running the gate once "
-                  "more with %s=0" % (GateStatus(status).name, hc_attempt["reason"],
-                                      phase_dir / TINY_ATTEMPT_HC_FUSED, gates.HC_FUSED_ENV), flush=True)
-            for text in hc_attempt["errors"]:
+            print("tiny: %s with %s (%s); kept under %s, running the gate once more with %s" %
+                  (GateStatus(status).name, " and ".join(what), attempt["reason"], phase_dir / name,
+                   " and ".join(flags)), flush=True)
+            for text in attempt["errors"]:
                 print("    %s" % text, flush=True)
             t0 = time.time()
             status, details, server_ran = self.tiny_attempt(phase_dir)
             details["combined_kernel_db"] = combined
-            self.note_hc_attempt(details, hc_attempt)
+            self.note_kernel_attempt(details, kept)
         if not (combined and server_ran and status in failed):
             return status, details
         first = self.keep_tiny_attempt(phase_dir, status, details, time.time() - t0)
@@ -807,16 +894,21 @@ class Runner:
         details["combined_kernel_db"] = False
         details["combined_kernel_db_disabled_by"] = "tiny"
         details["attempt_combined"] = first
-        self.note_hc_attempt(details, hc_attempt)
+        self.note_kernel_attempt(details, kept)
         return status, details
 
-    def note_hc_attempt(self, details: dict, hc_attempt) -> None:
-        """What a tiny attempt's details say about the hyper-connection kernels: whether its server ran
-        them, and the kept attempt that ran them and failed, if there was one."""
+    def note_kernel_attempt(self, details: dict, kept: dict) -> None:
+        """What a tiny attempt's details say about the hyper-connection and the MoE glue kernels: whether
+        its server ran them, and for each kind the tiny gate switched off (a key of `kept`: "hc_fused",
+        "moe_glue") that it did. The kept attempt that failed is recorded once, under the kind of its
+        folder: `attempt_moe_glue` when the MoE glue kernels were on (`kept["hc_fused"]` is then None),
+        `attempt_hc_fused` when only the hyper-connection kernels were."""
         details["hc_fused"] = self.hc_fused_on()
-        if hc_attempt is not None:
-            details["hc_fused_disabled_by"] = "tiny"
-            details["attempt_hc_fused"] = hc_attempt
+        details["moe_glue"] = self.moe_glue_on()
+        for kind, attempt in kept.items():
+            details["%s_disabled_by" % kind] = "tiny"
+            if attempt is not None:
+                details["attempt_%s" % kind] = attempt
 
     def tiny_attempt(self, phase_dir: Path) -> tuple:
         """One run of the tiny gate: (status, details, whether its server was started)."""
@@ -853,8 +945,8 @@ class Runner:
 
     def keep_tiny_attempt(self, phase_dir: Path, status, details: dict, seconds: float,
                           name: str = TINY_ATTEMPT_COMBINED) -> dict:
-        """Move the failed attempt's server log, status and details to tiny/<name>/ (attempt-combined or
-        attempt-hc-fused); its summary."""
+        """Move the failed attempt's server log, status and details to tiny/<name>/ (attempt-combined,
+        attempt-hc-fused or attempt-moe-glue); its summary."""
         keep = phase_dir / name
         keep.mkdir(parents=True, exist_ok=True)
         log_path = phase_dir / "server0.log"
@@ -1225,6 +1317,10 @@ class Runner:
             if isinstance(hc_fused, dict):
                 self.hc_fused_status = hc_fused.get("status")
                 self.hc_fused_reason = hc_fused.get("reason")
+            moe_glue = details.get("moe_glue")  # absent in a run made before --moe-glue existed
+            if isinstance(moe_glue, dict):
+                self.moe_glue_status = moe_glue.get("status")
+                self.moe_glue_reason = moe_glue.get("reason")
 
     def restore_hc_fused(self, manifest: dict) -> None:
         """On a resume: a tiny gate of the earlier start that took the fused hyper-connection kernels out
@@ -1234,6 +1330,14 @@ class Runner:
         by = hc_fused.get("disabled_by") if isinstance(hc_fused, dict) else None
         if self.hc_fused_disabled_by is None and by == "tiny":
             self.hc_fused_disabled_by = by
+
+    def restore_moe_glue(self, manifest: dict) -> None:
+        """On a resume, the same for the MoE glue kernels: the tiny gate's decision of the earlier start
+        stays, the request is this start's --moe-glue, the card test's result comes with G1b's details."""
+        moe_glue = manifest.get("moe_glue")
+        by = moe_glue.get("disabled_by") if isinstance(moe_glue, dict) else None
+        if self.moe_glue_disabled_by is None and by == "tiny":
+            self.moe_glue_disabled_by = by
 
     def restore_combined_db(self, manifest: dict) -> None:
         """On a resume: a gate of the earlier start that took the combined kernel database out of the
@@ -1284,6 +1388,14 @@ class Runner:
             "disabled_by": self.hc_fused_disabled_by,
             "outcome": self.hc_fused_outcome(),
         }
+        manifest["moe_glue"] = {
+            "requested": self.moe_glue_requested,
+            "status": self.moe_glue_status,
+            "reason": self.moe_glue_reason,
+            "on": self.moe_glue_on(),
+            "disabled_by": self.moe_glue_disabled_by,
+            "outcome": self.moe_glue_outcome(),
+        }
         if self.workload_info is not None:
             manifest["workload"] = self.workload_info
             manifest["workload_sha"] = self.workload_info.get("sha256")
@@ -1332,12 +1444,13 @@ class Runner:
 
     def variant_server_env(self, variant_env: dict) -> dict:
         """The environment of a variant's servers: the variant's flags, the GDN flags, the fused
-        hyper-connection flag (always explicit: "1" only when the operator asked and the card test
-        passed, `hc_fused_on`), the recipe cache for the servers that register no kernel database of
-        their own (`serve.recipe_cache_env`) and, by default, the skipped bucket warmup (the compiled
-        graphs land in the recipe cache)."""
+        hyper-connection flag and the MoE glue flag (always explicit: "1" only when the operator asked
+        and the card test passed, `hc_fused_on` and `moe_glue_on`), the recipe cache for the servers that
+        register no kernel database of their own (`serve.recipe_cache_env`) and, by default, the skipped
+        bucket warmup (the compiled graphs land in the recipe cache)."""
         env = server_env(variant_env, self.gdn_env)
         env[gates.HC_FUSED_ENV] = "1" if self.hc_fused_on() else "0"
+        env[gates.MOE_GLUE_ENV] = "1" if self.moe_glue_on() else "0"
         if self.skip_warmup:
             env["VLLM_SKIP_WARMUP"] = "true"
         combined = self.combined_db_active()
@@ -1417,6 +1530,10 @@ def _parse_args(argv):
                         help="ask for the fused hyper-connection kernels: the servers get VLLM_HPU_HC_FUSED=1 "
                         "when the kernels' card test in G1b passed (default: off, every server gets "
                         "VLLM_HPU_HC_FUSED=0); a tiny gate that fails with them runs once more without")
+    parser.add_argument("--moe-glue", action="store_true",
+                        help="ask for the MoE glue kernels: the servers get VLLM_HPU_MOE_GLUE=1 when the "
+                        "kernels' card test in G1b passed (default: off, every server gets "
+                        "VLLM_HPU_MOE_GLUE=0); a tiny gate that fails with them runs once more without")
     parser.add_argument("--recipe-cache", metavar="DIR", default=None,
                         help="folder for the HPU recipe cache; a server gets it only when it runs without the "
                         "fused GDN kernel, or when the combined kernel database is installed, G1b passed "

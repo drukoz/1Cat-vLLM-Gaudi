@@ -122,7 +122,10 @@ void CheckGuids()
 {
     uint32_t count = 0;
     Expect(g_guids(DEVICE_ID_GAUDI2, &count, nullptr), GLUE_SUCCESS, "guids/size_query");
-    Report(count == kHcFusedGuidCount, "guids/count", "count " + std::to_string(count));
+    // The six hyper-connection GUIDs, then the MoE glue GUIDs that were built into the library (0 to 4;
+    // moe_lib_check.cpp checks those).
+    Report(count >= kHcFusedGuidCount && count <= kHcFusedGuidCount + kMoeGlueGuidCount, "guids/count",
+           "count " + std::to_string(count));
     std::vector<GuidInfo> guids(count);
     uint32_t filled = count;
     Expect(g_guids(DEVICE_ID_GAUDI2, &filled, guids.data()), GLUE_SUCCESS, "guids/fill");
@@ -133,7 +136,7 @@ void CheckGuids()
     std::memset(few.data(), 0x7f, few.size() * sizeof(GuidInfo));
     uint32_t capacity = 2;
     Expect(g_guids(DEVICE_ID_GAUDI2, &capacity, few.data()), GLUE_SUCCESS, "guids/short_buffer");
-    Report(capacity == kHcFusedGuidCount && few[2].name[0] == 0x7f && !std::strcmp(few[0].name, guids[0].name),
+    Report(capacity == count && few[2].name[0] == 0x7f && !std::strcmp(few[0].name, guids[0].name),
            "guids/short_buffer_fills_only_capacity");
     uint32_t other = 7;
     Expect(g_guids(DEVICE_ID_GAUDI, &other, guids.data()), GLUE_SUCCESS, "guids/other_device");

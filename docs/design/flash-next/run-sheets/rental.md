@@ -207,10 +207,12 @@ and compares the served tokens with the reference each time:
 | `pytorch` | `VLLM_HPU_GDN_CORE_DECODE=0`, `VLLM_HPU_GDN_CORE_VERIFY=0` | the server builds and decodes on the torch GDN path |
 | `fused` | `VLLM_HPU_GDN_CORE_DECODE=1`, `VLLM_HPU_GDN_CORE_VERIFY=0` | the same with the fused decode kernel, and no layer fell back to the torch path |
 | `hc` (only when named: `--gdn hc`) | the `fused` flags and `VLLM_HPU_HC_FUSED=1` | the same with the fused hyper-connection kernels too, and no hyper-connection fell back to the torch path (no `HC fused ... is off for` and no `HC fused ... has no HPU kernel` line in the server log) |
+| `moe` (only when named: `--gdn moe`) | the `fused` flags and `VLLM_HPU_MOE_GLUE=1` | the same with the MoE glue kernels too, and no MoE block fell back to the torch path (no `MoE glue ... is off for` and no `MoE glue ... has no HPU kernel` line in the server log) |
 
 The `hc` mode is not in the default list: the hyper-connection kernels have passed the instruction
 simulator and the CPU tests, not a card. The tiny checkpoint has the geometry the kernels take
-(hidden size 128, 4 streams, low rank 16; the simulator cases include it). See
+(hidden size 128, 4 streams, low rank 16; the simulator cases include it). The `moe` mode (the MoE
+glue kernels, in the same library) is not in the default list either. See
 [Experiments that cost one smoke run each](#experiments-that-cost-one-smoke-run-each).
 
 The tiny checkpoint's GDN layers are built with head dim 128 (`make_tiny_checkpoint.py
@@ -259,7 +261,7 @@ minutes instead of a full run:
 |---|---|
 | `--reinstall` | install the stack again in the same container; needed after any change under `plugin/` (the servers run the installed plugin, not the source tree) |
 | `--fresh` | remove the container first: new install, new tiny checkpoint |
-| `--gdn LIST` | the modes to serve, in order (default `pytorch,fused`); the third mode, `hc`, runs only when named (`--gdn hc`, `--gdn pytorch,fused,hc`) |
+| `--gdn LIST` | the modes to serve, in order (default `pytorch,fused`); the third mode, `hc`, runs only when named (`--gdn hc`, `--gdn pytorch,fused,hc`), and so does the fourth, `moe` (`--gdn moe`) |
 | `--full-warmup` | run the real bucket warmup (about 15 minutes per mode); the default skips it, see above |
 | `--health-timeout S` | seconds to wait for a server to get healthy, passed to the check (default 1800) |
 | `--env KEY=VALUE` | extra server environment variable, repeatable; applied after the mode's own flags, so it can override them (a `KEY` without `=` is a usage error) |
@@ -380,6 +382,7 @@ checkpoint, and nothing `run_rental.sh` does changes. Run them after the two def
    `FAILED` with that one prompt; `pytorch/details.json` lists every prompt. The five shorter
    prompts matching here, when they do not in the plain `pytorch` mode, puts the fault in the
    sparse attention path.
+4. **Do the MoE glue kernels work in a server?** `sudo bash tiny_smoke.sh --gdn moe` serves the `fused` flags plus `VLLM_HPU_MOE_GLUE=1`. `PASSED`: the tokens match the reference and the server log has no `MoE glue ... is off for` and no `has no HPU kernel` line (each MoE block ran its kernels); pass `--moe-glue` to `run_rental.sh`. `FAILED`: the printed log lines say why; leave `--moe-glue` out and send `moe/server0.log`. The tiny checkpoint is BF16, so this run does not exercise the FP8 row-quantization kernel: only the card test of gate `fused_gdn` does.
 
 ## The one command (on the node)
 
@@ -422,6 +425,7 @@ Useful options:
 | `--quick-gates` | skip the recorded-only steps before the first measurement: G1b's eager replays and its bench, the verify crash probe, and the `card_tests` phase (recorded as skipped). The checks that decide the GDN kernel and the verify op still run |
 | `--no-verify-probe` | skip only the automatic crash probe that follows a crashed or hung GDN verify op test |
 | `--hc-fused` | ask for the fused hyper-connection kernels (off by default). The kernels' card test runs inside gate `fused_gdn` (`tests/unit_tests/hc_fused/test_hpu_op.py`, log `hc_hpu_op.log` in `fused_gdn/`); the servers get `VLLM_HPU_HC_FUSED=1` only when it passed, otherwise an explicit `VLLM_HPU_HC_FUSED=0`, and the run goes on with the torch hyper-connections. A tiny gate that fails with the kernels runs once more without them. `summary.md` says `HC fused: on` or why not. Try `tiny_smoke.sh --gdn hc` first |
+| `--moe-glue` | the same switch for the MoE glue kernels (off by default; they are in the hyper-connection library, so nothing more is built): their card test runs right after the hyper-connection one (`tests/unit_tests/hc_fused/test_moe_hpu_op.py`, log `moe_hpu_op.log` in `fused_gdn/`), the servers get `VLLM_HPU_MOE_GLUE=1` only when it passed and otherwise an explicit `VLLM_HPU_MOE_GLUE=0`, a tiny gate that fails with the kernels runs once more without them, and `summary.md` says `MoE glue: on` or why not; try `tiny_smoke.sh --gdn moe` first |
 | `--load-read-timeout S` | measured load: seconds a request may go without receiving data (default 1800) |
 | `--warm-request-timeout S` | warm pass: seconds a request may go without receiving data, first graph compiles included (default 3600) |
 | `--image IMG` | container image (default the 1.24.1 base image) |
@@ -457,6 +461,14 @@ gate failed with it and passed without)`; the manifest's `hc_fused` has the same
 `status`, `on`, `disabled_by`, `outcome`). A server that got the kernels and did not use them on a
 layer leaves `HC fused ... is off for <layer>` lines in `<variant>/gdn_fallback.txt`, counted in the
 summary as `HC fused fallback lines in <variant>`.
+
+**The MoE glue kernels (`--moe-glue`)** follow the same rules under their own names: `moe_glue` in
+G1b's details and in the manifest, `VLLM_HPU_MOE_GLUE=0` for every server that does not get them,
+the summary line `MoE glue: on`, `MoE glue: off (not requested)` or `MoE glue: off
+(test_moe_hpu_op.py failed)`, and `MoE glue fallback lines in <variant>`. The tiny gate has one retry
+for the two switches: when it fails or times out with either kind of kernels on, it runs once more
+without both, and the attempt is kept under `tiny/attempt-moe-glue/` when the MoE glue kernels were
+on (alone or with the hyper-connection kernels), under `tiny/attempt-hc-fused/` otherwise.
 
 ### The container
 
@@ -570,8 +582,8 @@ variant yet.
 |---|---|---|
 | G0 preflight | 8 cards in `hl-smi`; the checkpoint config is block-FP8 [128, 128]; the FP8 layout check passes for each layout in the run; free disk; records the bundle commit, the image, `hl-smi -q` and the environment | any check fails |
 | G1 build | stage 1's install from the bundle; `vllm.__version__` is `0.28.1rc1.dev392+g8f816a3f6`; `import vllm_gaudi`; `flashinfer_gaudi.get_capabilities()` | install or import fails, or the version is wrong |
-| G1b fused GDN kernel | op numerics of both GDN decode ops on the card against the CPU reference (`test_hpu_op.py`), 1,000-step graph replay against eager (two cases), then the verification op's numerics and two replays (only after the decode checks pass), then the speed measurement; all of these run with `PT_HPU_LAZY_MODE=1`, the servers' bridge mode, and only they decide the kernel. The two decode replays then run once more with `PT_HPU_LAZY_MODE=0` for `torch.compile` and are recorded only (`replay_eager`, `eager_compile_ok`): an eager failure never turns the kernel off. Every step runs in its own process group and is killed with its whole group at its timeout (op tests 600 s, each replay 900 s, bench 1200 s). When `test_hpu_verify_op.py` crashes or times out, G1b runs `gdn_verify_crash_probe.sh` (at most 4500 s) into `fused_gdn/verify_crash/`; recorded only. `--quick-gates` skips the recorded-only steps (the eager replays, the bench and the crash probe); `--no-verify-probe` skips only the probe. Right after these steps the fused hyper-connection kernels' own card test runs (`tests/unit_tests/hc_fused/test_hpu_op.py`, lazy mode, the installed libraries by path, its own process group, 600 s, log `hc_hpu_op.log`): recorded as `hc_fused` in this gate's details, it never changes this gate's status or the GDN flags; with `--quick-gates` it runs only when `--hc-fused` was passed | never stops: on a failure, a skip or a missing library, every later server runs with `VLLM_HPU_GDN_CORE_DECODE=0` (the PyTorch GDN path), recorded in the manifest and the summary; a verify failure leaves `VLLM_HPU_GDN_CORE_VERIFY=0`, only a pass sets it to 1 |
-| G2 tiny TP8 | stage 2a's tiny 8-head checkpoint (GDN head dim 128) at TP8: greedy agreement with `reference.json` on its six prompts (1 to 2,600 tokens). The server gets a fixed 1,200 s to become healthy (`--server-timeout` does not apply). When the gate fails or times out with the fused hyper-connection kernels on (`--hc-fused` and a passed card test), that attempt is kept under `tiny/attempt-hc-fused/` and the gate runs once more without them. When the gate fails or times out with the combined kernel database loaded, that attempt is kept under `tiny/attempt-combined/` and the gate runs once more without the database | fewer than 16/16 tokens match on any prompt, or the server is not healthy in time (after the retry, when there is one) |
+| G1b fused GDN kernel | op numerics of both GDN decode ops on the card against the CPU reference (`test_hpu_op.py`), 1,000-step graph replay against eager (two cases), then the verification op's numerics and two replays (only after the decode checks pass), then the speed measurement; all of these run with `PT_HPU_LAZY_MODE=1`, the servers' bridge mode, and only they decide the kernel. The two decode replays then run once more with `PT_HPU_LAZY_MODE=0` for `torch.compile` and are recorded only (`replay_eager`, `eager_compile_ok`): an eager failure never turns the kernel off. Every step runs in its own process group and is killed with its whole group at its timeout (op tests 600 s, each replay 900 s, bench 1200 s). When `test_hpu_verify_op.py` crashes or times out, G1b runs `gdn_verify_crash_probe.sh` (at most 4500 s) into `fused_gdn/verify_crash/`; recorded only. `--quick-gates` skips the recorded-only steps (the eager replays, the bench and the crash probe); `--no-verify-probe` skips only the probe. Right after these steps the fused hyper-connection kernels' own card test runs (`tests/unit_tests/hc_fused/test_hpu_op.py`, lazy mode, the installed libraries by path, its own process group, 600 s, log `hc_hpu_op.log`): recorded as `hc_fused` in this gate's details, it never changes this gate's status or the GDN flags; with `--quick-gates` it runs only when `--hc-fused` was passed. The MoE glue kernels' card test follows it under the same rules (`tests/unit_tests/hc_fused/test_moe_hpu_op.py`, 900 s, log `moe_hpu_op.log`, recorded as `moe_glue`; with `--quick-gates` only when `--moe-glue` was passed) | never stops: on a failure, a skip or a missing library, every later server runs with `VLLM_HPU_GDN_CORE_DECODE=0` (the PyTorch GDN path), recorded in the manifest and the summary; a verify failure leaves `VLLM_HPU_GDN_CORE_VERIFY=0`, only a pass sets it to 1 |
+| G2 tiny TP8 | stage 2a's tiny 8-head checkpoint (GDN head dim 128) at TP8: greedy agreement with `reference.json` on its six prompts (1 to 2,600 tokens). The server gets a fixed 1,200 s to become healthy (`--server-timeout` does not apply). When the gate fails or times out with the fused hyper-connection kernels on (`--hc-fused` and a passed card test), that attempt is kept under `tiny/attempt-hc-fused/` and the gate runs once more without them. With the MoE glue kernels on (`--moe-glue` and a passed card test), alone or with the hyper-connection kernels, the attempt is kept under `tiny/attempt-moe-glue/` instead and the gate runs once more without both. When the gate fails or times out with the combined kernel database loaded, that attempt is kept under `tiny/attempt-combined/` and the gate runs once more without the database | fewer than 16/16 tokens match on any prompt, or the server is not healthy in time (after the retry, when there is one) |
 | card_tests (after the gates) | the two HPU-only unit-test files on the card, in lazy mode (`PT_HPU_LAZY_MODE=1`), 600 s each: `tests/unit_tests/test_defragmentation.py` and `tests/unit_tests/ops/test_hpu_fused_moe.py`; each file's output is kept as `<stem>.log` and the pytest counts are recorded in `details.json`. Skipped with `--quick-gates` | never stops the run: a failure, a timeout or a skip is recorded only |
 | G3 startup, per server | `Maximum concurrency for 131,072 tokens per request` ≥ agents on that server; `Usable num_blocks`, KV tokens, weights and warmup recorded | the concurrency is too low, or no healthy `/v1/models` within the health timeout (default 1,800 s, `--server-timeout`; warmup is skipped by default, so startup is usually minutes) |
 | G4w warm pass, per variant (RUK-3203) | a one-turn copy of the workload, files shifted by one, on the variant's own servers (`max_tokens=64`): compiles the workload's graphs on first use and caches the shared system block; `warm-pass.json` records requests, seconds and non-OK rows; `--no-warm-pass` switches it off | any non-OK row fails the variant with `warm pass: <n> non-OK rows` (the variant's "on failure" rule applies: A stops the run, B and C continue) — see [Warm pass](#warm-pass-ruk-3203) |
@@ -656,7 +668,7 @@ and `run_rental.sh` ends with two lines:
   errors, wall time), one section per variant — each with its `Warm pass:` line, the numbers of
   the [warm pass](#warm-pass-ruk-3203) (`none` with `--no-warm-pass`) —, the GDN decode line
   (fused kernel or PyTorch path) and the native-kernel line from `toolchain.json`. Its header
-  also carries the `HC fused:` line (`on`, or `off (<why>)`), the run's warmup mode (`Warmup: skipped ...` / `Warmup: full`) and the server
+  also carries the `HC fused:` and `MoE glue:` lines (`on`, or `off (<why>)`), the run's warmup mode (`Warmup: skipped ...` / `Warmup: full`) and the server
   health timeout (RUK-3200). Paste it whole into a comment on RUK-2709. It is written at the end
   of every run that reached the orchestrator, passed or failed.
 - `SEND THIS FILE: <results>/<run-id>.tar.gz` — the whole run folder, made even when the run

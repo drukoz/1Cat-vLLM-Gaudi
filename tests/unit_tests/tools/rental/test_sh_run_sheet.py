@@ -112,3 +112,39 @@ def test_the_sheet_names_what_the_scripts_add_to_the_run_folder():
     assert "pytest==9.2.0" in entry_text and "pinned to 9.2.0" in sheet
     assert "tiny/ckpt/*.safetensors" in run_text and "tiny/ckpt/*.safetensors" in sheet
     assert ".bundle-sha" in entry_text and "plugin/build/.bundle-sha" in sheet
+
+
+def test_the_kernel_switches_have_rows_and_the_sheet_quotes_their_card_tests():
+    """`--hc-fused` and `--moe-glue`: one row each in the run table with the card test's file and log, and
+    the G1b row gives each card test's limit, all as gates.py has them."""
+    sheet = _sheet()
+    gates_py = "tools/flash_next/rental/gates.py"
+    g1b = [line for line in sheet.splitlines() if line.startswith("| G1b fused GDN kernel |")]
+    assert len(g1b) == 1
+    for option, prefix, flag in (("`--hc-fused`", "HC", "HC_FUSED_ENV"), ("`--moe-glue`", "MOE", "MOE_GLUE_ENV")):
+        rows = [line for line in sheet.splitlines() if line.startswith("| %s |" % option)]
+        assert len(rows) == 1, option
+        op_test, op_log = _constant(gates_py, prefix + "_OP_TEST"), _constant(gates_py, prefix + "_OP_LOG")
+        assert "`%s`" % op_test in rows[0] and "`%s`" % op_log in rows[0], option
+        env = _constant(gates_py, flag)
+        assert "`%s=1`" % env in rows[0] and "`%s=0`" % env in rows[0], option
+        assert "`%s`" % op_test in g1b[0], option
+        assert "%d s, log `%s`" % (_constant(gates_py, prefix + "_OP_TIMEOUT_S"), op_log) in g1b[0], option
+
+
+def test_every_smoke_mode_is_in_the_mode_table():
+    from tools.flash_next.rental import tiny_smoke
+
+    sheet = _sheet()
+    section = sheet[sheet.index("## First on the node: the tiny smoke test"):
+                    sheet.index("## Experiments that cost one smoke run each")]
+    gdn_row = [line for line in section.splitlines() if line.startswith("| `--gdn LIST` |")]
+    assert len(gdn_row) == 1 and "`%s`" % tiny_smoke.DEFAULT_MODES in gdn_row[0]
+    default = tiny_smoke.DEFAULT_MODES.split(",")
+    assert len(tiny_smoke.GDN_MODES) >= 4
+    for mode in tiny_smoke.GDN_MODES:
+        rows = [line for line in section.splitlines() if line.startswith("| `%s` " % mode)]
+        assert len(rows) == 1, mode
+        if mode not in default:  # a mode that runs only when named: the row and the option's row say so
+            assert rows[0].startswith("| `%s` (only when named: `--gdn %s`) |" % (mode, mode)), mode
+            assert "`--gdn %s`" % mode in gdn_row[0], mode
