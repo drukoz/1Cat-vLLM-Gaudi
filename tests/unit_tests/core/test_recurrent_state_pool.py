@@ -261,3 +261,34 @@ def test_install_reports_a_missing_engine_function(monkeypatch):
 
 if __name__ == "__main__":
     pytest.main([__file__])
+
+
+@pytest.mark.parametrize("k", [0] + list(SPEC_SIZES))
+def test_flash_next_mtp_positions_are_the_engines_group_sizes(k):
+    # The MTP draft adds a 13th attention layer: the engine still makes 3 GDN groups, now of 12 layers each
+    # (layers[i::3] of 36), so the runner allocates 12 GDN state tensors; one more position would charge every
+    # pool slot one GDN page it never gets (I37 (f): 0.49 GiB per card at k = 3, 32 sequences).
+    specs = _flash_next_specs(k)
+    specs["mtp.layers.48.attn"] = specs["layers.3.attn"]
+    groups = hpu_kv_cache_groups(specs, _engine_groups())
+    assert _group_sizes(groups, FullAttentionSpec) == [13]
+    per_group = {}
+    for group in groups:
+        if is_recurrent_spec(group.kv_cache_spec):
+            per_group[group.kv_cache_spec] = max(per_group.get(group.kv_cache_spec, 0), len(group.layer_names))
+    assert recurrent_positions(specs) == per_group
+    gdn = specs["layers.0.attn"]
+    assert per_group[gdn] == 12
+    assert num_recurrent_groups(specs) == len(_group_sizes(groups, MambaSpec)) == 4
+
+
+@pytest.mark.parametrize("n_attn,n_gdn", [(1, 3), (2, 3), (12, 36), (13, 36), (16, 48), (17, 48), (13, 18), (4, 5)])
+def test_recurrent_positions_mirror_the_engine_grouping(n_attn, n_gdn):
+    flash_next = _flash_next_specs()
+    attn, gdn = flash_next["layers.3.attn"], flash_next["layers.0.attn"]
+    specs = {f"g.{i}": gdn for i in range(n_gdn)}
+    specs.update({f"a.{i}": attn for i in range(n_attn)})
+    groups = _engine_groups()(specs)
+    gdn_sizes = [len(group.layer_names) for group in groups if group.kv_cache_spec == gdn]
+    assert recurrent_positions(specs) == {gdn: max(gdn_sizes)}
+    assert num_recurrent_groups(specs) == len(gdn_sizes)

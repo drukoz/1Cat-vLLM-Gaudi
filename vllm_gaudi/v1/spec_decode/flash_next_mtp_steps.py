@@ -36,6 +36,23 @@ def is_flash_next_mtp(speculative_config) -> bool:
     return FLASH_NEXT_MTP_ARCH in architectures
 
 
+FLASH_NEXT_MULTIMODAL_TARGET = "Qwen4ExpForConditionalGeneration"
+IMAGE_TOKEN_ID_TARGET = "Qwen3_5ForConditionalGeneration"
+
+
+def flash_next_target_model_name(class_name: str) -> str:
+    """The name the proposer's ``load_model`` should look the target up by.
+
+    The Flash-Next multimodal target (``Qwen4ExpForConditionalGeneration`` or the plugin's subclass of it,
+    ``HpuQwen4ExpForConditionalGeneration``) keeps its image token in ``config.image_token_id``, like
+    ``Qwen3_5ForConditionalGeneration``, which upstream's ``load_model`` lists: that name is returned for it.
+    Any other name is returned unchanged.
+    """
+    if class_name.endswith(FLASH_NEXT_MULTIMODAL_TARGET):
+        return IMAGE_TOKEN_ID_TARGET
+    return class_name
+
+
 def split_draft_output(ret) -> tuple[torch.Tensor, torch.Tensor]:
     """(sample, multi) from the draft's return.
 
@@ -52,6 +69,61 @@ def split_draft_output(ret) -> tuple[torch.Tensor, torch.Tensor]:
     return sample, multi
 
 
+MROPE_KEYS = ("mrope_section", "mrope_interleaved")
+
+
+def _rope_parameter_dicts(model_config) -> list[dict]:
+    """The ``rope_parameters`` dicts of a model config's ``hf_config`` and ``hf_text_config`` (each once)."""
+    found: dict[int, dict] = {}
+    for config in (getattr(model_config, "hf_config", None), getattr(model_config, "hf_text_config", None)):
+        rope_parameters = getattr(config, "rope_parameters", None)
+        if isinstance(rope_parameters, dict):
+            found[id(rope_parameters)] = rope_parameters
+    return list(found.values())
+
+
+def config_uses_mrope(model_config) -> bool:
+    """True when a model config still carries an M-RoPE section (its attention layers build MRotaryEmbedding)."""
+    return any(rope_parameters.get("mrope_section") for rope_parameters in _rope_parameter_dicts(model_config))
+
+
+def align_draft_rope_with_target(target_model_config, draft_model_config) -> bool:
+    """Give the MTP draft the rotary embedding the target runs with. Returns True when the draft was changed.
+
+    With ``--language-model-only`` the engine strips the M-RoPE keys from the target's config, so its QSA
+    layers build the plain ``RotaryEmbedding`` and the runner sends one position per token. The draft's
+    config is built on its own (``SpeculativeConfig`` does not pass ``language_model_only`` on) and keeps
+    the keys of a checkpoint with a vision tower: its QSA layer then built ``MRotaryEmbedding`` and read
+    the runner's ``[rows, tokens]`` positions as the three M-RoPE rows, which fails on the first draft pass
+    ("index 1 is out of bounds for dimension 0 with size 1"). The keys are removed from the draft here,
+    before the draft model is built.
+
+    A target that keeps M-RoPE (a server without ``--language-model-only``) is refused: the drafter gathers
+    its positions per row and does not carry the three M-RoPE rows.
+    """
+    if config_uses_mrope(target_model_config):
+        raise NotImplementedError("Flash-Next MTP on HPU runs with --language-model-only: the target keeps "
+                                  "M-RoPE positions, which the drafter does not carry")
+    changed = False
+    for rope_parameters in _rope_parameter_dicts(draft_model_config):
+        for key in MROPE_KEYS:
+            if key in rope_parameters:
+                rope_parameters.pop(key)
+                changed = True
+    return changed
+
+
+def flat_token_rows(hidden: torch.Tensor) -> torch.Tensor:
+    """``hidden`` as ``[T, width]``, one row per token.
+
+    The runner hands the drafter ``[vbs, 1, width]`` after a decode step and ``[1, seq, width]`` after a
+    prefill (one bucket row); ``Qwen4ExpMultiTokenPredictor.forward`` reads the token count from dim 0 and
+    views the rows as ``[T, hc, H]``, so a prefill's ``[1, seq, width]`` failed there with "shape '[1, 4, H]'
+    is invalid".
+    """
+    return hidden.reshape(-1, hidden.shape[-1])
+
+
 def ring_slots_from_lattice(indices: torch.Tensor) -> torch.Tensor:
     """[groups, bs, T] -> [groups, bs] (column 0); [groups, bs] unchanged; ValueError otherwise."""
     if indices.dim() == 3:
@@ -65,7 +137,7 @@ def ring_slots_from_lattice(indices: torch.Tensor) -> torch.Tensor:
 def next_step_hidden(multi: torch.Tensor, last_token_indices: torch.Tensor) -> torch.Tensor:
     """multi viewed as [vbs, hc*H], rows last_token_indices -> [bs, 1, hc*H]."""
     hidden_size = multi.shape[-1]
-    rows = multi.view(-1, hidden_size)[last_token_indices]
+    rows = torch.index_select(multi.view(-1, hidden_size), 0, last_token_indices)  # no advanced indexing (rule 3)
     return rows.view(-1, 1, hidden_size)
 
 
@@ -134,3 +206,21 @@ class DraftRankStats:
                 f"rank1={self.counts[0]} rank2={self.counts[1]} rank3={self.counts[2]} "
                 f"rank4={self.counts[3]} beyond4={self.counts[4]} all_accepted={self.all_accepted}")
 
+def draft_argmax(logits: torch.Tensor) -> torch.Tensor:
+    """The draft's token ids ``[rows]`` from its logits ``[rows, vocab]``.
+
+    VLLM_HPU_MTP_DRAFT_IDS=0 (default): ``argmax`` (int64 ids; the draft loop narrows them with ``.int()`` in the
+    same lazy graph). 1: int32 ids from an fp32 id table, the first index of the row maximum as ``argmax`` gives it,
+    with no int64 id made on the device (card rule 9: ``torch.topk`` ids narrowed to int32 in the same lazy graph
+    came back as every second id; for ``argmax`` that is not measured). A row without a maximum (NaN) gets the last
+    id, never an id outside the vocabulary.
+    """
+    from vllm_gaudi import envs as gaudi_envs
+
+    if int(gaudi_envs.VLLM_HPU_MTP_DRAFT_IDS) != 1:
+        return logits.argmax(dim=-1)
+    vocab = logits.shape[-1]
+    ids = torch.arange(vocab, device=logits.device, dtype=torch.float32)
+    is_max = logits == logits.amax(dim=-1, keepdim=True)
+    first = torch.where(is_max, ids, torch.full_like(ids, float(vocab - 1))).amin(dim=-1)
+    return first.to(torch.int32)

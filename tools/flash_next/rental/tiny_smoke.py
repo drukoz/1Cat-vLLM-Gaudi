@@ -25,6 +25,14 @@ example with and without an `--env` pair); it never changes a result.
 A server that exits before it is healthy is a failure with its exit code and the last error lines of
 its log (`serve.unhealthy_reason`, `serve.error_lines`: the run's gates report it the same way).
 
+`--spec K` adds after each mode its speculative mode `<mode>+mtpK`: the same server with the MTP layer drafting
+K tokens (`--speculative-config {"method": "mtp", "num_speculative_tokens": K}`), its tokens compared with the
+reference and token for token with the mode's own server without speculation (`spec_vs_plain`), the acceptance
+length printed from the speculative counters of `/metrics` (`spec_probe`). Its rungs (`SPEC_RUNGS`) are tried in
+order until one passes: the fused GDN verification op (`VLLM_HPU_GDN_CORE_VERIFY=1`; a log line saying a layer
+ran the torch verification path fails the rung), the torch verification, no speculation. A pass on the last
+rung only is the status "fallback", a failure of the speculative mode.
+
 By default the servers skip the bucket warmup (`VLLM_SKIP_WARMUP=true`): the warmup alone takes about
 15 minutes per mode on the tiny model, while the four short prompts need only a handful of graphs,
 which then compile on first use. `--full-warmup` keeps the warmup (it measures the real one), and
@@ -54,7 +62,7 @@ import sys
 import time
 from pathlib import Path
 
-from tools.flash_next.rental import gates, serve
+from tools.flash_next.rental import gates, serve, spec_probe
 from tools.flash_next.rental import main as orchestrator
 from tools.flash_next.rental.schema import GateStatus
 
@@ -144,9 +152,110 @@ def decode_ms_per_token(base_url: str, reference_path: Path, post=None, clock=ti
         return None
 
 
+def served_streams(base_url: str, reference_path: Path, post=None) -> dict | None:
+    """``{prompt length: the token ids served}`` for every reference prompt (greedy, gates.TINY_MAX_TOKENS
+    tokens), or None when a request fails. The comparison ran these prompts before, so nothing compiles."""
+    post = post or gates._post_json
+    try:
+        reference = json.loads(Path(reference_path).read_text(encoding="utf-8"))
+        streams = {}
+        for p in reference["prompts"]:
+            resp = post(base_url, "/v1/completions", {"model": "tiny", "prompt": p["prompt_ids"],
+                                                      "max_tokens": gates.TINY_MAX_TOKENS, "temperature": 0,
+                                                      "return_token_ids": True}, gates.HTTP_TIMEOUT_S)
+            streams[len(p["prompt_ids"])] = list((resp.get("choices") or [{}])[0].get("token_ids") or [])
+        return streams
+    except Exception:  # noqa: BLE001 - a record, the comparison decides
+        return None
+
+
+def compare_streams(spec: dict | None, plain: dict | None) -> dict | None:
+    """The speculative server's streams against the same mode's server without speculation: per prompt length
+    the first differing token (None: equal). None when either side is missing."""
+    if spec is None or plain is None:
+        return None
+    result = {"equal": True, "first_diff": {}}
+    for length, want in sorted(plain.items()):
+        got = spec.get(length)
+        diff = None
+        if got != want:
+            diff = next((j for j, (a, b) in enumerate(zip(got or [], want)) if a != b), min(len(got or []), len(want)))
+            result["equal"] = False
+        result["first_diff"][str(length)] = diff
+    return result
+
+
+def spec_serve_args(k: int) -> list[str]:
+    """The serve arguments of an MTP server drafting ``k`` tokens (the variant B recipe at k = 3)."""
+    return ["--speculative-config", json.dumps({"method": "mtp", "num_speculative_tokens": int(k)})]
+
+
+# The speculative mode's rungs, tried in order until one passes (rule 8: an automatic fallback at every gate
+# that loads a component on its first card run): the fused GDN verification op on, then off, then no
+# speculation at all (which says whether the mode itself still serves).
+SPEC_RUNG_VERIFY = "verify"
+SPEC_RUNG_TORCH = "torch-verify"
+SPEC_RUNG_OFF = "no-spec"
+SPEC_RUNGS = (SPEC_RUNG_VERIFY, SPEC_RUNG_TORCH, SPEC_RUNG_OFF)
+
+
+def spec_mode_name(mode: str, k: int) -> str:
+    return "%s+mtp%d" % (mode, k)
+
+
+def _spec_counters(base_url: str) -> dict | None:
+    try:
+        return spec_probe.read_spec_counters(base_url)
+    except Exception:  # noqa: BLE001 - a record: a server without /metrics gives no acceptance
+        return None
+
+
+def run_spec_mode(mode: str, k: int, ckpt: Path, out_dir: Path, port: int, health_timeout_s: float,
+                  plain_streams: dict | None = None, **kwargs) -> dict:
+    """The speculative mode `<mode>+mtp<k>`: the rungs of SPEC_RUNGS in order until one passes.
+
+    Each rung is a `run_mode` call in `<out_dir>/<rung>/`. The entry passes on a speculative rung (`verify` or
+    `torch-verify`); a pass only on `no-spec` is a failure of the speculative mode (`status` "fallback", the
+    mode itself still serves). `spec_vs_plain` compares the passing speculative rung's tokens with the same
+    mode's server without speculation (`plain_streams`, from the run of that mode before), token for token.
+    """
+    name = spec_mode_name(mode, k)
+    entry: dict = {"mode": name, "status": "failed", "reason": None, "rung": None, "rungs": [], "spec_k": k,
+                   "acceptance": None, "spec_vs_plain": None, "decode_ms_per_token": None, "startup_seconds": None,
+                   "errors": [], "fallback_lines": [], "log": None, "warmup": None}
+    reasons = []
+    for rung in SPEC_RUNGS:
+        print("tiny smoke [%s]: rung %s" % (name, rung), flush=True)
+        attempt = run_mode(mode, ckpt, out_dir / rung, port, health_timeout_s, spec_k=k, rung=rung,
+                           keep_streams=True, **kwargs)
+        entry["rungs"].append({key: attempt.get(key) for key in ("rung", "status", "reason", "startup_seconds",
+                                                                   "decode_ms_per_token", "acceptance", "log")})
+        if attempt["status"] != "passed":
+            reasons.append("%s: %s" % (rung, attempt["reason"]))
+            entry["errors"], entry["fallback_lines"] = attempt["errors"], attempt["fallback_lines"]
+            continue
+        for key in ("rung", "acceptance", "decode_ms_per_token", "startup_seconds", "log", "warmup",
+                    "recipe_cache"):
+            entry[key] = attempt.get(key)
+        if rung == SPEC_RUNG_OFF:
+            # the errors of the last speculative rung stay: they say why speculation did not serve
+            entry["status"] = "fallback"
+            entry["reason"] = "speculation fell back to off (%s)" % "; ".join(reasons)
+        else:
+            entry["errors"], entry["fallback_lines"] = [], []
+            entry["status"] = "passed"
+            entry["reason"] = "; ".join(reasons) or None  # why an earlier rung did not pass
+            entry["spec_vs_plain"] = compare_streams(attempt.get("streams"), plain_streams)
+        break
+    else:
+        entry["reason"] = "; ".join(reasons)
+    _write_json(out_dir / "details.json", entry)
+    return entry
+
+
 def run_mode(mode: str, ckpt: Path, out_dir: Path, port: int, health_timeout_s: float, skip_warmup: bool = True,
              extra_env: dict | None = None, recipe_cache: str | None = None, recipe_cache_mb: int = 8192,
-             combined_db: bool = False) -> dict:
+             combined_db: bool = False, spec_k: int = 0, rung: str | None = None, keep_streams: bool = False) -> dict:
     """Serve the tiny checkpoint in one GDN mode, compare it with the reference, stop the server.
 
     The overrides are the mode's GDN flags, then `VLLM_SKIP_WARMUP=true` when `skip_warmup`, then the
@@ -154,18 +263,29 @@ def run_mode(mode: str, ckpt: Path, out_dir: Path, port: int, health_timeout_s: 
     database must stay alone in `GC_KERNEL_PATH`), then `extra_env` applied last so it may override
     any of them. Returns the mode's summary entry; the comparison's own record goes to
     `<out_dir>/details.json`.
+
+    With `spec_k` > 0 the server drafts `spec_k` tokens with the MTP layer (`spec_serve_args`) on the given
+    `rung` (SPEC_RUNGS): `verify` sets `VLLM_HPU_GDN_CORE_VERIFY=1` and fails when the log says a layer ran the
+    torch verification path, `torch-verify` sets it to 0, `no-spec` serves without speculation. A speculative
+    rung also records the acceptance (`spec_probe` counters of `/metrics` around the comparison).
+    `keep_streams` records the tokens served for every reference prompt (`served_streams`).
     """
     out_dir.mkdir(parents=True, exist_ok=True)
     log_path = out_dir / "server0.log"
+    speculative = bool(spec_k) and rung != SPEC_RUNG_OFF
     entry: dict = {"mode": mode, "status": None, "reason": None, "startup_seconds": None, "errors": [],
                    "fallback_lines": [], "log": str(log_path),
                    "warmup": "warmup skipped" if skip_warmup else "full warmup", "decode_ms_per_token": None}
+    if spec_k:
+        entry.update(rung=rung, spec_k=int(spec_k) if speculative else 0, acceptance=None)
     details: dict = {}
     status = GateStatus.FAILED
     if serve.port_in_use(port):
         entry["reason"] = "port %d already in use" % port
     else:
         overrides = dict(GDN_MODES[mode])
+        if speculative:
+            overrides[gates.GDN_VERIFY_ENV] = "1" if rung == SPEC_RUNG_VERIFY else "0"
         if skip_warmup:
             overrides["VLLM_SKIP_WARMUP"] = "true"
         cache_env, note = serve.recipe_cache_env(recipe_cache, recipe_cache_mb, overrides, combined_db)
@@ -182,23 +302,37 @@ def run_mode(mode: str, ckpt: Path, out_dir: Path, port: int, health_timeout_s: 
         cache_word = "on" if cache_env else "off"
         print("tiny smoke [%s]: starting the server (recipe cache %s; log: %s)" % (mode, cache_word, log_path),
               flush=True)
-        popen = serve.start_server(serve_command(ckpt, port), env, log_path, out_dir)
+        command = serve_command(ckpt, port) + (spec_serve_args(spec_k) if speculative else [])
+        popen = serve.start_server(command, env, log_path, out_dir)
+        base_url = "http://127.0.0.1:%d" % port
         try:
             started = time.monotonic()
             healthy = serve.wait_healthy(port, health_timeout_s, popen)
             entry["startup_seconds"] = round(time.monotonic() - started, 1)
             if healthy:
-                status, details = gates.tiny_compare("http://127.0.0.1:%d" % port, ckpt / "reference.json")
+                before = _spec_counters(base_url) if speculative else None
+                status, details = gates.tiny_compare(base_url, ckpt / "reference.json")
                 entry["reason"] = details.get("reason") or details.get("error")
+                if speculative:
+                    entry["acceptance"] = spec_probe.spec_summary(
+                        spec_probe.counters_delta(before, _spec_counters(base_url)))
+                if keep_streams:
+                    entry["streams"] = served_streams(base_url, ckpt / "reference.json")
                 # Recorded only, while the server is still up. Also after a failed comparison: a server
                 # that decodes the wrong tokens still shows what a decode step costs (None when it died).
-                entry["decode_ms_per_token"] = decode_ms_per_token("http://127.0.0.1:%d" % port,
-                                                                   ckpt / "reference.json")
+                entry["decode_ms_per_token"] = decode_ms_per_token(base_url, ckpt / "reference.json")
             else:
                 status, entry["reason"] = serve.unhealthy_reason(popen, entry["startup_seconds"], health_timeout_s)
         finally:
             serve.stop_server(popen)  # also on Ctrl-C: the workers must not keep the cards
         log_text = _read(log_path)
+        if status is GateStatus.PASSED and speculative and rung == SPEC_RUNG_VERIFY:
+            fallback = [ln for ln in gates.gdn_fallback_lines(log_text) if "GDN core verify" in ln]
+            if fallback:
+                status = GateStatus.FAILED
+                entry["reason"] = ("the fused verification op did not run: %d log line(s) say a layer used the "
+                                   "torch verification path" % len(fallback))
+                entry["fallback_lines"] = fallback[:MAX_LINES]
         if status is GateStatus.PASSED and mode in DECODE_KERNEL_MODES:
             fallback = [ln for ln in gates.gdn_fallback_lines(log_text) if DECODE_FALLBACK in ln]
             if fallback:
@@ -234,9 +368,48 @@ def run_mode(mode: str, ckpt: Path, out_dir: Path, port: int, health_timeout_s: 
     return entry
 
 
+def report_spec(entry: dict) -> None:
+    """The speculative mode's lines: which rung passed, the acceptance, the tokens against the plain mode."""
+    mode = entry["mode"]
+    acceptance = entry.get("acceptance") or {}
+    length = acceptance.get("acceptance_length")
+    rates = ", ".join("%.2f" % r for r in acceptance.get("position_rates") or [] if r is not None)
+    if entry["status"] == "passed":
+        print("tiny smoke [%s]: PASSED on rung %s (server up in %s s, tokens match the reference)%s" %
+              (mode, entry["rung"], entry["startup_seconds"],
+               "; earlier rungs: %s" % entry["reason"] if entry.get("reason") else ""), flush=True)
+    else:
+        print("tiny smoke [%s]: %s (%s)" % (mode, "FALLBACK" if entry["status"] == "fallback" else "FAILED",
+                                            entry["reason"]), flush=True)
+    if length is not None:
+        print("tiny smoke [%s]: acceptance length %.2f (%d drafts, %d of %d draft tokens accepted; per position "
+              "%s)" % (mode, length, acceptance["drafts"], acceptance["accepted"], acceptance["draft_tokens"],
+                       rates or "-"), flush=True)
+    elif entry["status"] == "passed":
+        print("tiny smoke [%s]: acceptance not measured (no speculative counters on /metrics)" % mode, flush=True)
+    versus = entry.get("spec_vs_plain")
+    if versus is not None:
+        diffs = {n: d for n, d in versus["first_diff"].items() if d is not None}
+        print("tiny smoke [%s]: tokens %s the same mode without speculation%s" %
+              (mode, "equal to" if versus["equal"] else "DIFFER from",
+               "" if versus["equal"] else " (prompt length: first differing token %s)" % diffs), flush=True)
+    decode = entry.get("decode_ms_per_token")
+    if decode is not None:
+        print("tiny smoke [%s]: decode %.1f ms/token (the shortest prompt, %d tokens against 1, best of %d)" %
+              (mode, decode, gates.TINY_MAX_TOKENS, DECODE_TIMING_REPEATS), flush=True)
+    if entry["status"] != "passed":
+        for line in entry["errors"] + entry["fallback_lines"]:
+            print("    %s" % line, flush=True)
+        for rung in entry.get("rungs") or []:
+            print("    rung %s: %s, log: %s" % (rung["rung"], rung["status"], rung["log"]), flush=True)
+
+
 def report_mode(entry: dict) -> None:
     """One result line for the console, and on a failure the error lines and the log to read."""
     mode = entry["mode"]
+    if "rungs" in entry:
+        report_spec(entry)
+        return
     if entry["status"] == "passed":
         note = entry.get("recipe_cache", serve.RECIPE_CACHE_NONE)
         cache_word = "off" if note in (serve.RECIPE_CACHE_NONE, serve.RECIPE_CACHE_OFF_REASON) else "on"
@@ -282,10 +455,17 @@ def main(argv: list[str] | None = None) -> int:
                         "per-bundle subfolder DIR/<plugin commit, 12 characters>")
     parser.add_argument("--recipe-cache-mb", type=int, default=8192, metavar="N",
                         help="recipe cache size in MB (default: 8192)")
+    parser.add_argument("--spec", type=int, default=0, metavar="K",
+                        help="after each mode, its speculative mode <mode>+mtpK: the MTP layer drafts K tokens, "
+                        "the tokens are compared with the reference and with the mode's own tokens, the "
+                        "acceptance is printed; rungs: the fused verification op, then the torch "
+                        "verification, then no speculation (default 0: no speculative mode)")
     args = parser.parse_args(argv)
     modes = [m for m in args.gdn.split(",") if m]
     if not modes or any(m not in GDN_MODES for m in modes):
         parser.error("--gdn takes a comma-separated list of: %s" % ", ".join(GDN_MODES))
+    if args.spec < 0:
+        parser.error("--spec takes the number of drafted tokens, 1 or more (0: off)")
     extra_env: dict = {}
     for pair in args.env or []:
         if "=" not in pair:
@@ -305,17 +485,23 @@ def main(argv: list[str] | None = None) -> int:
     summary: dict = {"passed": False, "reason": None, "checkpoint": str(ckpt), "modes": []}
     summary["reason"] = build_checkpoint(ckpt)
     if summary["reason"] is None:
+        common = dict(skip_warmup=not args.full_warmup, extra_env=extra_env, recipe_cache=recipe_cache,
+                      recipe_cache_mb=args.recipe_cache_mb, combined_db=combined_db)
         for mode in modes:
-            entry = run_mode(mode, ckpt, out / mode, args.port, args.health_timeout,
-                             skip_warmup=not args.full_warmup, extra_env=extra_env,
-                             recipe_cache=recipe_cache, recipe_cache_mb=args.recipe_cache_mb,
-                             combined_db=combined_db)
+            entry = run_mode(mode, ckpt, out / mode, args.port, args.health_timeout, keep_streams=bool(args.spec),
+                             **common)
+            plain_streams = entry.pop("streams", None)
             summary["modes"].append(entry)
             report_mode(entry)
+            if args.spec:
+                spec_entry = run_spec_mode(mode, args.spec, ckpt, out / spec_mode_name(mode, args.spec), args.port,
+                                           args.health_timeout, plain_streams=plain_streams, **common)
+                summary["modes"].append(spec_entry)
+                report_mode(spec_entry)
         summary["passed"] = all(entry["status"] == "passed" for entry in summary["modes"])
     _write_json(out / "summary.json", summary)
     if summary["passed"]:
-        print("tiny smoke: PASSED (%s)" % ", ".join(modes), flush=True)
+        print("tiny smoke: PASSED (%s)" % ", ".join(entry["mode"] for entry in summary["modes"]), flush=True)
         return 0
     failed = [entry["mode"] for entry in summary["modes"] if entry["status"] != "passed"]
     print("tiny smoke: FAILED (%s)" % (summary["reason"] or ", ".join(failed)), flush=True)

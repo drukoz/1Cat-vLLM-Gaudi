@@ -131,6 +131,49 @@ step, and the plain step after one, through
 (`GDN core verify ... is off for <layer>: <reason>`) and runs the torch path.
 It stays off until the rental's gate G1b has checked the op on a card.
 
+`VLLM_HPU_SPEC_SAMPLED_VERIFY` decides what a Flash-Next MTP server does with a
+sampled request (temperature above 0, which the checkpoint's
+`generation_config.json` makes the default for a request that sets none), as an
+integer. `0` (default) refuses it at request validation with an error naming
+this flag: the HPU rejection sampler verifies greedy requests only, and before
+this flag a sampled request stopped the worker. `1` verifies the drafts of
+sampled requests by speculative sampling in torch (accept the draft with the
+target's probability of it after temperature, top-k and top-p; on a rejection
+draw from the target with the draft removed), exact in distribution;
+`vllm_gaudi/v1/sample/hpu_rejection_sampler.py`, `sampled_rejection_sample`.
+
+`VLLM_HPU_MTP_DRAFT_LOOP` selects how the Flash-Next MTP draft loop gets the
+positions of its steps 1 to k-1, as an integer. `0` (default) reads them back
+from the device after draft step 0, a host sync in the middle of the draft. `1`
+takes them from the runner's host books (the position of each request's last
+accepted token, `num_tokens_no_spec - 2` once the step's tokens are counted),
+so the host builds the next step's metadata while the device runs draft step 0;
+the drafts are the same.
+
+`VLLM_HPU_MTP_DRAFT_IDS` selects how the Flash-Next MTP draft turns its logits into
+token ids, as an integer. `0` (default): `argmax`, whose int64 ids the draft loop
+narrows to int32 in the same lazy graph before they feed the next draft pass. `1`:
+int32 ids from an fp32 id table (the first index of the row maximum), so no int64 id
+exists on the device. For card rule 9: `torch.topk` ids narrowed to int32 in the same
+lazy graph came back as every second id (job 00038). The sampler's `argmax` narrowing
+is sound at 8 and 32 rows (job 00021, by the streams' texts); set `1` only if the card
+shows draft positions 2 to k collapsing with more than one stream.
+
+`VLLM_HPU_MTP_TIMING` times the steps of a Flash-Next MTP server, as an integer. `0`
+(default): no timer. `1`: per step the verification part (to the drafter call) and the
+draft, with a lap per draft pass and one device wait after the draft; every 25 steps of
+a row count the means go to a log line (`MTP step timing: ...`) and to
+`mtp_step_timing_r<rank>_<pid>.jsonl` in the server's working directory, with
+`Ft_ms` (the verification part) and `Fd_ms` (the draft divided by k).
+
+`VLLM_HPU_MTP_CHUNK_KV` decides whether the Flash-Next MTP draft runs over the
+prefill chunks that complete no prompt, as an integer. `0` (default): it runs
+only over the chunk that completes a prompt, so its attention layer has no KV
+for the earlier chunks of a prompt above the chunk threshold, and every later
+draft attends to whatever those blocks hold. `1`: it also runs over each such
+chunk (one draft forward per chunk, the prompt's next token as the input at the
+chunk's last token, nothing sampled), so its KV covers the whole prompt.
+
 `VLLM_HPU_HC_FUSED` selects the path of the Flash-Next hyper-connections as an
 integer. `0` (default) keeps the torch path. `1` runs the element-wise parts of
 every hyper-connection (the grouped norm, the silu with the injection split, the
