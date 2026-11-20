@@ -6703,11 +6703,20 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                     elif fused_sampled_token_ids is not None:
                         # Greedy verification from the arg max of every row: no sampler pass over logits.
                         sampler_output, sampling_metadata = None, None
+                    elif spec_decode_metadata is not None:
+                        # The rejection sampler samples the bonus rows itself, so only the sampling metadata here
+                        # (no discarded sampler pass): one row per request of the padded batch, its bonus row, as
+                        # that sampler pass and the sampled verification read it (idea-sweep I07). Padded to the
+                        # logits' 1 + k rows per request, a sampled request's temperature did not fit its row.
+                        htorch.core.mark_step()
+                        sampling_metadata = self._prepare_sampling(batch_changed, pd_info.decode_req_ids,
+                                                                   int(spec_decode_metadata.bonus_logits_indices.shape[0]))
+                        htorch.core.mark_step()
+                        sampler_output = None
                     else:
-                        sampler_output, sampling_metadata = self._run_sampling(
-                            batch_changed, logits_device if spec_decode_metadata is None else
-                            logits_device[spec_decode_metadata.bonus_logits_indices], pd_info.decode_req_ids,
-                            logits_device.shape[0])
+                        sampler_output, sampling_metadata = self._run_sampling(batch_changed, logits_device,
+                                                                               pd_info.decode_req_ids,
+                                                                               logits_device.shape[0])
 
                     if spec_decode_metadata is None:
                         assert sampler_output is not None
