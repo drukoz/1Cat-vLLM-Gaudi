@@ -12,8 +12,10 @@
 # perf is not installed on the node: unpack it once into ~/farm/<track>/perf/root with
 #   cd ~/farm/<track>/perf && apt-get download linux-tools-$(uname -r) linux-tools-$(uname -r | sed 's/-generic//') \
 #       && for d in *.deb; do dpkg -x "$d" root; done
-# Output: ~/farm/<track>/results/perf-<JOB_ID>/<server>-N<n>.{data,dso.txt,sym.txt,tid.txt,calls.txt} and
-# <server>-N<n>-strace.{count.txt,calls.txt}; fetch with `farm fetch <track> <JOB_ID> perf-<JOB_ID>`.
+# Output: ~/farm/<track>/results/perf-<JOB_ID>/<server>-N<n>.{data,dso.txt,sym.txt,tid.txt,calls.txt},
+# <server>-N<n>-strace.{count.txt,calls.txt}, load.log (the node's load at the start and the end of every round) and
+# loadavg.log; fetch with `farm fetch <track> <JOB_ID> perf-<JOB_ID>`. Run a copy of this script, not the file a
+# later update overwrites: `cp watch.sh run-<id>.sh && nohup bash run-<id>.sh <id> &`.
 JOB="$1"
 T=$HOME/farm/${WATCH_TRACK:-step-anatomy}
 P=$(ls "$T"/perf/root/usr/lib/linux-tools-*/perf 2>/dev/null | head -n 1)
@@ -66,21 +68,39 @@ trace_calls() {  # trace_calls SERVER N: system calls of the rank-0 worker (stra
     sudo -n chown -R "$(id -un):" "$OUT" 2>/dev/null
     log "$server N=$n: strace written ($(wc -l < "$f.calls.txt" 2>/dev/null) call lines)"
 }
-SEEN="$OUT/seen.txt"; : > "$SEEN"
+# The node's load next to every round (a one-stream step is host-bound: a loaded node makes it slower): one line in
+# load.log when a round starts and when it ends, with the load averages, the runnable tasks and the image builds
+# that run at that moment; and one line every five seconds in loadavg.log while the job runs.
+load_line() {
+    echo "$(date -u +%H:%M:%S) load $(cut -d' ' -f1-4 /proc/loadavg) image-builds $(sudo -n docker ps --format '{{.Names}}' 2>/dev/null | grep -c '^farm-img') | $1" >> "$OUT/load.log"
+}
+declare -A HANDLED  # per server: the lines of its probe.log that are handled
+TICK=0
 while :; do
     st=$(cat "$JD/state" 2>/dev/null)
     for plog in "$RUN"/*/probe.log; do
         [ -f "$plog" ] || continue
         server=$(basename "$(dirname "$plog")")
-        # every "round start ... tag=perf" line not handled yet (line number as its key)
-        grep -n "^round start phase .* tag=\(perf\|strace\)" "$plog" 2>/dev/null | while IFS= read -r hit; do
-            key="$server:${hit%%:*}"
-            grep -qxF "$key" "$SEEN" && continue
-            echo "$key" >> "$SEEN"
-            n=$(echo "$hit" | sed -n 's/.* N=\([0-9]*\) .*/\1/p')
-            case "$hit" in *tag=strace*) trace_calls "$server" "$n" ;; *) sample "$server" "$n" ;; esac
-        done
+        total=$(wc -l < "$plog")
+        from=${HANDLED[$server]:-0}
+        [ "$total" -gt "$from" ] || continue
+        while IFS= read -r line; do
+            case "$line" in
+                "round start phase "*)
+                    load_line "$server | $line"
+                    n=$(echo "$line" | sed -n 's/.* N=\([0-9]*\) .*/\1/p')
+                    case "$line" in
+                        *tag=strace*) trace_calls "$server" "$n" ;;
+                        *tag=perf*) sample "$server" "$n" ;;
+                    esac
+                    ;;
+                "phase "* | "trace "* | "flush "*) load_line "$server | end of: ${line:0:100}" ;;
+            esac
+        done < <(sed -n "$((from + 1)),${total}p" "$plog")
+        HANDLED[$server]=$total
     done
+    TICK=$((TICK + 1))
+    if [ $((TICK % 16)) -eq 0 ]; then echo "$(date -u +%H:%M:%S) $(cat /proc/loadavg)" >> "$OUT/loadavg.log"; fi
     [ "$st" = running ] || break
     sleep 0.3
 done
