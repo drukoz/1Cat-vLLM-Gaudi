@@ -202,6 +202,7 @@ run_benches() {
         python3 "$HERE/bench_mme_rows.py" ${mme_cards:+--cards "$mme_cards"} --child-timeout "$limit" \
         --out "$RESULTS/mme_rows.json" > "$RESULTS/mme_rows.log" 2>&1 &
     pids+=($!)
+    if [ "$STAGE" -eq 2 ]; then wait "${pids[0]}"; fi  # one card: the two benches in turn, never side by side
     HABANA_VISIBLE_MODULES="${lazy_card:-${HABANA_VISIBLE_MODULES:-}}" timeout "$limit" \
         python3 "$HERE/bench_lazy_ops.py" --acc-modes 0 --child-budget $(( limit > 300 ? limit - 120 : limit / 2 )) \
         --out "$RESULTS/lazy_ops_mode0.json" > "$RESULTS/lazy_ops_mode0.log" 2>&1 &
