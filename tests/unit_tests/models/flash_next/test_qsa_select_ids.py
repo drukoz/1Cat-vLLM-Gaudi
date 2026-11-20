@@ -48,6 +48,34 @@ def test_sharded_long_context_selection_is_the_oracle(name, world):
     assert rows == len(sc.real_rows(case))
 
 
+@pytest.mark.parametrize("mode,world", [(0, 1), (1, 1), (1, 4)])
+def test_a_context_sized_block_table_selects_the_same(mode, world):
+    """VLLM_HPU_QSA_TABLE_WIDTH=1: the table as wide as the batch's longest request needs, not as the engine's."""
+    from vllm_gaudi.v1.worker.flash_next_inputs import decode_block_table_width
+    case = sc.build_case("decode8_32k")
+    want = sc.oracle(case)
+    blocks = [(ctx + n + sc.BLOCK - 1) // sc.BLOCK for ctx, n in case.specs]
+    width = decode_block_table_width(blocks, sc.MB, 1)
+    assert width == 256 and decode_block_table_width(blocks, sc.MB, 0) == sc.MB
+    assert bool((case.block_table[:, width:] == sc.PAD_PAGE).all())  # the dropped columns hold the pad block only
+    rows = 0
+    for rank in range(world):
+        got = sc.decode_selection(case, "cpu", mode, int(world > 1), (rank, world) if world > 1 else None, width=width)
+        cmp = sc.compare(case, got, want)
+        rows += cmp["rows"]
+        assert cmp["ok"], (rank, cmp)
+    assert rows == len(sc.real_rows(case))
+
+
+@pytest.mark.parametrize("blocks,mode,expected", [([1, 3, 9], 1, 64), ([64], 1, 64), ([65, 2], 1, 128),
+                                                  ([257], 1, 512), ([1000, 3], 1, 1024), ([1024], 1, 1024),
+                                                  ([5], 0, 1024), ([5], 2, 1024), ([], 1, 1024)])
+def test_decode_block_table_width(blocks, mode, expected):
+    from vllm_gaudi.v1.worker.flash_next_inputs import decode_block_table_width
+    assert decode_block_table_width(blocks, 1024, mode) == expected
+    assert decode_block_table_width([900], 1000, 1) == 1000  # an engine whose longest context is not a power of two
+
+
 def test_the_case_really_selects():
     """The case is a top-k test: most rows see more blocks than the budget, and the oracle drops visible blocks."""
     case = sc.build_case("decode8")

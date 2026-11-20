@@ -83,6 +83,15 @@ requests and all-gathers the int32 block selections once per QSA layer, so every
 holds the same selection. A decode bucket whose batch is not a multiple of the TP size
 stays replicated. Any other value is `0`.
 
+`VLLM_HPU_QSA_TABLE_WIDTH` sets the columns of the Flash-Next sparse QSA decode block
+table. `0` (default) is `ceil(max_model_len / block_size)`, fixed per engine: the
+indexer then gathers and scores every compressed key of a full context for every decode
+row (32,768 keys at `--max-model-len 131072`), whatever the row's own context. `1` is
+the longest request of the decode batch, rounded up to a power of two (at least 64
+blocks, at most the engine's): the key scan follows the context in use, a quarter of
+the keys at 32K tokens. The selections are the same; each (decode bucket, width) met
+compiles its own decode graph. Any other value is `0`.
+
 `VLLM_HPU_GDN_CORE_DECODE` selects the GDN decode core path as an integer.
 `1` (default) is fused: every non-speculative decode step runs through the
 fused core op `torch.ops.flashinfer_gaudi.gdn_core_decode` (conv, gates,
