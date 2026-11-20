@@ -24,9 +24,9 @@
 // of vector local memory for its __local__ vectors plus the compiler's vector spills. It must
 // compile with the default flags, exactly as the decode kernel. Never add -vlm: it only raises the
 // compiler's limit. Built with -vlm 32 (28928 bytes used) this kernel passed the simulator and
-// segfaulted on a card (RUK-3105). `tpc-clang -reg-mem-count` prints the total: 11008 bytes with
-// tpc-clang 2.7.33, of which the arrays below are 32 vectors x 256 bytes = 8192 bytes and the
-// rest is 11 spilled vectors.
+// segfaulted on a card (RUK-3105). `tpc-clang -reg-mem-count` prints the total: 12544 bytes with
+// tpc-clang 2.7.33, of which the arrays below are 36 vectors x 256 bytes = 9216 bytes (6 vectors
+// per node) and the rest is 13 spilled vectors; 3840 bytes stay free.
 float64_pair_t bf16_to_f32_linear(bfloat128 input)
 {
     // The native all-lanes conversion preserves Gaudi dual-group ordering,
@@ -67,18 +67,22 @@ float64_pair_t bf16_to_f32_linear(bfloat128 input)
     return result;
 }
 
-// T <= 4 (T = 1 + k with k = 3 draft tokens). The same number is kGdnCoreVerifyMaxNodes in
+// T <= 6 (T = 1 + k with k = 5 draft tokens). The same number is kGdnCoreVerifyMaxNodes in
 // gdn_core_decode_params.h; the host glue rejects a larger T, so it never reaches this kernel.
-#define GDN_VERIFY_MAX_NODES 4
+#define GDN_VERIFY_MAX_NODES 6
+#if GDN_VERIFY_MAX_NODES > 8
+#error "decay and beta of node t are lane t of two registers, and the shuffle that reads them takes lanes 0 to 7"
+#endif
 __local__ float64 verify_q[2 * GDN_VERIFY_MAX_NODES];   // node t: [2t] = elements 0..63, [2t+1] = 64..127
 __local__ float64 verify_k[2 * GDN_VERIFY_MAX_NODES];
 // conv_verify_block's result for one 128-channel block: the Q block and the K block before their
 // normalization, then v of the current value head. The recurrence header reads v from it and
 // replaces it element by element with o, so after the recurrence it holds o of that value head.
 __local__ float64 verify_vo[2 * GDN_VERIFY_MAX_NODES];
-__local__ float64 verify_decay[GDN_VERIFY_MAX_NODES];   // the current value head, all lanes equal
-__local__ float64 verify_beta[GDN_VERIFY_MAX_NODES];
 __local__ int verify_store_slot[GDN_VERIFY_MAX_NODES];  // ssm_store_indices[r, t] if t < n and in [0, S), else -1
+// decay and beta of the current value head are not arrays: main packs them into two registers, node t
+// in lane t, and passes them to the recurrence header (12 vectors less than one broadcast vector per
+// node and gate, which at 6 nodes would leave 1280 bytes free).
 #include "gdn_core_verify_recurrence.h"
 #include "gdn_core_decode_norm.h"
 
@@ -183,6 +187,7 @@ void main(tensor conv_state, tensor ssm_state, tensor mixed_qkv, tensor z, tenso
 {
     const uchar256 broadcast_lane_zero = 0x80;
     const uint64 lanes = read_lane_id_4b_b();
+    const uint64 group_lanes = lanes & 15;   // the lane number inside its 16-lane dual group
     const int5 index_start = get_index_space_offset();
     const int5 index_end = get_index_space_size() + index_start;
     const int head_dim = 128;
@@ -267,6 +272,9 @@ void main(tensor conv_state, tensor ssm_state, tensor mixed_qkv, tensor z, tenso
                 conv_verify_block(conv_state, mixed_qkv, conv_weight_t, value_offset + value_head * head_dim,
                                   request, nodes, n, conv_load, offset, conv_store, conv_rows);
 
+                // decay and beta of this value head: node t in lane t of every 16-lane dual group.
+                float64 decay_nodes = 0.0f;
+                float64 beta_nodes = 0.0f;
                 for (int t = 0; t < n; ++t) {
                     int5 head_coords = {value_head, 0, 0, 0, 0};
                     int5 gate_coords = {value_head, request * nodes + t, 0, 0, 0};
@@ -292,11 +300,12 @@ void main(tensor conv_state, tensor ssm_state, tensor mixed_qkv, tensor z, tenso
                     const bf16 b_bf16 = s_bf16_ld_g(gen_addr(gate_coords, b));
                     const float64 beta = v_sigmoid_f32((float)b_bf16);
 
-                    verify_decay[t] = decay;
-                    verify_beta[t] = beta;
+                    const bool64 node_lane = v_u32_cmp_eq_b(group_lanes, (uint64)t);
+                    decay_nodes = v_f32_mov_vb(decay, 0, decay_nodes, node_lane, 0);
+                    beta_nodes = v_f32_mov_vb(beta, 0, beta_nodes, node_lane, 0);
                 }
 
-                gdn_core_verify_recurrence_head(ssm_state, ssm_load, value_head, n, lanes);
+                gdn_core_verify_recurrence_head(ssm_state, ssm_load, value_head, n, decay_nodes, beta_nodes, lanes);
 
                 for (int t = 0; t < nodes; ++t) {
                     if (t < n) {

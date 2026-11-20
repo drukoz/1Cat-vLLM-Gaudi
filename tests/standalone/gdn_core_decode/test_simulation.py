@@ -17,7 +17,9 @@ each ``recurrent_sim_case.RECURRENT_CASES`` case is compared by
 The third fixture does the same for the fused GDN verification kernel (phase 2, T = 1 + k)
 ``csrc/gdn_fused/kernels/gdn_core_verify_gaudi2.c`` (host program ``verify_sim_host.cpp``, glue
 ``csrc/gdn_fused/host/gdn_core_verify_gaudi2.cpp``), and each ``verify_sim_case.VERIFY_CASES``
-case is compared by ``verify_sim_case.compare_verify``.
+case (T = 1 to 6) is compared by ``verify_sim_case.compare_verify``.  One node more than the op
+takes (T = 7) is rejected by the glue, and the kernel itself, reached through a glue built to let
+7 nodes pass, writes zeros and touches no state.
 
 All three kernels are compiled with the same flags, ``TPC_FLAGS``, and no local-memory override:
 a kernel that calls lookup-table functions has 16 KiB of vector local memory, tpc-clang enforces
@@ -39,13 +41,15 @@ import subprocess
 from pathlib import Path
 
 import pytest
+import torch
 
 from tests.unit_tests.gdn_core_decode.recurrent_sim_case import (RECURRENT_CASES, compare_recurrent,
                                                                   make_recurrent_inputs, read_recurrent_outputs,
                                                                   write_recurrent_inputs)
 from tests.unit_tests.gdn_core_decode.sim_case import CASES, compare, make_inputs, read_outputs, write_inputs
-from tests.unit_tests.gdn_core_decode.verify_sim_case import (MAX_NODES, VERIFY_CASES, VERIFY_TOO_MANY_NODES_CASE,
-                                                              compare_verify, make_verify_inputs, read_verify_outputs,
+from tests.unit_tests.gdn_core_decode.verify_sim_case import (MAX_NODES, QUERY_LEN, VERIFY_CASES,
+                                                              VERIFY_TOO_MANY_NODES_CASE, compare_verify,
+                                                              make_verify_inputs, read_verify_outputs,
                                                               write_verify_inputs)
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -67,9 +71,10 @@ VERIFY_KERNEL_OBJECT = "gdn_core_verify_gaudi2.o"
 # The flags of every kernel, as GDN_TPC_FLAGS in csrc/gdn_fused/CMakeLists.txt.  No -vlm, -slm or -spill-vlm.
 TPC_FLAGS = ("-Wall", "-Werror", "-O2", "-march=gaudi2")
 # Vector local memory of a kernel that calls lookup-table functions, in bytes (tpc-clang's own limit for
-# __local__ vectors plus vector spills), and the most each kernel may use so that 4 KiB (16 vectors) stay free.
+# __local__ vectors plus vector spills), and the most each kernel may use so that 3 KiB (12 vectors) stay free.
+# The verify kernel at 6 nodes uses 12544 bytes: 36 __local__ vectors and 13 spilled ones (tpc-clang 2.7.33).
 VLM_LIMIT = 16384
-VLM_BUDGET = VLM_LIMIT - 4096
+VLM_BUDGET = VLM_LIMIT - 3072
 
 
 def _missing_sdk_parts() -> list[str]:
@@ -170,15 +175,25 @@ def verify_sim_binary(tmp_path_factory: pytest.TempPathFactory) -> Path:
     ],
          cwd=build,
          timeout=600)
+    _link_verify_host(build, build / "verify_sim_host")
+    return build
+
+
+def _link_verify_host(build: Path, output: Path, first_include: Path | None = None) -> None:
+    """Link ``verify_sim_host.cpp`` and the real host glue with the kernel ELF embedded in ``build``.
+
+    ``first_include`` is searched before ``csrc/gdn_fused``: a folder with another ``gdn_core_decode_params.h``
+    gives the glue another ``kGdnCoreVerifyMaxNodes`` without touching the sources.
+    """
+    includes = [f"-I{first_include}"] if first_include is not None else []
     _run([
         "g++", "-std=c++17", "-O2", "-Wall", VERIFY_HOST_SOURCE, VERIFY_GLUE_SOURCE,
-        build / "gdn_core_verify_gaudi2_embedded.o", f"-I{REPO_ROOT / 'csrc' / 'gdn_fused'}",
+        build / "gdn_core_verify_gaudi2_embedded.o", *includes, f"-I{REPO_ROOT / 'csrc' / 'gdn_fused'}",
         f"-I{REPO_ROOT / 'csrc' / 'gdn_fused' / 'host'}", f"-I{REPO_ROOT / 'tools'}", f"-I{TOOLS_INCLUDE}",
         f"-I{DRIVER_INCLUDE}", "-L/usr/lib/habanatools", "-Wl,-rpath,/usr/lib/habanatools", "-ltpc_tests_core_ext",
-        "-o", build / "verify_sim_host"
+        "-o", output
     ],
          timeout=1800)
-    return build
 
 
 def test_kernel_disassembles_for_gaudi2(sim_binary: Path) -> None:
@@ -216,7 +231,7 @@ def test_vector_local_memory(source: Path, tmp_path: Path) -> None:
     """tpc-clang's own count of vector local memory (statics plus spills), compiled with the default flags.
 
     The compile itself fails past ``VLM_LIMIT`` ("too much vector memory is used for statically allocated
-    data", "Too many vector spills"); the assertion keeps 4 KiB of that free.
+    data", "Too many vector spills"); the assertion keeps 3 KiB of that free.
     """
     proc = _run(
         ["tpc-clang", *TPC_FLAGS, "-reg-mem-count", f"-I{TOOLS_INCLUDE}", source, "-c", "-o", tmp_path / "kernel.o"],
@@ -250,6 +265,38 @@ def test_verify_glue_rejects_too_many_nodes(verify_sim_binary: Path, tmp_path: P
     assert "GLUE_INCOMPATIBLE_INPUT_SIZE" in proc.stderr
     assert "instructions executed" not in proc.stdout
     assert not (case_dir / "out.bin").exists()
+
+
+def test_verify_kernel_pads_a_node_count_above_its_arrays(verify_sim_binary: Path, tmp_path: Path) -> None:
+    """The kernel's own guard, behind the glue's: T = MAX_NODES + 1 through a glue built to accept it.
+
+    The glue is compiled against a copy of ``gdn_core_decode_params.h`` that says one node more, so the same
+    kernel ELF is simulated with 7 nodes.  Its per-node arrays hold 6: it must treat the row as padding, write
+    zeros for every node and leave both state pools as they were.
+    """
+    case = VERIFY_TOO_MANY_NODES_CASE
+    assert case.T == MAX_NODES + 1
+    params = (REPO_ROOT / "csrc" / "gdn_fused" / "gdn_core_decode_params.h").read_text()
+    stated = f"kGdnCoreVerifyMaxNodes = {MAX_NODES};"
+    assert params.count(stated) == 1
+    patched = tmp_path / "patched"
+    patched.mkdir()
+    (patched / "gdn_core_decode_params.h").write_text(
+        params.replace(stated, f"kGdnCoreVerifyMaxNodes = {MAX_NODES + 1};"))
+    host = tmp_path / "verify_sim_host_wide"
+    _link_verify_host(verify_sim_binary, host, first_include=patched)
+
+    inputs = make_verify_inputs(case)
+    assert int(inputs["row_indices"][0, QUERY_LEN]) == case.T  # a real row: only the node count makes it padding
+    case_dir = tmp_path / case.name
+    write_verify_inputs(case, inputs, case_dir)
+    proc = _run([host, case_dir], timeout=900)
+    assert "instructions executed" in proc.stdout
+    got = read_verify_outputs(case, case_dir)
+    assert tuple(got["out"].shape) == (case.B * case.T, case.HV, 128)
+    assert not got["out"].any()
+    assert (got["conv_state"].view(torch.int16) == inputs["conv_state"].view(torch.int16)).all()
+    assert (got["ssm_state"].view(torch.int32) == inputs["ssm_state"].view(torch.int32)).all()
 
 
 @pytest.mark.parametrize("case", CASES, ids=[case.name for case in CASES])

@@ -101,16 +101,43 @@ itself and exports `PYTHONPATH=/work`, so run it from a worktree root.
 - Do not run pytest without `--noconftest` in the container:
   `tests/unit_tests/conftest.py` imports vLLM, which is not installed.
 
-## Verify kernel bitcode
+## Verify kernel: default flags, local memory and the bitcode diagnostic
+
+`gdn_core_verify_gaudi2.c` is compiled with the flags of the other two GDN
+kernels (`-Wall -Werror -O2 -march=gaudi2`) and no local-memory override. It
+was once built with `-vlm 32`, passed this simulator and segfaulted on a card
+(RUK-3105): a kernel that calls lookup-table functions has 16 KiB of vector
+local memory, tpc-clang checks that only without `-vlm`, and **the simulator
+does not check it at all**. A green simulator run therefore says nothing
+about local memory. What does:
+
+- `tpc-clang ... -reg-mem-count` prints `Total VLM used: N bytes` (statics
+  plus spills; 12544 for the verify kernel, which holds 6 nodes), and
+  `test_vector_local_memory` asserts that each kernel leaves 3 KiB of the
+  16384 free;
+- `tests/standalone/gdn_core_decode/test_kernel_build.py` builds
+  `csrc/gdn_fused` with CMake and fails when `-vlm`, `-slm` or `-spill-vlm`
+  reaches any kernel.
+
+```bash
+tools/flash_next/tpcsim.sh 'tpc-clang -Wall -Werror -O2 -march=gaudi2 -reg-mem-count \
+    -I/usr/lib/habanatools/include csrc/gdn_fused/kernels/gdn_core_verify_gaudi2.c \
+    -c -o /tmp/k.o 2>&1 | grep "VLM used"'                           # Total VLM used: 12544 bytes
+tools/flash_next/tpcsim.sh 'python3 -m pytest -q -p no:cacheprovider --noconftest \
+    tests/standalone/gdn_core_decode/test_simulation.py \
+    tests/standalone/gdn_core_decode/test_kernel_build.py'           # 35 passed
+```
 
 `cmake -DGDN_FUSED_VERIFY_STRIP_BITCODE=ON` (default OFF) adds an
 `objcopy --remove-section=.llvmbc` step after the compile of
 `gdn_core_verify_gaudi2.o` in `csrc/gdn_fused/CMakeLists.txt`, so the verify
-kernel's ELF carries no embedded LLVM bitcode. This is a RUK-3105 diagnostic:
-hypothesis H2 blames the card segfault on the graph compiler recompiling that
-bitcode in-process without the kernel's `-vlm 32` flag. The verify simulator
-fixture mirrors it with `GDN_VERIFY_SIM_STRIP_BITCODE=1`; both runs must pass
-the same (5 passed):
+kernel's ELF carries no embedded LLVM bitcode. It is a card diagnostic kept
+from RUK-3105, never the shipped build: one hypothesis there was that the
+graph compiler recompiles that bitcode in-process, without the `-vlm 32` the
+kernel then needed. The kernel needs no such flag any more. The verify
+simulator fixture mirrors the option with `GDN_VERIFY_SIM_STRIP_BITCODE=1`;
+both runs must pass (19 passed; with the strip 18 passed, 1 skipped, the
+test that the ELF keeps its bitcode):
 
 ```bash
 tools/flash_next/tpcsim.sh 'python3 -m pytest -q -p no:cacheprovider --noconftest \
@@ -118,6 +145,12 @@ tools/flash_next/tpcsim.sh 'python3 -m pytest -q -p no:cacheprovider --noconftes
 tools/flash_next/tpcsim.sh 'GDN_VERIFY_SIM_STRIP_BITCODE=1 python3 -m pytest -q -p no:cacheprovider \
     --noconftest tests/standalone/gdn_core_decode/test_simulation.py -k verify'
 ```
+
+The simulator's "instructions executed" counts every instruction word,
+including the all-`nop` words tpc-clang inserts to wait out the latency of a
+dependent chain (it schedules one basic block at a time). The count follows
+the longest chain of a loop body, not the number of operations in it; an
+operation that is off that chain is free.
 
 ## Known compiler hazard: in-place tensors
 

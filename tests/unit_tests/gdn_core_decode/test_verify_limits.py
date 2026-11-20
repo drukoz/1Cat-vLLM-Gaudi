@@ -11,14 +11,15 @@ compiler's own count and the real build are checked in ``tests/standalone/gdn_co
 
 import pathlib
 import re
+import types
 
 import pytest
 import torch
 
 from flashinfer_gaudi.gdn_core_verify import GDN_CORE_VERIFY_MAX_NODES, gdn_core_verify, gdn_core_verify_reference
-from tests.unit_tests.gdn_core_decode.verify_sim_case import (MAX_NODES, VERIFY_ARG_ORDER, VERIFY_HPU_CASES,
-                                                              VERIFY_TOO_MANY_NODES_CASE, make_verify_inputs,
-                                                              verify_scalars)
+from tests.unit_tests.gdn_core_decode.verify_sim_case import (MAX_NODES, VERIFY_ARG_ORDER, VERIFY_CASES,
+                                                              VERIFY_HPU_CASES, VERIFY_TOO_MANY_NODES_CASE,
+                                                              make_verify_inputs, verify_scalars)
 
 REPO = pathlib.Path(__file__).resolve().parents[3]
 GDN = REPO / "csrc" / "gdn_fused"
@@ -32,7 +33,9 @@ LAYER = REPO / "vllm_gaudi" / "models" / "qwen3_5.py"
 
 VECTOR_BYTES = 256  # one float64 (64 fp32 lanes) in vector local memory
 VLM_LIMIT = 16384  # vector local memory of a kernel that calls lookup-table functions
-STATIC_BUDGET = VLM_LIMIT // 2  # for the __local__ vectors; the rest is for the compiler's spills and headroom
+# For the __local__ vectors: what is left after 16 spilled vectors (4096 bytes; tpc-clang 2.7.33 spills 13) and
+# 3 KiB of headroom.  It is exactly 6 vectors for each of the 6 nodes (q, k and v/o, two halves each).
+STATIC_BUDGET = VLM_LIMIT - 4096 - 3072
 
 
 def _kernel_max_nodes() -> int:
@@ -42,8 +45,9 @@ def _kernel_max_nodes() -> int:
 
 
 def test_every_statement_of_the_maximum_agrees():
-    assert GDN_CORE_VERIFY_MAX_NODES == 4  # T = 1 + k, k = 3 draft tokens
+    assert GDN_CORE_VERIFY_MAX_NODES == 6  # T = 1 + k, k = 5 draft tokens
     assert MAX_NODES == GDN_CORE_VERIFY_MAX_NODES
+    assert VERIFY_TOO_MANY_NODES_CASE.T == 7
     assert _kernel_max_nodes() == GDN_CORE_VERIFY_MAX_NODES
     params = re.search(r"kGdnCoreVerifyMaxNodes = (\d+);", PARAMS.read_text())
     assert params and int(params.group(1)) == GDN_CORE_VERIFY_MAX_NODES
@@ -60,6 +64,21 @@ def test_every_statement_of_the_maximum_agrees():
     assert not re.search(r"T <= 8|MaxNodes = 8|MAX_NODES 8", doc)
 
 
+def test_no_file_states_an_older_maximum():
+    """The sources, the tests and the design note say 6 wherever they state the limit (it was 8, then 4)."""
+    stale = re.compile(r"T <= [45]\b|1<=T<=[45]\b|MaxNodes = [45]\b|MAX_NODES\W* (?:= )?\(?[45]\b|"
+                       r"\[1, [45]\]|largest `T` is [45]\b|`T = [56]`? is rejected|What happens for `T = [56]`")
+    files = [KERNEL, KERNEL.with_name("gdn_core_verify_recurrence.h"), PARAMS, GLUE, OP, DOC,
+             REPO / "flashinfer_gaudi" / "gdn_core_verify.py",
+             REPO / "tests" / "unit_tests" / "gdn_core_decode" / "verify_sim_case.py",
+             REPO / "tests" / "standalone" / "gdn_core_decode" / "test_simulation.py",
+             REPO / "tests" / "standalone" / "gdn_core_decode" / "verify_sim_host.cpp"]
+    found = [f"{path.relative_to(REPO)}:{number}: {line.strip()}" for path in files
+             for number, line in enumerate(path.read_text().splitlines(), 1)
+             if stale.search(line) and "->" not in line]  # "8 -> 4 -> 6" is the history, not a statement
+    assert not found, "\n".join(found)
+
+
 def test_layer_gate_uses_the_same_maximum():
     """The layer sends only ``1 <= T <= maximum`` to the op; anything else takes the torch path."""
     gates = re.findall(r"1 <= T <= (\w+) and T \+ 2 <= R", LAYER.read_text())
@@ -68,8 +87,42 @@ def test_layer_gate_uses_the_same_maximum():
         f"{LAYER.name} gates the verify op at T <= {gates[0]}, the op takes T <= {GDN_CORE_VERIFY_MAX_NODES}")
 
 
+def test_layer_gate_takes_the_torch_path_above_the_maximum():
+    """``_maybe_gdn_core_verify`` with a ``[B, T]`` lattice: T = maximum reaches the layer's precondition check,
+    T = maximum + 1 returns ``None`` (the torch path) before it, with a conv pool that has rows for both."""
+    from vllm_gaudi.models import qwen3_5
+    from flashinfer_gaudi.gdn_core_verify import GdnCoreVerifyMode
+
+    assert qwen3_5.GDN_CORE_VERIFY_MAX_NODES == GDN_CORE_VERIFY_MAX_NODES
+    B, C = 2, 8
+
+    class ReachedTheCheck(Exception):
+        pass
+
+    def reached(conv_pool, ssm_pool):
+        raise ReachedTheCheck
+
+    def call(T):
+        conv_pool = torch.zeros(4, GDN_CORE_VERIFY_MAX_NODES + 3, C)  # R = T + 2 rows for T = maximum + 1
+        layer = types.SimpleNamespace(gdn_core_verify_mode=GdnCoreVerifyMode.FUSED,
+                                      _hpu_defer_ssm_writeback=False,
+                                      kv_cache=(conv_pool, torch.zeros(4, 1, 1, 1)),
+                                      _gdn_core_verify_ok=None,
+                                      _gdn_core_verify_reason=reached)
+        load = torch.zeros(B, T, dtype=torch.int32)
+        qsl = torch.arange(B + 1, dtype=torch.int32) * T
+        accepted = torch.ones(B, dtype=torch.int32)
+        return qwen3_5.HPUGatedDeltaNetAttention._maybe_gdn_core_verify(layer, torch.zeros(B * T, C), None, None, None,
+                                                                         load, None, B * T, accepted, qsl, False, False)
+
+    with pytest.raises(ReachedTheCheck):
+        call(GDN_CORE_VERIFY_MAX_NODES)
+    assert call(GDN_CORE_VERIFY_MAX_NODES + 1) is None
+
+
 def test_kernel_arrays_fit_the_vector_local_memory_budget():
-    """The ``__local__`` vectors of the verify kernel take at most half of the 16 KiB; -vlm is never the answer."""
+    """The ``__local__`` vectors of the verify kernel take at most ``STATIC_BUDGET`` of the 16 KiB: 6 vectors per
+    node.  One more per node (or a seventh node) does not fit it; -vlm is never the answer."""
     source = re.sub(r"//[^\n]*", "", KERNEL.read_text())
     declarations = re.findall(r"^__local__\s+(\w+)\s+(\w+)\[([^\]]+)\];", source, re.M)
     assert len(declarations) == source.count("__local__"), "a __local__ declaration this test cannot parse"
@@ -84,7 +137,7 @@ def test_kernel_arrays_fit_the_vector_local_memory_budget():
             count *= max_nodes if factor == "GDN_VERIFY_MAX_NODES" else int(factor)
         if ctype == "float64":
             vectors += count
-    assert vectors > 0
+    assert vectors == 6 * max_nodes == 36
     assert vectors * VECTOR_BYTES <= STATIC_BUDGET, (
         f"{vectors} __local__ vectors = {vectors * VECTOR_BYTES} bytes, budget {STATIC_BUDGET} of {VLM_LIMIT}")
 
@@ -127,3 +180,14 @@ def test_the_maximum_itself_is_accepted():
     case = next(c for c in VERIFY_HPU_CASES if c.T == GDN_CORE_VERIFY_MAX_NODES)
     out = gdn_core_verify(*_args(case))
     assert tuple(out.shape) == (case.B * case.T, case.HV, 128)
+
+
+def test_the_shared_cases_cover_every_node_count():
+    """T = 1 .. maximum each have a simulator case, and T = 5 and T = 6 have the TP8 and TP4 geometries."""
+    assert {case.T for case in VERIFY_CASES} == set(range(1, GDN_CORE_VERIFY_MAX_NODES + 1))
+    for T in (5, 6):
+        shapes = {(case.H, case.HV, case.B) for case in VERIFY_CASES if case.T == T}
+        assert {(2, 6, 1), (2, 6, 16), (2, 6, 4), (4, 12, 2)} <= shapes, (T, shapes)
+        assert all(case.R >= T + 2 for case in VERIFY_CASES if case.T == T)
+    chain = next(case for case in VERIFY_CASES if case.name == "ver_tp8_t6_chain")
+    assert chain.T == 6 and chain.R == 8 and chain.rows[0].conv_offset == 5 and chain.rows[0].ssm_load == 6
