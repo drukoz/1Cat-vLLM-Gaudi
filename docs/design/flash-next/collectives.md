@@ -241,6 +241,45 @@ payload. In that light (INFERRED from the counts of section 1):
   bench, and the coordinator's two-server job 00048), and the host's work per collective inside the replay
   (native-replay: asynchronous replay, the bridge's host path).
 
+**Job 00073 (MEASURED, 2026-11-20 21:24-21:29 UTC, `bench_c4.py` at commit 684b54ad, all 8 cards):** the cost of
+one reduction of `[rows, 2560]` bf16 in a body of 96 (one element-wise op, then the reduction; `none` = the same
+96 ops in one recipe), the slowest rank's median of 12 calls after 3 warm ones, each call behind a one-element
+all-reduce barrier and timed until `torch.hpu.synchronize()` returns; per reduction = (form - none) / 96, so it
+includes the recipe split each collective forces, as in a served step. Microseconds at 1 / 8 / 32 / 128 rows:
+
+| ranks, regime | all-reduce | all-gather + local sum (the flag) | all-gather alone | `none` body (ms per 96) |
+|---|---|---|---|---|
+| 8, replay | 168 / 164 / 164 / 172 | 167 / 163 / 161 / 160 | 113 / 169 / 172 / 161 | 0.26 / 0.55 / 0.48 / 0.48 |
+| 4 (modules 0-3), replay | 147 / 162 / 165 / 155 | 128 / 142 / 146 / 153 | 86 / 134 / 141 / 146 | 0.27 / 0.48 / 0.27 / 0.54 |
+| 4, replay, both halves at once (1 and 32 rows) | 155 and 147 / 127 and 122 | 188 and 136 / 191 and 140 | | |
+| 8, lazy | 59 / 179 / 181 / 72 | 280 / 308 / 208 / 175 | 204 / 244 / 155 / 120 | 15.9 / 11.7 / 11.6 / 12.3 |
+| 4, lazy | 121 / 63 / 66 / 52 | 211 / 221 / 221 / 213 | 142 / 144 / 146 / 178 | 14.0 / 13.1 / 13.0 / 13.5 |
+
+Readings (INFERRED from the table unless marked):
+- Under replay a collective costs about 165 us at 8 ranks, flat in the payload (6.9 us per MB): host cost per
+  collective. 98 per step = about 16 ms of every TP8 step, which agrees with the replay call of the real step
+  (step-anatomy 00013: 22.8 ms on rank 0 at one stream = 98 x 165 us + 47 cut launches + about 2 ms).
+- **Four ranks are not cheaper per collective under replay** (165 against 164 us at 32 rows): the two-server
+  layout gains nothing on the collective term (coordinator job 00048: +10 % for the node, from fewer rows per
+  server).
+- **C4 does not pay at TP8:** gather + sum is within 1 to 8 % of the all-reduce at every row count, and the
+  all-gather alone (the fused-kernel form) saves 55 us at one row and nothing from 8 rows on.
+  `VLLM_HPU_ALL_REDUCE_AS_GATHER_ROWS` stays 0 and the fused form is not built. (At 4 ranks gather + sum is 12 to
+  14 % cheaper; irrelevant while TP8 stays.)
+- Lazy mode (no replay) is noisy and not what a decode step runs.
+- Against native-replay's 00065 (45 to 74 us at one row, 109 to 151 at 32): the same slowest-rank, barrier and
+  "without" definitions; its body carries GEMMs (up to 18 to 32 us per collective can hide behind them), its
+  run had a stack sampler on rank 0 and a load average of 228 to 270, its regimes of equal cost spread from 24 to
+  205 us, and its one-row point contradicts its own run (the segmented body without collectives took longer
+  than the body with them: -18 us per collective alone). What a served step pays is about 150 to 170 us per
+  collective (this job; 00012: 129 to 195; 00065 at 32 rows: 145), of which about 65 to 90 us is the recipe launch
+  the collective forces (00065's `replay_seg`). A host path that made the collective itself free would save
+  about 8 to 10 ms per TP8 step; collectives inside one recipe up to about 14 to 16 ms.
+
+The step's last collective (the logits all-gather against the `[rows, 2]` pair gather, `--tail-rows`) is not in
+00073 (its image predates it) and is not run: one collective and its payload per step is small next to the
+floor (coordinator, 2026-11-20).
+
 ## 6. Card jobs of this track, their readings and their results
 
 Every job runs the committed tree in the farm's per-commit image (`CARD.md`); scripts in
@@ -248,80 +287,62 @@ Every job runs the committed tree in the farm's per-commit image (`CARD.md`); sc
 
 | Job | What | Reading | Result |
 |---|---|---|---|
-| 00064 `idcheck-rule9`, 1 card | `id_check.py`: every id pattern of the token path against the CPU, one lazy graph and a replayed one, rows 1, 2, 5, 32, 128, untied and tied, at a shard's width and at a whole row | serving cases (`vp_argmax`, `fp32_ids_row`) must equal the CPU; the probes say which patterns card rule 9 breaks (`argmax -> int32` is the fused greedy region and vLLM's sampler, `argmax -> .int()` the MTP draft loop, `topk -> int32` the control) | pending |
-| 00073 `c4-bench-r8-r4`, 8 cards, in the place of 00019 | `bench_job.sh`: the id check through the all-gather on 8 ranks; `bench_c4.py` on 8 ranks, on the module group 0-3, and on both groups at once | `decide_g41.py`: alpha and us per MB per rank count, regime and form; C4 pays where `gather_sum` (the flag) or `gather_first` (the collective alone, the fused-kernel form) is below `all_reduce` under replay; alpha8 against alpha4 for the layout | pending |
-| 00074 `tiny-tp4-logits-rider`, 4 cards | the tiny model at TP4 with `VLLM_HPU_VOCAB_PARALLEL_LOGITS=1 VLLM_HPU_PLE_TABLE_RIDER=1`, fused hyper-connections | tokens equal the CPU reference (one request at a time: one row) | pending |
-| 00108 `idcheck-shapes`, 1 card (replaced 00081) | `id_check.py` at commit `1c9abfef`: the top-k forms at k = 20 and 64 on a shard of 31,040 columns with 64 known largest logits (`vp_topk@k` = this branch's `vocab_parallel_topk`, `topk_gather_fp32@k`, `stage2_topk_gather@k`, `first_maximum@k`, the old casts `topk_to_int32@k` and `topk_to_fp32@k`), the arg max forms, and the cases whose narrowed ids are consumed inside the graph (`argmax_int_embed`: the MTP draft loop; `topk_int32_embed@k`: the QSA block selection's shape) | this branch's top-k must equal the CPU at every row count; the probes say which casts the card gets wrong at these shapes, and whether a wrong narrowing is seen by the graph itself or only by a read to the host | pending |
-| 00082 `real4-ab2-off`, 00083 `real4-ab2-logits-rider`, 4 cards each | `ab_job.sh`: the real model at TP4 + EP4, 1 and 32 streams, 256 tokens, no `min_tokens`, every stream's text kept; 6 lone requests; one 32-stream round with the server's default sampling | `compare_arms.py <off> <logits-rider>`: the lone requests' texts are equal (texts of batched streams change with the batch: job 00021), the ms per token of both, and what a sampled step costs next to a greedy one | pending |
+| 00064 `idcheck-rule9`, 1 card, image 3abbd8df, 20:26 UTC | `id_check.py`: every id pattern of the token path against the CPU, one lazy graph and a replayed one, rows 1, 2, 5, 32, 128, untied and tied, at a shard's width and at a whole row | serving cases (`vp_argmax`, `fp32_ids_row`) must equal the CPU; the probes say which patterns card rule 9 breaks | **PASS.** Both serving cases equal the CPU in every case. Every arg max form is right everywhere (`argmax -> int32`: the fused greedy region and the sampler; `argmax -> .int()`: the MTP draft loop; int64; two graphs; fp32). `topk -> int32` read to the host: every second id at every row count, but only in the first lazy pass (a freshly compiled graph); right in the replayed graph and in the later lazy pass at the same shapes. `max(dim).indices -> int32`: the same at 2 rows and more. `topk` ids as they are, cast to fp32, or read out of an fp32 id table: right everywhere |
+| 00108 `idcheck-shapes`, 1 card, image 1c9abfef, 20:28 UTC (replaced 00081) | `id_check.py`: the top-k forms at k = 20 and 64 on a shard of 31,040 columns with 64 known largest logits, the arg max forms, and the cases whose narrowed ids are consumed inside the graph | this branch's top-k must equal the CPU at every row count | **PASS.** `vp_topk@20/@64` (this branch's `vocab_parallel_topk`), `topk_gather_fp32`, `stage2_topk_gather`, `first_maximum` at k = 20 and 64: equal at every row, both regimes, untied and tied, shard and whole row. `topk_to_int32@k` and `max_dim_to_int32` wrong again only in the first lazy pass. In-graph consumers right even there: `argmax_int_embed` (the MTP draft loop's ids into the embedding) and `topk_int32_embed@k` (the QSA block selection's pattern) |
+| 00073 `c4-bench-r8-r4`, 8 cards, image 684b54ad, 21:24-21:29 UTC | `bench_job.sh`: the id check through the all-gather on 8 ranks; `bench_c4.py` on 8 ranks, on the module group 0-3, and on both groups at once | alpha per rank count, regime and form (section 5) | **Exit 2 from the first stage**: the 8 id-check ranks hit the stage's 150 s limit and the script killed them (the "killed while waiting" kernel lines on cards 0, 4, 5, 6, 7; not a card fault; load average up to 414). Before that `vp_argmax` through the 8-rank all-gather equalled the CPU at every row, regime and data set, and `vp_topk` (the earlier form) in every case that ran. The bench stages ran to the end: section 5 |
+| 00112 `cuts-cardproof-tp4`, 4 cards (modules 0-3), commit d1cbe91d (the head of PR #14), 23:08-23:12 UTC | `cardproof_job.sh`: `id_check.py` on 4 hccl ranks; the tiny model at TP4 with fused hyper-connections, arm `logits-rider` (`VLLM_HPU_VOCAB_PARALLEL_LOGITS=1 VLLM_HPU_PLE_TABLE_RIDER=1`) and arm `logits2-embed` (`VLLM_HPU_VOCAB_PARALLEL_LOGITS=2 VLLM_HPU_REPLICATED_EMBEDDING=1`) | the serving id cases equal the CPU; every arm's tokens equal the reference | **Ids PASS at 4 ranks**: `vp_argmax` and `vp_topk@20/@64` (the merged top-k head through the 4-rank all-gather) equal at rows 1, 2, 32, 128, both regimes, untied and tied. **Tiny: exit 1.** Both arms give identical tokens: prompts of 7, 33, 2,600 tokens 16/16; 1 and 100 tokens near ties at token 0 (excused, as in every baseline); the 700-token prompt 4/16, first difference at token 4. The same 700-token answer, token for token, comes from engine-step's 00093 `tiny-flags` at TP1 (`VLLM_HPU_FUSED_GREEDY_LOGITS=1`, none of this track's flags) and from mtp-card-ready's 00105 fused-verify arms at TP2, while every baseline tiny run matches 16/16. So it comes with the in-graph greedy region (or any small numerical change), not with the cuts: a near tie of the reference at token 4 (coordinator, 2026-11-20; the tiny model's logits are near-flat: top-2 margins of 0.0005 to 0.02 at values near 0.27, where one bf16 step is 0.002, on a same-recipe checkpoint built on the Mac) |
+| 00082 `real4-ab2-off`, 00083 `real4-ab2-logits-rider` (commit d158c6d5) | the real-model A/B against the plugin's default path | | replaced by the pair below: against the default path the lone texts can part at a bf16 tie that the greedy region itself moves, which says nothing about the cuts |
+| the pair `real4-ab3-region` / `real4-ab3-cuts`, 4 cards each, 25 min, ids in the handoff | `ab_job.sh` on this branch's head: the real model at TP4 + EP4, 1 and 32 streams, 256 tokens, no `min_tokens`, every stream's text kept; 6 lone requests; one 32-stream round with the server's default sampling. Arm `region`: `VLLM_HPU_FUSED_GREEDY_LOGITS=1` (the greedy region over the gathered logits); arm `cuts`: `VLLM_HPU_VOCAB_PARALLEL_LOGITS=1 VLLM_HPU_PLE_TABLE_RIDER=1` (the same region, the vocabulary-parallel arg max, the PLE rows on the embedding all-reduce); both `VLLM_GRAPH_RESERVED_MEM=0.5` | `compare_arms.py <region> <cuts>`: the 6 lone requests' texts must be equal token for token (both arms compute the same bf16 logits; the cuts are exact); the ms per step at 1 and 32 streams is the cuts' own effect (expected under 1 ms: one all-gather of `[rows, 62,080]` bf16 per rank and one all-reduce fewer) | pending |
 
 A probe that sends `min_tokens` measures none of this: a request with `min_tokens` is kept out of the greedy region
 (`_can_fuse_plain_greedy_sampling`, `hpu_model_runner.py`), so the logits are gathered and sampled as before.
 
 ## Handoff (if this agent stops)
 
-State at 20:20 UTC 2026-11-20 (third agent of this track, started 19:00 UTC). Branch
-`feat/flash-next-gaudi-collectives`, worktree `/Volumes/Storage/Claude/gaudi-work/wt/collectives`, scratch, logs and
-card results in `/Volumes/Storage/Claude/gaudi-work/reports/collectives/` (`logs/`, `card/`). This section is the
-track's report (the harness refuses a REPORT.md).
+State at 23:50 UTC on 2026-11-20 (fourth agent of this track, from 23:15 UTC, Opus 5.5). Branch
+`feat/flash-next-gaudi-collectives`, worktree `/Volumes/Storage/Claude/gaudi-work/wt/collectives`; scratch, logs
+and card results in `/Volumes/Storage/Claude/gaudi-work/reports/collectives/` (`card/<id>-<name>/`, `logs/`,
+`probes/`). This section is the track's report: the harness refuses a REPORT.md.
 
 Where things are:
 
-- Pull request #13 carries everything on the branch: the five cuts (default off), the card tools
-  (`tools/flash_next/collectives/`), and the top-k interface of the sampled step (section 2, mode 2). The program
-  head `b0cd0bb` is merged into the branch (`6b265d50`). The common gate (`bin/gate <worktree> --tools`) was
-  restarted at 20:08 UTC on the branch head with all of it (`bin/gate` runs one gate at a time on this Mac since
-  20:12 UTC: it waits its turn, see `/tmp/gaudi-gate.lock/tree`): its lines are in the newest
-  `/tmp/gate.*/summary.txt` and at the end in `logs/gate_3c0ada27.log` (`rc=0` in the last line = green; later
-  commits touched only `tools/flash_next/collectives/`, its unit test and this note). An earlier run on `fc71ef83` had 44 of
-  82 files green and none red when it was stopped. Green: `gh pr merge 13 --merge`. A red line: run that file
-  alone (`reports/collectives/pt2.sh <name> <file>`; add `-p tests.unit_tests.hpu_cpu_stubs` for
-  `tests/unit_tests/worker/test_hpu_model_runner.py`) and compare with the program head before deciding.
-- `reports/collectives/dev-wt` is a second worktree (branch `feat/flash-next-gaudi-collectives-dev`, on origin) used
-  while a gate reads the main one: develop there (`reports/collectives/ptd.sh <name> <pytest args>`), then
-  `git -C wt/collectives merge --ff-only feat/flash-next-gaudi-collectives-dev`. A local branch
-  `collectives-sampler-snapshot` (`f11f2cfc`) keeps a complete sampler stage over candidates with its tests
-  (dropped: the engine-step track ships that stage).
-- The sampled step (BRIEF 19:45: real agents sample): engine-step (agent `ad4fd8b387ee2314a`) builds
-  `v1/sample/candidate_sampling.py` and calls `vocab_parallel.top_k` and `vocab_parallel.first_maximum` from this
-  branch (agreed 20:05 UTC; it cherry-picks `ea3bc30a` until the program branch has it). mtp-card-ready's sampled
-  verification can take the same call for every verification row.
-- Card rule 9 on this track's paths: no int64 id is cast (section 2; `test_vocab_parallel_candidates.py` watches
-  the dispatched ops). The fused greedy region and its gathered fallback belong to engine-step: not edited here.
-- Reported to the coordinator: the MTP draft loop's `argmax -> .int()` (19:12), the farm probe's `min_tokens`
-  (fixed 19:20), that every probe was greedy (19:42; a program rule since 19:45), the structural answer (19:42).
-- An incident of this agent (20:05:25 UTC, reported at once; BRIEF has the rule since): a `pkill -f` with options
-  after its pattern matched nearly every process of the user. Never kill by name or pattern on this Mac: only a
-  pid your own command started (`ps -eo pid,ppid,etime,command | grep ...`, then `kill <pid>`).
+- PRs #13 and #14 are merged (program head 938dada4): the cuts behind their flags (default 0), the card tools
+  (`tools/flash_next/collectives/`), the top-k head (`vocab_parallel.top_k`, `first_maximum`). The branch head has
+  only this note on top. **No pull request tonight** (BRIEF 23:45 UTC: card evidence first, pull requests after
+  04:00 UTC; the integration track builds from pushed branches). The second worktree
+  `reports/collectives/dev-wt` (branch `feat/flash-next-gaudi-collectives-dev`) is an ancestor of the branch head
+  and has nothing of its own.
+- Card results, all read and fetched (section 6): 00064, 00108, 00112 (ids), 00073 (collective cost, section 5).
+  Sent to the coordinator at about 23:30 UTC: the id verdicts, why 00073 failed and what it measured, the cuts'
+  card state; at about 23:40 UTC the bench comparison with native-replay's 00065 (also sent to native-replay).
 
-Card jobs (section 6 has what each decides). 00064 (bumped: single-card wave after the QSA pair, about 20:45
-to 21:30 UTC), 00108 (replaced 00081; the coordinator was asked at 20:16 UTC to bump it into the same wave),
-00073 (all cards, bumped behind prefill's 00014 and step-anatomy's 00069; do not replace it: a replacement loses
-the bump). At the end of the queue, any:4: 00074 (tiny TP4 token parity), 00082
-and 00083 (real TP4 arms off / logits + rider; `ab_job.sh` with 6 lone requests for the text test and one round
-with the server's default sampling). One waiter per job runs in a background shell of this agent
-(`reports/collectives/waitfetch.sh <id> <name>`; for 00108 the `farm job` command itself) and copies the results
-to `reports/collectives/card/<id>-<name>/` when the job ends; if the agent is gone:
-`bin/farm ledger | grep -w collectives`, then `bin/farm fetch collectives <id> <id>-<name>`. Cancel the any:4 jobs
-if they have not started by about 03:00 UTC.
+What is proven on the card (VERIFIED by the jobs named):
+- `vocab_parallel_argmax` (mode 1's arg max): equal to the CPU at 1 rank (00064, 00108), through the 4-rank
+  (00112) and the 8-rank (00073) all-gather, lazy and replay, tied and untied, rows 1 to 128.
+- The top-k head (mode 2, `vocab_parallel_topk` / `top_k`) at k = 20 and 64: equal at 1 rank (00108) and
+  through the 4-rank all-gather (00112); its second stage (`first_maximum`, the top k of the gathered candidates)
+  at 1 rank (00108). Not run: through an 8-rank gather (the same gather as the arg max's, which passed at 8).
+- The tiny model at TP4 with mode 1 + PLE rider and with mode 2 + replicated embedding: identical tokens, and
+  identical to the greedy region without any cut (00093 at TP1); the 700-token prompt's token 4 is a near tie
+  that the region moves (section 6). Not formally a pass of the smoke.
+- Not on any card: `VLLM_HPU_MTP_REPLICATED_FC=1`; mode 1 or 2 under MTP (greedy verification from the arg max,
+  `hpu_greedy_verify.py`; this branch lacks mtp-card-ready's state-write fixes, so an MTP run belongs on the
+  integration tree).
+- Not worth it (00073): `VLLM_HPU_ALL_REDUCE_AS_GATHER_ROWS` (keep 0) and its fused form.
+
+Card jobs: the real-model pair `real4-ab3-region` / `real4-ab3-cuts` replaced 00082 / 00083 (their ids, the
+commit and the waiters are in the line below once submitted). When both have ended:
+`python3 -I tools/flash_next/collectives/compare_arms.py <region folder> <cuts folder>` (folders under
+`reports/collectives/card/`): the 6 lone texts must be equal; the ms per step at 1 and 32 streams is the cuts'
+own effect. If no waiter of this agent is alive: `bin/farm ledger | grep -w collectives`, then
+`bin/farm fetch collectives <id> <id>-<name>`. Cancel the pair if it has not started by about 03:00 UTC.
 
 Pending, in order:
 
-1. Merge #13 when the gate is green; tell engine-step (it then switches its `take_candidates` to `top_k`) and
-   mtp-card-ready (its proposer conflicts with `_draft_tokens`: keep its `draft_argmax(logits)` as the gathered
-   branch and `vocab_parallel.vocab_parallel_argmax` under `vocab_parallel.enabled(self.model)`).
-2. 00064's and 00081's lines to the coordinator, mtp-card-ready and engine-step the moment they end
-   (`grep '^idcheck:' reports/collectives/card/00064-idcheck-rule9.log`). If `topk_gather_fp32` is wrong on the
-   card, `vocab_parallel_candidates` needs another way to its ids (tell engine-step at once).
-3. 00073: `python3 -I tools/flash_next/collectives/decide_g41.py reports/collectives/card/00073-c4-bench-r8-r4 --json ...`;
-   alpha and us per MB for 8 and 4 ranks, lazy and replay, into `reports/collectives/collective_alpha.json` (its
-   `pending` fields) and to the coordinator (`main`); the decisions into section 5.
-4. C4 only where the replay regime of 00073 shows the gather form below the all-reduce (I34 row gate): then a
-   real-model arm with `VLLM_HPU_ALL_REDUCE_AS_GATHER_ROWS=<rows>` (`ab_job.sh`), and the fused form (the sum
-   inside `hc_combine_norm`) only if `gather_first` beats `gather_sum` by more than the sum op.
-5. The logits all-gather against the `[rows, 2]` pair gather (`bench_c4.py --tail-rows`, commit `db917dfd`) is not in
-   00073 (its image is `684b54ad`): run `bench_job.sh` once more on any:4 if a slot is free.
-6. When MTP runs on the card: an MTP k = 3 A/B of `VLLM_HPU_VOCAB_PARALLEL_LOGITS=2 VLLM_HPU_REPLICATED_EMBEDDING=1
-   VLLM_HPU_MTP_REPLICATED_FC=1` (9 collectives and four logits gathers fewer per MTP step).
-7. Count work left, small (0.15 to 0.19 ms each at TP8): the PLE rows on layer 0's mixer all-reduce when the
-   embedding is replicated (98 to 97, costs the 1.11 GB table); the draft's arg-max gather carrying the winner's
-   embedding row. The per-layer floor of 2 is algebraic (section 3).
+1. When the pair ends: compare the arms, write the result into section 6, tell the coordinator (`main`) which
+   flags are proven for the integration build (mode 1 + rider if the lone texts are equal), push.
+2. Pull requests after 04:00 UTC: this note (sections 5 and 6, the handoff); nothing else is unmerged.
+3. Count work left, small (0.15 to 0.19 ms each at TP8, coordinator: not worth card time tonight): the PLE rows on
+   layer 0's mixer all-reduce when the embedding is replicated; the draft's arg-max gather carrying the winner's
+   embedding row. The per-layer floor of 2 is algebraic (section 3); the cost per collective is the host path
+   inside the replay call (section 5), native-replay's domain.
