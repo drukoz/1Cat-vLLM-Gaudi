@@ -26,9 +26,15 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
-from vllm.forward_context import get_forward_context
-
 import vllm_gaudi.envs as envs
+
+
+def rows_without_selection(selected: torch.Tensor) -> torch.Tensor:
+    """Bool ``[..., 1]``: True for the rows of ``selected`` (``[..., W]``, -1 padded) with no position at all.
+
+    One max over the row (a tensor op, no host read): such rows are the padding rows of a bucket.
+    """
+    return selected.amax(dim=-1, keepdim=True) < 0
 
 
 def prefill_selection_bias(selected: torch.Tensor, context_lens: torch.Tensor, n_ctx_cols: int, num_chunk_cols: int,
@@ -47,7 +53,11 @@ def prefill_selection_bias(selected: torch.Tensor, context_lens: torch.Tensor, n
     for the chunk. The query-row count is ``selected.shape[1]`` (the tile
     height), decoupled from the column count so every tile of a long-context
     prefill shares the same ``n_ctx_cols + seq_len`` key width. ``-1`` entries
-    are redirected to an extra dump column that is dropped. Pure torch, no
+    are redirected to an extra dump column that is dropped. A query row with no
+    selected position at all (a padding row of the bucket, whose position is
+    ``-1``) gets an all-zero bias row instead of an all ``-inf`` one: the
+    softmax of an all ``-inf`` row is NaN, and the layers after this one carry
+    a NaN on a padding row into the recurrent state they save. Pure torch, no
     loops over tokens.
     """
     bs, num_queries, _ = selected.shape
@@ -62,8 +72,9 @@ def prefill_selection_bias(selected: torch.Tensor, context_lens: torch.Tensor, n
     mask = torch.zeros(bs, num_queries, cols + 1, dtype=torch.bool, device=selected.device)
     mask.scatter_(2, col, True)
     selected_cols = mask[:, :, :cols]  # drop the dump column
+    nothing_selected = rows_without_selection(selected)  # [bs, T, 1]
     bias = torch.full((bs, 1, num_queries, cols), float("-inf"), dtype=dtype, device=selected.device)
-    bias.masked_fill_(selected_cols.unsqueeze(1), 0.0)
+    bias.masked_fill_((selected_cols | nothing_selected).unsqueeze(1), 0.0)
     return bias
 
 
@@ -118,7 +129,11 @@ class HpuQsaSparseAttention(torch.nn.Module):
 
     Built as ``HpuQsaSparseAttention(attn)`` where ``attn`` is the QSA layer's
     ``Attention`` child: its ``.impl`` is the fork's ``HPUAttentionImpl`` and
-    its bound KV cache is ``attn.kv_cache[get_forward_context().virtual_engine]``.
+    its bound KV cache is ``attn.kv_cache``, the ``(key_cache, value_cache,
+    k_scales, v_scales)`` tuple the runner allocates and ``bind_kv_cache``
+    assigns (the fork's dense path reads it the same way,
+    ``vllm_gaudi/ops/hpu_attention.py``). The pinned vLLM has no
+    ``ForwardContext.virtual_engine`` and no per-engine cache list.
     """
 
     def __init__(self, attn) -> None:
@@ -143,7 +158,7 @@ class HpuQsaSparseAttention(torch.nn.Module):
         num_kv_heads = self.num_kv_heads
         head_dim = self.head_dim
 
-        kv_cache = self.attn.kv_cache[get_forward_context().virtual_engine]
+        kv_cache = self.attn.kv_cache
         # Split the (key, value, k_scales, v_scales) cache tuple; keep it local
         # so decode needs no HPU-only import (split_kv_cache is pure indexing).
         key_cache, value_cache, k_scales, v_scales = kv_cache[0], kv_cache[1], kv_cache[2], kv_cache[3]
@@ -195,7 +210,10 @@ class HpuQsaSparseAttention(torch.nn.Module):
             return out.reshape(tokens, num_heads * head_dim)
 
         slots = decode_selected_slots(selected, md.block_table, int(md.block_size))
-        valid = selected >= 0
+        # A row with no selected position (a padding row of the batch under M-RoPE: position -1)
+        # attends to its gathered pad-block rows instead of to nothing: the softmax of an all
+        # -inf row is NaN.
+        valid = (selected >= 0) | rows_without_selection(selected)
         out = sparse_decode_attention(q, key_cache, value_cache, slots, valid, num_heads, num_kv_heads, head_dim,
                                       impl.scale)
         return out.reshape(q.shape[0], num_heads * head_dim)
@@ -205,5 +223,6 @@ __all__ = [
     "HpuQsaSparseAttention",
     "decode_selected_slots",
     "prefill_selection_bias",
+    "rows_without_selection",
     "sparse_decode_attention",
 ]

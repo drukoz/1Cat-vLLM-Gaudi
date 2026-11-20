@@ -9,7 +9,8 @@ the T4a torch oracle (``ple_forward_torch`` / ``ple_gate_torch``) across
 2. a single-row prefill (output and slot state),
 3. a padded two-row prefill (padding ignored, per-row state),
 4. a chunked prefill followed by decode (state carried in the slot),
-5. a decode batch whose padding row (index ``-1``) is neither read nor written,
+5. a decode batch whose padding row (index ``-1``) is not read and writes only the state tensor's last row
+   (the padding row; one fixed-shape write, see ``test_ple_padded_bucket.py``),
 6. a profile run (no metadata: gated output, cache untouched),
 7. the ``Qwen4ExpPLELayer`` and ``Qwen4ExpNGramEmbedding`` seam rebinding in
    ``apply_flash_next_patches``, and the host-multiplier n-gram embedding
@@ -253,7 +254,9 @@ def test_padding_row_not_written(ple_layer):
         layer(hidden, ids, qsl, ctx)
 
     assert not torch.equal(layer.kv_cache[0][1], before[1])
-    for slot in (0, 2, 3, 4):
+    # The write is one fixed-shape index_copy_ (HPU graphs): the invalid row goes to the state tensor's
+    # last row, the padding row of every runner layout (slot 4 here), and to no request's slot.
+    for slot in (0, 2, 3):
         assert torch.equal(layer.kv_cache[0][slot], before[slot])
 
 

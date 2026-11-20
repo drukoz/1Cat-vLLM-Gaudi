@@ -27,7 +27,6 @@ from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.mamba.mamba_utils import is_conv_state_dim_first
 from vllm.models.qwen4_exp.nvidia.ple_layer import Qwen4ExpNGramEmbedding, Qwen4ExpPLELayer
 
-from vllm_gaudi.models.qwen3_5 import _save_ssm_state
 from vllm_gaudi.models.qwen4_exp.ple_ops import (
     NGRAM_HASH_LIMBS,
     check_ngram_hash_bounds,
@@ -330,6 +329,51 @@ class HpuQwen4ExpPLELayer(Qwen4ExpPLELayer):
             indices = indices[:, 0]
         return indices.reshape(-1).long()
 
+    @staticmethod
+    def _prefill_lengths(md: object, padding_mask: torch.Tensor | None, rows: int, seq_len: int,
+                         device: torch.device) -> torch.Tensor:
+        """Real token count of every row of a padded prompt bucket: int64 ``[rows]``, exact.
+
+        ``query_start_loc_p`` is the runner's int32 cumulative sum of the real query lengths of the
+        bucket's rows (``_form_prefill_batch``; a chunk of a chunked prefill is its own bucket), so the
+        lengths are its differences. Metadata without it falls back to the padding mask summed as
+        int32. The mask is never summed in its own dtype: the runner builds it in the model dtype, and
+        bfloat16 holds integers exactly only up to 256 (1701 ones sum to 1704), which would cut the
+        saved conv window at the wrong row.
+        """
+        query_start_loc = getattr(md, "query_start_loc_p", None)
+        if query_start_loc is not None and query_start_loc.numel() == rows + 1:
+            qsl = query_start_loc.to(device=device, dtype=torch.long)
+            return (qsl[1:] - qsl[:-1]).clamp(min=0, max=seq_len)
+        if padding_mask is not None and padding_mask.numel() == rows * seq_len:
+            return padding_mask.view(rows, seq_len).to(torch.int32).sum(1, dtype=torch.int32).long()
+        return torch.full((rows,), seq_len, dtype=torch.long, device=device)
+
+    @staticmethod
+    def _save_conv_state(result: torch.Tensor, new_state: torch.Tensor, view: torch.Tensor,
+                         store: torch.Tensor) -> torch.Tensor:
+        """Write every row's new conv state with one fixed-shape ``index_copy_``; returns ``result``.
+
+        The GDN helper ``qwen3_5._save_ssm_state`` drops the rows whose index is invalid through
+        ``torch.nonzero`` and a Python ``if`` on its result: a host read and a data-dependent shape,
+        which an HPU graph cannot replay, on every PLE decode step of a batch of two or more. Here a
+        row with an invalid index (outside the tensor: the ``-1`` padding of the compact layout)
+        writes the state tensor's LAST row instead, so the write always has ``store.numel()`` rows.
+
+        The last row is the padding row in every layout the runner allocates, never a request's
+        slot: ``num_blocks + 1`` rows with ``_MAMBA_PAD_BLOCK_ID = num_blocks`` (the hybrid, the
+        naive-sharing and the plain allocation in ``initialize_kv_cache``), ``pool_slots + 2`` rows
+        with ``pool_pad_block_id = pool_slots + 1`` (the recurrent state pool). The padding rows of a
+        bucket already carry that index and wrote that row before this change; ``qsa_side_caches``
+        relies on the same row for the key ring. Several rows may write it in one call: it holds no
+        state anyone reads back as a request's.
+        """
+        store = store.reshape(-1).to(device=view.device, dtype=torch.long)
+        valid = (store >= 0) & (store < view.shape[0])
+        pad_row = torch.full_like(store, view.shape[0] - 1)
+        view.index_copy_(0, torch.where(valid, store, pad_row), new_state.to(device=view.device, dtype=view.dtype))
+        return result
+
     def _hpu_short_conv(self, gated: torch.Tensor, normed: torch.Tensor) -> torch.Tensor:
         """Add the dilated short convolution and persist the new state into the cache slots.
 
@@ -338,9 +382,9 @@ class HpuQwen4ExpPLELayer(Qwen4ExpPLELayer):
         ``load_indices_tensor`` slot (padding rows read zeros, chunked prefill rows only
         when ``has_initial_states_p`` says so and the load slot is not the null block 0)
         and writes the new state to the ``store_indices_tensor`` slots through
-        ``_save_ssm_state``, so invalid indices are neither read nor written. Metadata that
-        carries ``num_accepted_tokens`` is an MTP verification or transition step and goes
-        to ``_hpu_short_conv_spec``.
+        ``_save_conv_state``: an invalid index is not read and writes the padding row, never a
+        request's slot. Metadata that carries ``num_accepted_tokens`` is an MTP verification or
+        transition step and goes to ``_hpu_short_conv_spec``.
         """
         attn_metadata = get_forward_context().attn_metadata
         if attn_metadata is None:
@@ -396,9 +440,8 @@ class HpuQwen4ExpPLELayer(Qwen4ExpPLELayer):
             mask = mask & (load.to(device=init.device) != 0)
             init = torch.where(mask.view(rows, 1, 1), init, torch.zeros_like(init))
 
-        padding_mask = getattr(md, "padding_mask_flat", None)
-        if is_prompt and padding_mask is not None and padding_mask.numel() == tokens:
-            lengths = padding_mask.view(rows, seq_len).sum(1).long()
+        if is_prompt:
+            lengths = self._prefill_lengths(md, getattr(md, "padding_mask_flat", None), rows, seq_len, normed.device)
         else:
             lengths = torch.full((rows,), seq_len, dtype=torch.long, device=normed.device)
 
@@ -410,9 +453,9 @@ class HpuQwen4ExpPLELayer(Qwen4ExpPLELayer):
             lengths,
         )
         result = gated + out.reshape(tokens, self.hc_hidden_size)
-        # State save in the dynamo-disabled wrapper so a compiled graph keeps the
-        # in-place write (the GDN layer uses the same helper for its SSM state).
-        return _save_ssm_state(result, new_state, view, store)
+        # One fixed-shape in-place write; the helper returns ``result`` so the caller's graph
+        # consumes the call (the convention of the GDN layer's ``_save_ssm_state``).
+        return self._save_conv_state(result, new_state, view, store)
 
     def _hpu_short_conv_spec(
         self,
@@ -467,5 +510,5 @@ class HpuQwen4ExpPLELayer(Qwen4ExpPLELayer):
             self.short_conv_dilation,
         )
         result = gated + out.reshape(tokens, self.hc_hidden_size)
-        # State save in the dynamo-disabled wrapper, as on the non-spec path.
-        return _save_ssm_state(result, new_state, view, store)
+        # The same fixed-shape write as on the non-spec path.
+        return self._save_conv_state(result, new_state, view, store)

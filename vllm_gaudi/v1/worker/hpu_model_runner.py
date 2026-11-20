@@ -1927,6 +1927,13 @@ def trim_attn_metadata(metadata: HPUAttentionMetadataV1) -> object:
     # input_hash(torch.tensor(123)) == input_hash(torch.tensor(321))
     # input_hash(123) != input_hash(321)
     # input_hash("abc") != input_hash("cba")
+    #
+    # Flash-Next (qwen4_exp): 'block_table' is a tensor ([padded_bs * num_tokens, max_blocks],
+    # None for a prompt) read by the sparse QSA decode. 'lattice_store_differs' is a bool the
+    # PLE and GDN layers branch on in Python, so it is hashed by value on purpose (one graph
+    # per branch, like 'is_prompt' and 'direct_gdn_state'); a tensor would be a host read.
+    # tests/unit_tests/worker/test_flash_next_trim_metadata.py checks that every field these
+    # layers read is listed here.
     attention_metadata = subtuple(metadata, 'TrimmedAttentionMetadata', [
         'attn_bias', 'seq_lens_tensor', 'context_lens_tensor', 'block_list', 'block_mapping', 'block_usage',
         'slot_mapping', 'is_prompt', 'block_size', 'block_groups', 'window_block_list', 'window_block_mapping',
@@ -1934,7 +1941,8 @@ def trim_attn_metadata(metadata: HPUAttentionMetadataV1) -> object:
         'chunked_block_list', 'chunked_block_usage', 'chunked_block_groups', 'prep_initial_states',
         'has_initial_states_p', 'last_chunk_indices_p', 'load_indices_tensor', 'store_indices_tensor',
         'num_accepted_tokens', 'query_start_loc', 'query_start_loc_p', 'padding_mask_flat', 'blocks_caching_range',
-        'mamba_chunks_to_block_mapping', 'seqlens_offsets_for_blocks', 'direct_gdn_state', 'dflash_full_query', 'causal'
+        'mamba_chunks_to_block_mapping', 'seqlens_offsets_for_blocks', 'direct_gdn_state', 'dflash_full_query', 'causal',
+        'block_table', 'lattice_store_differs'
     ])
     return attention_metadata
 

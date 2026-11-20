@@ -19,6 +19,7 @@ import vllm_gaudi.envs as envs  # noqa: E402
 from vllm_gaudi.models.qwen4_exp.qsa_hpu_attention import (  # noqa: E402
     decode_selected_slots,
     prefill_selection_bias,
+    rows_without_selection,
     sparse_decode_attention,
 )
 
@@ -97,6 +98,28 @@ def test_prefill_bias_tiled_columns():
             assert zeros == expected, (b, t, sorted(zeros), sorted(expected))
             others = row[~torch.isin(torch.arange(row.shape[0]), torch.tensor(sorted(expected)))]
             assert torch.all(others == neg_inf)
+
+
+def test_rows_without_selection():
+    selected = torch.tensor([[3, -1, -1], [-1, -1, -1], [-1, -1, 0]], dtype=torch.int32)
+    assert rows_without_selection(selected).tolist() == [[False], [True], [False]]
+
+
+def test_prefill_bias_row_without_selection_is_not_all_inf():
+    """A padding row of a bucket selects nothing (position -1): its bias row must not be all -inf, or the
+    softmax of that row is NaN. It gets an all-zero row; the rows that select something are unchanged."""
+    bs, n_ctx_cols, T = 1, 8, 4
+    context_lens = torch.tensor([8], dtype=torch.int64)
+    selected = torch.full((bs, T, 3), -1, dtype=torch.int32)
+    selected[0, 0, :2] = torch.tensor([2, 8])  # a context position and the first chunk position
+    selected[0, 1, 0] = 9
+    bias = prefill_selection_bias(selected, context_lens, n_ctx_cols, T, torch.float32)
+    assert bias.shape == (bs, 1, T, n_ctx_cols + T)
+    assert torch.nonzero(bias[0, 0, 0] == 0).flatten().tolist() == [2, 8]
+    assert torch.nonzero(bias[0, 0, 1] == 0).flatten().tolist() == [9]
+    for row in (2, 3):  # the rows with no selection
+        assert bool((bias[0, 0, row] == 0).all())
+    assert bool(torch.isfinite(torch.softmax(torch.randn(bs, 1, T, n_ctx_cols + T) + bias, dim=-1)).all())
 
 
 def test_decode_selected_slots():
