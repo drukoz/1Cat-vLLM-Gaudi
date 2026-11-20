@@ -50,6 +50,8 @@ EPS = 1e-6
 CASES = {
     "decode8": ([(9, 1), (2045, 1), (2053, 1), (4001, 1), (20002, 1), (65533, 1), (100001, 1), (131069, 1)], 1),
     "lattice4": ([(100000, 4), (3000, 2), (2040, 4), (60001, 3)], 4),
+    # Contexts up to 32K tokens (256 blocks): the batch a context-sized table (VLLM_HPU_QSA_TABLE_WIDTH=1) narrows.
+    "decode8_32k": ([(9, 1), (2045, 1), (2053, 1), (4001, 1), (20002, 1), (30001, 1), (31005, 1), (32765, 1)], 1),
 }
 
 
@@ -164,14 +166,18 @@ def consumer(selected: torch.Tensor, block_table: torch.Tensor, slot_values: tor
     return torch.where(valid, got, torch.full_like(got, -1.0))
 
 
-def on_device(case: SimpleNamespace, device) -> SimpleNamespace:
-    """Fresh copies of the case's tensors on ``device`` and the decode metadata of the step."""
+def on_device(case: SimpleNamespace, device, width: int | None = None) -> SimpleNamespace:
+    """Fresh copies of the case's tensors on ``device`` and the decode metadata of the step.
+
+    ``width`` keeps only the first ``width`` columns of the block table (a context-sized table).
+    """
     def dev(t):
         return None if t is None else t.clone().to(device)
 
     rope = dev(case.rope)
+    table = case.block_table if width is None else case.block_table[:, :width].contiguous()
     md = SimpleNamespace(is_prompt=False, query_start_loc_p=dev(case.query_start_loc_p),
-                         block_table=dev(case.block_table), block_size=BLOCK)
+                         block_table=dev(table), block_size=BLOCK)
     return SimpleNamespace(md=md, cache=dev(case.cache), ring=dev(case.ring), q=dev(case.q), raw_k=dev(case.raw_k),
                            positions=dev(case.positions), slot_mapping=dev(case.slot_mapping), load=dev(case.load),
                            k_weight=dev(case.k_weight), slot_values=dev(case.slot_values),
@@ -200,18 +206,19 @@ def as_rank(rank: int, world: int, sink: list):
         fused.tp_rank_and_size, fused.all_gather_rows = saved
 
 
-def decode_selection(case: SimpleNamespace, device, mode: int, shard: int = 0, rank_world=None) -> dict:
+def decode_selection(case: SimpleNamespace, device, mode: int, shard: int = 0, rank_world=None,
+                     width: int | None = None) -> dict:
     """One decode step of ``HpuQsaIndexer._select_decode`` on ``device``; host copies of what it produced.
 
     ``mode``/``shard`` are ``VLLM_HPU_QSA_FUSED`` / ``VLLM_HPU_QSA_INDEXER_SHARD``. Returns ``selected`` (int32
     ``[rows, W]``), ``consumer`` (fp32 ``[rows, W]``, built in the same graph as the selection) and ``first_row``;
-    with ``rank_world = (rank, world)`` the rows are that rank's share only.
+    with ``rank_world = (rank, world)`` the rows are that rank's share only. ``width``: see ``on_device``.
     """
     from vllm_gaudi.models.qwen4_exp.qsa import HpuQsaIndexer
     from vllm_gaudi.models.qwen4_exp.qsa_fused_path import QsaFusedMode, QsaShardMode
     from vllm_gaudi.models.qwen4_exp.qsa_sparse_ops import expand_selection
 
-    dev = on_device(case, device)
+    dev = on_device(case, device, width)
     indexer = SimpleNamespace(index_head_dim=DIM, compress_ratio=RATIO, block_topk=TOPK,
                               fused_mode=QsaFusedMode(mode), shard_mode=QsaShardMode(shard),
                               key_ring_slots=int(dev.ring.shape[0]) // RING_ROWS, _key_ring_flat=dev.ring,
