@@ -14,9 +14,10 @@ This file is the rental gate of the MoE glue (``gates.moe_glue``); ``docs/design
 ("MoE glue kernels", "Rental gate") says what a pass means.
 
 ``MOE_GLUE_OP_TEST_DEVICE=cpu`` is a dry run of this file without a card (``test_moe_hpu_op_dry_run.py``):
-the ops run their CPU stand-in, with the kernel's own rule for equal logits, and the vendor ops run the
-CPU stand-ins of ``tests/unit_tests/models/flash_next/moe_block.py``.  It proves that this file runs, not
-that a kernel is right.
+the ops are stand-ins for the kernels (the kernel's own rule for equal logits, the kernel's oracle for the
+row quantization), the vendor ops run the CPU stand-ins of ``tests/unit_tests/models/flash_next/moe_block.py``,
+and the plugin's ``dynamic_quant`` runs with the one arithmetic rule of the card that is known to differ
+from CPU torch (``hpu_arithmetic.py``).  It proves that this file runs, not that a kernel is right.
 """
 
 import os
@@ -36,7 +37,7 @@ else:
     pytest.importorskip("habana_frameworks.torch")
 
 from flashinfer_gaudi import _native  # noqa: E402
-from tests.unit_tests.hc_fused import moe_case, moe_ops, moe_reference  # noqa: E402
+from tests.unit_tests.hc_fused import hpu_arithmetic, moe_case, moe_ops, moe_reference  # noqa: E402
 from tests.unit_tests.hc_fused.moe_case import (BF16, HPU_CASES, INPUT_ORDER, OP_NAME, OUTPUT_ORDER,  # noqa: E402
                                                 case_by_name, compare, make_inputs, scalars, summary)
 
@@ -58,8 +59,23 @@ def _route(gates, experts, top_k):
     return moe_ops.moe_route(gates, experts, top_k)
 
 
+def _row_quant(x, fp8_max):
+    """The quantization op.  In a dry run the stand-in is the kernel's oracle, not the op's CPU kernel."""
+    if DRY_RUN:
+        return moe_reference.moe_row_quant_reference(x, fp8_max)
+    return moe_ops.moe_row_quant(x, fp8_max)
+
+
+def _dynamic_quant_on_the_card(plugin_ops, x):
+    """The plugin's dynamic_quant.  A dry run has no card: the same function with the card's scalar division."""
+    if DRY_RUN:
+        with hpu_arithmetic.card_arithmetic():
+            return plugin_ops.dynamic_quant(x)
+    return plugin_ops.dynamic_quant(x)
+
+
 def _run(case, device_inputs):
-    op = _route if case.kind == "route" else getattr(moe_ops, OP_NAME[case.kind])
+    op = {"route": _route, "row_quant": _row_quant}.get(case.kind) or getattr(moe_ops, OP_NAME[case.kind])
     out = op(*[device_inputs[name] for name in INPUT_ORDER[case.kind]], *scalars(case))
     out = out if isinstance(out, tuple) else (out, )
     assert len(out) == len(OUTPUT_ORDER[case.kind])
@@ -203,13 +219,14 @@ def test_row_quant_is_the_plugins_dynamic_quant_on_the_card(monkeypatch):
                  "VLLM_HPU_CGUID_DYNAMIC_QUANT"):
         monkeypatch.setenv(flag, "0")
         assert not getattr(plugin_ops.gaudi_envs, flag), flag
+    if DRY_RUN:  # a dry run stands for a Gaudi2 card: its fp8 range, in the plugin and in the cast stand-in
+        monkeypatch.setattr(plugin_ops, "FP8_MAX", moe_reference.GAUDI2_FP8_MAX)
     fp8_max = float(plugin_ops.FP8_MAX)
-    if not DRY_RUN:
-        assert fp8_max == moe_reference.GAUDI2_FP8_MAX, "FP8_MAX of the plugin on this device is not Gaudi2's 240"
+    assert fp8_max == moe_reference.GAUDI2_FP8_MAX, "FP8_MAX of the plugin on this device is not Gaudi2's 240"
     for name in ("row_quant_real_r32", "row_quant_real_stress", "row_quant_real_edge"):
         x = make_inputs(case_by_name(name))["x"].to(DEVICE)
-        want_fp8, want_scale = plugin_ops.dynamic_quant(x)
-        got_fp8, got_scale = moe_ops.moe_row_quant(x, fp8_max)
+        want_fp8, want_scale = _dynamic_quant_on_the_card(plugin_ops, x)
+        got_fp8, got_scale = _row_quant(x, fp8_max)
         assert got_fp8.dtype == want_fp8.dtype == torch.float8_e4m3fn and got_scale.dtype == want_scale.dtype
         scale_differs = int((got_scale.cpu() != want_scale.cpu()).sum())
         have, want = got_fp8.cpu().float(), want_fp8.cpu().float()
