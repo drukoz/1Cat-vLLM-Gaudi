@@ -529,6 +529,11 @@ fi
 # stay zombies and every crashed server cost the orchestrator its full 65 s stop wait on the
 # 2026-11-18 rental). --sig-proxy=false and the run-id label belong to the end path below: the script
 # itself signals the container, and it only ever stops a container that carries its own run id.
+# PT_HPU_LAZY_ACC_PAR_MODE=0 turns the bridge's parallel graph accumulation off for every process of
+# the run (gates, tiny gate, servers): with it on, a custom op (GDN, hyper-connection, MoE glue) whose
+# input is produced by a still-queued op gets that input as an empty graph input ("Empty tensor
+# optional", "ValidateSyncInputTensors tensor_data is empty"). Card test 2026-11-20: the
+# hyper-connection op test is 84 passed, 6 failed with the default 1 and 90 passed with 0.
 # PYTHONFAULTHANDLER gives every Python process a stack on a crash; HABANA_LOGS moves the Habana
 # runtime logs from the container's home (gone with --rm) into the run folder.
 DOCKER_CMD=(
@@ -541,6 +546,7 @@ DOCKER_CMD=(
     -e OMPI_MCA_btl_vader_single_copy_mechanism=none
     -e PYTHONUNBUFFERED=1
     -e PYTHONFAULTHANDLER=1
+    -e PT_HPU_LAZY_ACC_PAR_MODE=0
     -e "HABANA_LOGS=/results/$RUN_ID/habana_logs"
     --cap-add=sys_nice
     --net=host
