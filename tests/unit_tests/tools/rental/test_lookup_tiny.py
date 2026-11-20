@@ -35,7 +35,10 @@ def test_every_oracle_schedule_fits_its_k():
         if config["oracle"]:
             assert max(config["oracle"]["schedule"]) == k and 0 in config["oracle"]["schedule"], name
         assert config["passes"], name
-    assert lt.CONFIGS["mtp3-lookup"]["env"] == {lt.LOOKUP_ENV: "1"}
+    assert lt.CONFIGS["mtp3-lookup"]["env"] == {lt.LOOKUP_ENV: "1", "VLLM_HPU_GDN_CORE_VERIFY": "1"}
+    assert lt.CONFIGS["ngram3-fused"]["env"] == {"VLLM_HPU_GDN_CORE_VERIFY": "1"}
+    assert "env" not in lt.CONFIGS["ngram8"]  # 9 rows: the torch recurrence (the preset's VERIFY=0)
+    assert lt.DEFAULT_CONFIGS.split(",") == ["ngram3", "ngram8", "mtp3-lookup", "ngram3-search"]
     assert [p[1] for p in lt.CONFIGS["mtp3-lookup"]["passes"]] == [1, 2, 0]
 
 
@@ -138,7 +141,7 @@ def test_whole_run_passes_on_lossless_servers(monkeypatch, tmp_path, capsys):
     assert rc == 0, printed
     record = json.loads((out / "lookup_tiny.json").read_text())
     assert record["baseline"]["status"] == "passed" and len(record["baseline"]["streams"]) == 11
-    assert [c["config"] for c in record["configs"]] == list(lt.CONFIGS)
+    assert [c["config"] for c in record["configs"]] == lt.DEFAULT_CONFIGS.split(",")
     assert all(c["status"] == "passed" for c in record["configs"])
     hybrid = record["configs"][2]
     assert [p["pass"] for p in hybrid["passes"]] == ["hybrid", "lookup-only", "mtp"]

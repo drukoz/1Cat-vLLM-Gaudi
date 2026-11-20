@@ -17,14 +17,18 @@ speculative paths on the tiny checkpoint in a few minutes per server. Inside a f
    must be a near-tie of the baseline (the best two log-probabilities within ``TIE``; bfloat16 logits of a
    random model are nearly flat, and two correct computations in different batch shapes can pick either).
 
-Configurations (``--configs``, default all in this order), one server each:
+Configurations (``--configs``, default ngram3,ngram8,mtp3-lookup,ngram3-search), one server each:
   ngram3         n-gram k = 3, oracle drafts on the ragged schedule 3,1,0,2,3,3,3, a tampered draft every 4th
                  context length: every accepted count 0..3, empty drafts, steps widened after a full acceptance
   ngram8         n-gram k = 8 (9-row verification, the torch GDN recurrence), schedule 8,4,0,6,8,3,7,1,5,2
   mtp3-lookup    MTP k = 3 with VLLM_HPU_FLASH_NEXT_SPEC_LOOKUP=1 and the oracle of ngram3, three passes over the
                  scenarios with the request's own mode (vllm_xargs spec_lookup): hybrid (lookup rows padded with
                  -1 to k, and MTP rows, in the same streams), lookup-only (lookup rows or k empty drafts), mtp
-                 (the MTP drafts alone: what the other two share with plain MTP)
+                 (the MTP drafts alone: what the other two share with plain MTP). It verifies with the fused
+                 GDN verification op (VLLM_HPU_GDN_CORE_VERIFY=1), the path the MTP track runs on the card; the
+                 n-gram configurations verify with the torch recurrence (their steps are ragged, and 9 rows are
+                 more than the op takes)
+  ngram3-fused   ngram3 with the fused GDN verification op (rows of 2 to 4 tokens)
   ngram3-search  n-gram k = 3 with vLLM's own search and prompt_lookup_min 1 (drafts on most steps, hardly any
                  accepted): the numba search in the workers, ragged widths without an oracle
 
@@ -70,11 +74,16 @@ CONFIGS = {
     "ngram8": {"spec": dict(NGRAM, num_speculative_tokens=8),
                "oracle": {"schedule": [8, 4, 0, 6, 8, 3, 7, 1, 5, 2], "tamper_every": 5},
                "passes": [("ngram8", None, True)]},
-    "mtp3-lookup": {"spec": MTP3, "env": {LOOKUP_ENV: "1"}, "oracle": RAGGED,
+    "mtp3-lookup": {"spec": MTP3, "env": {LOOKUP_ENV: "1", "VLLM_HPU_GDN_CORE_VERIFY": "1"}, "oracle": RAGGED,
                     "passes": [("hybrid", 1, True), ("lookup-only", 2, True), ("mtp", 0, False)]},
+    "ngram3-fused": {"spec": dict(NGRAM, num_speculative_tokens=3), "env": {"VLLM_HPU_GDN_CORE_VERIFY": "1"},
+                     "oracle": RAGGED, "passes": [("ngram3-fused", None, True)]},
     "ngram3-search": {"spec": dict(NGRAM, num_speculative_tokens=3, prompt_lookup_min=1), "oracle": None,
                       "passes": [("ngram3-search", None, False)]},
 }
+
+
+DEFAULT_CONFIGS = "ngram3,ngram8,mtp3-lookup,ngram3-search"
 
 
 def scenarios(reference: dict, tokens: int) -> list[dict]:
@@ -326,7 +335,7 @@ def summary_line(entry: dict) -> str:
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    ap.add_argument("--configs", default=",".join(CONFIGS), help="comma-separated, of: %s" % ", ".join(CONFIGS))
+    ap.add_argument("--configs", default=DEFAULT_CONFIGS, help="comma-separated, of: %s" % ", ".join(CONFIGS))
     ap.add_argument("--tp", type=int, default=int(os.environ.get("FARM_NCARDS") or 8))
     ap.add_argument("--tokens", type=int, default=48, help="tokens generated per request (default 48)")
     ap.add_argument("--out", default=os.environ.get("FARM_OUT") or "/results/lookup-tiny")
