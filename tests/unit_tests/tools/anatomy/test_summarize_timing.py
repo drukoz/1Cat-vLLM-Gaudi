@@ -84,3 +84,9 @@ def test_summarize_without_probe_groups_by_mode_and_rows(tmp_path):
     result = summarize_timing.summarize(str(tmp_path))
     assert [c["label"] for c in result["columns"]] == ["mode1/N=8"]
     assert summarize_timing.main([str(tmp_path)]) == 0
+
+
+def test_summarize_reads_records_in_the_run_folder_itself(tmp_path):
+    _run_worker(tmp_path, 0, 32, 30, 70.0, 3.0)  # a farm-serve server writes into its working directory
+    result = summarize_timing.summarize(str(tmp_path))
+    assert [c["label"] for c in result["columns"]] == ["mode1/N=32"]

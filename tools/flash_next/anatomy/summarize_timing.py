@@ -2,7 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Budget tables of the step timer (``VLLM_HPU_STEP_TIMING``) of one server run of the step-anatomy job.
 
-``python3 -I summarize_timing.py <run dir>`` reads ``<run dir>/timing/step_timing_<role>_r<rank>_<pid>.jsonl``
+``python3 -I summarize_timing.py <run dir>`` reads ``<run dir>/timing/step_timing_<role>_r<rank>_<pid>.jsonl`` (or the
+same files in ``<run dir>`` itself, where a ``farm serve`` server's timer writes them)
 (one JSON record per window: the steps of one kind and row count between two idle gaps) and, when present,
 ``<run dir>/probe.json`` of ``anatomy_probe.py`` (the wall-clock span of every round). Each record is matched to
 the probe round it falls in, and the steady records (``kind`` decode or verify, ``rows`` equal to the round's
@@ -30,7 +31,9 @@ FILE_RE = re.compile(r"step_timing_(?P<role>[a-z]+)_r(?P<rank>\d+)_(?P<pid>\d+)\
 
 def load_records(run_dir: str) -> list:
     records = []
-    for path in sorted(glob.glob(os.path.join(run_dir, "timing", "step_timing_*.jsonl"))):
+    paths = glob.glob(os.path.join(run_dir, "timing", "step_timing_*.jsonl"))
+    paths += glob.glob(os.path.join(run_dir, "step_timing_*.jsonl"))  # a server whose timer wrote to its cwd
+    for path in sorted(set(paths)):
         match = FILE_RE.search(os.path.basename(path))
         with open(path, encoding="utf-8") as fh:
             for line in fh:
