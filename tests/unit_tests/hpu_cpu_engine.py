@@ -429,6 +429,16 @@ def _record_draft_calls(runner) -> list[dict]:
                        common_attn_metadata, block_table_cpu_tensor, model_runner, *args, **kwargs)
 
     drafter.propose = recording
+    fill = getattr(drafter, "fill_prefill_chunk", None)
+    if fill is not None:
+
+        def recording_fill(token_ids, position_ids, target_hidden_states, attn_metadata, last_index, next_token_id):
+            real = position_ids.reshape(-1)[:int(last_index) + 1]
+            calls.append({"fill": True, "first_position": int(real.min()), "last_position": int(real.max()),
+                          "next_token_id": int(next_token_id)})
+            return fill(token_ids, position_ids, target_hidden_states, attn_metadata, last_index, next_token_id)
+
+        drafter.fill_prefill_chunk = recording_fill
     return calls
 
 
@@ -498,6 +508,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--max-tokens", type=int, default=16)
     parser.add_argument("--max-model-len", type=int, default=4096)
     parser.add_argument("--max-num-seqs", type=int, default=4)
+    parser.add_argument("--max-num-batched-tokens", type=int, default=None, help="the chunk budget of a step")
     parser.add_argument("--concurrent", action="store_true", help="send every prompt in one generate call")
     parser.add_argument("--oracle", default=None,
                         help='JSON {"streams": [{"prompt_ids", "generated_ids"}], "accept": [a0, a1, ...]}: the '
@@ -522,6 +533,8 @@ def main(argv: list[str] | None = None) -> int:
                   language_model_only=True,
                   trust_remote_code=True,
                   enable_prefix_caching=not args.no_prefix_caching)
+    if args.max_num_batched_tokens:
+        kwargs["max_num_batched_tokens"] = args.max_num_batched_tokens
     if args.k:
         kwargs["speculative_config"] = {"method": "mtp", "num_speculative_tokens": args.k}
     llm = LLM(**kwargs)

@@ -115,6 +115,14 @@ accepted token, `num_tokens_no_spec - 2` once the step's tokens are counted),
 so the host builds the next step's metadata while the device runs draft step 0;
 the drafts are the same.
 
+`VLLM_HPU_MTP_CHUNK_KV` decides whether the Flash-Next MTP draft runs over the
+prefill chunks that complete no prompt, as an integer. `0` (default): it runs
+only over the chunk that completes a prompt, so its attention layer has no KV
+for the earlier chunks of a prompt above the chunk threshold, and every later
+draft attends to whatever those blocks hold. `1`: it also runs over each such
+chunk (one draft forward per chunk, the prompt's next token as the input at the
+chunk's last token, nothing sampled), so its KV covers the whole prompt.
+
 `VLLM_HPU_HC_FUSED` selects the path of the Flash-Next hyper-connections as an
 integer. `0` (default) keeps the torch path. `1` runs the element-wise parts of
 every hyper-connection (the grouped norm, the silu with the injection split, the

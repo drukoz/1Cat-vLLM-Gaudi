@@ -98,9 +98,10 @@ def _check_oracle(engine_runs: dict, run: dict, accept: list[int], k: int) -> No
             assert after["n_out"] - before["n_out"] == before["accept"] + 1, (before, after)
             checked += 1
     assert checked >= len(by_req)
-    # the decode batches load from the accepted counts of the step before
+    # the decode batches load from the accepted counts of the step before (1 after a prefill, fewer near
+    # max_tokens, where the scheduler cuts the drafts)
     loaded = {a for step in run["decode_steps"] if step["num_accepted"] for a in step["num_accepted"] if a > 0}
-    assert loaded and loaded <= {a + 1 for a in accept}
+    assert loaded and max(loaded) == max(accept) + 1 and loaded <= set(range(1, k + 2))
     assert max(r for step in run["decode_steps"] for r in step["rows"]) == 1 + k
 
 
@@ -119,7 +120,7 @@ def test_the_drafter_reads_the_attention_groups_block_table(engine_runs):
     facts = engine_runs["spec"]["runner"]
     assert facts["groups"][0]["spec"] == "MambaSpec"  # the premise: group 0 is not the attention group
     assert facts["groups"][facts["attention_group"]]["spec"] == "FullAttentionSpec"
-    calls = engine_runs["spec"]["draft_calls"]
+    calls = [call for call in engine_runs["spec"]["draft_calls"] if not call.get("fill")]
     assert calls
     assert all(call["is_attention_table"] for call in calls), calls[:3]
 
@@ -186,18 +187,36 @@ def test_oracle_drafts_with_the_fused_kernels_reference_ops(engine_runs):
 
 
 def test_sampled_requests_through_the_speculative_engine(engine_runs):
-    # temperature 1.0 with a seed per request: the engine's RejectionSampler runs the HPU sampled path
-    # (apply_sampling_constraints with the torch expand, sampled_rejection_sample); a seeded run repeats itself.
+    # temperature 1.0: the engine's RejectionSampler runs the HPU sampled path (apply_sampling_constraints with
+    # the torch expand, sampled_rejection_sample) and the bonus rows through the sampler. No per-request seed:
+    # the runner makes a torch.Generator on its device, which the CPU stand-in has no backend for (the seeded rows
+    # are checked in sampler/test_hpu_spec_sampled_verify.py).
     env = {"VLLM_HPU_SPEC_SAMPLED_VERIFY": "1"}
-    runs = [hpu_cpu_engine.run(engine_runs["ckpt"], engine_runs["dir"] / f"sampled_{i}.json", "--k", str(K),
-                               "--temperature", "1.0", "--seed", "7", "--max-tokens", "8", env=env) for i in range(2)]
-    for prompt_a, prompt_b in zip(runs[0]["prompts"], runs[1]["prompts"]):
-        assert len(prompt_a["generated_ids"]) == 8
-        assert prompt_a["generated_ids"] == prompt_b["generated_ids"]
-    assert max(r for step in runs[0]["decode_steps"] for r in step["rows"]) == 1 + K
+    run = hpu_cpu_engine.run(engine_runs["ckpt"], engine_runs["dir"] / "sampled.json", "--k", str(K),
+                             "--temperature", "1.0", "--max-tokens", "8", env=env)
+    for prompt in run["prompts"]:
+        assert len(prompt["generated_ids"]) == 8
+        assert all(0 <= t < 248320 for t in prompt["generated_ids"])
+    assert max(r for step in run["decode_steps"] for r in step["rows"]) == 1 + K
 
 
 def test_a_sampled_request_is_refused_without_the_flag(engine_runs):
     with pytest.raises(RuntimeError, match="VLLM_HPU_SPEC_SAMPLED_VERIFY=1"):
         hpu_cpu_engine.run(engine_runs["ckpt"], engine_runs["dir"] / "sampled_refused.json", "--k", str(K),
                            "--temperature", "1.0", "--max-tokens", "4", env={"VLLM_HPU_SPEC_SAMPLED_VERIFY": "0"})
+
+
+def test_the_draft_runs_over_every_chunk_of_a_chunked_prompt(engine_runs):
+    # VLLM_HPU_MTP_CHUNK_KV=1: with a 512-token chunk budget the 700- and 2600-token prompts take several chunks;
+    # the draft now runs over the chunks that complete no prompt too (its KV then covers the whole prompt), and
+    # the stream stays the non-speculative one.
+    options = ("--k", str(K), "--max-num-batched-tokens", "512")
+    off = hpu_cpu_engine.run(engine_runs["ckpt"], engine_runs["dir"] / "chunked_off.json", *options)
+    on = hpu_cpu_engine.run(engine_runs["ckpt"], engine_runs["dir"] / "chunked_on.json", *options,
+                            env={"VLLM_HPU_MTP_CHUNK_KV": "1"})
+    assert not [call for call in off["draft_calls"] if call.get("fill")]
+    fills = [call for call in on["draft_calls"] if call.get("fill")]
+    assert fills and min(call["first_position"] for call in fills) == 0
+    assert max(call["last_position"] for call in fills) >= 2048  # the 2600-token prompt's chunks before its last
+    assert_same_streams(engine_runs["base"], on)
+    assert_same_streams(engine_runs["base"], off)

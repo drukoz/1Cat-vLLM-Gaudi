@@ -534,6 +534,7 @@ if TYPE_CHECKING:
     VLLM_HPU_GDN_CORE_VERIFY: int = 0  # GdnCoreVerifyMode: 0 off (default), 1 fused verification steps
     VLLM_HPU_SPEC_SAMPLED_VERIFY: int = 0  # 0 speculation serves greedy requests only (default), 1 also sampled
     VLLM_HPU_MTP_DRAFT_LOOP: int = 0  # 0 draft positions read back from the device (default), 1 host books
+    VLLM_HPU_MTP_CHUNK_KV: int = 0  # 1 the MTP draft also runs over prefill chunks that complete no prompt
     VLLM_HPU_PLE_HOST_NGRAM_IDS: int = 0  # 0 PLE n-gram ids computed in the graph (default), 1 on the host
     VLLM_HPU_HC_FUSED: int = 0  # 0 torch hyper-connections (default), 1 the fused hyper-connection kernels
     VLLM_HPU_MOE_GLUE: int = 0  # 0 torch MoE glue (default), 1 the fused MoE glue kernels
@@ -1904,6 +1905,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # metadata while the device runs draft step 0.
     "VLLM_HPU_MTP_DRAFT_LOOP":
     lambda: int(os.environ.get("VLLM_HPU_MTP_DRAFT_LOOP", "0")),
+
+    # The Flash-Next MTP draft over chunked prompts. 0 (default) = the draft runs only over the prefill chunk that
+    # completes a prompt, so its attention layer holds no KV for the earlier chunks of a prompt above the chunk
+    # threshold. 1 = it also runs over every chunk that completes no prompt (one draft forward per chunk, nothing
+    # sampled), so its KV covers the whole prompt.
+    "VLLM_HPU_MTP_CHUNK_KV":
+    lambda: int(os.environ.get("VLLM_HPU_MTP_CHUNK_KV", "0")),
 
     # Flash-Next PLE n-gram ids. 0 (default) = every forward computes them on the device (token
     # packing, searchsorted, the EOS shift scan, the int32 limb hash). 1 = the runner computes the

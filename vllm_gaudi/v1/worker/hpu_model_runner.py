@@ -9830,6 +9830,10 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                         # A chunk that completes no prompt sampled nothing; its requests are still prefilling, and
                         # the scheduler drops a prefilling request's drafts. Zero rows keep the draft rows in the
                         # input batch's request order (take_draft_token_ids pairs them by position).
+                        if gaudi_envs.VLLM_HPU_MTP_CHUNK_KV == 1 and hasattr(self.drafter, "fill_prefill_chunk"):
+                            self._fill_draft_kv_for_chunk(scheduler_output, hidden_states_prefills,
+                                                          aux_hidden_states_prefills, idx, req_id, token_ids,
+                                                          position_ids, attn_metadata, prefill_batch_start_idx)
                         draft_token_ids_prefill.append(
                             torch.zeros((len(req_id), self.speculative_config.num_speculative_tokens),
                                         dtype=torch.int64,
@@ -10208,6 +10212,29 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
 
         draft_token_ids = draft_token_ids[:num_decodes]
         return draft_token_ids
+
+    def _fill_draft_kv_for_chunk(self, scheduler_output, hidden_states_prefills, aux_hidden_states_prefills, idx,
+                                 req_ids, token_ids, position_ids, attn_metadata, batch_start_idx) -> None:
+        """VLLM_HPU_MTP_CHUNK_KV=1: the draft's first step over a prefill chunk that completes no prompt.
+
+        Without it the draft never sees such a chunk, so its attention layer has no KV for those positions and
+        every later draft attends to whatever the blocks hold there: on a prompt above the chunk threshold (2048
+        tokens) that is most of the context. The input at the chunk's last token is the prompt's next token
+        (upstream's rule for a partial prefill); nothing is sampled.
+        """
+        if len(req_ids) != 1:
+            return  # merged prefill batches do not happen for hybrid models; keep today's behaviour
+        context = int(self.input_batch.num_computed_tokens_cpu[batch_start_idx])
+        num_tokens = int(scheduler_output.num_scheduled_tokens[req_ids[0]])
+        if num_tokens < 1 or context + num_tokens >= int(self.input_batch.num_prompt_tokens[batch_start_idx]):
+            return
+        next_token_id = int(self.input_batch.token_ids_cpu[batch_start_idx, context + num_tokens])
+        if self.use_aux_hidden_state_outputs:
+            target_hidden_states = torch.cat(aux_hidden_states_prefills[idx], dim=-1)
+        else:
+            target_hidden_states = hidden_states_prefills[idx]
+        self.drafter.fill_prefill_chunk(token_ids, position_ids, target_hidden_states, attn_metadata, num_tokens - 1,
+                                        next_token_id)
 
     def propose_eagle_prefill(
         self,

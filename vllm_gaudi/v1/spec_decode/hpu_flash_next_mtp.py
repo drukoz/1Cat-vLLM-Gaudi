@@ -211,6 +211,30 @@ class HpuFlashNextMtpProposer(HpuEagleProposer):
             self.last_draft_top_ids = torch.stack(draft_top_ids, dim=1)
         return draft_token_ids
 
+    def fill_prefill_chunk(self, token_ids, position_ids, target_hidden_states, attn_metadata, last_index: int,
+                           next_token_id: int) -> None:
+        """The draft's first step over a prefill chunk that completes no prompt (VLLM_HPU_MTP_CHUNK_KV=1): its
+        attention layer writes its KV for the chunk's positions, as the target's layers do; nothing is sampled.
+
+        The inputs are those of a prefill propose (``propose`` with the chunk's metadata): the tokens shifted one to
+        the left, the prompt's next token at the chunk's last token (``last_index``), the target's multi stream
+        of the chunk as the hidden state.
+        """
+        tokens = token_ids.reshape(-1)
+        shifted = torch.cat((tokens[1:], tokens[:1]))
+        index = torch.tensor([int(last_index)], dtype=torch.int64, device=shifted.device)
+        value = torch.tensor([int(next_token_id)], dtype=shifted.dtype, device=shifted.device)
+        shifted.index_copy_(0, index, value)
+        hidden = target_hidden_states.unsqueeze(0) if target_hidden_states.dim() == 2 else target_hidden_states
+        self.model(
+            input_ids=shifted.unsqueeze(0),
+            positions=position_ids,
+            hidden_states=flat_token_rows(hidden),
+            inputs_embeds=None,
+            attn_metadata=attn_metadata,
+            spec_step_idx=0,
+        )
+
     # VLLM_HPU_MTP_DRAFT_LOOP=1: the runner's host books give each draft row's base position (the position of the
     # request's last accepted token, num_tokens_no_spec - 2 after the step's tokens are counted), set right before
     # propose and taken by it, so the draft loop reads no device value back (no sync behind draft step 0).
