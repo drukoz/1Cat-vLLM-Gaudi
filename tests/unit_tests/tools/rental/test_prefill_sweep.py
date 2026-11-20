@@ -342,3 +342,84 @@ def test_an_interrupted_run_still_writes_its_report(server, tmp_path):
         report = json.loads((out / "prefill_sweep.json").read_text())
         assert [row["case"] for row in report["cases"]] == ["cold 2048"], output
         assert (out / "prefill_sweep.md").exists()
+
+
+# ----- the agent loop -----
+
+
+def test_summarize_agents_reports_what_a_stream_sees():
+    # two agents; a turn: sent at t, first token 0.5 s later, then 4 more tokens 0.1 s apart
+    def turn(name, t_send, cached):
+        arrivals = [[t_send + 0.5 + 0.1 * i, i + 1] for i in range(5)]
+        return {"name": name, "status": 0, "t_send": t_send, "t_first": arrivals[0][0], "t_last": arrivals[-1][0],
+                "arrivals": arrivals, "output_tokens": 5, "prompt_tokens": 1000, "sent_tokens": 1000,
+                "cached_tokens": cached}
+
+    records = [turn("agent-0-turn-1", 0.0, 600), turn("agent-0-turn-2", 1.0, 800), turn("agent-1-turn-1", 0.0, 600)]
+    records.append({"name": "agent-1-turn-2", "status": 2, "t_send": 1.0, "t_first": None, "t_last": None,
+                    "arrivals": [], "output_tokens": 0, "prompt_tokens": None, "sent_tokens": 1000,
+                    "cached_tokens": None})
+    got = ps.summarize_agents(records, 0.0, 2.0)
+    assert (got["agents"], got["turns"], got["output_tokens"]) == (2, 3, 15)
+    assert got["output_tokens_per_s"] == pytest.approx(7.5)
+    assert got["stream_tokens_per_s_p50"] == pytest.approx(10.0) and got["stream_tokens_per_s_min"] == pytest.approx(10.0)
+    assert got["itl_p50_ms"] == pytest.approx(100.0) and got["itl_max_ms"] == pytest.approx(100.0)
+    assert got["ttft_p50_s"] == pytest.approx(0.5) and got["ttft_max_s"] == pytest.approx(0.5)
+    assert got["uncached_tokens_per_turn"] == pytest.approx((400 + 200 + 400) / 3)
+    assert got["decoding_share"] == pytest.approx(3 * 0.4 / (2.0 * 2))
+
+
+def test_agents_plan_runs_conversations_in_a_closed_loop(server, tmp_path):
+    code, report, out = run_tool(server, tmp_path, "--plan", "agents", "--agents", "3", "--agent-context", "4096",
+                                 "--agent-new-tokens", "512", "--agent-output", "16", "--agent-seconds", "2.0",
+                                 "--canaries", "0")
+    assert code == 0
+    setup, loop = report["cases"]
+    assert setup["case"] == "agents setup 3x4096" and setup["aggregate"]["uncached_tokens"] == 3 * 4096
+    assert loop["case"] == "agents 3x4096 +512 in 16 out"
+    agents = loop["agents"]
+    assert agents["agents"] == 3 and agents["turns"] >= 3
+    assert agents["turns"] == len(loop["requests"]) and loop["aggregate"]["errors"] == 0
+    assert agents["output_tokens"] == 16 * agents["turns"] and agents["output_tokens_per_s"] > 0
+    # a turn re-sends the conversation: all of it but the new tokens (and the last partial block) is cached
+    first_turns = [r for r in loop["requests"] if r["name"].endswith("-turn-1")]
+    assert len(first_turns) == 3
+    for request in first_turns:
+        assert request["sent_tokens"] == 4096 + 16 + 512
+        assert request["cached_tokens"] == 4096 and request["uncached_tokens"] == 16 + 512
+    second_turns = [r for r in loop["requests"] if r["name"].endswith("-turn-2")]
+    assert second_turns and all(r["sent_tokens"] == 4096 + 2 * (16 + 512) for r in second_turns)
+    assert all(r["cached_tokens"] == 4608 for r in second_turns)  # 4,640 tokens of history: 9 full blocks
+    assert 0.0 < agents["decoding_share"] <= 1.0
+    assert agents["itl_p50_ms"] is not None and agents["ttft_p50_s"] > 0
+    text = (out / "prefill_sweep.md").read_text()
+    assert "## Agent loops" in text and "| server | agents 3x4096 +512 in 16 out |" in text
+    assert "| server | agents setup 3x4096 | 3 |" in text
+
+
+def test_agents_plan_runs_one_loop_per_pacing_pair_with_fresh_turns(server, tmp_path):
+    code, report, _ = run_tool(server, tmp_path, "--plan", "agents", "--knobs-file", str(server.knobs), "--agents",
+                               "2", "--agent-context", "2048", "--agent-new-tokens", "512", "--agent-output", "8",
+                               "--agent-seconds", "1.0", "--agent-pacing", "100:0,25:512", "--canaries", "0")
+    assert code == 0
+    assert [(row["setting"], row["case"]) for row in report["cases"]] == [
+        ("server", "agents setup 2x2048"), ("pacing off", "agents 2x2048 +512 in 8 out"),
+        ("share 25% slice 512", "agents 2x2048 +512 in 8 out")]
+    assert server.knobs_seen == [{"mode": 0}, {"mode": 1, "share_percent": 25, "slice_tokens": 512}]
+    assert json.loads(server.knobs.read_text()) == {}
+    # the second loop goes on from the first loop's conversations and never repeats one of its turns
+    second = report["cases"][2]["requests"]
+    assert all(r["uncached_tokens"] >= 512 for r in second)
+    assert min(r["sent_tokens"] for r in second) > 2048 + 8 + 512
+
+
+def test_a_second_run_reuses_the_conversations_and_sends_new_turns(server, tmp_path):
+    common = ["--url", server.url, "--model", "m", "--synthetic-ids", "--corpus-tokens", "50000", "--plan", "agents",
+              "--agents", "2", "--agent-context", "2048", "--agent-new-tokens", "512", "--agent-output", "8",
+              "--agent-seconds", "0.5", "--canaries", "0", "--nonce", "same"]
+    assert ps.main(common + ["--out", str(tmp_path / "one")]) == 0
+    assert ps.main(common + ["--out", str(tmp_path / "two")]) == 0
+    two = json.loads((tmp_path / "two" / "prefill_sweep.json").read_text())["cases"]
+    # the first turns were cached by run one (all but the last block: a prompt's last token is always computed)
+    assert [r["cached_tokens"] for r in two[0]["requests"]] == [1536, 1536]
+    assert all(r["uncached_tokens"] >= 512 for r in two[1]["requests"])  # its turns are new

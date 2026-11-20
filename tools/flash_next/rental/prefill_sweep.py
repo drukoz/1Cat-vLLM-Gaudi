@@ -22,7 +22,12 @@ before, during and after the prefill. The cases:
 Plans: ``baseline`` runs all of them at the server's own settings; ``ladder`` sends cold requests of
 growing length (the rate by context depth: a rate that falls with depth is work that grows with the
 context); ``sweep`` repeats ``cold`` and ``concurrent`` for every ``--settings`` pair of step budget and
-per-request prompt cap; ``pacing`` repeats ``cold`` under every ``--pacing`` pair of share and slice.
+per-request prompt cap; ``pacing`` repeats ``cold`` under every ``--pacing`` pair of share and slice;
+``agents`` is the workload itself in small: ``--agents`` conversations of ``--agent-context`` tokens, each
+sending its next turn (the history, what it generated and ``--agent-new-tokens`` new tokens) as soon as
+its last one ended, for ``--agent-seconds``, once per ``--pacing`` pair when that option is given. It
+reports what an agent sees while the others' turns arrive: output tokens per second in all and per
+stream while it decodes, the inter-token latency and the time to first token of a turn.
 ``sweep`` and ``pacing`` change the settings of the RUNNING server through ``--knobs-file``, the file the
 server was started with as ``VLLM_HPU_SCHED_KNOBS_FILE`` (``vllm_gaudi/v1/core/sched/prefill_pacing.py``),
 so the server starts once, with ``--max-num-batched-tokens`` at the largest budget of the sweep.
@@ -72,7 +77,7 @@ KNOBS_SETTLE_S = 0.8  # the engine polls the knobs file every 0.25 s
 SYNTHETIC_ID_RANGE = (1000, 60000)  # ordinary vocabulary ids, far from the special tokens at the top
 RECORDED_TOKEN_IDS = 64  # output token ids kept per request row (--return-ids)
 
-PLANS = ("baseline", "ladder", "sweep", "pacing")
+PLANS = ("baseline", "ladder", "sweep", "pacing", "agents")
 DEFAULT_SETTINGS = "8192:2048,8192:8192,16384:4096,16384:16384,32768:8192,32768:32768,65536:16384,65536:0"
 DEFAULT_PACING = "100:0,50:2048,25:2048,25:512,10:2048"
 METRIC_NAMES = {
@@ -564,10 +569,143 @@ class Runner:
             await self.cold(a.sweep_tokens)
         await self.set_knobs("server", {})
 
+    # ----- the agent loop -----
+
+    async def plan_agents(self) -> None:
+        """``--agents`` conversations in a closed loop (the module text), once per ``--agent-pacing`` pair."""
+        a = self.args
+        prompts = [self.corpus.cold(a.agent_context, f"agent-{i}") for i in range(a.agents)]
+        setup = await self.run_case(f"agents setup {a.agents}x{a.agent_context}",
+                                    [(f"agent-{i}", ids) for i, ids in enumerate(prompts)],
+                                    max_tokens=a.agent_output, return_ids=True, canaries=False)
+        histories = [ids + record["token_ids"] for ids, record in zip(prompts, setup["_records"])]
+        if not a.agent_pacing:
+            await self.agent_loop(histories)
+            return
+        for share, slice_tokens in a.agent_pacing:
+            knobs = ({"mode": 0} if share >= 100 else {"mode": 1, "share_percent": share,
+                                                         "slice_tokens": slice_tokens})
+            await self.set_knobs("pacing off" if share >= 100 else f"share {share}% slice {slice_tokens}", knobs)
+            await self.agent_loop(histories)
+        await self.set_knobs("server", {})
+
+    async def agent_loop(self, histories: list[list[int]]) -> dict:
+        """Every agent sends turn after turn until ``--agent-seconds`` have passed; ``histories`` (one token
+        list per agent) grow by each turn's new tokens and output, so a later loop goes on from there."""
+        a = self.args
+        before = self.metrics()
+        t_start = time.time()
+        # new turn tokens in every loop of every run: a turn an earlier loop sent would be a full prefix hit
+        stamp = "%s-%d-%d" % (self.setting["label"], len(self.rows), int(t_start * 1000))
+        deadline = t_start + a.agent_seconds
+        records: list[dict] = []
+
+        async def one_agent(index: int) -> None:
+            turn = 0
+            while time.time() < deadline:
+                turn += 1
+                prompt = histories[index] + self.corpus.take(a.agent_new_tokens, f"agent-{index}-{stamp}-{turn}")
+                if len(prompt) + a.agent_output > a.agent_max_context:
+                    return  # the conversation is full
+                record = new_record(f"agent-{index}-turn-{turn}", len(prompt))
+                records.append(record)
+                await stream_completion(self._session, self.url,
+                                        completion_payload(self.model, prompt, a.agent_output, True), record)
+                if record["status"] != 0:
+                    return
+                histories[index] = prompt + record["token_ids"]
+
+        await asyncio.gather(*[one_agent(i) for i in range(len(histories))])
+        t_end = time.time()  # the turns in flight at the deadline have ended
+        after = self.metrics()
+        rows = [request_row(r) for r in records]
+        result = {
+            "setting": self.setting["label"],
+            "knobs": self.setting["knobs"],
+            "case": "agents %dx%d +%d in %d out" % (len(histories), a.agent_context, a.agent_new_tokens,
+                                                    a.agent_output),
+            "requests": rows,
+            "aggregate": {
+                "requests": len(rows),
+                "uncached_tokens": sum(r["uncached_tokens"] for r in rows),
+                "seconds_to_last_first_token": t_end - t_start,
+                "prefill_tokens_per_s": sum(r["uncached_tokens"] for r in rows) / (t_end - t_start),
+                "errors": sum(1 for r in rows if r["status"] != 0),
+            },
+            "canaries": None,
+            "agents": summarize_agents(records, t_start, t_end),
+            "metrics_delta": {k: (None if before.get(k) is None or after.get(k) is None else after[k] - before[k])
+                              for k in METRIC_NAMES},
+        }
+        self.rows.append(result)
+        self._cases_file.write(json.dumps(result) + "\n")
+        self._cases_file.flush()
+        print(format_line(result), flush=True)
+        return result
+
+
+def summarize_agents(records: list[dict], t_start: float, t_end: float) -> dict:
+    """What the agents of one loop saw between ``t_start`` and ``t_end`` (every turn had ended by then).
+
+    ``output_tokens_per_s`` is all output over the wall time (prefill waits included: the rate the workload
+    gets); ``stream_tokens_per_s`` is a turn's output over the time from its first to its last token (the
+    rate an agent sees while it decodes), median and slowest turn; the inter-token latencies are over every
+    token of every turn; ``ttft_s`` is per turn (the prefill of the turn's uncached tokens and the wait for
+    it); ``decoding_share`` is the part of the wall time an average agent spent between a first and a last
+    token.
+    """
+    done = [r for r in records if r["status"] == 0 and r["t_first"] is not None]
+    gaps: list[float] = []
+    rates: list[float] = []
+    decoding = 0.0
+    for r in done:
+        previous_t, previous_n = None, 0
+        for t, n in r["arrivals"]:
+            if previous_t is not None:
+                gaps.extend([(t - previous_t) / max(n - previous_n, 1)] * max(n - previous_n, 1))
+            previous_t, previous_n = t, n
+        span = r["t_last"] - r["t_first"]
+        decoding += span
+        if span > 0 and r["output_tokens"] > 1:
+            rates.append((r["output_tokens"] - 1) / span)
+    ttfts = [r["t_first"] - r["t_send"] for r in done]
+    wall = max(t_end - t_start, 1e-9)
+    agents = len({r["name"].rsplit("-turn-", 1)[0] for r in records}) or 1
+    uncached = [(r["prompt_tokens"] if r["prompt_tokens"] is not None else r["sent_tokens"]) - (r["cached_tokens"] or 0)
+                for r in done]
+    return {
+        "seconds": wall,
+        "agents": agents,
+        "turns": len(done),
+        "output_tokens": sum(r["output_tokens"] for r in records),
+        "output_tokens_per_s": sum(r["output_tokens"] for r in records) / wall,
+        "stream_tokens_per_s_p50": statistics.median(rates) if rates else None,
+        "stream_tokens_per_s_min": min(rates) if rates else None,
+        "itl_p50_ms": None if not gaps else statistics.median(gaps) * 1000.0,
+        "itl_p90_ms": None if not gaps else percentile(gaps, 0.90) * 1000.0,
+        "itl_p99_ms": None if not gaps else percentile(gaps, 0.99) * 1000.0,
+        "itl_max_ms": None if not gaps else max(gaps) * 1000.0,
+        "ttft_p50_s": statistics.median(ttfts) if ttfts else None,
+        "ttft_max_s": max(ttfts) if ttfts else None,
+        "uncached_tokens_per_turn": statistics.mean(uncached) if uncached else None,
+        "decoding_share": decoding / (wall * agents),
+    }
+
 
 def format_line(result: dict) -> str:
     agg = result["aggregate"]
     rows = result["requests"]
+    if result.get("agents"):
+        g = result["agents"]
+        text = ("%-22s %-28s %d turns in %.0f s: output %s tok/s in all, %s per stream while decoding (slowest "
+                "%s); ITL ms p50 %s p99 %s max %s; TTFT s p50 %s max %s; %s uncached tokens per turn" % (
+                    result["setting"], result["case"], g["turns"], g["seconds"], _fmt(g["output_tokens_per_s"]),
+                    _fmt(g["stream_tokens_per_s_p50"]), _fmt(g["stream_tokens_per_s_min"]), _fmt(g["itl_p50_ms"]),
+                    _fmt(g["itl_p99_ms"]), _fmt(g["itl_max_ms"], 0), _fmt(g["ttft_p50_s"], 2),
+                    _fmt(g["ttft_max_s"], 2), _fmt(g["uncached_tokens_per_turn"], 0)))
+        if agg["errors"]:
+            text += " | ERRORS %d: %s" % (agg["errors"], next(r["error"] for r in rows if r["status"] != 0))
+        return text
     ttfts = [r["ttft_s"] for r in rows if r["ttft_s"] is not None]
     cached = sum(r["cached_tokens"] or 0 for r in rows)
     text = "%-22s %-28s uncached %7d cached %7d ttft %s s rate %s tok/s" % (
@@ -605,6 +743,8 @@ def write_report(out_dir: Path, rows: list[dict], meta: dict) -> None:
         "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|",
     ]
     for row in clean:
+        if row.get("agents"):
+            continue  # the agent loops have their own table
         agg, reqs, can = row["aggregate"], row["requests"], row["canaries"]
         ttfts = [r["ttft_s"] for r in reqs if r["ttft_s"] is not None]
         cached = sum(r["cached_tokens"] or 0 for r in reqs)
@@ -617,6 +757,20 @@ def write_report(out_dir: Path, rows: list[dict], meta: dict) -> None:
             _fmt(during.get("tokens_per_s_p50")), _fmt(during.get("tokens_per_s_min")),
             _fmt(during.get("stall_ms"), 0), _fmt(before.get("itl_p50_ms")), _fmt(during.get("itl_p50_ms")),
             _fmt(during.get("itl_p99_ms")), agg["errors"]))
+    loops = [row for row in clean if row.get("agents")]
+    if loops:
+        lines += ["", "## Agent loops (every agent sends its next turn as soon as its last one ended)", "",
+                  "| setting | case | seconds | turns | output tok/s in all | per stream while decoding (median, slowest "
+                  "turn) | ITL ms p50 | p90 | p99 | max | TTFT s p50 | max | uncached tokens per turn | "
+                  "decoding share | errors |", "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"]
+        for row in loops:
+            g = row["agents"]
+            lines.append("| %s | %s | %.0f | %d | %s | %s, %s | %s | %s | %s | %s | %s | %s | %s | %s | %d |" % (
+                row["setting"], row["case"], g["seconds"], g["turns"], _fmt(g["output_tokens_per_s"]),
+                _fmt(g["stream_tokens_per_s_p50"]), _fmt(g["stream_tokens_per_s_min"]), _fmt(g["itl_p50_ms"]),
+                _fmt(g["itl_p90_ms"]), _fmt(g["itl_p99_ms"]), _fmt(g["itl_max_ms"], 0), _fmt(g["ttft_p50_s"], 2),
+                _fmt(g["ttft_max_s"], 2), _fmt(g["uncached_tokens_per_turn"], 0), _fmt(g["decoding_share"], 2),
+                row["aggregate"]["errors"]))
     marginals = depth_marginals(clean)
     if marginals:
         lines += ["", "## Rate by context depth (single cold requests of growing length)", "",
@@ -702,6 +856,15 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     p.add_argument("--sweep-concurrent", type=_int_list, default=[4])
     p.add_argument("--sweep-concurrent-tokens", type=int, default=0,
                    help="sweep: prompt size of the concurrent requests (0 = --sweep-tokens)")
+    p.add_argument("--agents", type=int, default=8, help="agents: conversations in the loop")
+    p.add_argument("--agent-context", type=int, default=32768, help="agents: prompt tokens of every first turn")
+    p.add_argument("--agent-new-tokens", type=int, default=1024, help="agents: new prompt tokens of every later turn")
+    p.add_argument("--agent-output", type=int, default=256, help="agents: tokens generated per turn")
+    p.add_argument("--agent-seconds", type=float, default=60.0, help="agents: wall time of one loop")
+    p.add_argument("--agent-max-context", type=int, default=131072, help="agents: a conversation stops before this")
+    p.add_argument("--agent-pacing", type=_pairs, default=[],
+                   help="agents: one loop per share_percent:slice_tokens pair (share 100 = pacing off); "
+                   "empty = one loop at the server's settings")
     p.add_argument("--repeat", type=int, default=1,
                    help="cold passes per size; with 2 the first pass compiles the graphs and the second measures")
     p.add_argument("--canaries", type=int, default=2, help="streams already decoding during each case (0 = none)")
@@ -724,6 +887,8 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         p.error("unknown plan(s) %s; known: %s" % (unknown, ", ".join(PLANS)))
     if args.knobs is not None and not args.knobs_file:
         p.error("--knobs needs --knobs-file (the server's VLLM_HPU_SCHED_KNOBS_FILE)")
+    if args.agents < 1 or args.agent_output < 2:
+        p.error("--agents needs at least one agent and --agent-output at least 2 tokens")
     return args
 
 

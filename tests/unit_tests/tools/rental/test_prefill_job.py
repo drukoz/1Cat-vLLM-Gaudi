@@ -156,7 +156,8 @@ def test_the_committed_plans_parse_and_never_repeat_a_cold_prompt():
             names.append(name)
             nonces.append(args.nonce)
             # a line that changes the running server says which file it writes
-            assert (args.knobs is None and "pacing" not in args.plans) or args.knobs_file == "/tmp/prefill_knobs.json"
+            changes = args.knobs is not None or "pacing" in args.plans or ("agents" in args.plans and args.agent_pacing)
+            assert not changes or args.knobs_file == "/tmp/prefill_knobs.json"
         assert len(set(names)) == len(names), plan.name
         # the nonce salts a line's prompts: two lines with one nonce would send the same "cold" prompt twice
         assert len(set(nonces)) == len(nonces) and None not in nonces, plan.name

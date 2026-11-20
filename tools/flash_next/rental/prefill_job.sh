@@ -9,9 +9,10 @@
 #
 # PLAN: a file of prefill_sweep runs, one per line, "NAME ARGS..." (ARGS without --url, --model, --out;
 # '#' lines are comments); a plain name is looked up in prefill_plans/ next to this script: arm.sweeps (one
-# arm of an A/B: a cold 32,768 and a cold 122,880 prompt twice each, four streams decoding during a prefill,
-# four prompts at once), base_then_graphs.sweeps (the arm, then prompt HPU graphs through the runtime knob),
-# arm_then_pacing_cap.sweeps (the arm, then two pacing shares and the 8,192-token prompt cap).
+# arm of an A/B: a cold 32,768 and a cold 122,880 prompt twice each, next turns of 64 to 2,048 new tokens at
+# 120K, four streams decoding during a prefill, four prompts at once), base_then_graphs.sweeps (the arm, then
+# prompt HPU graphs through the runtime knob), arm_then_pacing_cap.sweeps (the arm, then the agent loop with
+# and without pacing, two pacing shares on one prompt, a two-turn conversation and the 8,192-token prompt cap).
 # Server: the rental's command (serve.py) at TP = the job's card count with expert parallelism,
 # --max-num-batched-tokens 8192 --long-prefill-token-threshold 2048 unless EXTRA args override them, and the
 # program head's preset environment of serve_probe.sh (each value only when the job did not set it), plus
