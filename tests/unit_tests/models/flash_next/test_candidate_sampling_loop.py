@@ -2,9 +2,10 @@
 """Sampling over candidates in the whole serving loop (``VLLM_HPU_CANDIDATE_SAMPLING=1``, ``engine_harness``).
 
 * Requests with the checkpoint's default sampling (temperature 1.0, top_k 20, top_p 0.95) decode in the
-  LM-head region: no decode step takes vLLM's sampler, every drawn token is one vLLM's sampler could draw (it
-  has a probability above zero in vLLM's processed distribution of that step's logits), and a greedy request
-  in the same batch still gives the HF reference's tokens.
+  LM-head region: every decode step with a sampled request runs there (only the steps in which the greedy
+  request decodes alone take vLLM's sampler), every drawn token is one vLLM's sampler could draw (it has a
+  probability above zero in vLLM's processed distribution of that step's logits), and a greedy request in the
+  same batch still gives the HF reference's tokens.
 * A seeded request repeats itself.
 * A request outside the conditions (top_k unset, min_p) and a server without the flag keep vLLM's sampler.
 """
@@ -15,6 +16,7 @@ import json  # noqa: E402
 
 import pytest  # noqa: E402
 import torch  # noqa: E402
+from vllm.sampling_params import SamplingType  # noqa: E402
 from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p_pytorch  # noqa: E402
 
 from vllm_gaudi.v1.sample.candidate_sampling import PARAM_COLUMNS  # noqa: E402
@@ -36,13 +38,21 @@ class _Steps:
     def __init__(self, engine) -> None:
         self.sampled = 0
         self.general = 0
+        self.gate: list[tuple[bool, bool]] = []  # per decode step: (every request greedy, the region refused)
         self.draws: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]] = []
         runner = engine.runner
         model = runner.model
         region, inner = model.select_compute_logits_and_sample, model.model
         compute_logits = inner.compute_logits
         generic = runner._execute_model_generic
+        inputs = runner._candidate_sampling_inputs
         captured = {}
+
+        def recording_inputs(request_ids, rows):
+            result = inputs(request_ids, rows)
+            greedy = all(runner.requests[r].sampling_params.sampling_type == SamplingType.GREEDY for r in request_ids)
+            self.gate.append((greedy, result is None))
+            return result
 
         def counting_generic(token_ids, position_ids, attn_metadata, *args, **kwargs):
             if (not attn_metadata.is_prompt and kwargs.get("candidate_sampling") is None
@@ -68,6 +78,7 @@ class _Steps:
 
         model.select_compute_logits_and_sample = sampled_region
         runner._execute_model_generic = counting_generic
+        runner._candidate_sampling_inputs = recording_inputs
 
 
 def vllm_probs(logits, temperature, top_k, top_p):
@@ -87,7 +98,11 @@ def test_sampled_requests_draw_in_the_logits_region(tiny_checkpoint, reference):
         assert engine.tokens["greedy"] == greedy["generated_ids"]  # a greedy row of a mixed batch: the arg max
         for index in range(len(prompts) - 1):
             assert len(engine.tokens[f"s{index}"]) == 12
-    assert steps.sampled > 0 and steps.general == 0, (steps.sampled, steps.general)
+    # Every decode step with a sampled request ran in the region; the others (the greedy request alone, before
+    # the sampled ones finish their prompts or after their last token) took vLLM's sampler as before.
+    assert steps.sampled > 0 and all(refused == greedy for greedy, refused in steps.gate), steps.gate
+    assert steps.sampled == sum(1 for greedy, _ in steps.gate if not greedy)
+    assert steps.general == sum(1 for greedy, _ in steps.gate if greedy)
     checked = 0
     for logits, tokens, params, top_k_index in steps.draws:
         assert tokens.dtype == torch.int64 and tokens.shape == (logits.shape[0], 1)
