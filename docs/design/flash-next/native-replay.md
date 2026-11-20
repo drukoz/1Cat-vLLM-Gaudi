@@ -326,6 +326,18 @@ Readings:
    0000:0b:00.0, which logged the same "unexpected user error interrupt" at 17:48:02 during job 00009). The
    other seven ranks finished; the next process acquired all cards. Later jobs leave that regime out.
 
+8. **The ranks did not report the same times (found 2026-11-20 19:55 UTC in `replay_r8.json`, per rank).** In
+   `replay` with collectives at 32 rows rank 0 reported 10.4 ms per call and 13.7 ms to `synchronize`, the seven
+   other ranks 0.5-0.7 ms and 0.8 ms, less than the body without collectives (1.2 ms); at 1 row all eight
+   reported 16.8-18.8 ms; in `replay_layer` at 1 row rank 0 reported 7.9 ms and the others 20.2 ms. An all-reduce
+   needs every rank, so a rank cannot finish a step 17 times faster than another: on a rank that is ahead the
+   call returns after queueing and `torch.hpu.synchronize()` returns without waiting for the launches that sit
+   behind a collective (INFERRED; VERIFIED only that the reported times differ). So "call" in the table above is
+   not always the host's issue time and "total" not always the end of the step: the slowest rank's median, which
+   the table uses, is the rank that the others waited for. The benchmark now ends every timed call with a read
+   of one output element (`done`, commit `40b14e24`), as the runner's read of the sampled tokens does, records
+   the calling thread's CPU time and context switches per call, and the 00065/00067/00068 jobs measure with it.
+
 What this means for the real decode step (INFERRED): with C1 on, a step replays about 98 collectives and about
 146 recipes. At about 150 us per collective that is 13-19 ms; the 47 per-layer cuts at 45-90 us add 2-4 ms. Together
 they are the "about 22 ms that does not scale with the op count" of the BRIEF's fit; the device time of the ops
@@ -359,7 +371,7 @@ change in each module.
 
 ## Handoff (if this agent stops)
 
-State at 2026-11-20 19:45 UTC (third agent of this track, started 19:00 UTC). Branch
+State at 2026-11-20 20:05 UTC (third agent of this track, started 19:00 UTC). Branch
 `feat/flash-next-gaudi-native-replay` (worktree `/Volumes/Storage/Claude/gaudi-work/wt/native-replay`), pushed to
 `origin`, the program head `b0cd0bb` merged in (`b0140c3f`); nothing of this track is merged into
 `feat/flash-next-gaudi` yet. No uncommitted change in the repository. This harness refuses report files, so this
@@ -379,9 +391,11 @@ the settings that exist), `probes/const_ops.py` (section 7.3), `logs/` (CPU test
   CPU tests green: `tests/unit_tests/worker/test_decode_cut_interval.py` (11),
   `tests/unit_tests/worker/test_hpu_graph_async_replay.py` (4).
 - The benchmark separates a launch from a collective and looks at the host from outside (commits `649d32f6`,
-  `eefaf058`, `22ec52cf`; `tests/unit_tests/tools/test_bench_replay.py`, 21 tests; gloo self-test of every new
-  regime): `replay_seg`, `*_cache`, `*_busy` (the device's floor behind one long operation), `replay_ag`
-  (all-gather plus local sum), host CPU per call, `--env-sets`, `--hold-file` with
+  `eefaf058`, `22ec52cf`, `bb3e2c6d`, `40b14e24`; `tests/unit_tests/tools/test_bench_replay.py`, 25 tests; gloo
+  self-test of every new regime): `replay_seg`, `*_cache`, `*_busy` (the device's floor behind one long
+  operation), `*_work` (device work in every sub-block: is the host held back by a slower device),
+  `replay_ag` (all-gather plus local sum), a read of the output after every timed call (`done`), host CPU per
+  call, `--env-sets`, `--hold-file` with
   `tools/flash_next/replay/host_sampler.sh` (thread CPU and context switches from /proc, gdb stacks, strace of
   rank 0; its process matching tested in the Linux VM; gdb and strace themselves first run in job 00067),
   `--ranks 1`.
@@ -393,11 +407,15 @@ the settings that exist), `probes/const_ops.py` (section 7.3), `logs/` (CPU test
 ### Queued card jobs (submitted 19:22-19:24 UTC) and what to do with each result
 
 Every job is a stub that runs `~/farm/native-replay/late/replay_job.sh RUN MODE 649d32f69cb2`; the commit that
-really runs is the one in `~/farm/native-replay/late/SHA` (now `22ec52cf4480`, image built): write a newer
-synced commit there to move the queued jobs to it. Fetch with
+really runs is the one in `~/farm/native-replay/late/SHA` (now `40b14e24f6b0`; the node keeps the images of
+the last three synced commits): write a newer synced commit there to move the queued jobs to it. Fetch with
 `bin/farm wait <id>; bin/farm fetch native-replay <id> <RUN>...` into `reports/native-replay/card/`.
 `reports/native-replay/probes/knob_table.py <knobs_rN.json>` prints the per-setting table,
-`probes/stacks.py <bench/sampler/stacks.txt>` the stack histogram.
+`probes/per_rank.py <json> [cases] [rows]` every rank's times and CPU, `probes/stacks.py
+<bench/sampler/stacks.txt>` the stack histogram. After its sweep a job serves the tiny model once more with the
+settings that won (`late/pick_settings.py`: 8 % or more at every row count, values right) plus the lines of
+`~/farm/native-replay/late/tinyenv.txt` (`KEY=VALUE ...`, put the one-card job's winners there before 00065
+runs), when 5 minutes of its hold are left: run folder `<RUN>-winners`, log `<RUN>/tiny-winners.log`.
 
 1. **00065** `replay-host-path-r8-tiny-cut` (`all`, 20 min; the coordinator bumps it behind prefill's 00014).
    Run folders `host-r8` and `host-r8-cut`. Steps: (a) `bench/replay_r8.log|json`: 14 regimes at rows 1 and 32,
@@ -429,6 +447,11 @@ model). For the second: `replay_job.sh RUN tinyenv <sha12> name:KEY=VALUE[,KEY=V
 once per setting (submit it as a stub like the others, `any:4` or `any:1`, about 4 min per setting). `late/real_ab.sh` is ready for a real-model A/B
 (not submitted yet): `printf 'bash $HOME/farm/native-replay/late/real_ab.sh real4 1,32 128 base cut:VLLM_HPU_DECODE_CUT_INTERVAL=1000\n' | bin/farm submit native-replay real4-cut-ab any:4 32m`
 (two server starts on the same four cards; results in `real4-base/` and `real4-cut/`, `scaling.json`).
+That job is submitted as **00084** `real4-cut-interval-ab` (`any:4`, 32 min, end of the queue; it will not run
+before the node ends unless the coordinator bumps it). Each arm also writes `hostwatch/` (`late/host_watch.sh`):
+`threads_series.txt`, the CPU time of worker rank 0's threads every 2 s through the probe (the calling thread's
+share at 1 and at 32 streams says whether the host is busy or waits inside the replay call), and native stacks
+after the second measured round at 32 streams.
 
 ### Pending subtasks, in order
 
