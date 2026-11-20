@@ -10,102 +10,74 @@ repository is under `/Volumes/Storage/Claude/gaudi-work/reports/spec-lookup/` (`
 
 ## Handoff (if this agent stops)
 
-State at **2026-11-20 20:22 UTC**. Branch head: the commit that holds this text, pushed. It contains
-mtp-card-ready through `f1aa2292` (both card fixes of job 00021, the int64 conv index, the MTP step timer) and
-the program head `1b28bbff`.
+State at **2026-11-20 23:35 UTC** (fourth agent, Opus 5.5). Branch head: the commit that holds this text, pushed.
+It contains the program head `938dada4` (merged as `49eb18cb`: PR #14 collectives), mtp-card-ready through
+`f1aa2292` and every commit of this track. The node ends about 04:00 UTC on 2026-11-21: everything on it is lost.
 
-**Card jobs in the queue** (`bin/farm status`; results land in `reports/spec-lookup/card/<id>-<name>/`)
+**Card jobs** (`bin/farm status`, `bin/farm ledger | grep -w spec-lookup`; results in
+`reports/spec-lookup/card/<id>-<name>/`, mirrored under `node-mirror/farm/spec-lookup/results/`)
 
 | Job | What | State |
 |---|---|---|
-| 00086 `tiny2-ngram3-oracle` (any:2, 10 min) | tiny model: baseline, then n-gram k = 3 with prefix caching and the rehearsal oracle | waiting, bumped by the coordinator to the tail of the 1-card wave (bound 21:09 UTC); runs commit `628d9716` |
-| 00087 `tiny2-ngram8-search` (any:2, 14 min) | tiny model: baseline, n-gram k = 8 with the oracle, n-gram k = 3 with vLLM's own search | the same (bound 21:14 UTC) |
-| 00107 `tiny2-mtp3-lookup-oracle2` (any:2, 12 min) | tiny model: baseline, then MTP k = 3 + the lookup hook with the oracle, three passes (hybrid, lookup-only, MTP alone); torch GDN verification | waiting, bumped by the coordinator (bound 21:20 UTC); runs commit `e121d61b` |
-| `tiny2-mtp3-lookup-fused` (any:2, 12 min) | the same with the fused GDN verification op (`VLLM_HPU_GDN_CORE_VERIFY=1`), the path the MTP track runs on the card: the first accepted drafts through that op | submitted 20:17 UTC from `f0e2b5dd` (id in `reports/spec-lookup/card/submit-tiny2-mtp3-lookup-fused.log`); end of the queue until the coordinator bumps it |
-| 00095 `real4-nospec-edit-prose` (any:4, 28 min) | real model without speculation: the edit, prose, whole-answer and large-file rounds (section 6) | waiting in 00029's place (bound 02:34 UTC, realistically hours earlier); runs commit `c13d1b97` |
+| 00086, 00087, 00107, 00114 | tiny-model rehearsals (n-gram k = 3 and 8, vLLM's search, the hybrid with the torch and the fused GDN verification) | ended ok 20:33 to 20:38 UTC; read, reported to the coordinator; numbers in section 7 |
+| 00095 `real4-nospec-edit-prose` | real model, no speculation, TP4 + EP4: the reference and the token ids for the replay | ended ok 23:22 UTC; numbers and the replay in section 7 |
+| **00120 `real4-ngram5-edit`** (any:4, 40 min) | real model, n-gram k = 5 with prefix caching and the fused GDN verification op, rounds `edit:1:384`, `edit:32:384`, `prose:32:256`, `prose:1:256` (the same rounds and prompts as 00095); commit `49eb18cb` | **waiting** (submitted 23:27 UTC; the coordinator was asked for its place). Its local waiter wrote `reports/spec-lookup/card/submit-real4-ngram5-edit.log`; if that waiter is gone: `bin/farm fetch spec-lookup 00120 00120-real4-ngram5-edit` |
 
-The local `farm job` commands that submitted 00086, 00087 and 00095 were killed with the agent's shell at 20:05
-UTC; the jobs are on the node. Detached waiters copy their results when they end
-(`reports/spec-lookup/card/wait-<id>.txt` says so); if those are gone too:
-`bin/farm fetch spec-lookup <id> <id>-<name>`.
+When 00120 ends:
+```bash
+cd /Volumes/Storage/Claude/gaudi-work/wt/spec-lookup
+C=/Volumes/Storage/Claude/gaudi-work/reports/spec-lookup/card
+python3 tools/flash_next/lookup_summary.py $C/00095-real4-nospec-edit-prose $C/00120-real4-ngram5-edit
+grep -E "MEAS|fallback|DONE|ERROR" $C/00120-real4-ngram5-edit/probe.log $C/00120-real4-ngram5-edit.log
+```
+and report to the coordinator (SendMessage `main`) and in section 7: measured tokens per step against the replay
+(edit k = 5: 4.72), ms per step at 1 stream and at 32 streams (192 rows), ms per token against 00095 (29.9 and
+108.0 ms), the cost per extra verification row `c = (T_32,ngram - 108.0) / (192 - 32)` and `rho = c / 108`,
+the prose round at 32 streams (the ragged-width penalty), and whether the 1-stream edit stream equals 00095's
+token for token (`lookup_summary.py` prints it; a difference is a defect unless it is a near-tie).
 
-When a tiny job ends: send its result lines (the `lookup tiny [...]` lines: tokens per step, the rate of every
-draft position, drafts and accepted; any failure with its traceback from `<config>/server0.log`) to the
-coordinator (`main`) and to the mtp-card-ready track at once: it is the first card run with accepted drafts
-(mtp-card-ready's tiny and real MTP runs accept only what the MTP layer drafts: 0 of 270 on the tiny model).
-When the no-speculation job ends: run
-`python3 tools/flash_next/lookup_replay.py reports/spec-lookup/card/00095-real4-nospec-edit-prose/probe.json --out reports/spec-lookup/card/00095-replay.json`
-and send the acceptance per draft position for depths 3 to 16 on the edit prompts with the rows a verification
-step carries at 32 streams (the tool prints both), and
-`python3 tools/flash_next/lookup_summary.py reports/spec-lookup/card/<run folders>` for the table of section 7.
-
-**Done and verified on CPU**
-
-| What | Evidence |
-|---|---|
-| n-gram lookup with prefix caching through the real engine (scheduler, HPU worker and runner, tiny model): ragged oracle drafts with tampered ones (every accepted count 0..3, empty drafts, 11 widened steps, 3 block-completion commits, 440 tokens compared), full acceptance across 256-token block boundaries, vLLM's own `NgramProposer`, prefix caching off, k = 8 (every accepted count 0..8, 21 widened steps), the mutation without the widening breaks | `tests/unit_tests/models/flash_next/test_lookup_engine.py`: **8 passed** in 1,156 s on the tree of `3d536265` (this branch + mtp-card-ready `9722b888`), log `reports/spec-lookup/logs/m1_test_lookup_engine.log` |
-| The lookup + MTP hybrid through the same engine (lookup rows padded with -1 and MTP rows in the same streams, lossless up to a bf16 near-tie) | the same run: `test_hybrid_lookup_beside_mtp_with_prefix_caching` passed (it was skipped before the merge: the MTP engine did not start) |
-| Hybrid proposer, its modes, the per-request mode, the per-load log line, the rehearsal oracle | `tests/unit_tests/worker/test_flash_next_lookup.py` 19 passed (head) |
-| The rehearsal oracle through the real engine, as the card jobs use it (the file named in the environment): the n-gram server (356 tokens compared, 108 oracle drafts of which 28 tampered, every accepted count 0..3, 30 widened steps, 2 block-completion commits) and the hybrid (lookup rows 108, 225 drafts accepted over 105 verified rows, MTP rows 68) | `tests/unit_tests/models/flash_next/test_lookup_oracle_engine.py` 2 passed in 209 s on `c809b15e` + the test, log `reports/spec-lookup/logs/m7_test_lookup_oracle_engine.log` |
-| Verification width helpers | `tests/unit_tests/worker/test_verify_width.py` 12 passed |
-| Platform: n-gram with prefix caching served, k limits `{"mtp": 5, "ngram": 8}` | `tests/unit_tests/test_flash_next_platform.py` 75 passed (head) |
-| Card job tools | `tests/unit_tests/tools/rental/test_lookup_probe.py` 11 passed, `test_lookup_tiny.py` 9 passed, `test_spec_probe.py` 13 passed (head) |
-| The replay tool; its `earliest` policy equals vLLM's n-gram kernel on 400 random streams | `tests/unit_tests/tools/test_lookup_replay.py` 5 passed (head) |
-| Model-level n-gram tests at k = 3, 4, 5, 8 (earlier agent, `7dcc65a3`; not rerun after the merges) | `tests/unit_tests/models/flash_next/test_ngram_end_to_end.py`, logs `reports/spec-lookup/logs/ngram_k8*.log` |
-
-**Not verified yet**
-
-- The CPU engine tests on the head (`test_lookup_engine.py`, 19 min under load; `test_engine_mtp.py`, 30 min).
-  `test_lookup_engine.py` is running on a copy of `7ec81b17` with the conv index cast by hand
-  (`reports/spec-lookup/logs/m4_scratch_test_lookup_engine.log`); mtp-card-ready's own cast (`9d013a36`) is
-  merged since `e121d61b`. An earlier `test_engine_mtp.py` run on a tree that changed under it had 12 passed
-  and 2 artefacts (`m1_test_engine_mtp.log`).
-- `bin/gate /Volumes/Storage/Claude/gaudi-work/wt/spec-lookup --tools` on the head (needed before a pull request).
-- **Nothing of this track has run on a card yet.** MTP on the card (mtp-card-ready's
-  `docs/design/flash-next/mtp-card-ready.md`, job 00021): two card failures fixed (`f0e7d02f`, `9d013a36`),
-  then MTP k = 3 on the real model at TP8 + EP8, one stream: 2.78 tokens per step, acceptance per position
-  0.83 / 0.57 / 0.39, 84.3 ms per step against 41.6 ms without speculation (31.0 against 41.6 ms per token).
-  On the tiny model every MTP draft is rejected. Accepted drafts beyond what MTP drafts, widened steps and
-  block-completion commits have not run on a card: jobs 00086 and 00087 are the first.
+**The gate.** A gate of this worktree (`bin/gate .../wt/spec-lookup --tools`, pid 29898, started by the third
+agent about 20:10 UTC) waits for the shared lock behind other tracks' gates (one gate at a time on the Mac); it
+tests the worktree as it is when it starts and writes `reports/spec-lookup/logs/gate_8dfb638a.log` (the name is
+the old head; the tree is the current one). Do not start a second one; check that log.
 
 **Pending, in order**
 
-1. **Read the tiny rehearsals** (00086, 00087, 00107, the fused one) and report them (above). If a
-   configuration fails: the traceback is in `reports/spec-lookup/card/<id>-<name>/<config>/server0.log`;
-   `lookup_tiny.json` has every stream. The n-gram rehearsals and 00107 verify with the torch GDN recurrence
-   (`VLLM_HPU_GDN_CORE_VERIFY=0`), which no card run has exercised yet (the MTP track's passes used the fused
-   op); n-gram k = 8 has no other path (9 rows are more than the op's 6). If the torch path fails on the card,
-   the n-gram server at k <= 5 can still run with the op: rehearse it with
-   ```bash
-   F=/Volumes/Storage/Claude/gaudi-work/bin/farm
-   $F job spec-lookup tiny2-ngram3-fused any:2 10m --no-model -- python tools/flash_next/rental/lookup_tiny.py --configs ngram3-fused
-   ```
-2. **Real-model speculative jobs, TP4 + EP4** (section 6 has the rounds), each after its tiny rehearsal passed.
-   One of them can still take the other half of 00029's place until 21:20 UTC (`--replaces 00029`; the
-   no-speculation job took the first half); after that they queue at the end:
-   ```bash
-   $F job spec-lookup real4-ngram8 any:4 30m --replaces 00029 -- bash tools/flash_next/rental/lookup_serve.sh \
-       --label ngram8 --ngram 8 --rounds edit:32:384:-,prose:32:256:-,edit:1:384:-,prose:1:256:-,editl:8:512:-
-   $F job spec-lookup real4-mtp3-lookup any:4 30m --env VLLM_HPU_GDN_CORE_VERIFY=1 -- bash tools/flash_next/rental/lookup_serve.sh \
-       --label mtp3lookup --mtp 3 --lookup 1 --rounds edit:32:384:0,edit:32:384:1,edit:32:384:2,prose:32:256:0,prose:32:256:1,edit:1:384:0,edit:1:384:1,edit:1:384:2,prose:1:256:0,prose:1:256:1,editl:8:512:0,editl:8:512:1
-   ```
-   (`VLLM_HPU_GDN_CORE_VERIFY=1` for the MTP server: the fused verification op is what the MTP track proved on
-   the real model; the n-gram server at k = 8 keeps the torch recurrence.)
-   Reread CARD.md before each submit. Results: `probe.json`, `probe.log`, `server0.log`; compare texts across
-   jobs with `python3 tools/flash_next/rental/lookup_probe.py --compare A/probe.json B/probe.json ...`.
-3. **Numbers to section 7 and to the coordinator** (SendMessage to `main`): accepted tokens per step, ms per
-   step, effective ms per token for lookup and the hybrid against MTP alone and against no speculation, on
-   edit-and-return and on fresh prose, at 1 and 32 streams.
-4. **Depth beyond 5 and the search's host cost** (sections 4 and 5): the hybrid's lookup rows are capped at
-   the MTP k (the rows are the MTP shapes); deeper lookup drafts need either the n-gram server (k = 8 proven on
-   CPU) or hybrid rows wider than MTP's (not built). `HybridLookup.merge` runs vLLM's O(context) search once
-   per request and step: MEASURED on the workstation 0.10 ms per search at 128,000 tokens, 3.2 ms per step for
-   32 requests (0.1 ms per step at 4,000 tokens); the index drafter of `tools/flash_next/lookup_replay.py`
-   is O(n) per step and its `follow` policy accepts more in the replay. Not yet in the server.
-5. **Merge** per the protocol: after mtp-card-ready's pull request (this branch contains that branch), run the
-   gate on the merged tree, `gh pr create --base feat/flash-next-gaudi`, `gh pr merge --merge`. The flags of
-   this track are its own (`VLLM_HPU_FLASH_NEXT_SPEC_LOOKUP`, `..._LOOKUP_MIN_NGRAM`, `..._LOOKUP_MAX_NGRAM`,
-   `..._LOOKUP_ORACLE`), all default off.
+1. 00120's numbers (above). If it fails in the fused verification op: the torch path is the fallback
+   (`--env VLLM_HPU_GDN_CORE_VERIFY=0`, rehearsed on the card in 00086 / 00087); if it fails elsewhere, the
+   traceback is in `00120-real4-ngram5-edit/server0.log`.
+2. **Merge** per the protocol once the gate is green and 00120 has run: `git fetch origin && git merge
+   origin/feat/flash-next-gaudi`, `bin/gate <worktree> --tools`, push, `gh pr create --base feat/flash-next-gaudi`,
+   `gh pr merge --merge`. Card-proven so far: n-gram with prefix caching (tiny model: 00086 k = 3, 00087 k = 8 and
+   vLLM's search; real model: 00120), the hybrid (tiny model, 00107 torch and 00114 fused verification). All flags
+   of this track default off (`VLLM_HPU_FLASH_NEXT_SPEC_LOOKUP`, `..._LOOKUP_MIN_NGRAM`, `..._LOOKUP_MAX_NGRAM`,
+   `..._LOOKUP_ORACLE`); n-gram itself is chosen by `--speculative-config`. This branch contains mtp-card-ready's
+   commits through `f1aa2292` (not yet on the program head): a pull request of this branch brings them along;
+   say so in its body or wait for mtp-card-ready's own merge.
+3. **Rows at 32 streams** (section 7): an n-gram step is as wide as its longest draft, an empty draft is the
+   2-row placeholder, so 32 streams carry `32 (1 + k)` rows as soon as one stream drafts. Two code steps would
+   fix the economics of a mixed load: per-request (ragged) verification rows (rows `sum(1 + d_i)`, not
+   `32 (1 + max d_i)`), and no placeholder row for a request without a draft. Both need the runner's decode
+   batch to carry per-request query lengths; not started. A smaller step for warm-up and graph memory: a flag
+   that pins the n-gram width to `1 + k` (one HPU graph per bucket instead of `k`; `verification_width`).
+4. Depth beyond 5 with the fused verification op needs a 9-node lattice (`GDN_CORE_VERIFY_MAX_NODES = 6`);
+   k = 8 runs the torch recurrence today (rehearsed on the tiny model, 00087).
+
+**Done and verified on CPU** (earlier agents; tests on the tree of each named commit)
+
+| What | Evidence |
+|---|---|
+| n-gram lookup with prefix caching through the real engine (ragged oracle drafts, tampered drafts, every accepted count 0..3, empty drafts, widened steps, block-completion commits, k = 8, vLLM's own `NgramProposer`, prefix caching off) | `tests/unit_tests/models/flash_next/test_lookup_engine.py`: 8 passed (`3d536265`), `reports/spec-lookup/logs/m1_test_lookup_engine.log` |
+| The lookup + MTP hybrid through the same engine | the same run: `test_hybrid_lookup_beside_mtp_with_prefix_caching` passed |
+| Hybrid proposer, modes, per-request mode, log line, rehearsal oracle | `tests/unit_tests/worker/test_flash_next_lookup.py` 19 passed |
+| The rehearsal oracle through the engine (n-gram server and hybrid) | `tests/unit_tests/models/flash_next/test_lookup_oracle_engine.py` 2 passed (`c809b15e` + the test), `logs/m7_test_lookup_oracle_engine.log` |
+| Verification width helpers | `tests/unit_tests/worker/test_verify_width.py` 12 passed |
+| Platform: n-gram with prefix caching served, k limits `{"mtp": 5, "ngram": 8}` | `tests/unit_tests/test_flash_next_platform.py` 75 passed |
+| Card job tools | `tests/unit_tests/tools/rental/test_lookup_probe.py` 11, `test_lookup_tiny.py` 9, `test_spec_probe.py` 13 passed |
+| The replay tool (its `earliest` policy equals vLLM's n-gram kernel on 400 random streams) | `tests/unit_tests/tools/test_lookup_replay.py` 5 passed |
+
+Not yet rerun on the merged head: the CPU engine tests (`test_lookup_engine.py` about 19 min under load,
+`test_engine_mtp.py` about 30 min); the gate above runs the Flash-Next model tests and the platform and tool tests.
 
 ## 1. What is on the branch
 
@@ -123,6 +95,8 @@ step carries at 32 streams (the tool prints both), and
 | `ffb4d87e`, `c13d1b97` | `lookup_probe.py`: whole answers (`editf`), the token ids of every stream and prompt |
 | `8c5ac747`, `877cab29` | `tools/flash_next/lookup_replay.py` (lookup drafters replayed over recorded streams), `lookup_summary.py` (the table of the card jobs) |
 | `e121d61b` | merge of mtp-card-ready `f1aa2292` |
+| `aa51e8b9`, `f0e2b5dd`, `074fb2b6` | the hybrid's counters through the `vllm` logger; `lookup_tiny.py` with the fused GDN verification op; the rehearsal oracle through the engine on CPU |
+| `49eb18cb` | merge of the program head `938dada4` (PR #14 collectives) |
 
 ## 2. n-gram lookup with prefix caching
 
@@ -257,7 +231,116 @@ show without the weights is the load itself: on the card the MTP server is healt
 
 ## 7. Card results
 
-None yet (2026-11-20 19:50 UTC).
+### 7.1 Tiny-model rehearsals (jobs 00086, 00087, 00107, 00114; 2026-11-20 20:30 to 20:38 UTC)
+
+`lookup_tiny.py`, TP2 on two cards, prefix caching on, the real-model job's decode flags, drafts from the
+rehearsal oracle (the baseline's own continuation on a ragged schedule, every 4th or 5th draft tampered).
+MEASURED (`reports/spec-lookup/card/<id>-<name>/lookup_tiny.json`, the job logs):
+
+| Job, commit | Configuration (pass) | Drafts | Accepted | Tokens per step | Rate per position | Streams equal to the baseline |
+|---|---|---|---|---|---|---|
+| 00086, `628d9716` | n-gram k = 3, torch GDN verification | 328 | 153 | 1.47 | 0.22, 0.18, 0.07 | 1 of 11 |
+| 00087, `628d9716` | n-gram k = 8 (9-row torch verification) | 200 | 285 | 2.42 | 0.24, 0.24, 0.23, 0.23, 0.19, 0.14, 0.10, 0.05 | 5 of 11 |
+| 00087 | n-gram k = 3, vLLM's own search (`prompt_lookup_min` 1), no oracle | 481 | 0 | 1.00 | 0 | 3 of 11 |
+| 00107, `e121d61b` | MTP k = 3 + lookup, torch verification: hybrid / lookup only / MTP alone | 293 / 293 / 481 | 190 / 190 / 0 | 1.65 / 1.65 / 1.00 | 0.30, 0.25, 0.10 | 2 / 2 / 4 of 11 |
+| 00114, `074fb2b6` | the same with the fused GDN verification op | 264 / 264 / 481 | 221 / 221 / 0 | 1.84 / 1.84 / 1.00 | 0.39, 0.32, 0.13 | 5 / 5 / 7 of 11 |
+
+("Drafts" counts verification rows with a draft; the hybrid's own counter in 00114: lookup rows 216, 2.08
+accepted per row; MTP rows 0 accepted, a random model.)
+
+- **MEASURED: accepted drafts beyond what MTP drafts run on the card** through the n-gram verification (ragged
+  widths, widened steps, the torch GDN recurrence at k = 3 and k = 8) and through the MTP-shaped verification
+  (torch and fused GDN verification op), with prefix caching on: no error line, no fallback line, every request
+  answered. 00114 is the first card run of accepted drafts through the fused verification op.
+- Token equality on the random tiny model: no stream accepted a tampered draft (its first difference is never
+  the tampered token, VERIFIED over every pass); the four baselines are identical token for token; most first
+  differences sit where the passes without any accepted draft differ too (MTP alone, vLLM's search) and where
+  the baseline's own twins differ (the 7-token prompt alone and in a batch, token 40): batch-shape near-ties of
+  a random model with flat logits (INFERRED). Two (prompt, position) pairs differ only with accepted drafts
+  (the 100-token prompt at token 28 in three jobs, the second turn at token 14 in two): **not classified**,
+  because the baseline's log-probability request crashed the server (below). The real-model run at one stream
+  (00120 against 00095) is the check.
+- Defect found on the way (reported to the coordinator, owner engine-step / the sampler): a `/v1/completions`
+  request with `logprobs: 5` killed the HPU server's output handler: `OverflowError: out of range integral type
+  conversion attempted` in the detokenizer of the top-logprob ids (`00086-.../baseline/server0.log`, about line
+  426), so the ids it got were outside the u32 range: the shape of card rule 9 (top-k ids narrowed in one graph)
+  in the logprobs path. Every request in flight then failed with HTTP 500 and the API server shut down.
+
+### 7.2 The real model without speculation (job 00095, 2026-11-20 23:03 to 23:22 UTC)
+
+TP4 + EP4 on cards 3 to 6, commit `c13d1b97`, `lookup_serve.sh --label nospec`, greedy, thinking off, healthy
+after 442 s, no fallback line. MEASURED, ms per engine step (median gap between a stream's chunks):
+
+| Round | Streams | Tokens | ms per step | tok/s per stream |
+|---|---|---|---|---|
+| edit (whole small file returned, ignore_eos) | 32 | 384 | 108.0 | 9.3 |
+| prose | 32 | 256 | 107.2 | 9.3 |
+| edit | 1 | 384 | 29.9 | 33.4 |
+| prose | 1 | 256 | 30.9 | 32.4 |
+| editf (answered to the model's own end: 617 to 831 tokens) | 24 | up to 1,400 | 110.8 | 9.0 |
+| editl (3,168 to 3,600-token prompts) | 8 | 512 | 52.8 | 18.9 |
+
+The model returns the whole file in a code fence (`texts` in `probe.json`).
+
+### 7.3 Lookup acceptance on the real model's answers (REPLAY of 00095)
+
+`tools/flash_next/lookup_replay.py .../00095-real4-nospec-edit-prose/probe.json --depths 3,4,5,6,8,12,16` ->
+`reports/spec-lookup/card/00095-replay.json`. Greedy verification accepts a draft token exactly when it equals
+the target's token, so for these recorded greedy streams the acceptance of vLLM's n-gram search (`earliest`,
+n-gram 3..8) is exact arithmetic; time is not in it. Tokens per step per stream, and the share of ALL steps
+that accepted at least j tokens:
+
+| k | editf (24 whole answers, 17,727 tokens) | j = 1 .. k | edit (32 x 384) | editl (8 x 512) | prose (32 x 256) | rows per step at 32 streams: edits / prose (n-gram server) |
+|---|---|---|---|---|---|---|
+| 3 | 3.48 | 0.84 0.82 0.81 | 3.44 | 2.90 | 1.00 | 128 / 76 |
+| 4 | 4.16 | 0.81 0.79 0.78 0.77 | 4.11 | 3.35 | 1.00 | 160 / 82 |
+| 5 | 4.78 | 0.78 0.76 0.75 0.74 0.74 | 4.72 | 3.72 | 1.00 | 192 / 88 |
+| 6 | 5.36 | 0.76 0.74 0.73 0.72 0.71 0.70 | 5.27 | 4.02 | 1.00 | 224 / 94 |
+| 8 | 6.41 | 0.72 0.70 0.68 0.68 0.67 0.66 0.66 0.65 | 6.29 | 4.57 | 1.00 | 288 / 105 |
+| 12 | 8.07 | 0.65 .. 0.56 | 7.87 | 5.23 | 1.00 | 416 / 125 |
+| 16 | 9.44 | 0.59 .. 0.49 | 9.09 | 5.74 | 1.00 | 544 / 143 |
+
+- A draft on 87 % (k = 3) to 64 % (k = 16) of the steps of the whole answers; on prose on 1 % of the steps.
+- The `follow` policy adds 0 to 0.1 tokens per step; `recent` is slightly worse: the search policy is not the lever.
+- Rows: an n-gram step is as wide as its longest draft and an empty draft runs as the 2-row placeholder, so 32
+  editing streams carry `32 (1 + k)` rows; 32 prose streams still carry 76 to 143 rows (expected, streams drafting
+  independently) for nothing. The MTP and hybrid shapes are always `32 (1 + k)`.
+- The real answers accept slightly less than the synthetic preview of section 5 (3.48 against 3.61 at k = 3,
+  6.41 against 7.09 at k = 8): the model rewrites more than the synthetic edits did. MTP alone on the same
+  model: 2.62 to 2.78 tokens per step at k = 3 (mtp-card-ready, job 00021, one stream).
+
+### 7.4 Depth as a function of the cost of a verification row (INFERRED from 7.3 and the cost model)
+
+Model: a step at 32 streams that carries `R` rows costs `T32 + c (R - 32)`, `T32` the plain step, `c` the cost
+of one extra row; per stream the n-gram server then spends `(T32 + c (R - 32)) / a` per token, `a` the tokens
+per step (7.3). With `rho = c / T32` the speed-up on edits is `a / (1 + 32 k rho)`
+(`reports/spec-lookup/replay/depth_by_row_cost.py`, output `card/00095-depth-by-row-cost.txt`):
+
+| rho = c / T32 | best k on edits at 32 streams | speed-up there | k = 3 | k = 8 |
+|---|---|---|---|---|
+| 0.022 (MTP k = 3 at 32 streams, TP4, head's QSA path: 338 ms at 128 rows with the draft passes; upper bound) | 3 | x1.11 | x1.11 | x0.96 |
+| 0.017 (TP4 head's QSA path: 1.8 ms per decode row, qsa-fused 00062, T32 = 108) | 3 | x1.34 | x1.34 | x1.22 |
+| 0.011 (TP4 with the QSA data-flow change: 0.84 / 73.4) | 4 to 5 | x1.69 | x1.66 | x1.63 |
+| 0.005 | 8 | x2.8 | x2.3 | x2.8 |
+| 0.0025 | 12 to 16 | x4.1 | x2.8 | x3.9 |
+
+- Break-even `rho*` = `(a - 1) / (32 k)`: 0.026 (k = 3), 0.024 (k = 5), 0.021 (k = 8), 0.017 (k = 16).
+- The optimum is flat: k = 3 to 6 lie within 3 % of each other for rho 0.01 to 0.017.
+- One stream (T1 = 30 ms at TP4, a host-bound step): every depth pays; with an assumed 0.5 ms per extra row,
+  k = 5 gives about 6.7 ms per token (x4.5) and k = 8 about 5.2 (x5.8). 00120 measures it.
+- Prose at 32 streams: the n-gram server loses at every depth (x0.58 at rho 0.017, k = 3; x0.67 at rho 0.011).
+- Mixed load at 32 streams, a share `f` of the streams in an edit span: the n-gram server runs
+  `(T32 + 32 k c) / (f a_L + (1 - f))`; the hybrid (MTP rows on prose, lookup rows on edits, always 1 + k wide,
+  plus the MTP draft passes `D` per step) runs `(T32 + 32 k c + D) / (f a_H + (1 - f) a_M)`, with `a_L` the
+  lookup tokens per step (3.48 at k = 3), `a_M` MTP's (2.6 to 2.8) and `a_H` the hybrid's on edits (about
+  `0.87 x 3.86 + 0.13 x a_M` = 3.7 at k = 3: lookup on the 87 % of steps with a match, MTP on the rest). On the
+  head's path at TP4 (T32 = 108, c = 1.8, so `D` = 338 - 281 = about 57 ms for three draft passes, INFERRED):
+  f = 0: n-gram x0.58 (76 rows), hybrid x0.86; f = 0.5: n-gram x0.86, hybrid x1.02; f = 1: n-gram x1.34,
+  hybrid x1.18 (a_M = 2.7).
+  The hybrid is the safer server for a mixed load; the n-gram server only for a pure copy load, until the rows
+  become per-request (Handoff, pending 3).
+
+### 7.5 n-gram on the real model (job 00120): pending
 
 ## 8. Notes for other tracks
 
