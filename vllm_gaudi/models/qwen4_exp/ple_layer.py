@@ -44,6 +44,36 @@ from vllm_gaudi.models.qwen4_exp.ple_ops import (
 )
 
 
+def adapt_fp8_table_for_gaudi(embedding, wrapper=None) -> bool:
+    """Give an FP8 n-gram table the Gaudi2 range conversion at load. True when it is in place.
+
+    Gaudi2's FP8 ends at 240, the checkpoint's E4M3FN at 448. On the card the conversion of an FP8
+    tensor to bfloat16 turns every code above 240 into inf or NaN, and the engine reads the table
+    exactly that way (``embeddings.to(dtype) * weight_scale`` in ``_dequantize_embeddings``): the first
+    real-model server answered token 0 at every position (rental 2026-11-20). The FP8 linears and
+    experts already load through ``gaudi_weight_wrapper``, which halves the codes and doubles the
+    scale; the engine's own quantization method builds the table, so it never got that loader.
+
+    ``embedding`` is the table module (``weight``, and ``weight_scale`` when it is FP8). ``wrapper``
+    defaults to ``gaudi_weight_wrapper`` on Gaudi2; Gaudi3 has the full range and is left alone. A
+    table of another dtype is left alone and returns False, without importing the HPU-only module.
+    """
+    weight = getattr(embedding, "weight", None)
+    if weight is None or weight.dtype != torch.float8_e4m3fn:
+        return False
+    if wrapper is None:
+        import vllm_gaudi.extension.ops as hpu_ops  # HPU-only module: reached with an FP8 table only
+
+        if not hpu_ops.is_hpu_gaudi2:
+            return False
+        wrapper = hpu_ops.gaudi_weight_wrapper
+    weight.weight_loader = wrapper(weight.weight_loader)
+    weight_scale = getattr(embedding, "weight_scale", None)
+    if weight_scale is not None:
+        weight_scale.weight_loader = wrapper(weight_scale.weight_loader)
+    return True
+
+
 class HpuQwen4ExpNGramEmbedding(Qwen4ExpNGramEmbedding):
     """N-gram embedding with the hash multipliers on the host and int32-only ids.
 
@@ -132,6 +162,8 @@ class HpuQwen4ExpNGramEmbedding(Qwen4ExpNGramEmbedding):
             quant_config=quant_config,
             params_dtype=params_dtype,
         )
+        # Before any weight is loaded: an FP8 table needs the Gaudi2 range at load.
+        adapt_fp8_table_for_gaudi(self.ngram_embedding)
         # The real tables, as plain Python ints on the host. The engine class, not
         # self, so the zero override above is skipped.
         multipliers = Qwen4ExpNGramEmbedding._make_layer_multipliers(
