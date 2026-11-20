@@ -75,11 +75,55 @@ def test_derive_compares_raw_graph_async_and_metadata_with_the_wrapper():
         _entry("replay_async", 32, True, 6.0, call=0.05),
     ]
     lines = {(line["case"], line["rows"]): line for line in bench.derive(merged)}
-    assert lines[("graph_raw", 32)]["vs_replay_total_ms"] == pytest.approx(-0.3)
-    assert lines[("graph_raw", 32)]["vs_replay_call_ms"] == pytest.approx(-0.2)
-    assert lines[("replay_meta", 32)]["vs_replay_total_ms"] == pytest.approx(0.9)
-    assert lines[("replay_async", 32)]["vs_replay_call_ms"] == pytest.approx(-0.45)
-    assert "vs_replay_total_ms" not in lines[("replay", 32)]
+    assert lines[("graph_raw", 32)]["vs"] == "replay"
+    assert lines[("graph_raw", 32)]["vs_total_ms"] == pytest.approx(-0.3)
+    assert lines[("graph_raw", 32)]["vs_call_ms"] == pytest.approx(-0.2)
+    assert lines[("replay_meta", 32)]["vs_total_ms"] == pytest.approx(0.9)
+    assert lines[("replay_async", 32)]["vs_call_ms"] == pytest.approx(-0.45)
+    assert "vs" not in lines[("replay", 32)]
+
+
+def test_derive_compares_fused_pair_and_async_tail_with_their_references():
+    merged = [
+        _entry("replay_par2", 1, True, 12.0, call=10.0),
+        _entry("replay_fused2", 1, True, 7.0, call=5.5),
+        _entry("replay_tail", 1, True, 14.0, call=14.0),
+        _entry("replay_async_tail", 1, True, 13.2, call=13.2),
+    ]
+    lines = {(line["case"], line["rows"]): line for line in bench.derive(merged)}
+    assert lines[("replay_fused2", 1)]["vs"] == "replay_par2"
+    assert lines[("replay_fused2", 1)]["vs_total_ms"] == pytest.approx(-5.0)
+    assert lines[("replay_async_tail", 1)]["vs"] == "replay_tail"
+    assert lines[("replay_async_tail", 1)]["vs_total_ms"] == pytest.approx(-0.8)
+
+
+def test_derive_divides_by_the_recorded_number_of_calls():
+    merged = [
+        dict(_entry("replay_fused2", 1, False, 2.0), all_reduces=0),
+        dict(_entry("replay_fused2", 1, True, 2.0 + 48 * 0.1), all_reduces=48),
+    ]
+    line = bench.derive(merged)[0]
+    assert line["all_reduce_ms_each"] == pytest.approx(0.1)
+
+
+def test_pair_layer_modes_give_the_same_values_on_cpu():
+    body = bench.Body(torch, "cpu", layers=2, world=1)
+    x = torch.randn(3, bench.HIDDEN).to(torch.bfloat16)
+    calls = []
+
+    def reduce(t):
+        calls.append(t.shape[0])
+        return t  # world 1: the all-reduce is the identity
+
+    import contextlib
+    par2 = body.forward_pair(x, reduce, "par2")
+    n_par2 = len(calls)
+    fused2 = body.forward_pair(x, reduce, "fused2")
+    n_fused2 = len(calls) - n_par2
+    coal = body.forward_pair(x, reduce, "coalesce", contextlib.nullcontext)
+    assert torch.equal(par2, fused2) and torch.equal(par2, coal)
+    assert n_par2 == 4 and n_fused2 == 2  # two calls per layer against one over the stacked pair
+    assert calls[n_par2] == 6  # the stacked call carries both outputs' rows
 
 
 def test_meta_inputs_look_like_trimmed_metadata():

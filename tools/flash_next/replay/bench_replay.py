@@ -61,7 +61,18 @@ DEFAULT_ROWS = (1, 32, 128)
 COMPILE_FULL_ROWS = (1, 32)
 EXIT_GRACE_S = 20.0
 LAZY_REGIMES = ("lazy", "lazy_layer", "lazy_coll", "replay", "replay_layer", "replay_coll", "graph_raw",
-                "replay_async", "replay_meta")
+                "replay_async", "replay_meta", "replay_tail", "replay_async_tail", "replay_par2", "replay_fused2",
+                "replay_coalesce")
+# The pair regimes: both sub-blocks of a layer from the same input, so the layer's two all-reduces are independent
+# (par2: two calls; fused2: one call over the stacked pair, the same bytes; coalesce: the two calls in a coalescing
+# context). Layer.layer_pair. They have the compute of a pair layer, so they compare with each other, not with replay.
+PAIR_REGIMES = {"replay_par2": "par2", "replay_fused2": "fused2", "replay_coalesce": "coalesce"}
+# derive(): each of these against its reference regime, with the collectives.
+COMPARE_WITH = {"graph_raw": "replay", "replay_async": "replay", "replay_meta": "replay",
+                "replay_async_tail": "replay_tail", "replay_fused2": "replay_par2", "replay_coalesce": "replay_par2"}
+# The sampler stand-in after a replay in the *_tail regimes: lazy ops on [rows, TAIL_COLS] of the output.
+TAIL_OPS = 24
+TAIL_COLS = 256
 # replay_meta passes, besides the input, a namedtuple of META_TENSORS int32 tensors (half [rows, META_COLS], half
 # [rows, 1]) and two scalars as a keyword, like the runner's trimmed decode metadata, so the wrapper hashes and
 # copies them every call.
@@ -124,12 +135,43 @@ class Body:
         self.down = [weight(HIDDEN, PROJ, scale_down) for _ in range(2)]
         self.up = [weight(PROJ, HIDDEN, scale_up) for _ in range(2)]
 
-    def sub_block(self, x, k: int, reduce, cut_coll):
+    def branch(self, x, k: int):
+        """RMS norm, GEMM down, SiLU, GEMM up: the part of a sub-block before its all-reduce."""
         torch = self.torch
         x32 = x.float()
         var = x32.pow(2).mean(-1, keepdim=True)
         h = (x32 * torch.rsqrt(var + 1e-6)).to(torch.bfloat16) * self.norm_w[k]
-        h = torch.nn.functional.silu(h @ self.down[k]) @ self.up[k]
+        return torch.nn.functional.silu(h @ self.down[k]) @ self.up[k]
+
+    def layer_pair(self, x, reduce, mode: str, coalesce=None):
+        """Both sub-blocks from the same input, so their two all-reduces are independent of each other.
+
+        mode ``par2``: two all-reduces; ``fused2``: one all-reduce of the two outputs stacked (the same bytes,
+        half the calls); ``coalesce``: the two all-reduces inside ``coalesce()`` (a coalescing context).
+        """
+        torch = self.torch
+        h0 = self.branch(x, 0)
+        h1 = self.branch(x, 1)
+        if reduce is not None:
+            if mode == "fused2":
+                both = reduce(torch.cat([h0, h1], 0))
+                h0, h1 = both[:x.shape[0]], both[x.shape[0]:]
+            elif mode == "coalesce" and coalesce is not None:
+                with coalesce():
+                    h0 = reduce(h0)
+                    h1 = reduce(h1)
+            else:
+                h0 = reduce(h0)
+                h1 = reduce(h1)
+        return x + h0 + h1
+
+    def forward_pair(self, x, reduce, mode: str, coalesce=None):
+        for _ in range(self.layers):
+            x = self.layer_pair(x, reduce, mode, coalesce)
+        return x
+
+    def sub_block(self, x, k: int, reduce, cut_coll):
+        h = self.branch(x, k)
         if reduce is not None:
             if cut_coll is not None:
                 cut_coll()
@@ -235,6 +277,23 @@ class Rank:
 
         return reduce
 
+    def sampler_tail(self, out):
+        """TAIL_OPS lazy element-wise ops on a slice of the output, an argmax and a mark_step: int32 [rows]."""
+        torch = self.torch
+        h = out[:, :TAIL_COLS].float()
+        for i in range(TAIL_OPS):
+            h = h * 1.0001 + 1e-4 if i % 2 == 0 else h - 1e-4
+        tokens = h.argmax(-1).to(torch.int32)
+        self.mark_step()
+        return tokens
+
+    def coalescing_context(self):
+        """torch.distributed's coalescing manager over the TP group (the closest stock form of a grouped call)."""
+        manager = getattr(self.dist, "_coalescing_manager", None)
+        if manager is None:
+            raise RuntimeError("torch.distributed has no _coalescing_manager")
+        return manager(group=self.group)
+
     def meta_inputs(self, rows: int, count: int):
         """Namedtuples shaped like the runner's trimmed decode metadata: META_TENSORS int32 tensors and scalars."""
         torch = self.torch
@@ -315,12 +374,32 @@ class Rank:
         cut = self.mark_step if regime.endswith(("_layer", "_coll")) else None
         cut_coll = self.mark_step if regime.endswith("_coll") else None
 
+        pair_mode = PAIR_REGIMES.get(regime)
+
         def step(x):
+            if pair_mode is not None:
+                return body.forward_pair(x, reduce, pair_mode, self.coalescing_context)
             return body.forward(x, reduce, cut, cut_coll)
 
         inputs = self.inputs(rows)
         torch = self.torch
-        if regime.startswith("lazy"):
+        if regime in ("replay_tail", "replay_async_tail"):
+
+            class TailStep(torch.nn.Module):
+
+                def forward(self, x):
+                    return step(x)
+
+            module = TailStep()
+            if self.htorch is not None:
+                module = self.htorch.hpu.wrap_in_hpu_graph(module, asynchronous=(regime == "replay_async_tail"),
+                                                           disable_tensor_cache=True)
+
+            def call(x):
+                # What the runner does after the replayed forward: lazy ops on its output (logits and greedy
+                # sampling stand-in), a mark_step, and a read of the tokens to the host.
+                return self.sampler_tail(module(x)).cpu()
+        elif regime.startswith("lazy"):
 
             def call(x):
                 out = step(x)
@@ -359,7 +438,8 @@ class Rank:
             call = module
         record = self.timed(call, inputs, repeats, warmup=3)
         record.update({"case": regime, "rows": rows, "collectives": collectives, "layers": body.layers,
-                       "all_reduces": 2 * body.layers if collectives else 0})
+                       "all_reduces": ((body.layers if pair_mode == "fused2" else 2 * body.layers)
+                                       if collectives else 0)})
         return record
 
     # ------------------------------------------------------------------------------- eager process
@@ -412,7 +492,19 @@ class Rank:
         module(x)
         replay = module(x).float().cpu()
         diff = float((lazy - replay).abs().max())
-        return {"case": "check", "replay_vs_lazy_max_abs": diff, "finite": bool(torch.isfinite(replay).all())}
+        record = {"case": "check", "replay_vs_lazy_max_abs": diff, "finite": bool(torch.isfinite(replay).all())}
+        # An asynchronous replay followed at once by host-side lazy ops on its output and a read (the runner's
+        # sampler pattern) must give the synchronous replay's tokens.
+        module_async = Step()
+        if self.htorch is not None:
+            module_async = self.htorch.hpu.wrap_in_hpu_graph(module_async, asynchronous=True,
+                                                             disable_tensor_cache=True)
+        module_async(x)
+        sync_tokens = self.sampler_tail(module(x)).cpu()
+        async_tokens = self.sampler_tail(module_async(x)).cpu()
+        record["async_tokens_equal_sync"] = bool(torch.equal(sync_tokens, async_tokens))
+        record["async_replay_vs_lazy_max_abs"] = float((lazy - module_async(x).float().cpu()).abs().max())
+        return record
 
 
 def dump_bridge_sources(dump_dir: str) -> dict:
@@ -551,7 +643,8 @@ def derive(merged: list) -> list:
         line = {"case": case, "rows": rows, "total_without_ms": without, "total_with_ms": with_c,
                 "call_with_ms": call_with}
         if None not in (without, with_c) and layers:
-            line["all_reduce_ms_each"] = (with_c - without) / (2 * layers)
+            calls = next((e.get("all_reduces") for e in merged if case_key(e) == (case, rows, True)), None)
+            line["all_reduce_ms_each"] = (with_c - without) / (calls or 2 * layers)
         if with_c and call_with is not None:
             line["host_call_share"] = call_with / with_c
         base = {"lazy_layer": "lazy", "lazy_coll": "lazy_layer", "replay_layer": "replay",
@@ -564,14 +657,17 @@ def derive(merged: list) -> list:
                 line["cut_ms_each_with_collectives"] = (with_c - base_with) / cuts
             if None not in (base_without, without) and case.endswith("_layer"):
                 line["cut_ms_each_without_collectives"] = (without - base_without) / cuts
-        if case in ("graph_raw", "replay_async", "replay_meta"):
-            # Against the plain wrapper on the same body: the wrapper's own per-call cost (graph_raw), what an
-            # asynchronous replay changes, and what hashing and copying a decode-metadata-sized input adds.
-            replay_with, replay_call, _ = total("replay", rows, True)
-            if None not in (replay_with, with_c):
-                line["vs_replay_total_ms"] = with_c - replay_with
-            if None not in (replay_call, call_with):
-                line["vs_replay_call_ms"] = call_with - replay_call
+        ref = COMPARE_WITH.get(case)
+        if ref is not None:
+            # Against its reference on the same body, with the collectives: the wrapper's own per-call cost
+            # (graph_raw), an asynchronous replay (replay_async, replay_async_tail), hashing and copying a
+            # decode-metadata-sized input (replay_meta), and one call per pair of all-reduces (fused2, coalesce).
+            ref_with, ref_call, _ = total(ref, rows, True)
+            line["vs"] = ref
+            if None not in (ref_with, with_c):
+                line["vs_total_ms"] = with_c - ref_with
+            if None not in (ref_call, call_with):
+                line["vs_call_ms"] = call_with - ref_call
         lines.append(line)
     return lines
 
@@ -591,9 +687,9 @@ def print_summary(merged: list, derived: list, ranks: int, echo=print) -> None:
              (line["case"], line["rows"], _fmt(line.get("all_reduce_ms_each"), 4),
               _fmt(line.get("cut_ms_each_with_collectives"), 4), _fmt(line.get("cut_ms_each_without_collectives"), 4),
               _fmt(line.get("host_call_share"), 2),
-              ("; against replay: total %s ms, call %s ms" %
-               (_fmt(line.get("vs_replay_total_ms"), 4), _fmt(line.get("vs_replay_call_ms"), 4)))
-              if "vs_replay_total_ms" in line or "vs_replay_call_ms" in line else ""))
+              ("; against %s: total %s ms, call %s ms" %
+               (line["vs"], _fmt(line.get("vs_total_ms"), 4), _fmt(line.get("vs_call_ms"), 4)))
+              if "vs" in line else ""))
 
 
 def run_ranks(args, process: str, echo=print) -> dict:
