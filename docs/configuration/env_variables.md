@@ -340,6 +340,106 @@ Default `0` (resolved, not set).
 states the pool formula adds to the live need of `max_num_seqs` requests.
 Default `512`.
 
+`VLLM_HPU_PREFIX_KEEP_PROMPT_END=1` makes the recurrent state pool keep the
+recurrent state at a prompt's end when the prompt ends on a scheduler block
+(512 tokens at TP8, 896 at TP4). At `--prefix-cache-retention-interval 0` (the
+default) a recurrent group keeps one state per request, at the prompt's last
+token aligned down to the block; for a prompt whose length is a multiple of the
+block that position is one block before its end, where a state exists only if
+a prompt chunk happened to end there. When none did (three of four aligned
+lengths at TP8, one of two at TP4, with the 2,048-token prompt cap) the next
+turn of the conversation gets no prefix-cache hit at all and prefills its whole
+context again. With `1` the state after the last prompt token is kept as well,
+so the next turn starts right behind the previous prompt. Cost: one more
+retained state per recurrent group for such a prompt. A retry of the same
+aligned prompt is not helped (it must compute its last token again). Default
+`0`. See `keep_block_aligned_prompt_end` in
+`vllm_gaudi/v1/core/recurrent_pool_coordinator.py`.
+
+`VLLM_HPU_PREFIX_KEEP_DECODE_END=1` makes the recurrent state pool keep the
+recurrent state at the last scheduler-block boundary a request reached while
+decoding. At retention interval 0 a request leaves one recurrent state behind,
+at its prompt's end aligned down to the block, so the next turn of a
+conversation prefills the previous turn's whole output again (with a
+1,100-token output at TP8: 2,148 tokens prefilled where 612 are new or
+unaligned). With `1` the state its decode steps completed at the last block
+boundary is kept too (one per request and recurrent group: an earlier one
+leaves the prefix cache when a later one is cached), and the next turn starts
+there. Dense retention (`--prefix-cache-retention-interval` at the block size)
+gives the same hit but keeps every chunk-end state of every prompt. Ignored,
+with a warning, when speculative decoding is on: a speculative step that
+straddles a block boundary leaves no state exactly at it. Default `0`. See
+`keep_last_decode_boundary` in
+`vllm_gaudi/v1/core/recurrent_pool_coordinator.py`.
+
+`VLLM_HPU_PREFIX_ALIGN_SPLIT=1` makes prompt chunks end at the recurrent
+state block (896 tokens at TP4, 512 at TP8) when the engine core's
+`cache_config.block_size` differs from it. The engine's
+`Scheduler._mamba_block_aligned_split` aligns chunk ends to
+`cache_config.block_size`, while the runner keeps a recurrent state per
+recurrent block. On the card the chunk ends were multiples of 2,048 (prefill
+job 00014), so the state at a prompt's last block boundary existed only when a
+chunk happened to end there: the next turn of most conversations missed the
+prefix cache completely (00014, and a 120,832-token prefix in engine-step job
+00110). At TP4 a state slot could also receive the state of another position,
+which a later prefix hit reads. With `1` the engine's own rule runs with the
+recurrent block. Either way the first prompt chunk logs both block sizes once
+("Prefill chunk ends follow ..." or a warning). Default `0`. See
+`install_recurrent_aligned_split` in
+`vllm_gaudi/v1/core/recurrent_pool_coordinator.py`.
+
+`VLLM_HPU_PREFILL_PACING` keeps decoding streams alive while prompts are
+prefilled, as an integer mode. `0` (default) leaves vLLM's scheduler untouched.
+`1` (time share) wraps `Scheduler.schedule`: while at least one request is
+decoding, prompt work gets `VLLM_HPU_PREFILL_PACING_SHARE` percent of wall time
+(default `25`; after a step that carried prompt tokens the following steps
+carry decode rows only until they have lasted `(100 - share) / share` times the
+extra time of that step) and one step carries at most
+`VLLM_HPU_PREFILL_PACING_SLICE_TOKENS` prompt tokens (default `2048`, rounded
+down to whole scheduler blocks and at least one block: 512 tokens at TP8, 896
+at TP4; `0` removes the cap). The slice bounds the longest stall of a stream,
+the share bounds the loss of decode speed. With no request decoding nothing is
+paced, so a cold start prefills at the full step budget. The mode needs async
+scheduling off (Flash-Next runs without it). See
+`vllm_gaudi/v1/core/sched/prefill_pacing.py`.
+
+`VLLM_HPU_SCHED_KNOBS_FILE` names a JSON file of scheduler knobs that the
+engine re-reads while it runs (checked every 0.25 s): `max_num_scheduled_tokens`
+(at most `--max-num-batched-tokens`), `long_prefill_token_threshold` (`0` = no
+per-request cap), and the pacing knobs `mode`, `share_percent`, `slice_tokens`.
+It exists so a settings sweep (`tools/flash_next/rental/prefill_sweep.py`)
+changes the step budget on a running server instead of restarting it for every
+pair. A file that does not parse keeps the last good values. The same file
+carries one knob for the workers, `prompt_graph_max_tokens`: the model runner
+reads it at the start of every engine step and uses it as its prompt HPU-graph
+threshold (`-1` or absent = the server's `VLLM_HPU_PROMPT_GRAPH_MAX_TOKENS`,
+`0` = upstream's threshold, a positive value = the threshold), so one server
+measures prompt forwards with and without graph replay. Change it only while no
+request runs: every worker must take the change at the same step. Default:
+empty (no file, nothing wrapped, nothing read).
+
+`VLLM_HPU_PROMPT_GRAPH_MAX_TOKENS` sets the size up to which a prompt forward is
+replayed from an HPU graph: `batch x query + context blocks x block size` tokens.
+`0` (default) keeps upstream's threshold, `max_cudagraph_capture_size`, which is
+`--max-num-batched-tokens` unless configured (vLLM caps a configured value
+there). With the rental settings a 2,048-token chunk of a long prompt is then
+traced op by op on the host once its context passes about 6,000 tokens. A
+positive value (for example `140000`) replays every chunk of a 128K prompt from
+graphs; each new (query, context) bucket is captured on first use. Decode is
+unchanged.
+
+`VLLM_HPU_QSA_PREFILL_INDEXER_SPLIT=1` splits the QSA indexer's prompt scoring
+over the tensor-parallel ranks. The indexer projection and the compressed key
+cache are replicated, so by default every rank scores every query row of a
+prompt chunk against all block keys (fp32 tiles of `[512, heads, context / 4]`
+and a top-k over `context / 4` blocks) and gets the same selection. With `1`,
+rank `r` scores rows `[r * T / tp, (r + 1) * T / tp)` and one all-gather per
+prompt row collects the selected block ids (sent as fp32, exact). The ids are
+fp32 from the selection on: the top-k's int64 ids index an fp32 table and are
+never cast on the device (a cast of them in the graph that made them returns
+every second id on the card). A bucket that does not split evenly keeps the
+default. Default `0`.
+
 `VLLM_COMPACT_GDN` selects the compact-GDN fast path with per-token state
 checkpoints for GDN hybrids. Under prefix caching the platform hook defaults
 it to `0`, and starting with `VLLM_COMPACT_GDN=1` and prefix caching enabled is
@@ -523,6 +623,7 @@ prepared-model entrypoint and disabled in the generic entrypoint.
 | `VLLM_GDN_FUSED_STATE_MATMUL` | Fuses the GDN phase-B output and recurrent-state projections into one larger matrix multiplication per chunk. | `false` |
 | `VLLM_GDN_DEFERRED_OUTPUT_ADD` | Defers GDN phase-B output accumulation until after the recurrent loop, avoiding in-place writes to chunk views in compiled HPU graphs. | `false` |
 | `VLLM_GDN_RECURSIVE_SOLVER_BASE` | Enables recursive block inversion for the GDN triangular solve. Set to `0` to disable it or a power-of-two base size of which the chunk size is a power-of-two multiple. | `0` |
+| `VLLM_GDN_RECURSIVE_SOLVER_REFINE` | Newton refinement steps applied after the recursive block inverse (`VLLM_GDN_RECURSIVE_SOLVER_BASE` > 0). Base 16 alone leaves an error near 3e-4 on ill-conditioned chunks (nearly repeated keys, beta near 1, slow decay); `1` restores the accuracy of the default 14-step solve for two batched matmuls. Lowering `VLLM_GDN_NEUMANN_ITERS` to 7 is not a substitute: in fp32 the default's steps 8 to 14 repair a cancellation that step 7 leaves on such chunks. | `0` |
 | `VLLM_GDN_COMPACT_REPEATED_KKT` | Computes the GDN KKT product once per unique key head when value heads repeat the same key heads. | `false` |
 | `VLLM_GDN_COMPACT_REPEATED_LOCAL_ATTN` | Computes the phase-B local Q/K product once per unique Q/K head, then combines it with each repeated value head's causal decay. | `false` |
 | `VLLM_GDN_COMPILED_QK_L2NORM` | Keeps GDN Q/K L2 normalization inside the compiled prefill graph. Leave disabled on HPU compiler versions where this path has not been validated. | `false` |

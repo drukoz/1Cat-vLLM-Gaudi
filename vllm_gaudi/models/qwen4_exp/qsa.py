@@ -23,7 +23,11 @@ import torch
 from torch import nn
 
 from vllm.config import VllmConfig
-from vllm.distributed import get_tensor_model_parallel_world_size
+from vllm.distributed import (
+    get_tensor_model_parallel_rank,
+    get_tensor_model_parallel_world_size,
+    tensor_model_parallel_all_gather,
+)
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.layernorm import GemmaRMSNorm
@@ -71,6 +75,38 @@ class QsaMode(enum.IntEnum):
 
     DENSE = 0
     SPARSE = 1
+
+
+def prefill_indexer_split(seq: int) -> tuple[int, int] | None:
+    """``(rank, world)`` when ``VLLM_HPU_QSA_PREFILL_INDEXER_SPLIT=1`` and a ``seq``-row prompt bucket splits
+    evenly over the TP ranks; ``None`` (every rank scores every row, the default) otherwise."""
+    if int(envs.VLLM_HPU_QSA_PREFILL_INDEXER_SPLIT) != 1:
+        return None
+    world = get_tensor_model_parallel_world_size()
+    if world <= 1 or seq % world:
+        return None
+    return get_tensor_model_parallel_rank(), world
+
+
+def select_block_ids_fp32(scores: torch.Tensor, visible: torch.Tensor, block_topk: int) -> torch.Tensor:
+    """``select_blocks`` with the block ids as fp32 ``[T, block_topk]`` (-1.0 padded), without an integer cast
+    of the top-k's ids.
+
+    Card rule 9 (kernel-fixes job 00038): ``torch.topk``'s int64 ids narrowed with ``.to(torch.int32)`` on the
+    device in the graph that made them read back as every second id. Here the int64 ids are used as they are
+    (the form measured right on the card), as the index of an ``index_select`` into an fp32 ``arange``, so the
+    ids leave as fp32 values (block ids and -1 are exact below 2**24) and no cast ever reads them.
+    """
+    t, n = scores.shape
+    k = min(block_topk, n)
+    cols = torch.arange(n, device=scores.device)
+    masked = scores.masked_fill(cols[None, :] >= visible[:, None], float("-inf"))
+    vals, idx = torch.topk(masked, k, dim=-1)
+    ids = torch.arange(n, dtype=torch.float32, device=scores.device)
+    picked = ids.index_select(0, idx.reshape(-1)).view(t, k).masked_fill(vals == float("-inf"), -1.0)
+    if k < block_topk:
+        picked = torch.cat((picked, picked.new_full((t, block_topk - k), -1.0)), dim=1)
+    return picked
 
 
 def platform_is_hpu() -> bool:
@@ -343,8 +379,12 @@ class HpuQsaIndexer(nn.Module):
             all_rows.scatter_(1, dst[..., None].expand(-1, -1, D), keys.view(rows, n_full, D).to(cache.dtype))
             q4 = q.view(rows, seq, H, D)
             out = cache.new_full((rows, seq, width), -1, dtype=torch.int32)
+            split = prefill_indexer_split(seq)
             for b in range(rows):
                 row_keys = all_rows[b]
+                if split is not None:
+                    out[b] = self._select_prompt_rows_split(q4[b], row_keys, positions2[b], topk, split)
+                    continue
                 for lo in range(0, seq, self.SCORE_TILE):
                     hi = min(lo + self.SCORE_TILE, seq)
                     pos_tile = positions2[b, lo:hi]
@@ -423,6 +463,30 @@ class HpuQsaIndexer(nn.Module):
             md, ("emit_inputs", T), lambda: (positions.to(torch.int32, copy=True), owned(md.block_table.to(torch.int32))))
         slots, valid_cols = qsa_index_emit(owned(blocks_sel), positions32, table32, ratio, int(md.block_size))
         return QsaDecodeSelection(slots, valid_cols)
+
+    def _select_prompt_rows_split(self, q_row: torch.Tensor, row_keys: torch.Tensor, pos_row: torch.Tensor,
+                                  topk: int, split: tuple[int, int]) -> torch.Tensor:
+        """One prompt row's selection with the scoring split over the TP ranks (``prefill_indexer_split``).
+
+        Every rank holds the same queries and block keys (replicated projection, replicated cache), so rank
+        ``r`` scores only its query rows ``[r * seq / tp, (r + 1) * seq / tp)``, and one all-gather in rank
+        order collects the block ids of all rows. They are fp32 from the selection on
+        (``select_block_ids_fp32``: the top-k's int64 ids are never cast, card rule 9) and travel as fp32;
+        the one cast, fp32 to int32, comes after the all-gather. The expansion to token positions runs for
+        all rows on every rank. ``[seq, width]`` int32.
+        """
+        rank, world = split
+        seq = q_row.shape[0]
+        per = seq // world
+        start = rank * per
+        parts = []
+        for lo in range(start, start + per, self.SCORE_TILE):
+            hi = min(lo + self.SCORE_TILE, start + per)
+            scores = score_blocks(q_row[lo:hi], row_keys)
+            parts.append(select_block_ids_fp32(scores, visible_blocks(pos_row[lo:hi], self.compress_ratio), topk))
+        local = parts[0] if len(parts) == 1 else torch.cat(parts, dim=0)
+        gathered = tensor_model_parallel_all_gather(local, dim=0).to(torch.int32)
+        return expand_selection(gathered, pos_row, self.compress_ratio)
 
     def _select_decode(
         self,

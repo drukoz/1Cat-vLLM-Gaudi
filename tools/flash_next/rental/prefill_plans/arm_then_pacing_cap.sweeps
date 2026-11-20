@@ -1,0 +1,25 @@
+# One arm of a prefill A/B (TP4 + EP4: scheduler block 896 tokens). Every arm sends the same prompts (the nonces).
+# The 32,768-token lines come first: a 2,048-token chunk at 120K context needs about 3.3 GB of attention scores
+# per QSA layer at TP4 (6 heads x 2,048 x 133K, bf16), close to the memory left there, so a server that dies
+# in c120k has already given its other numbers.
+# c32k: a cold 32,768-token prompt twice (pass 1 compiles the buckets it meets, pass 2 is the warm number).
+c32k --plan baseline --cold-tokens 32768 --repeat 2 --warm-tokens "" --concurrent "" --turn2-tokens 0 --shared-prefix 0 --canaries 0 --case-max-tokens 8 --return-ids --nonce arm-32k
+# suffix: 32 conversations of 8,192 tokens (the setup row: 32 cold prompts at once), then every one sends turn
+# after turn for 40 s: 892 new tokens + its 4 output tokens = one 896-token block per turn, so every turn
+# prefills exactly 1,024 uncached tokens after a prefix hit, in one forward of one bucket (1024 x ctx 123).
+# The first round is 32 suffixes at once (step-anatomy's case: time to first token = the prompt forwards queue).
+suffix --plan agents --agents 32 --agent-context 8192 --agent-new-tokens 892 --agent-output 4 --agent-seconds 40 --canaries 0 --nonce arm-suffix
+# streams: 4 streams decode while one 32,768-token prompt, then four 16,384-token prompts at once, are prefilled.
+streams --plan baseline --cold-tokens 32768 --repeat 1 --warm-tokens "" --concurrent 4 --concurrent-tokens 16384 --turn2-tokens 0 --shared-prefix 0 --canaries 4 --nonce arm-streams
+# c120k: a cold 122,880-token prompt twice, then its second prompt again with 64, 512 and 2,048 new tokens,
+# twice (a next turn at 120K: a prefix hit and a short prefill; round 1 compiles those buckets, round 2 is warm).
+c120k --plan baseline --cold-tokens 122880 --repeat 2 --warm-tokens 64,512,2048,64,512,2048 --concurrent "" --turn2-tokens 0 --shared-prefix 0 --canaries 0 --case-max-tokens 8 --return-ids --nonce arm-120k
+# agents: the workload in small: 8 conversations of 32,768 tokens, each sends its next turn (history + its 256
+# output tokens + 1,024 new tokens) as soon as the last one ended, for 60 s; pacing off, then prompt work at 25 %.
+agents --knobs-file /tmp/prefill_knobs.json --plan agents --agents 8 --agent-context 32768 --agent-new-tokens 1024 --agent-output 256 --agent-seconds 60 --agent-pacing 100:0,25:2048 --canaries 0 --nonce arm-agents
+# pacing: the 32,768-token prompt of "streams" again with prompt work at 50 % and at 25 % of wall time.
+pacing --knobs-file /tmp/prefill_knobs.json --plan pacing --pacing 50:2048,25:2048 --sweep-tokens 32768 --canaries 4 --nonce arm-pacing
+# turn2: a 32,768-token prompt, 256 generated tokens, then the same conversation with 40 new tokens (what is reused).
+turn2 --plan baseline --cold-tokens "" --concurrent "" --turn2-tokens 32768 --turn2-generate 256 --shared-prefix 0 --canaries 0 --nonce arm-turn2
+# cap8192: one 8,192-token forward of a prompt per step instead of 2,048 (its buckets compile on pass 1).
+cap8192 --knobs-file /tmp/prefill_knobs.json --knobs '{"long_prefill_token_threshold": 8192}' --label "cap 8192" --plan baseline --cold-tokens 32768 --repeat 2 --warm-tokens "" --concurrent "" --turn2-tokens 0 --shared-prefix 0 --canaries 0 --case-max-tokens 8 --return-ids --nonce arm-cap8192

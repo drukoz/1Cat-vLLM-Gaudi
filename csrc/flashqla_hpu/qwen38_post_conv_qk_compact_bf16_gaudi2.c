@@ -3,11 +3,16 @@
 // Normalize the physical Q/K heads in FP32, then write one BF16 copy of
 // each head. The GDN graph can broadcast these heads to the value heads
 // after the expensive FP32 normalization boundary.
+//
+// QWEN38_QK_HEADS is the number of key heads of one rank: 16 (TP1, packed
+// q|k|v width 10240), 8 (TP2, 5120), 4 (TP4, 2560) or 2 (TP8, 1280). The
+// 16 and 8 head objects are unchanged by the two smaller layouts.
 #ifndef QWEN38_QK_HEADS
 #define QWEN38_QK_HEADS 16
 #endif
-#if QWEN38_QK_HEADS != 16 && QWEN38_QK_HEADS != 8
-#error "Only Qwen3.8 TP1 and TP2 compact Q/K layouts are supported"
+#if QWEN38_QK_HEADS != 16 && QWEN38_QK_HEADS != 8 && \
+    QWEN38_QK_HEADS != 4 && QWEN38_QK_HEADS != 2
+#error "Only the TP1, TP2, TP4 and TP8 compact Q/K layouts are supported"
 #endif
 
 void main(tensor packed_qkv, tensor q_out, tensor k_out)
@@ -27,7 +32,11 @@ void main(tensor packed_qkv, tensor q_out, tensor k_out)
         packed_coords[1] = token;
         output_coords[2] = token;
 
+#if QWEN38_QK_HEADS >= 4
         #pragma loop_unroll(4) pipelined taken
+#else
+        #pragma loop_unroll(2) pipelined taken
+#endif
         for (int head = 0; head < qk_heads; ++head)
         {
             packed_coords[0] = head * head_dim;
