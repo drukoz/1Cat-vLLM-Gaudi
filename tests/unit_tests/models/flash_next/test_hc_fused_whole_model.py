@@ -25,7 +25,7 @@ from vllm.forward_context import set_forward_context  # noqa: E402
 
 from tests.unit_tests.hc_fused import hc_ops  # noqa: E402,F401  the CPU stand-in: the oracle as the CPU kernels
 from tests.unit_tests.models.flash_next.cpu_model import (  # noqa: E402
-    cpu_model, dense_reference_prompts, eos_token_id, ple_kwargs, prefill_metadata, reset_cpu_states)
+    cpu_draft_model, cpu_model, dense_reference_prompts, eos_token_id, ple_kwargs, prefill_metadata, reset_cpu_states)
 from vllm_gaudi.models.qwen4_exp import hyperconnection as layer_module  # noqa: E402
 from vllm_gaudi.models.qwen4_exp.hyperconnection import HpuGatedResidual  # noqa: E402
 
@@ -160,3 +160,39 @@ def test_fewer_owned_copies_change_no_bit_and_hand_no_op_a_view(tiny_checkpoint,
         assert base_counter.clones - counter.clones == calls * (per_forward["0"] - per_forward[mode]), mode
         for got, want in zip(outputs, base_out):
             assert got.dtype == want.dtype and torch.equal(got, want), f"mode {mode}"
+
+
+def test_the_mtp_draft_model_hands_no_fused_op_a_view_in_any_copy_mode(tiny_checkpoint, monkeypatch):
+    """The MTP draft model's layer is handed a ``flatten`` view of its input and passes it on as the residual of
+    its MLP hyper-connection. Copy mode 2 must copy it (it is not the very tensor a fused op returned): a view at a
+    custom op fails the step on a card. Every mode: the fused ops run, none is given a view, no layer is off, and
+    the draft's two outputs are the bits of mode 0 (the dummy weights are seeded)."""
+    lines: list[str] = []
+    monkeypatch.setattr(layer_module.logger, "warning", lambda message, *args: lines.append(message % args))
+    monkeypatch.setenv("VLLM_HPU_HC_FUSED", "1")
+    rows, multi_width = 3, 512
+    g = torch.Generator().manual_seed(11)
+    hidden_states = torch.randn(rows, multi_width, generator=g).to(torch.bfloat16)
+    runs = {}
+    for mode in ("0", "1", "2"):
+        monkeypatch.setenv("VLLM_HPU_HC_FUSED_COPY_MODE", mode)
+        with cpu_model(tiny_checkpoint, speculative_config={"method": "mtp", "num_speculative_tokens": 3},
+                       load_format="dummy") as (vllm_config, _):
+            draft = cpu_draft_model(vllm_config)
+            with _FusedOpCounter() as counter, set_forward_context(prefill_metadata(rows), vllm_config), \
+                    torch.no_grad():
+                sample, multi = draft(input_ids=torch.tensor([5, 6, 7]), positions=torch.arange(rows),
+                                      hidden_states=hidden_states.clone(), spec_step_idx=0)
+            runs[mode] = (sample.clone(), multi.clone(), counter)
+    assert lines == []
+    base_sample, base_multi, base_counter = runs["0"]
+    # one draft layer: its attention hyper-connection mixes (hc_norm), its MLP one and the final mixer combine
+    assert base_counter.ops == {"hc_norm": 1, "hc_combine_norm": 2, "hc_silu_split": 2, "hc_silu": 1, "hc_gate_mix": 3}
+    for mode, (sample, multi, counter) in runs.items():
+        assert counter.ops == base_counter.ops, mode
+        assert dict(counter.views) == {}, f"mode {mode}: fused ops were given views"
+        assert torch.equal(sample, base_sample) and torch.equal(multi, base_multi), mode
+    # mode 2 keeps the copy of the residual the layer was handed (a view) and of the two block outputs; mode 1
+    # also copies the chained residual and the two injections
+    assert base_counter.clones - runs["1"][2].clones == 3 + 3 * 2  # the three silu inputs, the three gated mixes
+    assert runs["1"][2].clones - runs["2"][2].clones == 3  # the final mixer's residual and the two injections
