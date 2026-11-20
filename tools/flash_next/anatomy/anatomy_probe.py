@@ -14,7 +14,8 @@ Every stream generates exactly ``TOKENS`` tokens (``max_tokens`` with ``ignore_e
 coding agent's request does. A fourth field ``min`` (``MODE:LEVELS:TOKENS:min``) sends ``min_tokens = max_tokens``
 for a round that measures that mask (``nomin`` is accepted and is the default); such a request also keeps the fused
 greedy LM-head path (``VLLM_HPU_FUSED_GREEDY_LOGITS``) off. The trace and flush rounds never send ``min_tokens``.
-The option ``ctx=N`` gives every stream a prompt of about N tokens (decode cost against context length; warm such
+The option ``tag=WORD`` names a round in the ``round start`` line the probe prints before every round (a watcher on
+the node, such as a perf sampler, starts on that line). The option ``ctx=N`` gives every stream a prompt of about N tokens (decode cost against context length; warm such
 a round first: with prefix caching the measured round then decodes almost at once).
 Per round: ms per token over each stream's own decode span (p50, min, max over the streams), time to first token,
 the aggregate tokens per second, a hash of every stream's text (greedy text parity between two servers) and one
@@ -81,21 +82,25 @@ def parse_phases(text: str, default_tokens: int) -> list:
         tokens = int(fields[2]) if len(fields) >= 3 and fields[2] else default_tokens
         if tokens < 2:
             raise ValueError("TOKENS must be at least 2, got %d" % tokens)
-        phase = {"mode": mode, "levels": levels, "tokens": tokens, "min_tokens": False, "ctx": 0}
+        phase = {"mode": mode, "levels": levels, "tokens": tokens, "min_tokens": False, "ctx": 0, "tag": ""}
         for option in fields[3:]:
             if option == "min":
                 phase["min_tokens"] = True
             elif option.startswith("ctx=") and option[4:].isdigit():
                 phase["ctx"] = int(option[4:])
+            elif option.startswith("tag=") and option[4:].isalnum():
+                phase["tag"] = option[4:]
             elif option not in ("", "nomin"):
-                raise ValueError("a phase option is 'min', 'nomin' or 'ctx=N', got %r in %r" % (option, part))
+                raise ValueError("a phase option is 'min', 'nomin', 'ctx=N' or 'tag=WORD', got %r in %r" %
+                                 (option, part))
         phases.append(phase)
     return phases
 
 
 def phase_text(phase: dict) -> str:
-    return "%s:%s:%d%s%s" % (phase["mode"], ",".join(str(n) for n in phase["levels"]), phase["tokens"],
-                             ":min" if phase["min_tokens"] else "", ":ctx=%d" % phase["ctx"] if phase["ctx"] else "")
+    return "%s:%s:%d%s%s%s" % (phase["mode"], ",".join(str(n) for n in phase["levels"]), phase["tokens"],
+                               ":min" if phase["min_tokens"] else "", ":ctx=%d" % phase["ctx"] if phase["ctx"] else "",
+                               ":tag=%s" % phase["tag"] if phase.get("tag") else "")
 
 
 def extra_phases(default_tokens: int, after: bool = False) -> list:
@@ -317,7 +322,7 @@ def run(args) -> int:
             elif args.timing_dir:
                 write_mode(args, args.warm_mode)
             entry = {"mode": mode, "tokens": phase["tokens"], "min_tokens": phase["min_tokens"],
-                     "ctx": phase["ctx"], "rounds": [], "t_start": time.time()}
+                     "ctx": phase["ctx"], "tag": phase.get("tag", ""), "rounds": [], "t_start": time.time()}
             results["phases"].append(entry)
             for n in phase["levels"]:
                 # An idle gap before every round: the timer then writes the steps of each round as their own
@@ -325,6 +330,11 @@ def run(args) -> int:
                 # idle seconds).
                 time.sleep(args.idle)
                 t_round = time.time()
+                # A line when a round starts: a watcher outside the server (perf on the node) starts on it.
+                print("round start phase %s N=%d tokens=%d%s%s%s" % (
+                    mode, n, phase["tokens"], " min" if phase["min_tokens"] else "",
+                    " ctx=%d" % phase["ctx"] if phase["ctx"] else "",
+                    " tag=%s" % phase["tag"] if phase.get("tag") else ""), flush=True)
                 res = run_round(args, n, phase["tokens"], phase["min_tokens"], phase["ctx"],
                                 None if mode == "warm" or phase["ctx"] else args.measured_timeout)
                 res["mode"] = mode
@@ -444,7 +454,8 @@ def selftest(args) -> int:
     assert [p["ctx"] for p in data["phases"]] == [0, 0, 0, 0, 50]
     assert len(prompt_for(3, 50).split()) > 50 and prompt_for(3, 50).endswith(prompt_for(3))
     assert data["phases"][1]["rounds"][1]["ms_per_token_all_decoding"] > 0
-    assert [phase_text(p) for p in parse_phases("3:32,1:64:min:ctx=9;warm:8", 128)] == ["3:32,1:64:min:ctx=9", "warm:8:128"]
+    assert [phase_text(p) for p in parse_phases("3:32,1:64:min:ctx=9;warm:8;1:2:9:tag=perf", 128)] == [
+        "3:32,1:64:min:ctx=9", "warm:8:128", "1:2:9:tag=perf"]
     # two nomin rounds of 2 streams, the trace round of 3 streams and the flush round
     assert calls["no_min_tokens"] == 2 + 2 + 3 + 1, calls
     assert data["phases"][1]["rounds"][1]["ok"] == 3

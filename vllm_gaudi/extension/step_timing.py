@@ -16,9 +16,16 @@ Modes (``VLLM_HPU_STEP_TIMING``, an integer; any other value is 0):
 * ``3`` spans with device attribution: the host waits for the device (``mark_step()`` then ``synchronize()``)
   before and after every collective and after the forward and the sampler, so the device time of every segment
   between two collectives and of every collective is measured on its own. A step is slower in this mode (one
-  extra launch and wait per segment); the segments, not the step total, are the result.
-* ``4`` spans and the dispatched-op count of the forward, the logits and the sampler (a ``TorchDispatchMode``
-  around each). The Python dispatch makes the host spans of this mode slower than they are.
+  extra launch and wait per segment); the segments, not the step total, are the result. With
+  ``VLLM_HPU_STEP_TIMING_COMPONENTS=1`` the host also waits where a model component starts and ends
+  (hyper-connection, GDN mixer, QSA with its indexer and its sparse attention, MoE block with its expert op, PLE
+  layer), so the device time, the collective time and the host time of each component are measured on their own
+  (``components`` in the record). Segments and components exist only when the forward runs in Python
+  (``--enforce-eager``): a replayed HPU graph runs no Python between two steps.
+
+There is no mode 4. It counted the ops dispatched in the forward, the logits and the sampler with a
+``TorchDispatchMode`` around each; on the card (job 00013, TP8) its 23rd one-stream step never returned and the
+engine died of an RPC timeout. A replayed HPU graph dispatches no ops anyway.
 
 A step of the worker is one ``execute_model`` call and the ``sample_tokens`` call that follows it:
 
@@ -54,13 +61,11 @@ MODE_OFF = 0
 MODE_SPANS = 1
 MODE_COUNTERS = 2
 MODE_SYNC = 3
-MODE_OPS = 4
-MODES = (MODE_OFF, MODE_SPANS, MODE_COUNTERS, MODE_SYNC, MODE_OPS)
+MODES = (MODE_OFF, MODE_SPANS, MODE_COUNTERS, MODE_SYNC)
 MODE_FILE = "step_timing.mode"
 SCHEMA = 1
 IDLE_S = 2.0
 MAX_SITES = 24
-MAX_OP_NAMES = 80
 
 WORKER_SPANS = ("execute_model", "rpc_gap", "setup", "prepare", "launch_inputs", "forward", "logits", "launch_model",
                 "device_forward", "sample", "launch_sample", "device_sample", "wait", "draft", "post", "seg_compute",
@@ -69,7 +74,6 @@ ENGINE_SPANS = ("schedule", "execute_model_send", "execute_model_wait", "sample_
                 "sample_tokens_rpc", "update_from_output", "other")
 
 TIMER: StepTimer | None = None  # the process timer; None when the flag is 0
-_NULL_CONTEXT = contextlib.nullcontext()
 _MISSING = object()
 
 
@@ -107,8 +111,7 @@ def parse_mode(text) -> int:
 class _Window:
     """The steps of one kind and row count since the last flush."""
 
-    __slots__ = ("kind", "rows", "bucket_rows", "steps", "t_first", "t_last", "series", "segments", "sites",
-                 "op_names", "mode")
+    __slots__ = ("kind", "rows", "bucket_rows", "steps", "t_first", "t_last", "series", "segments", "sites", "mode")
 
     def __init__(self, kind, rows, mode, wall):
         self.kind = kind
@@ -120,7 +123,6 @@ class _Window:
         self.series = {}  # name -> one value per step (ms for spans, a number for counters, None when absent)
         self.segments = []  # mode 3: per step [(name, compute ms, collective ms), ...]
         self.sites = {}  # mode 2: (label, "file:line") -> count
-        self.op_names = {}  # mode 4: op name -> count
         self.mode = mode
 
     def put(self, name, value):
@@ -134,46 +136,6 @@ class _Window:
         for column in self.series.values():
             if len(column) < self.steps:
                 column.append(None)
-
-
-class _OpCountContext:
-    """Counts the ops dispatched inside the ``with`` block into the open step (mode 4)."""
-
-    def __init__(self, timer, name):
-        self.timer = timer
-        self.name = name
-        self.mode = None
-
-    def __enter__(self):
-        timer = self.timer
-        try:
-            from torch.utils._python_dispatch import TorchDispatchMode
-
-            names = timer._op_names
-            box = [0]
-
-            class Counter(TorchDispatchMode):
-
-                def __torch_dispatch__(self, func, types, args=(), kwargs=None):
-                    box[0] += 1
-                    schema = getattr(func, "_schema", None)
-                    key = schema.name if schema is not None else str(func)
-                    names[key] = names.get(key, 0) + 1
-                    return func(*args, **(kwargs or {}))
-
-            self.box = box
-            self.mode = Counter()
-            self.mode.__enter__()
-        except Exception as exc:  # noqa: BLE001 - counting must never break a step
-            self.mode = None
-            timer._warn_once("ops", "op counting is not available: %s: %s" % (type(exc).__name__, exc))
-        return self
-
-    def __exit__(self, exc_type, exc, tb):
-        if self.mode is not None:
-            self.mode.__exit__(exc_type, exc, tb)
-            self.timer.count("ops_" + self.name, self.box[0])
-        return False
 
 
 class StepTimer:
@@ -212,8 +174,9 @@ class StepTimer:
         self._tags = None
         self._bucket_rows = None
         self._segments = []
+        self._stack = []  # mode 3: the open model components, innermost last
+        self._components = {}  # mode 3: component -> [host ns, device ns, collective ns, calls]
         self._sites = {}
-        self._op_names = {}
         self._windows = {}
         self._runtime = None  # (htorch, torch) of the worker, for modes 2 and 3
         self._patches = []  # mode 2: (object, attribute, saved value)
@@ -283,7 +246,8 @@ class StepTimer:
         self._tags = None
         self._bucket_rows = None
         self._segments = []
-        self._op_names = {}
+        self._stack = []
+        self._components = {}
         self.phase = "forward"
         self._open_marker()
 
@@ -411,11 +375,14 @@ class StepTimer:
             window.put("n:" + name, value)
         if self._segments:
             window.segments.append(self._segments)
+        for name, (host, device, collective, calls) in self._components.items():
+            window.put("comp_host:" + name, host / 1e6)
+            window.put("comp_device:" + name, device / 1e6)
+            window.put("comp_collective:" + name, collective / 1e6)
+            window.put("comp_calls:" + name, calls)
         for site, n in self._sites.items():
             window.sites[site] = window.sites.get(site, 0) + n
         self._sites = {}
-        for name, n in self._op_names.items():
-            window.op_names[name] = window.op_names.get(name, 0) + n
         window.close_step()
         if window.steps >= self.every:
             self._flush_window(key)
@@ -425,13 +392,7 @@ class StepTimer:
         """Before a collective of the open step. Mode 3 first runs what is accumulated so far on its own and
         records it as the compute segment in front of this collective."""
         if self.mode == MODE_SYNC and self._runtime is not None:
-            self.lap(self.phase)
-            self._device_wait()
-            now = self._clock()
-            compute = now - self._t_last
-            self._spans["seg_compute"] = self._spans.get("seg_compute", 0) + compute
-            self._t_last = now
-            return compute
+            return self._sync_cut(1)
         return self._clock()
 
     def collective_end(self, token: int, name: str, tensor=None) -> None:
@@ -453,6 +414,7 @@ class StepTimer:
             self._spans["seg_collective"] = self._spans.get("seg_collective", 0) + collective
             self._t_last = now
             self._segments.append((name, token / 1e6, collective / 1e6))
+            self._component_entry()[2] += collective
             return
         self._nested["collective_host"] = self._nested.get("collective_host", 0) + self._clock() - token
 
@@ -467,11 +429,47 @@ class StepTimer:
         htorch.core.mark_step()
         torch.hpu.synchronize()
 
-    def ops(self, name: str):
-        """A context manager that counts the ops dispatched inside it (mode 4); otherwise it does nothing."""
-        if self._open and self.mode == MODE_OPS:
-            return _OpCountContext(self, name)
-        return _NULL_CONTEXT
+    # -------------------------------------------------------------------------- mode 3: components
+    def _component_entry(self) -> list:
+        """``[host ns, device ns, collective ns, calls]`` of the innermost open component (``other``: none is)."""
+        stack = self._stack
+        owner = stack[-1] if stack else "other"
+        entry = self._components.get(owner)
+        if entry is None:
+            entry = self._components[owner] = [0, 0, 0, 0]
+        return entry
+
+    def _sync_cut(self, slot: int) -> int:
+        """Mode 3: run what is accumulated so far on its own. The host time since the last boundary stays in the
+        span of the phase; the wait is ``seg_compute``; both are credited to the innermost open component. Returns
+        the wait."""
+        now = self._clock()
+        spans = self._spans
+        host = now - self._t_last
+        spans[self.phase] = spans.get(self.phase, 0) + host
+        self._t_last = now
+        self._device_wait()
+        now = self._clock()
+        wait = now - self._t_last
+        spans["seg_compute"] = spans.get("seg_compute", 0) + wait
+        self._t_last = now
+        entry = self._component_entry()
+        entry[0] += host
+        entry[slot] += wait
+        return wait
+
+    def component_begin(self, name: str) -> None:
+        """Mode 3, before a model component runs: what the enclosing component has accumulated runs first."""
+        if self._open and self.mode == MODE_SYNC and self._runtime is not None:
+            self._sync_cut(1)
+            self._stack.append(name)
+            self._component_entry()[3] += 1
+
+    def component_end(self) -> None:
+        """Mode 3, after a model component ran: its accumulated ops run and their device time is its own."""
+        if self._open and self.mode == MODE_SYNC and self._runtime is not None and self._stack:
+            self._sync_cut(1)
+            self._stack.pop()
 
     # ------------------------------------------------------------------------- mode 2: sync counters
     def _sync_point(self, label: str, depth: int = 2) -> None:
@@ -622,7 +620,7 @@ class StepTimer:
 
     def window_record(self, window: _Window) -> dict:
         """The JSON record of one window: the statistics per series and the raw values."""
-        spans, nested, counters, raw = {}, {}, {}, {}
+        spans, nested, counters, raw, components = {}, {}, {}, {}, {}
         for name, column in window.series.items():
             raw[name] = [None if v is None else round(v, 4) for v in column]
             summary = stats(column)
@@ -632,6 +630,9 @@ class StepTimer:
                 counters[name[2:]] = summary
             elif name.startswith("in:"):
                 nested[name[3:]] = summary
+            elif name.startswith("comp_"):
+                field, _, component = name[5:].partition(":")
+                components.setdefault(component, {})[field] = summary
             else:
                 spans[name] = summary
         record = {
@@ -653,6 +654,8 @@ class StepTimer:
         }
         if window.segments:
             record["segments"] = self._segment_record(window.segments)
+        if components:
+            record["components"] = components
         if window.sites:
             top = sorted(window.sites.items(), key=lambda item: -item[1])[:MAX_SITES]
             record["sync_sites"] = [{
@@ -660,9 +663,6 @@ class StepTimer:
                 "where": where,
                 "per_step": n / window.steps
             } for (label, where), n in top]
-        if window.op_names:
-            top = sorted(window.op_names.items(), key=lambda item: -item[1])[:MAX_OP_NAMES]
-            record["op_names_per_step"] = {name: n / window.steps for name, n in top}
         return record
 
     @staticmethod
@@ -695,15 +695,79 @@ class StepTimer:
         for name, summary in sorted(record["counters"].items()):
             extras.append("%s %g" % (name, summary["p50"]))
         bucket = "" if record["bucket_rows"] is None else " bucket=%d" % record["bucket_rows"]
-        return "step timing: %s rank %d %s rows=%d%s steps=%d mode=%d | %s | %s%s (ms, p50/p90)" % (
+        line = "step timing: %s rank %d %s rows=%d%s steps=%d mode=%d | %s | %s%s (ms, p50/p90)" % (
             self.role, self.rank, record["kind"], record["rows"], bucket, record["steps"], record["mode"], " ".join(
                 part for part in head if part), " ".join(part for part in body if part),
             " | " + " ".join(extras) if extras else "")
+        components = record.get("components")
+        if components:
+
+            def p50(fields, field):
+                return (fields.get(field) or {}).get("p50", 0.0)
+
+            line += " | components, device/collective/host ms p50 (calls): " + ", ".join(
+                "%s %.2f/%.2f/%.2f (%g)" % (name, p50(fields, "device"), p50(fields, "collective"), p50(
+                    fields, "host"), p50(fields, "calls")) for name, fields in sorted(components.items()))
+        return line
 
 
-def ops(timer: StepTimer | None, name: str):
-    """``timer.ops(name)``, or a context manager that does nothing when there is no timer."""
-    return _NULL_CONTEXT if timer is None else timer.ops(name)
+# VLLM_HPU_STEP_TIMING_COMPONENTS: the components of a Flash-Next decoder layer, by the attribute that holds them.
+COMPONENT_CHILDREN = (("linear_attn", "gdn"), ("self_attn", "qsa"), ("mlp", "moe"), ("ple", "ple"))
+COMPONENT_PARTS = {"qsa": (("indexer", "select", "qsa_indexer"), ("sparse_attn", "forward", "qsa_attention")),
+                   "moe": (("experts", "forward", "moe_experts"), )}
+HC_ATTRIBUTES = ("attn_hyper_connection", "mlp_hyper_connection", "hyper_connection_mixer")
+HC_METHODS = ("combine_and_mix", "mix", "combine")
+
+
+def install_component_cuts(timer: StepTimer | None, model) -> dict:
+    """Wrap the component entry points of ``model`` (a module tree with ``...DecoderLayer`` modules) so that mode 3
+    of ``timer`` measures every component on its own: ``hc`` (the three hyper-connection calls), ``gdn``, ``qsa``
+    with ``qsa_indexer`` and ``qsa_attention`` inside it, ``moe`` with ``moe_experts`` inside it, ``ple``. The
+    wrappers sit on the instances, test one attribute outside mode 3, and never change what a component returns.
+    Returns how many entry points were wrapped per component."""
+    counts: dict = {}
+    if timer is None:
+        return counts
+
+    def wrap(owner, method: str, component: str) -> None:
+        original = getattr(owner, method, None)
+        if original is None or getattr(original, "_step_timing_component", None) is not None:
+            return
+
+        def wrapper(*args, **kwargs):
+            if not timer.active or timer.mode != MODE_SYNC:
+                return original(*args, **kwargs)
+            timer.component_begin(component)
+            try:
+                return original(*args, **kwargs)
+            finally:
+                timer.component_end()
+
+        wrapper._step_timing_component = component
+        try:
+            object.__setattr__(owner, method, wrapper)
+        except Exception:  # noqa: BLE001 - an entry point that cannot be wrapped is not measured
+            return
+        counts[component] = counts.get(component, 0) + 1
+
+    for module in model.modules():
+        for attribute in HC_ATTRIBUTES:
+            connection = getattr(module, attribute, None)
+            if connection is not None:
+                for method in HC_METHODS:
+                    wrap(connection, method, "hc")
+        if not type(module).__name__.endswith("DecoderLayer"):
+            continue
+        for attribute, component in COMPONENT_CHILDREN:
+            child = getattr(module, attribute, None)
+            if child is None:
+                continue
+            wrap(child, "forward", component)
+            for part_attribute, method, part in COMPONENT_PARTS.get(component, ()):
+                part_owner = getattr(child, part_attribute, None)
+                if part_owner is not None:
+                    wrap(part_owner, method, part)
+    return counts
 
 
 def env_settings(environ=None) -> tuple[int, int, str]:

@@ -90,3 +90,50 @@ def test_summarize_reads_records_in_the_run_folder_itself(tmp_path):
     _run_worker(tmp_path, 0, 32, 30, 70.0, 3.0)  # a farm-serve server writes into its working directory
     result = summarize_timing.summarize(str(tmp_path))
     assert [c["label"] for c in result["columns"]] == ["mode1/N=32"]
+
+
+class _Runtime:
+    """mark_step and synchronize of a device that needs 2 ms per wait."""
+
+    def __init__(self, clock):
+        self.clock = clock
+        self.core = self
+        self.hpu = self
+
+    def mark_step(self):
+        pass
+
+    def synchronize(self):
+        self.clock.advance(2.0)
+
+
+def test_summarize_tabulates_the_components_of_a_mode_3_round(tmp_path):
+    from vllm_gaudi.extension.step_timing import MODE_SYNC
+
+    for rank, host_ms in ((0, 0.5), (1, 0.7)):
+        clock = FakeClock()
+        timer = StepTimer("worker", rank=rank, mode=MODE_SYNC, every=10_000, out_dir=str(tmp_path / "timing"),
+                          clock=clock, wall=lambda: 2000.5, idle_s=2.0)
+        timer.bind_runtime(_Runtime(clock), _Runtime(clock))
+        for _ in range(25):
+            timer.begin_step()
+            timer.tag("decode", 32, 32)
+            for name in ("hc", "qsa"):
+                timer.component_begin(name)
+                clock.advance(host_ms)
+                timer.component_end()
+            timer.end_step()
+            clock.advance(5.0)
+        timer.close()
+    probe = {"phases": [{"mode": "3", "min_tokens": True, "ctx": 4000,
+                         "rounds": [{"streams": 32, "tokens": 48, "t_start": 2000.0, "t_end": 2001.0,
+                                     "ms_per_token_p50": 300.0}]}], "traces": []}
+    (tmp_path / "probe.json").write_text(json.dumps(probe))
+    result = summarize_timing.summarize(str(tmp_path))
+    col = result["columns"][0]
+    assert col["label"] == "3/N=32/min/ctx=4000"
+    assert col["components"]["qsa"] == {"host": 0.5, "device": 2.0, "collective": 0.0, "calls": 1}
+    assert col["components_rank_max"]["qsa"]["host"] == 0.7
+    text = summarize_timing.markdown(result)
+    assert "| qsa | 1 | 2.00 (2.00) | 0.00 (0.00) | 0.50 (0.70) |" in text
+    assert "| all components | | 8.00 | 0.00 | 1.00 |" in text  # other: the two waits in front of the components

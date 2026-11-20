@@ -536,7 +536,8 @@ if TYPE_CHECKING:
     VLLM_HPU_HC_FUSED: int = 0  # 0 torch hyper-connections (default), 1 the fused hyper-connection kernels
     VLLM_HPU_MOE_GLUE: int = 0  # 0 torch MoE glue (default), 1 the fused MoE glue kernels
     VLLM_HPU_COLLECTIVE_MARK_STEP: int = 1  # 1 (default) mark_step() before every HPU collective, 0 none
-    VLLM_HPU_STEP_TIMING: int = 0  # StepTimingMode: 0 off (default), 1 spans, 2 sync counters, 3 device waits, 4 ops
+    VLLM_HPU_STEP_TIMING: int = 0  # StepTimingMode: 0 off (default), 1 spans, 2 sync counters, 3 device waits
+    VLLM_HPU_STEP_TIMING_COMPONENTS: int = 0  # 0 (default) none, 1 mode 3 also waits around every model component
     VLLM_HPU_STEP_TIMING_EVERY: int = 100  # steps per log line and JSON record of the step timer
     VLLM_HPU_STEP_TIMING_DIR: str = ""  # folder of the step timer's JSON files ("" = the working directory)
     VLLM_HPU_RECURRENT_STATE_POOL: int = 0  # RecurrentStatePoolMode: 0 off, 1 pool
@@ -1933,11 +1934,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # per step. 2 = 1 and the debug counters of host synchronisation points (.item(), .cpu(), .tolist(),
     # copies between host and device, mark_step calls) with their source lines. 3 = 1 with a wait for the
     # device around every collective and after the forward and the sampler, which gives the device time
-    # of every segment (the step itself is slower in this mode). 4 = 1 and the dispatched-op count of the
-    # forward, the logits and the sampler. Any other value is 0. A process started with a nonzero value
-    # rereads <dir>/step_timing.mode (one integer) when a step starts after two idle seconds.
+    # of every segment (the step itself is slower in this mode). Any other value is 0 (there is no mode 4:
+    # its op counting hung a TP8 server, job 00013). A process started with a nonzero value rereads
+    # <dir>/step_timing.mode (one integer) when a step starts after two idle seconds.
     "VLLM_HPU_STEP_TIMING":
     lambda: int(os.environ.get("VLLM_HPU_STEP_TIMING", "0")),
+    # 1 = mode 3 of the step timer also waits for the device where a model component starts and ends
+    # (hyper-connection, GDN, QSA indexer and attention, MoE and its expert op, PLE), so each component's
+    # device, collective and host time is measured on its own. For a server without HPU graphs
+    # (--enforce-eager): a replayed graph runs no Python. 0 (default) = the model is not touched.
+    "VLLM_HPU_STEP_TIMING_COMPONENTS":
+    lambda: int(os.environ.get("VLLM_HPU_STEP_TIMING_COMPONENTS", "0")),
     # Steps of one kind and row count per log line and JSON record of the step timer.
     "VLLM_HPU_STEP_TIMING_EVERY":
     lambda: int(os.environ.get("VLLM_HPU_STEP_TIMING_EVERY", "100")),

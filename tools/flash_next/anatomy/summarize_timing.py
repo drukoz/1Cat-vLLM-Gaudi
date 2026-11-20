@@ -63,7 +63,9 @@ def load_rounds(run_dir: str) -> list:
         for res in phase.get("rounds", []):
             if "t_start" not in res:
                 continue
-            label = "%s/N=%d%s" % (phase["mode"], res["streams"], "" if phase.get("min_tokens", True) else "/nomin")
+            label = "%s/N=%d%s%s%s" % (phase["mode"], res["streams"], "/min" if phase.get("min_tokens") else "",
+                                       "/ctx=%d" % phase["ctx"] if phase.get("ctx") else "",
+                                       "/%s" % phase["tag"] if phase.get("tag") else "")
             if any(r["label"] == label for r in rounds):  # the same phase twice: number the repeats
                 label += "/#%d" % (1 + sum(1 for r in rounds if r["label"].startswith(label)))
             rounds.append({"label": label, "mode": phase["mode"],
@@ -151,7 +153,7 @@ def summarize(run_dir: str, rank: int = 0, min_steps: int = 20) -> dict:
                "mode": driver.get("mode") if driver else (engine or {}).get("mode"),
                "bucket_rows": driver.get("bucket_rows") if driver else None, "worker": {}, "worker_rank_max": {},
                "nested": {}, "counters": {}, "engine": {}, "segments": (driver or {}).get("segments"),
-               "sync_sites": (driver or {}).get("sync_sites"), "op_names": (driver or {}).get("op_names_per_step")}
+               "sync_sites": (driver or {}).get("sync_sites"), "components": {}, "components_rank_max": {}}
         rnd = next((r for r in rounds if r["label"] == label), None)
         col["ms_per_token"] = rnd["ms_per_token"] if rnd else None
         if driver:
@@ -164,11 +166,43 @@ def summarize(run_dir: str, rank: int = 0, min_steps: int = 20) -> dict:
                 col["nested"][name] = p50(driver, "nested_ms", name)
             for name in (driver.get("counters") or {}):
                 col["counters"][name] = p50(driver, "counters", name)
+            # mode 3 with VLLM_HPU_STEP_TIMING_COMPONENTS: per component the device, collective and host time
+            for name, fields in (driver.get("components") or {}).items():
+                col["components"][name] = {field: (summary or {}).get("p50") for field, summary in fields.items()}
+                slowest = {}
+                for field in ("device", "collective", "host"):
+                    values = [((rec.get("components") or {}).get(name) or {}).get(field) for rec in workers.values()]
+                    values = [v.get("p50") for v in values if v]
+                    slowest[field] = max(values) if values else None
+                col["components_rank_max"][name] = slowest
         if engine:
             for name in (engine.get("spans_ms") or {}):
                 col["engine"][name] = p50(engine, "spans_ms", name)
         result["columns"].append(col)
     return result
+
+
+def components_table(col: dict) -> str:
+    """The component table of one mode-3 column: ms per step, p50, of the driver rank and of the slowest rank."""
+    comps, slowest = col["components"], col.get("components_rank_max") or {}
+    order = sorted(comps, key=lambda n: -((comps[n].get("device") or 0.0) + (comps[n].get("collective") or 0.0)))
+    lines = ["%s: components per step (mode 3, ms p50; rank 0, and the slowest rank in brackets)" % col["label"],
+             "| component | calls | device | collective | host issue |", "|---|---|---|---|---|"]
+    total = {"device": 0.0, "collective": 0.0, "host": 0.0}
+
+    def cell(name, field):
+        value, worst = comps[name].get(field), (slowest.get(name) or {}).get(field)
+        if value is None:
+            return ""
+        return "%.2f (%.2f)" % (value, worst) if worst is not None else "%.2f" % value
+
+    for name in order:
+        for field in total:
+            total[field] += comps[name].get(field) or 0.0
+        lines.append("| %s | %s | %s | %s | %s |" % (name, fmt(comps[name].get("calls"), 0), cell(name, "device"),
+                                                     cell(name, "collective"), cell(name, "host")))
+    lines.append("| all components | | %.2f | %.2f | %.2f |" % (total["device"], total["collective"], total["host"]))
+    return "\n".join(lines)
 
 
 def markdown(result: dict) -> str:
@@ -198,10 +232,8 @@ def markdown(result: dict) -> str:
         if c.get("sync_sites"):
             out.append("\n%s: host sync points per step (mode 2): %s" % (c["label"], "; ".join(
                 "%s at %s x%.1f" % (s["what"], s["where"], s["per_step"]) for s in c["sync_sites"][:12])))
-        if c.get("op_names"):
-            top = sorted(c["op_names"].items(), key=lambda kv: -kv[1])[:15]
-            out.append("\n%s: dispatched ops per step (mode 4), top: %s" % (c["label"], ", ".join(
-                "%s %.0f" % (k, v) for k, v in top)))
+        if c.get("components"):
+            out.append("\n" + components_table(c))
     return "\n".join(out)
 
 

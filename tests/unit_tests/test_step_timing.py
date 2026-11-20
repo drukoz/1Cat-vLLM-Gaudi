@@ -360,29 +360,150 @@ def test_mode_2_counts_mark_step_and_synchronize_of_the_bound_runtime(tmp_path, 
     assert calls[-1] == "mark_step"
 
 
-def test_mode_4_counts_the_ops_dispatched_inside_a_block(tmp_path, clock, lines):
-    timer = make(tmp_path, clock, lines, mode=step_timing.MODE_OPS, every=1)
-    x = torch.ones(2, 4)
+def test_mode_3_gives_every_component_its_device_collective_and_host_time(tmp_path, clock, lines):
+    timer = make(tmp_path, clock, lines, mode=step_timing.MODE_SYNC, every=1)
+    calls = []
+    # the waits, in order: before hc (other), hc, before gdn (other), gdn's ops in front of its collective,
+    # gdn's collective, the rest of gdn, before qsa (other), qsa before its indexer, the indexer, the rest of qsa,
+    # the tail of the forward
+    runtime = FakeRuntime(clock, calls, [0.5, 2.0, 0.0, 3.0, 0.4, 0.1, 0.25, 1.0, 6.0, 0.7, 1.5])
+    timer.bind_runtime(runtime, runtime)
     timer.begin_step()
-    timer.tag("decode", 2)
-    with timer.ops("forward"):
-        y = x * 2.0 + 1.0
-        y = torch.nn.functional.silu(y)
-    with timer.ops("logits"):
-        y.sum()
+    timer.tag("decode", 32)
+    timer.phase = "forward"
+    clock.ms(0.3)  # the embedding, issued by the host outside every component
+    timer.component_begin("hc")
+    clock.ms(0.2)
+    timer.component_end()
+    timer.component_begin("gdn")
+    clock.ms(0.2)
+    token = timer.collective_begin()
+    timer.collective_end(token, "all_reduce")
+    timer.component_end()
+    timer.component_begin("qsa")
+    clock.ms(0.1)
+    timer.component_begin("qsa_indexer")
+    clock.ms(0.4)
+    timer.component_end()
+    timer.component_end()
+    timer.lap("forward")
+    timer.device_wait("device_forward")
     timer.end_step()
     record = records(timer)[0]
-    assert record["counters"]["ops_forward"]["p50"] == 3
-    assert record["counters"]["ops_logits"]["p50"] == 1
-    assert record["op_names_per_step"]["aten::mul"] == 1.0 and record["op_names_per_step"]["aten::silu"] == 1.0
+    components = {name: {field: summary["p50"] for field, summary in fields.items()}
+                  for name, fields in record["components"].items()}
+    assert components["other"] == pytest.approx({"host": 0.3, "device": 0.75, "collective": 0.0, "calls": 0})
+    assert components["hc"] == pytest.approx({"host": 0.2, "device": 2.0, "collective": 0.0, "calls": 1})
+    assert components["gdn"] == pytest.approx({"host": 0.2, "device": 3.1, "collective": 0.4, "calls": 1})
+    assert components["qsa"] == pytest.approx({"host": 0.1, "device": 1.7, "collective": 0.0, "calls": 1})
+    assert components["qsa_indexer"] == pytest.approx({"host": 0.4, "device": 6.0, "collective": 0.0, "calls": 1})
+    spans = record["spans_ms"]
+    assert spans["forward"]["p50"] == pytest.approx(1.2)  # the host time of the forward: 0.3 + 0.2 + 0.2 + 0.1 + 0.4
+    assert spans["seg_compute"]["p50"] == pytest.approx(0.5 + 2.0 + 3.0 + 0.1 + 0.25 + 1.0 + 6.0 + 0.7)
+    assert spans["seg_collective"]["p50"] == pytest.approx(0.4)
+    assert spans["device_forward"]["p50"] == pytest.approx(1.5)
+    assert record["segments"]["compute_p50_ms"] == [3.0]
+    assert "components, device/collective/host ms p50 (calls): gdn 3.10/0.40/0.20 (1), hc 2.00/0.00/0.20 (1)" in lines[-1]
 
 
-def test_ops_is_a_null_context_in_the_other_modes_and_without_a_timer(tmp_path, clock, lines):
+def test_components_are_measured_in_mode_3_only(tmp_path, clock, lines):
     timer = make(tmp_path, clock, lines, mode=step_timing.MODE_SPANS, every=1)
+    calls = []
+    runtime = FakeRuntime(clock, calls, [])
+    timer.bind_runtime(runtime, runtime)
     timer.begin_step()
-    assert timer.ops("forward") is step_timing.ops(None, "forward")
-    with step_timing.ops(timer, "forward"):
-        pass
+    timer.tag("decode", 1)
+    timer.component_begin("hc")
+    timer.component_end()
+    timer.end_step()
+    assert calls == [] and "components" not in records(timer)[0]
+
+
+class _Part(torch.nn.Module):
+
+    def __init__(self, add):
+        super().__init__()
+        self.add = add
+
+    def forward(self, x):
+        return x + self.add
+
+    def select(self, x):
+        return x * 2
+
+    def combine_and_mix(self, x):
+        return x - 1
+
+    def mix(self, x):
+        return x
+
+    def combine(self, x):
+        return x
+
+
+class _TinyDecoderLayer(torch.nn.Module):
+
+    def __init__(self, qsa):
+        super().__init__()
+        self.attn_hyper_connection = _Part(0)
+        self.mlp_hyper_connection = _Part(0)
+        if qsa:
+            self.self_attn = _Part(10)
+            self.self_attn.indexer = _Part(0)
+            self.self_attn.sparse_attn = None  # the dense QSA mode has no sparse attention module
+        else:
+            self.linear_attn = _Part(20)
+        self.mlp = _Part(100)
+        self.mlp.experts = _Part(1000)
+
+    def forward(self, x):
+        x = self.attn_hyper_connection.combine_and_mix(x)
+        x = self.self_attn(self.self_attn.indexer.select(x)) if hasattr(self, "self_attn") else self.linear_attn(x)
+        x = self.mlp_hyper_connection.combine_and_mix(x)
+        return self.mlp(x)
+
+
+def test_install_component_cuts_wraps_the_entry_points_of_every_layer(tmp_path, clock, lines):
+    timer = make(tmp_path, clock, lines, mode=step_timing.MODE_SYNC, every=1)
+    calls = []
+    runtime = FakeRuntime(clock, calls, [])
+    timer.bind_runtime(runtime, runtime)
+    model = torch.nn.Sequential(_TinyDecoderLayer(False), _TinyDecoderLayer(True))
+    expected = model(torch.zeros(2))
+    counts = step_timing.install_component_cuts(timer, model)
+    assert counts == {"hc": 12, "gdn": 1, "qsa": 1, "qsa_indexer": 1, "moe": 2, "moe_experts": 2}
+    assert step_timing.install_component_cuts(timer, model) == {}  # a second call wraps nothing twice
+    assert torch.equal(model(torch.zeros(2)), expected) and calls == []  # outside a step: untouched, no waits
+    timer.begin_step()
+    timer.tag("decode", 2)
+    assert torch.equal(model(torch.zeros(2)), expected)
+    timer.end_step()
+    record = records(timer)[0]
+    called = {name: fields["calls"]["p50"] for name, fields in record["components"].items()}
+    assert called == {"hc": 4, "gdn": 1, "qsa": 1, "qsa_indexer": 1, "moe": 2, "other": 0}
+    assert calls == ["mark_step", "synchronize"] * 18  # two waits per component call
+    timer.set_mode(step_timing.MODE_SPANS)
+    del calls[:]
+    timer.begin_step()
+    timer.tag("decode", 2)
+    assert torch.equal(model(torch.zeros(2)), expected)
+    timer.end_step()
+    assert calls == []
+    assert step_timing.install_component_cuts(None, model) == {}
+
+
+def test_a_component_that_raises_leaves_no_component_open(tmp_path, clock, lines):
+    timer = make(tmp_path, clock, lines, mode=step_timing.MODE_SYNC, every=1)
+    runtime = FakeRuntime(clock, [], [])
+    timer.bind_runtime(runtime, runtime)
+    layer = _TinyDecoderLayer(False)
+    layer.linear_attn.add = "not a number"
+    step_timing.install_component_cuts(timer, torch.nn.Sequential(layer))
+    timer.begin_step()
+    timer.tag("decode", 1)
+    with pytest.raises(TypeError):
+        layer(torch.zeros(2))
+    assert timer._stack == []
     timer.discard_step()
 
 
@@ -409,7 +530,7 @@ def test_the_mode_file_is_reread_when_a_step_starts_after_an_idle_gap(tmp_path, 
     assert modes == [(1, 2), (3, 1), (1, 1)]
 
 
-@pytest.mark.parametrize("text, mode", [("0", 0), ("1", 1), (" 2\n", 2), ("3", 3), ("4", 4), ("5", 0), ("-1", 0),
+@pytest.mark.parametrize("text, mode", [("0", 0), ("1", 1), (" 2\n", 2), ("3", 3), ("4", 0), ("5", 0), ("-1", 0),
                                         ("on", 0), ("", 0), (None, 0)])
 def test_parse_mode(text, mode):
     assert step_timing.parse_mode(text) == mode
@@ -463,9 +584,11 @@ def test_init_timer_reads_the_three_variables(tmp_path, monkeypatch):
 def test_the_plugin_documents_the_three_variables():
     from vllm_gaudi import envs
 
-    for name in ("VLLM_HPU_STEP_TIMING", "VLLM_HPU_STEP_TIMING_EVERY", "VLLM_HPU_STEP_TIMING_DIR"):
+    for name in ("VLLM_HPU_STEP_TIMING", "VLLM_HPU_STEP_TIMING_EVERY", "VLLM_HPU_STEP_TIMING_DIR",
+                 "VLLM_HPU_STEP_TIMING_COMPONENTS"):
         assert name in envs.environment_variables
-    assert envs.environment_variables["VLLM_HPU_STEP_TIMING"]() in (0, 1, 2, 3, 4)
+    assert envs.environment_variables["VLLM_HPU_STEP_TIMING"]() in (0, 1, 2, 3)
+    assert envs.environment_variables["VLLM_HPU_STEP_TIMING_COMPONENTS"]() in (0, 1)
 
 
 def test_profiler_markers_cut_the_trace_into_steps(tmp_path):

@@ -208,19 +208,6 @@ def test_without_the_flag_the_forward_runs_unchanged(no_timer, clock):
     assert outputs[0].shape == (2, 1, 8) and outputs[3].shape == (2, 16)
 
 
-def test_mode_4_counts_the_ops_of_the_forward(tmp_path, clock, monkeypatch):
-    timer = StepTimer("worker", mode=step_timing.MODE_OPS, every=1, out_dir=str(tmp_path), clock=clock,
-                      wall=clock.wall)
-    runner = make_runner(timer, clock)
-    runner.model.forward = lambda **kwargs: (torch.ones(2, 1, 8) * 2.0 + 1.0)
-    timer.begin_step()
-    timer.tag("decode", 2)
-    run_generic(runner)
-    timer.end_step()
-    record = records(timer)[0]
-    assert record["counters"]["ops_forward"]["p50"] == 3  # ones, mul, add
-
-
 def sampling_runner(timer, clock, marks):
     runner = object.__new__(HPUModelRunner)
     runner._prepare_sampling = lambda *args: "metadata"

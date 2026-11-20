@@ -10,13 +10,12 @@
 # the coordinator's scale-base job), each with the step timer on and anatomy_probe.py against it, and the
 # one-card benchmarks the plan names.
 #
-# Plans: S = one server with the timer: spans without and with min_tokens at 1, 8, 32 streams, device waits (mode 3),
-# host sync points (mode 2). M = S plus decode rounds at longer contexts, then a second server with the torch
-# profiler (HPU activities) and one capture of steady decode steps at 32 and at 1 stream. T8 = S, then the capture
-# server when the hold allows (the 8-card form). L = VLLM_CONFIG_HIDDEN_LAYERS=4 against the default 1 (I10 / G4-2),
-# then a server without HPU graphs (--enforce-eager) in mode 3: the device time of every segment between two
-# collectives, so of every mixer and MoE block (4 ranks only: a mark_step before every collective stalled at 8
-# ranks in job 00012). A = S with the capture server and the one-card benches (job 00013's plan). B = the one-card
+# Plans: S = one server with the timer: spans at 1, 8, 32 streams (one round with min_tokens, three tagged for a
+# perf sampler on the node), device waits (mode 3), host sync points (mode 2). M = S plus decode rounds at longer
+# contexts, then a second server with the torch profiler (HPU activities) and one capture of steady decode steps
+# at 32 and at 1 stream. T8 = S, then the component server (the 8-card form). L = VLLM_CONFIG_HIDDEN_LAYERS=4
+# against the default 1 (I10 / G4-2), then the component server: no HPU graphs (--enforce-eager), mode 3 with
+# VLLM_HPU_STEP_TIMING_COMPONENTS=1, the device time of every model component at 1, 8 and 32 streams. A = S with the capture server and the one-card benches (job 00013's plan). B = the one-card
 # MME row sweep (G1-1) and the small lazy-op cases, then VLLM_CONFIG_HIDDEN_LAYERS 4 (and 12 with time left).
 # Q = one server, one short phase (a check of this script's plumbing). T = the profiler capture with the Habana
 # SDK in API-controlled mode (HABANA_PROFILE=1 and a profiler configuration file).
@@ -24,6 +23,7 @@
 # A stage-2 job reads the file anatomy_late.sh next to its results folder (on the node:
 # ~/farm/<track>/results/anatomy_late.sh) before its plan starts: it may set ANATOMY_S_PHASES, ANATOMY_C_PHASES,
 # ANATOMY_TRACE_PHASES, ANATOMY_TRACE_LEVELS, ANATOMY_L_PHASES, ANATOMY_E_PHASES, ANATOMY_LAYERS, ANATOMY_ONE_SERVER,
+# ANATOMY_SECOND (plan T8's second server: eager or trace),
 # so a job that waits in the queue can still be given what an earlier job taught.
 #
 # Every server: $RESULTS/<label>/{server0.log, probe.json, timing/step_timing_*.jsonl, versions.txt}.
@@ -74,6 +74,7 @@ base_env() {
     export VLLM_HPU_PLE_HOST_NGRAM_IDS=1 VLLM_HPU_COLLECTIVE_MARK_STEP=0 VLLM_SKIP_WARMUP=true
     [ "$STAGE" -eq 1 ] && export HABANA_VISIBLE_MODULES=0,1,2,3,4,5,6,7  # stage 2: the job's own modules
     unset HABANA_PROFILE HABANA_PROF_CONFIG VLLM_CONFIG_HIDDEN_LAYERS VLLM_TORCH_PROFILER_DIR VLLM_HPU_FUSED_GREEDY_LOGITS
+    unset VLLM_HPU_STEP_TIMING_COMPONENTS
 }
 
 SP=""
@@ -157,7 +158,10 @@ plan_q() {
 
 # The timer rounds of one server. Mode 4 (dispatched ops) is not among them: in job 00013 its 23rd one-stream step
 # never returned (sample_tokens RPC timeout after 300 s, the engine died) and took the rest of the job along.
-S_PHASES="warm:1,8,32:128;1:1,8,32:128;1:1,8,32:128:min;1:32,1:128;3:32,1:64;3:32:64:min;2:32:24"
+# One :min round only: on HPU the min_tokens mask never runs (engine-step, hpu_input_batch.py:554-562), the round
+# confirms it. The rounds tagged perf are for a sampler on the node (perf record of the workers); mode 3 on a
+# replayed graph splits the wait into the forward's device time and the sampler's.
+S_PHASES="warm:1,8,32:128;1:1,8,32:128;1:32:128:min;1:32,8,1:128:tag=perf;3:32,8,1:64;2:32:24"
 # Decode at longer contexts (target-model prediction 1): 8 streams with about 4,000- and 16,000-token prompts; the
 # warm round fills the prefix cache, so the measured round decodes almost at once.
 C_PHASES="warm:8:64:ctx=4000;1:8:64:ctx=4000;warm:8:64:ctx=16000;1:8:64:ctx=16000"
@@ -165,6 +169,24 @@ C_PHASES="warm:8:64:ctx=4000;1:8:64:ctx=4000;warm:8:64:ctx=16000;1:8:64:ctx=1600
 plan_s() {
     base_env
     serve s-timer "${ANATOMY_S_PHASES:-$S_PHASES}" ""
+}
+
+# eager_server: the device time of every model component. No HPU graphs (--enforce-eager: the forward runs in
+# Python every step), timer mode 3 with VLLM_HPU_STEP_TIMING_COMPONENTS=1: the host waits for the device before and
+# after every collective and where a component starts and ends (hyper-connection, GDN, QSA indexer and attention,
+# MoE and its expert op, PLE), in the warm rounds too, so the measured rounds compile nothing. The step itself is
+# several times slower than a replayed one: the component times, not the total, are the result. (A synthetic
+# 8-rank replay with a mark_step before every collective stalled once, job 00012; the morning's real-model runs
+# had one before every collective and did not.)
+E_PHASES="warm:1,8,32:24;3:1,8,32:32"
+eager_server() {
+    base_env
+    export VLLM_HPU_STEP_TIMING_COMPONENTS=1
+    PROBE_EXTRA="--warm-mode 3" serve e-eager "${ANATOMY_E_PHASES:-$E_PHASES}" "" --enforce-eager
+    local rc=$?
+    grep -E "step timing: component cuts" "$RESULTS/e-eager/server0.log" | head -n 2 | cut -c1-300
+    unset VLLM_HPU_STEP_TIMING_COMPONENTS
+    return "$rc"
 }
 
 # trace_server LABEL: the torch profiler with HPU activities; mode 1 again (does the profiler setting cost time
@@ -196,17 +218,19 @@ plan_m() {
 }
 
 plan_t8() {
-    # The 8-card form: the timer rounds first (the decisive part), then the capture server when the hold leaves
-    # the ten minutes it needs.
+    # The 8-card form: the timer rounds on the replayed graphs first, then (ANATOMY_SECOND, default eager) the
+    # component server or the capture server when the hold leaves the eleven minutes it needs.
     if [ "${ANATOMY_ONE_SERVER:-0}" = "1" ]; then
         ANATOMY_TRACE_PHASES="${ANATOMY_S_PHASES:-$S_PHASES}" trace_server s-timer-trace
         return
     fi
     plan_s
-    if [ $(( ${ANATOMY_HOLD_S:-1500} - SECONDS )) -ge 600 ]; then
+    if [ $(( ${ANATOMY_HOLD_S:-1500} - SECONDS )) -lt 660 ]; then
+        say "no time left for a second server ($SECONDS s used of ${ANATOMY_HOLD_S:-1500})"
+    elif [ "${ANATOMY_SECOND:-eager}" = "trace" ]; then
         ANATOMY_TRACE_PHASES="${ANATOMY_TRACE_PHASES:-warm:32,1:160}" trace_server m-trace
     else
-        say "no time left for the capture server ($SECONDS s used of ${ANATOMY_HOLD_S:-1500})"
+        eager_server
     fi
 }
 
@@ -216,21 +240,11 @@ plan_l() {
     base_env
     export VLLM_CONFIG_HIDDEN_LAYERS="${ANATOMY_LAYERS:-4}"
     serve "l-layers$VLLM_CONFIG_HIDDEN_LAYERS" "${ANATOMY_L_PHASES:-warm:1,8,32:128;1:1,8,32:128;1:32,1:128;3:32,1:64}" ""
-    # The device time of every segment between two collectives: no HPU graphs (--enforce-eager: the forward runs
-    # in Python every step), timer mode 3 (mark_step and synchronize before and after every collective, warm
-    # rounds too, so the measured rounds compile nothing). Per layer: the segment in front of the first all-reduce
-    # is hyper-connection + mixer (GDN, or QSA in every fourth layer), in front of the second hyper-connection +
-    # MoE; the segment after the last collective is logits and sampler (with the min_tokens mask in the :min round).
-    if [ "$TP" -gt 4 ]; then
-        say "no eager mode-3 server on $TP ranks (job 00012: a mark_step before every collective stalled at 8 ranks)"
-        return
-    fi
     if [ $(( ${ANATOMY_HOLD_S:-2400} - SECONDS )) -lt 840 ]; then
         say "no time left for the eager mode-3 server ($SECONDS s used of ${ANATOMY_HOLD_S:-2400})"
         return
     fi
-    base_env
-    PROBE_EXTRA="--warm-mode 3" serve e-eager "${ANATOMY_E_PHASES:-warm:1,32:32;3:1,32:48;3:32:48:min}" "" --enforce-eager
+    eager_server
 }
 
 plan_a() {

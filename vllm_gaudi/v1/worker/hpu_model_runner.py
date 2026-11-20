@@ -5728,14 +5728,13 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             # Full-graph Dynamo cannot trace setattr on LoraMask, while doing
             # it immediately before the call preserves the existing lifetime.
             LoraMask.setLoraMask(lora_mask)
-            with step_timing.ops(step_timer, "forward"):
-                hidden_states = self.model.forward(input_ids=token_ids,
-                                                   positions=position_ids,
-                                                   attn_metadata=trimmed_attn_metadata,
-                                                   kv_caches=kv_caches,
-                                                   inputs_embeds=inputs_embeds,
-                                                   model_mm_kwargs=model_mm_kwargs,
-                                                   **additional_kwargs)
+            hidden_states = self.model.forward(input_ids=token_ids,
+                                               positions=position_ids,
+                                               attn_metadata=trimmed_attn_metadata,
+                                               kv_caches=kv_caches,
+                                               inputs_embeds=inputs_embeds,
+                                               model_mm_kwargs=model_mm_kwargs,
+                                               **additional_kwargs)
         if step_timer is not None:
             step_timer.lap("forward")
             step_timer.phase = "logits"
@@ -5767,16 +5766,15 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                                                      f'{batch_size}_'
                                                      f'seq{seq_len}_ctx'
                                                      f'{num_blocks}')):
-            with step_timing.ops(step_timer, "logits"):
-                if fuse_greedy_sampling:
-                    hidden_states, fused_sampled_token_ids = self.model.select_compute_logits_and_greedy(
-                        hidden_states,
-                        logits_indices,
-                    )
-                    logits = None
-                else:
-                    hidden_states, logits = self.model.select_and_compute_logits(hidden_states, logits_indices)
-                    fused_sampled_token_ids = None
+            if fuse_greedy_sampling:
+                hidden_states, fused_sampled_token_ids = self.model.select_compute_logits_and_greedy(
+                    hidden_states,
+                    logits_indices,
+                )
+                logits = None
+            else:
+                hidden_states, logits = self.model.select_and_compute_logits(hidden_states, logits_indices)
+                fused_sampled_token_ids = None
         if step_timer is not None:
             step_timer.lap("logits")
         return non_flattened_hidden_states, aux_hidden_states, \
@@ -6123,8 +6121,7 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         step_timer = self.step_timer
         htorch.core.mark_step()
         sampling_metadata = self._prepare_sampling(batch_changed, request_ids, pad_to, logits_requests)
-        with step_timing.ops(step_timer, "sample"):
-            sampler_output = self.sampler(logits=logits_device, sampling_metadata=sampling_metadata)
+        sampler_output = self.sampler(logits=logits_device, sampling_metadata=sampling_metadata)
         if step_timer is not None:
             step_timer.lap("sample")
         htorch.core.mark_step()
@@ -7146,6 +7143,11 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                             get_target_layer_suffix_list(model_config.model_type if model_config is not None else None),
                             hidden_layer_markstep_interval)
         torch.hpu.synchronize()
+        # VLLM_HPU_STEP_TIMING_COMPONENTS (default 0): mode 3 of the step timer measures every model component
+        # on its own when the forward runs in Python (--enforce-eager).
+        if self.step_timer is not None and gaudi_envs.VLLM_HPU_STEP_TIMING_COMPONENTS:
+            logger.info("step timing: component cuts %s", step_timing.install_component_cuts(self.step_timer,
+                                                                                          self.model))
         if self.is_pooling_model:
             self.set_causal_option(self.model)
 
