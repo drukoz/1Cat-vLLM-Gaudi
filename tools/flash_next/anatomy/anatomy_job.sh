@@ -46,7 +46,7 @@ base_env() {
     export VLLM_HPU_RECURRENT_STATE_POOL=1 VLLM_HPU_GDN_CORE_DECODE=1 VLLM_HPU_HC_FUSED=1
     export VLLM_HPU_PLE_HOST_NGRAM_IDS=1 VLLM_HPU_COLLECTIVE_MARK_STEP=0 VLLM_SKIP_WARMUP=true
     export HABANA_VISIBLE_MODULES=0,1,2,3,4,5,6,7
-    unset HABANA_PROFILE VLLM_CONFIG_HIDDEN_LAYERS VLLM_TORCH_PROFILER_DIR
+    unset HABANA_PROFILE HABANA_PROF_CONFIG VLLM_CONFIG_HIDDEN_LAYERS VLLM_TORCH_PROFILER_DIR VLLM_HPU_FUSED_GREEDY_LOGITS
 }
 
 SP=""
@@ -192,7 +192,17 @@ plan_b() {
     base_env
     export VLLM_CONFIG_HIDDEN_LAYERS=4
     serve b-layers4 "warm:1,32:128;1:1,32:128" ""
-    if [ "$SECONDS" -lt 1500 ]; then
+    # D4 rider: the in-graph greedy LM head (VLLM_HPU_FUSED_GREEDY_LOGITS=1) engages only for requests without
+    # min_tokens, so one server gives both arms: rounds with min_tokens (today's path) and without (fused).
+    if [ "$SECONDS" -lt 1800 ]; then
+        base_env
+        export VLLM_HPU_FUSED_GREEDY_LOGITS=1
+        serve b-fused-greedy "warm:1,32:128;warm:1,32:128:nomin;1:1,32:128;1:1,32:128:nomin" ""
+        unset VLLM_HPU_FUSED_GREEDY_LOGITS
+    else
+        say "no time left for the fused greedy rider ($SECONDS s used)"
+    fi
+    if [ "$SECONDS" -lt 1700 ]; then
         base_env
         export VLLM_CONFIG_HIDDEN_LAYERS=12
         serve b-layers12 "warm:1,32:128;1:1,32:128" ""

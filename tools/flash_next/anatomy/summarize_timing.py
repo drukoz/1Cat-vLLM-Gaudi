@@ -60,7 +60,10 @@ def load_rounds(run_dir: str) -> list:
         for res in phase.get("rounds", []):
             if "t_start" not in res:
                 continue
-            rounds.append({"label": "%s/N=%d" % (phase["mode"], res["streams"]), "mode": phase["mode"],
+            label = "%s/N=%d%s" % (phase["mode"], res["streams"], "" if phase.get("min_tokens", True) else "/nomin")
+            if any(r["label"] == label for r in rounds):  # the same phase twice: number the repeats
+                label += "/#%d" % (1 + sum(1 for r in rounds if r["label"].startswith(label)))
+            rounds.append({"label": label, "mode": phase["mode"],
                            "streams": res["streams"], "tokens": res["tokens"], "t_start": res["t_start"],
                            "t_end": res["t_end"], "ms_per_token": res.get("ms_per_token_p50"), "trace": False})
     for res in probe.get("traces", []):

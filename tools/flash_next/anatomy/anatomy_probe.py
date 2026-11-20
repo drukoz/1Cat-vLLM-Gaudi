@@ -9,7 +9,9 @@ round per level. ``LEVELS`` is a comma list of stream counts. A ``warm`` round g
 measured rounds, so every decode bucket those rounds touch is compiled before the first measured round (the
 server runs with ``VLLM_SKIP_WARMUP=true`` and compiles a bucket the first time a step needs it).
 
-Every stream generates exactly ``TOKENS`` tokens (``min_tokens = max_tokens``, ``ignore_eos``), temperature 0.
+Every stream generates exactly ``TOKENS`` tokens (``min_tokens = max_tokens``, ``ignore_eos``), temperature 0. A fourth
+field ``nomin`` (``MODE:LEVELS:TOKENS:nomin``) leaves ``min_tokens`` out (``ignore_eos`` alone keeps the length): a
+request with ``min_tokens`` keeps the fused greedy LM-head path (``VLLM_HPU_FUSED_GREEDY_LOGITS``) off.
 Per round: ms per token over each stream's own decode span (p50, min, max over the streams), time to first token,
 the aggregate tokens per second, and a hash of every stream's text (greedy text parity between two servers).
 
@@ -56,26 +58,32 @@ def parse_phases(text: str, default_tokens: int) -> list:
         if not part:
             continue
         fields = part.split(":")
-        if len(fields) not in (2, 3):
-            raise ValueError("a phase is MODE:LEVELS[:TOKENS], got %r" % part)
+        if len(fields) not in (2, 3, 4):
+            raise ValueError("a phase is MODE:LEVELS[:TOKENS[:nomin]], got %r" % part)
+        if len(fields) == 4 and fields[3].strip() not in ("", "nomin"):
+            raise ValueError("the fourth field of a phase is 'nomin', got %r" % part)
         mode = fields[0].strip()
         if mode != "warm" and not mode.isdigit():
             raise ValueError("MODE is 'warm' or a timer mode number, got %r" % mode)
         levels = [int(x) for x in fields[1].split(",") if x.strip()]
         if not levels or min(levels) < 1:
             raise ValueError("LEVELS are positive stream counts, got %r" % fields[1])
-        tokens = int(fields[2]) if len(fields) == 3 else default_tokens
+        tokens = int(fields[2]) if len(fields) >= 3 and fields[2].strip() else default_tokens
         if tokens < 2:
             raise ValueError("TOKENS must be at least 2, got %d" % tokens)
-        phases.append({"mode": mode, "levels": levels, "tokens": tokens})
+        phases.append({"mode": mode, "levels": levels, "tokens": tokens,
+                       "min_tokens": not (len(fields) == 4 and fields[3].strip() == "nomin")})
     return phases
 
 
-def one_stream(host, port, model, prompt, ntok, rec, start_barrier, timeout_s):
-    body = json.dumps({
+def one_stream(host, port, model, prompt, ntok, rec, start_barrier, timeout_s, min_tokens=True):
+    request = {
         "model": model, "prompt": prompt, "max_tokens": ntok, "min_tokens": ntok, "ignore_eos": True,
         "temperature": 0, "stream": True, "stream_options": {"include_usage": True},
-    })
+    }
+    if not min_tokens:
+        del request["min_tokens"]
+    body = json.dumps(request)
     try:
         start_barrier.wait()
         conn = http.client.HTTPConnection(host, port, timeout=timeout_s)
@@ -116,14 +124,14 @@ def new_record():
     return {"status": None, "t0": None, "times": [], "text": [], "usage": None, "err": None, "done": False}
 
 
-def start_round(args, n, ntok):
+def start_round(args, n, ntok, min_tokens=True):
     """Start ``n`` streams; returns ``(records, threads, t_start)``."""
     records = [new_record() for _ in range(n)]
     barrier = threading.Barrier(n)
     threads = [
         threading.Thread(target=one_stream,
                          args=(args.host, args.port, args.model, prompt_for(i), ntok, records[i], barrier,
-                               args.timeout),
+                               args.timeout, min_tokens),
                          daemon=True) for i in range(n)
     ]
     t_start = time.perf_counter()
@@ -166,8 +174,8 @@ def finish_round(args, n, ntok, records, threads, t_start) -> dict:
     return res
 
 
-def run_round(args, n, ntok) -> dict:
-    records, threads, t_start = start_round(args, n, ntok)
+def run_round(args, n, ntok, min_tokens=True) -> dict:
+    records, threads, t_start = start_round(args, n, ntok, min_tokens)
     return finish_round(args, n, ntok, records, threads, t_start)
 
 
@@ -244,19 +252,22 @@ def run(args) -> int:
             write_mode(args, int(mode))
         elif args.timing_dir:
             write_mode(args, args.warm_mode)
-        entry = {"mode": mode, "tokens": phase["tokens"], "rounds": [], "t_start": time.time()}
+        entry = {"mode": mode, "tokens": phase["tokens"], "min_tokens": phase["min_tokens"], "rounds": [],
+                 "t_start": time.time()}
         results["phases"].append(entry)
         for n in phase["levels"]:
             # An idle gap before every round: the timer then writes the steps of each round as their own records
             # (it keeps the steps of one kind and row count together until a step starts after two idle seconds).
             time.sleep(args.idle)
             t_round = time.time()
-            res = run_round(args, n, phase["tokens"])
+            res = run_round(args, n, phase["tokens"], phase["min_tokens"])
             res["mode"] = mode
+            res["min_tokens"] = phase["min_tokens"]
             res["t_start"], res["t_end"] = t_round, time.time()
             entry["rounds"].append(res)
             save()
-            print("phase %-4s N=%-3d tokens=%-4d %s" % (mode, n, phase["tokens"], describe(res)), flush=True)
+            print("phase %-4s N=%-3d tokens=%-4d%s %s" % (mode, n, phase["tokens"], "" if phase["min_tokens"] else
+                                                       " nomin", describe(res)), flush=True)
             if not res.get("ok"):
                 failed = True
                 break
@@ -294,7 +305,7 @@ def run(args) -> int:
 def _stub_server():
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-    calls = {"start_profile": 0, "stop_profile": 0, "completions": 0}
+    calls = {"start_profile": 0, "stop_profile": 0, "completions": 0, "no_min_tokens": 0}
 
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
@@ -313,6 +324,8 @@ def _stub_server():
                 return
             calls["completions"] += 1
             req = json.loads(body)
+            if "min_tokens" not in req:
+                calls["no_min_tokens"] += 1
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
             self.send_header("Transfer-Encoding", "chunked")
@@ -342,7 +355,7 @@ def selftest(args) -> int:
         args.port = server.server_address[1]
         args.timing_dir = os.path.join(tmp, "timing")
         args.out = os.path.join(tmp, "probe.json")
-        args.phases = "warm:1,3:8;1:1,3:8;4:2:4"
+        args.phases = "warm:1,3:8;1:1,3:8;4:2:4;1:2:6:nomin"
         args.trace = "3"
         args.trace_tokens = 40
         args.trace_after = 3
@@ -353,7 +366,9 @@ def selftest(args) -> int:
         mode_text = open(os.path.join(args.timing_dir, MODE_FILE), encoding="utf-8").read().strip()
     server.shutdown()
     assert rc == 0, rc
-    assert [p["mode"] for p in data["phases"]] == ["warm", "1", "4"], data["phases"]
+    assert [p["mode"] for p in data["phases"]] == ["warm", "1", "4", "1"], data["phases"]
+    assert [p["min_tokens"] for p in data["phases"]] == [True, True, True, False]
+    assert calls["no_min_tokens"] == 2, calls
     assert data["phases"][1]["rounds"][1]["ok"] == 3
     assert data["phases"][0]["rounds"][0]["text_sha1"] == data["phases"][1]["rounds"][0]["text_sha1"]
     assert data["traces"][0]["start_profile"][0] == 200 and calls["stop_profile"] == 1
