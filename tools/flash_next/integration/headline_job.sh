@@ -14,6 +14,10 @@
 #           --no-sampled-check (sampled verification is off in this build: a sampled request gets HTTP 400);
 #           acceptance per draft position per level from /metrics (SPEC lines).
 #   mtp3-32 server 2 with the 32-stream level only (a short hold).
+#   mtp3-noshard  server 2 with VLLM_HPU_QSA_INDEXER_SHARD=0 (isolates the request-sharded indexer, never run in a
+#           served speculative step before this build). Run by itself after mtp3 when mtp3 ended with the server
+#           dead (3) or the probe failed (5) and HEADLINE_HOLD_S (default 2400, the job's hold) leaves 900 s or more;
+#           HEADLINE_MTP_FALLBACK=0 turns that off.
 # Between two servers: the leftover vLLM workers of THIS container are killed (the container has its own
 # process namespace) and the script waits until no worker is left, then 8 s more for the cards (CARD.md).
 #
@@ -44,6 +48,9 @@ PYTHON="${FARM_PYTHON:-python3}"
 OUT="${FARM_OUT:-/results/headline}"
 TOKENS="${HEADLINE_TOKENS:-128}"
 WARM="${HEADLINE_WARM_TOKENS:-48}"
+T0="$(date -u +%s)"
+HOLD_S="${HEADLINE_HOLD_S:-2400}"
+FALLBACK="${HEADLINE_MTP_FALLBACK:-1}"
 
 for kv in VLLM_HPU_QSA_FUSED=1 VLLM_HPU_QSA_INDEXER_SHARD=1 \
     VLLM_HPU_GDN_KERNEL_INTERLEAVE=1 VLLM_HPU_GDN_GLUE_CACHE=1 VLLM_HPU_HC_FUSED_COPY_MODE=2 \
@@ -108,7 +115,11 @@ clear_cards() {
 
 failed=0
 first=1
-for arm in "$@"; do
+ARMS=("$@")
+i_arm=0
+while [ "$i_arm" -lt "${#ARMS[@]}" ]; do
+    arm="${ARMS[$i_arm]}"
+    i_arm=$((i_arm + 1))
     if [ "$first" -eq 0 ]; then clear_cards; fi
     first=0
     echo "=== headline_job: arm $arm start $(date -u +%T)"
@@ -117,9 +128,12 @@ for arm in "$@"; do
             bash "$HERE/serve_probe.sh" --out "$OUT/nospec" --levels 1,8,32 --tokens "$TOKENS" --warm-tokens "$WARM" \
                 --repeat-top 2 --no-mintok-check --probe-arg --sampled-levels=1,8,32
             ;;
-        mtp3 | mtp3-32)
+        mtp3 | mtp3-32 | mtp3-noshard)
             levels=32,8,1
             if [ "$arm" = mtp3-32 ]; then levels=32; fi
+            shard="$VLLM_HPU_QSA_INDEXER_SHARD"
+            if [ "$arm" = mtp3-noshard ]; then shard=0; fi
+            VLLM_HPU_QSA_INDEXER_SHARD="$shard" \
             VLLM_HPU_GDN_CORE_VERIFY="${VLLM_HPU_GDN_CORE_VERIFY:-1}" VLLM_HPU_MTP_TIMING="${VLLM_HPU_MTP_TIMING:-1}" \
                 VLLM_HPU_MTP_DRAFT_LOOP="${VLLM_HPU_MTP_DRAFT_LOOP:-1}" VLLM_HPU_MTP_CHUNK_KV="${VLLM_HPU_MTP_CHUNK_KV:-1}" \
                 bash "$HERE/serve_probe.sh" --out "$OUT/$arm" --mtp 3 --levels "$levels" --tokens "$TOKENS" \
@@ -132,9 +146,33 @@ for arm in "$@"; do
             ;;
     esac
     rc=$?
+    # The probe ends with 0 even when rounds failed (it records them): a round with errors, or no measured round
+    # at all, makes the arm a probe failure (5).
+    if [ "$rc" -eq 0 ] && ! "$PYTHON" - "$OUT/$arm/scaling.json" <<'PY2'
+import json, sys
+try:
+    data = json.load(open(sys.argv[1]))
+except (OSError, ValueError):
+    sys.exit(1)
+rounds = (data.get("levels") or []) + (data.get("sampled") or [])
+sys.exit(0 if rounds and all(r.get("ok") and not r.get("errors") for r in rounds) else 1)
+PY2
+    then
+        echo "headline_job: arm $arm: a round failed or none was measured (scaling.json): counted as a probe failure"
+        rc=5
+    fi
     echo "=== headline_job: arm $arm rc=$rc end $(date -u +%T)"
     if [ "$rc" -ne 0 ]; then failed=$((failed + 1)); fi
     "$PYTHON" "$HERE/headline_table.py" "$OUT" --md "$OUT/headline.md" --json "$OUT/headline.json" || true
+    left=$((HOLD_S - ($(date -u +%s) - T0)))
+    if [ "$arm" = mtp3 ] && [ "$FALLBACK" = 1 ] && { [ "$rc" -eq 3 ] || [ "$rc" -eq 5 ]; }; then
+        if [ "$left" -ge 900 ]; then
+            echo "headline_job: mtp3 ended with $rc: the same server with VLLM_HPU_QSA_INDEXER_SHARD=0 next ($left s left)"
+            ARMS+=(mtp3-noshard)
+        else
+            echo "headline_job: mtp3 ended with $rc; only $left s left: no run without the request shard"
+        fi
+    fi
 done
-echo "headline_job: $failed of $# arms failed; $(date -u +%T)"
+echo "headline_job: $failed of ${#ARMS[@]} arms failed; $(date -u +%T)"
 exit "$failed"
