@@ -15,7 +15,8 @@
 # contexts, then a second server with the torch profiler (HPU activities) and one capture of steady decode steps
 # at 32 and at 1 stream. T8 = S, then the component server (the 8-card form). L = VLLM_CONFIG_HIDDEN_LAYERS=4
 # against the default 1 (I10 / G4-2), then the component server: no HPU graphs (--enforce-eager), mode 3 with
-# VLLM_HPU_STEP_TIMING_COMPONENTS=1, the device time of every model component at 1, 8 and 32 streams. A = S with the capture server and the one-card benches (job 00013's plan). B = the one-card
+# VLLM_HPU_STEP_TIMING_COMPONENTS=1, the device time of every model component at 1, 8 and 32 streams. R = a
+# rehearsal of S and the component server on the tiny model (2 or 4 cards, minutes). A = S with the capture server and the one-card benches (job 00013's plan). B = the one-card
 # MME row sweep (G1-1) and the small lazy-op cases, then VLLM_CONFIG_HIDDEN_LAYERS 4 (and 12 with time left).
 # Q = one server, one short phase (a check of this script's plumbing). T = the profiler capture with the Habana
 # SDK in API-controlled mode (HABANA_PROFILE=1 and a profiler configuration file).
@@ -46,6 +47,11 @@ else
     TP=8
 fi
 MODEL="${ANATOMY_MODEL:-/models/Qwen3.8-Flash-Next-FP8}"
+TINY=0  # plan R: the tiny model of the rental gate stands in for the real one
+# What every server of the real model is started with (job 00007's arguments).
+MODEL_ARGS=(--enable-expert-parallel --max-model-len 131072 --max-num-seqs 32 --enable-prefix-caching
+    --language-model-only --trust-remote-code --gpu-memory-utilization 0.92 --max-num-batched-tokens 8192
+    --long-prefill-token-threshold 2048 --enable-prompt-tokens-details)
 ENTRY=/bundle/plugin/tools/flash_next/rental/container_entry.sh
 mkdir -p "$RESULTS" && cd "$RESULTS" || exit 2
 
@@ -75,6 +81,10 @@ base_env() {
     [ "$STAGE" -eq 1 ] && export HABANA_VISIBLE_MODULES=0,1,2,3,4,5,6,7  # stage 2: the job's own modules
     unset HABANA_PROFILE HABANA_PROF_CONFIG VLLM_CONFIG_HIDDEN_LAYERS VLLM_TORCH_PROFILER_DIR VLLM_HPU_FUSED_GREEDY_LOGITS
     unset VLLM_HPU_STEP_TIMING_COMPONENTS
+    # The tiny model runs with the flags of the rental gate's hc mode only.
+    if [ "$TINY" -eq 1 ]; then
+        unset VLLM_HPU_FLASH_NEXT_QSA_MODE VLLM_HPU_RECURRENT_STATE_POOL VLLM_HPU_PLE_HOST_NGRAM_IDS
+    fi
 }
 
 SP=""
@@ -110,10 +120,7 @@ serve() {
       env | grep -E '^(VLLM_|PT_HPU|HABANA_|FLASHINFER)' | sort; } > versions.txt
     say "$label: starting the server"
     vllm serve "$MODEL" --served-model-name fn --host 127.0.0.1 --port "$PORT" \
-        --tensor-parallel-size "$TP" --enable-expert-parallel --max-model-len 131072 --max-num-seqs 32 \
-        --enable-prefix-caching --language-model-only --trust-remote-code --gpu-memory-utilization 0.92 \
-        --max-num-batched-tokens 8192 --long-prefill-token-threshold 2048 --enable-prompt-tokens-details "$@" \
-        > server0.log 2>&1 &
+        --tensor-parallel-size "$TP" "${MODEL_ARGS[@]}" "$@" > server0.log 2>&1 &
     SP=$!
     t0=$(date +%s)
     while :; do
@@ -136,7 +143,7 @@ serve() {
         server0.log | head -n 8 | cut -c1-260
     # shellcheck disable=SC2086  # PROBE_EXTRA is a list of probe options
     python3 "$PROBE" --port "$PORT" --model fn --timing-dir "$out/timing" --phases "$phases" \
-        ${trace:+--trace "$trace"} ${PROBE_EXTRA:-} --out "$out/probe.json" 2>&1 | tee "$out/probe.log"
+        ${trace:+--trace "$trace"} ${PROBE_EXTRA:-} ${ANATOMY_PROBE_ARGS:-} --out "$out/probe.json" 2>&1 | tee "$out/probe.log"
     rc=${PIPESTATUS[0]}
     say "$label: probe rc $rc"
     [ -f "$HERE/summarize_timing.py" ] && python3 "$HERE/summarize_timing.py" "$out" --json "$out/timing_summary.json" \
@@ -247,6 +254,21 @@ plan_l() {
     eager_server
 }
 
+plan_r() {
+    # R: a rehearsal of plans S and E on the tiny model of the rental gate (prebuilt in the job's image), on 2 or
+    # 4 cards in minutes: the timer rounds on replayed graphs, a round tagged for the perf sampler, then the
+    # component server (--enforce-eager, mode 3, component cuts). It checks the mechanics, not the numbers.
+    TINY=1
+    MODEL="${ANATOMY_MODEL:-/tmp/fn-smoke-ckpt}"
+    local len
+    len=$(python3 -c "import sys; from pathlib import Path; from tools.flash_next.rental.main import tiny_model_len; print(tiny_model_len(Path(sys.argv[1])))" "$MODEL" 2> /dev/null)
+    MODEL_ARGS=(--max-model-len "${len:-512}" --max-num-seqs 4 --language-model-only --trust-remote-code)
+    say "tiny model $MODEL, model length ${len:-512}"
+    export ANATOMY_PROBE_ARGS="--prompt-ids 8"
+    ANATOMY_S_PHASES="${ANATOMY_S_PHASES:-warm:1,4:24;1:1,4:24;1:4:24:min;1:4,1:24:tag=perf;3:4,1:16;2:4:8}" plan_s
+    ANATOMY_E_PHASES="${ANATOMY_E_PHASES:-warm:1,4:12;3:1,4:16}" eager_server
+}
+
 plan_a() {
     # Job 00013's plan with what it taught: the timer server, the capture server, then the one-card benches.
     plan_s
@@ -351,6 +373,7 @@ case "$PLAN" in
     M) plan_m ;;
     T8) plan_t8 ;;
     L) plan_l ;;
+    R) plan_r ;;
     B) plan_b ;;
     Q) plan_q ;;
     T) plan_t ;;

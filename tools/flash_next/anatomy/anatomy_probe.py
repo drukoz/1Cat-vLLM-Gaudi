@@ -62,6 +62,12 @@ def prompt_for(i: int, ctx_tokens: int = 0) -> str:
     return "Stream %d notes: " % i + " ".join(filler) + "\n\n" + head
 
 
+def prompt_ids_for(i: int, n: int) -> list:
+    """A prompt of ``n`` token ids for stream ``i`` (``--prompt-ids``): for a checkpoint without a tokenizer, such
+    as the tiny model of the rental gate. Small ids, distinct per stream."""
+    return [10 + (i * 7 + k * 13) % 200 for k in range(n)]
+
+
 def parse_phases(text: str, default_tokens: int) -> list:
     """``"warm:1,8,32:128;1:1,32;1:8:64:min:ctx=4000"`` -> a list of phases, each a dict with ``mode``, ``levels``,
     ``tokens``, ``min_tokens`` and ``ctx``."""
@@ -132,6 +138,8 @@ def one_stream(host, port, model, prompt, ntok, rec, start_barrier, timeout_s, m
     }
     if not min_tokens:
         del request["min_tokens"]
+    if not isinstance(prompt, str):  # a prompt of token ids (a checkpoint without a tokenizer): ids come back too
+        request["return_token_ids"] = True
     body = json.dumps(request)
     try:
         start_barrier.wait()
@@ -160,9 +168,10 @@ def one_stream(host, port, model, prompt, ntok, rec, start_barrier, timeout_s, m
                 if obj.get("usage"):
                     rec["usage"] = obj["usage"]
                 choices = obj.get("choices") or []
-                if choices and choices[0].get("text"):
+                if choices and (choices[0].get("text") or choices[0].get("token_ids")):
                     rec["times"].append(time.perf_counter())
-                    rec["text"].append(choices[0]["text"])
+                    rec["text"].append(choices[0].get("text") or
+                                       " ".join(str(t) for t in choices[0]["token_ids"]) + " ")
         conn.close()
     except Exception as exc:  # noqa: BLE001 - a probe records every failure
         rec["err"] = repr(exc)
@@ -180,8 +189,9 @@ def start_round(args, n, ntok, min_tokens=False, ctx=0, timeout=None):
     barrier = threading.Barrier(n)
     threads = [
         threading.Thread(target=one_stream,
-                         args=(args.host, args.port, args.model, prompt_for(i, ctx), ntok, records[i], barrier,
-                               timeout or args.timeout, min_tokens),
+                         args=(args.host, args.port, args.model,
+                               prompt_ids_for(i, args.prompt_ids) if args.prompt_ids > 0 else prompt_for(i, ctx),
+                               ntok, records[i], barrier, timeout or args.timeout, min_tokens),
                          daemon=True) for i in range(n)
     ]
     t_start = time.perf_counter()
@@ -453,6 +463,7 @@ def selftest(args) -> int:
     assert [p["min_tokens"] for p in data["phases"]] == [True, True, True, False, False]
     assert [p["ctx"] for p in data["phases"]] == [0, 0, 0, 0, 50]
     assert len(prompt_for(3, 50).split()) > 50 and prompt_for(3, 50).endswith(prompt_for(3))
+    assert prompt_ids_for(0, 4) != prompt_ids_for(1, 4) and all(10 <= t < 210 for t in prompt_ids_for(5, 40))
     assert data["phases"][1]["rounds"][1]["ms_per_token_all_decoding"] > 0
     assert [phase_text(p) for p in parse_phases("3:32,1:64:min:ctx=9;warm:8;1:2:9:tag=perf", 128)] == [
         "3:32,1:64:min:ctx=9", "warm:8:128", "1:2:9:tag=perf"]
@@ -487,6 +498,8 @@ def build_parser():
     ap.add_argument("--measured-timeout", type=float, default=240.0,
                     help="the same for measured, trace and flush rounds: a server that hangs in a step (job 00013) "
                     "ends the probe after this long")
+    ap.add_argument("--prompt-ids", type=int, default=0,
+                    help="send prompts of this many token ids instead of text (a checkpoint without a tokenizer)")
     ap.add_argument("--out", default="probe.json")
     ap.add_argument("--selftest", action="store_true")
     return ap
