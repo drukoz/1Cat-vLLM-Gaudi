@@ -251,66 +251,70 @@ Every job runs the committed tree in the farm's per-commit image (`CARD.md`); sc
 | 00064 `idcheck-rule9`, 1 card | `id_check.py`: every id pattern of the token path against the CPU, one lazy graph and a replayed one, rows 1, 2, 5, 32, 128, untied and tied, at a shard's width and at a whole row | serving cases (`vp_argmax`, `fp32_ids_row`) must equal the CPU; the probes say which patterns card rule 9 breaks (`argmax -> int32` is the fused greedy region and vLLM's sampler, `argmax -> .int()` the MTP draft loop, `topk -> int32` the control) | pending |
 | 00073 `c4-bench-r8-r4`, 8 cards, in the place of 00019 | `bench_job.sh`: the id check through the all-gather on 8 ranks; `bench_c4.py` on 8 ranks, on the module group 0-3, and on both groups at once | `decide_g41.py`: alpha and us per MB per rank count, regime and form; C4 pays where `gather_sum` (the flag) or `gather_first` (the collective alone, the fused-kernel form) is below `all_reduce` under replay; alpha8 against alpha4 for the layout | pending |
 | 00074 `tiny-tp4-logits-rider`, 4 cards | the tiny model at TP4 with `VLLM_HPU_VOCAB_PARALLEL_LOGITS=1 VLLM_HPU_PLE_TABLE_RIDER=1`, fused hyper-connections | tokens equal the CPU reference (one request at a time: one row) | pending |
-| 00075 `real4-ab-off`, 00076 `real4-ab-logits-rider`, 4 cards each | `ab_job.sh`: the real model at TP4 + EP4, 1 and 32 streams, 256 tokens, no `min_tokens`, every stream's text kept | `compare_arms.py <off> <logits-rider>`: the same texts (a wrong id parts at once), and the ms per token of both | pending |
+| 00081 `idcheck-consumers`, 1 card | `id_check.py`, the cases whose narrowed ids are consumed inside the graph (`argmax_int_embed`: the MTP draft loop; `topk_int32_embed`: the QSA block selection's shape) | whether a wrong narrowing is seen by the graph itself or only by a read to the host | pending |
+| 00082 `real4-ab2-off`, 00083 `real4-ab2-logits-rider`, 4 cards each | `ab_job.sh`: the real model at TP4 + EP4, 1 and 32 streams, 256 tokens, no `min_tokens`, every stream's text kept; 6 lone requests; one 32-stream round with the server's default sampling | `compare_arms.py <off> <logits-rider>`: the lone requests' texts are equal (texts of batched streams change with the batch: job 00021), the ms per token of both, and what a sampled step costs next to a greedy one | pending |
 
 A probe that sends `min_tokens` measures none of this: a request with `min_tokens` is kept out of the greedy region
 (`_can_fuse_plain_greedy_sampling`, `hpu_model_runner.py`), so the logits are gathered and sampled as before.
 
 ## Handoff (if this agent stops)
 
-State at 19:35 UTC 2026-11-20 (third agent of this track, started 19:00 UTC). Branch
+State at 20:10 UTC 2026-11-20 (third agent of this track, started 19:00 UTC). Branch
 `feat/flash-next-gaudi-collectives`, worktree `/Volumes/Storage/Claude/gaudi-work/wt/collectives`, scratch, logs and
 card results in `/Volumes/Storage/Claude/gaudi-work/reports/collectives/` (`logs/`, `card/`). This section is the
 track's report (the harness refuses a REPORT.md).
 
 Where things are:
 
-- `origin` has the branch up to `fc71ef83` (pull request #13's head). **Local commits after it are not pushed on
-  purpose** until #13 is merged, so that the gate result covers the pull request's head: `3abbd8df` (id check),
-  `684b54ad` (bench, A/B and reader tools, a unit test), and the commits of this note. After the merge:
-  `git push origin feat/flash-next-gaudi-collectives`, then a second pull request for them.
-- Pull request #13 (the five cuts, default off): the program head `b0cd0bb` is already merged into the branch
-  (`6b265d50`); the cut suite gave 35 passed on the merged tree (`logs/cuts_m2.log`); the common gate
-  (`bin/gate <worktree> --tools`) was started at 19:00 UTC on `fc71ef83`: its lines are in `/tmp/gate.rqDQHN/summary.txt`
-  and at the end in `logs/gate_fc71ef83.log` (`rc=0` in the last line = green). Green: `gh pr merge 13 --merge`.
-  A red line: run that file alone (`reports/collectives/pt2.sh <name> <file>`) and compare with the program head
-  before deciding (two files were order-dependent in one process; the gate runs one process per file).
-- Card rule 9 (BRIEF 19:15) on this track's paths, by reading: the vocabulary-parallel arg max has no int64 on the
-  device (fp32 id table, max / where / min, an fp32 to int32 cast); mode 2 (`vocab_parallel_topk`, no serving
-  caller) casts topk indices to fp32 in the graph: change it to a gather from an fp32 id table when job 00064 shows
-  which form the card computes right (`topk_to_fp32` against `topk_gather_fp32`). The fused greedy region
-  (`select_compute_logits_and_greedy`) and its gathered fallback belong to engine-step (its commit `121c88b0` and
-  later): do not edit them here; when both branches meet, its region keeps its own path and calls
-  `vocab_parallel.vocab_parallel_argmax` when `vocab_parallel.enabled(model)`.
-- Reported to the coordinator at 19:12 and 19:20 UTC: the MTP draft loop (`hpu_flash_next_mtp.py:118, 141` on the
-  program branch) is `argmax -> .int()` in one graph (wrong from the second row on if rule 9 holds for argmax; with
-  `VLLM_HPU_VOCAB_PARALLEL_LOGITS=1` the drafts are int32 from the start); the farm's probe sent `min_tokens`
-  (fixed on the node at 19:20).
+- Pull request #13 carries everything on the branch: the five cuts (default off), the card tools
+  (`tools/flash_next/collectives/`), and the top-k interface of the sampled step (section 2, mode 2). The program
+  head `b0cd0bb` is merged into the branch (`6b265d50`). The common gate (`bin/gate <worktree> --tools`) was
+  restarted at 20:10 UTC on the branch head with all of it: its lines are in the newest `/tmp/gate.*/summary.txt`
+  and at the end in `logs/gate_<sha>.log` (`rc=0` in the last line = green). An earlier run on `fc71ef83` had 44 of
+  82 files green and none red when it was stopped. Green: `gh pr merge 13 --merge`. A red line: run that file
+  alone (`reports/collectives/pt2.sh <name> <file>`; add `-p tests.unit_tests.hpu_cpu_stubs` for
+  `tests/unit_tests/worker/test_hpu_model_runner.py`) and compare with the program head before deciding.
+- `reports/collectives/dev-wt` is a second worktree (branch `feat/flash-next-gaudi-collectives-dev`, on origin) used
+  while a gate reads the main one: develop there (`reports/collectives/ptd.sh <name> <pytest args>`), then
+  `git -C wt/collectives merge --ff-only feat/flash-next-gaudi-collectives-dev`. A local branch
+  `collectives-sampler-snapshot` (`f11f2cfc`) keeps a complete sampler stage over candidates with its tests
+  (dropped: the engine-step track ships that stage).
+- The sampled step (BRIEF 19:45: real agents sample): engine-step (agent `ad4fd8b387ee2314a`) builds
+  `v1/sample/candidate_sampling.py` and calls `vocab_parallel.top_k` and `vocab_parallel.first_maximum` from this
+  branch (agreed 20:05 UTC; it cherry-picks `ea3bc30a` until the program branch has it). mtp-card-ready's sampled
+  verification can take the same call for every verification row.
+- Card rule 9 on this track's paths: no int64 id is cast (section 2; `test_vocab_parallel_candidates.py` watches
+  the dispatched ops). The fused greedy region and its gathered fallback belong to engine-step: not edited here.
+- Reported to the coordinator: the MTP draft loop's `argmax -> .int()` (19:12), the farm probe's `min_tokens`
+  (fixed 19:20), that every probe was greedy (19:42; a program rule since 19:45), the structural answer (19:42).
 
-Card jobs (section 6 has what each decides): 00064 (bumped, runs after 00048 and the QSA pair, about 20:20 to
-21:15 UTC), 00073 (all cards, 15 min, in the place of 00019, by 00:26 UTC at the latest), 00074, 00075, 00076
-(any:4, at the end of the queue: they run only if the queue moves faster than its maximum holds; cancel them if
-they have not started by about 03:00 UTC). Each `farm` command waits in a background shell of this agent and
-copies the results to `reports/collectives/card/<id>-<name>/` when its job ends; if the agent is gone:
-`bin/farm ledger | grep -w collectives`, then `bin/farm fetch collectives <id> <id>-<name>`. A job can be
-changed while it waits by a new submit with `--replaces <id>` (00073 passes on the place of 00019).
+Card jobs (section 6 has what each decides). Bumped by the coordinator: 00064 and 00081 (single-card wave after
+the QSA pair, about 20:45 to 21:30 UTC), 00073 (all cards, after prefill's 00014 and step-anatomy's 00069; do not
+replace it: a replacement loses the bump). At the end of the queue, any:4: 00074 (tiny TP4 token parity), 00082
+and 00083 (real TP4 arms off / logits + rider; `ab_job.sh` with 6 lone requests for the text test and one round
+with the server's default sampling). Each `farm` command waits in a background shell of this agent and copies the
+results to `reports/collectives/card/<id>-<name>/` when its job ends; if the agent is gone:
+`bin/farm ledger | grep -w collectives`, then `bin/farm fetch collectives <id> <id>-<name>`. Cancel the any:4 jobs
+if they have not started by about 03:00 UTC.
 
 Pending, in order:
 
-1. Merge #13 when the gate is green; push; open the second pull request (tools and the id check: no flag, no
-   plugin code) after its own gate.
-2. 00064's lines to the coordinator, mtp-card-ready and engine-step the moment it ends
-   (`grep '^idcheck:' reports/collectives/card/00064-idcheck-rule9.log`).
+1. Merge #13 when the gate is green; tell engine-step (it then switches its `take_candidates` to `top_k`) and
+   mtp-card-ready (its proposer conflicts with `_draft_tokens`: keep its `draft_argmax(logits)` as the gathered
+   branch and `vocab_parallel.vocab_parallel_argmax` under `vocab_parallel.enabled(self.model)`).
+2. 00064's and 00081's lines to the coordinator, mtp-card-ready and engine-step the moment they end
+   (`grep '^idcheck:' reports/collectives/card/00064-idcheck-rule9.log`). If `topk_gather_fp32` is wrong on the
+   card, `vocab_parallel_candidates` needs another way to its ids (tell engine-step at once).
 3. 00073: `python3 -I tools/flash_next/collectives/decide_g41.py reports/collectives/card/00073-c4-bench-r8-r4 --json ...`;
    alpha and us per MB for 8 and 4 ranks, lazy and replay, into `reports/collectives/collective_alpha.json` (its
    `pending` fields) and to the coordinator (`main`); the decisions into section 5.
 4. C4 only where the replay regime of 00073 shows the gather form below the all-reduce (I34 row gate): then a
    real-model arm with `VLLM_HPU_ALL_REDUCE_AS_GATHER_ROWS=<rows>` (`ab_job.sh`), and the fused form (the sum
    inside `hc_combine_norm`) only if `gather_first` beats `gather_sum` by more than the sum op.
-5. Count work left (each collective about 0.15 to 0.19 ms at TP8): the PLE rows on layer 0's mixer all-reduce when
-   the embedding is replicated (98 to 97); the draft's arg-max gather carrying the winner's embedding row (the
-   draft's embedding all-reduce without the 1.11 GB replicated table). The per-layer floor of 2 is algebraic
-   (section 3).
-6. When MTP runs on the card (mtp-card-ready's fixes merged): an MTP k = 3 A/B of
-   `VLLM_HPU_VOCAB_PARALLEL_LOGITS=1 VLLM_HPU_REPLICATED_EMBEDDING=1 VLLM_HPU_MTP_REPLICATED_FC=1` (9 collectives
-   and four logits gathers fewer per MTP step, the verification from tokens).
+5. The logits all-gather against the `[rows, 2]` pair gather (`bench_c4.py --tail-rows`, commit `db917dfd`) is not in
+   00073 (its image is `684b54ad`): run `bench_job.sh` once more on any:4 if a slot is free.
+6. When MTP runs on the card: an MTP k = 3 A/B of `VLLM_HPU_VOCAB_PARALLEL_LOGITS=2 VLLM_HPU_REPLICATED_EMBEDDING=1
+   VLLM_HPU_MTP_REPLICATED_FC=1` (9 collectives and four logits gathers fewer per MTP step).
+7. Count work left, small (0.15 to 0.19 ms each at TP8): the PLE rows on layer 0's mixer all-reduce when the
+   embedding is replicated (98 to 97, costs the 1.11 GB table); the draft's arg-max gather carrying the winner's
+   embedding row. The per-layer floor of 2 is algebraic (section 3).
