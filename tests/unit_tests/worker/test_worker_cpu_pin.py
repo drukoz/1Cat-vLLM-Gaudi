@@ -228,3 +228,84 @@ def test_the_calling_thread_keeps_its_share_when_the_kernel_refuses():
     assert cpus.give_calling_thread_its_own_cpu([4, 5, 6], cpus.PIN_SHARE_AND_OWN_CPU, log, setaffinity=setaffinity,
                                                 thread_ids=lambda: [7, 8], calling_thread=7) is None
     assert log.lines[-1][0] == "warning" and "keeps the whole share" in log.lines[-1][1]
+
+
+# --- mode 3: the model thread on a CPU whose host hyperthread sibling is kept free (section 7.12) ---
+
+from vllm_gaudi.v1.worker import hpu_worker_cpus as _cpus  # noqa: E402
+
+# the farm's layout since 2026-11-21 06:58: every module share is 9 whole cores (vCPUs 2k, 2k+1)
+_SHARE0 = list(range(0, 18))
+_SHARE1 = list(range(20, 38))
+
+
+def test_sibling_rule():
+    assert _cpus.sibling_cpu(20, "xor1") == 21 and _cpus.sibling_cpu(21, "xor1") == 20
+    assert _cpus.sibling_cpu(20, "none") is None
+
+
+def test_own_core_whole_core_share():
+    own, sib, rest = _cpus.own_core(_SHARE1, "xor1", allowed=range(152))
+    assert own == 21 and sib == 20
+    assert 20 not in rest and 21 not in rest and len(rest) == 16
+
+
+def test_own_core_skips_a_cpu_whose_sibling_is_another_workers():
+    # an old-layout share 19-36: 19's sibling 18 was outside every share, 36's sibling 37 too
+    share = list(range(19, 37))
+    own, sib, rest = _cpus.own_core(share, "xor1", allowed=[c for c in range(152) if c not in (18, 37)])
+    assert own == 20 and sib == 21
+    # with 37 inside the server's CPUs and outside this share, 36 would not qualify as long as another CPU does
+    own2, _, _ = _cpus.own_core([36, 38, 39], "xor1", allowed=range(152))
+    assert own2 == 38
+
+
+def test_own_core_none_rule_is_mode_two_on_the_second_cpu():
+    own, sib, rest = _cpus.own_core(_SHARE0, "none")
+    assert own == 1 and sib is None and rest == [0] + list(range(2, 18))
+
+
+def test_mode_three_moves_threads_and_the_parent():
+    aff = {100: set(_SHARE1), 101: set(_SHARE1), 102: set(_SHARE1), 900: set(range(152)), 901: set(range(20, 30))}
+    calls = []
+
+    def setaffinity(tid, cpus):
+        calls.append(tid)
+        aff[100 if tid == 0 else tid] = set(cpus)
+
+    own = _cpus.give_calling_thread_its_own_core(
+        _SHARE1, 3, rule="xor1", allowed=range(152), getaffinity=lambda t: aff[100 if t == 0 else t],
+        setaffinity=setaffinity, thread_ids=lambda: [100, 101, 102], parent_thread_ids=lambda: [900, 901],
+        calling_thread=100, rehome=False)
+    assert own == 21
+    assert aff[100] == {21}
+    assert aff[101] == aff[102] == set(_SHARE1) - {20, 21}
+    assert aff[900] == set(range(152)) - {20, 21}
+    assert aff[901] == set(range(22, 30))
+
+
+def test_mode_three_is_a_no_op_for_other_modes():
+    for mode in (0, 1, 2):
+        assert _cpus.give_calling_thread_its_own_core(_SHARE1, mode, setaffinity=lambda *a: None,
+                                                      getaffinity=lambda t: set(_SHARE1), rehome=False) is None
+
+
+def test_trim_threads_keeps_a_thread_that_has_no_other_cpu():
+    aff = {1: {20}, 2: {20, 22}}
+
+    def setaffinity(tid, cpus):
+        aff[tid] = set(cpus)
+
+    moved = _cpus.trim_threads([20, 21], [1, 2], getaffinity=lambda t: aff[t], setaffinity=setaffinity)
+    assert moved == 1 and aff == {1: {20}, 2: {22}}
+
+
+def test_mode_three_pins_nothing_at_init_and_returns_the_share():
+    calls = []
+    share = _cpus.pin_from_env(1, 8, _cpus.PIN_SHARE_AND_OWN_CORE, environ={"HLS_MODULE_ID": "1",
+                                                                            "HABANA_VISIBLE_MODULES": "0,1,2,3,4,5,6,7"},
+                               getaffinity=lambda pid: set(c for c in range(152) if c not in (18, 19, 56, 57, 94, 95,
+                                                                                               132, 133)),
+                               setaffinity=lambda *a: calls.append(a), thread_ids=lambda: [1, 2, 3])
+    assert share == list(range(20, 38))
+    assert calls == []
