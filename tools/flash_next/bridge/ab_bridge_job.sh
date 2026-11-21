@@ -1,0 +1,99 @@
+#!/bin/bash
+# SPDX-License-Identifier: Apache-2.0
+#
+# ab_bridge_job.sh: the real model with the image's PyTorch bridge against our own builds of it, one server per
+# arm, one after another on all of the job's cards. Runs on the node's host inside a job of the card queue
+# (CARDQ_* set); each arm is one container started by ~/farm/farm_job.sh (cards, CPUs, ports, labels as for every
+# job), probed by the farm's serve_probe.sh + decode_scaling.py. Deployed to ~/farm/collectives/bridge/.
+#
+#   ab_bridge_job.sh [--sha SHA12] ARM...      ARM = name:BUILD[:KEY=VALUE[,KEY=VALUE...]]
+#     BUILD "-" = the image's bridge; otherwise a build id of ~/farm/native-replay/bridge-build/out/, installed by
+#     with_bridge.py at the container's start (exit 7 or 8 and the arm fails if it is not what loads).
+#   e.g. stock:-  lean0:lean-0123456789ab:PT_HPU_HPUGRAPH_PREPARED_REPLAY=0
+#        lean1:lean-0123456789ab:PT_HPU_HPUGRAPH_PREPARED_REPLAY=1
+#
+# PROBE_OPTS: serve_probe.sh's options (default: 1 and 32 streams, 256 tokens, two measured rounds at 32, no
+# MINTOK round). Every arm also gets VLLM_GRAPH_RESERVED_MEM (default 0.4 at 8 cards, 0.5 below; the 23:50 UTC
+# rule) unless its KEY=VALUE list sets it. Results: ~/farm/<track>/results/<job>-<name>-<arm>/ (scaling.json,
+# server0.log, probe.log, versions.txt, summary.json, bridge.json), and one summary line per arm and level here.
+# Exit code 0 when every arm's server answered and its probe ended well.
+set -u
+F="$HOME/farm"
+TRACK="${CARDQ_TRACK:?not inside a job of the card queue}"
+JOB="${CARDQ_JOB:?}"
+NAME="${CARDQ_NAME:-bridge-ab}"
+SHA=""
+if [ "${1:-}" = "--sha" ]; then SHA="$2"; shift 2; fi
+[ -n "$SHA" ] || SHA="$(basename "$(readlink "$F/$TRACK/current")")"
+[ $# -ge 1 ] || { echo "usage: ab_bridge_job.sh [--sha SHA12] name:BUILD[:K=V,...]..."; exit 2; }
+PROBE_OPTS="${PROBE_OPTS:---levels 1,32 --tokens 256 --warm-tokens 64 --repeat-top 2 --no-mintok-check}"
+NCARDS="$(echo "${CARDQ_CARDS:-}" | tr ',' '\n' | grep -c .)"
+RESERVED="$([ "$NCARDS" -ge 8 ] && echo 0.4 || echo 0.5)"
+WRAP='exec python3 "$FARM_OUT/bridge/with_bridge.py" "$FARM_OUT/bridge" -- "$@"'
+now() { date -u +%T; }
+rc_all=0
+echo "ab_bridge: job $JOB, commit $SHA, cards ${CARDQ_CARDS:-?}, arms: $* [$(now)]"
+for arm in "$@"; do
+    name="${arm%%:*}"
+    rest="${arm#*:}"
+    build="${rest%%:*}"
+    kvs=""
+    [ "$rest" != "$build" ] && kvs="${rest#*:}"
+    case "$name" in '' | *[!A-Za-z0-9_-]*) echo "ab_bridge: bad arm name '$name'"; exit 2 ;; esac
+    run="$JOB-$NAME-$name"
+    out="$F/$TRACK/results/$run"
+    mkdir -p "$out"
+    envs=()
+    has_reserved=0
+    if [ -n "$kvs" ]; then
+        IFS=',' read -r -a pairs <<<"$kvs"
+        for kv in "${pairs[@]}"; do
+            envs+=(--env "$kv")
+            case "$kv" in VLLM_GRAPH_RESERVED_MEM=*) has_reserved=1 ;; esac
+        done
+    fi
+    [ "$has_reserved" -eq 1 ] || envs+=(--env "VLLM_GRAPH_RESERVED_MEM=$RESERVED")
+    wrap=()
+    if [ "$build" != "-" ]; then
+        src="$F/native-replay/bridge-build/out/$build"
+        if [ ! -f "$src/manifest.json" ]; then
+            echo "ab_bridge: arm $name: no bridge build $build on the node"
+            rc_all=2
+            continue
+        fi
+        mkdir -p "$out/bridge" && cp -r "$src/." "$out/bridge/" && cp "$F/collectives/bridge/with_bridge.py" "$out/bridge/" \
+            || { echo "ab_bridge: arm $name: cannot copy build $build"; rc_all=2; continue; }
+        wrap=(bash -c "$WRAP" with-bridge)
+    fi
+    label="$build"
+    [ "$build" = "-" ] && label="the image's"
+    echo "ab_bridge: arm $name: bridge $label, env ${kvs:-none} [$(now)]"
+    # shellcheck disable=SC2086  # PROBE_OPTS is a list of options
+    bash "$F/farm_job.sh" --sha "$SHA" --run-id "$run" --suffix "$name" "${envs[@]}" -- \
+        ${wrap[@]+"${wrap[@]}"} bash /farm/serve_probe.sh $PROBE_OPTS >"$out/arm.log" 2>&1
+    rc=$?
+    grep -E "^BRIDGE |serve_probe: (SERVER-|PROBE-RC|DONE|fallback)|^MEAS|^SAMPLED|^TEXT" "$out/arm.log" | cut -c1-220 | head -40
+    echo "ab_bridge: arm $name ended rc $rc [$(now)]"
+    [ "$rc" -eq 0 ] || rc_all=$rc
+    sleep "${CARD_RELEASE_S:-15}"  # the cards are not free the moment the server's processes end
+done
+# one line per arm and level: the steady ms per token (median gap between chunks) of the measured rounds
+python3 - "$F/$TRACK/results" "$JOB-$NAME" "$@" <<'PY'
+import json, sys, os
+root, prefix, arms = sys.argv[1], sys.argv[2], sys.argv[3:]
+for arm in arms:
+    name = arm.split(":")[0]
+    try:
+        d = json.load(open(os.path.join(root, "%s-%s" % (prefix, name), "scaling.json")))
+    except Exception as exc:
+        print("ab_bridge: %-8s no scaling.json (%s)" % (name, exc))
+        continue
+    for lv in d.get("levels", []):
+        print("ab_bridge: %-8s N=%-3s rep %s: steady ms/token p50 %s x tokens/chunk %s, ms/token p50 %s, "
+              "total tok/s %s, ok %s err %s" % (
+                  name, lv.get("streams"), lv.get("rep"), lv.get("steady_ms_per_token_p50"),
+                  lv.get("tokens_per_chunk_p50"), lv.get("ms_per_token_p50"), lv.get("aggregate_tok_s"),
+                  lv.get("ok"), lv.get("errors")))
+PY
+echo "ab_bridge: DONE rc $rc_all [$(now)]"
+exit "$rc_all"
