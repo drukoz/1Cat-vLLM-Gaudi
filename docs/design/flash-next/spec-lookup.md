@@ -383,7 +383,46 @@ per step (7.3). With `rho = c / T32` the speed-up on edits is `a / (1 + 32 k rho
   a pure copy load, until its rows become per-request (Handoff, pending 3). At one stream both pay (the step is
   host-bound): MTP alone 1.69x at TP4 (00099 / 00104), n-gram on edits x4 to x6 by 7.4.
 
-### 7.5 n-gram on the real model (job 00133): pending
+### 7.5 n-gram on the real model (job 00133, TP4 + EP4, 2026-11-21 00:25 to 00:44 UTC)
+
+n-gram k = 5 with prefix caching, commit `f2b86e91`, `VLLM_GRAPH_RESERVED_MEM=0.5`, the fused GDN verification op
+first, then (the job's own fallback) the torch verification; rounds as 00095. MEASURED
+(`reports/spec-lookup/card/00133-real4-ngram5-edit3/`, `probe.log` and `torch-verify/probe.log`):
+
+| Server | Request | tokens per step (rate per position) | ms per step (p90) | ms per token, steady | tok/s per stream | against 00095 (29.9 ms) |
+|---|---|---|---|---|---|---|
+| n-gram k = 5, fused verification | 1 stream, edit prompt 0, 384 tokens | 5.87 (0.97 at every position) | 68.9 (87.7) | 11.7 | 85 | x2.55 |
+| n-gram k = 5, torch verification | the same | 5.88 (0.97 at every position) | 84.8 (104.1) | 14.4 | 69 | x2.07 |
+
+- These are the warm rounds (the measured rounds never ran, below); the median gap between chunks is one engine
+  step and is not moved by the few compile pauses (longest 7.8 and 9.6 s).
+- One stream on the head's QSA path at TP4: an extra verification row costs (68.9 - 29.9) / 5 = 7.8 ms with the
+  fused op, 11.0 ms with the torch recurrence: rows are not cheap at one stream there (the torch QSA path works
+  per query row). The replay's average edit stream (4.72 tokens per step at k = 5) would give about
+  (29.9 + 5 x 7.8) / 4.72 = 14.6 ms per token there (INFERRED); stream 0 copies its file almost verbatim.
+- **Then both servers died on the second request on the same prompt**, at the first recurrent block the decode
+  completed (896 tokens at TP4): the fused one on the step starting at position 896 (`ValidateSyncInputTensors
+  tensor_data is empty`: the first input of `gdn_core_verify`, the conv pool), the torch one a step later
+  (`Neither storage attached to input tensor` in `replayV3`). Cause, found by mtp-card-ready (`5c770d96`, BRIEF rule
+  11): `commit_conv`, the align-mode copy of a completed block's conv state (the boundary commit and the pre-step
+  copy, prefix caching with speculation only), wrote the pool through a slice; the fix writes whole rows with
+  `index_copy_`. 00095 (no speculation) ran the same request sequence without a crash. MTP had never completed a
+  block during decode on a card (prompts and outputs under one block).
+- 32 streams: not measured (the server was gone). Prompts repeat no more in this track's probes (`ab513444`).
+
+### 7.6 n-gram and the hybrid at TP8 on the integration build (jobs 00154, 00155): pending
+
+Build `e85a3292` (branch `feat/flash-next-gaudi-spec-lookup-tp8`, pushed): the integration build 2's code
+(`a9814f72`), this branch (`ab513444`) and mtp-card-ready's `5c770d96`; build 2's flags (`VLLM_HPU_QSA_FUSED=1
+VLLM_HPU_QSA_INDEXER_SHARD=1 VLLM_HPU_GDN_KERNEL_INTERLEAVE=1 VLLM_HPU_GDN_GLUE_CACHE=1 VLLM_HPU_HC_FUSED_COPY_MODE=2
+VLLM_HPU_DECODE_CUT_INTERVAL=1000 VLLM_HPU_CANDIDATE_SAMPLING=1 VLLM_GRAPH_RESERVED_MEM=0.4`) and
+`VLLM_HPU_GDN_CORE_VERIFY=1`; `tools/flash_next/rental/lookup_arms.sh` with the rounds `edit:1:384:-:100,
+edit:32:384:-:0, mix:32:384:-:400, edit:1:384:-:100` (the last repeats prompt 100: a second request decoding past
+the 512-token block the first one cached, the 00133 case at TP8; no prefix flags, as in build 2). 00154: arms
+`nospec`, `hybrid3` (MTP k = 3 + lookup; every round in mode 1 and, on prompts + 300, in mode 0 = MTP alone);
+00155: arm `ngram5`. CPU on that tree: `test_align_commit_slice_writes.py` 10, `test_lookup_oracle_engine.py` 2,
+`test_engine_mtp.py` 15 passed.
+
 
 ## 8. Notes for other tracks
 
