@@ -31,7 +31,9 @@ its accepted drafts plus one) and ``prev_committed`` (the same request's count i
 Why (engine-step, 2026-11-21): in card job 00156 (k = 2) the 1-stream verification part ranged from 51 to 71 ms
 between rounds of one server, and its 25-step means tracked the share of steps whose first draft was rejected;
 the per-step record shows whether the steps after a full rejection are the slow ones. Each line also has ``t``
-(wall clock at the step's start), ``replay_ms`` (the target forward's replay calls, timed by the runner), the draft's
+(wall clock at the step's start), ``replay_ms`` (the target forward's replay calls, timed by the runner) and
+``replay_first_ms`` (the first one's start from the step's start: ``t`` plus it places every rank's forward start on one
+clock, the ranks' skew), the draft's
 laps, ``gc_freeze`` (``VLLM_HPU_WORKER_GC_FREEZE`` at the step) and the collector's pauses in the step (``gc_ms``,
 ``gc_gen2``: generation-2 collections). The record costs one ``write`` of a line per step.
 """
@@ -75,6 +77,7 @@ class MtpStepTimer:
         self._previous: dict = {}  # request -> tokens it committed in its last timed step
         self._replay_s = 0.0  # the target forward's replay calls in the step (the runner's replay())
         self._replays = 0
+        self._first_replay_s = None  # the first replay call's start, from the step's start
         self._wall_start = None
         self.gc_pauses = None  # a gc_control.GcPauses the runner installs: the collector's pauses per step
 
@@ -87,13 +90,18 @@ class MtpStepTimer:
         self._committed = None
         self._replay_s = 0.0
         self._replays = 0
+        self._first_replay_s = None
         self._wall_start = time.time()
         if self.gc_pauses is not None:
             self.gc_pauses.reset()
 
     def replay(self, seconds: float) -> None:
-        """The runner's target forward call took ``seconds`` (the HPU graph replay issued from the host)."""
+        """The runner's target forward call took ``seconds`` (the HPU graph replay issued from the host), ending now.
+        The first one of a step also gives the offset of its start from the step's start: with ``t`` (the step's wall
+        clock) every rank's first replay call is placed on one clock, so the ranks' start skew of the forward shows."""
         if self._step_start is not None:
+            if self._first_replay_s is None:
+                self._first_replay_s = max(0.0, self.clock() - float(seconds) - self._step_start)
             self._replay_s += float(seconds)
             self._replays += 1
 
@@ -189,6 +197,7 @@ class MtpStepTimer:
                "prev_committed": self._histogram(previous),
                "t": None if self._wall_start is None else round(self._wall_start, 3),
                "replay_ms": round(1000.0 * self._replay_s, 3), "replays": self._replays,
+               "replay_first_ms": None if self._first_replay_s is None else round(1000.0 * self._first_replay_s, 3),
                "laps": {name: round(1000.0 * value, 3) for name, value in spans.items()
                         if name not in (SPAN_VERIFY, SPAN_DRAFT)},
                "gc_freeze": 1 if os.environ.get("VLLM_HPU_WORKER_GC_FREEZE", "0").strip() == "1" else 0}

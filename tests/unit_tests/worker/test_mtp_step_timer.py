@@ -191,10 +191,12 @@ def test_per_step_records_carry_the_replay_calls_laps_and_collector_pauses(tmp_p
     timer.replay(0.5)  # outside a step: ignored
     timer.step_start()
     timer.step_tokens(["a"], [2])
+    clock.advance(6.0)  # input preparation, then a 20 ms replay call ending now
+    clock.advance(20.0)
     timer.replay(0.020)
     timer.replay(0.004)
     timer.gc_pauses.ms, timer.gc_pauses.gen2, timer.gc_pauses.collections = 7.5, 1, 3
-    clock.advance(40.0)
+    clock.advance(14.0)
     timer.draft_start("verify", 3, 1, 2)
     clock.advance(3.0)
     timer.lap("pass0")
@@ -202,6 +204,7 @@ def test_per_step_records_carry_the_replay_calls_laps_and_collector_pauses(tmp_p
     timer.draft_end()
     line = json.loads(open(timer.step_path).read().splitlines()[0])
     assert line["replay_ms"] == pytest.approx(24.0) and line["replays"] == 2
+    assert line["replay_first_ms"] == pytest.approx(6.0) and line["verify_ms"] == pytest.approx(40.0)
     assert line["laps"]["pass0"] == pytest.approx(3.0) and line["laps"]["final_wait"] == pytest.approx(5.0)
     assert line["gc_freeze"] == 1 and line["gc_ms"] == 7.5 and line["gc_gen2"] == 1 and line["gc_collections"] == 3
     assert isinstance(line["t"], float) and timer.gc_pauses.resets == 1
