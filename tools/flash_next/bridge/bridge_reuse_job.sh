@@ -40,6 +40,9 @@
 # differ only in the spinner; its texts_1 must equal real-ref's); LEAN4=0 (BRIDGE_LEAN4) leaves real-lean4 out;
 # VERIFY_KV (BRIDGE_VERIFY_KV, ';'-separated) is extra env of real-lean5-verify alone, the arm that is not timed (e.g.
 # PT_HPU_HPUGRAPH_STATIC_PLAN_MISS_LOG=200 with native-replay's lean6m wheel: one line per missing launcher).
+# The job's environment only: BRIDGE_PROBE_EXTRA, more words for every real arm's serve_probe.sh (a build's own log
+# checks, e.g. build 5's "--probe-require-log runs.the.dense.MoE.form": no spaces inside a word), and
+# BRIDGE_REQUIRE_LOG, a text every real arm's server0.log must hold ("requirelog-<arm> ok|fail" verdicts).
 # Verdicts: ~/farm/<track>/results/<job>-<name>-verdicts.txt; exit code 0 when all passed and no arm was skipped.
 set -u
 IMG="${1:?image}"
@@ -80,7 +83,9 @@ SPINKV=""
 [ "$SPIN" = off ] && SPINKV=";PT_HPU_SYNCHRONOUS_ACC_QUEUE_FLUSHING=1"
 F1="PT_HPU_HPUGRAPH_PREPARED_REPLAY=1"
 echo "bridge_reuse: image $IMG, arm set $ARMSET, lean4 $L, lean5 ${L5:-none}, spinner $SPIN, pin ${PIN_KV:-none}, placement ${PLACE:-none}, ref pair $REF_PAIR, lean4 arm $WITH_LEAN4, verify arm extra ${VERIFY_KV:-none}"
-PROBE="bash $P/serve_probe.sh --levels 32,8,1 --tokens 128 --warm-tokens 48 --repeat-top 2 --no-mintok-check --probe-arg --sampled-levels=32,8,1 --probe-arg --interleave-sampled --probe-arg --rounds=2"
+PROBE="bash $P/serve_probe.sh --levels 32,8,1 --tokens 128 --warm-tokens 48 --repeat-top 2 --no-mintok-check --probe-arg --sampled-levels=32,8,1 --probe-arg --interleave-sampled --probe-arg --rounds=2${BRIDGE_PROBE_EXTRA:+ $BRIDGE_PROBE_EXTRA}"
+REQ_LOG="${BRIDGE_REQUIRE_LOG:-}"
+echo "bridge_reuse: probe extra ${BRIDGE_PROBE_EXTRA:-none}; required log text ${REQ_LOG:-none}"
 CMD="$PROBE"
 [ -z "$PLACE" ] || CMD="bash /results/bench/place_wrap.sh $PLACE -- $PROBE"
 LEANKV="${PIN_KV:+;$PIN_KV}$SPINKV"
@@ -202,6 +207,15 @@ check_arm() {  # the checks of one real arm, right after it ended
     fi
     if in_list "$arm" ${PLAN[@]+"${PLAN[@]}"}; then plan_check "$arm"; fi
     if in_list "$arm" ${T32[@]+"${T32[@]}"}; then t32_check "$arm"; fi
+    if [ -n "$REQ_LOG" ]; then  # the build's own form must have run (e.g. build 5's dense MoE)
+        if [ ! -f "$d/server0.log" ]; then
+            echo "requirelog-$arm fail no server0.log"
+        elif grep -qF -- "$REQ_LOG" "$d/server0.log"; then
+            echo "requirelog-$arm ok '$REQ_LOG'"
+        else
+            echo "requirelog-$arm fail no line holds '$REQ_LOG'"
+        fi >>"$V"
+    fi
     return 0
 }
 
