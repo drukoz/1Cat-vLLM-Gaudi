@@ -40,7 +40,6 @@ reports() {  # reports FILE LABEL: the text reports, while the container (and so
     sudo -n "$P" --buildid-dir "$BD" report -i "$f.data" --stdio --no-children -g none --sort pid,dso --percent-limit 0.2 2>/dev/null | grep -v "^$" | head -n 150 > "$f.dso.txt"
     sudo -n "$P" --buildid-dir "$BD" report -i "$f.data" --stdio --no-children -g none --sort dso,sym --percent-limit 0.15 2>/dev/null | grep -v "^$" | head -n 220 > "$f.sym.txt"
     sudo -n "$P" --buildid-dir "$BD" report -i "$f.data" --stdio --no-children -g none --sort pid,tid,dso --percent-limit 0.3 2>/dev/null | grep -v "^$" | head -n 200 > "$f.tid.txt"
-    sudo -n "$P" --buildid-dir "$BD" report -i "$f.data" --stdio --children -g caller,0.5,callee --sort sym --percent-limit 2 2>/dev/null | grep -v "^$" | head -n 400 > "$f.calls.txt"
     sudo -n chown -R "$(id -un):" "$OUT" 2>/dev/null
     log "$2: reports written ($(wc -l < "$f.sym.txt") symbol lines)"
 }
@@ -64,7 +63,9 @@ sample() {  # sample SERVER N: perf record of every worker of the job's containe
         python3 "$T/perf/thread_stat.py" --pids "$pids" --seconds "$dur" --out "$f.threadstat.json" > "$f.threadstat.txt" 2>&1 &
         side+=($!)
     fi
-    sudo -n "$P" --buildid-dir "$BD" record -F 999 -g -p "$pids" -o "$f.data" -- sleep "$dur" > "$f.record.log" 2>&1
+    # IP samples only (card rule 12, BRIEF 00:52 UTC 2026-11-21): a call graph (-g or --call-graph dwarf) makes the
+    # kernel read user memory above each thread's stack, which can touch a mapped NIC doorbell page and reset the card.
+    sudo -n "$P" --buildid-dir "$BD" record -F 999 -p "$pids" -o "$f.data" -- sleep "$dur" > "$f.record.log" 2>&1
     wait "${side[@]}" 2>/dev/null
     ps -L -o pid,tid,psr,pcpu,stat,comm -p "$pids" 2>/dev/null | awk 'NR==1 || $4 >= 1.0' > "$f.threads.txt"
     for pid in ${pids//,/ }; do taskset -cp "$pid" 2>/dev/null; done > "$f.affinity.txt"
