@@ -849,6 +849,17 @@ all-reduces already split every layer).
    tiny-lean3t-inline (tokens), real-lean3t and real-lean3t-inline (`PT_HPU_DISABLE_ASYNC_COLLECTIVE=1`, VERIFIED in
    `habana_kernels/hccl_kernels.cpp:354`: the collective runs inline instead of `JobThreadLazyHCCL::addJob` +
    `submit_future`), all with the spinner off, the flag and the headline env.
+3b. **lean3a** (`lean3a-8f6f7faf88dc`, `patches/lean3a.patch`, published 03:47:54 UTC, VERIFIED in the wheel; the
+   bridge clone's local commit after 6edcb0f): lean3t plus two cuts under the flag, written before 00181's data because
+   they remove pure overhead. (1) `backend/synapse_helpers/event.cpp` `event::stream_wait_event`: the stock code
+   releases and re-takes the GIL (`AutoNoGIL`) for every input that has a producer event, also when the event is done
+   or on the same stream; the HPU-graph replay binding (`replayV3`, `python_packages/.../csrc/bindings.cpp:311`) holds
+   the GIL during the whole replay, so a replayed launch does about one GIL release and re-take per such input (and
+   any other Python thread can take the GIL in between: INFERRED, a possible source of the ranks' random multi-ms
+   stalls). Now: `try_lock`; done or same stream returns at once; otherwise the stock path. (2) `graph::launch`: the
+   logs and traces that are off are skipped before their arguments are built. Measured by the sub-timers
+   (in_streamwait, in_waits, syn_workspace, syn_trace, syn_after) against lean3t in 00181. Offered for 00181 or the
+   next bridge job.
 4. **Background: the lean path's first plan (next-week item 1, the coordinator's choice of the program's best fixed-cost plan): a bridge-only lean replay
    path.** Read from the bridge source at `5176b1b2`. What a replayed launch does on the main thread today, per
    captured segment (step-anatomy: 148 per step at 1 stream, 209 at 32; about 150 us of bridge work each under the
