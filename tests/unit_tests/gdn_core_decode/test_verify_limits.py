@@ -149,7 +149,9 @@ def test_build_rules_pass_no_local_memory_override():
     flags = re.search(r"set\(GDN_TPC_FLAGS ([^)]*)\)", text)
     assert flags and flags.group(1).split() == ["-Wall", "-Werror", "-O2", "-march=gaudi2"]
     commands = re.findall(r'COMMAND "\$\{TPC_COMPILER\}"([^\n]*)', text)
-    assert len(commands) == 4  # decode, recurrent, verify, and the configure-time try of the verify compile
+    # decode, recurrent, verify, the configure-time try of the verify compile, and for the interleaved kernels
+    # (one loop over both) their try and their build
+    assert len(commands) == 6
     for arguments in commands:
         assert arguments.split()[0] == "${GDN_TPC_FLAGS}", arguments
     # The diagnostic that strips the verify ELF's bitcode is off unless asked for.

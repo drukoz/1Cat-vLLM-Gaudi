@@ -57,12 +57,13 @@ inline constexpr int32_t kMoeGlueMaxExperts = 32767;
 inline constexpr float kMoeGlueFp8Max = 240.0f;
 
 // Node parameters (PyTorch op -> glue), the same 16 bytes for the four GUIDs. A kernel that has no
-// use for a field gets 0 in it: experts and top_k are read by route, gate_column by combine,
-// fp8_max by row_quant.
+// use for a field gets 0 in it: experts and top_k are read by route, gate_column by combine and by
+// silu_mul, fp8_max by row_quant.
 struct MoeGlueParams {
     int32_t experts;      // router columns of the merged gate output
     int32_t top_k;        // experts per token
-    int32_t gate_column;  // the column of the merged gate output that holds the shared-gate logit
+    int32_t gate_column;  // combine: the column of the merged gate output that holds the shared-gate logit;
+                          // silu_mul: the first column of the gate_up block of its input (0: the whole input)
     float fp8_max;        // FP8_MAX of the plugin on this device (240 on Gaudi2)
 };
 static_assert(sizeof(MoeGlueParams) == 16, "the moe_glue node-parameter ABI is three I32 values and one FP32");

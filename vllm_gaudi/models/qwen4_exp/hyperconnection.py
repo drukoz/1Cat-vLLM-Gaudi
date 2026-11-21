@@ -191,6 +191,10 @@ class HpuGatedResidual(nn.Module):
         self.layer_name = prefix or type(self).__name__
         # Fused hyper-connection kernels: the flag is read once, here. 1 = fused; anything else = torch.
         self.hc_fused_requested = envs.VLLM_HPU_HC_FUSED == 1
+        # VLLM_HPU_HC_FUSED_COPY_MODE (read once, here): which activations get an owned copy before a fused op.
+        # 0 (the default, and any other value) passes no argument, so the ops are called as before.
+        copy_mode = envs.VLLM_HPU_HC_FUSED_COPY_MODE
+        self._hc_copy = {"copy_mode": copy_mode} if copy_mode in (1, 2) else {}
         self._hc_fused_ok: bool | None = None  # None = the once-per-layer check has not run yet
         self._hc_fused_logged = False  # the layer's one "is off" line was written
 
@@ -358,17 +362,17 @@ class HpuGatedResidual(nn.Module):
         """GEMM, silu (and the injection split), GEMM, gated mix: the part ``mix`` and ``combine_and_mix`` share."""
         if self.use_combine:
             down_and_injection = self.input_mix_weight_down_block_inject(xn)  # GEMM 1 (matrix engine)
-            lora, injection = ops.hc_silu_split(down_and_injection, self.hc_count, self.lora_rank)
+            lora, injection = ops.hc_silu_split(down_and_injection, self.hc_count, self.lora_rank, **self._hc_copy)
         else:
-            lora = ops.hc_silu(self.input_mix_weight_down(xn), self.hc_count)
+            lora = ops.hc_silu(self.input_mix_weight_down(xn), self.hc_count, **self._hc_copy)
             injection = None
         gate = self.input_mix_weight_up(lora)  # GEMM 2 (matrix engine)
-        block_input = ops.hc_gate_mix(xn, gate, self.hc_count)
+        block_input = ops.hc_gate_mix(xn, gate, self.hc_count, **self._hc_copy)
         return hidden_states, block_input, injection
 
     def _hc_fused_mix(self, ops,
                       hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
-        xn = ops.hc_norm(hidden_states, self.hc_norm.weight, self.config.rms_norm_eps, self.hc_count)
+        xn = ops.hc_norm(hidden_states, self.hc_norm.weight, self.config.rms_norm_eps, self.hc_count, **self._hc_copy)
         return self._hc_fused_mix_tail(ops, hidden_states, xn)
 
     def _hc_fused_combine_and_mix(
@@ -380,7 +384,7 @@ class HpuGatedResidual(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
         # One kernel: the combine, rounded to bf16, and the norm of the rounded result.
         hidden_states, xn = ops.hc_combine_norm(hidden_states, prev_block_output, prev_injection, self.hc_norm.weight,
-                                                self.config.rms_norm_eps, self.hc_count)
+                                                self.config.rms_norm_eps, self.hc_count, **self._hc_copy)
         return self._hc_fused_mix_tail(ops, hidden_states, xn)
 
     # -- torch path (default), with the fused path in front of it ------------
@@ -466,7 +470,7 @@ class HpuGatedResidual(nn.Module):
         ops = self._hc_fused(hidden_states, True, block_output, injection)
         if ops is not None:
             try:
-                return ops.hc_combine(hidden_states, block_output, injection, self.hc_count)
+                return ops.hc_combine(hidden_states, block_output, injection, self.hc_count, **self._hc_copy)
             except Exception as exc:  # noqa: BLE001 - the torch path below takes over
                 self._hc_fused_raised(exc)
 
