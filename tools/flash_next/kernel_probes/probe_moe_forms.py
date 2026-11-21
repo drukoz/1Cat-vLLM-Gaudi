@@ -14,6 +14,8 @@ Big rows (the verify rows of 32 streams):
                 served activation, quantization, batched down GEMM and sum (mid moved to [E, T, I])
   flat13-mmsum  flat13 with the sum over E as a matmul with a ones row ([1, E] x [E, T*H]; the c1 question: is the
                 TPC sum the slow part)
+  flat13-bf16act  flat13 with the activation in bf16 (silu(gate) * up on the bf16 GEMM output, no fp32 copies; the
+                (b) question: how much of the glue is the fp32 path)
   flatdown      (c2, NOT exact, parity only) W2 requantized once to a per-channel scale shared by the experts, so the
                 down projection is ONE 2-D GEMM with K = E*I (the routing weight folded into mid before its per-row
                 quantization) and no sum
@@ -88,12 +90,15 @@ def _flat_gate_up(torch, layer, local, x):
     return gate_up.reshape(rows, local, 2 * I)
 
 
-def flat13_moe(torch, layer, local, x, ids32, weights, expert_ids, mmsum=False):
+def flat13_moe(torch, layer, local, x, ids32, weights, expert_ids, mmsum=False, bf16_act=False):
     _, w2, _, s2 = layer
     rows = x.shape[0]
     wmat = _pair_weights(torch, ids32, weights, expert_ids)
     gu = _flat_gate_up(torch, layer, local, x)
-    mid = (torch.nn.functional.silu(gu[..., :I].float()) * gu[..., I:].float()).to(torch.bfloat16)  # [T, E, I]
+    if bf16_act:  # the activation in bf16 (the MoE glue's moe_silu_mul rounding): half the bytes of the fp32 path
+        mid = torch.nn.functional.silu(gu[..., :I]) * gu[..., I:]
+    else:
+        mid = (torch.nn.functional.silu(gu[..., :I].float()) * gu[..., I:].float()).to(torch.bfloat16)  # [T, E, I]
     mid = mid.transpose(0, 1).contiguous()  # [E, T, I]
     m8, ms = dp.quantize_rows(torch, mid)
     m_scale = ms * wmat.t().unsqueeze(-1)
@@ -241,6 +246,8 @@ def main():
                 "dense": lambda layer, x, i: dp.dense_moe_folded(torch, layer, local, x, ids32_d, w_d, expert_ids),
                 "flat13": lambda layer, x, i: flat13_moe(torch, layer, local, x, ids32_d, w_d, expert_ids),
                 "flat13-mmsum": lambda layer, x, i: flat13_moe(torch, layer, local, x, ids32_d, w_d, expert_ids, True),
+                "flat13-bf16act": lambda layer, x, i: flat13_moe(torch, layer, local, x, ids32_d, w_d, expert_ids,
+                                                                 bf16_act=True),
                 "flatdown": lambda layer, x, i: flatdown_moe(torch, layer, prep[i], local, x, ids32_d, w_d,
                                                              expert_ids),
                 "vendor-chunk64": lambda layer, x, i: dp.vendor_moe(torch, layer, local, x, ids_d, w_d, 64),
