@@ -4136,7 +4136,10 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         runtime switch file (``VLLM_HPU_RUNTIME_SWITCH_FILE``) set a smaller value (0 or 1: one chunk per forward)."""
         rows = getattr(self, "prefill_batch_rows", 0)
         if rows and getattr(self, "_runtime_switches", None) is not None:
-            rows = min(rows, resolve_prefill_batch_rows())
+            try:
+                rows = min(rows, resolve_prefill_batch_rows())
+            except ValueError:  # a negative value in the switch file: one chunk per forward
+                rows = 0
         return rows
 
     def _count_prefill_batch(self, batches: list[BatchContents]) -> None:

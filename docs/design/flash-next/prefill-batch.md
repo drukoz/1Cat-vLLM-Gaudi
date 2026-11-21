@@ -226,7 +226,7 @@ test_engine_prefill_batch.py` (the engine plan off / on, without and with MTP; s
 runtime switch at 0 and 2), `test_runtime_switches.py`, `tests/unit_tests/test_qwen3_next.py` (state save; its two
 gated-FP8 tests are red on the base `8ead88c7` too, not this track's).
 
-## Ops of a merged forward (VERIFIED by CPU dispatcher count, 13:25 UTC; device time INFERRED)
+## Ops of a merged forward (VERIFIED by CPU dispatcher count, 13:21 UTC; device time INFERRED)
 
 `prefill_batch_engine.py --count-ops` counts the ops every model forward dispatches (on a card each one is a node of
 the forward's graph). Tiny model (4 layers: 3 GDN + 1 QSA), bursts of K equal turns (`reports/prefill-batch/tools/
@@ -238,3 +238,9 @@ graph nodes of a one-row forward, not 8 times. If the 80 ms intercept of section
 (35,000 x 2.4 us = 84 ms, coord 00009's per-op cost), merging removes most of it per removed forward: the upper
 column of section 4. Byte- and FLOP-bound per-row work (context gathers, attention) is not counted here; the burst
 probe of 00267 measures the whole.
+
+Without prefix caching (`tools/exp5.py`, `--no-prefix-caching`: load = store = the request's own slot): 9 of 9
+streams and logprobs equal, 14 -> 11 prompt forwards, one merged pair with contexts 512 and 333 in one context bucket.
+Side finding (not this track's, both arms alike): without prefix caching a chunk can start at a context that is not
+a multiple of 4 (333 here), while the QSA prompt indexer assumes 4-aligned contexts (`qsa.py`, "ctx is 4-aligned by
+construction"); only the align mode guarantees it, which every served configuration uses.
