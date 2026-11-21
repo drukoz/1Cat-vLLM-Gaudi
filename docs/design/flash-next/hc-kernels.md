@@ -293,6 +293,14 @@ engines, kernel-fixes' point 3), the slope of two K, and the bits of variants 1 
 card; then profiler traces (`HABANA_PROFILE=profile_api_light`) of variants 0, 1, 4 at batch 1 and 32 for the engines
 per call (`tools/flash_next/hc_kernels/kernel_engines.py`).
 
+If the card shows that neither variant 1 nor variant 4 moves the call off 16 engines at 128 rows, the next layout to
+try is a flat index space of key heads x requests (64 points at 128 rows): `tpc_kernel_lib_interface.h` declares the
+mapping coefficients `a`, `start_b`, `end_b` as floats, so the request dimension of the token-row tensors can follow
+the flat index with `a = 1 / key heads`, and the dimensions that follow the key head (its channels and value heads)
+are declared `allRequired`; with `preferredSplitDim = 1` (the header's encoding: dimension index + 1, so 1 = dim 0,
+which is what variants 4, 5 and 7 set) the compiler would cut it into single points, at most 3 per engine on 24.
+INFERRED only: whether the compiler accepts fractional `a` and overlapping output declarations needs a card.
+
 Next candidates (not built): the conv blocks and the gated RMSNorm per (node, value head), now a larger share; two
 nodes' norms in one block instead of four clamped ones. The value-head split of kernel-fixes' option (c) list is not
 needed while the variants above work.
