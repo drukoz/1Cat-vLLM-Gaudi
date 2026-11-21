@@ -119,6 +119,41 @@ any other name is reported and the file is ignored. Replace the file with a rena
 at the same step. `tools/flash_next/engine_step/long_context_probe.py` measures two arms of one server
 this way.
 
+`VLLM_HPU_QSA_FUSED` selects the sparse QSA decode path (with
+`VLLM_HPU_FLASH_NEXT_QSA_MODE=1`) as an integer. `0` (default) keeps the torch path.
+`1` is the restructured torch data flow: the indexer gathers each request's
+compressed keys once for all its rows (whole kernel blocks, one table row per
+request) instead of once per query row, and the decode attention multiplies the
+grouped query heads with the gathered K and V instead of repeating them. `2` adds
+two TPC kernels, `torch.ops.flashinfer_gaudi.qsa_index_prepare` (indexer queries,
+ring and compressed-key writes) and `qsa_index_emit` (the attended K/V slots); they
+ship in `libqsa_fused_gaudi2.so` with the extension `qsa_fused_ops*.so`, built by
+`tools/build_flashinfer_gaudi.py --qsa-fused-only` or `VLLM_GAUDI_BUILD_QSA_FUSED=1`
+(`QSA_FUSED_GAUDI_KERNEL_LIBRARY` and `QSA_FUSED_GAUDI_NATIVE_LIBRARY` name the two
+files when they are not in the package's `lib` folder). When they do not load the
+plugin logs one warning at startup, and a layer they cannot serve logs `QSA fused
+... is off for <layer>: <reason>` and runs mode `1`. `3` is mode `2` plus two more
+kernels, `qsa_index_threshold` and `qsa_index_select`, in place of `torch.topk`: the
+same selected blocks except among scores equal at the cut, where the lowest blocks
+win. Any other value is `0`. See `docs/design/flash-next/qsa-fused.md`.
+
+`VLLM_HPU_QSA_INDEXER_SHARD` (with `VLLM_HPU_QSA_FUSED` `1` or `2`): `0` (default)
+scores every decode row on every TP rank; `1` scores each rank's share of the
+requests and all-gathers the int32 block selections once per QSA layer, so every rank
+holds the same selection. A decode bucket whose batch is not a multiple of the TP size
+stays replicated. `2` is `1` with the selections sent as fp32 (exact: block ids are
+below 2^24), the dtype of every other collective of the served model. Any other value
+is `0`.
+
+`VLLM_HPU_QSA_TABLE_WIDTH` sets the columns of the Flash-Next sparse QSA decode block
+table. `0` (default) is `ceil(max_model_len / block_size)`, fixed per engine: the
+indexer then gathers and scores every compressed key of a full context for every decode
+row (32,768 keys at `--max-model-len 131072`), whatever the row's own context. `1` is
+the longest request of the decode batch, rounded up to a power of two (at least 64
+blocks, at most the engine's): the key scan follows the context in use, a quarter of
+the keys at 32K tokens. The selections are the same; each (decode bucket, width) met
+compiles its own decode graph. Any other value is `0`.
+
 `VLLM_HPU_GDN_CORE_DECODE` selects the GDN decode core path as an integer.
 `1` (default) is fused: every non-speculative decode step runs through the
 fused core op `torch.ops.flashinfer_gaudi.gdn_core_decode` (conv, gates,

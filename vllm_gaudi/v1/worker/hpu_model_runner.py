@@ -38,7 +38,8 @@ from vllm_gaudi.extension.debug import init_debug_logger
 from vllm_gaudi.v1.core.recurrent_state_pool import pool_pad_block_id, pool_slots_from_env, pool_tensor_slots
 from vllm_gaudi.v1.worker.hpu_dp_utils import set_hpu_dp_metadata
 from vllm_gaudi.v1.worker.gdn_state_layout import has_contiguous_dflash_checkpoints
-from vllm_gaudi.v1.worker.flash_next_inputs import (build_block_table, build_ple_inputs, dummy_ple_inputs,
+from vllm_gaudi.v1.worker.flash_next_inputs import (build_block_table, build_ple_inputs, decode_block_table_width,
+                                                    dummy_ple_inputs,
                                                     model_requires_block_table, model_requires_raw_input_tokens)
 from vllm_gaudi.v1.worker.flash_next_decode_metadata import (compact_state_indices, fill_pad_slots,
                                                              request_block_table, sparse_decode_metadata_refusal)
@@ -5223,19 +5224,22 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         logits_indices[:num_decodes] = query_start_loc_cpu[1:num_decodes + 1] - 1
 
         positions_device = async_h2d_copy(positions, dtype=position_dtype, device=self.device)
+        # VLLM_HPU_QSA_TABLE_WIDTH=1: as wide as the batch's longest request needs, not as the engine's longest
+        # context (the QSA indexer scores every column's keys); the same width with the sparse decode metadata.
+        table_width = decode_block_table_width(num_blocks, self._block_table_max_blocks,
+                                               gaudi_envs.VLLM_HPU_QSA_TABLE_WIDTH)
         if sparse_md:
             # One row per request (the pages of its last scheduled token), repeated over its verification rows.
             block_table_cpu = request_block_table(block_table_cpu_tensor, num_blocks, num_tokens,
-                                                  padded_batch_size * num_tokens, self._block_table_max_blocks,
-                                                  self._PAD_BLOCK_ID)
+                                                  padded_batch_size * num_tokens, table_width, self._PAD_BLOCK_ID)
             block_list = block_groups = block_usage = None
         else:
             block_tables_list = self._resolve_all_blocks(block_tables_list)
 
             block_table_cpu = None
             if getattr(self, '_needs_block_table', False):
-                block_table_cpu = build_block_table(block_tables_list, padded_batch_size * num_tokens,
-                                                    self._block_table_max_blocks, self._PAD_BLOCK_ID)
+                block_table_cpu = build_block_table(block_tables_list, padded_batch_size * num_tokens, table_width,
+                                                    self._PAD_BLOCK_ID)
 
             # CONTEXT_LENS [batch_size]
             block_list, block_groups, block_usage = \
