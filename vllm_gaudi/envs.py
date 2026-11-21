@@ -551,6 +551,9 @@ if TYPE_CHECKING:
     VLLM_HPU_STEP_TIMING_COMPONENTS: int = 0  # 0 (default) none, 1 mode 3 also waits around every model component
     VLLM_HPU_STEP_TIMING_EVERY: int = 100  # steps per log line and JSON record of the step timer
     VLLM_HPU_STEP_TIMING_DIR: str = ""  # folder of the step timer's JSON files ("" = the working directory)
+    VLLM_HPU_DECODE_CUT_INTERVAL: int = 0  # 0 (default) decode keeps the per-layer cuts, N cut every N-th layer
+    VLLM_HPU_GRAPH_ASYNC_REPLAY: int = 0  # 0 (default) the model's HPU graph replays synchronously, 1 asynchronously
+    VLLM_HPU_WORKER_CPU_PIN: int = 0  # WorkerCpuPin: 0 off (default), 1 each worker on its CPU share, 2 and its own CPU
     VLLM_HPU_VOCAB_PARALLEL_LOGITS: int = 0  # VocabParallelMode: 0 logits all-gather (default), 1 greedy, 2 candidates
     VLLM_HPU_REPLICATED_EMBEDDING: int = 0  # 0 vocabulary-sharded token embedding (default), 1 one full copy per rank
     VLLM_HPU_MTP_REPLICATED_FC: int = 0  # 0 the MTP fc linears shard and all-gather (default), 1 unsharded
@@ -2080,6 +2083,30 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Folder of the step timer's files (step_timing_<role>_r<rank>_<pid>.jsonl); "" is the working directory.
     "VLLM_HPU_STEP_TIMING_DIR":
     lambda: os.environ.get("VLLM_HPU_STEP_TIMING_DIR", ""),
+    # The mark_step() that modify_model_layers hooks after every VLLM_CONFIG_HIDDEN_LAYERS-th decoder layer,
+    # in decode and verification forwards (attention metadata with is_prompt=False). 0 (default) keeps the
+    # hooks as they are for every forward. N >= 1 cuts a decode forward after every N-th layer only; a value
+    # above the layer count (1000) leaves a captured decode graph with no per-layer cut. Prompt forwards keep
+    # VLLM_CONFIG_HIDDEN_LAYERS. docs/design/flash-next/native-replay.md.
+    "VLLM_HPU_DECODE_CUT_INTERVAL":
+    lambda: int(os.environ.get("VLLM_HPU_DECODE_CUT_INTERVAL", "0")),
+
+    # The model's HPU graph (wrap_in_hpu_graph in lazy mode): 0 (default) replays synchronously, the caller's
+    # thread issuing every captured recipe and collective before the forward returns; 1 passes asynchronous=True,
+    # so the forward returns once the replay is queued and the logits and sampler ops are issued meanwhile.
+    # docs/design/flash-next/native-replay.md.
+    "VLLM_HPU_GRAPH_ASYNC_REPLAY":
+    lambda: int(os.environ.get("VLLM_HPU_GRAPH_ASYNC_REPLAY", "0")),
+
+    # Where the HPU worker processes run on the host (vllm_gaudi/v1/worker/hpu_worker_cpus.py). 0 (default) leaves
+    # them to the kernel. 1: after torch.hpu.set_device every thread of a worker keeps to one equal share of the
+    # CPUs the server may use, the share at its module's position among HABANA_VISIBLE_MODULES (the rank's
+    # without them); threads started later inherit it. 2: as 1, and after load and warmup the thread that runs
+    # the model has the share's first CPU for itself, the worker's other threads the rest.
+    # docs/design/flash-next/native-replay.md.
+    "VLLM_HPU_WORKER_CPU_PIN":
+    lambda: int(os.environ.get("VLLM_HPU_WORKER_CPU_PIN", "0")),
+
     # Collective cuts of a tensor-parallel Flash-Next step (docs/design/flash-next/collectives.md). All default 0.
     # VLLM_HPU_VOCAB_PARALLEL_LOGITS: 0 = every consumer gets the all-gathered logits; 1 = arg-max consumers
     # (plain greedy decode, MTP drafts, greedy MTP verification) reduce each rank's vocabulary shard first and

@@ -1,0 +1,443 @@
+diff --git a/backend/habana_device/HPUGraph.cpp b/backend/habana_device/HPUGraph.cpp
+index eb79a8c..1b76d37 100644
+--- a/backend/habana_device/HPUGraph.cpp
++++ b/backend/habana_device/HPUGraph.cpp
+@@ -13,6 +13,7 @@
+  * limitations under the License.
+  */
+ #include "HPUGraph.h"
++#include "backend/habana_device/hpugraph_replay_timing.h"
+ 
+ #include <algorithm>
+ #include <cstddef>
+@@ -489,6 +490,10 @@ void SingleHPUGraph::replayGraph(
+     habana_lazy::ir::ValueList& input_vals,
+     bool async) {
+   PT_LAZY_TRACE;
++  namespace rt = habana::replay_timing;
++  rt::ReplayScope replay_timing_scope;
++  const uint64_t rt_t0 = rt::Stamp();
++  uint64_t rt_t2 = 0;
+   bool dynamic_env_ = habana_helpers::GetRefineDynamicShapeStatus();
+   if (dynamic_env_) {
+     habana_helpers::DisableRefineDynamicShape();
+@@ -553,6 +558,7 @@ void SingleHPUGraph::replayGraph(
+             launch_jobid,
+             capture_stream_);
+   } else {
++    rt::Add(rt::kGraphPrep, rt_t0, rt::Stamp());
+     habana_lazy::HbLazyTensor::ExecuteCachedGraph(
+         cached_rarg_psh,
+         graph_,
+@@ -565,6 +571,7 @@ void SingleHPUGraph::replayGraph(
+         seed_tensors_generator_,
+         launch_jobid,
+         capture_stream_);
++    rt_t2 = rt::Stamp();
+   }
+ 
+   auto num_inputs = input_vals.size();
+@@ -576,6 +583,7 @@ void SingleHPUGraph::replayGraph(
+   }
+ 
+   c10::hpu::setCurrentHPUStream(old_stream);
++  rt::Add(rt::kGraphTail, rt_t2, rt::Stamp());
+ 
+   // Not enabling DS back once HPU graph detected
+   /*if (dynamic_env_) {
+diff --git a/backend/habana_device/hpugraph_replay_timing.h b/backend/habana_device/hpugraph_replay_timing.h
+new file mode 100644
+index 0000000..4516403
+--- /dev/null
++++ b/backend/habana_device/hpugraph_replay_timing.h
+@@ -0,0 +1,174 @@
++/**
++ * Phase timers of a launch replayed from an HPU graph (native-replay, 2026-11-21).
++ *
++ * Off unless PT_HPU_HPUGRAPH_REPLAY_TIMING=N (N > 0): then every thread that replays HPU graphs prints, every N
++ * replayed launches, one line "HPUGRAPH_REPLAY_TIMING ..." on stderr with the mean microseconds per launch of each
++ * phase below and the mean number of tensors per launch. Only launches replayed synchronously by
++ * SingleHPUGraph::replayGraph are timed; every other launch path is untouched. A timestamp costs about 20 ns.
++ */
++#pragma once
++#include <sys/syscall.h>
++#include <unistd.h>
++#include <chrono>
++#include <cstdint>
++#include <cstdio>
++#include <cstdlib>
++
++namespace habana::replay_timing {
++
++enum Phase : int {
++  kGraphPrep = 0, // SingleHPUGraph::replayGraph before ExecuteCachedGraph
++  kExecSetup, // ExecuteCachedGraph: the stack, HlExec, set_graph, until hlexec.Launch
++  kLaunchHashes, // HlExec::Launch: symint and permutation hashes, graph index, metadata
++  kCreateLauncher, // HlExec::Launch: CreateLauncher (a new HabanaLaunchOpPT)
++  kRunPrep, // HabanaLaunchOpPT::run: ProcessInputStack, the graph keys, until the spec
++  kRunSpec, // the RecipeArgumentSpec (built, or the cached one)
++  kRunLookup, // TemporaryRecipeStore::Wait, GetCachedRecipe, the hit bookkeeping
++  kRunPatching, // UpdatePatchingInformation
++  kSynCacheConst, // ExecuteSynapseCache: the inference-mode constant scan
++  kLauncherInputs, // RecipeLauncher::Launch: input refs, add_wait_events_on_stream, intermediates
++  kLauncherOutputs, // outputs, external tensor events
++  kSynLaunch, // synapse_helpers::graph::launch
++  kLauncherPost, // recipe counter, producers, resource holder, collective launch
++  kSynCacheTail, // ExecuteSynapseCache after the launch: UpdateRecipeOutputs, ClearStatics
++  kExecBind, // ExecuteCachedGraph after hlexec.Launch: binding the outputs
++  kGraphTail, // SingleHPUGraph::replayGraph after ExecuteCachedGraph
++  kCount
++};
++
++inline const char* const kNames[kCount] = {
++    "graph_prep",
++    "exec_setup",
++    "launch_hashes",
++    "create_launcher",
++    "run_prep",
++    "run_spec",
++    "run_lookup",
++    "run_patching",
++    "syncache_const",
++    "launcher_inputs",
++    "launcher_outputs",
++    "syn_launch",
++    "launcher_post",
++    "syncache_tail",
++    "exec_bind",
++    "graph_tail"};
++
++struct Totals {
++  uint64_t ns[kCount] = {};
++  uint64_t launches = 0;
++  uint64_t total_ns = 0;
++  uint64_t inputs = 0;
++  uint64_t intermediates = 0;
++  uint64_t outputs = 0;
++  uint64_t externals = 0;
++};
++
++inline int Interval() {
++  static const int value = [] {
++    const char* env = std::getenv("PT_HPU_HPUGRAPH_REPLAY_TIMING");
++    return env != nullptr ? std::atoi(env) : 0;
++  }();
++  return value;
++}
++
++inline bool& InReplay() {
++  thread_local bool in_replay = false;
++  return in_replay;
++}
++
++inline Totals& ThreadTotals() {
++  thread_local Totals totals;
++  return totals;
++}
++
++inline bool Active() {
++  return InReplay();
++}
++
++inline uint64_t Now() {
++  return static_cast<uint64_t>(
++      std::chrono::duration_cast<std::chrono::nanoseconds>(
++          std::chrono::steady_clock::now().time_since_epoch())
++          .count());
++}
++
++// A timestamp inside a replayed launch, 0 elsewhere (so the Add below is a no-op).
++inline uint64_t Stamp() {
++  return Active() ? Now() : 0;
++}
++
++inline void Add(Phase phase, uint64_t t0, uint64_t t1) {
++  if (t0 != 0 && t1 >= t0) {
++    ThreadTotals().ns[phase] += t1 - t0;
++  }
++}
++
++inline void Count(
++    uint64_t inputs,
++    uint64_t intermediates,
++    uint64_t outputs,
++    uint64_t externals) {
++  if (!Active()) {
++    return;
++  }
++  auto& t = ThreadTotals();
++  t.inputs += inputs;
++  t.intermediates += intermediates;
++  t.outputs += outputs;
++  t.externals += externals;
++}
++
++inline void EndLaunch(uint64_t total_ns) {
++  auto& t = ThreadTotals();
++  t.launches++;
++  t.total_ns += total_ns;
++  const int interval = Interval();
++  if (interval <= 0 || t.launches % static_cast<uint64_t>(interval) != 0) {
++    return;
++  }
++  const double n = static_cast<double>(t.launches);
++  std::fprintf(
++      stderr,
++      "HPUGRAPH_REPLAY_TIMING pid %d tid %ld launches %llu total_us %.2f",
++      static_cast<int>(getpid()),
++      static_cast<long>(syscall(SYS_gettid)),
++      static_cast<unsigned long long>(t.launches),
++      static_cast<double>(t.total_ns) / n / 1000.0);
++  for (int i = 0; i < kCount; ++i) {
++    std::fprintf(
++        stderr, " %s %.2f", kNames[i], static_cast<double>(t.ns[i]) / n / 1000.0);
++  }
++  std::fprintf(
++      stderr,
++      " | per launch inputs %.1f intermediates %.1f outputs %.1f externals %.1f\n",
++      static_cast<double>(t.inputs) / n,
++      static_cast<double>(t.intermediates) / n,
++      static_cast<double>(t.outputs) / n,
++      static_cast<double>(t.externals) / n);
++  std::fflush(stderr);
++  t = Totals();
++}
++
++// One replayed launch: SingleHPUGraph::replayGraph from entry to exit.
++struct ReplayScope {
++  bool on;
++  uint64_t start;
++  ReplayScope() : on(Interval() > 0), start(0) {
++    if (on) {
++      InReplay() = true;
++      start = Now();
++    }
++  }
++  ~ReplayScope() {
++    if (!on) {
++      return;
++    }
++    InReplay() = false;
++    EndLaunch(Now() - start);
++  }
++  ReplayScope(const ReplayScope&) = delete;
++  ReplayScope& operator=(const ReplayScope&) = delete;
++};
++
++} // namespace habana::replay_timing
+diff --git a/backend/kernel/hpu_habana_cache.cpp b/backend/kernel/hpu_habana_cache.cpp
+index 025e248..3975497 100644
+--- a/backend/kernel/hpu_habana_cache.cpp
++++ b/backend/kernel/hpu_habana_cache.cpp
+@@ -13,6 +13,7 @@
+  * limitations under the License.
+  */
+ 
++#include "backend/habana_device/hpugraph_replay_timing.h"
+ #include "backend/kernel/hpu_habana_cache.h"
+ #include <algorithm>
+ #include "backend/backend_meta.h"
+@@ -1619,6 +1620,9 @@ void RecipeLauncher::Launch(
+     std::vector<size_t>& external_tensor_info_indexes,
+     const VecOfIValPtrSh& dma_inputs) {
+   PT_BRIDGE_BEGIN_WITH_INDEX(debug_id_);
++  namespace rt = habana::replay_timing;
++  const uint64_t rt_n0 = rt::Stamp();
++  uint64_t rt_n3 = rt_n0;
+   MaybePrintDebugInfo(
+       input_refs, intermediate_tensors_ptr, aten_outputs, *this);
+   if (recipe_ != nullptr) {
+@@ -1674,6 +1678,8 @@ void RecipeLauncher::Launch(
+         ptRefs.emplace_back(intermediate_tensor->toTensor());
+       }
+     }
++    const uint64_t rt_n1 = rt::Stamp();
++    rt::Add(rt::kLauncherInputs, rt_n0, rt_n1);
+ 
+     outPtRefs.reserve(aten_outputs.size());
+     for (const auto& output : aten_outputs) {
+@@ -1711,6 +1717,8 @@ void RecipeLauncher::Launch(
+           outDevPtr.end());
+     }
+ 
++    const uint64_t rt_n2 = rt::Stamp();
++    rt::Add(rt::kLauncherOutputs, rt_n1, rt_n2);
+     auto& recipe_counter = device.get_active_recipe_counter();
+ 
+     std::unique_ptr<synapse_helpers::device_ptr_lock> address_lock;
+@@ -1743,6 +1751,8 @@ void RecipeLauncher::Launch(
+             ext_events,
+             stream_handle,
+             active_graph_key_);
++        rt_n3 = rt::Stamp();
++        rt::Add(rt::kSynLaunch, rt_n2, rt_n3);
+         habana_lazy::log_dev_mem_stats(
+             "Post-Launch", graph_name_, workspace_size_);
+       } else {
+@@ -1908,6 +1918,12 @@ void RecipeLauncher::Launch(
+   }
+ 
+   num_launches++;
++  rt::Add(rt::kLauncherPost, rt_n3, rt::Stamp());
++  rt::Count(
++      input_refs.size(),
++      intermediate_tensors_ptr ? intermediate_tensors_ptr->size() : 0,
++      aten_outputs.size(),
++      external_tensor_info_indexes.size());
+   PT_BRIDGE_END;
+ }
+ 
+diff --git a/backend/kernel/hpu_habana_launch_op_pt.cpp b/backend/kernel/hpu_habana_launch_op_pt.cpp
+index da7db3b..a13bb22 100644
+--- a/backend/kernel/hpu_habana_launch_op_pt.cpp
++++ b/backend/kernel/hpu_habana_launch_op_pt.cpp
+@@ -13,6 +13,7 @@
+  * See the License for the specific language governing permissions and
+  * limitations under the License.
+  */
++#include "backend/habana_device/hpugraph_replay_timing.h"
+ #include "backend/kernel/hpu_habana_launch_op_pt.h"
+ #include <ATen/native/Resize.h>
+ #include <ATen/record_function.h>
+@@ -4878,6 +4879,8 @@ void HabanaLaunchOpPT::update_syn_launch_info(
+ // call this function for recipe caching (graph/eager)
+ void HabanaLaunchOpPT::ExecuteSynapseCache() {
+   PT_BRIDGE_BEGIN;
++  namespace rt = habana::replay_timing;
++  const uint64_t rt_x0 = rt::Stamp();
+   if (habana_helpers::IsInferenceMode()) {
+     // Cache recipe hash computation - computed once instead of repeatedly
+     const auto recipe_hash = cur_rargpsh_->hashCode();
+@@ -4994,6 +4997,7 @@ void HabanaLaunchOpPT::ExecuteSynapseCache() {
+     }
+   }
+ 
++  rt::Add(rt::kSynCacheConst, rt_x0, rt::Stamp());
+   if (!dry_run_) {
+     recipe_launcher_->Launch(
+         hpu_stream_,
+@@ -5004,6 +5008,7 @@ void HabanaLaunchOpPT::ExecuteSynapseCache() {
+         external_tensor_info_indexes_,
+         dma_inputs_);
+   }
++  const uint64_t rt_x2 = rt::Stamp();
+ 
+   if (!jit_graph_and_meta_data_->get_is_pipeline_supported()) {
+     // Update the stack from the recipe itself
+@@ -5012,6 +5017,7 @@ void HabanaLaunchOpPT::ExecuteSynapseCache() {
+   PT_BRIDGE_DEBUG("Returning cached recipe : ", cur_rargpsh_->hashCode());
+ 
+   ClearStatics();
++  rt::Add(rt::kSynCacheTail, rt_x2, rt::Stamp());
+   PT_BRIDGE_END;
+ }
+ 
+@@ -5133,6 +5139,8 @@ void HabanaLaunchOpPT::run(
+     bool dry_run,
+     HabanaLaunchOpPipeline::PipelineCallBase& pipeline_execution) {
+   PT_BRIDGE_BEGIN_WITH_INDEX(debug_id_);
++  namespace rt = habana::replay_timing;
++  const uint64_t rt_r0 = rt::Stamp();
+   if (enable_shape_agnostic_caching_) {
+     HABANA_ASSERT(output_shapes.has_value());
+     out_shapes_ = std::move(*output_shapes);
+@@ -5196,6 +5204,8 @@ void HabanaLaunchOpPT::run(
+   //   DumpSymbolValueMap(in_symbol_value_map_);
+   // }
+   idx += 1;
++  const uint64_t rt_r1 = rt::Stamp();
++  rt::Add(rt::kRunPrep, rt_r0, rt_r1);
+   if (enable_caching_ || IS_BRIDGE_DEBUG_ENABLED) {
+     if (maybe_static_recipe_ &&
+         ((cached_rarg_psh == nullptr) ||
+@@ -5221,6 +5231,8 @@ void HabanaLaunchOpPT::run(
+     }
+   }
+ 
++  const uint64_t rt_r2 = rt::Stamp();
++  rt::Add(rt::kRunSpec, rt_r1, rt_r2);
+   // eager and graph recipe caching :: begin
+   if (enable_caching_ && maybe_static_recipe_) {
+     HABANA_ASSERT(
+@@ -5260,7 +5272,10 @@ void HabanaLaunchOpPT::run(
+       PT_IRGRAPH_DEBUG("HabanaOp recipe cache hit :: static shapes");
+       PT_TEST_DEBUG("HabanaOp recipe cache hit :: static path");
+ 
++      const uint64_t rt_r3 = rt::Stamp();
++      rt::Add(rt::kRunLookup, rt_r2, rt_r3);
+       UpdatePatchingInformation(rvs, !recipe_launcher_->recipe_);
++      rt::Add(rt::kRunPatching, rt_r3, rt::Stamp());
+ 
+       if (habana_helpers::GetRefineDynamicShapeStatus() || refine_ds_enabled_) {
+         CreateStaticCompilationDBI(graph_key_with_perm_);
+diff --git a/habana_lazy/hlexec.cpp b/habana_lazy/hlexec.cpp
+index 7c27c8f..165798c 100644
+--- a/habana_lazy/hlexec.cpp
++++ b/habana_lazy/hlexec.cpp
+@@ -12,6 +12,7 @@
+  * See the License for the specific language governing permissions and
+  * limitations under the License.
+  */
++#include "backend/habana_device/hpugraph_replay_timing.h"
+ #include <torch/csrc/jit/ir/irparser.h>
+ #include <torch/csrc/jit/passes/common_subexpression_elimination.h>
+ #include <torch/csrc/jit/passes/constant_pooling.h>
+@@ -135,6 +136,8 @@ void HlExec::Launch(
+     std::shared_ptr<habana::RecipeArgumentSpec> cached_rarg_psh,
+     bool dry_run) {
+   PT_LAZY_TRACE;
++  namespace rt = habana::replay_timing;
++  const uint64_t rt_l0 = rt::Stamp();
+   auto* context = get_device_lazy_execution_context();
+   // TODO : remove this env variable use
+   // This is temporarily done to deactivate code in synapse helpers for lazy
+@@ -177,7 +180,10 @@ void HlExec::Launch(
+   mp_g_and_meta_data_->set_graph_perm_hash(perm_hash_code);
+   mp_g_and_meta_data_->set_valid_graph_symint_perm_hash(true);
+ 
++  const uint64_t rt_l1 = rt::Stamp();
++  rt::Add(rt::kLaunchHashes, rt_l0, rt_l1);
+   auto launcher = CreateLauncher(mp_g_and_meta_data_, lazyInfo);
++  rt::Add(rt::kCreateLauncher, rt_l1, rt::Stamp());
+   try {
+     launcher->Run(stack, cached_rarg_psh, dry_run);
+   } catch (const std::exception& e) {
+diff --git a/habana_lazy/hpu_lazy_tensors.cpp b/habana_lazy/hpu_lazy_tensors.cpp
+index c61f067..9a74327 100644
+--- a/habana_lazy/hpu_lazy_tensors.cpp
++++ b/habana_lazy/hpu_lazy_tensors.cpp
+@@ -12,6 +12,7 @@
+  * See the License for the specific language governing permissions and
+  * limitations under the License.
+  */
++#include "backend/habana_device/hpugraph_replay_timing.h"
+ #include "hpu_lazy_tensors.h"
+ #include <torch/csrc/jit/ir/ir.h>
+ #include "backend/habana_device/HPUDevice.h"
+@@ -1515,6 +1516,8 @@ void HbLazyTensor::ExecuteCachedGraph(
+     uint64_t launch_jobid,
+     c10::hpu::HPUStream capture_stream [[maybe_unused]]) {
+   PT_LAZY_TRACE;
++  namespace rt = habana::replay_timing;
++  const uint64_t rt_e0 = rt::Stamp();
+   get_habana_lazy_executor().setExecutionMode(LazyExecutionMode::kLOWERING);
+   bool dynamic_env_ = habana_helpers::GetRefineDynamicShapeStatus();
+   habana_helpers::SetRefineDynamicShape(false);
+@@ -1568,7 +1571,9 @@ void HbLazyTensor::ExecuteCachedGraph(
+   hlexec.set_opstrs(opStrs);
+ 
+   // Launch the execution
++  rt::Add(rt::kExecSetup, rt_e0, rt::Stamp());
+   hlexec.Launch(stack, capture_stream, cached_rarg_psh, false);
++  const uint64_t rt_e2 = rt::Stamp();
+ 
+   HABANA_ASSERT(stack.size() == hblazy_tensors_out.size());
+   for (const auto& in : hblazy_tensors_in) {
+@@ -1597,6 +1602,7 @@ void HbLazyTensor::ExecuteCachedGraph(
+   habana_helpers::SetRefineDynamicShape(dynamic_env_);
+   get_habana_lazy_executor().setExecutionMode(LazyExecutionMode::kLAZY);
+   context->DelFromJobidStreamidMap(launch_jobid);
++  rt::Add(rt::kExecBind, rt_e2, rt::Stamp());
+ }
+ 
+ void HbLazyTensor::setTensorOriginalType(c10::ScalarType type) {
