@@ -8,11 +8,11 @@ limit (``1 + k = 6`` nodes). Every sized test first asks the platform's own star
 
 * a size the tests call served must start, or the test fails with the validator's message: a CPU proof
   of a size the server refuses would say nothing about the product;
-* ``PROVEN_NOT_SERVED`` are sizes proven here ahead of the validator. The platform still refuses
-  ``k = 5``: the CPU proof holds, but one 8-card server with 32 sequences of 131072 tokens has no room
-  for its recurrent state pool (``docs/design/flash-next/gdn-core-decode.md``, "Sizes above the recipe").
-  Their tests run all the same, and fail once the validator accepts the size, until it is removed from
-  that tuple: from then on the server counts as tested at that size.
+* ``PROVEN_NOT_SERVED`` are sizes proven here ahead of the validator (none since the validator accepts
+  ``k = 5``, 2026-11-20: at 32 sequences of 131072 tokens one 8-card server holds a little fewer full-length
+  sequences at k = 5, which lowers the engine's concurrency figure, not the server's start;
+  ``docs/design/flash-next/gdn-core-decode.md``, "Sizes above the recipe"). Tests of such a size run all the
+  same, and fail once the validator accepts the size, until it is removed from that tuple.
 
 The validator lives in ``vllm_gaudi.platform``, which imports ``habana_frameworks``; on a CPU-only
 machine that import needs the stand-ins of ``hpu_cpu_stubs``, and those must not leak into a process
@@ -31,7 +31,7 @@ from pathlib import Path
 
 RECIPE_K = 3
 SPEC_SIZES = (3, 4, 5)  # drafted tokens per step: the recipe and the sizes above it
-PROVEN_NOT_SERVED = (5, )  # of those, the sizes the platform's validator still refuses at startup
+PROVEN_NOT_SERVED = ()  # of those, the sizes the platform's validator still refuses at startup
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 

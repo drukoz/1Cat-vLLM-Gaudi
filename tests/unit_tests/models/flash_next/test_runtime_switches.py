@@ -36,6 +36,7 @@ def write(path, text: str) -> None:
 def test_switch_file_format():
     assert set(SWITCHABLE) == {"VLLM_HPU_FLASH_NEXT_DECODE_METADATA", "VLLM_HPU_FUSED_GREEDY_LOGITS",
                                "VLLM_HPU_CANDIDATE_SAMPLING", "VLLM_HPU_VOCAB_PARALLEL_LOGITS",
+                               "VLLM_HPU_MTP_DRAFT_GRAPH", "VLLM_HPU_MTP_DRAFT_CHAIN",
                                "VLLM_HPU_MOE_DENSE_MIN_TOKENS", "VLLM_HPU_MOE_DENSE_MAX_TOKENS"}
     assert set(GRAPH_SWITCHABLE) == {"VLLM_HPU_MOE_DENSE_MIN_TOKENS", "VLLM_HPU_MOE_DENSE_MAX_TOKENS"}
     assert parse_switches("VLLM_HPU_MOE_DENSE_MIN_TOKENS=1\nVLLM_HPU_MOE_DENSE_MAX_TOKENS=512\n") == {
@@ -86,21 +87,21 @@ def test_moe_dense_range_drops_the_captured_graphs(tmp_path, monkeypatch):
             dropped.append(self.name)
 
     path = tmp_path / "switches"
-    runner = types.SimpleNamespace(model=Graphed("model"), drafter=types.SimpleNamespace(model=Graphed("drafter")),
-                                   _runtime_switches=RuntimeSwitchFile(str(path)))
+    drafter = types.SimpleNamespace(model=Graphed("drafter"), _draft_graph=Graphed("draft loop"), _draft_chain=None)
+    runner = types.SimpleNamespace(model=Graphed("model"), drafter=drafter, _runtime_switches=RuntimeSwitchFile(str(path)))
     runner._drop_hpu_graphs = types.MethodType(HPUModelRunner._drop_hpu_graphs, runner)
     for name in GRAPH_SWITCHABLE + ("VLLM_HPU_FUSED_GREEDY_LOGITS", ):
         monkeypatch.setenv(name, "0")  # monkeypatch restores them after the test
     write(path, "VLLM_HPU_MOE_DENSE_MIN_TOKENS=1\nVLLM_HPU_MOE_DENSE_MAX_TOKENS=512\n")
     HPUModelRunner._poll_runtime_switches(runner)
-    assert dropped == ["model", "drafter"]
+    assert dropped == ["model", "drafter", "draft loop"]  # no chained draft was built
     assert os.environ["VLLM_HPU_MOE_DENSE_MIN_TOKENS"] == "1"
     assert os.environ["VLLM_HPU_MOE_DENSE_MAX_TOKENS"] == "512"
     HPUModelRunner._poll_runtime_switches(runner)  # the file did not change: nothing
-    assert dropped == ["model", "drafter"]
+    assert dropped == ["model", "drafter", "draft loop"]
     write(path, "VLLM_HPU_FUSED_GREEDY_LOGITS=1\n")
     HPUModelRunner._poll_runtime_switches(runner)  # a flag read outside the captured forward: the graphs stay
-    assert dropped == ["model", "drafter"]
+    assert dropped == ["model", "drafter", "draft loop"]
     assert os.environ["VLLM_HPU_FUSED_GREEDY_LOGITS"] == "1"
     runner.drafter, runner.model = None, object()  # no drafter, an eager model: nothing to drop
     assert HPUModelRunner._drop_hpu_graphs(runner) == []

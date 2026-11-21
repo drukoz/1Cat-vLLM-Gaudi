@@ -539,6 +539,13 @@ if TYPE_CHECKING:
     VLLM_HPU_GDN_CORE_DECODE: int = 1  # GdnCoreDecodeMode: 1 fused (default), 0 off, 2 recurrence
     VLLM_HPU_GDN_CORE_DECODE_DEBUG: int = 0  # GdnCoreDecodeDebug: 0 off, 1 check slot indices every step (host sync)
     VLLM_HPU_GDN_CORE_VERIFY: int = 0  # GdnCoreVerifyMode: 0 off (default), 1 fused verification steps
+    VLLM_HPU_SPEC_SAMPLED_VERIFY: int = 0  # 0 greedy requests only (default), 1 also sampled, 2 sampled over candidates
+    VLLM_HPU_MTP_DRAFT_LOOP: int = 0  # 0 draft positions read back from the device (default), 1 host books
+    VLLM_HPU_MTP_DRAFT_IDS: int = 0  # 0 draft ids by argmax, int64 narrowed in the graph (default), 1 int32 ids
+    VLLM_HPU_MTP_DRAFT_GRAPH: int = 0  # 0 one HPU graph per MTP draft pass (default), 1 the k passes in one graph
+    VLLM_HPU_MTP_DRAFT_CHAIN: int = 0  # 0 the MTP draft after the host read (default), 1 chained behind the verify
+    VLLM_HPU_MTP_TIMING: int = 0  # 0 off (default), 1 time the verification part and the draft of every step
+    VLLM_HPU_MTP_CHUNK_KV: int = 0  # 1 the MTP draft also runs over prefill chunks that complete no prompt
     VLLM_HPU_GDN_KERNEL_INTERLEAVE: int = 0  # 0 today's GDN decode/verify kernels, 1 four value rows per iteration
     VLLM_HPU_GDN_GLUE_CACHE: int = 0  # 0 per-step glue of the fused GDN ops (default), 1 constants and indices cached
     VLLM_HPU_PLE_HOST_NGRAM_IDS: int = 0  # 0 PLE n-gram ids computed in the graph (default), 1 on the host
@@ -1911,8 +1918,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # An operator's A/B on one server (v1/worker/runtime_switches.py). Unset (default): nothing. A path: every
     # worker looks at that file before each step and, when it changed, takes the flags it lists (NAME=VALUE lines).
     # Only flags the runner reads at every step can be switched: VLLM_HPU_FLASH_NEXT_DECODE_METADATA,
-    # VLLM_HPU_FUSED_GREEDY_LOGITS, VLLM_HPU_CANDIDATE_SAMPLING and VLLM_HPU_VOCAB_PARALLEL_LOGITS. Replace the
-    # file with a rename while no request runs.
+    # VLLM_HPU_FUSED_GREEDY_LOGITS, VLLM_HPU_CANDIDATE_SAMPLING, VLLM_HPU_VOCAB_PARALLEL_LOGITS,
+    # VLLM_HPU_MTP_DRAFT_GRAPH and VLLM_HPU_MTP_DRAFT_CHAIN. Replace the file with a rename while no request runs.
     "VLLM_HPU_RUNTIME_SWITCH_FILE":
     lambda: os.environ.get("VLLM_HPU_RUNTIME_SWITCH_FILE", "").strip(),
 
@@ -2008,6 +2015,63 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # docs/design/flash-next/gdn-core-decode.md, "Phase 2 contract, version 2".
     "VLLM_HPU_GDN_CORE_VERIFY":
     lambda: int(os.environ.get("VLLM_HPU_GDN_CORE_VERIFY", "0")),
+
+    # Speculative decoding (Flash-Next MTP) with sampled requests (temperature > 0). 0 (default) = a Flash-Next
+    # MTP server refuses a sampled request with an error naming this flag (the HPU rejection sampler verified
+    # greedy requests only, and a sampled one stopped the worker). 1 = the drafts of sampled requests are verified
+    # by speculative sampling in torch, exact in distribution (hpu_rejection_sampler.sampled_rejection_sample).
+    # 2 = the same over the 64 largest logits of every row (hpu_candidate_verify.py: no pass over the vocabulary
+    # beyond one top-k) for a step whose requests all have top_k 1..64, no seed and no logprobs; other steps as 1.
+    "VLLM_HPU_SPEC_SAMPLED_VERIFY":
+    lambda: int(os.environ.get("VLLM_HPU_SPEC_SAMPLED_VERIFY", "0")),
+
+    # The Flash-Next MTP draft loop (idea-sweep I02). 0 (default) = the base positions of the draft steps 1..k-1
+    # are read back from the device after draft step 0 (a host sync in the middle of the draft). 1 = the runner
+    # gives them from its host books (num_tokens_no_spec - 2 per request), so the host builds the next step's
+    # metadata while the device runs draft step 0.
+    "VLLM_HPU_MTP_DRAFT_LOOP":
+    lambda: int(os.environ.get("VLLM_HPU_MTP_DRAFT_LOOP", "0")),
+
+    # The Flash-Next MTP draft's token ids. 0 (default) = ``logits.argmax`` (int64 ids), narrowed with ``.int()`` in
+    # the same lazy graph before they feed the next draft pass. 1 = int32 ids from an fp32 id table (the first index
+    # of the row maximum): no int64 id is made on the device. Card rule 9 (job 00038): ``torch.topk`` ids narrowed
+    # to int32 in the same lazy graph came back as every second id of the true table; whether ``argmax`` ids do the
+    # same is not measured yet (with it, draft positions 2 to k of every row but the first would be wrong).
+    "VLLM_HPU_MTP_DRAFT_IDS":
+    lambda: int(os.environ.get("VLLM_HPU_MTP_DRAFT_IDS", "0")),
+
+    # The Flash-Next MTP draft passes of a decode step. 0 (default) = each pass is its own HPU-graph replay, the LM
+    # head and the arg max run lazily between the replays and the host builds each later pass's attention metadata
+    # between them. 1 = the metadata of every later pass is built first (the host knows their positions: use it with
+    # VLLM_HPU_MTP_DRAFT_LOOP=1, which takes them from the runner's books), then one HPU graph runs pass 0, the LM
+    # head, the arg max and the passes 1 .. k-1 (spec_decode/flash_next_mtp_steps.py MtpDraftLoop): one replay per
+    # decode draft. Prefill drafts and the draft-rank log (VLLM_FLASH_NEXT_DRAFT_RANK_LOG=1) keep the per-pass path.
+    "VLLM_HPU_MTP_DRAFT_GRAPH":
+    lambda: int(os.environ.get("VLLM_HPU_MTP_DRAFT_GRAPH", "0")),
+
+    # The Flash-Next MTP draft chained behind the verification. 0 (default) = the runner reads the verification's
+    # result on the host (parse_output), then builds the draft's inputs and issues it. 1 = right after the rejection
+    # sampler, before any host read, the drafter computes on the device each request's committed rows, the draft's
+    # inputs and its later passes' block tables and slots, and issues the draft (MtpDraftChain, one HPU graph; its
+    # device outputs stay in HPUModelRunner._mtp_chain_out for async scheduling's mode 3). Needs
+    # VLLM_HPU_MTP_DRAFT_GRAPH=1 and the sparse decode metadata (VLLM_HPU_FLASH_NEXT_DECODE_METADATA=1); a step with
+    # a prefill, a sampled request (greedy only so far), structured output or the draft-rank log keeps today's path.
+    "VLLM_HPU_MTP_DRAFT_CHAIN":
+    lambda: int(os.environ.get("VLLM_HPU_MTP_DRAFT_CHAIN", "0")),
+
+    # What a speculative step is made of. 1 = the runner times every step of a speculative server: the verification
+    # part (to the drafter call) and the draft, with the proposer's laps per draft pass and one device wait after
+    # the draft (vllm_gaudi/v1/spec_decode/mtp_step_timer.py): a log line and a JSON line per 25 steps of a row
+    # count (mtp_step_timing_r<rank>_<pid>.jsonl in the working directory). 0 (default) = no timer exists.
+    "VLLM_HPU_MTP_TIMING":
+    lambda: int(os.environ.get("VLLM_HPU_MTP_TIMING", "0")),
+
+    # The Flash-Next MTP draft over chunked prompts. 0 (default) = the draft runs only over the prefill chunk that
+    # completes a prompt, so its attention layer holds no KV for the earlier chunks of a prompt above the chunk
+    # threshold. 1 = it also runs over every chunk that completes no prompt (one draft forward per chunk, nothing
+    # sampled), so its KV covers the whole prompt.
+    "VLLM_HPU_MTP_CHUNK_KV":
+    lambda: int(os.environ.get("VLLM_HPU_MTP_CHUNK_KV", "0")),
 
     # Flash-Next PLE n-gram ids. 0 (default) = every forward computes them on the device (token
     # packing, searchsorted, the EOS shift scan, the int32 limb hash). 1 = the runner computes the
