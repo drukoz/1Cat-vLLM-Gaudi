@@ -7901,9 +7901,10 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                             # the host reads anything (the books below read the result as before)
                             self._mtp_chain_issue(sampled_token_ids, decode_data, non_flattened_hidden_states,
                                                   aux_hidden_states, num_decodes)
-                            if self._spec_early is not None:
-                                early_output = self._issue_early_output(num_decodes, num_prefills, warmup_mode,
-                                                                        sampling_metadata)
+                        if self._mtp_chain_step and self._mtp_chain_out is not None and self._spec_early is not None:
+                            # =3: the chained step (stage A here, or stage B's chain inside the verification graph)
+                            early_output = self._issue_early_output(num_decodes, num_prefills, warmup_mode,
+                                                                    sampling_metadata)
                         if early_output is None:
                             if self._spec_early is not None and self._spec_early.pending:
                                 self._settle_spec_books(block=True)  # the books of earlier steps before this read
