@@ -10,7 +10,7 @@ repository is under `/Volumes/Storage/Claude/gaudi-work/reports/spec-lookup/` (`
 
 ## Handoff (if this agent stops)
 
-State at **2026-11-21 01:15 UTC** (fourth agent, Opus 5.5). Branch head: the commit that holds this text, pushed.
+State at **2026-11-21 02:55 UTC** (fourth agent, Opus 5.5). Branch head: the commit that holds this text, pushed.
 It contains the program head `5c1e8219` (PR #15 kernel-fixes, merged as `f4dad13a`), mtp-card-ready through
 `f1aa2292` and every commit of this track. **The node was extended (BRIEF 00:50 UTC): it ends about 00:00 UTC on
 2026-11-22**; everything on it is lost then. Merges are allowed again (one gate at a time).
@@ -44,6 +44,20 @@ MTP alone); the mix round's halves (`by_kind` in probe.json: edit and prose stre
 streams = (ngram5 edit:32 ms per step - nospec edit:32 ms per step) / 160 and at 1 stream / 5; and whether the
 repeat round (the last edit:1, a second request on prompt 100 past the 512-token block) ran and equals the first
 edit:1 stream token for token (TEXT lines; at TP8 a difference points at the commit path, coordinator 00:57 UTC).
+
+**Defect fixed at 02:50 UTC (coordinator's request, found by async-sched): a one-token request padded by the
+scheduler.** vLLM's scheduler pads a waiting request with exactly one token left to compute to `1 + k` tokens
+with `k` draft placeholders (-1) when speculation is on and other requests run in the step (or the request has
+computed tokens): "pad new decode requests to uniform spec decoding size to preserve full cudagraph". The HPU
+runner took it on the prompt path, computed the placeholders as tokens (the recurrent state ran over them) and
+sampled every row: three garbage tokens after the first, accepted. Fix `005e1ff9`
+(`vllm_gaudi/v1/worker/spec_padding.py`, four lines in `_prepare_inputs`): the prompt path computes only a
+request's real tokens; the scheduler rejects the placeholders. VERIFIED: `test_lookup_engine.py::
+test_one_token_prompt_joining_a_verifying_batch` failed in all three configurations (n-gram with prefix caching
+off and on, MTP k = 3 with prefix caching on) and passes; async-sched's staggered schedule with the 1-token
+prompt passes with the same change on their branch. Serving triggers: a 1-token prompt beside running requests,
+a prompt whose cached prefix leaves exactly one token, a resumed request with one token left. Cherry-pickable
+alone (the engine test needs this branch's harness).
 
 **The gate.** The third agent's waiting gate was stopped at 23:41 UTC (BRIEF 23:21, since withdrawn by the 00:50
 entry). Run `bin/gate <worktree> --tools` when the merge is due (step 2 below); it waits for the lock.
@@ -128,6 +142,7 @@ Not yet rerun on the merged head: the CPU engine tests (`test_lookup_engine.py` 
 | `2dd6bc75` | sampled verification: a lookup padding draft (-1) is never accepted (mtp-card-ready's function) |
 | `e6d8b4d6` | the sampled-request engine test of both lookup paths (needs mtp-card-ready's `0d1be6fc`) |
 | `be141e1a` | `VLLM_HPU_FLASH_NEXT_NGRAM_PLAIN_STEPS`: plain decode steps when no request drafts |
+| `005e1ff9` | the prompt path never computes the scheduler's draft placeholders of a padded one-token request (all speculative methods) |
 
 ## 2. n-gram lookup with prefix caching
 
