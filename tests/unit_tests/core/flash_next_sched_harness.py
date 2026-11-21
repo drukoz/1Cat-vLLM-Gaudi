@@ -51,7 +51,9 @@ from vllm.v1.request import Request  # noqa: E402
 from vllm.v1.structured_output import StructuredOutputManager  # noqa: E402
 
 from tests.unit_tests.startup import test_kv_cache_sizing as sizing  # noqa: E402
-from vllm_gaudi.v1.core.recurrent_pool_coordinator import HpuRecurrentPoolCoordinator  # noqa: E402
+import vllm.v1.core.kv_cache_manager as kv_cache_manager_module  # noqa: E402
+
+from vllm_gaudi.v1.core.recurrent_pool_coordinator import ENV_BOUNDARY_COMMITS, HpuRecurrentPoolCoordinator  # noqa: E402
 from vllm_gaudi.v1.core.recurrent_state_pool import ENV_MODE, ENV_SLOTS  # noqa: E402
 from vllm_gaudi.v1.worker.hpu_model_runner import compute_prefix_caching_block_indices  # noqa: E402
 
@@ -85,6 +87,14 @@ class Settings:
     max_num_seqs: int | None = None  # None: the layout's (32 at TP8, 16 at TP4)
     pool_slots: int | None = None  # None: what the platform hook resolved for the layout
     num_attention_blocks: int | None = None  # None: what the server start computed
+    # Speculative decoding as the KV-cache manager sees it (the stand-in runner still decodes one token a step, so
+    # every block boundary a decode step completes holds its exact state, as the HPU runner's boundary commit
+    # makes it under speculation): ``speculative_blocks`` on the recurrent groups' specs, ``eagle_drop`` the
+    # EAGLE / MTP rule that drops the last matched block of a hit, ``boundary_commits`` what the platform hook
+    # writes to VLLM_HPU_RECURRENT_BOUNDARY_COMMITS (None: nothing).
+    speculative_blocks: int = 0
+    eagle_drop: bool = False
+    boundary_commits: bool | None = None
 
 
 # -- token helpers -------------------------------------------------------------------------------------------
@@ -169,6 +179,12 @@ class Sim:
                                               prefix_cache_retention_interval=settings.retention_interval)
         if settings.num_attention_blocks is not None:
             kv_cache_config = dataclasses.replace(kv_cache_config, num_blocks=settings.num_attention_blocks)
+        if settings.speculative_blocks:
+            kv_cache_config = dataclasses.replace(kv_cache_config, kv_cache_groups=[
+                dataclasses.replace(group, kv_cache_spec=dataclasses.replace(
+                    group.kv_cache_spec, num_speculative_blocks=settings.speculative_blocks))
+                if isinstance(group.kv_cache_spec, MambaSpec) else group for group in kv_cache_config.kv_cache_groups
+            ])
         vllm_config.cache_config.prefix_cache_retention_interval = settings.retention_interval
         vllm_config.cache_config.num_gpu_blocks = kv_cache_config.num_blocks  # EngineCore._initialize_kv_caches
         self.vllm_config = vllm_config
@@ -177,9 +193,16 @@ class Sim:
 
         # EngineCore.__init__
         self.block_size, self.hash_block_size = resolve_kv_cache_block_sizes(kv_cache_config, vllm_config)
-        saved = {name: os.environ.get(name) for name in (ENV_MODE, ENV_SLOTS)}
+        saved = {name: os.environ.get(name) for name in (ENV_MODE, ENV_SLOTS, ENV_BOUNDARY_COMMITS)}
         os.environ[ENV_MODE] = "1"
         os.environ[ENV_SLOTS] = str(self.pool_slots)
+        if settings.boundary_commits is None:
+            os.environ.pop(ENV_BOUNDARY_COMMITS, None)
+        else:
+            os.environ[ENV_BOUNDARY_COMMITS] = "1" if settings.boundary_commits else "0"
+        factory = kv_cache_manager_module.get_kv_cache_coordinator
+        if settings.eagle_drop:
+            kv_cache_manager_module.get_kv_cache_coordinator = lambda **kwargs: factory(**{**kwargs, "use_eagle": True})
         try:
             self.scheduler = Scheduler(vllm_config=vllm_config,
                                        kv_cache_config=kv_cache_config,
@@ -189,6 +212,7 @@ class Sim:
                                        block_size=self.block_size,
                                        hash_block_size=self.hash_block_size)
         finally:
+            kv_cache_manager_module.get_kv_cache_coordinator = factory
             for name, value in saved.items():
                 if value is None:
                     os.environ.pop(name, None)

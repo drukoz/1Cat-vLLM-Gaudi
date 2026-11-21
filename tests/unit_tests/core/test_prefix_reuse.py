@@ -294,22 +294,87 @@ def test_both_keep_flags_together_on_a_block_aligned_prompt(monkeypatch):
     assert short.violations == [] and long.violations == []
 
 
-def test_keeping_the_decode_end_is_refused_for_a_group_with_speculative_blocks():
-    """Under speculative decoding a step of 1 + k tokens that straddles a block boundary keeps its running state
-    in the block of its last scheduled token: the earlier block's slot is then not the state at the boundary."""
+def test_keeping_the_decode_end_for_speculative_blocks_needs_the_runner_s_boundary_commit():
+    """Upstream, a step of 1 + k tokens that straddles a block boundary keeps its running state in the block of its
+    last scheduled token, so the earlier block's slot is not the state at the boundary. The HPU runner commits that
+    state into the completed block (``_commit_recurrent_boundaries``) whenever ``recurrent_spec_enabled`` with prefix
+    caching, which the platform hook records (VLLM_HPU_RECURRENT_BOUNDARY_COMMITS): a speculative group is kept
+    only then, and is left as it is when the runner does not commit or nothing was recorded."""
     from types import SimpleNamespace
 
-    from vllm_gaudi.v1.core.recurrent_pool_coordinator import keep_last_decode_boundary
+    from vllm_gaudi.v1.core.recurrent_pool_coordinator import boundary_commits_known, keep_last_decode_boundary
     from vllm_gaudi.v1.worker.recurrent_lattice import align_running_block
 
     def untouched(*_args, **_kwargs):
         raise AssertionError("not called")
 
-    manager = SimpleNamespace(kv_cache_spec=SimpleNamespace(num_speculative_blocks=3), cache_blocks=untouched,
-                              reachable_block_mask=untouched, pop_blocks_for_free=untouched)
-    assert keep_last_decode_boundary(manager) is False
-    assert manager.cache_blocks is untouched and manager.reachable_block_mask is untouched
-    # the reason, in the lattice's own terms: 4 tokens scheduled 2 before a boundary run in the NEXT block
+    def manager(speculative_blocks: int) -> SimpleNamespace:
+        return SimpleNamespace(kv_cache_spec=SimpleNamespace(num_speculative_blocks=speculative_blocks),
+                               cache_blocks=untouched, reachable_block_mask=untouched,
+                               pop_blocks_for_free=untouched)
+
+    for commits in (None, False):
+        refused = manager(3)
+        assert keep_last_decode_boundary(refused, commits) is False
+        assert refused.cache_blocks is untouched and refused.reachable_block_mask is untouched
+    kept = manager(3)
+    assert keep_last_decode_boundary(kept, True) is True and kept.cache_blocks is not untouched
+    plain = manager(0)  # no speculative blocks: kept whatever the runner does
+    assert keep_last_decode_boundary(plain, None) is True
+    # the platform hook's record
+    assert boundary_commits_known({}) is None and boundary_commits_known({"VLLM_HPU_RECURRENT_BOUNDARY_COMMITS": "0"})\
+        is False and boundary_commits_known({"VLLM_HPU_RECURRENT_BOUNDARY_COMMITS": "1"}) is True
+    # the upstream reason, in the lattice's own terms: 4 tokens scheduled 2 before a boundary run in the NEXT block
     assert align_running_block(context_len=510, num_scheduled=4, block_size=BLOCK) == 1
     assert align_running_block(context_len=510, num_scheduled=1, block_size=BLOCK) == 0
     assert align_running_block(context_len=511, num_scheduled=1, block_size=BLOCK) == 0  # ends ON the boundary
+
+
+def test_the_platform_hook_records_the_runner_s_boundary_commit(monkeypatch):
+    from types import SimpleNamespace
+
+    from vllm_gaudi.platform import _configure_recurrent_state
+    from vllm_gaudi.v1.core.recurrent_pool_coordinator import ENV_BOUNDARY_COMMITS
+
+    start = h.server_start(8)
+    monkeypatch.setenv("VLLM_HPU_RECURRENT_STATE_POOL", "1")
+    monkeypatch.setenv("VLLM_HPU_RECURRENT_STATE_POOL_SLOTS", str(start.pool_slots))
+    for speculative, want in ((None, "0"), (SimpleNamespace(num_speculative_tokens=3), "1"),
+                              (SimpleNamespace(num_speculative_tokens=0), "0")):
+        monkeypatch.delenv(ENV_BOUNDARY_COMMITS, raising=False)
+        config = SimpleNamespace(**{name: getattr(start.vllm_config, name)
+                                    for name in ("model_config", "parallel_config", "cache_config",
+                                                 "scheduler_config")}, speculative_config=speculative)
+        _configure_recurrent_state(config)
+        assert __import__("os").environ.get(ENV_BOUNDARY_COMMITS) == want, speculative
+
+
+ENV_SPLIT = "VLLM_HPU_PREFIX_ALIGN_SPLIT"
+CARD_ENGINE_BLOCK = 128  # cache_config.block_size of the engine-core process on the card (test_prefix_split_alignment)
+
+
+def _speculative_next_turn(monkeypatch, commits: bool | None, keep_decode_end: bool = True) -> tuple[int, list, h.Sim]:
+    monkeypatch.setenv(ENV_SPLIT, "1")
+    if keep_decode_end:
+        monkeypatch.setenv(ENV_KEEP_DECODE, "1")
+    else:
+        monkeypatch.delenv(ENV_KEEP_DECODE, raising=False)
+    sim = h.Sim(h.Settings(speculative_blocks=3, eagle_drop=True, boundary_commits=commits))
+    sim.scheduler.cache_config.block_size = CARD_ENGINE_BLOCK
+    prompts = _turns(sim, h.agent_prompt(0, 24_000), turns=2, generate=1100)
+    return sim.admissions["t2"].cached_tokens, prompts, sim
+
+
+def test_keeping_the_decode_end_with_speculative_blocks_hits_one_block_before_the_last_decode_boundary(monkeypatch):
+    """MTP's next turn: turn 1 decodes 1,100 tokens across two block boundaries (24,576 and 25,088). With the
+    runner's boundary commit the last two decode boundaries are kept, and the EAGLE / MTP drop of the last matched
+    block lands the hit on the earlier one. Without the commit nothing of the decode is kept (the same hit as with
+    the flag off)."""
+    cached, prompts, sim = _speculative_next_turn(monkeypatch, commits=True)
+    last = (len(prompts[0]) + 1100 - 1) // BLOCK * BLOCK
+    assert last == 25_088 and cached == last - BLOCK == 24_576
+    assert sim.violations == []
+    off, _, off_sim = _speculative_next_turn(monkeypatch, commits=False)
+    flag_off, _, flag_off_sim = _speculative_next_turn(monkeypatch, commits=None, keep_decode_end=False)
+    assert off == flag_off < len(prompts[0])  # the hit stays inside the first prompt: nothing of its output
+    assert off_sim.violations == [] and flag_off_sim.violations == []
