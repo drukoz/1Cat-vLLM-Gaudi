@@ -9,7 +9,7 @@ Labels: MEASURED (card, with its file), VERIFIED (CPU test or code line), INFERR
 
 ## Handoff (if this agent stops)
 
-**Build 5 (fifth agent of the track, Opus 5.5, started 08:04 UTC on 2026-11-21; updated 08:40 UTC).**
+**Build 5 (fifth agent of the track, Opus 5.5, started 08:04 UTC on 2026-11-21; updated 08:47 UTC).**
 
 - **Tree.** Base = build 4 (`8cdc5999`) with the program head `adbcff30` (PRs #18 to #22) merged in, so the tree is the
   program head plus what build 4 carried that the head lacks (qsa-fused's branch, mtp-card-ready + the per-step record,
@@ -33,7 +33,14 @@ Labels: MEASURED (card, with its file), VERIFIED (CPU test or code line), INFERR
   server with pin mode 3) and `.../switches/ss0` ("on" = the stage-submission arms run and the inline arm does not).
   Dry runs against a fake server on the Mac: `scratchpad/integration/dry-*` (all arms, post steps, the dense stop,
   the switches).
-- **The job (planned):** `real8-build5`, all cards, hold 110 min, after 00202 / 00203 (coordinator, about 11:30 UTC).
+- **The job: 00218 `real8-build5`** (queued 08:44 UTC; commit `385cf2b7` = the kit `716ff094` + kv_logprob_probe's
+  PASSNOISE, the teacher-logprob |delta| of its two passes on one server = the noise floor of the FP8 comparison; image
+  `farm-integration:385cf2b7a8ac`), all cards, hold 110 min, placed after 00202 / 00203 (coordinator, about 11:30 UTC).
+  The pin and ss0 switch files are the coordinator's to set before the start. Submitted by
+  `reports/integration/late/submit_b5.sh` (log `reports/integration/card/submit-real8-build5.log`; it copies the results
+  when the job ends while it still runs). Read: `python3 -I reports/integration/b5/b5_compare.py
+  reports/integration/card/00218-real8-build5` (the table against 00186 and 00205), the TEXT lines, the REQUIRE-LOG
+  lines, PASSNOISE next to COMPARE in the FP8 arm's kvlp_fp8.log, and the job's end line (kernel lines, node load).
   Arms: `tiny mtp2-async-sw-cap-kvlp mtp2-async-spin mtp3-async mtp2-kvlpfb ifnot-ss0:mtp2-async-inline-greedy
   if-ss0:mtp2-async-ss0-greedy if-ss0:mtp2-async-irlog-lv1-greedy mtp2-async-fp8kv-hpulog-32-greedy-dg32-kvlp-long`.
   Late-bound: `reports/integration/late/make_run5.sh` (run5.sh; `--pin on|off`). Results:
