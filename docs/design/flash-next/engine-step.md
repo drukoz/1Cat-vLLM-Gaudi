@@ -11,9 +11,9 @@ This track's harness refuses report files outside the repository, so the handoff
 
 ## Handoff (if this agent stops)
 
-Last update: **2026-11-21 03:07 UTC** (fourth agent, Opus 5.5; the node was extended to about 00:00 UTC on
-2026-11-22). Branch `feat/flash-next-gaudi-engine-step`, head `fe4cac24` (the program head with PR 16 merged in; code of
-this track up to `01d66e31`), pushed. A second branch of this track,
+Last update: **2026-11-21 04:46 UTC** (fourth agent, Opus 5.5; the node was extended to about 00:00 UTC on
+2026-11-22). Branch `feat/flash-next-gaudi-engine-step`, head after `bcef8aa5` (merged into the program branch as PR #20;
+code of this track up to `01d66e31`), pushed. A second branch of this track,
 **`feat/flash-next-gaudi-engine-step-mtp-record`** (`2b90707f`, worktree `reports/engine-step/trees/mtp-record`):
 mtp-card-ready's head `7c4d65e3` plus `VLLM_HPU_MTP_TIMING=2` (one record per speculative step, section 14), for
 integration build 4 in place of mtp-card-ready's branch (the timer exists only there). Scratch files, probes and
@@ -36,17 +36,12 @@ question answered on the CPU (section 14).
 
 ### If you take over, in this order
 
-1. The gate. The program head moved (PR 16 qsa-dataflow); it is merged in at **`fe4cac24`** (conflicts in
-   `envs.py`, `env_variables.md` and the decode block table, resolved keeping both sides: the sparse decode
-   metadata's table takes PR 16's `VLLM_HPU_QSA_TABLE_WIDTH` width too; test at `ba1441b7`). **Gate of
-   `ba1441b7`**: snapshot `reports/engine-step/merge-wt2`, log `reports/engine-step/logs/gate_ba1441b7.log`
-   (wrapper pid 19401, no `--tools`), started 03:07 UTC (the first try died in the /Volumes/Storage outage of 03:01
-   to 03:05). The gate of `01d66e31` (`--tools`) ended with every flash_next file green and 4 red rental tool
-   files (environment: "not a git repository", container signals, the outage; kernel-fixes' gate fails the same).
-   Owner's rule (03:07): merge the PR as soon as its gate is green (everything in it is default-off or
-   card-proven); PR text in the scratchpad `pr_engine_step.md` of this session (summary below). When green: from
-   `wt/engine-step`, merge `origin/feat/flash-next-gaudi` again if it moved, push, `gh pr create --base
-   feat/flash-next-gaudi`, `gh pr merge --merge`; tell the coordinator the number.
+1. **Done: PR #20 merged** into `feat/flash-next-gaudi` at 04:46 UTC (merge commit `2e9f9196`): this branch up to
+   `bcef8aa5` (program head with PR 16 and PR 19 merged in). Gate of `ba1441b7`: 69 files, 0 red (one file failed
+   only in the parallel pass, `test_gdn_core_decode_batch.py`, green alone). Owner's rule (03:07 UTC): merge your
+   own PR as soon as its gate is green and the change is card-proven or default-off, then tell the coordinator the
+   number. Next PR: gate the branch (`bin/gate <snapshot>`, no `--tools`: the rental tool tests fail on this Mac for
+   every track), merge the program head first.
 2. Read 00164, 00166 and 00169 when they land (table below); section 9 and the coordinator.
 3. Build 4 runs the `mtp-record` branch with `VLLM_HPU_MTP_TIMING=2`: read `mtp_step_record_r*.jsonl` (verify ms of
    the steps whose `prev_committed` is `{"1": n}` against the others).
