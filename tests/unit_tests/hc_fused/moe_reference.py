@@ -133,6 +133,10 @@ def moe_route_reference(gates: torch.Tensor, experts: int, top_k: int) -> tuple[
     path's, as int32: the caller widens them for the vendor op.  Which expert wins among equal
     probabilities at the cut is whatever ``torch.topk`` does here; ``moe_case.compare`` accepts
     every valid choice and pins the kernel's own rule (the lowest expert id).
+
+    A CPU oracle.  Do not issue it on a card: there the ``.to(torch.int32)`` below, in the lazy graph that
+    holds the top-k, returns every second id of the table (card probe ``probe_moe_route.py``, 2026-11-20).  On a
+    card read the int64 ids of ``moe_route_torch`` and narrow them on the host (``test_moe_hpu_op.py``).
     """
     ids, weights = moe_route_torch(gates, gates[:, :experts], _TopK(top_k))
     return ids.to(torch.int32), weights
@@ -165,9 +169,13 @@ def moe_row_quant_cpu_reference(x: torch.Tensor,
     return moe_row_quant_torch(x, fp8_max, cast)
 
 
-def moe_silu_mul_reference(gate_up: torch.Tensor) -> torch.Tensor:
-    """``moe_silu_mul``: ``[T, 2 * D] -> [T, D]``."""
-    return moe_silu_mul_torch(gate_up)
+def moe_silu_mul_reference(gate_up: torch.Tensor, first_column: int = 0) -> torch.Tensor:
+    """``moe_silu_mul``: ``[T, first_column + 2 * D] -> [T, D]``, the torch code on the columns from ``first_column``.
+
+    ``first_column`` is 0 for the gate_up GEMM output; with that GEMM merged into the gate GEMM it is the
+    first column after the router logits and the shared-gate logit.
+    """
+    return moe_silu_mul_torch(gate_up[..., first_column:])
 
 
 def moe_combine_reference(shared: torch.Tensor, gates: torch.Tensor, routed: torch.Tensor,

@@ -285,6 +285,97 @@ def test_op_count_of_one_decode_step_call(world1, vllm_ctx, flag_on):
     assert fused == {"hc_combine": 1} and total == 1 + 3 and gemm == 0  # the op and its three input copies
 
 
+def test_copy_mode_flag_default_value_and_documentation(monkeypatch):
+    from vllm_gaudi import envs as gaudi_envs
+
+    flag = "VLLM_HPU_HC_FUSED_COPY_MODE"
+    monkeypatch.delenv(flag, raising=False)
+    assert gaudi_envs.VLLM_HPU_HC_FUSED_COPY_MODE == 0
+    monkeypatch.setenv(flag, "2")
+    assert gaudi_envs.VLLM_HPU_HC_FUSED_COPY_MODE == 2
+    assert f"    {flag}: int = 0" in Path(gaudi_envs.__file__).read_text()
+    assert f"`{flag}`" in (REPO_ROOT / "docs" / "configuration" / "env_variables.md").read_text()
+    assert hc_fused.COPY_MODES == (0, 1, 2)
+
+
+@pytest.mark.parametrize("mode,copies,combine_copies,norm_copies", [("1", 3, 3, 1), ("2", 1, 1, 0), ("7", 6, 3, 1)])
+def test_copy_mode_leaves_out_copies_and_changes_no_bit(world1, vllm_ctx, flag_on, monkeypatch, warnings, mode, copies,
+                                                        combine_copies, norm_copies):
+    """VLLM_HPU_HC_FUSED_COPY_MODE in a chain, as the model's layers call it: the residual and the injection of the
+    second call are the first call's outputs. 1 copies what the layer is handed (residual, block output,
+    injection); 2 only the block output, because the other two are a fused op's own outputs; another value is 0.
+    The ops and their results are those of mode 0."""
+    base = _module(*REAL)
+    hidden, block, injection = _inputs(base, 32)
+    block2 = _inputs(base, 32)[1].flip(0).contiguous()
+    (want_residual, _, want_injection), _, _, _ = _run(lambda: base.combine_and_mix(hidden, block, injection))
+    want_cm, _, _, _ = _run(lambda: base.combine_and_mix(want_residual, block2, want_injection))
+    want_combine, _, _, _ = _run(lambda: base.combine(want_residual, block2, want_injection))
+    want_mix, _, _, _ = _run(lambda: base.mix(want_residual))
+
+    monkeypatch.setenv("VLLM_HPU_HC_FUSED_COPY_MODE", mode)
+    module = _module(*REAL)
+    first = _run(lambda: module.combine_and_mix(hidden, block, injection))
+    (residual, _, chained_injection), fused, total, gemm = first
+    # the first call of a chain is handed three tensors no fused op made: all three are copied in modes 1 and 2
+    assert sum(fused.values()) == 3 and total - gemm == 3 + (6 if mode == "7" else 3)
+    assert _same(residual, want_residual) and _same(chained_injection, want_injection)
+    got, fused, total, gemm = _run(lambda: module.combine_and_mix(residual, block2, chained_injection))
+    assert fused == {"hc_combine_norm": 1, "hc_silu_split": 1, "hc_gate_mix": 1} and total - gemm == 3 + copies
+    assert _same_tuple(got, want_cm)
+    got, fused, total, gemm = _run(lambda: module.combine(residual, block2, chained_injection))
+    assert fused == {"hc_combine": 1} and total == 1 + combine_copies and _same(got, want_combine)
+    got, fused, total, gemm = _run(lambda: module.mix(residual))
+    assert fused == {"hc_norm": 1, "hc_silu_split": 1, "hc_gate_mix": 1}
+    assert total - gemm == 3 + norm_copies + (3 if mode == "7" else 0) and _same_tuple(got, want_mix)
+    assert warnings == []
+
+
+class _ViewWatch(TorchDispatchMode):
+    """The (op, argument index) of every tensor argument of a fused op that is a view or not contiguous."""
+
+    def __init__(self):
+        super().__init__()
+        self.views = []
+
+    def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+        name = func._schema.name
+        if name.startswith(FUSED_PREFIX):
+            self.views += [(name[len(FUSED_PREFIX):], index) for index, arg in enumerate(args)
+                           if isinstance(arg, torch.Tensor) and (arg._is_view() or not arg.is_contiguous())]
+        return func(*args, **(kwargs or {}))
+
+
+@pytest.mark.parametrize("mode", ["0", "1", "2"])
+def test_no_copy_mode_hands_a_fused_op_a_view(world1, vllm_ctx, flag_on, monkeypatch, warnings, mode):
+    """Contiguous views a caller can hand in, in every copy mode: a view of the chained residual (the MTP draft
+    layer's ``flatten``), a view of the chained injection, a block output that is a reshape. Mode 2 skips a copy
+    only for the very tensor a fused op returned, so each of these is copied. (A view that is not contiguous,
+    like the ``split`` a layer on the torch path returns as its injection, never reaches a fused op: the layer's
+    own check sends that call to the torch path, ``test_injection_that_is_a_view_of_the_torch_path``.)"""
+    monkeypatch.setenv("VLLM_HPU_HC_FUSED_COPY_MODE", mode)
+    module = _module(*REAL)
+    hidden, block, injection = _inputs(module, 8)
+    tokens = hidden.shape[0]
+    with torch.no_grad():
+        residual, _, chained_injection = module.combine_and_mix(hidden, block, injection)
+        want = module.combine_and_mix(residual, block, chained_injection)
+        cases = {
+            "residual view": (residual.view(tokens, module.hc_count, -1).flatten(-2), block, chained_injection),
+            "injection view": (residual, block, chained_injection.view(tokens, -1)),
+            "block output view": (residual, block.view(tokens, -1), chained_injection),
+        }
+        for name, args in cases.items():
+            assert any(arg._is_view() for arg in args), name
+            with _ViewWatch() as watch:
+                got = module.combine_and_mix(*args)
+                module.combine(*args)
+                module.mix(args[0])
+            assert watch.views == [], (name, watch.views)
+            assert _same_tuple(got, want), name
+    assert warnings == []
+
+
 # ----- the wiring, through a stand-in that records and validates -------------------------------------------------
 
 
