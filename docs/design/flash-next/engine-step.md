@@ -11,7 +11,7 @@ This track's harness refuses report files outside the repository, so the handoff
 
 ## Handoff (if this agent stops)
 
-Last update: **2026-11-21 09:33 UTC** (fourth agent, Opus 5.5; the node was extended to about 00:00 UTC on
+Last update: **2026-11-21 10:27 UTC** (fourth agent, Opus 5.5; the node was extended to about 00:00 UTC on
 2026-11-22). Branch `feat/flash-next-gaudi-engine-step`, pushed; merged into the program branch up to `bcef8aa5` (PR
 #20); since then, not yet in a PR, all default-off: `ff160409` (`VLLM_HPU_WORKER_GC_FREEZE`), `ca52fa33`
 (`VLLM_HPU_LOG_UNMATCHED_GRAPH_INPUTS`), `844a37f2` (`VLLM_HPU_VERIFY_LOGITS_IN_GRAPH`), `8efc6969`
@@ -48,7 +48,8 @@ question answered on the CPU (section 14). Section 15 (the host's serial work of
 default off: the verify's LM head and arg max inside the captured forward, the persistent per-step inputs, the
 collector freeze, the unmatched-input logger. 00223 (1 card): the verify forward and the draft passes have no cut a
 collective would not explain (only the per-layer hook, which follows the MoE all-reduce); the nine step-level cuts
-between the graphs are listed there; 00226 (TP2) is to name the TP8 front cuts.
+between the graphs are listed there; 00235 (TP2, replaced 00226) is to name the TP8 front cuts. The census's
+"29 .item() per step" from tensor printing (async-sched's 00220) is one capture step, not every step (section 15).
 
 ### If you take over, in this order
 
@@ -58,14 +59,14 @@ between the graphs are listed there; 00226 (TP2) is to name the TP8 front cuts.
    own PR as soon as its gate is green and the change is card-proven or default-off, then tell the coordinator the
    number. Next PR: gate the branch (`bin/gate <snapshot>`, no `--tools`: the rental tool tests fail on this Mac for
    every track), merge the program head first.
-2. Read 00207 and 00169 when they land (table below); section 9 and the coordinator.
+2. Read 00236 (replaced 00207) and 00169 when they land (table below); section 9 and the coordinator.
 3. Section 15 (the host's serial work, coordinator 08:10 UTC), in this order: (a) integration's build-5 round with
    the unmatched-input logger (`HPU_GRAPH_UNMATCHED` lines): fix every named input (persistent base tensor, sliced
    inside the forward; a slice that reaches a custom op gets an owned copy inside the graph, card rule 1); (b) I01
    in the serve setting once 00207 and 00169 agree; (c) last, the packed upload (`VLLM_HPU_PACKED_INPUTS`) with
    async-sched's per-input switch. Rank skew: native-replay's pin mode 3, seen per rank with `replay_first_ms`.
-   (d) 00226's TP2 cut log: name the cuts of 00205's `embed` and `ple` segments (`python3
-   reports/engine-step/probes/cutlog/cuts.py reports/engine-step/card/00226-*/habana_logs`, then `seq.py` on the
+   (d) 00235's TP2 cut log (it replaced 00226): name the cuts of 00205's `embed` and `ple` segments (`python3
+   reports/engine-step/probes/cutlog/cuts.py reports/engine-step/card/00235-*/habana_logs`, then `seq.py` on the
    verify and draft captures) and tell the coordinator. (e) The chain job (coordinator 09:19 UTC) is
    mtp-draft-graph's 00230 `real8-chain-b5b` (it replaced 00228), after 00222 (about 13:00 UTC), on its branch
    `feat/flash-next-gaudi-mtp-draft-graph-b5` (build 5 `eb21ac75` + the chain + async-sched's M1 + this track's
@@ -76,6 +77,9 @@ between the graphs are listed there; 00226 (TP2) is to name the TP8 front cuts.
    `reports/mtp-draft-graph/card/00230-real8-chain-b5b/tiny-chain-vlg/habana_logs` (one rank's main thread: 8 ranks
    write there) shows which of the nine step-level cuts of section 15 are gone; tell the coordinator. The
    unmatched-input lines of the three chain gates are in the job log, after each gate's `arm ... start` line.
+   (f) The tensor-formatting reads (coordinator 09:58 UTC; section 15): name the callers from 00235 / 00236's
+   `TENSOR_READS` lines, remove or guard the formatting (default path if it is pure logging; CPU test), then tell
+   the coordinator and async-sched (`a58988ba328b40a9b`) the sites and the count that remains.
 4. Build 4's code with this track's card tools and flags is the local branch `engine-step-int4-card` (`4b180729`);
    the CPU census tree is `reports/engine-step/trees/b4`.
 
@@ -90,9 +94,9 @@ between the graphs are listed there; 00226 (TP2) is to name the TP8 front cuts.
 | 00173 `h2d-copies-1card` (1 card, `01d66e31`) | `h2d_copies_bench.py` at 32 and 1 rows | ended 02:02 UTC, exit 0 | done: section 13 |
 | 00164 `real8-mtp2-cand2-sampled`, 00166 `real8-candvp-short2` | (TP8 jobs) | folded into 00206 at 07:03 UTC (00164 replaced, 00166 cancelled) | - |
 | 00206 `real8-mtp2-candsw` | | replaced by 00207 at 07:58 UTC (the collector arms added) | - |
-| **00207** `real8-mtp2-candsw-gc` (all, TP8 + EP8, 35m, `4b180729` = build 4 `30f4e37e` + the probe's `--spec-arms` + `VLLM_HPU_WORKER_GC_FREEZE`; local branch `engine-step-int4-card`) | one MTP k = 2 server, build 4's mtp2 env (00186's `versions.txt`) with `VLLM_HPU_MTP_TIMING=2`: `serve_long_probe.sh --arms both --no-long --spec-arms cand,cand2,cand2vp --gc-arms --logprobs-check` (`SERVE_SPEC_K=2`) | queued | as 00206 (greedy base / both; sampled cand / cand2 / cand2vp at 32 and 1 streams: step ms, tokens per chunk, acceptance per position; the `Candidate sampling` lines; seeded; logprobs under MTP), then the collector rounds (`gc32`, `gc1`: off / on, twice): `python3 reports/engine-step/probes/gc_steps.py reports/engine-step/card/00207-*` gives p50 / p99 per rank of the replay call and the step and the generation-2 counts; the `SCHED:` line (may the container take SCHED_FIFO) |
+| **00236** `real8-mtp2-candsw-gc-fmt` (replaced 00207 at 10:25 UTC, same place, hold and arguments, starts by 15:31 UTC; all, TP8 + EP8, 35m, `4b180729` = build 4 `30f4e37e` + the probe's `--spec-arms` + `VLLM_HPU_WORKER_GC_FREEZE`; local branch `engine-step-int4-card`) | one MTP k = 2 server, build 4's mtp2 env (00186's `versions.txt`) with `VLLM_HPU_MTP_TIMING=2`, plus the tensor-formatting hook in its formatting-only mode (`TENSOR_READ_SITES=1 TENSOR_READ_LIGHT=1`, `reports/engine-step/probes/tensor_reads/sitecustomize.py` written into `$FARM_OUT/treads` and put first on PYTHONPATH; submit log `card_job/submit_candsw_gc_fmt.log`): `serve_long_probe.sh --arms both --no-long --spec-arms cand,cand2,cand2vp --gc-arms --logprobs-check` (`SERVE_SPEC_K=2`) | queued | as 00206 (greedy base / both; sampled cand / cand2 / cand2vp at 32 and 1 streams: step ms, tokens per chunk, acceptance per position; the `Candidate sampling` lines; seeded; logprobs under MTP), then the collector rounds (`gc32`, `gc1`: off / on, twice): `python3 reports/engine-step/probes/gc_steps.py reports/engine-step/card/00236-*` gives p50 / p99 per rank of the replay call and the step and the generation-2 counts; the `SCHED:` line (may the container take SCHED_FIFO); `grep TENSOR_READS` in the server logs: the real model's (FP8) capture-time tensor formatting with its callers (section 15) |
 | 00223 `tiny-cutlog` (1 card, `4b18072924bb`, `LOG_LEVEL_PT_IRGRAPH=1`, `LOG_LEVEL_PT_LAZY=1`) | `farm_tiny.py --gdn hc --spec 3`, every `step marker due to` reason | ended 09:01 UTC, exit 0 | done: section 15 (the cut reasons; parsers `reports/engine-step/probes/cutlog/`) |
-| **00226** `tiny-cutlog-tp2` (any:2, 10m, `--no-sync` = `4b18072924bb`; coordinator GO 09:19 UTC, runs beside 00225 and 00119 after build 5, about 13:00 UTC) | the same at `--tp 2` with 00205's flags through tiny_smoke's `--env` (`PLE_HOST_NGRAM_IDS=1`, `COLLECTIVE_MARK_STEP=0`, `DECODE_CUT_INTERVAL=1000`, `QSA_FUSED=1`, `QSA_INDEXER_SHARD=1`, `GDN_KERNEL_INTERLEAVE=1`, `GDN_GLUE_CACHE=1`, `HC_FUSED_COPY_MODE=2`, `CANDIDATE_SAMPLING=1`, `PT_HPU_LAZY_ACC_PAR_MODE=0`, `PT_HPU_SYNCHRONOUS_ACC_QUEUE_FLUSHING=1`); submit log `card_job/submit_cutlog_tp2.log` | queued | `cuts.py` / `seq.py` on `card/00226-tiny-cutlog-tp2/habana_logs`: every cut inside the verify and draft captures with its op, which are collectives (with `COLLECTIVE_MARK_STEP=0`), and what cuts after the embedding and the PLE cast; tell the coordinator |
+| **00235** `tiny-cutlog-tp2-reads` (replaced 00226 at 10:18 UTC, same place and hold, starts by 12:42 UTC; any:2, 10m, `--no-sync` = `4b18072924bb`; coordinator GO 09:19 UTC, runs beside 00225 and 00119 after build 5, about 13:00 UTC) | the same at `--tp 2` with 00205's flags through tiny_smoke's `--env` (`PLE_HOST_NGRAM_IDS=1`, `COLLECTIVE_MARK_STEP=0`, `DECODE_CUT_INTERVAL=1000`, `QSA_FUSED=1`, `QSA_INDEXER_SHARD=1`, `GDN_KERNEL_INTERLEAVE=1`, `GDN_GLUE_CACHE=1`, `HC_FUSED_COPY_MODE=2`, `CANDIDATE_SAMPLING=1`, `PT_HPU_LAZY_ACC_PAR_MODE=0`, `PT_HPU_SYNCHRONOUS_ACC_QUEUE_FLUSHING=1`); and the tensor-formatting hook in full mode (`TENSOR_READ_SITES=1`, every 50 steps; its lines collected into `treads/tensor_reads.txt`); submit log `card_job/submit_cutlog_tp2_reads.log` | queued | `cuts.py` / `seq.py` on `card/00235-tiny-cutlog-tp2-reads/habana_logs`: every cut inside the verify and draft captures with its op, which are collectives (with `COLLECTIVE_MARK_STEP=0`), and what cuts after the embedding and the PLE cast; the `TENSOR_READS` lines (`first <kind> at step S: <frames>`: who formats device tensors; does a read during capture cut the graph); tell the coordinator and async-sched |
 | 00218 `real8-build5` | | cancelled 08:57 UTC; build 5 is 00222 | - |
 | 00222 `real8-build5b` (integration's, starts by 11:22 UTC) | this track's asks inside build 5 (as planned for 00218) | queued | `reports/integration/card/00222-real8-build5b/` (arm folders as integration names them; planned: `mtp2-async-fp8kv-hpulog-32-greedy-dg32-kvlp-long/server0.log` (`HPU_GRAPH_UNMATCHED`, draft graph off then on; probe_dg32.log, scaling_dg32.json) -> mtp-draft-graph and section 15; `mtp2-async-sw-cap-kvlp/scaling_sw.json` (I01 off / dg / md); `mtp2-kvlpfb/mtp_step_record_r*.jsonl` (per-rank `replay_first_ms` skew); if ss0 is on, `mtp2-async-ss0-greedy/` and `mtp2-async-irlog-lv1-greedy/habana_logs/` (integration sends the two greps)) |
 | **00169** `real8-i01-long120k` (all, 50m) | I01 at 32 x 120K over a shared prefix with prefill's prefix flags, and an MTP k = 2 part (`probe.log`, `mtp2/probe.log`) | queued | `prepare_inputs` and step time base against I01 at a long context |
@@ -628,7 +632,7 @@ step while the host works.
   segments, and `qsa_attention` | `moe` in passes 1 and 2) come from TP-only code or from 00205 flags the tiny run
   lacked (`PLE_HOST_NGRAM_IDS=1`, `QSA_FUSED=1`, `QSA_INDEXER_SHARD=1`, `HC_FUSED_COPY_MODE=2`, ...). `seq.py`'s
   `coll` needs the collective to start within 150 us of the segment's end, so an all-reduce a slow host issues
-  late reads as none: row 23 to 25 is most likely the vocabulary-parallel embedding's all-reduce (INFERRED). 00226
+  late reads as none: row 23 to 25 is most likely the vocabulary-parallel embedding's all-reduce (INFERRED). 00235
   (TP2, 00205's flags) names them.
 - **The step-level cuts between the graphs (MEASURED, 00223, 161 steady steps; per step; none is a collective):**
   (1) `host step marker` launches 3 pending PLE input ops (cast, add, index) before the verify replay; (2)
@@ -645,6 +649,22 @@ step while the host works.
   (626), `local scalar` (2). mtp-draft-graph's chain and `VLLM_HPU_VERIFY_LOGITS_IN_GRAPH` take out (3)'s flush,
   the pending-op launches of (5) to (8) and the read (6) (coordinator, 09:19 UTC): check with `window.py` when the
   chain job runs.
+- **The tensor-printing reads (coordinator 09:58 UTC, from async-sched's 00220 census): one capture step, not every
+  step (MEASURED).** In `nospec-async-census/timing/step_timing_worker_r0_*.jsonl` the item, tolist, scalar and
+  all_reduce counters have n = 1 in the first rows=8 window: one step made 1454 `.item()`, 384 `.tolist()`, 500 scalar
+  reads (all inside torch's tensor printing) and 98 all-reduces; `sync_sites` divides by the window's 50 steps (29.08,
+  7.68, 5.6 "per step"). The 10 later rows=8 windows have none (h2d 14-16, mark_step 2-4, d2h_to 1). All-reduces are
+  counted only while the forward runs in Python, so that step is the capture of the bucket's graph (warmup skipped).
+  CPU (engine harness, tiny model, device tensors marked, 8 rows, `reports/engine-step/probes/tensor_reads/cpu_reads.py`):
+  sync and async no-spec decode steps format no device tensor; the device reads per step are the output's lists
+  (async `get_output`, 1.84 per step). So the printing is HPU- or FP8-only code that runs while a graph is captured.
+  The callers: the hook `reports/engine-step/probes/tensor_reads/sitecustomize.py` (PYTHONPATH first,
+  `TENSOR_READ_SITES=1`; `TENSOR_READ_LIGHT=1` wraps only str / repr / format / contains) in 00235 (tiny TP2, full)
+  and 00236 (real model, formatting only): `TENSOR_READS ... first <kind> at step S: <8 frames>`. A host read of a
+  pending tensor during a capture also ends a graph segment (a cut in every replay): check against 00235's IR log.
+  async-sched agreed (10:26 UTC); its steady mode-1 gap (forward 36-41 ms async against 29-34 sync, post 2-8 ms
+  against 0.2) has the 14 pageable H2D per step as first suspect: it adds an async arm with
+  `VLLM_HPU_PERSISTENT_INPUTS=1` once that is on the program head.
 - **Stage 1 of the upload, done on CPU: `VLLM_HPU_PERSISTENT_INPUTS=1`** (`8efc6969`, default 0; coordinator GO
   08:38 UTC): every per-step input of the decode builder, the speculative indices and the PLE inputs through
   `HPUModelRunner._upload`, a persistent pinned host tensor and a persistent device tensor per (name, shape, dtype),
