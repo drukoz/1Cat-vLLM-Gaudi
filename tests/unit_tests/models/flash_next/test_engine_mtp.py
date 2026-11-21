@@ -350,6 +350,31 @@ def test_the_chain_takes_the_verify_graphs_ids(engine_runs):
     _check_oracle(engine_runs, chain, accept, K)
 
 
+def test_async_scheds_m1_switched_at_run_time_with_the_chain(engine_runs):
+    # The card's m1sw arm: a server started with async-sched's VLLM_HPU_FLASH_NEXT_SPEC_DEVICE_INPUTS=2 (the device-made
+    # verification inputs) and the chain on (stage A), the flag switched to 0 after prompt 2 and back to 2 after
+    # prompt 4 through the runtime switch file. Both switches are taken (the flag is switchable), the streams equal
+    # the per-pass drafter's, the device-made inputs were used and nothing refused or differed.
+    import re
+
+    accept = [2, 0, 1]
+    per_pass = _oracle_run(engine_runs, accept, k=2, env=CHAIN_BASE, tag="_loop_md")
+    switch_file = engine_runs["dir"] / "m1.switches"
+    flag = "VLLM_HPU_FLASH_NEXT_SPEC_DEVICE_INPUTS"
+    options = ["--switch-after", "2", f"{flag}=0", "--switch-after", "4", f"{flag}=2"]
+    env = {**CHAIN, flag: "2", "VLLM_HPU_RUNTIME_SWITCH_FILE": str(switch_file)}
+    run = _oracle_run(engine_runs, accept, *options, k=2, env=env, tag="_m1_switch")
+    assert [p["generated_ids"] for p in run["prompts"]] == [p["generated_ids"] for p in per_pass["prompts"]]
+    assert run["runner"]["draft_chain_calls"] > 0
+    log = engine_runs["dir"].joinpath("k2_accept_201" + "".join(o.strip("-")[:3] for o in options)
+                                      + "_m1_switch.json.log").read_text(encoding="utf-8", errors="replace")
+    assert "is ignored" not in log  # the switch file named only switchable flags
+    assert f"{flag}=0" in log and log.count(f"Runtime switches from {switch_file}") >= 2
+    stats = re.findall(flag + r"=2: (\d+) verification steps, (\d+) advanced on the device", log)
+    assert stats and int(stats[-1][1]) > 0, stats
+    assert "device-made inputs differ" not in log and "keeps the host's inputs" not in log
+
+
 def test_a_sampled_request_keeps_the_draft_after_the_host_read(engine_runs):
     # The chain is greedy only so far: a step with a sampled request keeps today's path (logged once), and its
     # stream gets its tokens.
