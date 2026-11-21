@@ -38,6 +38,13 @@ id table with the top-k indices (``vocab_parallel.top_k``, ``topk_ids.topk_with_
 cast or read back as data on the card), so the drawn ids are int32; the index of the k-th column is made on the
 host as int64. ``take_candidates`` (int64 ids as ``topk`` makes them) is the CPU oracle of the tests.
 
+Speculative decode steps (``VLLM_HPU_CANDIDATE_SAMPLING=2``, with deterministic drafts: MTP's arg max, n-gram):
+every verification row and the bonus row draws from the target distribution of its row with its own noise, and
+the runner verifies the drafts against those draws with ``hpu_greedy_verify.greedy_rejection_sample_from_tokens``
+(accept while a row's draw equals the draft; the first unequal draw, or the bonus draw, ends the step). With a draft
+distribution one-hot at the draft d that is speculative sampling exactly: the draft is accepted with probability
+p(d), and a rejected row's draw follows p without d, renormalized, p(x) / (1 - p(d)); rows draw independently.
+
 Pure functions: this module imports only ``torch``.
 """
 
@@ -46,6 +53,7 @@ from typing import Optional, Sequence
 import torch
 
 CANDIDATES = 64  # candidates per row: the largest top_k a request may ask for on this path
+NOISE_SEED = 20261121  # the runner's host noise generator: seeded alike on every TP rank, used by nothing else
 PARAM_COLUMNS = 3  # temperature, top_p, greedy flag; the row's noise follows
 STOP_ID_LIMIT = 8  # fused_greedy.STOP_ID_WIDTH: stop ids of a min_tokens request the logits region masks
 GREEDY_TEMPERATURE = 1e-5  # vLLM's _SAMPLING_EPS: below it a request is greedy
@@ -177,6 +185,7 @@ def candidate_refusal(*,
 
 __all__ = [
     "CANDIDATES",
+    "NOISE_SEED",
     "GREEDY_TEMPERATURE",
     "PARAM_COLUMNS",
     "candidate_parameters",

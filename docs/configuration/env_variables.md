@@ -89,7 +89,15 @@ the conditions (`top_k` unset or above 64, `min_p`, penalties, `logit_bias`, `al
 scheduling) keeps vLLM's sampler; an all-greedy step is not affected. The server logs one INFO line
 (`Candidate sampling (VLLM_HPU_CANDIDATE_SAMPLING=1): a sampled decode step drew in the logits region ...`)
 the first time a sampled step takes the region, and one (`... took vLLM's sampler instead: <reason>`) the
-first time a sampled step falls back; a change of the runtime switch file logs them again. CPU-checked
+first time a sampled step falls back; a change of the runtime switch file logs them again. `2` is `1`, and the
+decode steps of a speculative server with deterministic drafts (MTP's arg max, n-gram) sample in the region too:
+every verification row and the bonus row of a request draws from the target distribution with its own noise, and
+the drafts are verified against those draws (`hpu_greedy_verify.greedy_rejection_sample_from_tokens`): accepted
+while a row's draw equals the draft, else the first unequal draw, else the bonus draw. For drafts that are one-hot
+that is speculative sampling exactly (acceptance p(draft), a rejected row follows p without the draft,
+renormalized), at about the cost of a greedy verification step. It needs `VLLM_HPU_SPEC_SAMPLED_VERIFY` at `1` or
+`2` (mtp-card-ready), which admits sampled requests to a speculative server and serves the steps the region refuses
+(a request with fewer drafts, `min_tokens`, logprobs, ...); without it `2` acts as `1`. CPU-checked
 against vLLM's `apply_top_k_top_p_pytorch`; on the card (TP4, 32 sampled streams) 4.9 ms less per step
 than vLLM's sampler (engine-step job 00110).
 
