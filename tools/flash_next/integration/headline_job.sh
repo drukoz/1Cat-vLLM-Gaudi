@@ -87,17 +87,20 @@ done
 # async-sched job branch: the sibling-aware placement (native-replay's place.sh, rule a^1 of job 00193, through
 # collectives' place_wrap.sh), switched late: the first word of the switch file, read once here at the job's start
 # (HEADLINE_PLACE_SWITCH, default /results/switches/place = ~/farm/async-sched/results/switches/place on the node),
-# "on" (rule a^1) or a rule ("a^1", "a+N/2") turns it on; "off", anything else or no file: off. On: every server arm
-# runs with VLLM_HPU_WORKER_CPU_PIN=1 (each worker on its share of the CPUs) under
-# /results/bench/place_wrap.sh /results/bench/place.sh (HEADLINE_PLACE_WRAP, HEADLINE_PLACE_SCRIPT), the placement's
-# output in the arm's placement.log.
+# "on" (rule a^1) or a rule ("a^1", "a+N/2") turns it on; "place" turns on the placement alone (rule a^1, no
+# VLLM_HPU_WORKER_CPU_PIN: the pin flag kept each rank to 18 CPUs while loading, 14.9 min against 7.5 in 00189);
+# "off", anything else or no file: off. On: every server arm runs under /results/bench/place_wrap.sh
+# /results/bench/place.sh (HEADLINE_PLACE_WRAP, HEADLINE_PLACE_SCRIPT), with VLLM_HPU_WORKER_CPU_PIN=1 (each worker
+# on its share of the CPUs) unless "place", the placement's output in the arm's placement.log.
 PLACE_SWITCH="${HEADLINE_PLACE_SWITCH:-/results/switches/place}"
 PLACE_WRAP="${HEADLINE_PLACE_WRAP:-/results/bench/place_wrap.sh}"
 PLACE_SCRIPT="${HEADLINE_PLACE_SCRIPT:-/results/bench/place.sh}"
 PLACE_RULE=""
+PLACE_PIN=1
 if [ -r "$PLACE_SWITCH" ]; then
     case "$(awk 'NR == 1 { print $1 }' "$PLACE_SWITCH")" in
         on) PLACE_RULE="a^1" ;;
+        place) PLACE_RULE="a^1"; PLACE_PIN=0 ;;
         "a^1") PLACE_RULE="a^1" ;;
         "a+N/2") PLACE_RULE="a+N/2" ;;
     esac
@@ -107,8 +110,9 @@ if [ -n "$PLACE_RULE" ] && { [ ! -r "$PLACE_WRAP" ] || [ ! -r "$PLACE_SCRIPT" ];
     PLACE_RULE=""
 fi
 if [ -n "$PLACE_RULE" ]; then
-    export VLLM_HPU_WORKER_CPU_PIN=1 PLACE_SIBLING_RULE="$PLACE_RULE"
-    echo "headline_job: placement ON (rule $PLACE_RULE; switch $PLACE_SWITCH; md5" \
+    export PLACE_SIBLING_RULE="$PLACE_RULE"
+    if [ "$PLACE_PIN" = 1 ]; then export VLLM_HPU_WORKER_CPU_PIN=1; fi
+    echo "headline_job: placement ON (rule $PLACE_RULE; pin flag $PLACE_PIN; switch $PLACE_SWITCH; md5" \
         "$(md5sum "$PLACE_WRAP" "$PLACE_SCRIPT" 2>/dev/null | awk '{ printf "%s %s ", $2, substr($1, 1, 8) }'))"
 else
     echo "headline_job: placement off (switch $PLACE_SWITCH: $(head -c 40 "$PLACE_SWITCH" 2>/dev/null || echo none))"
