@@ -21,7 +21,14 @@ CPU: 34 of 37 extra files green, 3 card-only skips (`reports/integration/cpu/out
 submit_b6.sh a|b` (6a: gates + A6 / il / shift / gv / pi / pin3-noplace, about 95 to 105 min; 6b: chain and mode-3
 gates, A6 with the chain switch A/B and the logprob references, mode 3 with the cross-server floor, the stacked arm
 with the capture, FP8 --chat; about 115 min), waiting for the coordinator's verdicts (GDN variant, 00230 chain, 00240
-mode 3) and the queue place. Build 5's record (00222) is below.
+mode 3) and the queue place. **6a = job 00249 `real8-build6a`** (queued 12:22 UTC, commit `bdd47cb2`, image
+`farm-integration:bdd47cb25b47`, hold 1h45m; after 00240, about 15:45 UTC): tiny, tiny-il, tiny-shift, tiny-pi, tiny-gv,
+then A6, A6+il, A6+shift, A6+pi, A6+gv6, pin3-noplace last. The GDN variant is late-bound: `reports/integration/late/
+make_run6.sh a --gv 7` or `--no-gv` (default 6). Its waiter: `reports/integration/card/submit-real8-build6a.log`;
+results `reports/integration/card/00249-real8-build6a/` (else `bin/farm fetch integration 00249 00249-real8-build6a`).
+6b waits for 00230's verdict (chain arms), 00240's (mode 3, "all"), 00241's (scaled FP8) and engine-step's
+KV_CACHES_IN_GRAPH_ARGS commit. CPU: the async loop test with `VLLM_HPU_PERSISTENT_INPUTS=1` 7 passed. Build 5's record
+(00222) is below.
 
 **Build 5 (fifth agent of the track, Opus 5.5, started 08:04 UTC on 2026-11-21; updated 12:10 UTC: job 00222 measured, results below).**
 
