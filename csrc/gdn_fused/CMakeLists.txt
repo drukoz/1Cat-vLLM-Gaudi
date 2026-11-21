@@ -150,6 +150,8 @@ if(GDN_VERIFY_BUILT)
     # docs/design/flash-next/hc-kernels.md, "GDN verify"): optional like the others.
     list(APPEND GDN_INTERLEAVE_CANDIDATES gdn_core_verify_interleaved_rmajor_gaudi2
          gdn_core_verify_interleaved_lean_gaudi2 gdn_core_verify_interleaved_rmajor_lean_gaudi2)
+    # VLLM_HPU_GDN_VERIFY_VARIANT 6 and 7: the fold recurrence (kernels/gdn_core_verify_recurrence_fold.h).
+    list(APPEND GDN_INTERLEAVE_CANDIDATES gdn_core_verify_interleaved_fold_gaudi2)
 endif()
 if(GDN_FUSED_INTERLEAVE)
     foreach(kernel IN LISTS GDN_INTERLEAVE_CANDIDATES)
@@ -160,6 +162,7 @@ if(GDN_FUSED_INTERLEAVE)
             "${CMAKE_CURRENT_SOURCE_DIR}/kernels/gdn_core_verify_interleaved_gaudi2.c"
             "${CMAKE_CURRENT_SOURCE_DIR}/kernels/gdn_core_decode_recurrence_interleaved.h"
             "${CMAKE_CURRENT_SOURCE_DIR}/kernels/gdn_core_verify_recurrence_interleaved.h"
+            "${CMAKE_CURRENT_SOURCE_DIR}/kernels/gdn_core_verify_recurrence_fold.h"
             "${CMAKE_CURRENT_SOURCE_DIR}/kernels/gdn_core_decode_norm.h")
         set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${kernel_sources})
         execute_process(

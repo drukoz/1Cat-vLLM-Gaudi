@@ -30,6 +30,9 @@ struct GdnKernelElf {
 //     of one (preferredSplitDim) and to go on with the request dimension, so that every (key head, request) point
 //     can land on its own TPC engine
 //   5 as 4, with the lean ELF
+//   6 the fold recurrence (kernels/gdn_core_verify_interleaved_fold_gaudi2.c): four rows' sums folded together by
+//     the additions of v_f32_reduce_add, node t's output overlapped with node t + 1's update; today's index space
+//   7 as 6, with the preferred split of 4
 // Any other value, or none, is 0: the interleaved kernel as it is.
 inline int GdnVerifyVariantRequested()
 {
@@ -40,6 +43,8 @@ inline int GdnVerifyVariantRequested()
     if (std::strcmp(value, "3") == 0) return 3;
     if (std::strcmp(value, "4") == 0) return 4;
     if (std::strcmp(value, "5") == 0) return 5;
+    if (std::strcmp(value, "6") == 0) return 6;
+    if (std::strcmp(value, "7") == 0) return 7;
     return 0;
 }
 

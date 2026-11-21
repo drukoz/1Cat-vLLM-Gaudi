@@ -18,7 +18,9 @@ one graph have no declared order: kernel-fixes' rule-10 note), CHAINED (call i +
 consecutive layers cannot), captured in one HPU graph and replayed with a synchronize; the median wall of a replay at
 two K (``--k``, default 4 and 12), and the slope is the device time per call (with one tiny add). The output and both
 pools of the first set (one eager call, no chain) are saved for a bit comparison between variants (``--compare-to
-DIR``: another run's out folder). ``--trace``: a torch-profiler trace of three replays at the larger K per batch size
+DIR``: another run's out folder). So is a digest of every set's pools and last outputs after all the replays: the
+cases store a node's state in the slot the next call loads (and the conv history likewise), so each set has been
+through a recurrence of 13 to 25 calls by then, the same calls in every variant (``chain_sha256``, compared too). ``--trace``: a torch-profiler trace of three replays at the larger K per batch size
 (the process must start with HABANA_PROFILE=profile_api_light), for the TPC engines each call runs on
 (reports/hc-kernels/tools/kernel_engines.py).
 """
@@ -108,6 +110,7 @@ def main() -> int:
             (out / f"b{batch}_{name}.bin").write_bytes(data)
         entry["sha256"] = digest
         walls = {}
+        last_outs = {}
         for k in (k_lo, k_hi):
 
             class Calls(torch.nn.Module):
@@ -134,7 +137,7 @@ def main() -> int:
             times = []
             for _ in range(a.iters):
                 t0 = time.perf_counter()
-                module(dummy)
+                last_outs[k] = module(dummy)
                 sync()
                 times.append((time.perf_counter() - t0) * 1e3)
             walls[k] = statistics.median(times)
@@ -149,6 +152,15 @@ def main() -> int:
                 say(f"{a.label} batch {batch:3d}: trace {trace_path}")
         per_call = (walls[k_hi] - walls[k_lo]) / (k_hi - k_lo) * 1e3
         entry.update(wall_ms=walls, us_per_call=per_call)
+        if not a.trace:  # a traced run replays more often: its states are not the others'
+            chain = hashlib.sha256()
+            for index, (_, args) in enumerate(sets):
+                for tensor in (args[0], args[1]):  # conv and SSM pools after every replay
+                    chain.update(tensor.detach().float().cpu().contiguous().numpy().tobytes())
+            for k in (k_lo, k_hi):
+                for tensor in last_outs[k]:
+                    chain.update(tensor.detach().float().cpu().contiguous().numpy().tobytes())
+            entry["chain_sha256"] = chain.hexdigest()
         say(f"{a.label} batch {batch:3d} T {a.tokens}: {per_call:8.1f} us per call (replay {walls[k_lo]:.3f} ms at "
             f"K={k_lo}, {walls[k_hi]:.3f} ms at K={k_hi})")
         if a.compare_to is not None:
@@ -159,6 +171,14 @@ def main() -> int:
                     entry.setdefault("same_bits_as_compare", {})[name] = same
                     say(f"{a.label} batch {batch:3d} {name}: {'bit-identical' if same else 'DIFFERS'} to "
                         f"{a.compare_to.name}")
+            other_json = a.compare_to / "bench_gdn_verify.json"
+            if "chain_sha256" in entry and other_json.is_file():
+                other_entry = json.loads(other_json.read_text()).get("batches", {}).get(str(batch), {})
+                if "chain_sha256" in other_entry:
+                    same = other_entry["chain_sha256"] == entry["chain_sha256"]
+                    entry.setdefault("same_bits_as_compare", {})["chain"] = same
+                    say(f"{a.label} batch {batch:3d} chain (every set's pools and outputs after all replays): "
+                        f"{'bit-identical' if same else 'DIFFERS'} to {a.compare_to.name}")
         (out / "bench_gdn_verify.json").write_text(json.dumps(results, indent=1) + "\n")
         del sets
     print("VERDICT gdn-verify " + a.label + ": " + ", ".join(

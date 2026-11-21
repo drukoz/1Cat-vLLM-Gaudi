@@ -551,7 +551,7 @@ if TYPE_CHECKING:
     # 2 also one record per step (mtp_step_record_r*.jsonl)
     VLLM_HPU_MTP_CHUNK_KV: int = 0  # 1 the MTP draft also runs over prefill chunks that complete no prompt
     VLLM_HPU_GDN_KERNEL_INTERLEAVE: int = 0  # 0 today's GDN decode/verify kernels, 1 four value rows per iteration
-    VLLM_HPU_GDN_VERIFY_VARIANT: int = 0  # with the interleave flag: 1 request-major, 2 lean, 3 both, 4/5 split hint
+    VLLM_HPU_GDN_VERIFY_VARIANT: int = 0  # with the interleave flag: 1 rmajor, 2 lean, 3 both, 4/5 split, 6/7 fold
     VLLM_HPU_GDN_GLUE_CACHE: int = 0  # 0 per-step glue of the fused GDN ops (default), 1 constants and indices cached
     VLLM_HPU_PLE_HOST_NGRAM_IDS: int = 0  # 0 PLE n-gram ids computed in the graph (default), 1 on the host
     VLLM_HPU_HC_FUSED: int = 0  # 0 torch hyper-connections (default), 1 the fused hyper-connection kernels
@@ -2043,9 +2043,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # index space {requests, key heads} instead of {key heads, requests} (the same points: the graph compiler can
     # spread them over more TPC engines); 2 lean broadcasts in the recurrence (11 % fewer instructions in the
     # simulator); 3 both; 4 today's index space with the graph compiler asked to split the key heads into partitions
-    # of one (preferredSplitDim); 5 as 4 with the lean build. Every variant's outputs and states are the interleaved
-    # kernel's bit for bit. Any other value is 0. A library built without a variant serves the interleaved kernel.
-    # Not yet run on a card.
+    # of one (preferredSplitDim); 5 as 4 with the lean build; 6 the fold build (four rows' sums folded together by
+    # the additions of v_f32_reduce_add, overlapped nodes and row groups, the gates of all nodes at once: 37 to 39 %
+    # fewer instructions in the simulator); 7 as 6 with the split of 4. Every variant's outputs and states
+    # are the interleaved kernel's bit for bit. Any other value is 0. A library built without a variant serves the
+    # interleaved kernel. Not yet run on a card.
     "VLLM_HPU_GDN_VERIFY_VARIANT":
     lambda: int(os.environ.get("VLLM_HPU_GDN_VERIFY_VARIANT", "0")),
 

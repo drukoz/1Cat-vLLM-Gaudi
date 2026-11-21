@@ -74,20 +74,25 @@ INTERLEAVED_VERIFY_SOURCE = REPO_ROOT / "csrc" / "gdn_fused" / "kernels" / "gdn_
 INTERLEAVE_ENV = "VLLM_HPU_GDN_KERNEL_INTERLEAVE"
 # The variant builds of the interleaved verify kernel (VLLM_HPU_GDN_VERIFY_VARIANT with the variable above;
 # docs/design/flash-next/hc-kernels.md, "GDN verify"): 1 request-major index space {requests, key heads}, 2 lean
-# broadcasts in the recurrence, 3 both. Each must give the interleaved kernel's bytes.
+# broadcasts in the recurrence, 3 both, 6 the fold recurrence. Each must give the interleaved kernel's bytes.
 VARIANT_VERIFY_SOURCES = {
     1: REPO_ROOT / "csrc" / "gdn_fused" / "kernels" / "gdn_core_verify_interleaved_rmajor_gaudi2.c",
     2: REPO_ROOT / "csrc" / "gdn_fused" / "kernels" / "gdn_core_verify_interleaved_lean_gaudi2.c",
     3: REPO_ROOT / "csrc" / "gdn_fused" / "kernels" / "gdn_core_verify_interleaved_rmajor_lean_gaudi2.c",
+    6: REPO_ROOT / "csrc" / "gdn_fused" / "kernels" / "gdn_core_verify_interleaved_fold_gaudi2.c",
 }
 VARIANT_ENV = "VLLM_HPU_GDN_VERIFY_VARIANT"
 # Variants 4 and 5 use the interleaved and the lean ELF with today's index space and the graph compiler's
-# preferred split of the key-head dimension (glue only; the simulator runs the whole index space on one TPC).
-VARIANTS = (1, 2, 3, 4, 5)
+# preferred split of the key-head dimension (glue only; the simulator runs the whole index space on one TPC); 7 the
+# fold ELF with that split.
+VARIANTS = (1, 2, 3, 4, 5, 6, 7)
 REQUEST_MAJOR_VARIANTS = (1, 3)
 LEAN_VARIANTS = (2, 3, 5)
 # Instructions of the lean variants over the interleaved kernel, at most (measured 2026-11-21: 0.887 to 0.925).
 LEAN_VERIFY_RATIO = 0.94
+FOLD_VARIANTS = (6, 7)
+# Instructions of the fold variants over the interleaved kernel, at most (measured 2026-11-21: 0.609 to 0.630).
+FOLD_VERIFY_RATIO = 0.70
 # Instructions of the interleaved kernel over today's, at most (measured 2026-11-20, tpc-clang 2.7.33: decode
 # 0.344 on every case, verify 0.369 to 0.378).
 INTERLEAVED_DECODE_RATIO = 0.40
@@ -248,7 +253,7 @@ def interleaved_sim_binary(tmp_path_factory: pytest.TempPathFactory) -> Path:
 
 @pytest.fixture(scope="module")
 def interleaved_verify_sim_binary(tmp_path_factory: pytest.TempPathFactory) -> Path:
-    """verify_sim_host linked with today's verify ELF, the interleaved one and its three variant builds."""
+    """verify_sim_host linked with today's verify ELF, the interleaved one and its four variant builds."""
     build = tmp_path_factory.mktemp("gdn_core_verify_interleaved_sim")
     variants = [_embed(build, source) for source in VARIANT_VERIFY_SOURCES.values()]
     for source in (VERIFY_KERNEL_SOURCE, INTERLEAVED_VERIFY_SOURCE):
@@ -332,8 +337,9 @@ def _run_verify(binary: Path, case, inputs, run_dir: Path, env_values: dict) -> 
 def test_verify_variant_is_bit_identical_to_the_interleaved_kernel(interleaved_verify_sim_binary: Path, case,
                                                                    variant: int, tmp_path: Path) -> None:
     """VLLM_HPU_GDN_VERIFY_VARIANT 1 (request-major index space), 2 (lean broadcasts), 3 (both), 4 (preferred split
-    of the key heads), 5 (4 with the lean ELF): every output and state byte is the interleaved kernel's; 1 and 4 run
-    the same instructions, 2, 3 and 5 fewer."""
+    of the key heads), 5 (4 with the lean ELF), 6 (the fold recurrence), 7 (6 with the split of 4): every output and
+    state byte is the interleaved kernel's; 1 and 4 run the same instructions, 2, 3 and 5 fewer, 6 and 7 fewer
+    still."""
     binary = interleaved_verify_sim_binary / "verify_sim_host"
     inputs = make_verify_inputs(case)
     base = _run_verify(binary, case, inputs, tmp_path / "interleaved", {INTERLEAVE_ENV: "1"})
@@ -350,24 +356,26 @@ def test_verify_variant_is_bit_identical_to_the_interleaved_kernel(interleaved_v
         assert base[2][name] == got[2][name], f"{name}: variant {variant}'s bytes differ"
     if variant in LEAN_VARIANTS:
         assert got[0] <= LEAN_VERIFY_RATIO * base[0]
+    elif variant in FOLD_VARIANTS:
+        assert got[0] <= FOLD_VERIFY_RATIO * base[0]
     else:
         assert abs(got[0] - base[0]) <= 0.02 * base[0]
 
 
 def test_a_variant_needs_the_interleave_variable_and_an_exact_value(interleaved_verify_sim_binary: Path,
                                                                     tmp_path: Path) -> None:
-    """The glue takes a variant only with the interleave variable at "1" and the variant at exactly "1" to "5"."""
+    """The glue takes a variant only with the interleave variable at "1" and the variant at exactly "1" to "7"."""
     binary = interleaved_verify_sim_binary / "verify_sim_host"
     case = VERIFY_CASES[0]
     inputs = make_verify_inputs(case)
     runs = {}
     for label, values in (("none", {}), ("variant_only", {VARIANT_ENV: "3"}),
-                          ("interleaved", {INTERLEAVE_ENV: "1"}), ("variant_6", {INTERLEAVE_ENV: "1", VARIANT_ENV: "6"}),
+                          ("interleaved", {INTERLEAVE_ENV: "1"}), ("variant_8", {INTERLEAVE_ENV: "1", VARIANT_ENV: "8"}),
                           ("variant_x", {INTERLEAVE_ENV: "1", VARIANT_ENV: "1 "}),
                           ("variant_3", {INTERLEAVE_ENV: "1", VARIANT_ENV: "3"})):
         runs[label] = _run_verify(binary, case, inputs, tmp_path / label, values)
     assert runs["none"][0] == runs["variant_only"][0] and runs["none"][1] == runs["variant_only"][1]
-    assert runs["interleaved"][0] == runs["variant_6"][0] == runs["variant_x"][0]
+    assert runs["interleaved"][0] == runs["variant_8"][0] == runs["variant_x"][0]
     assert runs["variant_3"][0] < runs["interleaved"][0] and runs["variant_3"][1] != runs["interleaved"][1]
 
 
