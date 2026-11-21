@@ -14,6 +14,7 @@ import torch.distributed
 import torch.nn as nn
 import habana_frameworks.torch as htorch
 from vllm.tasks import SupportedTask
+from vllm_gaudi.extension import step_timing
 from vllm_gaudi.extension.debug import init_debug_logger
 from vllm_gaudi.extension.defragmentation import OnlineDefragmenter
 from vllm_gaudi.extension.profiler import HabanaMemoryProfiler, format_bytes, setup_profiler
@@ -56,6 +57,8 @@ def setup_step_profiler(steps):
 
 
 class HPUWorker(WorkerBase):
+    step_timer = None  # VLLM_HPU_STEP_TIMING: set in __init__, None when the flag is 0
+
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -83,6 +86,8 @@ class HPUWorker(WorkerBase):
         self.profile_steps = get_config().VLLM_PROFILE_STEPS
         self.step_profiler = setup_step_profiler(self.profile_steps)
         self.step_debug = init_debug_logger("steps")
+        # VLLM_HPU_STEP_TIMING: None when the flag is 0 (the default); only the driver rank logs.
+        self.step_timer = step_timing.init_timer("worker", rank, log=logger.info if is_driver_worker else None)
 
         self.model_sleeping = False
         self.model_runner: HPUModelRunner | None = None
@@ -613,6 +618,8 @@ class HPUWorker(WorkerBase):
                 required_ops.append("custom_deepseek_v41_prefill_permuted_bf16_gaudi2")
             load_native_operators(required_ops)
         torch.hpu.set_device(device_index)
+        if self.step_timer is not None:
+            self.step_timer.bind_runtime(htorch, torch)
         logger.info(
             "HPU worker rank=%d local_rank=%d module=%s visible=%s prepared_v41=%s",
             self.rank,
@@ -621,6 +628,18 @@ class HPUWorker(WorkerBase):
             os.environ.get("HABANA_VISIBLE_MODULES"),
             is_v41(self.vllm_config),
         )
+        # VLLM_HPU_WORKER_CPU_PIN: this worker's threads on the CPUs next to its module, before the model and the
+        # communicators allocate host memory (0, the default, leaves them to the kernel and returns []).
+        from vllm_gaudi import envs as gaudi_envs
+        from vllm_gaudi.v1.worker.hpu_worker_cpus import pin_from_env
+
+        try:
+            self._cpu_share = pin_from_env(self.rank, self.parallel_config.world_size,
+                                           gaudi_envs.VLLM_HPU_WORKER_CPU_PIN, logger)
+        except Exception as exc:  # noqa: BLE001 - placement is an optimisation: never stop a worker for it
+            logger.warning("VLLM_HPU_WORKER_CPU_PIN=%d is off for this worker: %s", gaudi_envs.VLLM_HPU_WORKER_CPU_PIN,
+                           exc)
+            self._cpu_share = []
         self.device = torch.device("hpu")
         # Initialize the distributed environment.
         init_worker_distributed_environment(self.vllm_config, self.rank, self.distributed_init_method, self.local_rank)
@@ -1301,6 +1320,16 @@ class HPUWorker(WorkerBase):
             torch.hpu.reset_peak_memory_stats()
             self._native_peak_scope = "since_last_ready_including_request_warmup"
 
+        # VLLM_HPU_WORKER_CPU_PIN=2: the thread that runs the model (this one) gets a CPU of its own (no-op otherwise).
+        from vllm_gaudi import envs as gaudi_envs
+        from vllm_gaudi.v1.worker.hpu_worker_cpus import give_calling_thread_its_own_cpu
+
+        try:
+            give_calling_thread_its_own_cpu(getattr(self, "_cpu_share", []), gaudi_envs.VLLM_HPU_WORKER_CPU_PIN, logger)
+        except Exception as exc:  # noqa: BLE001 - placement is an optimisation: never stop a worker for it
+            logger.warning("VLLM_HPU_WORKER_CPU_PIN=%d: the calling thread keeps its share: %s",
+                           gaudi_envs.VLLM_HPU_WORKER_CPU_PIN, exc)
+
         return CompilationTimes(
             language_model=self.vllm_config.compilation_config.compilation_time,
             encoder=self.vllm_config.compilation_config.encoder_compilation_time,
@@ -1311,7 +1340,13 @@ class HPUWorker(WorkerBase):
             from vllm_gaudi.ops.deepseek_v41_failure import execute_guarded, guard_async
 
             return guard_async(execute_guarded(self.model_runner.sample_tokens, grammar_output, phase="sampling"))
-        return self.model_runner.sample_tokens(grammar_output)  # type: ignore[union-attr]
+        step_timer = self.step_timer
+        if step_timer is None:
+            return self.model_runner.sample_tokens(grammar_output)  # type: ignore[union-attr]
+        step_timer.lap("rpc_gap")  # the engine's turn between execute_model and sample_tokens
+        output = self.model_runner.sample_tokens(grammar_output)  # type: ignore[union-attr]
+        step_timer.end_step()
+        return output
 
     @torch.inference_mode()
     def execute_model(
@@ -1322,6 +1357,9 @@ class HPUWorker(WorkerBase):
             self.step_debug(f"step={self.step}")
         if self.step_profiler and self.step == self.profile_steps[0]:
             self.step_profiler.start()
+        step_timer = self.step_timer
+        if step_timer is not None:
+            step_timer.begin_step()
         with track_graph_compile("HPUWorker.execute_model") if self.gc_track_recompiles else contextlib.nullcontext():
             if getattr(self.model_runner, "fatal_execution_errors", False):
                 from vllm_gaudi.ops.deepseek_v41_failure import execute_guarded, guard_async
@@ -1331,6 +1369,10 @@ class HPUWorker(WorkerBase):
                 )
             else:
                 output = self.model_runner.execute_model(scheduler_output)  # type: ignore[union-attr]
+        if step_timer is not None:
+            step_timer.lap("execute_model")
+            if output is not None:
+                step_timer.end_step()  # no sample_tokens call follows (nothing scheduled, or a pooling step)
         # TODO(woosuk): Send the output to the engine process.
         if self.step_profiler:
             if self.step >= self.profile_steps[0]:

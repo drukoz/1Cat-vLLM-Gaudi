@@ -62,6 +62,9 @@ usage() {
     echo "                    gate fused_gdn passed, otherwise VLLM_HPU_MOE_GLUE=0 and the run goes on with"
     echo "                    the torch MoE glue; a tiny gate that fails with the kernels runs once more"
     echo "                    without them (one retry for --hc-fused and --moe-glue together)"
+    echo "  --anatomy         after each variant's first token, run the step-anatomy probe against its first"
+    echo "                    server with the step timer on (passed to the orchestrator): host spans, ops and"
+    echo "                    device waits at 1, 8 and 32 streams in <variant>/anatomy_summary.md (about 6 min)"
     echo "  --load-read-timeout S     measured load: seconds a request may go without receiving data"
     echo "                    (passed to the orchestrator; its default: 1800)"
     echo "  --warm-request-timeout S  warm pass: seconds a request may go without receiving data, first"
@@ -187,6 +190,7 @@ LOAD_READ_TIMEOUT=""
 WARM_REQUEST_TIMEOUT=""
 HC_FUSED=0
 MOE_GLUE=0
+ANATOMY=0
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -285,6 +289,10 @@ while [ $# -gt 0 ]; do
             ;;
         --moe-glue)
             MOE_GLUE=1
+            shift
+            ;;
+        --anatomy)
+            ANATOMY=1
             shift
             ;;
         --load-read-timeout)
@@ -499,6 +507,8 @@ if [ -n "$WARM_REQUEST_TIMEOUT" ]; then ENTRY_ARGS+=(--warm-request-timeout "$WA
 if [ "$HC_FUSED" -eq 1 ]; then ENTRY_ARGS+=(--hc-fused); fi
 # The same for the MoE glue kernels: the request only, VLLM_HPU_MOE_GLUE is the orchestrator's to set.
 if [ "$MOE_GLUE" -eq 1 ]; then ENTRY_ARGS+=(--moe-glue); fi
+# The step-anatomy probe after each variant's first token (tools/flash_next/anatomy).
+if [ "$ANATOMY" -eq 1 ]; then ENTRY_ARGS+=(--anatomy); fi
 # Appended last so the --dry-run line ends with --no-warm-pass.
 if [ "$NO_WARM_PASS" -eq 1 ]; then ENTRY_ARGS+=(--no-warm-pass); fi
 
