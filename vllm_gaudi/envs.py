@@ -532,14 +532,23 @@ if TYPE_CHECKING:
     VLLM_HPU_GDN_CORE_DECODE: int = 1  # GdnCoreDecodeMode: 1 fused (default), 0 off, 2 recurrence
     VLLM_HPU_GDN_CORE_DECODE_DEBUG: int = 0  # GdnCoreDecodeDebug: 0 off, 1 check slot indices every step (host sync)
     VLLM_HPU_GDN_CORE_VERIFY: int = 0  # GdnCoreVerifyMode: 0 off (default), 1 fused verification steps
+    VLLM_HPU_GDN_KERNEL_INTERLEAVE: int = 0  # 0 today's GDN decode/verify kernels, 1 four value rows per iteration
+    VLLM_HPU_GDN_GLUE_CACHE: int = 0  # 0 per-step glue of the fused GDN ops (default), 1 constants and indices cached
     VLLM_HPU_PLE_HOST_NGRAM_IDS: int = 0  # 0 PLE n-gram ids computed in the graph (default), 1 on the host
     VLLM_HPU_HC_FUSED: int = 0  # 0 torch hyper-connections (default), 1 the fused hyper-connection kernels
     VLLM_HPU_MOE_GLUE: int = 0  # 0 torch MoE glue (default), 1 the fused MoE glue kernels
+    VLLM_HPU_MOE_GLUE_MERGE_GATE_UP: int = 0  # with VLLM_HPU_MOE_GLUE=1: 1 merges the gate_up GEMM into the gate GEMM
+    VLLM_HPU_HC_FUSED_COPY_MODE: int = 0  # copies before a fused HC op: 0 all, 1 not its own outputs, 2 block output
     VLLM_HPU_COLLECTIVE_MARK_STEP: int = 1  # 1 (default) mark_step() before every HPU collective, 0 none
     VLLM_HPU_STEP_TIMING: int = 0  # StepTimingMode: 0 off (default), 1 spans, 2 sync counters, 3 device waits
     VLLM_HPU_STEP_TIMING_COMPONENTS: int = 0  # 0 (default) none, 1 mode 3 also waits around every model component
     VLLM_HPU_STEP_TIMING_EVERY: int = 100  # steps per log line and JSON record of the step timer
     VLLM_HPU_STEP_TIMING_DIR: str = ""  # folder of the step timer's JSON files ("" = the working directory)
+    VLLM_HPU_VOCAB_PARALLEL_LOGITS: int = 0  # VocabParallelMode: 0 logits all-gather (default), 1 greedy, 2 candidates
+    VLLM_HPU_REPLICATED_EMBEDDING: int = 0  # 0 vocabulary-sharded token embedding (default), 1 one full copy per rank
+    VLLM_HPU_MTP_REPLICATED_FC: int = 0  # 0 the MTP fc linears shard and all-gather (default), 1 unsharded
+    VLLM_HPU_PLE_TABLE_RIDER: int = 0  # 0 the PLE table rows get their own all-reduce (default), 1 on the embedding's
+    VLLM_HPU_ALL_REDUCE_AS_GATHER_ROWS: int = 0  # all-reduces of at most N rows run as all-gather + local sum; 0 never
     VLLM_HPU_RECURRENT_STATE_POOL: int = 0  # RecurrentStatePoolMode: 0 off, 1 pool
     VLLM_HPU_RECURRENT_STATE_POOL_SLOTS: int = 0  # resolved by the hook; positive overrides the formula
     VLLM_HPU_RECURRENT_STATE_POOL_CACHE_SLOTS: int = 512  # retained prefix states added to the live need
@@ -1886,6 +1895,26 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_HPU_GDN_CORE_DECODE_DEBUG":
     lambda: int(os.environ.get("VLLM_HPU_GDN_CORE_DECODE_DEBUG", "0")),
 
+    # The kernels behind the fused GDN decode and verification ops (libgdn_fused_gaudi2.so). 0 (default) =
+    # today's kernels; 1 = their interleaved builds, which carry four value rows per iteration of the
+    # recurrence instead of one: the same operations in the same order for every row, so outputs and states
+    # are bit-identical, with 2.91x (decode) and 2.7x (verify) fewer TPC instructions in the Gaudi2 simulator
+    # (idea I27). Read by the kernel library's host glue (csrc/gdn_fused/host/gdn_kernel_variant.hpp) each
+    # time the graph compiler instantiates the kernel, so it must be in the environment of the serving
+    # process; a library built without the interleaved kernels serves today's. Any other value is 0.
+    "VLLM_HPU_GDN_KERNEL_INTERLEAVE":
+    lambda: int(os.environ.get("VLLM_HPU_GDN_KERNEL_INTERLEAVE", "0")),
+
+    # The glue of the fused GDN decode and verify ops (idea I25). 0 (default) = every layer, every step, copies
+    # the transposed conv weight, casts dt_bias to fp32, selects its cache group's state indices, clones them
+    # to int32 and makes an output buffer the fused op replaces. 1 = the conv weight and dt_bias come from
+    # buffers filled at load by the weight-loader hooks, the state indices (and the verify step's row
+    # metadata) are selected and cloned once per step and cache group and shared by its layers, and no dead
+    # buffer is made. The same tensors reach the ops, so outputs are bit-identical. Read once per layer at
+    # construction; a layer whose hooks did not run makes the per-step copies. Any other value is 0.
+    "VLLM_HPU_GDN_GLUE_CACHE":
+    lambda: int(os.environ.get("VLLM_HPU_GDN_GLUE_CACHE", "0")),
+
     # Flash-Next GDN speculative verification steps (MTP) through the fused verify op
     # (flashinfer_gaudi.gdn_core_verify). 0 (default) = off (the torch path), 1 = fused.
     # Off until the rental's gate G1b has checked the op on a card; see
@@ -1920,6 +1949,27 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_HPU_MOE_GLUE":
     lambda: int(os.environ.get("VLLM_HPU_MOE_GLUE", "0")),
 
+    # With VLLM_HPU_MOE_GLUE=1 only: 1 adds the shared expert's gate_up rows to the block's merged gate
+    # weight (router rows, shared-gate row, then this rank's gate_up rows), so one GEMM gives the router
+    # logits, the shared-gate logit and the shared expert's gate_up output, and moe_silu_mul reads its block
+    # where it is (first_column = experts + 1). 0 (default) keeps the separate gate_up GEMM; any other value
+    # is 0. Read once per MoE block at construction. A block whose gate_up projection is not a plain bf16
+    # linear without bias logs one line and keeps the separate GEMM; the rest of the glue is unchanged.
+    "VLLM_HPU_MOE_GLUE_MERGE_GATE_UP":
+    lambda: int(os.environ.get("VLLM_HPU_MOE_GLUE_MERGE_GATE_UP", "0")),
+
+    # (Declared here because tests pin GDN_CORE_VERIFY, HC_FUSED, MOE_GLUE and MOE_GLUE_MERGE_GATE_UP as
+    # neighbours.) With VLLM_HPU_HC_FUSED=1 only: which activations get an owned copy before a fused
+    # hyper-connection op (a custom HPU op is never given a view: card job 00043, 2026-11-20, and a view that
+    # reaches one fails the step, there is no fallback). 0 = every activation, six copies per hyper-connection
+    # (default); 1 = not the tensors the hyper-connection makes inside the call (its norm output and its two
+    # GEMM outputs), three copies; 2 = as 1, and no copy of a residual or an injection that is the very tensor
+    # a fused hyper-connection op returned, which is how the model's layers chain them: one copy, the block
+    # output's. Whatever else a caller hands in (a view, another op's result) is copied as before. Any other
+    # value is 0. Read once per layer at construction. Not yet run on a card.
+    "VLLM_HPU_HC_FUSED_COPY_MODE":
+    lambda: int(os.environ.get("VLLM_HPU_HC_FUSED_COPY_MODE", "0")),
+
     # The htorch.core.mark_step() that HpuCommunicator issues before every all-reduce and all-gather
     # (a workaround for a Habana bridge bug with PT_HPU_ENABLE_LAZY_COLLECTIVES). 1 (default) keeps it.
     # 0 removes it: an experiment for a card, where a Flash-Next TP8 decode step has 99 collectives and
@@ -1951,6 +2001,36 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Folder of the step timer's files (step_timing_<role>_r<rank>_<pid>.jsonl); "" is the working directory.
     "VLLM_HPU_STEP_TIMING_DIR":
     lambda: os.environ.get("VLLM_HPU_STEP_TIMING_DIR", ""),
+    # Collective cuts of a tensor-parallel Flash-Next step (docs/design/flash-next/collectives.md). All default 0.
+    # VLLM_HPU_VOCAB_PARALLEL_LOGITS: 0 = every consumer gets the all-gathered logits; 1 = arg-max consumers
+    # (plain greedy decode, MTP drafts, greedy MTP verification) reduce each rank's vocabulary shard first and
+    # gather [rows, 2] fp32 per rank; 2 = 1, and vocab_parallel.top_k (the call of a sampler stage that draws
+    # from candidates, and of sampled verification) gathers each rank's k largest logits with their ids instead
+    # of the logits. Any other value is 0. Not yet run on a card.
+    "VLLM_HPU_VOCAB_PARALLEL_LOGITS":
+    lambda: int(os.environ.get("VLLM_HPU_VOCAB_PARALLEL_LOGITS", "0")),
+    # VLLM_HPU_REPLICATED_EMBEDDING=1: every rank holds the whole token embedding of a Flash-Next model
+    # (about 1.1 GiB more per card at TP8) and looks its rows up alone, so the embedding all-reduce is gone,
+    # in the target and in the MTP draft. Read when the model is built. Not yet run on a card.
+    "VLLM_HPU_REPLICATED_EMBEDDING":
+    lambda: int(os.environ.get("VLLM_HPU_REPLICATED_EMBEDDING", "0")),
+    # VLLM_HPU_MTP_REPLICATED_FC=1: the two hidden x hidden linears at the entry of the Flash-Next MTP draft
+    # (fc_embedding, fc_hidden) are built unsharded, so the two all-gathers of every draft step are gone
+    # (about 11 MiB more per card for each). Read when the draft is built. Not yet run on a card.
+    "VLLM_HPU_MTP_REPLICATED_FC":
+    lambda: int(os.environ.get("VLLM_HPU_MTP_REPLICATED_FC", "0")),
+    # VLLM_HPU_PLE_TABLE_RIDER=1: the Flash-Next target looks its PLE n-gram table rows up before the token
+    # embedding and sums both over the ranks in one all-reduce (extra columns), so the table's own all-reduce
+    # is gone. Needs the vocabulary-sharded embedding (no effect with VLLM_HPU_REPLICATED_EMBEDDING=1).
+    # Not yet run on a card.
+    "VLLM_HPU_PLE_TABLE_RIDER":
+    lambda: int(os.environ.get("VLLM_HPU_PLE_TABLE_RIDER", "0")),
+    # VLLM_HPU_ALL_REDUCE_AS_GATHER_ROWS=N > 0: an HPU tensor-parallel all-reduce of at most N rows (first dim)
+    # runs as an all-gather of every rank's partial and a local fp32 sum (the same bits on every rank); larger
+    # ones stay all-reduces. 0 (default) = never. For the small decode buckets, where one gather phase may cost
+    # less than the two phases of an all-reduce (C4 without the kernel). Not yet run on a card.
+    "VLLM_HPU_ALL_REDUCE_AS_GATHER_ROWS":
+    lambda: int(os.environ.get("VLLM_HPU_ALL_REDUCE_AS_GATHER_ROWS", "0")),
 
     # Recurrent (GDN / short-conv) state pool: 0 (default) keeps today's
     # one-recurrent-slot-per-attention-block-id allocation, 1 gives the

@@ -100,6 +100,31 @@ step, and the plain step after one, through
 (`GDN core verify ... is off for <layer>: <reason>`) and runs the torch path.
 It stays off until the rental's gate G1b has checked the op on a card.
 
+`VLLM_HPU_GDN_KERNEL_INTERLEAVE` (integer, default `0`) selects the TPC kernels
+behind `gdn_core_decode` and `gdn_core_verify`. `1` hands the graph compiler
+their interleaved builds (`kernels/gdn_core_decode_interleaved_gaudi2.c`,
+`kernels/gdn_core_verify_interleaved_gaudi2.c`), which carry four value rows
+per iteration of the recurrence instead of one: every row's operations and
+their order are unchanged, so outputs and states are bit-identical, and the
+Gaudi2 simulator executes 2.91x (decode) and 2.7x (verify) fewer instructions.
+The kernel library's host glue reads the variable when the graph compiler
+instantiates a kernel, so it must be set in the serving process's environment;
+a recipe compiled before the change keeps its kernel. A library built without
+the interleaved kernels (one that did not compile, or
+`-DGDN_FUSED_INTERLEAVE=OFF`) serves today's kernels. Any other value is `0`.
+
+`VLLM_HPU_GDN_GLUE_CACHE` (integer, default `0`) selects how a GDN layer
+prepares the inputs of the fused decode and verify ops. `0` makes them every
+step in every layer: the transposed conv weight, dt_bias cast to fp32, its cache
+group's row of the state indices and their int32 copies (and the verify step's
+row metadata), and an output buffer that the fused op's output replaces. `1`
+takes the conv weight and dt_bias from buffers that the weight-loader hooks
+fill at load, makes the state indices and their copies (and the verify row
+metadata) once per step and cache group for all of its layers, and makes no
+dead buffer. The ops get the same values, so the outputs are bit-identical. A
+layer whose hooks did not run makes the per-step copies. Any other value is
+`0`.
+
 `VLLM_HPU_HC_FUSED` selects the path of the Flash-Next hyper-connections as an
 integer. `0` (default) keeps the torch path. `1` runs the element-wise parts of
 every hyper-connection (the grouped norm, the silu with the injection split, the
@@ -117,8 +142,34 @@ kernels are not loaded, or whose input they do not take (not 2-D bfloat16 and
 contiguous, a hidden size that is not a multiple of 128), logs one warning
 (`HC fused (VLLM_HPU_HC_FUSED=1) is off for <layer>: <reason>; using the torch
 path`) and runs the torch path. With `0` the kernels are not loaded and their
-ops are not registered. The kernels pass the Gaudi2 instruction simulator and
-have not run on a card; see `docs/design/flash-next/hc-fused.md`.
+ops are not registered. In lazy mode the kernels need the bridge's accumulation
+thread off: with the flag at `1` the plugin sets `PT_HPU_LAZY_ACC_PAR_MODE=0`
+at start when the variable is unset, and a lazy process that has it at another
+value gets no kernels (the startup warning says so) and runs the torch path.
+`VLLM_HPU_MOE_GLUE=1` follows the same rule. The kernels pass the Gaudi2
+instruction simulator and their card test (90 of 90 on 2026-11-20 with the
+thread off); see `docs/design/flash-next/hc-fused.md` and
+`docs/design/flash-next/native-extensions.md`.
+
+`VLLM_HPU_HC_FUSED_COPY_MODE` (integer, default `0`) applies only with
+`VLLM_HPU_HC_FUSED=1`. A custom HPU op is never given a view (on a card every
+view raised `Empty tensor optional ... Strided Params Has Value: 1`, also with
+the accumulation thread off, and the refusal comes when the graph is launched:
+the step fails, a layer cannot fall back), so the fused ops get owned copies of
+their activations. `0` copies every activation: six copies per hyper-connection
+(residual, block output and injection for the combine, the down GEMM output for
+the silu, the norm output and the up GEMM output for the gated mix), about 580
+graph nodes per decode step of the 48-layer model. `1` leaves out the three
+tensors the hyper-connection makes inside the call (its norm output and its two
+GEMM outputs), which are op outputs and never views. `2` also leaves out a
+residual or an injection that is the very tensor a fused hyper-connection op
+returned (the ops mark their outputs), which is how the model's layers chain
+them: one copy per hyper-connection is left, the block output's (an attention
+or MoE block may return a view of its result). Whatever else a caller hands in
+is copied as in mode `1`: the first hidden state, a residual that went through
+another op, the MTP draft layer's `flatten` view of its input. Any other value
+is `0`. The flag is read once per layer at construction. The values are the
+same in every mode. Not yet run on a card.
 
 `VLLM_HPU_MOE_GLUE` selects the path of the element-wise ops of the Flash-Next
 MoE block as an integer. `0` (default) keeps the torch path. `1` computes the
@@ -143,6 +194,18 @@ logits the routing kernel takes the lowest expert id, where `torch.topk`
 leaves the choice open. With `0` nothing is loaded, registered or logged. The
 kernels pass the Gaudi2 instruction simulator and have not run on a card; see
 `docs/design/flash-next/hc-fused.md` ("MoE glue kernels").
+
+`VLLM_HPU_MOE_GLUE_MERGE_GATE_UP` (integer, default `0`) applies only with
+`VLLM_HPU_MOE_GLUE=1`. `1` appends the shared expert's gate_up rows of this
+rank to the block's merged gate weight (built once at load, a second
+non-persistent buffer), so one GEMM gives the router logits, the shared-gate
+logit and the shared expert's gate_up output, and `moe_silu_mul` reads the
+gate_up block in that output from column `experts + 1` on: one GEMM per MoE
+block less (48 per decode step on Flash-Next). `0` keeps the separate gate_up
+GEMM; any other value is `0`. A block whose gate_up projection is not a plain
+bfloat16 linear without bias logs one warning (`MoE glue
+(VLLM_HPU_MOE_GLUE_MERGE_GATE_UP=1) keeps the separate gate_up GEMM for
+<layer>: <reason>`) and runs the rest of the glue unchanged.
 
 `VLLM_HPU_RECURRENT_STATE_POOL` selects the allocation mode for the recurrent
 (GDN / short-conv) state slots as an integer. `0` (default) keeps today's
@@ -419,6 +482,11 @@ prepared-model entrypoint and disabled in the generic entrypoint.
 | `VLLM_HPU_TRITON_SILU_BLOCK_SIZE` | Power-of-two row chunk used to distribute each fused SiLU-and-mul row across Gaudi2 TPC engines; accepted range is 128–1024. | `128` |
 | `VLLM_HPU_TRITON_GDN_VALUE_TILE` | Value rows owned by each experimental Qwen3.5 packed GDN decode program; accepted values are 16, 32, 64, and 128. | `16` |
 | `VLLM_HPU_PLE_HOST_NGRAM_IDS` | Flash-Next only: where the PLE n-gram ids are computed. `0` computes them inside every graph (token packing, `searchsorted`, the EOS shift scan, the int32 hash). `1` computes the same ids on the host when a batch is built and passes them to the model as the int32 input `ple_ngram_ids`, which removes those ops from every prompt and decode graph (speculative verification steps included). A batch whose token ids are not all on the host (async scheduling, merged prefill) keeps the in-graph path and logs the reason once. Not yet checked on a card. | `0` |
+| `VLLM_HPU_VOCAB_PARALLEL_LOGITS` | Tensor-parallel models with a vocabulary-sharded LM head: consumers that need only the arg max do not all-gather the logits (`docs/design/flash-next/collectives.md`). `1`: plain greedy decode requests (the same gate as `VLLM_HPU_FUSED_GREEDY_LOGITS`, which this value also opens), the greedy verification of a Flash-Next MTP step and the MTP drafts take the largest logit of each rank's own vocabulary shard (lowest id on ties) and gather `[rows, 2]` fp32 per rank instead of `[rows, vocab]` (497 KB per row for Flash-Next). Requests with sampling, logprobs, `min_tokens`, penalties, logit bias, token masks or structured output keep the gathered logits. `2`: as `1`, and `vocab_parallel.top_k(model, hidden_states, k)`, the call of a sampler stage that draws from candidates (`VLLM_HPU_CANDIDATE_SAMPLING`), does not gather the logits either: each rank sends its `k` largest logits with their ids (`[rows, 2k]` fp32 per rank) and the top `k` of those is returned, the same values as `topk` over the gathered logits. Every token a top-k of at most `k` keeps is among them unless more than `k` such tokens lie in one rank's shard. Any other value is `0`. Not yet run on a card. | `0` |
+| `VLLM_HPU_REPLICATED_EMBEDDING` | Flash-Next only, read when the model is built: `1` gives every rank the whole token embedding (about 1.1 GiB more per card at TP8), so the all-reduce after the vocabulary-sharded lookup is gone from every target step and every MTP draft step. A model that ties its LM head to the embedding keeps the sharded table. Not yet run on a card. | `0` |
+| `VLLM_HPU_PLE_TABLE_RIDER` | Flash-Next only: `1` looks the PLE n-gram table rows up before the token embedding and sums both over the ranks in one all-reduce (the table rows as extra columns), so the table's own all-reduce is gone from every target step; the result is the same bit for bit. Needs the vocabulary-sharded embedding: with `VLLM_HPU_REPLICATED_EMBEDDING=1` nothing changes. Not yet run on a card. | `0` |
+| `VLLM_HPU_ALL_REDUCE_AS_GATHER_ROWS` | `N > 0`: an HPU tensor-parallel all-reduce whose input has at most `N` rows (first dimension) runs as an all-gather of every rank's partial and a local fp32 sum, the same bits on every rank; larger ones stay all-reduces (`docs/design/flash-next/collectives.md`, C4 without the fused kernel). The gather moves 7 times the payload at 8 ranks; it can pay only where one gather phase costs less than an all-reduce. `0` never. Not yet run on a card. | `0` |
+| `VLLM_HPU_MTP_REPLICATED_FC` | Flash-Next MTP only, read when the draft is built: `1` builds the draft's two hidden-by-hidden entry linears (`fc_embedding`, `fc_hidden`) unsharded, which removes their two all-gathers from every draft step (a 2560 x 2560 bf16 matrix each: about 11 MiB more per card each). Not yet run on a card. | `0` |
 
 The Gaudi2 backend routes supported contiguous BF16 residual RMSNorm calls with
 hidden sizes up to 8192 to one Triton-generated TPC kernel. It returns both the

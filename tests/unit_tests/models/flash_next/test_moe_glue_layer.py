@@ -36,8 +36,10 @@ GLUE_OPS = "flashinfer_gaudi.moe_"
 # One MoE block forward on the plugin's fast path with the flag at 0, recorded before the glue existed
 # (tiny fixture, CPU torch, the vendor ops as one entry each): (ops, non-view ops, sha256 of the op names)[:16].
 FLAG_OFF_OPS = {"bf16": (28, 16, "72e208cbedd5b0b5"), "fp8": (37, 24, "5c4f995594120e29")}
-# The same forward with the flag at 1.
-FLAG_ON_OPS = {"bf16": (17, 8), "fp8": (18, 9)}
+# The same forward with the flag at 1. No custom op is given a view (a card refuses one): the monolithic method
+# returns the vendor op's output without its output.view(...) (one view less than before), and the FP8 block
+# copies the input of moe_row_quant, which is a view on every call (one aten.clone more).
+FLAG_ON_OPS = {"bf16": (16, 8), "fp8": (18, 10)}
 ROWS = (1, 2, 32, 300)
 # Ops that read a tensor's data on the host or whose output shape depends on data.
 HOST_READS = ("aten._local_scalar_dense", "aten.item", "aten.nonzero", "aten.masked_select", "aten.unique",
@@ -513,3 +515,36 @@ def test_fp32_model_falls_back_with_one_line_per_layer(tiny_checkpoint, monkeypa
                 block(x)
         names = [block.experts.layer_name for block in blocks]
     _assert_one_line_per_layer(lines, names, "bfloat16")
+
+
+@pytest.mark.parametrize("merge", ["0", "1"], ids=["separate_gate_up", "merged_gate_up"])
+@pytest.mark.parametrize("mode", ["bf16", "fp8"])
+def test_no_glue_op_is_ever_given_a_view(tiny_checkpoint, monkeypatch, lines, mode, merge):
+    """Every tensor a MoE glue op gets is a tensor of its own, not a view.
+
+    The lazy bridge hands a view to a custom op as a graph input without data, also with the accumulation
+    thread off (card probe probe_view_inputs.py, 2026-11-20: 7 of 7 view cases raised at mode 0). The FP8 block
+    gives the row quantization ``x.view(-1, H)``; the op must get a copy of it.
+    """
+    monkeypatch.setenv(FLAG, "1")
+    monkeypatch.setenv("VLLM_HPU_MOE_GLUE_MERGE_GATE_UP", merge)
+    from flashinfer_gaudi import moe_glue
+
+    views: list[tuple[str, int]] = []
+    calls: list[str] = []
+    for name in moe_glue.OP_NAMES:
+        real = getattr(moe_glue, name)
+
+        def wrapped(*args, _name=name, _real=real):
+            calls.append(_name)
+            for index, arg in enumerate(args):
+                if isinstance(arg, torch.Tensor) and (arg._is_view() or not arg.is_contiguous()):
+                    views.append((_name, index))
+            return _real(*args)
+
+        monkeypatch.setattr(moe_glue, name, wrapped)
+    outputs, _, states, _, _ = _run_blocks(tiny_checkpoint, mode, rows=(1, 32))
+    assert lines == []
+    assert [state.ok for state in states] == [True] * 4
+    assert set(calls) == {"moe_route", "moe_silu_mul", "moe_combine"} | ({"moe_row_quant"} if mode == "fp8" else set())
+    assert views == [], f"glue ops were given views: {sorted(set(views))}"

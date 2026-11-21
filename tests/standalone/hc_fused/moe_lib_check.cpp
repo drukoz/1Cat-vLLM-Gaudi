@@ -126,7 +126,13 @@ bool RowIs(const TensorAccessPattern& pattern, float first, float last)
 }
 
 Node RouteNode() { return Node(kMoeGlueRouteGuid, {Matrix({513, 3})}, {Matrix({10, 3}, DATA_I32), Matrix({10, 3})}); }
-Node SiluMulNode() { return Node(kMoeGlueSiluMulGuid, {Matrix({160, 3})}, {Matrix({80, 3})}); }
+// silu_mul reads its gate_up block from column gate_column on: 0 for the gate_up GEMM output itself.
+Node SiluMulNode(uint64_t columns = 160, int32_t firstColumn = 0, uint64_t width = 80)
+{
+    Node node(kMoeGlueSiluMulGuid, {Matrix({columns, 3})}, {Matrix({width, 3})});
+    node.scalar.gate_column = firstColumn;
+    return node;
+}
 Node CombineNode()
 {
     return Node(kMoeGlueCombineGuid, {Matrix({2560, 3}), Matrix({513, 3}), Matrix({2560, 3})}, {Matrix({2560, 3})});
@@ -235,14 +241,41 @@ void CheckSiluMul()
                "silu_mul/index_space_and_patterns");
     }
     {
-        Node node(kMoeGlueSiluMulGuid, {Matrix({161, 3})}, {Matrix({80, 3})});
+        Node node = SiluMulNode(161);
         Expect(node.Instantiate(), GLUE_INCOMPATIBLE_INPUT_SIZE, "silu_mul/odd_columns");
     }
     {
-        Node node(kMoeGlueSiluMulGuid, {Matrix({160, 3})}, {Matrix({160, 3})});
+        Node node = SiluMulNode(160, 0, 160);
         Expect(node.Instantiate(), GLUE_INCOMPATIBLE_OUTPUT_SIZE, "silu_mul/output_size");
         Report(node.out[0].geometry.maxSizes[0] == 80 && node.out[0].geometry.maxSizes[1] == 3,
                "silu_mul/output_size_reported");
+    }
+    {
+        // The gate_up GEMM merged into the gate GEMM: 512 router columns, the shared-gate column, then
+        // the 2 * 80 gate_up columns of one rank at TP8. The kernel gets the first column of the block.
+        Node node = SiluMulNode(673, 513);
+        Expect(node.Instantiate(), GLUE_SUCCESS, "silu_mul/merged_instantiate");
+        Report(node.instance.indexSpaceRank == 1 && node.instance.indexSpaceGeometry[0] == 3 &&
+                   RowIs(node.inPatterns[0], 0, 672) && RowIs(node.outPatterns[0], 0, 79) && node.HasElf() &&
+                   node.Args().gate_column == 513 && node.Args().experts == 512 && node.Args().inv_fp8_max == 0.0f,
+               "silu_mul/merged_index_space_patterns_and_scalars");
+    }
+    {
+        Node node = SiluMulNode(674, 513);  // 161 columns from the first one on
+        Expect(node.Instantiate(), GLUE_INCOMPATIBLE_INPUT_SIZE, "silu_mul/merged_odd_block");
+    }
+    {
+        Node node = SiluMulNode(673, 513, 336);  // the output of an unmerged call on the same input
+        Expect(node.Instantiate(), GLUE_INCOMPATIBLE_OUTPUT_SIZE, "silu_mul/merged_output_size");
+        Report(node.out[0].geometry.maxSizes[0] == 80, "silu_mul/merged_output_size_reported");
+    }
+    {
+        Node node = SiluMulNode(160, 160);
+        Expect(node.Instantiate(), GLUE_KERNEL_INVALID_SCALAR_ARGUMENT, "silu_mul/first_column_past_the_row");
+    }
+    {
+        Node node = SiluMulNode(160, -2);
+        Expect(node.Instantiate(), GLUE_KERNEL_INVALID_SCALAR_ARGUMENT, "silu_mul/first_column_negative");
     }
 }
 
@@ -284,8 +317,10 @@ void CheckRowQuant()
     {
         Node node = RowQuantNode();
         Expect(node.Instantiate(), GLUE_SUCCESS, "row_quant/instantiate");
+        // The reciprocal is rounded to bf16, 0x1.12p-8: a card divides a bf16 tensor by 240 as a product
+        // with this constant (first card run, 2026-11-20), and the kernel must give the card's scale.
         Report(node.instance.indexSpaceRank == 1 && node.instance.indexSpaceGeometry[0] == 3 &&
-                   node.Args().inv_fp8_max == 1.0f / 240.0f,
+                   node.Args().inv_fp8_max == 0x1.12p-8f && node.Args().inv_fp8_max != 1.0f / 240.0f,
                "row_quant/index_space_and_args");
         Report(RowIs(node.inPatterns[0], 0, 2559) && RowIs(node.outPatterns[0], 0, 2559) &&
                    RowIs(node.outPatterns[1], 0, 0) && node.HasElf(),
@@ -381,6 +416,8 @@ void CheckShapeInference(const std::string& prefix, int modes)
         Report(result == GLUE_SUCCESS && ShapeIs(out[0], 10, 7) && ShapeIs(out[1], 10, 7), tag + "route");
         result = Infer(kMoeGlueSiluMulGuid, mode, {Matrix({160, 7})}, 1, MoeGlueParams{0, 0, 0, 0.0f}, out);
         Report(result == GLUE_SUCCESS && ShapeIs(out[0], 80, 7), tag + "silu_mul");
+        result = Infer(kMoeGlueSiluMulGuid, mode, {Matrix({673, 7})}, 1, MoeGlueParams{0, 0, 513, 0.0f}, out);
+        Report(result == GLUE_SUCCESS && ShapeIs(out[0], 80, 7), tag + "silu_mul_merged");
         result = Infer(kMoeGlueCombineGuid, mode, {Matrix({2560, 7}), Matrix({513, 7}), Matrix({2560, 7})}, 1,
                        MoeGlueParams{0, 0, 512, 0.0f}, out);
         Report(result == GLUE_SUCCESS && ShapeIs(out[0], 2560, 7), tag + "combine");

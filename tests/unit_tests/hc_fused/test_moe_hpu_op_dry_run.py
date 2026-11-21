@@ -20,8 +20,9 @@ CARD_TEST = "tests/unit_tests/hc_fused/test_moe_hpu_op.py"
 
 
 def _pytest(env_overrides: dict) -> subprocess.CompletedProcess:
+    """The card test as the rental gate runs it (tools/flash_next/rental/gates.py): ``pytest -q -rs``, no ``-s``."""
     env = dict(os.environ, PYTHONPATH=str(REPO_ROOT), VLLM_PLUGINS="", **env_overrides)
-    return subprocess.run([sys.executable, "-m", "pytest", "-q", "-rs", "-p", "no:cacheprovider", "-s", CARD_TEST],
+    return subprocess.run([sys.executable, "-m", "pytest", "-q", "-rs", "-p", "no:cacheprovider", CARD_TEST],
                           cwd=REPO_ROOT, capture_output=True, text=True, timeout=1800, env=env)
 
 
@@ -32,11 +33,16 @@ def test_the_card_test_passes_as_a_dry_run_on_cpu():
     summary = re.search(r"(\d+) passed", text)
     assert summary and int(summary.group(1)) >= 80, text[-2000:]
     assert " skipped" not in text.splitlines()[-1] and " failed" not in text.splitlines()[-1]
-    # the measurements an operator reads after a card run are printed
+    # The measurements an operator reads after a card run are in the log although every test passed and pytest
+    # captured their output: the card test prints them once more after its last test.
     for needle in ("MOEHPU vendor op fed by moe_route", "MOEHPU vendor op with the routing slots reversed",
                    "MOEHPU all-equal logits", "MOEHPU row_quant_real_stress against dynamic_quant",
-                   "MOEHPU chain of one block at 32 rows", "MOECASE route_prefill_r2048"):
+                   "MOEHPU chain of one block at 32 rows", "MOECASE route_prefill_r2048",
+                   "MOEHPU route_real_r16 ids: moe_route returns the kernel's rule (CPU) on 16 of 16 rows; the card's "
+                   "torch path returns CPU torch.topk's set on 15 of the 15 rows that do not tie at the cut",
+                   "MOEHPU row_quant_real_r32 against dynamic_quant on the card: 0 of 32 scales and 0 of 81920 fp8"):
         assert needle in text, needle
+    assert re.search(r"MOEHPU measurements of this run \((\d+) lines, passed tests included\):", text)
 
 
 def test_the_card_test_skips_as_a_whole_without_a_card():
