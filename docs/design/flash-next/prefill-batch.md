@@ -48,7 +48,7 @@ report files under `reports/`); scratch tools are in `/Volumes/Storage/Claude/ga
   `ple_layer.py` per request, the flag, new test files only. Seam: the 2D prompt bucket [bs, T_bucket] of padded
   rows (the form every model path already has); (a)'s checkpoint metadata is per row with row-local offsets.
 - **Design note**: below (sent to the coordinator 12:31 UTC; v1 approved 12:36 UTC).
-- **Next**: read 00257 / 00258 when they end; report the per-forward or per-row answer (burst probe) and the agent-loop
+- **Next**: read 00257 / 00267 when they end; report the per-forward or per-row answer (burst probe) and the agent-loop
   A/B to the coordinator; if merges are rare at 16K to 56K under the 64,000 graph bound, say what bound v1 needs and
   what it costs in KV capacity (the owner's trade). Then the PR of v1 (default off; gate: models/flash_next,
   platform, worker/test_prefill_batch_rules.py, test_qwen3_next.py with its two pre-existing red gated-FP8 tests).
@@ -249,3 +249,23 @@ streams and logprobs equal, 14 -> 11 prompt forwards, one merged pair with conte
 Side finding (not this track's, both arms alike): without prefix caching a chunk can start at a context that is not
 a multiple of 4 (333 here), while the QSA prompt indexer assumes 4-aligned contexts (`qsa.py`, "ctx is 4-aligned by
 construction"); only the align mode guarantees it, which every served configuration uses.
+
+## Why v1 merges only equal shapes (INFERRED from the fit of section 1)
+
+Merging a row into a larger bucket pads it: at 10K context each padded query token costs about 0.19 ms (TP4), and a
+merge saves at most the per-forward part, about 80 ms. So a row may be padded by at most about 80 / 0.19 = 420 tokens
+for a merge to pay, and only when the intercept is per forward: a 512-token tail in a 1,024-token batch (512 padded
+tokens, about 98 ms) costs more than it saves; a row padded into a larger context bucket also pays the context-
+dependent per-row work. Equal shapes are the only merges that can never lose; the agent bursts already come as runs
+of equal shapes (00150: a step of eight 896-token heads, the next of eight 512-token tails), consecutive in the
+input batch (running requests first), so neither mixed-shape merging nor reordering the input batch is worth its
+risk before the card has measured the intercept.
+
+## Graph memory: the risk of more prompt shapes (INFERRED)
+
+With warmup skipped every new (rows, query, context) bucket is captured on first use and kept, and prefill measured
+about 1 to 1.5 GB of card memory per prompt graph at contexts up to 32K at TP4 (00014). Merging adds the rows
+dimension (bs buckets 2, 4, 8), so a long run can hold up to four times as many prompt graphs. 00267 logs `hl-smi`
+every 15 s; a `PT_DEVMEM` line or a steady rise during the agent loops in the arm on is this. Mitigations if it shows:
+fewer bs buckets ({1, 4} or {1, 2, 4}), merges only below a context bucket, or a larger `VLLM_GRAPH_RESERVED_MEM`
+(KV capacity).
