@@ -493,7 +493,12 @@ def run_config(LLM, SamplingParams, plan: dict, config: dict, base: dict) -> dic
         if config.get("scenarios") is not None and scenario["name"] not in config["scenarios"]:
             continue
         prompts = _prompts(scenario, base)
-        params = [SamplingParams(temperature=0, max_tokens=r["max_tokens"], detokenize=False)
+        # a sampled configuration (temperature > 0, VLLM_HPU_SPEC_SAMPLED_VERIFY=1): every stream to its
+        # max_tokens, its tokens checked for validity, not against the greedy baseline (no per-request seed: the
+        # fake HPU device cannot make a generator)
+        temperature = float(config.get("temperature", 0))
+        params = [SamplingParams(temperature=temperature, max_tokens=r["max_tokens"], detokenize=False,
+                                 ignore_eos=temperature > 0)
                   for r in scenario["requests"]]
         outs = llm.generate([{"prompt_token_ids": p} for p in prompts], params, use_tqdm=False)
         for request, out in zip(scenario["requests"], outs):

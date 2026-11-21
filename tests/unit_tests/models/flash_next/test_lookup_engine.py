@@ -113,6 +113,41 @@ def hybrid_run(tiny_checkpoint, tmp_path_factory) -> dict:
     return _run_child(plan, tmp_path_factory.mktemp("lookup_engine_hybrid"))
 
 
+@pytest.fixture(scope="module")
+def sampled_run(tiny_checkpoint, tmp_path_factory) -> dict:
+    """Sampled requests (temperature 0.7, VLLM_HPU_SPEC_SAMPLED_VERIFY=1; no per-request seed: the fake HPU device has
+    no generator) with lookup drafts: the n-gram server
+    with ragged oracle drafts (the 1-token placeholder once a stream leaves the baseline) and the hybrid with an
+    oracle lookup (lookup rows padded with -1 to k beside MTP rows)."""
+    plan = _plan(Path(tiny_checkpoint))
+    scenarios = ["solo-solo-7", "solo-solo-100", "near-256", "batch"]
+    sampled = {"VLLM_HPU_SPEC_SAMPLED_VERIFY": "1"}
+    plan["configs"] = [
+        {"name": "ngram-sampled", "speculative_config": NGRAM, "prefix_caching": True, "env": sampled,
+         "oracle": {"schedule": SCHEDULE, "tamper_every": 4}, "temperature": 0.7, "scenarios": scenarios},
+        {"name": "hybrid-sampled", "speculative_config": {"method": "mtp", "num_speculative_tokens": K},
+         "prefix_caching": True, "env": dict(sampled, VLLM_HPU_FLASH_NEXT_SPEC_LOOKUP="1"), "oracle": None,
+         "lookup_oracle": {"schedule": [3, 0, 2, 0, 1, 3, 3]}, "temperature": 0.7, "scenarios": scenarios},
+    ]
+    return _run_child(plan, tmp_path_factory.mktemp("lookup_engine_sampled"))
+
+
+def test_sampled_requests_with_lookup_drafts(sampled_run, tiny_checkpoint):
+    plan_requests = {r["id"]: r for s in _plan(Path(tiny_checkpoint))["scenarios"] for r in s["requests"]}
+    for name in ("ngram-sampled", "hybrid-sampled"):
+        config = sampled_run["configs"][name]
+        assert "error" not in config, f"{name} failed:\n{config.get('error')}"
+        streams = config["streams"]
+        assert len(streams) == 7, (name, sorted(streams))
+        for request_id, tokens in streams.items():
+            # every stream runs to its length, and no padding draft (-1) ever comes out as a token
+            assert len(tokens) == plan_requests[request_id]["max_tokens"], (name, request_id, len(tokens))
+            assert min(tokens) >= 0, (name, request_id, [t for t in tokens if t < 0])
+    # the n-gram server verified ragged widths (placeholder rows) for sampled requests
+    widths = {w["width"] for w in sampled_run["configs"]["ngram-sampled"]["widths"]}
+    assert len(widths) >= 2, widths
+
+
 def _divergences(record: dict, config: str) -> tuple[int, list, list]:
     """``(matched, ties, breaks)`` of ``config`` against the baseline: per request the first token that differs is a
     tie when the speculative token is among the baseline's recorded best tokens there, at most ``TIE`` below the
