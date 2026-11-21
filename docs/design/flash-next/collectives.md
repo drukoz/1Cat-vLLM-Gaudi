@@ -484,7 +484,16 @@ the first throughput line (real-pin 14.9 min) and the per-rank us per launch at 
 8 / 32 against real-pin (INFERRED risk: memory first-touched during an unrestricted load on another NUMA node than the
 share; the node has `numa_balancing=1`). Its answer binds 00210 and integration's build-5 job and async-sched's jobs.
 `place_wrap.sh` b9aac4db (md5 363bcf9d; not in 00219) no longer leaves its health poller behind when the wrapped
-command ends before health (integration runs seven servers in one container). Pending.
+command ends before health (integration runs seven servers in one container). **Ran 09:05 to 09:15 UTC, exit 0,
+arm ok** (`card/00219-real8-place-only-real-place/`). **Place-only works:** 7.7 min to the first throughput line
+(healthy 09:12:39; real-pin 14.9, unpinned 7.5 to 8.1); greedy ms per step at 1 / 8 / 32 streams 24.0, 23.6 / 40.8,
+38.8 / 42.6, 42.0 (real-pin 27.9, 28.1 / 44.8, 45.0 / 45.8, 46.7), sampled 24.7, 24.5 / 39.4, 39.4 / 46.8, 45.4;
+per-rank us per launch at 1 stream 114 98 98 107 124 103 101 117 (median 105; real-pin 125), at 8 streams 104 86 84
+117 116 92 84 122 (median 98; real-pin 119), at 32 streams median 114 (real-pin 133), no slow rank (slowest 1.18 to
+1.24x); `placement.log` the same plan as real-pin, first pass 5117 threads moved (nothing pre-pinned), 0 failed. One
+start each: the further 20 us per launch against pin + place may be per-start spread; the NUMA risk did not show.
+Sent at 09:16 UTC to the coordinator (who writes integration's and async-sched's switches), integration,
+async-sched and native-replay; 00210 bound place-only (no `PIN_KV`) at 09:15 UTC.
 
 **The card queue's CPU layout (coordinator, 06:5x UTC; live since 06:58:07 UTC):** the image-build CPUs 18, 37, 56,
 75, 94, 113, 132, 151 had their hyperthread siblings (vCPUs 2k / 2k+1, native-replay's 00193) inside job cpusets;
@@ -502,22 +511,18 @@ Rollback: `mv ~/farm/q/cpu_layout ~/farm/q/cpu_layout.off`. The plugin's `VLLM_H
 
 ## Handoff (if this agent stops)
 
-State at 09:05 UTC on 2026-11-21 (fourth agent of this track, Opus 5.5). **The node stays until about 00:00 UTC
+State at 09:20 UTC on 2026-11-21 (fourth agent of this track, Opus 5.5). **The node stays until about 00:00 UTC
 on 2026-11-22** (BRIEF 00:50 UTC).
 
-**Now (09:05 UTC), in order:**
-1. **00219 (place-only proof)**: this agent's waiter fetches `card/00219-real8-place-only-real-place/` (else `bin/farm
-   fetch collectives 00219 00219-real8-place-only-real-place`). Report to the coordinator at once, then integration
-   (`a751467dff2502109`, build 5's job 00218 runs every server place-only if it works), async-sched
-   (`a58988ba328b40a9b`) and native-replay: minutes from the arm's start (`ab_bridge: arm real-place: ... [hh:mm:ss]`
-   in the job log) to the first `Avg prompt throughput` line of its `server0.log` (real-pin 14.9, unpinned 7.5 to 8.1),
-   `bridge_verdict.py` on it and on `card/00189-real8-bridge-vendor2-real-pin`, and `placement.log`.
-2. **Then bind 00210** (it starts by 12:57 UTC at the latest): if place-only matches real-pin, remove the `PIN_KV=`
-   line from `~/farm/collectives/bridge/late/00210.env` (keep `SPIN=on`, `REF_PAIR=1`, `PLACE=`, and `LEAN4=0` unless
-   the coordinator wants real-lean4 back); if not, ask the coordinator for the 135 min it offered (resubmit with
-   `--replaces 00210`: the `cmd.sh` of `~/farm/q/jobs/00210/`). Its waiter fetches the arms; report the verdicts, the
-   spinner pair (real-ref against real-ref-alt) and the per-rank per-level coverage to the coordinator, native-replay
-   and engine-step (`a8a87f4c2008bde9c`: plan_hit/plan_try per rank and level).
+**Now (09:20 UTC), in order:**
+1. 00219 (place-only proof) done and reported (section 7): place-only works.
+2. **00210** (starts by 12:57 UTC at the latest, 120 min) is bound: `~/farm/collectives/bridge/late/00210.env` =
+   `SPIN=on`, `REF_PAIR=1`, `PLACE=/results/bench/place.sh`, `LEAN4=0`, `LEAN5=lean6m-43fdd6850644` (published 09:01:25
+   UTC, wheel sha256s checked), `VERIFY_KV=PT_HPU_HPUGRAPH_STATIC_PLAN_MISS_LOG=200`; no pin. This agent's waiters fetch
+   every arm (`card/00210-real8-bridge-reuse2-*`, verdicts) and, as soon as real-lean5-verify ends, its `server0.log`
+   with the miss table (`card/00210-early/real-lean5-verify/miss_table.txt`). Report: the verdicts, the spinner pair
+   (real-ref against real-ref-alt), the per-rank per-level coverage (`bridge_verdict.py`) to the coordinator,
+   native-replay and engine-step (`a8a87f4c2008bde9c`); the miss table to engine-step and native-replay at once.
 3. **The stale test (coordinator 08:47 UTC)**: branch `fix/flash-next-gaudi-draft-rank-topk-test` (worktree
    `wt/collectives-fix`, 0f85066a on the program head adbcff30): `test_proposer_only_reaches_topk_under_the_gate` now
    checks PR 13's one guarded `.topk(` in `_draft_tokens`; the file passes (15). Gate it (`bin/gate wt/collectives-fix`),
