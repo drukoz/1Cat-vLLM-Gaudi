@@ -6,49 +6,61 @@ This file is the track's report. The harness of the track's agents does not writ
 
 ## Handoff (if this agent stops)
 
-Last update: 2026-11-21 01:00 UTC (fourth agent of the track, Opus 5.5, started 23:15 UTC). The node is extended to about
-for tonight (BRIEF 23:21): card evidence first, no pull request before 04:00 UTC; push the branch after each green
-step and tell the coordinator the commit and the flags (the integration track builds from this branch).
+Last update: 2026-11-21 01:02 UTC (fourth agent of the track, Opus 5.5, started 23:15 UTC). **The node runs until
+about 00:00 UTC on 2026-11-22 (BRIEF 00:50); merges allowed again.** Coordinator's plan for this track (00:42 UTC):
+(1) the verify-op crash of 00133, cause and fix, CPU first, then its card check (00162, mine); (2) the pull request
+of the card-proven MTP fixes (gate, merge); (3) with engine-step (agent a8a87f4c2008bde9c): sampled MTP verification
+through its candidate region; (4) the k choice at TP8 from integration's build 2 (00142) and MTP acceptance at long
+prompts. Take the time from `date -u` (coordinator stamps and my own estimates have run 10 to 50 minutes late).
 
-**State (00:13 UTC).** With the QSA data flow and the kernel-fixes flags, MTP k = 3 pays at 1 and 8 streams and
-breaks even at 32 on TP4 (00126 / 00127: 25.5 / 34.0 / 61.9 ms per token against 29.8 / 43.2 / 63.7; a 128-row
-verification costs Ft 131 ms, it was 303 on the torch QSA path); on TP8 (integration 00128) 40.7 against 51.1 ms per
-token at 32 streams. The draft loop is sound (acceptance 0.72 / 0.50 / 0.34 at 32 streams, as with it off).
-**Sampled verification (I07) works on the card** (exact path, `VLLM_HPU_SPEC_SAMPLED_VERIFY=1`: coherent texts,
-acceptance length 2.62 at 1 stream, 2.23 at 32) but adds about 26 ms per step, so sampled MTP loses at 32 streams on
-TP4 (82.4 against 76.2 ms per token); the candidate path (`=2`) targets that cost (jobs 00135, 00136). **At 32
-streams on TP4 k = 1 is the best k** (00126 arm k1: 55.2 ms per token greedy, 65.8 sampled, against 63.7 / 76.2
-without speculation and 61.9 / 82.4 at k = 3); at 1 and 8 streams k = 3. On TP8 (Ft grows about 0.24 ms per row)
-k = 2 to 4 are all about 40-41 ms per token at 32 streams by arithmetic.
+**State.** With the QSA data flow and the kernel-fixes flags, MTP k = 3 pays at 1 and 8 streams and breaks even at
+32 on TP4 (00126 / 00127: 25.5 / 34.0 / 61.9 ms per token against 29.8 / 43.2 / 63.7; a 128-row verification costs
+Ft 131 ms, it was 303 on the torch QSA path); on TP8 (integration 00128) 40.7 against 51.1 ms per token at 32 streams,
+acceptance 0.743 / 0.535 / 0.396. **At 32 streams on TP4 k = 1 is the best k** (55.2 ms per token greedy, 65.8
+sampled, against 63.7 / 76.2 without speculation); on TP8 (Ft grows about 0.24 ms per row) k = 2 to 4 are all about
+40-41 ms per token at 32 streams by arithmetic (integration's 00142 measures k = 2). The draft loop is sound.
+**Sampled verification (I07) works on the card** (`=1`, 00126) but adds about 26 ms per step at k = 3; `=2`
+(candidates) halves the rejection maths on one card (00135 / 00139, ids verified by value) and waits for a real-model
+run (00138, TP4, queued behind the TP8 jobs; integration's build 2 has it). engine-step built the end state
+(`VLLM_HPU_CANDIDATE_SAMPLING=2`, sampling every verification row in its region, then the greedy rejection; CPU-green
+at d5ad5e67) and runs its own TP4 job on a test branch with this branch merged (engine-step-mtp-card at c7669410).
 
-**The node runs until about 00:00 UTC on 2026-11-22 (BRIEF 00:50); merges allowed again.** Coordinator's plan for
-this track (00:42 UTC): (1) the verify-op crash of 00133, cause and fix, CPU first; (2) the pull request of the
-card-proven MTP fixes (gate, merge); (3) with engine-step (agent a8a87f4c2008bde9c): sampled MTP verification
-through its candidate region (`VLLM_HPU_CANDIDATE_SAMPLING=2`, admission stays on `VLLM_HPU_SPEC_SAMPLED_VERIFY`
-1 or 2); (4) the k choice at TP8 from integration's build 2 (00142) and MTP acceptance at long prompts.
+**00133 crash: cause and fix `5c770d96`, card check 00162.** The request after one whose decode completed a recurrent
+block died with `ValidateSyncInputTensors tensor_data is empty` at `gdn_core_verify`'s first input (the GDN conv
+pool), in a graph captured after the block commit. The align-mode copies (`recurrent_commit.commit_conv`, boundary
+commit and pre-step copy) wrote the conv window through a slice of the pool (`hpu::slice_insert`); `commit_ssm`
+(whole rows, `index_copy_`) was fine and its pool was not the failing input (INFERRED from code and log; BRIEF rule
+11 now). Fix: new whole rows from `index_select` copies, one `index_copy_` on the pool. CPU:
+`test_align_commit_slice_writes.py` 10 passed (8 failed before), `test_mtp_align_continuity.py` 76 passed, the
+3-turn CPU engine test (decode across the block, the same prompt again, the next turn) tokens equal to k = 0, copies
+ran, no slice write (`hpu_cpu_engine --slice-write-probe`).
+- **00162 `real4-commit-turns-check`** (any:4, 45 min, card build `b07d1733` = this branch at `05d2db66` + a merge of
+  `origin/feat/flash-next-gaudi-prefill`, pushed as `feat/flash-next-gaudi-mtp-card-ready-cardbuild`; one conflict
+  in qsa.py, both sides kept; 149 CPU tests passed on it): 00126's flags + `VLLM_HPU_PREFIX_ALIGN_SPLIT=1
+  VLLM_HPU_PREFIX_KEEP_PROMPT_END=1 VLLM_HPU_PREFIX_KEEP_DECODE_END=1`, arms k = 3 (fused verify, timer, draft loop,
+  chunk KV) and k = 0, probe `tools/flash_next/rental/commit_turns_probe.py --block 896 --decode 400`
+  (`MTP_PROBE_SCRIPT`, output `<arm>/turns.json`): one stream across 896, then 2 / 3 / 5 / 8 streams (new graph
+  captures), the first prompt again (must equal round 1 exactly), 8 long prompts crossing at once and again (equal
+  per stream), the next turn (cached tokens). Read: `COMPARE` / `ROUND` lines of `probe.log` per arm, `turns.json`,
+  `server0.log` (no `tensor_data is empty`), acceptance per position before and after the crossings.
+- CPU finding (prefill's flags, scratch tree `reports/mtp-card-ready/scratch-prefill`,
+  `reports/mtp-card-ready/cpu4/turns_prefix/summary.json`): with the flags on, the next turn hits 256 tokens at
+  k = 0 but 0 at k = 3. Prefill's `keep_last_decode_boundary` refuses speculative configs (the straddling step's state
+  lands in its last token's block upstream; our align-mode boundary commit writes the exact boundary state, so it
+  could be lifted for the HPU MTP path), and upstream's EAGLE / MTP rule drops the last matched block of every hit.
+  Asked the coordinator who takes it.
 
-**00133 crash (spec-lookup, TP4, n-gram k = 5, fused verify, prefix caching): cause and fix, `5c770d96`.** The
-request after one whose decode completed a recurrent block died with `ValidateSyncInputTensors tensor_data is
-empty` at `gdn_core_verify`'s first input (the GDN conv pool), in a graph captured after the block commit. The
-align-mode copies (`recurrent_commit.commit_conv`, boundary commit and pre-step copy) wrote the conv window through
-a slice of the pool (`state[dst].narrow(...).copy_`, `hpu::slice_insert`); `commit_ssm` (whole rows,
-`index_copy_`) was fine and its pool was not the failing input (INFERRED from code and log). Fix: whole new rows
-built from `index_select` copies, one `index_copy_` on the pool. CPU: `test_align_commit_slice_writes.py` 10 passed
-(8 failed before), `test_mtp_align_continuity.py` 76 passed, the 3-turn CPU engine test
-(`test_requests_after_a_block_committed_during_speculative_decode`: decode across the block, the same prompt
-again, the next turn) tokens equal to k = 0, copies ran, no slice write (`hpu_cpu_engine --slice-write-probe`).
-Turn 3 gets no prefix-cache hit on this build, with or without MTP. Card check proposed: spec-lookup reruns 00133's
-case with `5c770d96` (or a TP4 MTP arm decoding across 896 tokens, then new batch sizes). The prefix flags of
-prefill (`VLLM_HPU_PREFIX_ALIGN_SPLIT` and the two KEEP flags) on and off: scratch tree
-`reports/mtp-card-ready/scratch-prefill` (prefill merged, qsa.py ours), `reports/mtp-card-ready/turns_prefix_check.py`,
-output `reports/mtp-card-ready/cpu4/turns_prefix/summary.json`.
+**Pull request.** Gate queued at 00:58 UTC on a snapshot of `558277d2` (the program head `5c1e8219`, PR #15, merged
+in; contains `5c770d96`): `bin/gate reports/mtp-card-ready/gate-558277d2 --tools`, output
+`reports/mtp-card-ready/gate/gate-558277d2.txt`; it waits in the lock behind about seven gates. PR body draft:
+`reports/mtp-card-ready/pr/pr2_body.md`. The branch carries the qsa-fused merge (`697bffed`): merge qsa-fused's pull
+request first, or say in the PR that it carries it. Known tools/rental reds that are not this branch's: the signal
+and git tests (`test_sh_run_rental`, `test_sh_tiny_smoke` signal cases, `test_rental_scripts::test_make_rental_bundle`
+outside a git checkout).
 
-**Owner's directive (BRIEF 00:28): 8 cards first.** Every TP4 job waits behind the TP8 jobs and probably will
-not run tonight. Sampled MTP at TP8 runs in the integration track's build 2 (MTP k = 2, sampled rounds last with
-`VLLM_HPU_SPEC_SAMPLED_VERIFY=2`; its build 4681ee37 has this branch up to 6f5004f6, which contains `=2`; the
-optional log line is `409c83e5`).
-
-**Branch** (pushed: `origin/feat/flash-next-gaudi-mtp-card-ready` = `5c770d96` and this handoff):
+**Branch** (pushed: `origin/feat/flash-next-gaudi-mtp-card-ready` = `05d2db66` and this handoff):
+- `05d2db66` `commit_turns_probe.py` (the block-commit card check) and `MTP_PROBE_SCRIPT` in `mtp_real_card.sh`.
+- `558277d2` merge of the program head `5c1e8219` (PR #15 kernel-fixes), clean.
 - `5c770d96` the 00133 fix (above) with its tests; `hpu_cpu_engine.py --slice-write-probe` and `num_cached_tokens`.
 - 00139 (ended 00:38 UTC, ok): the bench with id checks by value passes on the card at 1 / 8 / 32
   requests (every candidate id holds its value, greedy holds the max); candidate path 3.3 / 10.3 / 19.1 ms against
