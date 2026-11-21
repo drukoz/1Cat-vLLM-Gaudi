@@ -1,15 +1,18 @@
-# Arms of qsa_next_job.sh for the next rental (qsa-fused, written 2026-11-21 00:40 UTC): the sparse-QSA data-flow
-# change at TP8 + EP8 (an `all` job; qsa_ab_job.sh serves at the job's card count), about 55 minutes in all:
-#   width1    mode 1 + request-sharded indexer + the context-sized block table, short prompts at 1, 16 and 32 streams:
-#             how much of a 32-stream step the indexer's 32,768-key scan is (compare with on64x32's short rounds).
-#   on64x32   mode 1 + request-sharded indexer: short prompts at 1 and 32 streams, the needle at 64K tokens, then
-#             32 streams at 64K (one warm and one measured round; the stream count is kept whatever the reuse trial
-#             says).
-#   off64x32  the same steps with the QSA flags off.
-# VLLM_GRAPH_RESERVED_MEM=0.4 at TP8 (BRIEF.md 2026-11-20 23:50 UTC). With prefix caching the long rounds' outputs
-# are only right at TP8 when the build carries the prefill track's aligned chunking: add
-# VLLM_HPU_PREFIX_ALIGN_SPLIT=1 to the three lines once it is card-proven and in this branch (the step times do not
-# depend on it). Never VLLM_HPU_QSA_FUSED=2 or 3 (the prepare kernel's stores are lost on the card).
-width1 VLLM_HPU_QSA_FUSED=1 VLLM_HPU_QSA_INDEXER_SHARD=1 VLLM_HPU_QSA_TABLE_WIDTH=1 VLLM_GRAPH_RESERVED_MEM=0.4 QSA_AB_LEVELS=1,16,32 QSA_AB_CTX=0 QSA_AB_NO_RETRY=1 QSA_ARM_SECONDS=900
-on64x32 VLLM_HPU_QSA_FUSED=1 VLLM_HPU_QSA_INDEXER_SHARD=1 VLLM_GRAPH_RESERVED_MEM=0.4 QSA_AB_LEVELS=1,32 QSA_AB_CTX=64000 QSA_AB_LONG_STREAMS=32 QSA_AB_LONG_REPEAT=1 QSA_ARM_SECONDS=1500
-off64x32 VLLM_HPU_QSA_FUSED=0 VLLM_HPU_QSA_INDEXER_SHARD=0 VLLM_GRAPH_RESERVED_MEM=0.4 QSA_AB_LEVELS=1,32 QSA_AB_CTX=64000 QSA_AB_LONG_STREAMS=32 QSA_AB_LONG_REPEAT=1
+# Arms of the qsa-fused TP8 job (00168, replaced with a 90-minute hold at 08:3x UTC), read by
+# /results/bench/qsa_next_job.sh (VERSION 2) when the job starts. Image: the commit named in
+# ~/farm/qsa-fused/job/next8.sha (d28aef775742 = build 3 d00c0a9a + FP8 K/V e4e6aabc + VLLM_HPU_QSA_SLOT_SHIFT), else
+# bbb9d0b0ac68 (the arms that need the flag are then skipped). Every real-model arm: the farm preset + build 3's
+# decode flags (00184's) + the prefix flags + VLLM_GRAPH_RESERVED_MEM=0.4; only the QSA flags differ.
+# VERSION 3 (2026-11-21 08:30 UTC, coordinator 08:15): width1 dropped (B parked); the slot-shift A/B added.
+#   tinyshift  the tiny TP8 token gate with VLLM_HPU_QSA_SLOT_SHIFT=1 (mode 1 + shard), plain and MTP k = 3.
+#   mtp3       mode 1 + shard, sync MTP k = 3, the flag OFF: 1 and 32 streams, 3 measured 32-stream rounds.
+#   mtp3shift  the same with VLLM_HPU_QSA_SLOT_SHIFT=1 (only after tinyshift passed): the same tokens expected.
+#   noshard    mode 1 with VLLM_HPU_QSA_INDEXER_SHARD=0: short rounds 1, 8, 16, 32 (the 8-stream question).
+#   on64x32    mode 1 + shard: short rounds, the needle at 64K, 32 streams at 64K.
+#   off64x32   the QSA flags off: short rounds, the needle, 32 streams at 64K. The rest of the hold.
+tinyshift QSA_TINY=hc QSA_TINY_SPEC=3 QSA_TINY_ENV=VLLM_HPU_QSA_SLOT_SHIFT=1,VLLM_HPU_QSA_FUSED=1,VLLM_HPU_QSA_INDEXER_SHARD=1 QSA_NEEDS_ENV=VLLM_HPU_QSA_SLOT_SHIFT QSA_ARM_SECONDS=420 QSA_MIN_SECONDS=240
+mtp3 VLLM_HPU_QSA_FUSED=1 VLLM_HPU_QSA_INDEXER_SHARD=1 VLLM_HPU_GDN_KERNEL_INTERLEAVE=1 VLLM_HPU_GDN_GLUE_CACHE=1 VLLM_HPU_HC_FUSED_COPY_MODE=2 VLLM_HPU_DECODE_CUT_INTERVAL=1000 VLLM_HPU_CANDIDATE_SAMPLING=1 VLLM_GRAPH_RESERVED_MEM=0.4 VLLM_HPU_PREFIX_ALIGN_SPLIT=1 VLLM_HPU_PREFIX_KEEP_PROMPT_END=1 VLLM_HPU_QSA_SLOT_SHIFT=0 QSA_AB_MTP=3 VLLM_HPU_GDN_CORE_VERIFY=1 VLLM_HPU_MTP_DRAFT_LOOP=1 VLLM_HPU_MTP_CHUNK_KV=1 QSA_NEEDS_ENV=VLLM_HPU_QSA_SLOT_SHIFT QSA_AB_LEVELS=1,32 QSA_AB_CTX=0 QSA_AB_NO_RETRY=1 QSA_AB_REPEAT_TOP=3 QSA_ARM_SECONDS=780
+mtp3shift VLLM_HPU_QSA_FUSED=1 VLLM_HPU_QSA_INDEXER_SHARD=1 VLLM_HPU_GDN_KERNEL_INTERLEAVE=1 VLLM_HPU_GDN_GLUE_CACHE=1 VLLM_HPU_HC_FUSED_COPY_MODE=2 VLLM_HPU_DECODE_CUT_INTERVAL=1000 VLLM_HPU_CANDIDATE_SAMPLING=1 VLLM_GRAPH_RESERVED_MEM=0.4 VLLM_HPU_PREFIX_ALIGN_SPLIT=1 VLLM_HPU_PREFIX_KEEP_PROMPT_END=1 VLLM_HPU_QSA_SLOT_SHIFT=1 QSA_AB_MTP=3 VLLM_HPU_GDN_CORE_VERIFY=1 VLLM_HPU_MTP_DRAFT_LOOP=1 VLLM_HPU_MTP_CHUNK_KV=1 QSA_NEEDS_ENV=VLLM_HPU_QSA_SLOT_SHIFT QSA_AFTER_TINY=tinyshift QSA_AB_LEVELS=1,32 QSA_AB_CTX=0 QSA_AB_NO_RETRY=1 QSA_AB_REPEAT_TOP=3 QSA_ARM_SECONDS=780
+noshard VLLM_HPU_QSA_FUSED=1 VLLM_HPU_QSA_INDEXER_SHARD=0 VLLM_HPU_GDN_KERNEL_INTERLEAVE=1 VLLM_HPU_GDN_GLUE_CACHE=1 VLLM_HPU_HC_FUSED_COPY_MODE=2 VLLM_HPU_DECODE_CUT_INTERVAL=1000 VLLM_HPU_CANDIDATE_SAMPLING=1 VLLM_GRAPH_RESERVED_MEM=0.4 VLLM_HPU_PREFIX_ALIGN_SPLIT=1 VLLM_HPU_PREFIX_KEEP_PROMPT_END=1 QSA_AB_LEVELS=1,8,16,32 QSA_AB_CTX=0 QSA_AB_NO_RETRY=1 QSA_ARM_SECONDS=720
+on64x32 VLLM_HPU_QSA_FUSED=1 VLLM_HPU_QSA_INDEXER_SHARD=1 VLLM_HPU_GDN_KERNEL_INTERLEAVE=1 VLLM_HPU_GDN_GLUE_CACHE=1 VLLM_HPU_HC_FUSED_COPY_MODE=2 VLLM_HPU_DECODE_CUT_INTERVAL=1000 VLLM_HPU_CANDIDATE_SAMPLING=1 VLLM_GRAPH_RESERVED_MEM=0.4 VLLM_HPU_PREFIX_ALIGN_SPLIT=1 VLLM_HPU_PREFIX_KEEP_PROMPT_END=1 QSA_AB_LEVELS=1,8,16,32 QSA_AB_CTX=64000 QSA_AB_LONG_STREAMS=32 QSA_AB_LONG_REPEAT=1 QSA_ARM_SECONDS=1380
+off64x32 VLLM_HPU_QSA_FUSED=0 VLLM_HPU_QSA_INDEXER_SHARD=0 VLLM_HPU_GDN_KERNEL_INTERLEAVE=1 VLLM_HPU_GDN_GLUE_CACHE=1 VLLM_HPU_HC_FUSED_COPY_MODE=2 VLLM_HPU_DECODE_CUT_INTERVAL=1000 VLLM_HPU_CANDIDATE_SAMPLING=1 VLLM_GRAPH_RESERVED_MEM=0.4 VLLM_HPU_PREFIX_ALIGN_SPLIT=1 VLLM_HPU_PREFIX_KEEP_PROMPT_END=1 QSA_AB_LEVELS=1,8,16,32 QSA_AB_CTX=64000 QSA_AB_LONG_STREAMS=32 QSA_AB_LONG_REPEAT=1

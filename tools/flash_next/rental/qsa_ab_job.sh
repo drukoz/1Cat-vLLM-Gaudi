@@ -7,7 +7,8 @@
 # --env. Every result is a plain line on standard output (the job's log) as soon as it exists.
 #
 #   1. The card check of the block selection (card rule 9), tests/unit_tests/qsa_select/test_hpu_select_ids.py,
-#      on one of the job's cards: QSAIDS lines, then one "RULE9 VERDICT" line.
+#      on one of the job's cards: QSAIDS lines, then one "RULE9 VERDICT" line. The server then runs the
+#      narrowing form the check found right (VLLM_HPU_QSA_TOPK_IDS; 0, the default, unless only another is).
 #   2. The real-model server on the job's cards: the farm's serve command and preset (serve_probe.sh).
 #   3. qsa_ab_probe.py: decode at 1, 16 and 32 streams with short prompts; the needle at about 32,000 tokens (then 64,000);
 #      32 streams at that context (the prefix served from the cache); every stream's text saved.
@@ -54,11 +55,12 @@ say "arm $ARM, cards ${FARM_CARDS:-?} (modules ${FARM_MODULES:-?}), commit ${FAR
 LIB="$(cd /tmp && env -u PYTHONPATH "$PY" -c "import flashinfer_gaudi, pathlib; print(pathlib.Path(flashinfer_gaudi.__file__).parent / 'lib')" 2>/dev/null | tail -n 1)"
 
 # ---------------------------------------------------------------- 1. the selection check on one card
+TOPK_IDS=0
 if [ "${QSA_AB_SKIP_IDS:-0}" != 1 ]; then
     say "step 1: the block-selection check on one card (rule 9)"
     (
         cd "$TREE" || exit 2
-        unset PT_HPU_RECIPE_CACHE_CONFIG VLLM_HPU_QSA_FUSED VLLM_HPU_QSA_INDEXER_SHARD
+        unset PT_HPU_RECIPE_CACHE_CONFIG VLLM_HPU_QSA_FUSED VLLM_HPU_QSA_INDEXER_SHARD VLLM_HPU_QSA_TOPK_IDS
         export PYTHONPATH="$TREE${PYTHONPATH:+:$PYTHONPATH}" PT_HPU_LAZY_MODE=1 FARM_OUT="$OUT"
         rm -f "$OUT/select_ids.json"
         timeout 420 "$PY" -m pytest -q -s -rs -p no:cacheprovider "$IDS_TEST" 2>&1 \
@@ -70,30 +72,37 @@ import json, sys
 try:
     d = json.load(open(sys.argv[1]))
 except Exception as e:
-    print("RULE9 VERDICT: no result file (%r): the check did not run" % (e,))
+    print("0|RULE9 VERDICT: no result file (%r): the check did not run; the server runs the default form" % (e,))
     sys.exit(0)
 def right(name):
     return d.get("variant/" + name, {}).get("in_graph_consumer_wrong_rows") == 0
 names = [k[len("variant/"):] for k in d if k.startswith("variant/") and "in_graph_consumer_wrong_rows" in d[k]]
 cast = d.get("variant/cast", {})
 plugin = {k[len("plugin/"):]: ("ok" if v.get("ok") else "WRONG") for k, v in d.items() if k.startswith("plugin/")}
+mode = 0
+if not (d.get("plugin/select_blocks", {}).get("ok") or right("gather_arange")):
+    mode = 1 if right("cast") else (2 if right("via_fp32") else 0)
 rows = cast.get("rows")
 direct = d.get("variant/cast_direct_read", {})
-print("RULE9 VERDICT: the cast topk(...).indices.to(int32) in one graph: read directly as the graph's output "
-      "(job 00038's read) %s of %s ids differ; as select_blocks used it (mask, expansion) the host read is wrong on "
+print("%d|RULE9 VERDICT: the cast topk(...).indices.to(int32) in one graph: read directly as the graph's output "
+      "(job 00038's read) %s of %s ids differ; as select_blocks uses it (mask, expansion) the host read is wrong on "
       "%s of %s rows and the in-graph consumer on %s of %s rows%s; forms right in the graph: %s; forms wrong in the "
-      "graph: %s; the plugin as it is (a gather from an int32 arange): %s" % (
-          direct.get("differ", direct.get("raised")), direct.get("elements"),
+      "graph: %s; the plugin as it is (a gather from an int32 arange): %s; the server runs "
+      "VLLM_HPU_QSA_TOPK_IDS=%d" % (
+          mode, direct.get("differ", direct.get("raised")), direct.get("elements"),
           cast.get("host_read_wrong_rows", cast.get("host_read_raised")), rows,
           cast.get("in_graph_consumer_wrong_rows", cast.get("in_graph_consumer_raised")), rows,
           (" (" + cast["host_read_detail"] + ")") if cast.get("host_read_detail") else "",
           ",".join(n for n in names if right(n)) or "none", ",".join(n for n in names if not right(n)) or "none",
-          json.dumps(plugin, sort_keys=True)))
+          json.dumps(plugin, sort_keys=True), mode))
 PY
 )"
-    echo "$VERDICT" | tee "$OUT/summary.txt"
+    TOPK_IDS="${VERDICT%%|*}"
+    echo "${VERDICT#*|}" | tee "$OUT/summary.txt"
+    case "$TOPK_IDS" in 0 | 1 | 2) ;; *) TOPK_IDS=0 ;; esac
     sleep 8 # the check's process has released its card before the server takes all of them
 fi
+export VLLM_HPU_QSA_TOPK_IDS="$TOPK_IDS"
 
 # ---------------------------------------------------------------- 2. the server (serve_probe.sh's command)
 for kv in PT_HPU_LAZY_MODE=1 PT_HPU_LAZY_ACC_PAR_MODE=0 VLLM_HPU_FLASH_NEXT_QSA_MODE=1 \
@@ -171,8 +180,8 @@ serve_and_probe() {
     started="$(date -u +%s)"
     setsid "${SERVE[@]}" >"$log" 2>&1 &
     SP=$!
-    say "server starting (tp $TP, expert parallel, port $PORT, VLLM_HPU_QSA_FUSED=${VLLM_HPU_QSA_FUSED:-0}" \
-        "VLLM_HPU_QSA_INDEXER_SHARD=${VLLM_HPU_QSA_INDEXER_SHARD:-0} VLLM_HPU_QSA_TABLE_WIDTH=${VLLM_HPU_QSA_TABLE_WIDTH:-0}), log $log"
+    say "server starting (tp $TP, expert parallel, port $PORT, VLLM_HPU_QSA_TOPK_IDS=$TOPK_IDS," \
+        "VLLM_HPU_QSA_FUSED=${VLLM_HPU_QSA_FUSED:-0} VLLM_HPU_QSA_INDEXER_SHARD=${VLLM_HPU_QSA_INDEXER_SHARD:-0}), log $log"
     while :; do
         if "$PY" -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:$PORT/health', timeout=5)" 2>/dev/null; then
             break
@@ -200,6 +209,7 @@ serve_and_probe() {
             --levels "$LEVELS" --tokens "$TOKENS" --ctx "$CTX" --docs "$TREE/docs/design/flash-next" \
             ${QSA_AB_LONG_STREAMS:+--long-streams "$QSA_AB_LONG_STREAMS"} \
             ${QSA_AB_LONG_REPEAT:+--long-repeat "$QSA_AB_LONG_REPEAT"} \
+            ${QSA_AB_REPEAT_TOP:+--repeat-top "$QSA_AB_REPEAT_TOP"} \
             --deadline "$((DEADLINE - RESERVE))" 2>&1 | tee "probe$tag.log"
         return "${PIPESTATUS[0]}"
     }
@@ -239,7 +249,7 @@ PY
     return 0
 }
 
-# Device memory every 15 s (a server can run out of device memory at run time with warmup skipped): hlsmi.log.
+# Device memory every 15 s (BRIEF.md 23:50 UTC: a server can run out of device memory at run time): hlsmi.log.
 MEMLOG=""
 if command -v hl-smi >/dev/null 2>&1; then
     (while :; do

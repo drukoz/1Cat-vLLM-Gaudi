@@ -16,7 +16,10 @@ HPU activities) and counts the graph launches (`ExecuteCachedGraph`). Launches p
 
 Arms (shapes of one TP8 + EP8 rank: 64 local FP8 experts of 512, top 10, H 2560, I 640, per-channel scales):
   s   the served class: vllm_gaudi's VllmMixtureOfExpertsOpFP8PerChannel.forward (dynamic_quant, the int64 ids, the
-      chunk kwargs of VLLM_MOE_CHUNK / VLLM_MOE_TOKEN_BOUNDARY), routing as the served apply (softmax, top-k, renorm)
+      chunk kwargs of VLLM_MOE_CHUNK / VLLM_MOE_TOKEN_BOUNDARY), routing as the served apply (softmax, top-k, renorm),
+      its experts and scales VIEWS of stacked [E, ...] tensors as in the served model
+  v   c with the experts and scales as views of the stacked tensors (the served layout); a..g give owned tensors
+  p2  c with one per-tensor power-of-two activation scale
   a   the vendor op alone on precomputed FP8 inputs and ids (one elementwise op before and after it)
   b   a + the row quantization in the graph (abs, amax, cast_to_fp8_v2: the ordinary dynamic_quant)
   c   b + the routing in the graph (softmax, top-k 10, renorm, ids .to(int64), weights .to(bf16))
@@ -42,7 +45,7 @@ from collections import Counter, defaultdict
 from pathlib import Path
 
 H, I, GLOBAL, TOPK, LOCAL = 2560, 640, 512, 10, 64
-ARMS = "s,a,c,d,h,g1,g2,g3,g4,e,b,f"
+ARMS = "s,v,a,c,d,h,e,p2,g1,g2,g3,g4,b,f"
 
 
 def say(text):
@@ -96,7 +99,15 @@ def main():
     s12 = [torch.full((2 * I, ), 1e-3, dtype=torch.float32).to(dev) for _ in range(LOCAL)]
     s3 = [torch.full((H, ), 1e-3, dtype=torch.float32).to(dev) for _ in range(LOCAL)]
     htcore.mark_step()
-    stacked = None  # the dense arm's [E, 2I, H] / [E, H, I] / [E, 2I] / [E, H]
+    # The served layout (fp8_block_moe_prepare_weights + _cache_weight_lists): stacked [E, 2I, H] / [E, H, I] experts
+    # and [E, 2I] / [E, H] scales; the op gets per-expert VIEWS of them. Arms a..g give it owned per-expert tensors.
+    stacked = (torch.stack(w12), torch.stack(w3), torch.stack([v.reshape(-1) for v in s12]),
+               torch.stack([v.reshape(-1) for v in s3]))
+    htcore.mark_step()
+    vw12 = [stacked[0][e] for e in range(LOCAL)]
+    vw3 = [stacked[1][e] for e in range(LOCAL)]
+    vs12 = [stacked[2][e] for e in range(LOCAL)]
+    vs3 = [stacked[3][e] for e in range(LOCAL)]
     bf16_w = None  # the bf16 arm's experts
 
     def quant_rows(x):
@@ -113,11 +124,18 @@ def main():
         w = w / w.sum(dim=-1, keepdim=True)
         return w.to(torch.bfloat16), ids.to(torch.int64)
 
-    def vendor(x8, scale, ids, rw, kwargs):
-        return torch.ops.hpu.mixture_of_experts(hidden_states=x8, expert_routing_table=ids, router_weights=rw, w12=w12,
-                                                w3=w3, d_scale_hidden_states=scale, d_scale_w12=s12, d_scale_w3=s3,
+    def vendor(x8, scale, ids, rw, kwargs, views=False):
+        a12, a3, b12, b3 = (vw12, vw3, vs12, vs3) if views else (w12, w3, s12, s3)
+        return torch.ops.hpu.mixture_of_experts(hidden_states=x8, expert_routing_table=ids, router_weights=rw, w12=a12,
+                                                w3=a3, d_scale_hidden_states=scale, d_scale_w12=b12, d_scale_w3=b3,
                                                 permuted_weights=True, activation="silu", experts_min=0,
                                                 experts_max=LOCAL - 1, **kwargs)
+
+    def quant_pow2(x):
+        """One per-tensor power-of-two activation scale."""
+        amax = x.abs().amax().float() + 1e-8
+        scale = torch.exp2(torch.ceil(torch.log2(amax / fp8_max)))
+        return torch.ops.hpu.cast_to_fp8_v2(x, 1.0 / scale, False, False, fp8)[0], scale
 
     def dense(x, ids, rw):
         w13s, w2s, s13s, s2s = stacked
@@ -146,10 +164,10 @@ def main():
             from vllm_gaudi.extension.ops import VllmMixtureOfExpertsOpFP8PerChannel
             op = VllmMixtureOfExpertsOpFP8PerChannel(GLOBAL, LOCAL, 0, LOCAL - 1)
             for e in range(LOCAL):
-                op.w13_list[e].set_weight(w12[e])
-                op.w13_list[e].set_scale_inv_fp8(s12[e])
-                op.w2_list[e].set_weight(w3[e])
-                op.w2_list[e].set_scale_inv_fp8(s3[e])
+                op.w13_list[e].set_weight(vw12[e])
+                op.w13_list[e].set_scale_inv_fp8(vs12[e])
+                op.w2_list[e].set_weight(vw3[e])
+                op.w2_list[e].set_scale_inv_fp8(vs3[e])
             if hasattr(op, "_cache_weight_lists"):
                 op._cache_weight_lists()
             say(f"served class: chunk list {getattr(op, 'chunk_size_list', None)}, "
@@ -180,6 +198,18 @@ def main():
             def f(acc):
                 x8, sc = quant_rows(acc)
                 return acc + vendor(x8, sc, idsc, rwc, kw)
+        elif arm == "v":
+
+            def f(acc):
+                rw, ids = route(logits + acc[:, :GLOBAL] * 0)
+                x8, sc = quant_rows(acc)
+                return acc + vendor(x8, sc, ids, rw, kw, views=True)
+        elif arm == "p2":
+
+            def f(acc):
+                rw, ids = route(logits + acc[:, :GLOBAL] * 0)
+                x8, sc = quant_pow2(acc)
+                return acc + vendor(x8, sc, ids, rw, kw)
         elif arm in ("c", "d", "e", "g1", "g2", "g3", "g4"):
             kwargs = {
                 "c": kw,
@@ -270,10 +300,6 @@ def main():
             res = {"arm": arm, "rows": rows}
             t0 = time.time()
             try:
-                if arm == "h" and stacked is None:
-                    stacked = (torch.stack(w12), torch.stack(w3), torch.stack([s.reshape(-1) for s in s12]),
-                               torch.stack([s.reshape(-1) for s in s3]))
-                    htcore.mark_step()
                 if arm == "f" and bf16_w is None:
                     bf16_w = ([w.to(torch.bfloat16) * 1e-3 for w in w12], [w.to(torch.bfloat16) * 1e-3 for w in w3])
                     htcore.mark_step()
