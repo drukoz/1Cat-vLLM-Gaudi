@@ -7303,7 +7303,13 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                     else:
                         # Handling spec decode sampling.
                         sampled_token_ids = None
-                        if fused_sampled_token_ids is not None:
+                        if fused_sampled_token_ids is not None and self._mtp_chain_step:
+                            # VLLM_HPU_MTP_DRAFT_CHAIN=1, stage B: the greedy rejection runs inside the chained
+                            # draft's graph, right behind the verification's per-row ids
+                            self._mtp_chain_issue(None, decode_data, non_flattened_hidden_states, aux_hidden_states,
+                                                  num_decodes, verify_ids=fused_sampled_token_ids)
+                            sampled_token_ids = self._mtp_chain_out.sampled
+                        elif fused_sampled_token_ids is not None:
                             from vllm_gaudi.v1.sample.hpu_greedy_verify import greedy_rejection_sample_from_tokens
 
                             sampled_token_ids = greedy_rejection_sample_from_tokens(
@@ -7351,9 +7357,9 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                                 )
                         if step_timer is not None:
                             step_timer.lap("sample")
-                        if self._mtp_chain_step:
-                            # VLLM_HPU_MTP_DRAFT_CHAIN=1: the draft goes behind the verification now, before the
-                            # host reads anything (the books below read the result as before)
+                        if self._mtp_chain_step and self._mtp_chain_out is None:
+                            # VLLM_HPU_MTP_DRAFT_CHAIN=1, stage A: the draft goes behind the verification now, before
+                            # the host reads anything (the books below read the result as before)
                             self._mtp_chain_issue(sampled_token_ids, decode_data, non_flattened_hidden_states,
                                                   aux_hidden_states, num_decodes)
                         decode_sampled_token_ids, spec_decode_num_tokens, decode_sampled_token_ids_device = \
@@ -10836,14 +10842,15 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             logger.info("VLLM_HPU_MTP_DRAFT_CHAIN=1: a step keeps the draft after the host read: %s", reason)
         return False
 
-    def _mtp_chain_issue(self, sampled_token_ids, decode_data, hidden_states, aux_hidden_states, num_decodes: int):
+    def _mtp_chain_issue(self, sampled_token_ids, decode_data, hidden_states, aux_hidden_states, num_decodes: int,
+                         verify_ids=None):
         """Issue the chained draft (drafter.propose_chain) on the verification's device result and keep its device
         outputs in ``self._mtp_chain_out``. Host work: a real-row mask and the requests' attention block table,
         copied to the device whole (fresh tensors, not views: no unmatched graph input)."""
         from vllm_gaudi.v1.spec_decode.flash_next_mtp_steps import MtpChainOut
 
         spec = decode_data.spec_decode_metadata
-        batch = int(sampled_token_ids.shape[0])
+        batch = int(spec.bonus_logits_indices.shape[0])
         real = async_h2d_copy(torch.arange(batch) < num_decodes, device=self.device)
         table = self.input_batch.block_table[self._get_attention_group_id_for_hybrid()].get_cpu_tensor()
         max_blocks = int(self._block_table_max_blocks)
@@ -10856,7 +10863,18 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         else:
             verify_hidden = (hidden_states, )
         drafts = self.drafter.propose_chain(sampled_token_ids, spec.cu_num_draft_tokens, real, decode_data.position_ids,
-                                            verify_hidden, decode_data.attn_metadata, table_full, self)
+                                            verify_hidden, decode_data.attn_metadata, table_full, self,
+                                            verify_ids=verify_ids, spec_decode_metadata=spec)
+        if drafts.sampled is not None:  # stage B: the chain's graph made the verification's result
+            sampled_token_ids = drafts.sampled
+        stage = "B (the greedy rejection in the chain's graph)" if verify_ids is not None else "A"
+        logged = self._mtp_chain_refusals
+        if logged is None:
+            logged = self._mtp_chain_refusals = set()
+        if stage not in logged:
+            logged.add(stage)
+            logger.info("VLLM_HPU_MTP_DRAFT_CHAIN=1: a step's draft is chained behind its verification, stage %s",
+                        stage)
         self._mtp_chain_out = MtpChainOut(accepted=drafts.accepted, next_ids=drafts.next_ids,
                                           sampled=sampled_token_ids, last_row=drafts.last_row,
                                           num_decodes=int(num_decodes), k=int(drafts.drafts.shape[1]),

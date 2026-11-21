@@ -205,3 +205,54 @@ def test_first_max_ids_equal_argmax_as_int32():
     ids = steps.first_max_ids(logits)
     assert ids.dtype == torch.int32
     assert torch.equal(ids.long(), logits.argmax(dim=-1))
+
+
+def test_stage_b_runs_the_greedy_rejection_inside_the_chain():
+    # Stage B (the verify graph returns the target's greedy id of every row): the chain runs
+    # greedy_rejection_sample_from_tokens itself and returns its result, the same as stage A fed that result.
+    from vllm_gaudi.v1.sample.hpu_greedy_verify import greedy_rejection_sample_from_tokens
+
+    k, batch, real, block_size, max_model_len, max_blocks = 3, 4, 3, 16, 256, 16
+    stride = k + 1
+    num_draft = [k, k, 2, 0]
+    gen = torch.Generator().manual_seed(21)
+    rows = batch * stride
+    verify_ids = torch.randint(0, FakeDraft.VOCAB, (rows, 1), generator=gen, dtype=torch.int32)
+    drafts_in = []
+    target_idx, bonus_idx = [], []
+    for b, n in enumerate(num_draft):
+        for j in range(n):
+            # the drafts match the target on a prefix of random length
+            drafts_in.append(int(verify_ids[b * stride + j]) if j < b else (int(verify_ids[b * stride + j]) + 1) % 23)
+            target_idx.append(b * stride + j)
+        for j in range(n, k):
+            drafts_in.append(-1)
+            target_idx.append(-1)
+        bonus_idx.append(b * stride + n)
+    draft_token_ids = torch.tensor(drafts_in, dtype=torch.int32)
+    target_logits_indices = torch.tensor(target_idx, dtype=torch.int64)
+    bonus_logits_indices = torch.tensor(bonus_idx, dtype=torch.int64)
+    cu = cu_draft(num_draft)
+    want_sampled = greedy_rejection_sample_from_tokens(verify_ids.reshape(-1), draft_token_ids, target_logits_indices,
+                                                       bonus_logits_indices, cu)
+    positions = (torch.tensor([40, 77, 120, 0])[:, None] + torch.arange(stride)[None, :]).reshape(-1, 1)
+    hidden = torch.randn(rows, FakeDraft.H * FakeDraft.HC, generator=gen)
+    table_full = torch.cat((torch.randint(1, 500, (real, max_blocks), generator=gen, dtype=torch.int32),
+                            torch.zeros((batch - real, max_blocks), dtype=torch.int32)))
+    real_mask = torch.arange(batch) < real
+
+    def make_md(slots, block_table, ring_slots):
+        return {"tag": float(slots.reshape(-1).to(torch.float32).sum() % 7)}
+
+    a_draft, b_draft = FakeDraft(), FakeDraft()
+    stage_a = steps.MtpDraftChain(a_draft.pass_forward, a_draft.draft_tokens, k, max_model_len, block_size, 0, 0,
+                                  make_md)
+    stage_b = steps.MtpDraftChain(b_draft.pass_forward, b_draft.draft_tokens, k, max_model_len, block_size, 0, 0,
+                                  make_md)
+    out_a = stage_a(want_sampled, cu, real_mask, positions, (hidden, ), {"tag": 0.5}, table_full)
+    out_b = stage_b(None, cu, real_mask, positions, (hidden, ), {"tag": 0.5}, table_full, (), verify_ids,
+                    draft_token_ids, target_logits_indices, bonus_logits_indices)
+    assert out_a.sampled is None
+    assert torch.equal(out_b.sampled, want_sampled)
+    for field in ("accepted", "last_row", "next_ids", "drafts"):
+        assert torch.equal(getattr(out_a, field), getattr(out_b, field)), field
