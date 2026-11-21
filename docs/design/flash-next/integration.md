@@ -32,6 +32,20 @@ when `bin/farm ledger | grep -w integration` shows it ended:
   HEADLINE_HOLD_S=4500`. Arms in priority order: tiny gate (`--spec 3`); no spec 32 / 8 / 1 (2 greedy + 2 sampled
   rounds); MTP k = 3 (greedy 32 / 8 / 1, then sampled 32 and 1 with `=2`); the low-stream bisect (greedy 8 and 1, 96
   tokens): `VLLM_HPU_QSA_INDEXER_SHARD=0`, then prefix flags off, then also `VLLM_HPU_DECODE_CUT_INTERVAL=0`.
+**For build 4 (notes received after the hand-back, 02:40 UTC):**
+- MoE: 00161 (build 2 image, MTP k = 3) measured `VLLM_MOE_CHUNK=64,8192 VLLM_MOE_TOKEN_BOUNDARY=512,1000000` at
+  38.7 / 38.0 ms per token at 32 streams against 43.1 / 40.8 without (about -12 ms per step), 26.2 / 26.4 against
+  24.9 / 24.2 at 1 stream (+3 ms), 23.9 against 29.3 at one 14.8K-token prompt; acceptance unchanged. 00177 decides
+  chunk against kernel-fixes' dense form (`VLLM_HPU_MOE_DENSE=1`, in build 3).
+- Async scheduling (async-sched track): its code is NOT in build 3's image, so an env switch in `run3.sh` does nothing
+  there; its own 00176 measures build 3 + its code. For build 4 merge commit `fb5cefca` of
+  `feat/flash-next-gaudi-async-sched` (not the branch head, which re-merges the program head with PR #16's QSA data
+  flow; it merges cleanly into this branch). Flags: `VLLM_HPU_FLASH_NEXT_ASYNC_SCHED=1` (async without speculation),
+  `=2` (with MTP: drafts stay on the device); with `=2` set `VLLM_HPU_MTP_TIMING=0` (the timer's device wait hides the
+  overlap). Under async, engine-step's candidate sampling needs engine-step `01d66e31` (otherwise sampled requests fall
+  back to vLLM's sampler), and `VLLM_HPU_PLE_HOST_NGRAM_IDS=1` has no effect. 00176's numbers arrive about 06:00 UTC.
+- Keep out: `VLLM_HPU_WORKER_CPU_PIN`, `PT_HPU_DISABLE_HPUGRAPH_REPLAY_HASHCHECK` (00156 arm B: slower).
+
 **Build 3** = commit `d00c0a9a` (plugin `848deb15`): build 2 (`b2a7f62f`) + engine-step `3e568842` (both server-killer
 fixes e9032e68 / logprobs, candidates on the vocabulary shard `VLLM_HPU_VOCAB_PARALLEL_LOGITS=2` (not set), sampled
 speculative steps in the candidate region, request parameters on the general sampler) + kernel-fixes 86104c9d and
