@@ -9,12 +9,15 @@ Labels: MEASURED (card, with its file), VERIFIED (CPU test or code line), INFERR
 
 ## Handoff (if this agent stops)
 
-Updated 2026-11-21 00:40 UTC (fourth agent of the track, Opus 5.5, started 23:12 UTC).
+Updated 2026-11-21 00:58 UTC (fourth agent of the track, Opus 5.5, started 23:12 UTC).
 
-**Now (00:40 UTC):** build 1 is measured (job **00128**, tables below; job **00121** tiny gate passed). **Build 2 is
-job 00142** (all cards, hold 60 min, commit `2de56804`, plugin code = `a39d1f48`), at the head of the 8-card queue
-(starts by 01:14 UTC). Its waiting `farm job` command copies the results to `reports/integration/card/00142-real8-build2/`
-(if the agent is gone: `bin/farm fetch integration 00142 00142-real8-build2`). Build 2 = build 1 + engine-step `ddc6bbbf`
+**Now (00:58 UTC):** build 1 is measured (job **00128**, tables below; job **00121** tiny gate passed). **Build 2 is
+job 00156** `real8-build2b` (all cards, hold 60 min, commit `b2a7f62f` = plugin code `a39d1f48` + mtp-card-ready's
+conv-pool fix `5c770d96` cherry-picked; it replaced 00142 with `--replaces`, same place and bump), at the head of the
+8-card queue (starts by about 01:12 UTC). Its waiting `farm job` command copies the results to
+`reports/integration/card/00156-real8-build2b/` (if the agent is gone: `bin/farm fetch integration 00156
+00156-real8-build2b`). The node now runs until about 00:00 UTC on 2026-11-22 (owner, BRIEF 00:50): after build 2,
+keep a build N+1 ready and submit a TP8 headline every 3 to 4 hours or when a lever lands (coordinator 00:43). Build 2 = build 1 + engine-step `ddc6bbbf`
 (candidate-path log lines), native-replay `9b0e7655` (`VLLM_HPU_WORKER_CPU_PIN`), prefill `2abf636a` (prefix flags,
 prompt graphs), mtp-card-ready `6f5004f6` (sampled-verification fix 0d1be6fc, candidate verification `=2`); CPU run
 `reports/integration/cpu/out-b6/summary.txt`: 152 files, 148 green, 3 card-only skips, the known flaky
@@ -142,7 +145,7 @@ checkpoint's temperature 1.0, top_k 20, top_p 0.95). Reference (program head, 00
 | 1 (00128) | MTP k = 3 | 1 | 66 | 24.3 (41.1) | not run | | 2.72 |
 | 1 (00128) | MTP k = 3 | 8 | 81 | 29.3 (34.1) | not run | | 2.76 |
 | 1 (00128) | MTP k = 3 | 32 | 106 | **40.7 (24.6)** | not run | | 2.61 |
-| 2 (00142) | (pending) | | | | | | |
+| 2 (00156) | (pending) | | | | | | |
 
 ## Merge log (what the conflicts were)
 
