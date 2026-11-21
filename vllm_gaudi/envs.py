@@ -552,6 +552,7 @@ if TYPE_CHECKING:
     VLLM_HPU_HC_FUSED: int = 0  # 0 torch hyper-connections (default), 1 the fused hyper-connection kernels
     VLLM_HPU_MOE_GLUE: int = 0  # 0 torch MoE glue (default), 1 the fused MoE glue kernels
     VLLM_HPU_MOE_GLUE_MERGE_GATE_UP: int = 0  # with VLLM_HPU_MOE_GLUE=1: 1 merges the gate_up GEMM into the gate GEMM
+    VLLM_HPU_FLASH_NEXT_ASYNC_SCHED: int = 0  # 0 Flash-Next without async scheduling (default), 1 with it, 2 also MTP
     VLLM_HPU_HC_FUSED_COPY_MODE: int = 0  # copies before a fused HC op: 0 all, 1 not its own outputs, 2 block output
     VLLM_HPU_MOE_DENSE: int = 0  # 0 vendor MoE op (default), 1 dense batched FP8 experts up to MAX_TOKENS rows
     VLLM_HPU_MOE_DENSE_MAX_TOKENS: int = 512  # with VLLM_HPU_MOE_DENSE=1: the most tokens a step runs dense
@@ -2106,6 +2107,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # linear without bias logs one line and keeps the separate GEMM; the rest of the glue is unchanged.
     "VLLM_HPU_MOE_GLUE_MERGE_GATE_UP":
     lambda: int(os.environ.get("VLLM_HPU_MOE_GLUE_MERGE_GATE_UP", "0")),
+
+    # Flash-Next and vLLM's async scheduling (the engine schedules step N+1 while step N runs; the worker
+    # prepares and issues step N+1 before step N's sampled tokens reach the host). 0 (default) = the
+    # platform turns async scheduling off for Flash-Next, as before. 1 = Flash-Next keeps vLLM's decision
+    # (on unless --no-async-scheduling) when there is no speculative config; with one it stays off. The
+    # runner then carries the PLE n-gram context of the decode rows on the device and keeps placeholders
+    # for the in-flight tokens. 2 = as 1, and with the Flash-Next MTP draft too: the runner keeps its
+    # synchronous speculative step, the drafts stay on the device for the next step and the scheduler's
+    # optimistic num_computed_tokens is corrected with the accepted counts (v1/worker/flash_next_async.py).
+    # Any other value is 0. See docs/design/flash-next/async-sched.md.
+    "VLLM_HPU_FLASH_NEXT_ASYNC_SCHED":
+    lambda: int(os.environ.get("VLLM_HPU_FLASH_NEXT_ASYNC_SCHED", "0")),
 
     # (Declared here because tests pin GDN_CORE_VERIFY, HC_FUSED, MOE_GLUE and MOE_GLUE_MERGE_GATE_UP as
     # neighbours.) With VLLM_HPU_HC_FUSED=1 only: which activations get an owned copy before a fused
