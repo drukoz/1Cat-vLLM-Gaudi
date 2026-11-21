@@ -621,7 +621,14 @@ State at 00:57 UTC:
   user while `out-logs/` was root-owned (the dev container created it), every redirection failed, so no command ran.
   Fixed by `chown` of `out-logs/`, `out/`, `dev-wheels/` to the node user (always run host-side scripts' logs there after
   this); the dev container is back to CPUs 18,37,56,75; `lean-e1dbb4942fb8` started by hand 02:10 UTC (incremental, 52
-  build steps; the prepared-replay sources compiled clean by 02:12; publish expected about 02:30). The bridge job is
+  build steps; the prepared-replay sources compiled clean; **published 02:17:35 UTC**, 7 min). VERIFIED in the wheels
+  (python zipfile): stock has none of the patch strings; timers has `HPUGRAPH_REPLAY_TIMING` in
+  libhabana_pytorch_backend.so; lean has it plus `PT_HPU_HPUGRAPH_PREPARED_REPLAY` and `RunPrepared`. VERIFIED with `nm -DC`
+  in the dev container: the thread-local state shared between libhabana_pytorch_backend.so (HPUGraph.cpp) and
+  libhabana_pytorch_plugin.so (hpu_lazy_tensors.cpp, hlexec.cpp), i.e. `PreparedSlot()::slot`, `ThreadTotals()::totals`,
+  `InReplay()::in_replay`, is exported STB_GNU_UNIQUE in both (one copy per thread at run time); default visibility. The
+  job confirms it at run time: in the timers arms `exec_setup`, `launch_hashes`, `create_launcher` must be nonzero; in the
+  lean arms `launch_hashes`, `create_launcher`, `run_spec`, `run_lookup` about 0 (the prepared path engaged). The bridge job is
   **00174** `real8-bridge-phase` (65 min, after integration's 00161, so after 02:48): tiny-timers, tiny-accsync, tiny-lean
   (last; it looks for the lean build when it starts), then real-timers, real-accsync, real-lean; each real arm only if
   its tiny arm passed; verdicts `<id>-real8-bridge-phase-verdicts.txt`, arm results `<id>-real8-bridge-phase-<arm>/`.
