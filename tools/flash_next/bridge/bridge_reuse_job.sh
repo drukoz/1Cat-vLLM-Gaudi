@@ -26,6 +26,9 @@
 # flags off), real-lean5 (REUSE=1, STATIC_PLAN=1, inline collectives), real-lean5-verify (REUSE=2, STATIC_PLAN=2,
 # BUMP_EVERY=5000, inline collectives), real-lean4 (REUSE=1), most important first; the lean5 arms also run
 # text_check --churn, whose texts must equal their own texts_1 and real-ref's, and their plan_bad must be 0.
+# REF_PAIR=1 (BRIDGE_REF_PAIR) adds real-ref-alt right after real-ref: the same arm with the other accumulation-thread
+# setting (two servers that differ only in the spinner; its texts_1 must equal real-ref's); LEAN4=0 (BRIDGE_LEAN4)
+# leaves real-lean4 out (the hold).
 # Verdicts: ~/farm/<track>/results/<job>-<name>-verdicts.txt; exit code 0 when all passed.
 set -u
 IMG="${1:?image}"
@@ -37,12 +40,14 @@ PIN_KV="${BRIDGE_PIN_KV:-}"
 PLACE="${BRIDGE_PLACE:-}"
 ARMSET="${BRIDGE_ARMSET:-lean4}"
 L5="${BRIDGE_LEAN5:-}"
+REF_PAIR="${BRIDGE_REF_PAIR:-0}"
+WITH_LEAN4="${BRIDGE_LEAN4:-1}"
 LATE="$HOME/farm/collectives/bridge/late/${CARDQ_JOB:-none}.env"
 if [ -s "$LATE" ]; then
     while IFS='=' read -r k v; do
         case "$v" in *[!A-Za-z0-9._,\;=/-]*) echo "bridge_reuse: ignored a bad value in $LATE: $k"; continue ;; esac
         case "$k" in SPIN) SPIN="$v" ;; PIN_KV) PIN_KV="$v" ;; PLACE) PLACE="$v" ;; ARMSET) ARMSET="$v" ;;
-            LEAN5) L5="$v" ;; esac
+            LEAN5) L5="$v" ;; REF_PAIR) REF_PAIR="$v" ;; LEAN4) WITH_LEAN4="$v" ;; esac
     done <"$LATE"
     echo "bridge_reuse: late-bound settings from $LATE"
 fi
@@ -62,7 +67,7 @@ done
 SPINKV=""
 [ "$SPIN" = off ] && SPINKV=";PT_HPU_SYNCHRONOUS_ACC_QUEUE_FLUSHING=1"
 F1="PT_HPU_HPUGRAPH_PREPARED_REPLAY=1"
-echo "bridge_reuse: image $IMG, arm set $ARMSET, lean4 $L, lean5 ${L5:-none}, spinner $SPIN, pin ${PIN_KV:-none}, placement ${PLACE:-none}"
+echo "bridge_reuse: image $IMG, arm set $ARMSET, lean4 $L, lean5 ${L5:-none}, spinner $SPIN, pin ${PIN_KV:-none}, placement ${PLACE:-none}, ref pair $REF_PAIR, lean4 arm $WITH_LEAN4"
 PROBE="bash $P/serve_probe.sh --levels 32,8,1 --tokens 128 --warm-tokens 48 --repeat-top 2 --no-mintok-check --probe-arg --sampled-levels=32,8,1 --probe-arg --interleave-sampled --probe-arg --rounds=2"
 CMD="$PROBE"
 [ -z "$PLACE" ] || CMD="bash /results/bench/place_wrap.sh $PLACE -- $PROBE"
@@ -76,14 +81,20 @@ if [ "$ARMSET" = lean5 ]; then
         "tiny-lean5-verify:$L5:$F1;PT_HPU_HPUGRAPH_PREPARED_REUSE=2;PT_HPU_HPUGRAPH_STATIC_PLAN=2;PT_HPU_HPUGRAPH_STATIC_PLAN_BUMP_EVERY=500;PT_HPU_HPUGRAPH_REPLAY_TIMING=2000$SPINKV"
     grep -q '^tiny-stock ok' "$V" || { echo "bridge_reuse: the reference tiny arm failed: no real arm"; cat "$V"; exit 3; }
     REAL=("real-ref:$L5:$T5$LEANKV")
+    if [ "$REF_PAIR" = 1 ]; then  # the other spinner setting, everything else the same
+        if [ "$SPIN" = off ]; then ALTKV="${PIN_KV:+;$PIN_KV}"; else ALTKV="${PIN_KV:+;$PIN_KV};PT_HPU_SYNCHRONOUS_ACC_QUEUE_FLUSHING=1"; fi
+        REAL+=("real-ref-alt:$L5:$T5$ALTKV")
+    fi
     if grep -q '^tiny-lean5-verify ok' "$V"; then
         REAL+=("real-lean5:$L5:$F1;PT_HPU_HPUGRAPH_PREPARED_REUSE=1;PT_HPU_HPUGRAPH_STATIC_PLAN=1;PT_HPU_DISABLE_ASYNC_COLLECTIVE=1;TEXT_CHECK_CHURN=1;$T5$LEANKV")
         REAL+=("real-lean5-verify:$L5:$F1;PT_HPU_HPUGRAPH_PREPARED_REUSE=2;PT_HPU_HPUGRAPH_STATIC_PLAN=2;PT_HPU_HPUGRAPH_STATIC_PLAN_BUMP_EVERY=5000;PT_HPU_DISABLE_ASYNC_COLLECTIVE=1;TEXT_CHECK_CHURN=1;$T5$LEANKV")
     fi
-    grep -q '^tiny-lean4-nan ok' "$V" && REAL+=("real-lean4:$L5:$F1;PT_HPU_HPUGRAPH_PREPARED_REUSE=1;$T5$LEANKV")
-    COMPARE=(real-lean5 real-lean5-verify real-lean4)
+    if [ "$WITH_LEAN4" = 1 ] && grep -q '^tiny-lean4-nan ok' "$V"; then
+        REAL+=("real-lean4:$L5:$F1;PT_HPU_HPUGRAPH_PREPARED_REUSE=1;$T5$LEANKV")
+    fi
+    COMPARE=(real-ref-alt real-lean5 real-lean5-verify real-lean4)
     CHURN=(real-lean5 real-lean5-verify)
-    T32=(real-ref real-lean5 real-lean5-verify real-lean4)
+    T32=(real-ref real-ref-alt real-lean5 real-lean5-verify real-lean4)
     PLAN=(tiny-lean5-verify real-lean5 real-lean5-verify)
 else
     bash "$J" --sha "$S" --image "$IMG" "${ENV[@]}" --cmd 'python /farm/farm_tiny.py --gdn hc' \
