@@ -11,7 +11,7 @@ This track's harness refuses report files outside the repository, so the handoff
 
 ## Handoff (if this agent stops)
 
-Last update: **2026-11-21 08:32 UTC** (fourth agent, Opus 5.5; the node was extended to about 00:00 UTC on
+Last update: **2026-11-21 08:40 UTC** (fourth agent, Opus 5.5; the node was extended to about 00:00 UTC on
 2026-11-22). Branch `feat/flash-next-gaudi-engine-step`, head after `bcef8aa5` (merged into the program branch as PR #20;
 code of this track up to `01d66e31`), pushed. A second branch of this track,
 **`feat/flash-next-gaudi-engine-step-mtp-record`** (`2b90707f`, worktree `reports/engine-step/trees/mtp-record`):
@@ -584,6 +584,20 @@ step while the host works.
     mark_step: the likely cause (INFERRED). qsa-fused's 1-card 00209 tests `PT_HPU_ENABLE_STAGE_SUBMISSION=0` on
     the MoE layer; integration has an optional build-5 arm (the env and the `step marker due to` grep recipe,
     08:30 UTC).
+- **Stage 1 of the upload, done on CPU: `VLLM_HPU_PERSISTENT_INPUTS=1`** (`8efc6969`, default 0; coordinator GO
+  08:38 UTC): every per-step input of the decode builder, the speculative indices and the PLE inputs through
+  `HPUModelRunner._upload`, a persistent pinned host tensor and a persistent device tensor per (name, shape, dtype),
+  copied non-blocking (two pairs alternating per input under async scheduling). Same tokens off and on (greedy, n-gram
+  k = 3 with oracle drafts); one device address per input shape, which lean5's static launch plan needs (asked
+  collectives for 00210's plan_hit per rank). async-sched's device-made inputs replace five of them in chained
+  verification steps (its own tensors; agreed 08:46 UTC).
+- **A regression of this track on the program branch, being fixed:** the PR 16 merge resolution (`fe4cac24`, in
+  PR 20) computed the block table's width before the sparse / dense branch; stub runners without
+  `_block_table_max_blocks` fail (`tests/unit_tests/worker/test_flash_next_host_ngram.py`, 4 tests; served models
+  unaffected). Fix branch `fix/flash-next-gaudi-block-table-width-guard` (`33eb7cb1`), gate
+  `reports/engine-step/logs/gate_fixbt.log` (wrapper pid 87075, worktree `reports/engine-step/trees/fixbt`); open
+  and merge its PR when green. Also fixed on this branch in `8efc6969`. Note: `bin/gate` does not run
+  `tests/unit_tests/worker/`; run the worker tests a change touches by hand.
 - **Plan (coordinator's order, 08:18 UTC):** (1) name and remove the copy-only graphs (persistent base tensors,
   sliced inside the forward), about 13 launches, 2-4 ms per step (INFERRED); (2) I01 in the serve setting once 00207
   (MTP, 32 streams) and 00169 (32 x 120K) agree (integration got the runtime-switch recipe); (3) last: the packed
