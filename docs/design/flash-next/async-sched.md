@@ -6,8 +6,19 @@ results are under `/Volumes/Storage/Claude/gaudi-work/reports/async-sched/card/`
 
 ## Handoff (if this agent stops)
 
-Updated 2026-11-21 09:50 UTC.
+Updated 2026-11-21 10:20 UTC.
 
+- **Card 00220 (mode 1 with `d3fb1b11`, placement on, MEASURED)**: ms/token sync → async: 1 stream greedy 27.9 →
+  29.4, sampled 32.0 → 31.6; 8 streams greedy 43.7 → 50.1, sampled 53.0 → 48.8 (00186: +16 to +21 ms/step). tiny-async
+  passed. Worker spans at 8 rows: sync forward (host) 29-34 ms + device wait 5-10; async forward 36-41 + post 2-8; the
+  census arm counts per decode step 29 `.item()`, 7.7 `.tolist()`, 5.6 scalar reads of device tensors from torch's
+  `_tensor_str` (something formats device tensors every step; source not found yet, likely HPU-only), 14 H2D, 4
+  mark_step, 98 all_reduce. Reported to the coordinator (step-anatomy's census could name the first non-torch frame).
+- **PR #25 merged** (`4f070c75`): modes 1 and 2 on the program head (gate 72 files, 0 red).
+- **M3 CPU-green** on s2 (`VLLM_HPU_FLASH_NEXT_SPEC_DEVICE_ALIGN`): mode 3 serves with prefix caching on. Card
+  need sent: tiny-m3 with prefix caching + TP8 mode 3 / M3=2 against mode 2 with prefix caching, a multi-turn round.
+- M2's card job is now **00233** (`--replaces 00229 --no-sync`, + `VLLM_HPU_MOE_DENSE_MIN_TOKENS=1`, the new serve
+  baseline); mtp-draft-graph's chain job is **00230** (replaced 00228). Waiters: `logs/wait_00233.out`.
 - **Two branches.**
   - `feat/flash-next-gaudi-async-sched`: modes 1 and 2 of `VLLM_HPU_FLASH_NEXT_ASYNC_SCHED` (default 0). Commits:
     `7a818007` mode 1; `fb5cefca` mode 2; `0cc8cf09` env order; `d3fb1b11` no wait in a steady decode step
