@@ -11,7 +11,7 @@ This track's harness refuses report files outside the repository, so the handoff
 
 ## Handoff (if this agent stops)
 
-Last update: **2026-11-21 08:44 UTC** (fourth agent, Opus 5.5; the node was extended to about 00:00 UTC on
+Last update: **2026-11-21 08:55 UTC** (fourth agent, Opus 5.5; the node was extended to about 00:00 UTC on
 2026-11-22). Branch `feat/flash-next-gaudi-engine-step`, head after `bcef8aa5` (merged into the program branch as PR #20;
 code of this track up to `01d66e31`), pushed. A second branch of this track,
 **`feat/flash-next-gaudi-engine-step-mtp-record`** (`2b90707f`, worktree `reports/engine-step/trees/mtp-record`):
@@ -592,6 +592,11 @@ step while the host works.
   k = 3 with oracle drafts); one device address per input shape, which lean5's static launch plan needs (asked
   collectives for 00210's plan_hit per rank). async-sched's device-made inputs replace five of them in chained
   verification steps (its own tensors; agreed 08:46 UTC).
+- **The lean5 A/B of the persistent inputs:** collectives runs `VLLM_HPU_PERSISTENT_INPUTS=1` against `=0` on one
+  image with lean5 on (its ab_bridge template), build 6 preferred, this track's image only if the coordinator or
+  collectives says so (do not sync it for this unasked). Best on native-replay's `lean6m-43fdd6850644` with
+  `PT_HPU_HPUGRAPH_STATIC_PLAN_MISS_LOG=200`: `HPUGRAPH_PLAN_MISS` lines per launcher, `input_moved` and
+  `first_input <idx> <dtype[shape]>` name the inputs that still move.
 - **A regression of this track on the program branch, being fixed:** the PR 16 merge resolution (`fe4cac24`, in
   PR 20) computed the block table's width before the sparse / dense branch; stub runners without
   `_block_table_max_blocks` fail (`tests/unit_tests/worker/test_flash_next_host_ngram.py`, 4 tests; served models
