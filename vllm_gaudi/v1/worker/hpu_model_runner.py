@@ -49,6 +49,7 @@ from vllm_gaudi.v1.worker.recurrent_spec import (accepted_counts, load_checkpoin
 from vllm_gaudi.v1.spec_decode.flash_next_mtp_steps import is_flash_next_mtp
 from vllm_gaudi.distributed import vocab_parallel
 from vllm_gaudi.platform import is_flash_next_model
+from vllm_gaudi.v1.worker.flash_next_async import AsyncOutputLedger, PleContextCarry, needs_output_token_values
 
 from vllm.v1.attention.backend import AttentionBackend, AttentionType, CommonAttentionMetadata
 from vllm.model_executor.layers.attention import Attention
@@ -3595,6 +3596,8 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                           request_ids: Union[None, list[str]] = None,
                           pad_to: Optional[int] = None,
                           logits_reqs=None) -> SamplingMetadata:
+        if self._async_ledger is not None and len(self._async_ledger) and needs_output_token_values(self.input_batch):
+            self._async_ledger.settle()  # async scheduling: the values of the step in flight (penalties, bad words)
         # Create the sampling metadata.
         req_id_output_token_ids_lst = \
             self._generate_req_id_output_token_ids_lst(request_ids, \
@@ -4498,8 +4501,30 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             from vllm_gaudi.models.qwen4_exp.ple_ops import HOST_NGRAM_IDS_KWARG
             kwargs[HOST_NGRAM_IDS_KWARG] = async_h2d_copy(ple_inputs[2], dtype=torch.int32, device=device)
         else:
-            kwargs["ngram_context"] = async_h2d_copy(ple_inputs[1], dtype=torch.int32, device=device)
+            context = ple_inputs[1]
+            # A context already on the device (the rows async scheduling carries, flash_next_async.py) goes in as is.
+            kwargs["ngram_context"] = (context if isinstance(context, torch.Tensor) and context.device.type != "cpu"
+                                       else async_h2d_copy(context, dtype=torch.int32, device=device))
         return kwargs
+
+    # Async scheduling of a Flash-Next server (VLLM_HPU_FLASH_NEXT_ASYNC_SCHED=1, v1/worker/flash_next_async.py):
+    # the PLE n-gram context of the decode rows carried on the device, and placeholders for the in-flight tokens in
+    # output_token_ids. Class defaults: a synchronous runner, another model and a runner built without __init__
+    # (unit tests) have neither.
+    _ple_carry: Optional[PleContextCarry] = None
+    _async_ledger: Optional[AsyncOutputLedger] = None
+    _flash_next_async_checked = False
+
+    def _flash_next_async_begin_step(self) -> None:
+        """Under async scheduling, once per engine step before its batches are built: the last step's decode
+        contexts become this step's, and every placeholder but the step in flight gets its token."""
+        if not self._flash_next_async_checked:
+            self._flash_next_async_checked = True
+            if is_flash_next_model(self.model_config):
+                self._ple_carry, self._async_ledger = PleContextCarry(), AsyncOutputLedger()
+        if self._ple_carry is not None:
+            self._ple_carry.begin_step()
+            self._async_ledger.settle(keep=1)
 
     def _form_prefill_batch(self, contents):
         if len(contents.req_ids) == 0:
@@ -5391,6 +5416,13 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             # VLLM_HPU_PLE_HOST_NGRAM_IDS=1: token_ids is the CPU copy of the step's input ids ([padded_batch_size *
             # num_tokens] row-major), speculative drafts included; hash it here instead of in the graph.
             ple_inputs = self._with_host_ngram_ids(ple_inputs, token_ids)
+            if self._ple_carry is not None and len(ple_inputs) == 2:
+                # Async scheduling: rows that decoded in the last step take their context from the device.
+                ple_inputs = (ple_inputs[0],
+                              self._ple_carry.decode_context(
+                                  async_h2d_copy(ple_inputs[1], dtype=torch.int32, device=self.device),
+                                  self.input_batch.req_ids[:num_decodes], token_ids_device,
+                                  num_tokens_per_req[:num_decodes]))
 
         return DecodeInputData(num_decodes=num_decodes,
                                token_ids=token_ids_device,
@@ -6401,6 +6433,8 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         warmup_mode = self.warmup_mode
         self.scheduler_output = None
         self.warmup_mode = False
+        if self.use_async_scheduling:
+            self._flash_next_async_begin_step()
 
         # NOTE(kzawora): Since scheduler doesn't differentiate between prefills
         # and decodes, we must handle mixed batches. In _update_states we make
@@ -6982,6 +7016,10 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                 async_output_copy_stream=self.async_output_copy_stream,
                 native_copy=gaudi_envs.VLLM_HPU_DSV4_NATIVE_DECODE_GRAPH and num_prefills == 0 and num_decodes == 1,
             )
+            if self._async_ledger is not None:
+                # One placeholder per sampled token in output_token_ids, settled from this host copy.
+                self._async_ledger.record(self.requests, self.input_batch.req_ids[:num_reqs], self.invalid_req_indices,
+                                          async_output._sampled_token_ids_cpu, async_output._async_copy_ready_event)
             # Hybrid recurrent states and request rows are still being
             # established while prefills enter the decode batch. Settle those
             # transitions before scheduling another batch, then retain normal

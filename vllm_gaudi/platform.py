@@ -126,6 +126,32 @@ def is_flash_next_model(model_config: Optional[ModelConfig]) -> bool:
     return any(arch in FLASH_NEXT_ARCHS for arch in architectures)
 
 
+def resolve_flash_next_async_scheduling(vllm_config: "VllmConfig") -> bool:
+    """Whether a Flash-Next server keeps vLLM's async scheduling (``VLLM_HPU_FLASH_NEXT_ASYNC_SCHED``); logs it.
+
+    ``0`` (default): async scheduling is turned off, as it was before the flag. ``1``: vLLM's decision stands
+    (on unless ``--no-async-scheduling``); a speculative config has already turned it off above (the HPU runner
+    does not run speculation under async scheduling). Under async scheduling the runner carries the PLE n-gram
+    context of the decode rows on the device (``v1/worker/flash_next_async.py``).
+    """
+    scheduler_config = vllm_config.scheduler_config
+    if int(gaudi_envs.VLLM_HPU_FLASH_NEXT_ASYNC_SCHED) == 1:
+        if scheduler_config.async_scheduling:
+            logger.info("[HPU] Async scheduling on for Flash-Next (VLLM_HPU_FLASH_NEXT_ASYNC_SCHED=1): the PLE "
+                        "n-gram context of the decode rows is carried on the device")
+        elif getattr(vllm_config, "speculative_config", None) is not None:
+            logger.warning("[HPU] VLLM_HPU_FLASH_NEXT_ASYNC_SCHED=1 has no effect: async scheduling stays off with "
+                           "a speculative config on HPU")
+        else:
+            logger.info("[HPU] VLLM_HPU_FLASH_NEXT_ASYNC_SCHED=1, but async scheduling is off for this server")
+        return bool(scheduler_config.async_scheduling)
+    if scheduler_config.async_scheduling:
+        scheduler_config.async_scheduling = False
+        logger.warning("[HPU] Async scheduling disabled for Flash-Next: PLE n-gram context needs sampled tokens "
+                       "on the CPU (VLLM_HPU_FLASH_NEXT_ASYNC_SCHED=1 keeps it on)")
+    return False
+
+
 def _configure_recurrent_state(vllm_config: "VllmConfig") -> None:
     """Compact-GDN rule and recurrent-state-pool resolution for GDN hybrids (M1-T1)."""
     from vllm_gaudi.v1.core.recurrent_state_pool import (ENV_CACHE_SLOTS, ENV_MODE, ENV_SLOTS,
@@ -579,10 +605,8 @@ class HpuPlatform(Platform):
         # However, for HPU, speculative decoding is not supported with async scheduling.
         vllm_config.scheduler_config.async_scheduling = \
             vllm_config.scheduler_config.async_scheduling and vllm_config.speculative_config is None
-        if vllm_config.scheduler_config.async_scheduling and is_flash_next_model(vllm_config.model_config):
-            vllm_config.scheduler_config.async_scheduling = False
-            logger.warning("[HPU] Async scheduling disabled for Flash-Next: "
-                           "PLE n-gram context needs sampled tokens on the CPU")
+        if is_flash_next_model(vllm_config.model_config):
+            resolve_flash_next_async_scheduling(vllm_config)
         _validate_hpu_dflash2_config(vllm_config)
         _validate_flash_next_speculative_config(vllm_config)
 
