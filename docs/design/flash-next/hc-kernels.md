@@ -184,8 +184,12 @@ engines, x 0.75). The index space is row-parallel already across requests; withi
 recurrence (each node's state is the previous node's), so they cannot run on separate engines without another
 algorithm (the chunked delta rule: not bit-identical, and its intermediate states would still be needed for every
 node's slot). The one finer split left is the value heads of a key head (kernel-fixes' option (c)): 3x the points at
-a third of the work each, which matters most at few requests (1 request: 6 engines instead of 2), at the price of
-q/k conv and norm work repeated per value head and conv-state stores that more than one point would have to own.
+a third of the work each, which matters most at few requests (1 request: 6 engines instead of 2; INFERRED about
+-27 % at 32 and 128 rows too, 192 points = 8 per engine on 24), at the price of the q/k conv and norm repeated per
+value head. It is not safe as the kernel stands: the q/k conv history is shifted in place (conv load slot = store
+slot, the normal case), so a value-head point running after another one on its key head would read a history that
+point already shifted. It needs the q/k conv-state update moved out of the points first (a separate op after the
+verify, or the history read by every point before any writes, which one kernel launch cannot order).
 
 **Variants** (`VLLM_HPU_GDN_VERIFY_VARIANT`, only with `VLLM_HPU_GDN_KERNEL_INTERLEAVE=1`; read by the glue like the
 interleave variable; each an optional ELF of the library, weak symbols):
