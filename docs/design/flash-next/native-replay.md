@@ -614,6 +614,17 @@ State at 00:57 UTC:
   32 streams), real-lean (+ the flag); each arm only if every arm before passed. Without the lean build: the timers job
   alone (`real8-bridge-timers`, 30 min). Logs: `<id>-<name>-<arm>/server0.log` (tiny: `hc/server0.log` in the same
   folder). The collectives agent sends the id to this track and the coordinator.
+- **02:15 UTC.** **00160 PASSED** (collectives track, all cards): `stock-5176b1b2` loads at TP8 (all 14 mapped bridge
+  .so files are our wheel's; 18 of its 23 .so differ from the image's; nothing needed the image's `.upstream` twins) and
+  the tiny model's tokens equal the image bridge's prompt by prompt: we can build and load our own bridge on this stack.
+  `timers-c281d8b53d08` published 01:39 UTC. The chain (`chain_lean.sh`) never started the lean build: it ran as the node
+  user while `out-logs/` was root-owned (the dev container created it), every redirection failed, so no command ran.
+  Fixed by `chown` of `out-logs/`, `out/`, `dev-wheels/` to the node user (always run host-side scripts' logs there after
+  this); the dev container is back to CPUs 18,37,56,75; `lean-e1dbb4942fb8` started by hand 02:10 UTC (incremental, 52
+  build steps; the prepared-replay sources compiled clean by 02:12; publish expected about 02:30). The bridge job is
+  **00174** `real8-bridge-phase` (65 min, after integration's 00161, so after 02:48): tiny-timers, tiny-accsync, tiny-lean
+  (last; it looks for the lean build when it starts), then real-timers, real-accsync, real-lean; each real arm only if
+  its tiny arm passed; verdicts `<id>-real8-bridge-phase-verdicts.txt`, arm results `<id>-real8-bridge-phase-<arm>/`.
 - The integration track's build 2 runs as **00156** (`real8-build2b`; 00142 was cancelled and resubmitted): arms tiny,
   nospec (A), nospec-pin (B: `VLLM_HPU_WORKER_CPU_PIN=1 PT_HPU_DISABLE_HPUGRAPH_REPLAY_HASHCHECK=1`), mtp2. The read-only
   CPU watcher was moved to it (`late/watch_job.sh 00156 ... nospec nospec-pin`, node pids 1372497/1372500, attached to
