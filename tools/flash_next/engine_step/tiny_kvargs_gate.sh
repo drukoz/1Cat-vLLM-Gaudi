@@ -17,8 +17,12 @@ OUT="${FARM_OUT:-/results/tiny-kvargs}"
 CKPT="${TINY_CKPT:-/tmp/fn-smoke-ckpt}"
 PORT=$(( ${FARM_PORT_BASE:-8000} + 10 ))
 TP="${FARM_NCARDS:-1}"
-BLOCK="${KVARGS_BLOCK:-512}"
-DECODE="${KVARGS_DECODE:-160}"
+# The tiny model's attention block (the prefix cache's and align mode's unit) is 12800 tokens (its mamba page):
+# prompts of 0.8 x that and 2700 decoded tokens cross it; the next turn then hits the cached block (job 00250 with
+# 512 crossed nothing and hit nothing).
+BLOCK="${KVARGS_BLOCK:-12800}"
+DECODE="${KVARGS_DECODE:-2700}"
+MAX_LEN="${KVARGS_MAX_LEN:-32768}"
 for kv in PT_HPU_LAZY_MODE=1 PT_HPU_LAZY_ACC_PAR_MODE=0 VLLM_HPU_FLASH_NEXT_QSA_MODE=1 \
     VLLM_HPU_RECURRENT_STATE_POOL=1 VLLM_HPU_GDN_CORE_DECODE=1 VLLM_HPU_GDN_CORE_VERIFY=1 VLLM_HPU_HC_FUSED=1 \
     VLLM_HPU_PREFIX_ALIGN_SPLIT=1 VLLM_HPU_PLE_HOST_NGRAM_IDS=1 VLLM_HPU_MTP_DRAFT_LOOP=1 VLLM_HPU_MTP_CHUNK_KV=1 \
@@ -34,7 +38,7 @@ for FLAG in 1 0; do
     mkdir -p "$D"
     echo "=== kvargs gate: VLLM_HPU_KV_CACHES_IN_GRAPH_ARGS=$FLAG $(date -u +%T)"
     VLLM_HPU_KV_CACHES_IN_GRAPH_ARGS=$FLAG setsid vllm serve "$CKPT" --served-model-name tiny \
-        --tensor-parallel-size "$TP" --max-model-len 4096 --max-num-seqs 8 --language-model-only --trust-remote-code \
+        --tensor-parallel-size "$TP" --max-model-len "$MAX_LEN" --max-num-seqs 8 --language-model-only --trust-remote-code \
         --enable-prefix-caching --enable-prompt-tokens-details --port "$PORT" --host 127.0.0.1 \
         --speculative-config '{"method": "mtp", "num_speculative_tokens": 3}' > "$D/server0.log" 2>&1 &
     SP=$!
@@ -75,7 +79,7 @@ for flag in ("1", "0"):
             m = re.search(r"HPU graph replay copies (\d+) unmatched input tensor\(s\) \(x(\d+)\): (.*)$", line)
             if m:
                 tensors = m.group(3).split("; ")
-                caches = [t for t in tensors if CACHE.search(t) and int(t.split("[")[1].split(",")[0]) > 512]
+                caches = [t for t in tensors if CACHE.search(t) and int(re.split(r"[,\]]", t.split("[", 2)[2])[0]) > 512]
                 found.append({"n": int(m.group(1)), "seen": int(m.group(2)), "caches": len(caches),
                               "shapes": [t.split(" offset")[0] for t in tensors][:8]})
     except OSError:
@@ -100,6 +104,11 @@ for flag, data in turns.items():
                 fail("arg%s: %s differs (first difference %s)" % (flag, name, row.get("first_diff")))
     if not all(r.get("ok") for r in data.get("rounds", [])):
         fail("arg%s: a round failed" % flag)
+    hits = [x.get("cached_tokens") or 0 for r in data.get("rounds", []) if r.get("round") == "next_turn"
+            for x in r.get("results", []) if x]
+    verdict.setdefault("next_turn_cached", {})[flag] = hits
+    if not any(hits):
+        fail("arg%s: the next turn hit no cached block" % flag)
 if len(turns) == 2:
     by = [{r["round"]: [x.get("token_ids") for x in r.get("results", []) if x] for r in turns[f].get("rounds", [])}
           for f in ("1", "0")]
