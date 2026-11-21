@@ -161,17 +161,18 @@ def _save_ssm_state(core_attn_out, final_state, ssm_state, state_indices):
     state_indices = state_indices.reshape(-1).to(device=ssm_state.device, dtype=torch.long)
     if state_indices.numel() == 1:
         # A real single-request prefill always owns its only state slot. Keep
-        # this hot path to one index operation per GDN layer; materializing
-        # nonzero(valid) here adds a device/host synchronization.
+        # this hot path to one index operation per GDN layer.
         safe_si = torch.remainder(state_indices, ssm_state.shape[0])
         ssm_state.index_copy_(0, safe_si, final_state.to(device=ssm_state.device, dtype=ssm_state.dtype))
         return core_attn_out
+    # Several rows (a prompt batch of VLLM_HPU_PREFILL_BATCH, or a padded bucket): one fixed-shape write, as the
+    # PLE layer's _save_conv_state does. A row whose index is outside the tensor (the -1 padding) writes the
+    # tensor's last row, the padding row of every layout the runner allocates, which no request reads back; no
+    # nonzero(valid) (a data-dependent shape and a host synchronization inside the captured forward).
     valid = (state_indices >= 0) & (state_indices < ssm_state.shape[0])
-    valid_positions = torch.nonzero(valid, as_tuple=False).reshape(-1)
-    if valid_positions.numel() > 0:
-        safe_si = state_indices.index_select(0, valid_positions)
-        state_rows = final_state.index_select(0, valid_positions).to(device=ssm_state.device, dtype=ssm_state.dtype)
-        ssm_state.index_copy_(0, safe_si, state_rows)
+    pad_row = torch.full_like(state_indices, ssm_state.shape[0] - 1)
+    ssm_state.index_copy_(0, torch.where(valid, state_indices, pad_row),
+                          final_state.to(device=ssm_state.device, dtype=ssm_state.dtype))
     return core_attn_out
 
 

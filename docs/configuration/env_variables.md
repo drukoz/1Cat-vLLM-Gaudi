@@ -521,6 +521,20 @@ positive value (for example `140000`) replays every chunk of a 128K prompt from
 graphs; each new (query, context) bucket is captured on first use. Decode is
 unchanged.
 
+`VLLM_HPU_PREFILL_BATCH=N` (N >= 2) runs up to N prompt chunks of one engine
+step as one forward on Flash-Next (`qwen4_exp`), instead of one forward per
+request (a hybrid model's runner never merged prompts). Chunks of consecutive
+requests share a forward when they have the same padded shape (the same query
+bucket and context bucket, so every row is padded as its own forward would be),
+all complete their prompt or none does, no request asks for prompt logprobs, and
+no chunk reads a block another chunk of the step writes. A run of equal chunks
+is cut into forwards whose row counts are prompt batch-size buckets (1, 2, 4,
+... up to N: no padded rows), and a forward that would leave the prompt HPU-graph
+limit (`rows x (query + context)` tokens, see above) is cut smaller. The prompt
+batch-size buckets go up to N. Each new (rows, query, context) bucket is
+compiled or captured on first use. Other models, merged prefill, KV transfer and
+data parallelism keep one request per prompt forward. Default `0` (off).
+
 `VLLM_HPU_QSA_PREFILL_INDEXER_SPLIT=1` splits the QSA indexer's prompt scoring
 over the tensor-parallel ranks. The indexer projection and the compressed key
 cache are replicated, so by default every rank scores every query row of a
