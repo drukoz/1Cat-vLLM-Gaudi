@@ -1511,6 +1511,41 @@ def _log_moe_dense_once(key, message, *args):
         logger.warning(message, *args)
 
 
+# VLLM_HPU_MOE_ROUTE_STATS (stats jobs only): each per-channel FP8 MoE op with kept stacked experts gets one row of
+# a process-wide int32 buffer [64, local experts + 1], allocated when its weights are prepared (before any graph is
+# captured); its forward writes the per-expert pair counts of the call and the call's row count into that row as a
+# whole row with index_copy_ (rule 11), and the runner reads the buffer once per step (moe_route_stats_rows).
+_ROUTE_STATS = {"buffer": None, "ops": 0}
+
+
+def _route_stats_slot(device, experts):
+    """The next row of the route-stats buffer as a 1-element index tensor on ``device`` (None when it is full)."""
+    if _ROUTE_STATS["buffer"] is None:
+        _ROUTE_STATS["buffer"] = torch.zeros(64, experts + 1, dtype=torch.int32, device=device)
+    buffer, index = _ROUTE_STATS["buffer"], _ROUTE_STATS["ops"]
+    if index >= buffer.shape[0] or buffer.shape[1] != experts + 1:
+        return None
+    _ROUTE_STATS["ops"] = index + 1
+    return torch.tensor([index], dtype=torch.int64, device=device)
+
+
+def _record_route_stats(slot, topk_ids, experts_min, experts, rows):
+    """Write [the call's pair count per local expert..., rows] into the op's row of the route-stats buffer."""
+    local = topk_ids.to(torch.int32) - int(experts_min)
+    expert_range = torch.arange(experts, dtype=torch.int32, device=topk_ids.device)
+    counts = (local.reshape(-1, 1) == expert_range).to(torch.int32).sum(dim=0, dtype=torch.int32)
+    row = torch.cat([counts, torch.full((1, ), int(rows), dtype=torch.int32, device=topk_ids.device)])
+    _ROUTE_STATS["buffer"].index_copy_(0, slot, row.unsqueeze(0))
+
+
+def moe_route_stats_rows():
+    """The route-stats rows of every op so far (a list per op: counts per local expert, then rows), or None."""
+    buffer = _ROUTE_STATS["buffer"]
+    if buffer is None or _ROUTE_STATS["ops"] == 0:
+        return None
+    return buffer[:_ROUTE_STATS["ops"]].cpu().tolist()
+
+
 def _set_moe_dense_weights(layer):
     """VLLM_HPU_MOE_DENSE=1: give a per-channel FP8 MoE op the layer's stacked experts and their scales."""
     op = getattr(layer, "moe_op", None)
@@ -1520,6 +1555,10 @@ def _set_moe_dense_weights(layer):
     s13 = torch.stack([s.reshape(-1).to(torch.float32) for s in op._cached_w13_scale_views])
     s2 = torch.stack([s.reshape(-1).to(torch.float32) for s in op._cached_w2_scale_views])
     op.set_dense_weights(layer.w13_weight.data, layer.w2_weight.data, s13, s2)
+    if envs.VLLM_HPU_MOE_ROUTE_STATS and op.route_stats_slot is None:
+        op.route_stats_slot = _route_stats_slot(layer.w13_weight.device, op.num_experts)
+        _log_moe_dense_once("route-stats", "VLLM_HPU_MOE_ROUTE_STATS: the MoE ops write their per-expert pair counts "
+                            "(%d ops so far)", _ROUTE_STATS["ops"])
 
 
 class VllmMixtureOfExpertsOpFP8PerChannel(VllmMixtureOfExpertsOpBase):
@@ -1550,6 +1589,8 @@ class VllmMixtureOfExpertsOpFP8PerChannel(VllmMixtureOfExpertsOpBase):
         # VLLM_HPU_MOE_DENSE=1: (w13 [E, 2I, H], w2 [E, H, I], s13 [E, 2I], s2 [E, H]), set after the weights reach
         # their device (_set_moe_dense_weights); None = the vendor op only.
         self.dense_weights = None
+        # VLLM_HPU_MOE_ROUTE_STATS: this op's row of the route-stats buffer (_route_stats_slot); None = off.
+        self.route_stats_slot = None
 
     def set_dense_weights(self, w13, w2, s13, s2):
         self.dense_weights = (w13, w2, s13, s2)
@@ -1596,6 +1637,8 @@ class VllmMixtureOfExpertsOpFP8PerChannel(VllmMixtureOfExpertsOpBase):
     ):
         tokens_num, _ = x.shape
         activation = _as_activation_str(activation)
+        if self.route_stats_slot is not None:
+            _record_route_stats(self.route_stats_slot, topk_ids, self.experts_min, self.num_experts, tokens_num)
         if (self.dense_weights is not None and self.w13_input_scale is None and self.is_gated
                 and activation == "silu"
                 and envs.VLLM_HPU_MOE_DENSE_MIN_TOKENS <= tokens_num <= envs.VLLM_HPU_MOE_DENSE_MAX_TOKENS):

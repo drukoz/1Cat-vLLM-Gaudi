@@ -152,3 +152,32 @@ def test_a_zero_chunk_size_leaves_the_vendor_op_its_default(tokens, expected):
     op, _ = _op()
     op.chunk_size_list, op.token_boundary_list = [0, 64, 8192], [16, 512, 1000000]
     assert op._get_extra_kwargs(tokens) == expected
+
+
+def test_route_stats_record_the_pairs_per_local_expert(monkeypatch, tmp_path):
+    """VLLM_HPU_MOE_ROUTE_STATS: an op with kept stacked experts writes the per-expert pair counts of its last call
+    and the call's row count into its row of the buffer, on the dense form and on the vendor op alike; without the
+    flag no row is allocated."""
+    monkeypatch.setattr(plugin_ops, "_ROUTE_STATS", {"buffer": None, "ops": 0})
+    op, dense = _op()
+
+    class Layer:
+        pass
+
+    layer = Layer()
+    layer.moe_op = op
+    layer.w13_weight = torch.nn.Parameter(dense[0], requires_grad=False)
+    layer.w2_weight = torch.nn.Parameter(dense[1], requires_grad=False)
+    monkeypatch.setenv("VLLM_HPU_MOE_DENSE", "1")
+    plugin_ops._set_moe_dense_weights(layer)
+    assert op.route_stats_slot is None and plugin_ops.moe_route_stats_rows() is None
+    op.dense_weights = None
+    monkeypatch.setenv("VLLM_HPU_MOE_ROUTE_STATS", str(tmp_path))
+    plugin_ops._set_moe_dense_weights(layer)
+    assert int(op.route_stats_slot) == 0
+    for rows in (20, 5):  # 20: the dense form (17 to 512 rows); 5: the vendor op
+        x, ids, weights = _batch(rows, seed=rows)
+        op(x, ids, weights)
+        expected = [int(((ids - EXPERTS_MIN) == e).sum()) for e in range(LOCAL)] + [rows]
+        assert plugin_ops.moe_route_stats_rows() == [expected]
+    assert len(moe_block.VENDOR_CALLS) == 1

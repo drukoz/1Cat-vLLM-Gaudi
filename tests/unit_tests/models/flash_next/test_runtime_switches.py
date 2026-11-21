@@ -106,6 +106,32 @@ def test_moe_dense_range_drops_the_captured_graphs(tmp_path, monkeypatch):
     assert HPUModelRunner._drop_hpu_graphs(runner) == []
 
 
+def test_moe_route_stats_are_appended_once_per_step(tmp_path, monkeypatch):
+    """VLLM_HPU_MOE_ROUTE_STATS=<folder>: the runner appends the MoE ops' route-stats rows to rank<r>.jsonl after
+    every step, with the step's token count and kind."""
+    import types
+
+    import torch
+
+    from vllm_gaudi.extension import ops as plugin_ops
+    from vllm_gaudi.v1.worker.hpu_model_runner import HPUModelRunner
+
+    folder = tmp_path / "stats"
+    monkeypatch.setenv("VLLM_HPU_MOE_ROUTE_STATS", str(folder))
+    monkeypatch.setattr(plugin_ops, "_ROUTE_STATS", {
+        "buffer": torch.tensor([[1, 2, 7], [0, 3, 7], [9, 9, 9]], dtype=torch.int32),
+        "ops": 2
+    })
+    step = types.SimpleNamespace(total_num_scheduled_tokens=8, scheduled_spec_decode_tokens={"a": [1, 2, 3]})
+    HPUModelRunner._dump_moe_route_stats(object(), step, 0, 2)
+    HPUModelRunner._dump_moe_route_stats(object(), step, 0, 2)
+    lines = (folder / "rank0.jsonl").read_text().splitlines()
+    assert len(lines) == 2
+    record = json.loads(lines[0])
+    assert record["ops"] == [[1, 2, 7], [0, 3, 7]]
+    assert (record["tokens"], record["spec_tokens"], record["decodes"], record["prefills"]) == (8, 3, 2, 0)
+
+
 @pytest.fixture(scope="module")
 def reference(tiny_checkpoint) -> list[dict]:
     return json.loads((tiny_checkpoint / "reference.json").read_text(encoding="utf-8"))["prompts"]
