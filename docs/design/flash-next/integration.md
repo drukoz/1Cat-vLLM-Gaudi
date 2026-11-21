@@ -172,6 +172,17 @@ checkpoint's temperature 1.0, top_k 20, top_p 0.95). Reference (program head, 00
 | 2 (00156) | MTP k = 2 (C) | 8 | 99 / 91 | 39.8 (25.1) | not run | | 2.29 |
 | 2 (00156) | MTP k = 2 (C) | 32 | 91 / 104 | **40.1 (24.9)** | 97 / 111 | **46.7 (21.4)** | 2.27 / 2.29 greedy, 2.08 sampled |
 | 2 (00156) | MTP k = 2 (C), 8 x 14.8K prompts | 8 | 86 | 35.0 (28.5) steady | | | 2.46 (acceptance 0.80 / 0.63) |
+| 3 (00178) | no spec | 1 | 29.4 / 29.7 | 29.4 (34.0) | 41.0 / 31.4 | 31.4 (31.9) | |
+| 3 (00178) | no spec | 8 | 53.4 / 52.9 | 52.9 (18.9) | 51.2 / 50.4 | 50.4 (19.8) | |
+| 3 (00178) | no spec | 32 | 69.1 / 66.7 | 66.7 (15.0) | 54.2 / 55.1 | 54.2 (18.4) | |
+| 3 (00178) | MTP k = 3 | 1 | 72 / 63 | 24.5 (40.8) | 68 / 69 | 27.2 (36.7) | 2.56 |
+| 3 (00178) | MTP k = 3 | 8 | 79 / 80 | 29.3 (34.1) | not run | | 2.67 / 2.72 |
+| 3 (00178) | MTP k = 3 | 32 | 104 / 105 | **39.4 (25.4)** | 121 / 119 | 49.0 (20.4) | 2.56 / 2.67 greedy, 2.46 / 2.37 sampled |
+| 3 (00178) bisect, greedy | no spec, QSA shard off | 8 / 1 | 57.5, 43.4 / 36.6, 29.3 | | | | |
+| 3 (00178) bisect, greedy | no spec, prefix flags off | 8 / 1 | 48.7, 48.7 / 38.4, 37.7 | | | | |
+| 3 (00178) bisect, greedy | no spec, prefix off, cut 0 | 8 / 1 | 51.7, 48.3 / 40.6, 37.1 | | | | |
+| MoE A/B 00161 (build 2 image) | MTP k = 3, base / VLLM_MOE_CHUNK | 32 | | 40.8 / **38.0 (26.3)** | | | |
+| MoE A/B 00177 (build 3 image) | MTP k = 3, base / VLLM_HPU_MOE_DENSE | 32 | | 40.2 / 43.4 | | | |
 
 Build 2 readings (arm A, two measured rounds per level, `a / b` = round 1 / round 2; the better round in the
 ms-per-token column): sampled equals greedy now (server0.log: `Candidate sampling (VLLM_HPU_CANDIDATE_SAMPLING=1): a
@@ -188,6 +199,13 @@ candidate verification path's first real-model run (no fallback line, coherent t
 96 rows verify 82-86 ms + draft 16-19 ms (k = 3 at 128 rows verified in about 85 ms: k barely moves the verification
 cost); the 8 x 14.8K long-prompt round ran without a crash (5c770d96 in the image) with acceptance 0.80 / 0.63. At 1
 and 8 streams k = 2 on build 2 is slower than k = 3 on build 1 (part of it the 8-stream regression of arm A).
+
+Build 3 (00178) and the MoE A/Bs: the 8-stream regression of build 2 is not reproduced (53 ms with every flag; the
+bisect arms land at 43 to 57 ms with 5 to 10 ms between rounds and servers: no flag explains build 2's 70);
+MTP k = 3 at 1 stream is 24.5 to 27.9 ms per token with `VLLM_HPU_SPEC_SAMPLED_VERIFY=2` set, so build 2's 1-stream
+slowdown was k = 2 on that server; `VLLM_MOE_CHUNK` wins at 32 streams (00161: -12 ms per MTP step), the dense form
+loses on the served model (00177). Single-server numbers at 32 streams vary by about 10 ms (00178: greedy 69 / 67
+against sampled 54 / 55 on the same server).
 
 ## Merge log (what the conflicts were)
 
