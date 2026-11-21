@@ -29,12 +29,22 @@ constexpr const char* kRmsNormGatedSchema =
 
 int64_t compact_post_conv_heads(const at::Tensor& packed) {
   TORCH_CHECK(packed.scalar_type() == at::ScalarType::BFloat16);
+  // One rank's packed q|k|v width is 5 * key heads * 128: TP1 16 heads
+  // (10240), TP2 8 (5120), TP4 4 (2560), TP8 2 (1280).
+  int64_t heads = 0;
+  if (packed.dim() == 2) {
+    for (int64_t candidate : {16, 8, 4, 2}) {
+      if (packed.size(1) == 5 * candidate * 128) {
+        heads = candidate;
+      }
+    }
+  }
   TORCH_CHECK(
-      packed.dim() == 2 &&
-          (packed.size(1) == 10240 || packed.size(1) == 5120),
-      "expected compact QKV shape [tokens, 10240] or [tokens, 5120], got ",
+      heads != 0,
+      "expected compact QKV shape [tokens, 10240], [tokens, 5120], "
+      "[tokens, 2560] or [tokens, 1280], got ",
       packed.sizes());
-  return packed.size(1) == 5120 ? 8 : 16;
+  return heads;
 }
 
 bool register_flashqla_pair_transform() {
