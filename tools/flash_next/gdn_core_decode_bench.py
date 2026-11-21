@@ -3,7 +3,11 @@
 
 Usage: ``PYTHONPATH=$PWD python tools/flash_next/gdn_core_decode_bench.py [--device auto|cpu|hpu]
 [--ops core,recurrent] [--tp 2,8] [--batches 1,16,64] [--iters 100] [--warmup 10] [--repeat 8]
-[--bandwidth-tbs 2.45] [--gate sigmoid|silu] [--no-hpu-graph]``.
+[--bandwidth-tbs 2.45] [--gate sigmoid|silu] [--no-hpu-graph] [--verify-tokens 4]``.
+
+``--ops`` also takes ``verify``: the fused verification op (``gdn_core_verify``, MTP) with ``--verify-tokens``
+nodes per request (1 + k draft tokens; default 4), every row an in-place chain row. Its floor is the core op's
+floor times the nodes, an estimate (each node loads and stores one state as a decode step does).
 
 On this Mac the script runs the CPU kernels as a smoke test only: CPU times mean nothing, the
 Gaudi card gives the numbers the rental compares with the target (at most 2x the floor).
@@ -20,10 +24,12 @@ import torch.nn as nn
 
 from flashinfer_gaudi.gdn_core_decode import GdnGateActivation
 from tests.unit_tests.gdn_core_decode.sim_case import SimCase, make_inputs, scalars
-from tools.flash_next.gdn_core_decode_replay import CoreStep, RecurrentStep, hpu_present
+from tests.unit_tests.gdn_core_decode.verify_sim_case import (VerifySimCase, _lattice_rows, make_verify_inputs,
+                                                              verify_scalars)
+from tools.flash_next.gdn_core_decode_replay import CoreStep, RecurrentStep, VerifyStep, hpu_present
 
 D = 128
-OPS = ("core", "recurrent")
+OPS = ("core", "recurrent", "verify")
 GATES = {"silu": GdnGateActivation.SILU, "sigmoid": GdnGateActivation.SIGMOID}
 
 
@@ -35,10 +41,14 @@ def heads(tp: int) -> tuple[int, int, int]:
     return H, HV, 2 * H * D + HV * D
 
 
-def floor_bytes(op: str, tp: int, batch: int) -> int:
-    """Bytes the op must move per call for ``batch`` rows: the memory-bandwidth floor numerator."""
+def floor_bytes(op: str, tp: int, batch: int, tokens: int = 1) -> int:
+    """Bytes the op must move per call for ``batch`` rows: the memory-bandwidth floor numerator.
+
+    ``verify`` with ``tokens`` nodes per row: the core op's bytes for ``batch * tokens`` rows (an estimate)."""
     _, HV, C = heads(tp)
     B = batch
+    if op == "verify":
+        return floor_bytes("core", tp, batch * tokens)
     if op == "core":
         extra = B * 3 * C * 2 * 2 + B * C * 2 + B * HV * D * 2
     elif op == "recurrent":
@@ -53,6 +63,13 @@ def bench_case(tp: int, batch: int, gate: GdnGateActivation) -> SimCase:
     H, HV, _ = heads(tp)
     return SimCase(f"bench_tp{tp}_b{batch}", H, HV, batch + 1, tuple(range(1, batch + 1)),
                    tuple(range(1, batch + 1)), gate, 100 + batch)
+
+
+def verify_case(tp: int, batch: int, tokens: int, gate: GdnGateActivation) -> VerifySimCase:
+    """Verification case of ``batch`` in-place chain rows with ``tokens`` nodes each (the lattice of the HPU cases)."""
+    H, HV, _ = heads(tp)
+    return VerifySimCase(f"bench_ver_tp{tp}_b{batch}_t{tokens}", H, HV, 1 + batch * tokens, tokens + 2,
+                         _lattice_rows(batch, tokens), gate, 200 + batch)
 
 
 class Repeat(nn.Module):
@@ -71,12 +88,21 @@ class Repeat(nn.Module):
 
 
 def time_op(op: str, tp: int, batch: int, gate: GdnGateActivation, device: torch.device, iters: int, warmup: int,
-            repeat: int, hpu_graph: bool) -> float:
+            repeat: int, hpu_graph: bool, tokens: int = 4) -> float:
     """Time ``iters`` calls of the op (each call runs the op ``repeat`` times); ms per op call."""
-    case = bench_case(tp, batch, gate)
-    inputs = {name: tensor.to(device) for name, tensor in make_inputs(case).items()}
-    scale, eps, gate_activation = scalars(case)
-    if op == "core":
+    if op == "verify":
+        vcase = verify_case(tp, batch, tokens, gate)
+        inputs = {name: tensor.to(device) for name, tensor in make_verify_inputs(vcase).items()}
+        scale, eps, gate_activation = verify_scalars(vcase)
+    else:
+        case = bench_case(tp, batch, gate)
+        inputs = {name: tensor.to(device) for name, tensor in make_inputs(case).items()}
+        scale, eps, gate_activation = scalars(case)
+    if op == "verify":
+        step = VerifyStep(inputs["A_log"], inputs["dt_bias"], inputs["conv_weight_t"], inputs["norm_weight"],
+                          inputs["row_indices"], inputs["ssm_store_indices"], scale, eps, gate_activation)
+        args = (inputs["conv_state"], inputs["ssm_state"], inputs["mixed_qkv"], inputs["z"], inputs["a"], inputs["b"])
+    elif op == "core":
         step = CoreStep(inputs["A_log"], inputs["dt_bias"], inputs["conv_weight_t"], inputs["norm_weight"],
                         inputs["load_indices"], inputs["store_indices"], scale, eps, gate_activation)
         args = (inputs["conv_state"], inputs["ssm_state"], inputs["mixed_qkv"], inputs["z"], inputs["a"], inputs["b"])
@@ -118,9 +144,9 @@ def slope(batches: list[int], ms: list[float]) -> float:
     return sum((x - mx) * (y - my) for x, y in zip(xs, ms)) / den
 
 
-def floor_ms(op: str, tp: int, batch: int, bandwidth_tbs: float) -> float:
+def floor_ms(op: str, tp: int, batch: int, bandwidth_tbs: float, tokens: int = 1) -> float:
     """The bandwidth floor for one call, in ms, at ``bandwidth_tbs`` TB/s."""
-    return floor_bytes(op, tp, batch) / (bandwidth_tbs * 1e12) * 1e3
+    return floor_bytes(op, tp, batch, tokens) / (bandwidth_tbs * 1e12) * 1e3
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -135,6 +161,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--bandwidth-tbs", type=float, default=2.45)
     parser.add_argument("--gate", choices=("sigmoid", "silu"), default="sigmoid")
     parser.add_argument("--no-hpu-graph", action="store_true")
+    parser.add_argument("--verify-tokens", type=int, default=4, help="nodes per request of the verify op (1 + k)")
     ns = parser.parse_args(argv)
 
     ops = [op.strip() for op in ns.ops.split(",") if op.strip()]
@@ -153,6 +180,9 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     if not batches or any(b < 1 for b in batches):
         print(f"--batches values must each be >= 1, got {ns.batches!r}", file=sys.stderr)
+        return 2
+    if "verify" in ops and not 1 <= ns.verify_tokens <= 6:
+        print(f"--verify-tokens must be 1 to 6 (the verify op's node limit), got {ns.verify_tokens}", file=sys.stderr)
         return 2
 
     device_str = ns.device
@@ -178,17 +208,21 @@ def main(argv: list[str] | None = None) -> int:
           f"graph={'on' if hpu_graph else 'off'} bandwidth={ns.bandwidth_tbs} TB/s", flush=True)
 
     for op in ops:
+        tokens = ns.verify_tokens if op == "verify" else 1
+        label = f"verify(T={tokens})" if op == "verify" else op
         for tp in tps:
             ms = [
-                time_op(op, tp, b, gate, device, ns.iters, ns.warmup, ns.repeat, hpu_graph) for b in batches
+                time_op(op, tp, b, gate, device, ns.iters, ns.warmup, ns.repeat, hpu_graph, ns.verify_tokens)
+                for b in batches
             ]
             for b, t in zip(batches, ms):
-                f_ms = floor_ms(op, tp, b, ns.bandwidth_tbs)
-                print(f"{op} tp{tp} B={b}: {t:.6f} ms/call, floor {f_ms:.6f} ms, {t / f_ms:.2f}x floor", flush=True)
+                f_ms = floor_ms(op, tp, b, ns.bandwidth_tbs, tokens)
+                print(f"{label} tp{tp} B={b}: {t:.6f} ms/call, floor {f_ms:.6f} ms, {t / f_ms:.2f}x floor",
+                      flush=True)
             if len(set(batches)) >= 2:
                 s = slope(batches, ms)
-                f1 = floor_ms(op, tp, 1, ns.bandwidth_tbs)
-                print(f"{op} tp{tp} slope: {s:.6f} ms/seq/layer, floor {f1:.6f}, "
+                f1 = floor_ms(op, tp, 1, ns.bandwidth_tbs, tokens)
+                print(f"{label} tp{tp} slope: {s:.6f} ms/seq/layer, floor {f1:.6f}, "
                       f"{s / f1:.2f}x floor (target <= 2x)", flush=True)
     return 0
 

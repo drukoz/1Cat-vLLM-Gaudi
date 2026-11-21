@@ -628,6 +628,18 @@ class HPUWorker(WorkerBase):
             os.environ.get("HABANA_VISIBLE_MODULES"),
             is_v41(self.vllm_config),
         )
+        # VLLM_HPU_WORKER_CPU_PIN: this worker's threads on the CPUs next to its module, before the model and the
+        # communicators allocate host memory (0, the default, leaves them to the kernel and returns []).
+        from vllm_gaudi import envs as gaudi_envs
+        from vllm_gaudi.v1.worker.hpu_worker_cpus import pin_from_env
+
+        try:
+            self._cpu_share = pin_from_env(self.rank, self.parallel_config.world_size,
+                                           gaudi_envs.VLLM_HPU_WORKER_CPU_PIN, logger)
+        except Exception as exc:  # noqa: BLE001 - placement is an optimisation: never stop a worker for it
+            logger.warning("VLLM_HPU_WORKER_CPU_PIN=%d is off for this worker: %s", gaudi_envs.VLLM_HPU_WORKER_CPU_PIN,
+                           exc)
+            self._cpu_share = []
         self.device = torch.device("hpu")
         # Initialize the distributed environment.
         init_worker_distributed_environment(self.vllm_config, self.rank, self.distributed_init_method, self.local_rank)
@@ -1307,6 +1319,16 @@ class HPUWorker(WorkerBase):
             # This changes counters only; it does not release cached storage.
             torch.hpu.reset_peak_memory_stats()
             self._native_peak_scope = "since_last_ready_including_request_warmup"
+
+        # VLLM_HPU_WORKER_CPU_PIN=2: the thread that runs the model (this one) gets a CPU of its own (no-op otherwise).
+        from vllm_gaudi import envs as gaudi_envs
+        from vllm_gaudi.v1.worker.hpu_worker_cpus import give_calling_thread_its_own_cpu
+
+        try:
+            give_calling_thread_its_own_cpu(getattr(self, "_cpu_share", []), gaudi_envs.VLLM_HPU_WORKER_CPU_PIN, logger)
+        except Exception as exc:  # noqa: BLE001 - placement is an optimisation: never stop a worker for it
+            logger.warning("VLLM_HPU_WORKER_CPU_PIN=%d: the calling thread keeps its share: %s",
+                           gaudi_envs.VLLM_HPU_WORKER_CPU_PIN, exc)
 
         return CompilationTimes(
             language_model=self.vllm_config.compilation_config.compilation_time,

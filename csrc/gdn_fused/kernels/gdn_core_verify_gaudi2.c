@@ -83,7 +83,13 @@ __local__ int verify_store_slot[GDN_VERIFY_MAX_NODES];  // ssm_store_indices[r, 
 // decay and beta of the current value head are not arrays: main packs them into two registers, node t
 // in lane t, and passes them to the recurrence header (12 vectors less than one broadcast vector per
 // node and gate, which at 6 nodes would leave 1280 bytes free).
+// The interleaved build of this kernel (VLLM_HPU_GDN_KERNEL_INTERLEAVE=1) compiles this file through a
+// wrapper that names another recurrence header; everything else is this file.
+#ifdef GDN_CORE_VERIFY_RECURRENCE_HEADER
+#include GDN_CORE_VERIFY_RECURRENCE_HEADER
+#else
 #include "gdn_core_verify_recurrence.h"
+#endif
 #include "gdn_core_decode_norm.h"
 
 // Every conv-state store goes through this helper. tpc-clang reorders ld_tnsr/st_tnsr on one

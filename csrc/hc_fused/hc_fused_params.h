@@ -57,22 +57,24 @@ inline constexpr int32_t kMoeGlueMaxExperts = 32767;
 inline constexpr float kMoeGlueFp8Max = 240.0f;
 
 // Node parameters (PyTorch op -> glue), the same 16 bytes for the four GUIDs. A kernel that has no
-// use for a field gets 0 in it: experts and top_k are read by route, gate_column by combine,
-// fp8_max by row_quant.
+// use for a field gets 0 in it: experts and top_k are read by route, gate_column by combine and by
+// silu_mul, fp8_max by row_quant.
 struct MoeGlueParams {
     int32_t experts;      // router columns of the merged gate output
     int32_t top_k;        // experts per token
-    int32_t gate_column;  // the column of the merged gate output that holds the shared-gate logit
+    int32_t gate_column;  // combine: the column of the merged gate output that holds the shared-gate logit;
+                          // silu_mul: the first column of the gate_up block of its input (0: the whole input)
     float fp8_max;        // FP8_MAX of the plugin on this device (240 on Gaudi2)
 };
 static_assert(sizeof(MoeGlueParams) == 16, "the moe_glue node-parameter ABI is three I32 values and one FP32");
 
 // Scalar arguments of every MoE kernel's main() (glue -> kernel), in this order. The glue derives
-// the reciprocal on the host.
+// the reciprocal on the host and rounds it to bf16: a Gaudi2 card divides a bf16 tensor by a
+// number as a product with the number's bf16 reciprocal, and the kernel returns the card's scale.
 struct MoeGlueKernelArgs {
     int32_t experts;
     int32_t top_k;
     int32_t gate_column;
-    float inv_fp8_max;  // 1 / fp8_max, or 0 for a kernel that does not quantize
+    float inv_fp8_max;  // bf16(1 / fp8_max) as fp32 (0x1.12p-8 for 240), or 0 for a kernel that does not quantize
 };
 static_assert(sizeof(MoeGlueKernelArgs) == 16, "the moe_glue kernel scalar ABI is three I32 values and one FP32");

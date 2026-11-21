@@ -200,12 +200,15 @@ def test_proposer_gate_on_builds_the_stats(monkeypatch):
 
 
 def test_proposer_only_reaches_topk_under_the_gate():
-    # The gate-off path must be the old one: every .topk( call sits below a
-    # `draft_rank_stats is not None` guard (k == 1 exit, draft step 0, loop steps).
+    # The gate-off path never reaches topk: the proposer's one .topk( call (``_draft_tokens``, which the k == 1
+    # exit, draft step 0 and the loop steps all go through since the collective cuts) is the else branch of a
+    # `draft_rank_stats is None` test on its own line, and its rows are kept only when they are not None.
     lines = PROPOSER_SRC.read_text().splitlines()
     topk_lines = [i for i, line in enumerate(lines) if ".topk(" in line]
-    assert len(topk_lines) == 3
+    assert len(topk_lines) == 1
     for i in topk_lines:
-        assert any("draft_rank_stats is not None" in line for line in lines[max(0, i - 2):i])
+        assert "None if self.draft_rank_stats is None else" in lines[i]
+    assert sum("self._draft_tokens(" in line for line in lines) == 2  # draft step 0 (and the k == 1 exit), the loop
+    assert sum("if top_ids is not None:" in line for line in lines) == 3
     # the collected rows are stacked only under the gate
     assert "torch.stack(draft_top_ids, dim=1)" in "\n".join(lines)

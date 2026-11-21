@@ -7,6 +7,7 @@ import ctypes
 import glob
 import importlib
 import os
+import sys
 import threading
 from enum import IntEnum
 from pathlib import Path
@@ -46,6 +47,8 @@ HC_FUSED_SCHEMA_MODULE = "flashinfer_gaudi.hc_fused"  # defines the six op schem
 # The MoE glue ops are implemented by the same extension, so importing the module above imports this one too.
 MOE_GLUE_SCHEMA_MODULE = "flashinfer_gaudi.moe_glue"
 COMBINED_MEMBERS_ENV = "FLASHINFER_GAUDI_COMBINED_MEMBERS"  # csrc/kernel_db_adapter/adapter.cpp (host tests)
+LAZY_ACC_PAR_ENV = "PT_HPU_LAZY_ACC_PAR_MODE"  # the lazy bridge's accumulation thread: 1 (its default) on, 0 off
+ALLOW_LAZY_ACC_THREAD_ENV = "FLASHINFER_GAUDI_ALLOW_LAZY_ACC_THREAD"  # "1": load custom ops next to that thread
 
 
 class KernelDbState(IntEnum):
@@ -261,6 +264,48 @@ def load_gdn_fused_extension() -> bool:
         return True
 
 
+def lazy_bridge_loaded() -> bool:
+    """True when the Habana PyTorch bridge is imported in this process and runs in lazy mode.
+
+    A custom-op extension binds to the bridge's plugin library, so the bridge is imported before a loader
+    here can load one; a process without it has no HPU op to protect.
+    """
+    bridge = sys.modules.get("habana_frameworks.torch")
+    if bridge is None:
+        return False
+    try:
+        return bool(bridge.utils.internal.is_lazy())
+    except Exception:  # noqa: BLE001 - a bridge that cannot be asked: the variable that selects the mode decides
+        return os.environ.get("PT_HPU_LAZY_MODE", "1").strip() != "0"
+
+
+def lazy_accumulation_reason() -> str | None:
+    """Why a custom HPU op must not run in this process, or None.
+
+    In lazy mode with ``PT_HPU_LAZY_ACC_PAR_MODE=1`` (the bridge's default) the bridge builds the graph nodes
+    of queued ops on a second thread, while ``UserCustomOpDescriptor::execute`` builds the node of a custom op
+    at once on the calling thread. An input whose producer is still queued is then wired as a graph input
+    that never gets data, and the graph fails when it runs. Measured on a Gaudi2 node on 2026-11-20 (bridge
+    1.24.1): the hyper-connection card test failed 6 and 7 of 90 tests at 1, a different set each run, and
+    passed 90 of 90 at 0 (``docs/design/flash-next/native-extensions.md``, "Custom ops and the lazy
+    accumulation thread"). The second thread is read off the failing graphs and the effect of the variable;
+    the bridge's source is not public. Only the exact value 0 counts as off.
+    ``FLASHINFER_GAUDI_ALLOW_LAZY_ACC_THREAD=1`` lifts the refusal for the probes and control runs that
+    reproduce the failure on purpose.
+    """
+    if os.environ.get(ALLOW_LAZY_ACC_THREAD_ENV, "").strip() == "1" or not lazy_bridge_loaded():
+        return None
+    value = os.environ.get(LAZY_ACC_PAR_ENV)
+    if value is not None and value.strip() == "0":
+        return None
+    shown = "unset (the bridge's default is 1)" if value is None else repr(value)
+    return (f"{LAZY_ACC_PAR_ENV} is {shown}: the lazy Habana bridge then builds queued ops on a second thread, and a "
+            f"custom op called while the producer of one of its inputs is still queued takes that input as a graph "
+            f"input without data. The graph fails when it runs, in a different place each time ('Empty tensor "
+            f"optional', 'ValidateSyncInputTensors tensor_data is empty'; Gaudi 1.24.1). Start the process with "
+            f"{LAZY_ACC_PAR_ENV}=0; the fused kernels are not loaded without it.")
+
+
 def _hc_fused_error(message: str) -> None:
     """Record one fused hyper-connection loader failure in the shared list and in the HC-only list."""
     _LOAD_ERRORS.append(message)
@@ -300,9 +345,10 @@ def combined_db_serves_hc_fused(combined: Path | str, kernel_db: str) -> bool:
 def _load_hc_fused_locked() -> bool:
     """The one attempt of ``load_hc_fused_extension`` (the caller holds ``_LOAD_LOCK``).
 
-    The order is what makes the fallback safe: both files exist; then the kernel database is registered for
-    the graph compiler; only then the schemas are imported and the extension, which registers the HPU kernels,
-    is loaded. A failure at any step leaves the ops without an HPU kernel, and the layers then run torch.
+    The order is what makes the fallback safe: both files exist; the bridge can run a custom op
+    (``lazy_accumulation_reason``); then the kernel database is registered for the graph compiler; only then
+    the schemas are imported and the extension, which registers the HPU kernels, is loaded. A failure at any
+    step leaves the ops without an HPU kernel, and the layers then run torch.
     """
     package_lib = Path(__file__).resolve().parent / "lib"
     kernel_db = os.environ.get(HC_FUSED_KERNEL_LIBRARY_ENV, "") or str(package_lib / HC_FUSED_KERNEL_DB)
@@ -316,6 +362,12 @@ def _load_hc_fused_locked() -> bool:
             _hc_fused_error(f"{path}: file does not exist")
             missing = True
     if missing:
+        return False
+    # Before anything is registered: a lazy bridge with its accumulation thread on cannot run a custom op
+    # reliably, and a process without the kernels runs the torch path.
+    reason = lazy_accumulation_reason()
+    if reason:
+        _hc_fused_error(reason)
         return False
     # The rules of the fused GDN library: the combined database when it can be the single
     # GC_KERNEL_PATH file, otherwise first in the colon list, which is refused next to a recipe
@@ -676,6 +728,115 @@ def add_rmsnorm_quant_op() -> Callable | None:
     if not _LOAD_ATTEMPTED:
         load_native_extensions()
     return _ADD_RMSNORM_QUANT_OP
+
+
+# ---------------------------------------------------------------------------------------------------------
+# The fused QSA decode kernels (VLLM_HPU_QSA_FUSED=2): libqsa_fused_gaudi2.so + qsa_fused_ops*.so, loaded by the
+# rules of the fused hyper-connection kernels above. docs/design/flash-next/qsa-fused.md.
+# ---------------------------------------------------------------------------------------------------------
+QSA_FUSED_KERNEL_DB = "libqsa_fused_gaudi2.so"  # an optional member of the combined kernel database
+QSA_FUSED_KERNEL_LIBRARY_ENV = "QSA_FUSED_GAUDI_KERNEL_LIBRARY"  # its path, when it is not in the package's lib/
+QSA_FUSED_NATIVE_LIBRARY_ENV = "QSA_FUSED_GAUDI_NATIVE_LIBRARY"  # the path of qsa_fused_ops*.so, same rule
+QSA_FUSED_EXTENSION_GLOB = "qsa_fused_ops*.so"
+QSA_FUSED_SCHEMA_MODULE = "flashinfer_gaudi.qsa_fused"  # defines the op schemas; imported only with the flag at 2 or 3
+_QSA_FUSED_LOADED: bool | None = None  # None = not attempted
+_QSA_FUSED_ERRORS: list[str] = []
+_QSA_FUSED_LOCK = threading.Lock()
+
+
+def _qsa_fused_error(message: str) -> None:
+    _LOAD_ERRORS.append(message)
+    _QSA_FUSED_ERRORS.append(message)
+
+
+def qsa_fused_extension_errors() -> tuple[str, ...]:
+    """Why ``load_qsa_fused_extension`` failed (empty when it loaded or was never called)."""
+    return tuple(_QSA_FUSED_ERRORS)
+
+
+def qsa_fused_extension_loaded() -> bool | None:
+    """The result of ``load_qsa_fused_extension``; None when it was never called (``VLLM_HPU_QSA_FUSED`` is not 2)."""
+    return _QSA_FUSED_LOADED
+
+
+def combined_db_serves_qsa_fused(combined: Path | str, kernel_db: str) -> bool:
+    """True when the combined kernel database `combined` forwards the GUIDs of `kernel_db` (as for hc_fused)."""
+    override = os.environ.get(COMBINED_MEMBERS_ENV, "")
+    if override:
+        return os.path.abspath(kernel_db) in [os.path.abspath(entry) for entry in override.split(":") if entry]
+    path = Path(os.path.abspath(kernel_db))
+    if path.name != QSA_FUSED_KERNEL_DB or path.parent != Path(os.path.abspath(combined)).parent:
+        return False
+    try:
+        return QSA_FUSED_KERNEL_DB.encode() in Path(combined).read_bytes()
+    except OSError:
+        return False
+
+
+def _load_qsa_fused_locked() -> bool:
+    """The one attempt of ``load_qsa_fused_extension``: files, the bridge's accumulation mode
+    (``lazy_accumulation_reason``, as the hyper-connection loader), kernel database, schemas, then the extension."""
+    package_lib = Path(__file__).resolve().parent / "lib"
+    kernel_db = os.environ.get(QSA_FUSED_KERNEL_LIBRARY_ENV, "") or str(package_lib / QSA_FUSED_KERNEL_DB)
+    extension = os.environ.get(QSA_FUSED_NATIVE_LIBRARY_ENV, "")
+    if not extension:
+        matches = sorted(glob.glob(str(package_lib / QSA_FUSED_EXTENSION_GLOB)))
+        extension = matches[0] if matches else str(package_lib / QSA_FUSED_EXTENSION_GLOB)
+    missing = False
+    for path in (kernel_db, extension):
+        if not os.path.isfile(path):
+            _qsa_fused_error(f"{path}: file does not exist")
+            missing = True
+    if missing:
+        return False
+    # Before anything is registered: a lazy bridge with its accumulation thread on cannot run a custom op
+    # reliably (card rule 4); a process without the kernels runs the mode-1 torch data flow.
+    reason = lazy_accumulation_reason()
+    if reason:
+        _qsa_fused_error(reason)
+        return False
+    combined = _combined_kernel_db_path()
+    serves = combined is not None and combined_db_serves_qsa_fused(combined, kernel_db)
+    if not (serves and _activate_combined_kernel_db()):
+        reason = _prepend_kernel_database(kernel_db)
+        if reason:
+            if combined is not None and not serves:
+                reason += (f" The combined kernel database {combined} does not serve {QSA_FUSED_KERNEL_DB}: rebuild "
+                           f"it with tools/build_flashinfer_gaudi.py --combined-only after building the library.")
+            _qsa_fused_error(reason)
+            return False
+    try:
+        importlib.import_module(QSA_FUSED_SCHEMA_MODULE)
+    except Exception as exc:  # pragma: no cover - the schema module is part of this package
+        _qsa_fused_error(f"{QSA_FUSED_SCHEMA_MODULE}: {type(exc).__name__}: {exc}")
+        return False
+    try:
+        torch.ops.load_library(extension)
+    except Exception as exc:
+        _qsa_fused_error(f"{extension}: {_exception_text(exc)}")
+        return False
+    _LOADED_PATHS.append(extension)
+    return True
+
+
+def load_qsa_fused_extension() -> bool:
+    """Register libqsa_fused_gaudi2.so and load qsa_fused_ops*.so once; True when loaded. Never raises.
+
+    Called only with ``VLLM_HPU_QSA_FUSED=2`` or ``3``, before the first HPU op of the process (SynapseAI reads
+    ``GC_KERNEL_PATH`` when its graph compiler starts). ``qsa_fused_extension_errors`` says why it returned False.
+    """
+    global _QSA_FUSED_LOADED
+    if _QSA_FUSED_LOADED is not None:
+        return _QSA_FUSED_LOADED
+    with _QSA_FUSED_LOCK:
+        if _QSA_FUSED_LOADED is None:
+            try:
+                with _LOAD_LOCK:
+                    _QSA_FUSED_LOADED = _load_qsa_fused_locked()
+            except Exception as exc:  # noqa: BLE001 - an optional kernel never stops a process
+                _qsa_fused_error(f"load_qsa_fused_extension: {_exception_text(exc)}")
+                _QSA_FUSED_LOADED = False
+        return _QSA_FUSED_LOADED
 
 
 # SynapseAI reads GC_KERNEL_PATH when its graph compiler is initialized. Set

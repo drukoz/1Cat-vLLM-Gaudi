@@ -35,7 +35,7 @@ import urllib.request
 from collections import Counter
 from pathlib import Path
 
-from tools.flash_next.rental import serve
+from tools.flash_next.rental import lazy_graph, serve
 from tools.flash_next.rental.schema import MAX_MODEL_LEN, GateStatus
 
 try:  # M4-H0 (written in parallel): the FP8 layout checker
@@ -409,6 +409,33 @@ def _gdn_pytest_summary(output: str) -> dict:
     return counts
 
 
+_PYTEST_FAILURE_SECTION = re.compile(r"^=+ (FAILURES|ERRORS) =+$")
+_PYTEST_FAILURE_HEADER = re.compile(r"^_{3,} (\S.*?) _{3,}$")
+
+
+def _pytest_failed_tests(output: str) -> list[str]:
+    """The failed tests pytest names in `output`, each as a line starting with "FAILED ".
+
+    With `-rf` pytest prints "FAILED <node id> - <message>" lines and those are returned. The card tests run
+    with `-q -rs`, which prints none: the names are then taken from the headers of the FAILURES and ERRORS
+    sections ("____ test_name[case] ____"), in order and once each.
+    """
+    lines = output.splitlines()
+    named = [ln for ln in lines if ln.startswith("FAILED ")]
+    if named:
+        return named
+    found: list[str] = []
+    in_failures = False
+    for ln in lines:
+        if _PYTEST_FAILURE_SECTION.match(ln):
+            in_failures = True
+            continue
+        header = _PYTEST_FAILURE_HEADER.match(ln) if in_failures else None
+        if header and "FAILED " + header.group(1) not in found:
+            found.append("FAILED " + header.group(1))
+    return found
+
+
 def _gdn_verify_not_run(reason: str) -> dict:
     """The "verify" details of a run in which the verify checks did not run at all."""
     return {"status": "not_run", "reason": reason, "hpu_op": None, "replay": []}
@@ -558,7 +585,7 @@ def fused_gdn(plugin_root: Path, out_dir: Path, python: str = sys.executable, sk
                     "skipped": counts["skipped"],
                     "failed": counts["failed"],
                 }
-                details["failed_tests"] = [ln for ln in text.splitlines() if ln.startswith("FAILED ")]
+                details["failed_tests"] = _pytest_failed_tests(text)
                 op_ok = (proc.returncode == 0 and counts["passed"] > 0 and counts["skipped"] == 0 and
                          counts["failed"] == 0 and counts["error"] == 0)
                 if not op_ok:
@@ -745,9 +772,10 @@ def moe_fallback_lines(log_text: str) -> list[str]:
 
 
 HC_FUSED_ENV = "VLLM_HPU_HC_FUSED"
+LAZY_ACC_PAR_ENV = "PT_HPU_LAZY_ACC_PAR_MODE"  # the lazy bridge's accumulation thread: 0 off, what custom ops need
 HC_OP_TEST = "tests/unit_tests/hc_fused/test_hpu_op.py"
 HC_OP_LOG = "hc_hpu_op.log"
-HC_OP_TIMEOUT_S = 600.0  # 90 tests, each one graph compile; the limit of the GDN op tests
+HC_OP_TIMEOUT_S = 600.0  # 95 tests, each at least one graph compile; the limit of the GDN op tests
 HC_KERNEL_LIB = "libhc_fused_gaudi2.so"
 HC_OPS_GLOB = "hc_fused_ops*.so"
 HC_KERNEL_LIBRARY_ENV = "HC_FUSED_GAUDI_KERNEL_LIBRARY"
@@ -779,7 +807,8 @@ def hc_fused(plugin_root: Path, out_dir: Path, python: str = sys.executable, ski
     and GDN_FUSED_GAUDI_KERNEL_LIBRARY so the loader finds the combined kernel database next to it), in
     its own process group (run_step) with its own limit HC_OP_TIMEOUT_S and its own log out_dir/HC_OP_LOG.
     `combined_db_off` puts FLASHINFER_GAUDI_COMBINED_KERNEL_DB=0 into the step when the servers of this
-    run will not load the combined database either.
+    run will not load the combined database either. The step runs with PT_HPU_LAZY_ACC_PAR_MODE=0 unless
+    the operator's environment sets the variable ("lazy_acc_par_mode" records the value).
 
     Returns {"status", "reason", "hpu_op", ...}: "passed" (exit 0, at least one test passed, none
     skipped, failed or in error), "failed" (anything else the test did, a skip and a timeout included),
@@ -807,11 +836,42 @@ def moe_glue(plugin_root: Path, out_dir: Path, python: str = sys.executable, ski
                              MOE_OP_TIMEOUT_S, MOE_NOT_INSTALLED)
 
 
+# The fused QSA decode kernels (docs/design/flash-next/qsa-fused.md): their own library and op extension, the
+# same card-test step as the hyper-connection kernels'. `run_rental.sh --qsa-fused` asks for them.
+QSA_FUSED_ENV = "VLLM_HPU_QSA_FUSED"
+QSA_SHARD_ENV = "VLLM_HPU_QSA_INDEXER_SHARD"
+QSA_OP_TEST = "tests/unit_tests/qsa_fused/test_hpu_op.py"
+QSA_OP_LOG = "qsa_hpu_op.log"
+QSA_OP_TIMEOUT_S = 900.0
+QSA_KERNEL_LIB = "libqsa_fused_gaudi2.so"
+QSA_OPS_GLOB = "qsa_fused_ops*.so"
+QSA_KERNEL_LIBRARY_ENV = "QSA_FUSED_GAUDI_KERNEL_LIBRARY"
+QSA_NATIVE_LIBRARY_ENV = "QSA_FUSED_GAUDI_NATIVE_LIBRARY"
+QSA_NOT_INSTALLED = "the fused QSA library is not installed: "
+
+
+def qsa_fused(plugin_root: Path, out_dir: Path, python: str = sys.executable, skip: str = None,
+              combined_db_off: bool = False) -> dict:
+    """The fused QSA kernels' card test (QSA_OP_TEST), run by the orchestrator after the hyper-connection and
+    MoE glue tests and recorded as G1b's details["qsa_fused"]. The step, the statuses and the keys of
+    `hc_fused`, with the QSA library and extension (QSA_KERNEL_LIB, QSA_OPS_GLOB, found through
+    QSA_FUSED_GAUDI_KERNEL_LIBRARY and QSA_FUSED_GAUDI_NATIVE_LIBRARY). Recorded only: the orchestrator gives the
+    servers VLLM_HPU_QSA_FUSED=2 only when the operator asked and this passed. Never raises."""
+    return _kernel_card_test(plugin_root, out_dir, python, skip, combined_db_off, QSA_OP_TEST, QSA_OP_LOG,
+                             QSA_OP_TIMEOUT_S, QSA_NOT_INSTALLED, kernel_lib=QSA_KERNEL_LIB, ops_glob=QSA_OPS_GLOB,
+                             kernel_env=QSA_KERNEL_LIBRARY_ENV, native_env=QSA_NATIVE_LIBRARY_ENV,
+                             flags=(QSA_FUSED_ENV, QSA_SHARD_ENV))
+
+
 def _kernel_card_test(plugin_root: Path, out_dir: Path, python: str, skip: str, combined_db_off: bool, op_test: str,
-                      op_log: str, timeout_s: float, not_installed: str) -> dict:
-    """One card test of the kernels in the fused hyper-connection library: what `hc_fused` and `moe_glue`
+                      op_log: str, timeout_s: float, not_installed: str, kernel_lib: str = HC_KERNEL_LIB,
+                      ops_glob: str = HC_OPS_GLOB, kernel_env: str = HC_KERNEL_LIBRARY_ENV,
+                      native_env: str = HC_NATIVE_LIBRARY_ENV, flags: tuple = (HC_FUSED_ENV, MOE_GLUE_ENV)) -> dict:
+    """One card test of the kernels in a fused kernel library: what `hc_fused`, `moe_glue` and `qsa_fused`
     do, for the test file `op_test`, the log `op_log`, the limit `timeout_s` and the words `not_installed`
-    that open the reason when the library is missing. Neither plugin flag reaches the test. Never raises."""
+    that open the reason when the library is missing; `kernel_lib`, `ops_glob`, `kernel_env` and `native_env`
+    name the library (the hyper-connection one by default) and `flags` the plugin flags kept from the test.
+    Never raises."""
     started = time.monotonic()
     test_name = Path(op_test).name
     result: dict = {"status": HC_NOT_RUN, "reason": "", "hpu_op": None}
@@ -833,24 +893,30 @@ def _kernel_card_test(plugin_root: Path, out_dir: Path, python: str, skip: str, 
                           (lookup.returncode, (lookup.stderr or "").strip()[:200]))
             return result
         lib_dir = Path(_last_line(lookup.stdout))
-        kernel = lib_dir / HC_KERNEL_LIB
-        ops_files = sorted(lib_dir.glob(HC_OPS_GLOB))
+        kernel = lib_dir / kernel_lib
+        ops_files = sorted(lib_dir.glob(ops_glob))
         if not kernel.is_file():
-            result.update(status=HC_SKIPPED, reason=not_installed + "%s missing in %s" % (HC_KERNEL_LIB, lib_dir))
+            result.update(status=HC_SKIPPED, reason=not_installed + "%s missing in %s" % (kernel_lib, lib_dir))
             return result
         if len(ops_files) != 1:
             result.update(status=HC_SKIPPED, reason=not_installed + "%d %s files in %s, expected 1" %
-                          (len(ops_files), HC_OPS_GLOB, lib_dir))
+                          (len(ops_files), ops_glob, lib_dir))
             return result
 
         env = dict(os.environ)
         env["PYTHONPATH"] = str(plugin_root)
-        env[HC_KERNEL_LIBRARY_ENV] = str(kernel)
-        env[HC_NATIVE_LIBRARY_ENV] = str(ops_files[0])
+        env[kernel_env] = str(kernel)
+        env[native_env] = str(ops_files[0])
         if (lib_dir / GDN_KERNEL_LIB).is_file():
             env["GDN_FUSED_GAUDI_KERNEL_LIBRARY"] = str(lib_dir / GDN_KERNEL_LIB)
         env[GDN_LAZY_ENV] = "1"  # the bridge mode of every server
-        for flag in (HC_FUSED_ENV, MOE_GLUE_ENV):  # the test loads the kernels itself
+        # A custom op is not safe next to the lazy bridge's accumulation thread, and the loader refuses the
+        # kernels without this at 0 (flashinfer_gaudi._native.lazy_accumulation_reason). The plugin sets it for
+        # a server that asks for the kernels; the test has no flag, so the step sets it. An operator's own
+        # value stays, and reaches the servers the same way.
+        env.setdefault(LAZY_ACC_PAR_ENV, "0")
+        result["lazy_acc_par_mode"] = env[LAZY_ACC_PAR_ENV]
+        for flag in flags:  # the test loads the kernels itself
             env.pop(flag, None)
         env.pop(serve.RECIPE_CACHE_ENV, None)  # a recipe cache would block the colon-list registration
         if combined_db_off:
@@ -875,7 +941,9 @@ def _kernel_card_test(plugin_root: Path, out_dir: Path, python: str, skip: str, 
         counts = _gdn_pytest_summary(text)
         result["hpu_op"] = {"exit": exit_code, "passed": counts["passed"], "skipped": counts["skipped"],
                             "failed": counts["failed"], "error": counts["error"], "timed_out": timed_out}
-        result["failed_tests"] = [ln for ln in text.splitlines() if ln.startswith("FAILED ")]
+        result["failed_tests"] = _pytest_failed_tests(text)
+        # which of the failures are the lazy bridge's empty graph input, and whether its producer was queued
+        result["empty_inputs"] = lazy_graph.summary(text)
         if timed_out:
             result.update(status=HC_FAILED, reason="%s did not finish in %s s" % (test_name, timeout_s))
         elif (exit_code == 0 and counts["passed"] > 0 and counts["skipped"] == 0 and counts["failed"] == 0

@@ -23,7 +23,11 @@ import torch
 from torch import nn
 
 from vllm.config import VllmConfig
-from vllm.distributed import get_tensor_model_parallel_world_size
+from vllm.distributed import (
+    get_tensor_model_parallel_rank,
+    get_tensor_model_parallel_world_size,
+    tensor_model_parallel_all_gather,
+)
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.layernorm import GemmaRMSNorm
@@ -41,6 +45,18 @@ from vllm.transformers_utils.configs.qwen4_exp import Qwen4ExpTextConfig
 from vllm.v1.attention.backend import AttentionBackend
 
 import vllm_gaudi.envs as envs
+from vllm_gaudi.models.qwen4_exp.qsa_fused_path import (
+    QsaDecodeSelection,
+    QsaFusedMode,
+    kernel_ops_reason,
+    kernel_shape_reason,
+    owned,
+    qsa_fused_mode,
+    qsa_shard_mode,
+    rows_table,
+    select_blocks_request_major,
+    step_cached,
+)
 from vllm_gaudi.models.qwen4_exp.qsa_sparse_ops import (
     compress_block_keys,
     compressed_row_slots,
@@ -59,6 +75,38 @@ class QsaMode(enum.IntEnum):
 
     DENSE = 0
     SPARSE = 1
+
+
+def prefill_indexer_split(seq: int) -> tuple[int, int] | None:
+    """``(rank, world)`` when ``VLLM_HPU_QSA_PREFILL_INDEXER_SPLIT=1`` and a ``seq``-row prompt bucket splits
+    evenly over the TP ranks; ``None`` (every rank scores every row, the default) otherwise."""
+    if int(envs.VLLM_HPU_QSA_PREFILL_INDEXER_SPLIT) != 1:
+        return None
+    world = get_tensor_model_parallel_world_size()
+    if world <= 1 or seq % world:
+        return None
+    return get_tensor_model_parallel_rank(), world
+
+
+def select_block_ids_fp32(scores: torch.Tensor, visible: torch.Tensor, block_topk: int) -> torch.Tensor:
+    """``select_blocks`` with the block ids as fp32 ``[T, block_topk]`` (-1.0 padded), without an integer cast
+    of the top-k's ids.
+
+    Card rule 9 (kernel-fixes job 00038): ``torch.topk``'s int64 ids narrowed with ``.to(torch.int32)`` on the
+    device in the graph that made them read back as every second id. Here the int64 ids are used as they are
+    (the form measured right on the card), as the index of an ``index_select`` into an fp32 ``arange``, so the
+    ids leave as fp32 values (block ids and -1 are exact below 2**24) and no cast ever reads them.
+    """
+    t, n = scores.shape
+    k = min(block_topk, n)
+    cols = torch.arange(n, device=scores.device)
+    masked = scores.masked_fill(cols[None, :] >= visible[:, None], float("-inf"))
+    vals, idx = torch.topk(masked, k, dim=-1)
+    ids = torch.arange(n, dtype=torch.float32, device=scores.device)
+    picked = ids.index_select(0, idx.reshape(-1)).view(t, k).masked_fill(vals == float("-inf"), -1.0)
+    if k < block_topk:
+        picked = torch.cat((picked, picked.new_full((t, block_topk - k), -1.0)), dim=1)
+    return picked
 
 
 def platform_is_hpu() -> bool:
@@ -151,6 +199,15 @@ class HpuQsaIndexer(nn.Module):
         self.q_layernorm = GemmaRMSNorm(self.index_head_dim, eps=self.eps)
         self.k_layernorm = GemmaRMSNorm(self.index_head_dim, eps=self.eps)
 
+        # VLLM_HPU_QSA_FUSED / VLLM_HPU_QSA_INDEXER_SHARD, read once (qsa_fused_path): mode 0 keeps the
+        # decode scoring below as it was; mode >= 1 scores request-major and may shard by request.
+        self.fused_mode = qsa_fused_mode()
+        self.shard_mode = qsa_shard_mode()
+        # Mode 2: whether the TPC kernels serve this layer, decided at its first sparse decode step (None = not
+        # yet), and the reason when they do not (logged once; the layer then runs mode 1).
+        self._kernels_ok: bool | None = None
+        self.kernels_off_reason: str | None = None
+
         self.compressed_key_cache: torch.Tensor | None = None
         # The raw-key ring as the flat table [slots * rows, D] and its rows per slot (see key_ring).
         self._key_ring_flat: torch.Tensor | None = None
@@ -221,6 +278,22 @@ class HpuQsaIndexer(nn.Module):
             indices = indices.squeeze(-1)
         return indices.reshape(-1).long()
 
+    def _kernels_serve(self, md: object, cos_sin: torch.Tensor | None, device: torch.device) -> bool:
+        """Mode 2: True when the TPC kernels serve this layer's decode steps (decided once, logged once if not)."""
+        if self._kernels_ok is None:
+            reason = kernel_ops_reason(device) or kernel_shape_reason(
+                dim=self.index_head_dim, heads=self.index_n_heads, ratio=self.compress_ratio,
+                ring_rows=self._key_ring_rows, block_size=int(md.block_size), cos_sin=cos_sin,
+                cache=self.compressed_key_cache, ring=self._key_ring_flat)
+            self._kernels_ok = reason is None
+            self.kernels_off_reason = reason
+            if reason is not None:
+                from vllm.logger import init_logger
+                init_logger(__name__).warning(
+                    "QSA fused (VLLM_HPU_QSA_FUSED=%d) is off for %s: %s; using the torch data flow (mode 1).",
+                    int(self.fused_mode), self.prefix or "the QSA indexer", reason)
+        return self._kernels_ok
+
     @torch.no_grad()
     def select(
         self,
@@ -228,12 +301,20 @@ class HpuQsaIndexer(nn.Module):
         positions: torch.Tensor,
         cos_sin_at: Callable[[torch.Tensor], tuple[torch.Tensor, torch.Tensor]],
         md: object,
-    ) -> torch.Tensor:
-        """Attended positions per query token: int32 ``[T, output_width]`` (absolute, -1 padded)."""
+        cos_sin: torch.Tensor | None = None,
+    ) -> torch.Tensor | QsaDecodeSelection:
+        """Attended positions per query token: int32 ``[T, output_width]`` (absolute, -1 padded).
+
+        In mode 2 (``VLLM_HPU_QSA_FUSED=2``) a decode step returns the attended K/V cache slots instead
+        (``QsaDecodeSelection``) when the kernels serve the layer; ``cos_sin`` is the attention's RoPE table.
+        """
         H, D, ratio = self.index_n_heads, self.index_head_dim, self.compress_ratio
         topk, width = self.block_topk, self.output_width
         T = hidden.shape[0]
         qk, _ = self.index_qk_proj(hidden)
+        if (self.fused_mode in (QsaFusedMode.KERNELS, QsaFusedMode.KERNELS_TOPK) and not md.is_prompt
+                and self._kernels_serve(md, cos_sin, qk.device)):
+            return self._select_decode_kernels(qk, positions, cos_sin, md)
         q, raw_k = qk.split([H * D, self.index_kv_heads * D], dim=-1)
         q = q.view(T, H, D)
         cos, sin = cos_sin_at(positions)
@@ -298,8 +379,12 @@ class HpuQsaIndexer(nn.Module):
             all_rows.scatter_(1, dst[..., None].expand(-1, -1, D), keys.view(rows, n_full, D).to(cache.dtype))
             q4 = q.view(rows, seq, H, D)
             out = cache.new_full((rows, seq, width), -1, dtype=torch.int32)
+            split = prefill_indexer_split(seq)
             for b in range(rows):
                 row_keys = all_rows[b]
+                if split is not None:
+                    out[b] = self._select_prompt_rows_split(q4[b], row_keys, positions2[b], topk, split)
+                    continue
                 for lo in range(0, seq, self.SCORE_TILE):
                     hi = min(lo + self.SCORE_TILE, seq)
                     pos_tile = positions2[b, lo:hi]
@@ -309,6 +394,99 @@ class HpuQsaIndexer(nn.Module):
             return out.view(T, width)
 
         return self._select_decode(q, raw_k, positions, cos_sin_at, md, load, store, slot_mapping, cache, rpb)
+
+    @staticmethod
+    def _decode_rows(md: object, positions: torch.Tensor, load: torch.Tensor, store: torch.Tensor,
+                     shared: bool = False):
+        """``(bs, lens, T_cols, valid, load_rows, store_rows)`` of a decode step's ``T`` rows (``_select_decode``).
+
+        ``shared`` (modes 1 and 2): the layer-independent part is built once per step (``step_cached``).
+        """
+        T = int(positions.numel())
+
+        def layout():
+            qsl = getattr(md, "query_start_loc_p", None)
+            if qsl is not None and int(qsl.numel()) >= 2:
+                bs = int(qsl.numel()) - 1
+                lens = (qsl[1:].long() - qsl[:bs].long()).to(device=positions.device)
+            else:
+                bs, lens = int(load.numel()), None
+            T_cols = T // bs
+            if lens is None:
+                valid = torch.ones(T, dtype=torch.bool, device=positions.device)
+            else:
+                cols = torch.arange(T, device=positions.device)
+                valid = (cols % T_cols) < lens.repeat_interleave(T_cols)
+            return bs, lens, T_cols, valid
+
+        bs, lens, T_cols, valid = (step_cached(md, ("layout", T, int(load.numel())), layout)
+                                   if shared else layout())
+        # ``load``/``store`` carry one slot per state row: the [groups, bs] form
+        # repeats each request's slot over its rows, the lattice form already
+        # is one slot per row (see ``_state_indices``).
+        n_slots = int(load.numel())
+        if n_slots == T:
+            load_rows, store_rows = load, store
+        elif n_slots * T_cols == T:
+            load_rows, store_rows = load.repeat_interleave(T_cols), store.repeat_interleave(T_cols)
+        else:
+            raise NotImplementedError(f"QSA decode got {n_slots} state slots for {T} rows of {bs} requests")
+        return bs, lens, T_cols, valid, load_rows, store_rows
+
+    def _select_decode_kernels(self, qk: torch.Tensor, positions: torch.Tensor, cos_sin: torch.Tensor,
+                               md: object) -> QsaDecodeSelection:
+        """Mode 2: ``qsa_index_prepare`` (K1), the request-major torch scores and top-k, ``qsa_index_emit`` (K4).
+
+        K1 does what ``index_queries`` and the write half of ``_select_decode`` do (the ring, the compressed
+        rows: write-then-score holds, K1 runs before the scores read the cache); K4 maps the selected blocks to
+        the attention's K/V cache slots. Every tensor a kernel gets is its own (``owned``): card rule 1.
+        """
+        from flashinfer_gaudi.qsa_fused import qsa_index_emit, qsa_index_prepare
+
+        H, D, ratio = self.index_n_heads, self.index_head_dim, self.compress_ratio
+        T = int(positions.numel())
+        load = self._state_indices(md, "load_indices_tensor")
+        store = self._state_indices(md, "store_indices_tensor")
+        if store is None:
+            store = load
+        slot_mapping = md.slot_mapping.reshape(-1)[:T]
+        bs, lens, T_cols, valid, load_rows, store_rows = self._decode_rows(md, positions, load, store, shared=True)
+        rows = rows_table(positions, slot_mapping, load_rows, store_rows, valid)
+        cache = self.compressed_key_cache
+        q_idx = qsa_index_prepare(self._key_ring_flat, cache, owned(qk), rows, self.q_layernorm.weight,
+                                  self.k_layernorm.weight, owned(cos_sin), self.eps, H, self._key_ring_rows, ratio)
+        rpb = int(md.block_size) // ratio
+        blocks_sel = select_blocks_request_major(q_idx.view(T, H, D), positions, md.block_table, lens, bs, T_cols, cache,
+                                                 rpb, ratio, self.block_topk, self.shard_mode, md=md,
+                                                 use_topk_kernels=self.fused_mode is QsaFusedMode.KERNELS_TOPK)
+        positions32, table32 = step_cached(
+            md, ("emit_inputs", T), lambda: (positions.to(torch.int32, copy=True), owned(md.block_table.to(torch.int32))))
+        slots, valid_cols = qsa_index_emit(owned(blocks_sel), positions32, table32, ratio, int(md.block_size))
+        return QsaDecodeSelection(slots, valid_cols)
+
+    def _select_prompt_rows_split(self, q_row: torch.Tensor, row_keys: torch.Tensor, pos_row: torch.Tensor,
+                                  topk: int, split: tuple[int, int]) -> torch.Tensor:
+        """One prompt row's selection with the scoring split over the TP ranks (``prefill_indexer_split``).
+
+        Every rank holds the same queries and block keys (replicated projection, replicated cache), so rank
+        ``r`` scores only its query rows ``[r * seq / tp, (r + 1) * seq / tp)``, and one all-gather in rank
+        order collects the block ids of all rows. They are fp32 from the selection on
+        (``select_block_ids_fp32``: the top-k's int64 ids are never cast, card rule 9) and travel as fp32;
+        the one cast, fp32 to int32, comes after the all-gather. The expansion to token positions runs for
+        all rows on every rank. ``[seq, width]`` int32.
+        """
+        rank, world = split
+        seq = q_row.shape[0]
+        per = seq // world
+        start = rank * per
+        parts = []
+        for lo in range(start, start + per, self.SCORE_TILE):
+            hi = min(lo + self.SCORE_TILE, start + per)
+            scores = score_blocks(q_row[lo:hi], row_keys)
+            parts.append(select_block_ids_fp32(scores, visible_blocks(pos_row[lo:hi], self.compress_ratio), topk))
+        local = parts[0] if len(parts) == 1 else torch.cat(parts, dim=0)
+        gathered = tensor_model_parallel_all_gather(local, dim=0).to(torch.int32)
+        return expand_selection(gathered, pos_row, self.compress_ratio)
 
     def _select_decode(
         self,
@@ -350,28 +528,8 @@ class HpuQsaIndexer(nn.Module):
         D, ratio = self.index_head_dim, self.compress_ratio
         topk = self.block_topk
         T = int(positions.numel())
-        qsl = getattr(md, "query_start_loc_p", None)
-        if qsl is not None and int(qsl.numel()) >= 2:
-            bs = int(qsl.numel()) - 1
-            lens = (qsl[1:].long() - qsl[:bs].long()).to(device=positions.device)
-        else:
-            bs, lens = int(load.numel()), None
-        T_cols = T // bs
-        if lens is None:
-            valid = torch.ones(T, dtype=torch.bool, device=positions.device)
-        else:
-            cols = torch.arange(T, device=positions.device)
-            valid = (cols % T_cols) < lens.repeat_interleave(T_cols)
-        # ``load``/``store`` carry one slot per state row: the [groups, bs] form
-        # repeats each request's slot over its rows, the lattice form already
-        # is one slot per row (see ``_state_indices``).
-        n_slots = int(load.numel())
-        if n_slots == T:
-            load_rows, store_rows = load, store
-        elif n_slots * T_cols == T:
-            load_rows, store_rows = load.repeat_interleave(T_cols), store.repeat_interleave(T_cols)
-        else:
-            raise NotImplementedError(f"QSA decode got {n_slots} state slots for {T} rows of {bs} requests")
+        shared = self.fused_mode is not QsaFusedMode.OFF
+        bs, lens, T_cols, valid, load_rows, store_rows = self._decode_rows(md, positions, load, store, shared=shared)
         scratch = torch.full((T,), self.key_ring_slots - 1, dtype=torch.long, device=positions.device)
         ring_write(self._key_ring_flat, torch.where(valid, store_rows, scratch), positions, raw_k,
                    rows=self._key_ring_rows)
@@ -387,6 +545,12 @@ class HpuQsaIndexer(nn.Module):
         row_slots = compressed_row_slots(slot_mapping, ratio)
         scratch_row = torch.full_like(row_slots, cache.shape[0] - 1)
         cache.index_copy_(0, torch.where(complete, row_slots, scratch_row), keys.to(cache.dtype))
+        if self.fused_mode is not QsaFusedMode.OFF:
+            # One key gather per request for all its rows, optionally this rank's requests only
+            # (qsa_fused_path): the same scores, the same top-k, without the [T, N] gather.
+            blocks_sel = select_blocks_request_major(q, positions, md.block_table, lens, bs, T_cols, cache, rpb, ratio,
+                                                     topk, self.shard_mode, md=md)
+            return expand_selection(blocks_sel, positions, ratio)
         MB = int(md.block_table.shape[1])
         n = MB * rpb
         bt = md.block_table.long()
@@ -578,7 +742,8 @@ class HpuQwen4ExpQSAAttention(Qwen4ExpQSAAttention):
                 and self.sparse_attn is not None and md is not None):
             pos = indexer_positions(positions, bool(getattr(self.rotary_emb, "mrope_section", None)))
             cos_sin_at = lambda p: self.rotary_emb.cos_sin_cache[p.clamp_min(0)].chunk(2, dim=-1)  # noqa: E731
-            selected = self.indexer.select(hidden_states.reshape(-1, self.hidden_size), pos, cos_sin_at, md)
+            selected = self.indexer.select(hidden_states.reshape(-1, self.hidden_size), pos, cos_sin_at, md,
+                                           cos_sin=self.rotary_emb.cos_sin_cache)
             attn_output = self.sparse_attn(q, k, v, selected, pos, md)
         else:
             attn_output = self.attn(q, k, v)

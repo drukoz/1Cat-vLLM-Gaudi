@@ -135,6 +135,64 @@ if(GDN_VERIFY_BUILT)
         "${CMAKE_CURRENT_BINARY_DIR}/gdn_core_verify_gaudi2_embedded.o")
 endif()
 
+# The interleaved builds of the decode and verify kernels (VLLM_HPU_GDN_KERNEL_INTERLEAVE=1; idea I27): the same
+# kernels with several value rows per iteration of the recurrence, bit-identical outputs. Optional like the verify
+# kernel: each compile is tried here first, and one that fails (or -DGDN_FUSED_INTERLEAVE=OFF) is left out. The
+# glue's references to them are weak, so the library then serves today's kernels whatever the variable says.
+# GDN_FUSED_INTERLEAVE_BUILT in CMakeCache.txt records which ones are in.
+option(GDN_FUSED_INTERLEAVE "Build the interleaved decode and verify kernels into the library" ON)
+set(GDN_INTERLEAVE_LIBRARY_SOURCES "")
+set(GDN_INTERLEAVE_BUILT "")
+set(GDN_INTERLEAVE_CANDIDATES gdn_core_decode_interleaved_gaudi2)
+if(GDN_VERIFY_BUILT)
+    list(APPEND GDN_INTERLEAVE_CANDIDATES gdn_core_verify_interleaved_gaudi2)
+endif()
+if(GDN_FUSED_INTERLEAVE)
+    foreach(kernel IN LISTS GDN_INTERLEAVE_CANDIDATES)
+        set(kernel_sources
+            "${CMAKE_CURRENT_SOURCE_DIR}/kernels/${kernel}.c"
+            "${CMAKE_CURRENT_SOURCE_DIR}/kernels/gdn_core_decode_gaudi2.c"
+            "${CMAKE_CURRENT_SOURCE_DIR}/kernels/gdn_core_verify_gaudi2.c"
+            "${CMAKE_CURRENT_SOURCE_DIR}/kernels/gdn_core_decode_recurrence_interleaved.h"
+            "${CMAKE_CURRENT_SOURCE_DIR}/kernels/gdn_core_verify_recurrence_interleaved.h"
+            "${CMAKE_CURRENT_SOURCE_DIR}/kernels/gdn_core_decode_norm.h")
+        set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${kernel_sources})
+        execute_process(
+            COMMAND "${TPC_COMPILER}" ${GDN_TPC_FLAGS} "-I${TPC_INCLUDE_DIR}"
+                    "${CMAKE_CURRENT_SOURCE_DIR}/kernels/${kernel}.c"
+                    -c -o "${CMAKE_CURRENT_BINARY_DIR}/${kernel}.probe.o"
+            RESULT_VARIABLE probe_result
+            OUTPUT_VARIABLE probe_log
+            ERROR_VARIABLE probe_log)
+        file(REMOVE "${CMAKE_CURRENT_BINARY_DIR}/${kernel}.probe.o")
+        if(NOT probe_result EQUAL 0)
+            string(REGEX MATCH "[^\n]*error[^\n]*" probe_error "${probe_log}")
+            message(WARNING "${kernel}.c does not compile with the default TPC flags (tpc-clang exit "
+                            "${probe_result}: ${probe_error}); the library serves today's kernel for it.")
+            continue()
+        endif()
+        add_custom_command(
+            OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/${kernel}.o"
+            COMMAND "${TPC_COMPILER}" ${GDN_TPC_FLAGS} -I"${TPC_INCLUDE_DIR}"
+                    "${CMAKE_CURRENT_SOURCE_DIR}/kernels/${kernel}.c"
+                    -c -o "${CMAKE_CURRENT_BINARY_DIR}/${kernel}.o"
+            DEPENDS ${kernel_sources}
+            VERBATIM)
+        add_custom_command(
+            OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/${kernel}_embedded.o"
+            COMMAND "${ELF_OBJCOPY}" -I binary -O elf64-x86-64 -B i386:x86-64 ${kernel}.o ${kernel}_embedded.o
+            DEPENDS "${CMAKE_CURRENT_BINARY_DIR}/${kernel}.o"
+            WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}"
+            VERBATIM)
+        set_source_files_properties("${CMAKE_CURRENT_BINARY_DIR}/${kernel}_embedded.o"
+            PROPERTIES EXTERNAL_OBJECT TRUE GENERATED TRUE)
+        list(APPEND GDN_INTERLEAVE_LIBRARY_SOURCES "${CMAKE_CURRENT_BINARY_DIR}/${kernel}_embedded.o")
+        list(APPEND GDN_INTERLEAVE_BUILT ${kernel})
+    endforeach()
+endif()
+set(GDN_FUSED_INTERLEAVE_BUILT "${GDN_INTERLEAVE_BUILT}" CACHE INTERNAL "the interleaved kernels in the library" FORCE)
+message(STATUS "gdn_fused: interleaved kernels in the library: ${GDN_INTERLEAVE_BUILT}")
+
 add_library(
     gdn_fused_gaudi2
     SHARED
@@ -144,6 +202,7 @@ add_library(
     "${CMAKE_CURRENT_BINARY_DIR}/gdn_core_decode_gaudi2_embedded.o"
     "${CMAKE_CURRENT_BINARY_DIR}/gdn_recurrent_decode_gaudi2_embedded.o"
     ${GDN_VERIFY_LIBRARY_SOURCES}
+    ${GDN_INTERLEAVE_LIBRARY_SOURCES}
 )
 if(NOT GDN_VERIFY_BUILT)
     target_compile_definitions(gdn_fused_gaudi2 PRIVATE GDN_FUSED_NO_VERIFY=1)

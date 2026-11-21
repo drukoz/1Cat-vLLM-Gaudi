@@ -37,6 +37,14 @@ extern "C" unsigned char
 extern "C" unsigned char
     _binary_qwen38_post_conv_qk_compact_tp2_bf16_gaudi2_o_end;
 extern "C" unsigned char
+    _binary_qwen38_post_conv_qk_compact_tp4_bf16_gaudi2_o_start;
+extern "C" unsigned char
+    _binary_qwen38_post_conv_qk_compact_tp4_bf16_gaudi2_o_end;
+extern "C" unsigned char
+    _binary_qwen38_post_conv_qk_compact_tp8_bf16_gaudi2_o_start;
+extern "C" unsigned char
+    _binary_qwen38_post_conv_qk_compact_tp8_bf16_gaudi2_o_end;
+extern "C" unsigned char
     _binary_qwen38_post_conv_qk_expanded_bf16_gaudi2_o_start;
 extern "C" unsigned char
     _binary_qwen38_post_conv_qk_expanded_bf16_gaudi2_o_end;
@@ -359,8 +367,9 @@ tpc_lib_api::GlueCodeReturn instantiate_inverse16(
     params->inputTensorNr = 1;
     return tpc_lib_api::GLUE_INCOMPATIBLE_INPUT_COUNT;
   }
-  if (params->outputTensorNr != 2) {
-    params->outputTensorNr = 2;
+  // One output: main(tensor lower, tensor inverse), schema "-> Tensor".
+  if (params->outputTensorNr != 1) {
+    params->outputTensorNr = 1;
     return tpc_lib_api::GLUE_INCOMPATIBLE_OUTPUT_COUNT;
   }
 
@@ -640,10 +649,15 @@ tpc_lib_api::GlueCodeReturn instantiate_compact_post_conv_qk(
   auto& q = params->outputTensors[0].geometry;
   auto& k = params->outputTensors[1].geometry;
   const uint64_t tokens = packed.maxSizes[1];
-  const unsigned heads = packed.maxSizes[0] == 5120 ? 8 : 16;
-  const bool packed_shape =
-      packed.dims == 2 &&
-      (packed.maxSizes[0] == 10240 || packed.maxSizes[0] == 5120);
+  // One rank's packed q|k|v width is 5 * key heads * 128: 10240 at TP1,
+  // 5120 at TP2, 2560 at TP4, 1280 at TP8.
+  unsigned heads = 0;
+  for (unsigned candidate : {16U, 8U, 4U, 2U}) {
+    if (packed.maxSizes[0] == 5ULL * candidate * 128) {
+      heads = candidate;
+    }
+  }
+  const bool packed_shape = packed.dims == 2 && heads != 0;
   const bool qk_shape =
       q.dims == 3 && q.maxSizes[0] == 128 &&
       q.maxSizes[1] == heads && q.maxSizes[2] == tokens &&
@@ -680,6 +694,18 @@ tpc_lib_api::GlueCodeReturn instantiate_compact_post_conv_qk(
         instance,
         &_binary_qwen38_post_conv_qk_compact_tp2_bf16_gaudi2_o_start,
         &_binary_qwen38_post_conv_qk_compact_tp2_bf16_gaudi2_o_end);
+  }
+  if (heads == 4) {
+    return copy_elf(
+        instance,
+        &_binary_qwen38_post_conv_qk_compact_tp4_bf16_gaudi2_o_start,
+        &_binary_qwen38_post_conv_qk_compact_tp4_bf16_gaudi2_o_end);
+  }
+  if (heads == 2) {
+    return copy_elf(
+        instance,
+        &_binary_qwen38_post_conv_qk_compact_tp8_bf16_gaudi2_o_start,
+        &_binary_qwen38_post_conv_qk_compact_tp8_bf16_gaudi2_o_end);
   }
   return copy_elf(
       instance,

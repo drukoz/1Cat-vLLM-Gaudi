@@ -27,21 +27,34 @@ file is HPU-only and is checked on hardware, run sheet stage 3e.
 import itertools
 
 import torch
+import vllm_gaudi.envs as gaudi_envs
 from vllm_gaudi.utils import async_h2d_copy
 from vllm_gaudi.v1.attention.backends.hpu_attn import HPUAttentionMetadataV1
 from vllm.model_executor.models.llama_eagle3 import Eagle3LlamaForCausalLM
 
-from vllm_gaudi.v1.spec_decode.flash_next_mtp_steps import (DRAFT_RANK_TOP, DraftRankStats, draft_rank_log_enabled,
-                                                             next_step_hidden, ring_slots_from_lattice,
-                                                             split_draft_output)
+from vllm_gaudi.v1.spec_decode.flash_next_mtp_steps import draft_argmax
+from vllm_gaudi.v1.spec_decode.flash_next_mtp_steps import (DRAFT_RANK_TOP, DraftRankStats,
+                                                             align_draft_rope_with_target, draft_rank_log_enabled,
+                                                             flash_next_target_model_name, flat_token_rows,
+                                                             next_step_hidden,
+                                                             ring_slots_from_lattice, split_draft_output)
 from vllm_gaudi.v1.worker.flash_next_inputs import build_block_table
+from vllm_gaudi.v1.worker.flash_next_decode_metadata import draft_step_block_table_and_slots
 from vllm_gaudi.v1.spec_decode.hpu_eagle import HpuEagleProposer
+from vllm.logger import init_logger
+
+logger = init_logger(__name__)
 
 
 class HpuFlashNextMtpProposer(HpuEagleProposer):
 
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
+    def __init__(self, vllm_config, *args, **kwargs):
+        # Before the base class reads the draft's config and before the draft model is built.
+        speculative_config = vllm_config.speculative_config
+        if align_draft_rope_with_target(vllm_config.model_config, speculative_config.draft_model_config):
+            logger.info("Flash-Next MTP: the draft runs with the target's plain RoPE (M-RoPE keys removed from "
+                        "the draft's config)")
+        super().__init__(vllm_config, *args, **kwargs)
         self._init_draft_rank_log()
 
     def _init_draft_rank_log(self) -> None:
@@ -52,6 +65,18 @@ class HpuFlashNextMtpProposer(HpuEagleProposer):
         """
         self.draft_rank_stats = DraftRankStats() if draft_rank_log_enabled() else None
         self.last_draft_top_ids = None
+
+    def get_model_name(self, model) -> str:
+        """The class name upstream's ``load_model`` looks up to find the target's image token id.
+
+        ``SpecDecodeBaseProposer.load_model`` copies the image token of a multimodal target into the draft's
+        config and knows where each listed class keeps it; for a class it does not list it reads
+        ``target_model.config.image_token_index``. The Flash-Next target is not listed (upstream serves it with
+        another runner) and ``Qwen4ExpConfig`` names the field ``image_token_id``, so the server died in
+        ``load_model`` with an ``AttributeError`` after the target's weights were loaded. Qwen3.5 keeps the id
+        in the same field and is listed: answer with its name for the Flash-Next multimodal class.
+        """
+        return flash_next_target_model_name(super().get_model_name(model))
 
     def propose(
         self,
@@ -83,6 +108,10 @@ class HpuFlashNextMtpProposer(HpuEagleProposer):
                     target_hidden_states)
             assert target_hidden_states.shape[-1] == self.hidden_size
 
+        # The draft takes one row per token, [T, hc * H]: a prefill hands [1, seq, hc * H] (one bucket row), and
+        # the draft reads the token count from dim 0.
+        target_hidden_states = flat_token_rows(target_hidden_states)
+
         ret_hidden_states = self.model(
             input_ids=target_token_ids,
             positions=target_positions,
@@ -97,34 +126,37 @@ class HpuFlashNextMtpProposer(HpuEagleProposer):
         # draft step.
         last_hidden_states, hidden_states = split_draft_output(ret_hidden_states)
         last_hidden_states = last_hidden_states.view(-1, last_hidden_states.shape[-1])
-        sample_hidden_states = last_hidden_states[last_token_indices]
-        logits = self.model.compute_logits(sample_hidden_states)
+        sample_hidden_states = torch.index_select(last_hidden_states, 0, last_token_indices)
+        draft_token_ids, top_ids = self._draft_tokens(sample_hidden_states)
 
         # Early exit if there is only one draft token to be generated.
         if self.num_speculative_tokens == 1:
-            draft_token_ids = logits.argmax(dim=-1)
-            if self.draft_rank_stats is not None:
-                self.last_draft_top_ids = logits.topk(DRAFT_RANK_TOP, dim=-1).indices.unsqueeze(1)
+            if top_ids is not None:
+                self.last_draft_top_ids = top_ids.unsqueeze(1)
             return draft_token_ids.view(-1, 1)
 
         # [num_tokens, 1]
         target_positions = target_positions.view(-1)
         # [batch_size]
-        positions = target_positions[last_token_indices]
+        positions = torch.index_select(target_positions, 0, last_token_indices)
         # [batch_size, 1, hc * hidden_size]: the draft's own multi' rows
         hidden_states = next_step_hidden(hidden_states, last_token_indices)
 
         # The first draft tokens
-        draft_token_ids = logits.argmax(dim=-1)
-        if self.draft_rank_stats is not None:
-            draft_top_ids.append(logits.topk(DRAFT_RANK_TOP, dim=-1).indices)
+        if top_ids is not None:
+            draft_top_ids.append(top_ids)
         # Generate the remaining draft tokens.
         draft_token_ids_list = [draft_token_ids]
 
+        # VLLM_HPU_MTP_TIMING=1: the runner's step timer takes a lap per draft pass (None: no timer).
+        timer = getattr(self, "mtp_step_timer", None)
+        if timer is not None:
+            timer.lap("pass0")
         # Positions used by prepare_attn_metadata needs to be cpu because
         # compile only mode for warmup will not do any real computations
-        target_positions_cpu = target_positions.cpu()
-        positions_cpu = target_positions_cpu[last_token_indices.cpu()]
+        positions_cpu = self._draft_positions_cpu(target_positions, last_token_indices, batch_size)
+        if timer is not None:
+            timer.lap("pass0_wait")
 
         # The QSA raw-key ring is addressed by the request's GDN state slot:
         # the state lattice's column 0, identical for every draft step.
@@ -147,6 +179,8 @@ class HpuFlashNextMtpProposer(HpuEagleProposer):
             # Prepare the attn metadata
             positions_cpu += 1
             attn_metadata = self.prepare_attn_metadata(block_table_cpu_tensor, positions_cpu, model_runner, ring_slots)
+            if timer is not None:
+                timer.lap("pass%d_meta" % (token_index + 1))
 
             # [batch_size, 1]
             input_ids = input_ids.view(-1, 1)
@@ -173,11 +207,12 @@ class HpuFlashNextMtpProposer(HpuEagleProposer):
             hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
 
             hidden_states = hidden_states[:batch_size]
-            logits = self.model.compute_logits(last_hidden_states[:batch_size])
-            draft_token_ids = logits.argmax(dim=-1)
-            if self.draft_rank_stats is not None:
-                draft_top_ids.append(logits.topk(DRAFT_RANK_TOP, dim=-1).indices)
+            draft_token_ids, top_ids = self._draft_tokens(last_hidden_states[:batch_size])
+            if top_ids is not None:
+                draft_top_ids.append(top_ids)
             draft_token_ids_list.append(draft_token_ids)
+            if timer is not None:
+                timer.lap("pass%d" % (token_index + 1))
 
         # [batch_size, num_speculative_tokens]
         draft_token_ids = torch.stack(draft_token_ids_list, dim=1)
@@ -185,6 +220,44 @@ class HpuFlashNextMtpProposer(HpuEagleProposer):
             # [batch_size, num_speculative_tokens, DRAFT_RANK_TOP]
             self.last_draft_top_ids = torch.stack(draft_top_ids, dim=1)
         return draft_token_ids
+
+    def fill_prefill_chunk(self, token_ids, position_ids, target_hidden_states, attn_metadata, last_index: int,
+                           next_token_id: int) -> None:
+        """The draft's first step over a prefill chunk that completes no prompt (VLLM_HPU_MTP_CHUNK_KV=1): its
+        attention layer writes its KV for the chunk's positions, as the target's layers do; nothing is sampled.
+
+        The inputs are those of a prefill propose (``propose`` with the chunk's metadata): the tokens shifted one to
+        the left, the prompt's next token at the chunk's last token (``last_index``), the target's multi stream
+        of the chunk as the hidden state.
+        """
+        tokens = token_ids.reshape(-1)
+        shifted = torch.cat((tokens[1:], tokens[:1]))
+        index = torch.tensor([int(last_index)], dtype=torch.int64, device=shifted.device)
+        value = torch.tensor([int(next_token_id)], dtype=shifted.dtype, device=shifted.device)
+        shifted.index_copy_(0, index, value)
+        hidden = target_hidden_states.unsqueeze(0) if target_hidden_states.dim() == 2 else target_hidden_states
+        self.model(
+            input_ids=shifted.unsqueeze(0),
+            positions=position_ids,
+            hidden_states=flat_token_rows(hidden),
+            inputs_embeds=None,
+            attn_metadata=attn_metadata,
+            spec_step_idx=0,
+        )
+
+    # VLLM_HPU_MTP_DRAFT_LOOP=1: the runner's host books give each draft row's base position (the position of the
+    # request's last accepted token, num_tokens_no_spec - 2 after the step's tokens are counted), set right before
+    # propose and taken by it, so the draft loop reads no device value back (no sync behind draft step 0).
+    host_base_positions = None
+
+    def _draft_positions_cpu(self, target_positions, last_token_indices, batch_size):
+        """The base positions of the ``batch_size`` draft rows on the host: the runner's (VLLM_HPU_MTP_DRAFT_LOOP=1)
+        when it set them for this call, else read back from the device (a sync behind draft step 0)."""
+        host = self.host_base_positions
+        self.host_base_positions = None
+        if host is not None and int(host.shape[0]) == int(batch_size):
+            return host.clone()
+        return target_positions.cpu()[last_token_indices.cpu()]
 
     def prepare_attn_metadata(
             self,
@@ -194,6 +267,8 @@ class HpuFlashNextMtpProposer(HpuEagleProposer):
             positions,
             model_runner,
             ring_slots=None):
+        if gaudi_envs.VLLM_HPU_FLASH_NEXT_DECODE_METADATA == 1 and model_runner.flash_next_sparse_decode_metadata():
+            return self.sparse_attn_metadata(block_table_cpu_tensor, positions, model_runner, ring_slots)
         # Prepare attn metadata on CPU. (Improve for pure HPU based attn metadata preparation)
         block_size = model_runner.block_size
         batch_size = positions.shape[0]
@@ -273,3 +348,45 @@ class HpuFlashNextMtpProposer(HpuEagleProposer):
         )
 
         return common_attn_metadata
+
+    def sparse_attn_metadata(self, block_table_cpu_tensor, positions, model_runner, ring_slots=None):
+        """``prepare_attn_metadata`` under VLLM_HPU_FLASH_NEXT_DECODE_METADATA=1: the same ``block_table`` and
+        ``slot_mapping`` (``flash_next_decode_metadata.draft_step_block_table_and_slots``), built without
+        per-row lists, and no paged-attention buffers, which the draft's sparse QSA layer does not read."""
+        block_table, slot_mapping = draft_step_block_table_and_slots(
+            block_table_cpu_tensor, positions, int(positions.shape[0]), model_runner.block_size, self.max_model_len,
+            model_runner._block_table_max_blocks, model_runner._PAD_BLOCK_ID, model_runner._PAD_SLOT_ID)
+        return HPUAttentionMetadataV1.make_decode_metadata(
+            block_list=None,
+            block_usage=None,
+            block_groups=None,
+            input_positions=None,
+            slot_mapping=async_h2d_copy(slot_mapping, device=self.device),
+            block_size=model_runner.block_size,
+            window_block_list=None,
+            window_block_usage=None,
+            window_block_groups=None,
+            chunked_block_list=None,
+            chunked_block_usage=None,
+            chunked_block_groups=None,
+            block_table=async_h2d_copy(block_table, device=self.device),
+            load_indices_tensor=ring_slots,
+            store_indices_tensor=ring_slots,
+        )
+
+    def _draft_tokens(self, hidden_states):
+        """``(draft token of every row [rows], top DRAFT_RANK_TOP ids [rows, top] or None)``.
+
+        ``VLLM_HPU_VOCAB_PARALLEL_LOGITS`` >= 1 and no draft-rank log: every rank reduces its own vocabulary shard
+        and only ``[rows, 2]`` fp32 per rank is gathered (``vocab_parallel.vocab_parallel_argmax``, int32 ids).
+        Otherwise the gathered logits and their arg max, as before (the rank log needs the logits); the ids come
+        from ``draft_argmax`` (``VLLM_HPU_MTP_DRAFT_IDS``).
+        """
+        from vllm_gaudi.distributed import vocab_parallel
+
+        if self.draft_rank_stats is None and vocab_parallel.enabled(self.model):
+            return vocab_parallel.vocab_parallel_argmax(self.model, hidden_states), None
+        logits = self.model.compute_logits(hidden_states)
+        top_ids = None if self.draft_rank_stats is None else logits.topk(DRAFT_RANK_TOP, dim=-1).indices
+        # draft_argmax: arg max, or int32 ids from an fp32 id table with VLLM_HPU_MTP_DRAFT_IDS=1 (card rule 9).
+        return draft_argmax(logits), top_ids
