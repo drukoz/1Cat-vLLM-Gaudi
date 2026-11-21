@@ -6054,12 +6054,6 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             if num_tokens > 1:
                 token_ids_device = token_ids_device.view(-1, 1)
 
-        if self._spec_draft_handoff is not None and scheduler_output is not None:
-            # Async scheduling with speculation: the last step's drafts into this batch's draft slots, on the device.
-            token_ids_device = self._spec_draft_handoff.scatter_drafts(token_ids_device,
-                                                                       self.input_batch.req_ids[:num_decodes],
-                                                                       num_tokens,
-                                                                       scheduler_output.scheduled_spec_decode_tokens)
         verify_made, verify_ok = None, False
         if self._verify_advance is not None and num_tokens > 1 and scheduler_output is not None:
             # VLLM_HPU_FLASH_NEXT_SPEC_DEVICE_INPUTS: this verification step's acceptance-dependent inputs from the
@@ -6070,6 +6064,14 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                                                                 token_ids_device, positions_device,
                                                                 slot_mapping_device, num_accepted_tokens,
                                                                 scheduler_output, block_table_device)
+        ids_made = verify_made is not None and token_ids_device is verify_made.token_ids
+        if self._spec_draft_handoff is not None and scheduler_output is not None and not ids_made:
+            # Async scheduling with speculation: the last step's drafts into this batch's draft slots, on the device
+            # (not when M1 made this step's ids: its draft columns are the chain's drafts already).
+            token_ids_device = self._spec_draft_handoff.scatter_drafts(token_ids_device,
+                                                                       self.input_batch.req_ids[:num_decodes],
+                                                                       num_tokens,
+                                                                       scheduler_output.scheduled_spec_decode_tokens)
         if (self._align_flag in (1, 2) and verify_ok and self.use_prefix_caching and self._recurrent_spec
                 and num_tokens > 1 and load_indices_tensor is not None and not self._compact_gdn_group_ids):
             (load_indices_tensor, store_indices_tensor, num_accepted_tokens,
