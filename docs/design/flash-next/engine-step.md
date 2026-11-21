@@ -29,9 +29,9 @@ verification row and the bonus row draws in the candidate region with its own no
 against those draws (`greedy_rejection_sample_from_tokens`), which is speculative sampling exactly for one-hot
 drafts (design and interface agreed with mtp-card-ready; it needs their `VLLM_HPU_SPEC_SAMPLED_VERIFY` at 1 or 2).
 Its 8-card check is 00164 (integration build 2 + `d5ad5e67`, MTP k = 2, sampled 32 and 1 streams).
-CPU-proven, not yet on a card: **`VLLM_HPU_SAMPLER_REQUEST_PARAMS=1`** (`299856cd`): a request's `min_tokens`,
-`logit_bias` and `min_p` take effect on the general sampler path (they were ignored on HPU), applied per row from
-each row's own request before vLLM's sampler. Pull request: the gate runs on `reports/engine-step/merge-wt` at
+**`VLLM_HPU_SAMPLER_REQUEST_PARAMS=1`** (`299856cd`, card-proven on the tiny model in 00167): a request's
+`min_tokens`, `logit_bias` and `min_p` take effect on the general sampler path (they were ignored on HPU), applied
+per row from each row's own request before vLLM's sampler. Pull request: the gate runs on `reports/engine-step/merge-wt` at
 `299856cd` (waiting for the lock since 00:40 UTC), then PR and merge.
 
 ### If you take over, in this order
@@ -412,6 +412,11 @@ requests repeat themselves (cand and vLLM's sampler). The `Candidate sampling` l
 from the gathered logits" (cand) and "... from each rank's vocabulary shard (VLLM_HPU_VOCAB_PARALLEL_LOGITS=2)"
 (candvp). Logprobs check: `logprobs=5` and `prompt_logprobs=2` answered 200 with valid ids, `/health` fine after.
 
+**00167 `tiny-request-params`** (one card, `9a3ed1d1`, 01:45 UTC, exit 0): the tiny model with
+`VLLM_HPU_SAMPLER_REQUEST_PARAMS=1` on the general sampler path: `logit_bias` +100 gives 6 of 6 biased tokens,
+`min_tokens` 6 with a stop token the model emits at token 3 gives 6 tokens without it, `min_p` 0.5 answers,
+`/health` 200 after; the greedy smoke still matches the reference; logprobs and prompt logprobs fine.
+
 ## 10. Time to first token of a cached-prefix turn: the runner's host part (MEASURED on the Mac)
 
 `reports/engine-step/probes/ttft_cached_prefix.py` (output `ttft_cached_prefix_out.txt`): the engine harness with
@@ -470,3 +475,25 @@ One difference: a request with logprobs gets them after its own bias and masks (
 VERIFIED on the CPU (`test_sampler_request_params.py`): the adjustments equal vLLM's rules; in the serving loop a
 `logit_bias` of +100 makes a greedy request write only that token and a stop token before `min_tokens` is not
 emitted, and without the flag both are ignored. Card check: job 00167 (tiny model, one card).
+
+## 13. Host time per decode step outside the forward (MEASURED on the Mac, 2026-11-21 01:45 UTC)
+
+`reports/engine-step/probes/step_phases.py` and `step_profile.py`: the engine harness with the stub model at the
+real geometry (TP8: five hybrid KV groups, 4 Mamba and 1 full attention, block 512), 32 requests at a 1K context,
+median wall ms per engine step over 60 steps, flags as noted.
+
+| configuration | step | `schedule` | `update_from_output` | runner `sample_tokens` | of which `_prepare_inputs` |
+|---|---|---|---|---|---|
+| greedy, vLLM's sampler | 2.14 | 0.56 | 0.09 | 1.14 | |
+| greedy, `VLLM_HPU_FUSED_GREEDY_LOGITS=1` | 0.98 | 0.40 | 0.06 | 0.50 | |
+| greedy, I05 + I01 | 1.00 | 0.40 | 0.06 | 0.50 | 0.32 |
+| sampled, `VLLM_HPU_CANDIDATE_SAMPLING=1` | 1.18 | 0.41 | 0.06 | 0.67 | |
+| 1 request, I05 | 0.30 | 0.03 | 0.01 | 0.24 | |
+
+- About 70 % of `schedule` is `KVCacheManager.allocate_slots` for each of the 32 requests across the five groups,
+  also on the steps where nothing changes (no block boundary, no newly full block). A decode fast path would have
+  to reproduce Mamba align mode's per-step partial-tail caching (`MambaManager.cache_blocks` re-marks the prompt
+  tail in `cached_blocks_this_step`); not done.
+- The card's `prepare` is about 2 ms at 32 rows (step-anatomy 00013) against 0.32 ms here: the 11 small
+  host-to-device copies per step are the suspect. Job 00173 (`h2d_copies_bench.py`, one card) times them one by one
+  against one packed copy.
