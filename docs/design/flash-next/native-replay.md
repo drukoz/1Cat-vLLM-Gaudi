@@ -836,8 +836,13 @@ all-reduces already split every layer).
    post_holder .. post_events .. post_record .. post_coll ..`; nested, not in the phase sum) **published 03:34:04 UTC**
    (7 min incremental; VERIFIED in the wheel: the sub-timer strings in the backend .so, `ReleaseLaunchState` in all
    three .so files; the bridge clone's local branch `native-replay-lean` commit 6edcb0f = this patch). Sent to the
-   collectives track at 03:35 UTC with two options: swap it into 00180 instead of lean2 (same prepared path), or a
-   separate job with the arms below. `probes/replay_timing.py` prints the sub-phases; the collectives
+   collectives track at 03:35 UTC. **00180 runs lean3t in its tiny-lean and real-lean arms** (the collectives
+   track's `bridge_headline_job.sh` reads `~/farm/collectives/bridge/late/00180.env` at start: `LEAN=lean3t-412153bbab3e`;
+   the job log prints it). `INLINE=1` in that file adds tiny-lean-inline and real-lean-inline (+
+   `PT_HPU_DISABLE_ASYNC_COLLECTIVE=1`, the real one only if its tiny one passed); the collectives track asked the
+   coordinator for a 65-minute resubmit that keeps the place. From real-lean (and real-lean-inline) the collectives
+   track sends the medians of every `sub_*`, the phases, run_prep, unattributed and the step times at 32, 8 and 1
+   streams, greedy and sampled; then choose among cuts (a)-(d) by the measured sub-phases. `probes/replay_timing.py` prints the sub-phases; the collectives
    track's parser reads them as `sub_*`. Arms to ask for (collectives track places the job): tiny-lean3t and
    tiny-lean3t-inline (tokens), real-lean3t and real-lean3t-inline (`PT_HPU_DISABLE_ASYNC_COLLECTIVE=1`, VERIFIED in
    `habana_kernels/hccl_kernels.cpp:354`: the collective runs inline instead of `JobThreadLazyHCCL::addJob` +
