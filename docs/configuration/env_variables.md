@@ -231,6 +231,20 @@ lazy graph came back as every second id (job 00038). The sampler's `argmax` narr
 is sound at 8 and 32 rows (job 00021, by the streams' texts); set `1` only if the card
 shows draft positions 2 to k collapsing with more than one stream.
 
+`VLLM_HPU_MTP_DRAFT_GRAPH` selects how the Flash-Next MTP draft runs its k passes
+after a decode step, as an integer. `0` (default): every pass is its own HPU-graph
+replay, the LM head and the arg max run lazily between the replays, and the host
+builds each later pass's attention metadata between them (at 32 streams on TP8 the
+draft cost 16 to 18 ms of a 104 ms step, almost all of it host issue). `1`: the host
+builds the metadata of every later pass first, then one HPU graph runs pass 0, the LM
+head, the arg max and passes 1 to k-1 (`MtpDraftLoop` in
+`vllm_gaudi/v1/spec_decode/flash_next_mtp_steps.py`): one replay per decode draft,
+the same drafts. Use it with `VLLM_HPU_MTP_DRAFT_LOOP=1` (without it the host reads
+the draft positions back from the device before the replay). Drafts after a prefill
+and the draft-rank log (`VLLM_FLASH_NEXT_DRAFT_RANK_LOG=1`) keep the per-pass path.
+With `VLLM_HPU_MTP_TIMING=1` the draft's laps are `graph_positions`, `graph_meta`
+(the metadata of the later passes) and `graph` (the replay's issue).
+
 `VLLM_HPU_MTP_TIMING` times the steps of a Flash-Next MTP server, as an integer. `0`
 (default): no timer. `1`: per step the verification part (to the drafter call) and the
 draft, with a lap per draft pass and one device wait after the draft; every 25 steps of

@@ -17,6 +17,12 @@ additions: --sampled-levels LIST runs the SAMPLED round (warm, then measured) at
 top level only, and on a server with speculation every measured round carries the speculative counters of
 /metrics read around it ("spec": acceptance length, rate per draft position; a SPEC line), so each level has its
 own acceptance. Everything else, the output format included, is the coordinator's.
+
+--switch-file PATH with --switch-arm NAME=LINES (repeatable; LINES are NAME=VALUE pairs separated by ';') runs an A/B
+on ONE server (track mtp-draft-graph): the server reads PATH as its VLLM_HPU_RUNTIME_SWITCH_FILE. Per level, one warm
+round per arm, then the measured rounds with the arms in turn (A, B, A, B, ...), the file replaced with a rename
+while no request runs. Every greedy round carries "arm" and "switch_lines" (the workers' "Runtime switches from"
+lines that came with it in --server-log: 0 means the round may not be that arm, a SWITCH line says so).
 """
 import argparse
 import http.client
@@ -262,7 +268,20 @@ def main():
                          "per level and --repeat-top at the top level, as the coordinator's probe)")
     ap.add_argument("--timeout", type=float, default=1800.0)
     ap.add_argument("--out", default="scaling.json")
+    ap.add_argument("--switch-file", default="", help="the server's VLLM_HPU_RUNTIME_SWITCH_FILE (with --switch-arm)")
+    ap.add_argument("--switch-arm", action="append", default=[], metavar="NAME=LINES",
+                    help="an arm of the A/B on one server: NAME=FLAG=VALUE[;FLAG=VALUE...] (repeatable, in order)")
+    ap.add_argument("--server-log", default="", help="the server's log, to check that the workers took each switch")
+    ap.add_argument("--switch-settle", type=float, default=2.0, help="seconds without requests around a switch")
     args = ap.parse_args()
+    arms = []
+    for spec in args.switch_arm:
+        name, sep, lines = spec.partition("=")
+        if not sep or not name or "=" not in lines:
+            raise SystemExit("--switch-arm takes NAME=FLAG=VALUE[;FLAG=VALUE...], got %r" % spec)
+        arms.append((name, lines))
+    if arms and not args.switch_file:
+        raise SystemExit("--switch-arm needs --switch-file (the server's VLLM_HPU_RUNTIME_SWITCH_FILE)")
     levels = [int(x) for x in args.levels.split(",") if x]
     sampled_levels = [int(x) for x in args.sampled_levels.split(",") if x] or levels[-1:]
     results = {"levels": [], "ctx": [], "mintok": [], "sampled": []}
@@ -293,8 +312,86 @@ def main():
                 print("SAMPLED N=%d rep=%d FAILED: %s" % (n, rep, m.get("error_samples")), flush=True)
                 break
 
+    current = {"arm": None}
+
+    def switch_lines():
+        """How many "Runtime switches from" lines the server's log holds (-1: no log to read)."""
+        if not args.server_log:
+            return -1
+        try:
+            with open(args.server_log, errors="replace") as f:
+                return sum(1 for line in f if "Runtime switches from" in line)
+        except OSError:
+            return -1
+
+    def switch_to(name, lines):
+        """Replace the switch file with the arm's flags (a rename) while no request runs; the log count before
+        (None when the arm is in force already: no switch, nothing to check)."""
+        if current["arm"] == name:
+            return None
+        before = switch_lines()
+        time.sleep(args.switch_settle)
+        staging = args.switch_file + ".new"
+        with open(staging, "w") as f:
+            f.write("".join(pair.strip() + "\n" for pair in lines.split(";") if pair.strip()))
+        os.replace(staging, args.switch_file)
+        time.sleep(args.switch_settle)
+        current["arm"] = name
+        return before
+
+    def switched(name, before):
+        """The log lines the switch to ``name`` gave (after the round's first step); a SWITCH line if none."""
+        if before is None:
+            return None
+        after = switch_lines()
+        seen = after - before if before >= 0 and after >= 0 else None
+        if seen == 0:
+            print("SWITCH arm %s: the workers logged no switch: this round may not be that arm" % name, flush=True)
+        return seen
+
+    def level_with_arms(n):
+        """One warm round per arm, then the measured rounds with the arms in turn. False: stop the probe."""
+        reps = args.rounds if args.rounds > 0 else (args.repeat_top if n == levels[-1] else 1)
+        warm = {}
+        for name, lines in arms:
+            before = switch_to(name, lines)
+            w = run_round(args, n, args.warm_tokens)
+            w["switch_lines"] = switched(name, before)
+            warm[name] = w
+            print("warm  N=%-3d arm=%s ok=%d err=%d wall=%.1fs ms/tok p50=%s" % (
+                n, name, w["ok"], w["errors"], w["wall_s"], ("%.1f" % w["ms_per_token_p50"]) if w.get("ok") else "-"),
+                  flush=True)
+            if not w.get("ok"):
+                print("stopping: the warm round at N=%d arm %s failed: %s" % (n, name, w.get("error_samples")),
+                      flush=True)
+                return False
+        for rep in range(reps):
+            for name, lines in arms:
+                before = switch_to(name, lines)
+                m = measured_round(args, n, args.tokens)
+                m["rep"] = rep
+                m["arm"] = name
+                m["switch_lines"] = switched(name, before)
+                m["warm"] = {k: warm[name].get(k) for k in ("ok", "errors", "wall_s", "ms_per_token_p50")}
+                results["levels"].append(m)
+                save()
+                if not m.get("ok"):
+                    print("MEAS  N=%d arm=%s rep=%d FAILED: %s" % (n, name, rep, m.get("error_samples")), flush=True)
+                    return False
+                print("MEAS  N=%-3d arm=%s rep=%d ok=%d err=%d  ms/tok p50=%.2f  steady ms/tok p50=%.2f, gap p90=%.1f ms, "
+                      "pauses>0.5s max=%.1fs, tok/chunk=%.2f, aggregate=%.1f tok/s" % (
+                          n, name, rep, m["ok"], m["errors"], m["ms_per_token_p50"], m["steady_ms_per_token_p50"],
+                          m["gap_p90_ms_p50"], m["pause_s_max"], m["tokens_per_chunk_p50"], m["aggregate_tok_s"] or 0),
+                      flush=True)
+                for k, t in m["samples"].items():
+                    print("TEXT  N=%-3d arm=%s rep=%d stream %-2s: %r" % (n, name, rep, k, t[:110]), flush=True)
+        return True
 
     for n in levels:
+        if arms:
+            if not level_with_arms(n):
+                break
+            continue
         t = time.time()
         w = run_round(args, n, args.warm_tokens)
         print("warm  N=%-3d ok=%d err=%d wall=%.1fs ms/tok p50=%s" % (

@@ -367,6 +367,8 @@ def runner_facts(runner) -> dict:
             "prefix_caching": bool(cache_config.enable_prefix_caching),
             "recurrent_pool_slots": int(runner._recurrent_pool_slots),
             "candidate_verify_steps": int(getattr(runner, "_candidate_verify_steps", 0)),
+            # VLLM_HPU_MTP_DRAFT_GRAPH=1: decode drafts whose k passes ran in one HPU graph (MtpDraftLoop)
+            "draft_graph_calls": int(getattr(getattr(runner, "drafter", None), "draft_graph_calls", 0)),
             "attention_group": runner._get_attention_group_id_for_hybrid(),
             "num_blocks": int(runner.kv_cache_config.num_blocks),
             "groups": groups}
@@ -419,6 +421,7 @@ def _record_draft_calls(runner) -> list[dict]:
         attn_table = runner.input_batch.block_table[runner._get_attention_group_id_for_hybrid()].get_cpu_tensor()
         rows = int(block_table_cpu_tensor.shape[0])
         calls.append({"rows": rows,
+                      "decode": not bool(getattr(common_attn_metadata, "is_prompt", True)),
                       "width": int(block_table_cpu_tensor.shape[1]),
                       "attention_width": int(attn_table.shape[1]),
                       "is_attention_table": bool(block_table_cpu_tensor.shape[1] == attn_table.shape[1]
@@ -426,8 +429,12 @@ def _record_draft_calls(runner) -> list[dict]:
                                                  and block_table_cpu_tensor.data_ptr()
                                                  < attn_table.data_ptr() + attn_table.numel() *
                                                  attn_table.element_size())})
-        return propose(target_token_ids, target_positions, target_hidden_states, last_token_indices,
-                       common_attn_metadata, block_table_cpu_tensor, model_runner, *args, **kwargs)
+        graphs_before = int(getattr(drafter, "draft_graph_calls", 0))
+        out = propose(target_token_ids, target_positions, target_hidden_states, last_token_indices,
+                      common_attn_metadata, block_table_cpu_tensor, model_runner, *args, **kwargs)
+        # VLLM_HPU_MTP_DRAFT_GRAPH=1: this draft's k passes ran in one graph (MtpDraftLoop)
+        calls[-1]["graph"] = int(getattr(drafter, "draft_graph_calls", 0)) > graphs_before
+        return out
 
     drafter.propose = recording
     fill = getattr(drafter, "fill_prefill_chunk", None)
@@ -529,6 +536,18 @@ def install_oracle_drafts(llm, runner, oracle: dict, k: int) -> list[dict]:
     return record
 
 
+def write_switch_file(lines: str) -> None:
+    """Replace the runtime switch file named by VLLM_HPU_RUNTIME_SWITCH_FILE with ``lines`` (NAME=VALUE pairs
+    separated by ';'), with a rename, as an operator's probe does between two rounds."""
+    path = os.environ.get("VLLM_HPU_RUNTIME_SWITCH_FILE", "").strip()
+    if not path:
+        raise SystemExit("--switch-after needs VLLM_HPU_RUNTIME_SWITCH_FILE in the environment")
+    staging = path + ".new"
+    with open(staging, "w", encoding="utf-8") as handle:
+        handle.write("".join(pair.strip() + "\n" for pair in lines.split(";") if pair.strip()))
+    os.replace(staging, path)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="python -m tests.unit_tests.hpu_cpu_engine", description=__doc__.split("\n")[0])
     parser.add_argument("--ckpt", required=True, help="a tiny Flash-Next checkpoint folder (with reference.json)")
@@ -558,6 +577,10 @@ def main(argv: list[str] | None = None) -> int:
                         help="record writes through a slice of the recurrent pools the align-mode copies write")
     parser.add_argument("--op-audit", action="store_true",
                         help="record every dispatched op and the custom ops' view and int64 arguments (make_op_audit)")
+    parser.add_argument("--switch-after", nargs=2, action="append", default=[], metavar=("K", "LINES"),
+                        help="after the K-th prompt, replace the runtime switch file (VLLM_HPU_RUNTIME_SWITCH_FILE in the "
+                        "environment) with LINES, NAME=VALUE pairs separated by ';' (repeatable): a flag switched in "
+                        "the middle of a run, as an operator's A/B on one server does")
     args = parser.parse_args(argv)
 
     install()
@@ -596,15 +619,19 @@ def main(argv: list[str] | None = None) -> int:
     streams = []
     with guard, (audit if audit is not None else contextlib.nullcontext()):
         batches = [prompts] if args.concurrent else [[prompt] for prompt in prompts]
-        for batch in batches:
+        switches = {int(k): lines for k, lines in args.switch_after}
+        for number, batch in enumerate(batches, 1):
             outputs = llm.generate([{"prompt_token_ids": prompt} for prompt in batch], params, use_tqdm=False)
             for prompt, output in zip(batch, outputs):
                 stream = {"prompt_ids": prompt, "generated_ids": list(output.outputs[0].token_ids),
-                          "num_cached_tokens": getattr(output, "num_cached_tokens", None)}
+                          "num_cached_tokens": getattr(output, "num_cached_tokens", None),
+                          "draft_calls_end": len(draft_calls)}
                 if args.logprobs:
                     stream["top_logprobs"] = [{str(t): float(lp.logprob) for t, lp in step.items()}
                                               for step in (output.outputs[0].logprobs or [])]
                 streams.append(stream)
+            if number in switches:
+                write_switch_file(switches[number])
         if args.next_turn and streams:
             turn = streams[0]["prompt_ids"] + streams[0]["generated_ids"] + list(json.loads(args.next_turn))
             output = llm.generate([{"prompt_token_ids": turn}], params, use_tqdm=False)[0]

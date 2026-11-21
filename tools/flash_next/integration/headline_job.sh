@@ -14,6 +14,22 @@
 #           --no-sampled-check (sampled verification is off in this build: a sampled request gets HTTP 400);
 #           acceptance per draft position per level from /metrics (SPEC lines).
 #   mtp3-32 server 2 with the 32-stream level only (a short hold).
+#   mtp<K>-graph  server 2 with VLLM_HPU_MTP_DRAFT_GRAPH=1 (the k draft passes of a decode step in one HPU graph,
+#           track mtp-draft-graph); the plain mtp<K> arm runs with VLLM_HPU_MTP_DRAFT_GRAPH=0 unless the job sets it.
+#           The tiny arm takes HEADLINE_TINY_DRAFT_GRAPH (default: the job's VLLM_HPU_MTP_DRAFT_GRAPH, else 0).
+#   mtp<K>-switch  ONE MTP server, VLLM_HPU_MTP_DRAFT_GRAPH switched per round through its runtime switch file
+#           (VLLM_HPU_RUNTIME_SWITCH_FILE=$OUT/<arm>/switches): per level a warm round per arm, then the
+#           measured rounds off, on, off, on (decode_scaling.py --switch-arm): an A/B without the
+#           server-to-server spread. Rows of scaling.json carry "arm" (off / on); the MTP timer's records of
+#           the one-graph drafts have the kind verify+graph.
+#           HEADLINE_SWITCH_SET=graph-md: four arms, the 2 x 2 of VLLM_HPU_MTP_DRAFT_GRAPH and
+#           VLLM_HPU_FLASH_NEXT_DECODE_METADATA (off, on, md, on-md).
+#   mtp<K>-rfc, mtp<K>-rfc-switch  the MTP server of mtp<K> / mtp<K>-switch built with VLLM_HPU_MTP_REPLICATED_FC=1 (the
+#           draft's two fc linears unsharded: two all-gathers fewer per draft pass); other MTP arms take the job's
+#           value, else 0. The tiny arm takes HEADLINE_TINY_MTP_REPLICATED_FC and HEADLINE_TINY_DECODE_METADATA
+#           (VLLM_HPU_FLASH_NEXT_DECODE_METADATA) the same way as HEADLINE_TINY_DRAFT_GRAPH.
+#   mtp<K>-async-switch  the same A/B on the mtp<K>-async server (VLLM_HPU_FLASH_NEXT_ASYNC_SCHED=2, the MTP timer
+#           at HEADLINE_ASYNC_MTP_TIMING: set 0 for this A/B, the timer's device wait hides async's overlap).
 #   nospec-noshard, nospec-noprefix, nospec-noprefix-nocut  the low-stream bisect: A's env with
 #           VLLM_HPU_QSA_INDEXER_SHARD=0; A's env without VLLM_HPU_PREFIX_ALIGN_SPLIT and VLLM_HPU_PREFIX_KEEP_PROMPT_END
 #           (then also VLLM_HPU_DECODE_CUT_INTERVAL=0); greedy 8 and 1 streams only.
@@ -180,6 +196,9 @@ while [ "$i_arm" -lt "${#ARMS[@]}" ]; do
             if [ "${HEADLINE_MTP_SAMPLED:-0}" = 1 ]; then tiny_sv="${VLLM_HPU_SPEC_SAMPLED_VERIFY:-1}"; fi
             VLLM_HPU_MTP_DRAFT_LOOP="${VLLM_HPU_MTP_DRAFT_LOOP:-1}" VLLM_HPU_MTP_CHUNK_KV="${VLLM_HPU_MTP_CHUNK_KV:-1}" \
                 VLLM_HPU_SPEC_SAMPLED_VERIFY="$tiny_sv" \
+                VLLM_HPU_MTP_DRAFT_GRAPH="${HEADLINE_TINY_DRAFT_GRAPH:-${VLLM_HPU_MTP_DRAFT_GRAPH:-0}}" \
+                VLLM_HPU_MTP_REPLICATED_FC="${HEADLINE_TINY_MTP_REPLICATED_FC:-${VLLM_HPU_MTP_REPLICATED_FC:-0}}" \
+                VLLM_HPU_FLASH_NEXT_DECODE_METADATA="${HEADLINE_TINY_DECODE_METADATA:-${VLLM_HPU_FLASH_NEXT_DECODE_METADATA:-0}}" \
                 "$PYTHON" /farm/farm_tiny.py --gdn hc ${spec[@]+"${spec[@]}"} --out "$OUT/tiny"
             rc=$?
             if [ "$rc" -ne 0 ] && [ "${HEADLINE_TINY_ABORT:-1}" = 1 ]; then
@@ -223,14 +242,49 @@ while [ "$i_arm" -lt "${#ARMS[@]}" ]; do
                 --warm-tokens "$WARM" --repeat-top 2 --no-mintok-check --probe-arg --no-sampled-check \
                 --probe-arg "--rounds=$ROUNDS"
             ;;
-        mtp[1-9] | mtp[1-9]-32 | mtp[1-9]-noshard | mtp[1-9]-async)
+        mtp[1-9] | mtp[1-9]-32 | mtp[1-9]-noshard | mtp[1-9]-async | mtp[1-9]-graph | mtp[1-9]-switch | \
+            mtp[1-9]-async-switch | mtp[1-9]-rfc | mtp[1-9]-rfc-switch)
             k="${arm:3:1}"
+            # mtp<K>-graph: the k draft passes of a decode step in one HPU graph (VLLM_HPU_MTP_DRAFT_GRAPH=1)
+            draft_graph="${VLLM_HPU_MTP_DRAFT_GRAPH:-0}"
+            case "$arm" in *-graph) draft_graph=1 ;; esac
+            # mtp<K>-rfc*: the draft's fc linears unsharded (built at the server's start, not switchable)
+            replicated_fc="${VLLM_HPU_MTP_REPLICATED_FC:-0}"
+            case "$arm" in *-rfc | *-rfc-*) replicated_fc=1 ;; esac
+            # mtp<K>-switch: the flag per round on one server (the server starts with it off)
+            switch_env=()
+            switch_args=()
+            case "$arm" in
+                *-switch)
+                    draft_graph=0
+                    mkdir -p "$OUT/$arm"
+                    rm -f "$OUT/$arm/switches" "$OUT/$arm/switches.new"
+                    switch_env=(VLLM_HPU_RUNTIME_SWITCH_FILE="$OUT/$arm/switches")
+                    switch_args=(--probe-arg "--switch-file=$OUT/$arm/switches"
+                        --probe-arg "--server-log=$OUT/$arm/server0.log")
+                    # HEADLINE_SWITCH_SET: graph (default) = off / on; graph-md = the 2 x 2 with engine-step's
+                    # VLLM_HPU_FLASH_NEXT_DECODE_METADATA (the sparse-QSA decode metadata, also switchable)
+                    case "${HEADLINE_SWITCH_SET:-graph}" in
+                        graph-md)
+                            switch_args+=(--probe-arg "--switch-arm=off=VLLM_HPU_MTP_DRAFT_GRAPH=0;VLLM_HPU_FLASH_NEXT_DECODE_METADATA=0"
+                                --probe-arg "--switch-arm=on=VLLM_HPU_MTP_DRAFT_GRAPH=1;VLLM_HPU_FLASH_NEXT_DECODE_METADATA=0"
+                                --probe-arg "--switch-arm=md=VLLM_HPU_MTP_DRAFT_GRAPH=0;VLLM_HPU_FLASH_NEXT_DECODE_METADATA=1"
+                                --probe-arg "--switch-arm=on-md=VLLM_HPU_MTP_DRAFT_GRAPH=1;VLLM_HPU_FLASH_NEXT_DECODE_METADATA=1")
+                            ;;
+                        *)
+                            switch_args+=(--probe-arg "--switch-arm=off=VLLM_HPU_MTP_DRAFT_GRAPH=0"
+                                --probe-arg "--switch-arm=on=VLLM_HPU_MTP_DRAFT_GRAPH=1")
+                            ;;
+                    esac
+                    ;;
+            esac
             # mtp<K>-async: VLLM_HPU_FLASH_NEXT_ASYNC_SCHED=2 (async scheduling with MTP) and the MTP timer at
             # HEADLINE_ASYNC_MTP_TIMING (default 2, the coordinator's; async-sched advises 0: the timer's device wait
             # at the draft's end hides the overlap).
             timing="${VLLM_HPU_MTP_TIMING:-1}"
             async_env=()
-            if [ "${arm%-async}" != "$arm" ]; then
+            # (mtp<K>-async-switch: the async server of mtp<K>-async with the draft-graph flag switched per round)
+            if [ "${arm%-async}" != "$arm" ] || [ "${arm%-async-switch}" != "$arm" ]; then
                 async_env=(VLLM_HPU_FLASH_NEXT_ASYNC_SCHED=2)
                 timing="${HEADLINE_ASYNC_MTP_TIMING:-2}"
             fi
@@ -246,13 +300,14 @@ while [ "$i_arm" -lt "${#ARMS[@]}" ]; do
                 sampled_args=(--probe-arg "--sampled-levels=${HEADLINE_MTP_SAMPLED_LEVELS:-32}")
                 sampled_verify="${VLLM_HPU_SPEC_SAMPLED_VERIFY:-1}"
             fi
-            env ${async_env[@]+"${async_env[@]}"} \
+            env ${async_env[@]+"${async_env[@]}"} ${switch_env[@]+"${switch_env[@]}"} \
             VLLM_HPU_QSA_INDEXER_SHARD="$shard" VLLM_HPU_SPEC_SAMPLED_VERIFY="$sampled_verify" \
             VLLM_HPU_GDN_CORE_VERIFY="${VLLM_HPU_GDN_CORE_VERIFY:-1}" VLLM_HPU_MTP_TIMING="$timing" \
                 VLLM_HPU_MTP_DRAFT_LOOP="${VLLM_HPU_MTP_DRAFT_LOOP:-1}" VLLM_HPU_MTP_CHUNK_KV="${VLLM_HPU_MTP_CHUNK_KV:-1}" \
+                VLLM_HPU_MTP_DRAFT_GRAPH="$draft_graph" VLLM_HPU_MTP_REPLICATED_FC="$replicated_fc" \
                 bash "$HERE/serve_probe.sh" --out "$OUT/$arm" --mtp "$k" --levels "$levels" --tokens "$TOKENS" \
                 --warm-tokens "$WARM" --repeat-top 1 --no-mintok-check "${sampled_args[@]}" \
-                --probe-arg "--rounds=$ROUNDS" ${HEADLINE_MTP_CTX:+--ctx "$HEADLINE_MTP_CTX"} $(barrier_args "$arm") $(guard_args)
+                ${switch_args[@]+"${switch_args[@]}"} --probe-arg "--rounds=$ROUNDS" ${HEADLINE_MTP_CTX:+--ctx "$HEADLINE_MTP_CTX"} $(barrier_args "$arm") $(guard_args)
             ;;
         *)
             echo "headline_job: unknown arm $arm (nospec, mtp3, mtp3-32)"

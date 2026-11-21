@@ -32,7 +32,8 @@ from vllm_gaudi.utils import async_h2d_copy
 from vllm_gaudi.v1.attention.backends.hpu_attn import HPUAttentionMetadataV1
 from vllm.model_executor.models.llama_eagle3 import Eagle3LlamaForCausalLM
 
-from vllm_gaudi.v1.spec_decode.flash_next_mtp_steps import draft_argmax
+from vllm_gaudi import envs as gaudi_envs
+from vllm_gaudi.v1.spec_decode.flash_next_mtp_steps import MtpDraftLoop, draft_argmax
 from vllm_gaudi.v1.spec_decode.flash_next_mtp_steps import (DRAFT_RANK_TOP, DraftRankStats,
                                                              align_draft_rope_with_target, draft_rank_log_enabled,
                                                              flash_next_target_model_name, flat_token_rows,
@@ -41,9 +42,11 @@ from vllm_gaudi.v1.spec_decode.flash_next_mtp_steps import (DRAFT_RANK_TOP, Draf
 from vllm_gaudi.v1.worker.flash_next_inputs import build_block_table
 from vllm_gaudi.v1.worker.flash_next_decode_metadata import draft_step_block_table_and_slots
 from vllm_gaudi.v1.spec_decode.hpu_eagle import HpuEagleProposer
-from vllm.logger import init_logger
+# The "vllm" logger (the runner's): a logger named after this module has no handler in a server, so its lines
+# were lost (the draft's RoPE line, the one-graph line).
+from vllm_gaudi.extension.logger import logger as init_logger
 
-logger = init_logger(__name__)
+logger = init_logger()
 
 
 class HpuFlashNextMtpProposer(HpuEagleProposer):
@@ -99,6 +102,10 @@ class HpuFlashNextMtpProposer(HpuEagleProposer):
 
         # A prefill-only call must never leave stale top-4 rows for the runner.
         self.last_draft_top_ids = None
+        if self._draft_graph_enabled(common_attn_metadata):
+            return self._propose_in_one_graph(target_token_ids, target_positions, target_hidden_states,
+                                              last_token_indices, common_attn_metadata, block_table_cpu_tensor,
+                                              model_runner)
         draft_top_ids = [] if self.draft_rank_stats is not None else None
 
         if self.method == "eagle3":
@@ -258,6 +265,80 @@ class HpuFlashNextMtpProposer(HpuEagleProposer):
         if host is not None and int(host.shape[0]) == int(batch_size):
             return host.clone()
         return target_positions.cpu()[last_token_indices.cpu()]
+
+    # VLLM_HPU_MTP_DRAFT_GRAPH=1: the k passes of a decode draft in one HPU graph (MtpDraftLoop). The loop is built
+    # at the first such draft and kept; the number of drafts it ran is counted for the CPU engine rehearsal.
+    _draft_graph = None
+    draft_graph_calls = 0
+
+    def _draft_graph_enabled(self, common_attn_metadata) -> bool:
+        """True for a decode draft of an MTP drafter with VLLM_HPU_MTP_DRAFT_GRAPH=1 and no draft-rank log."""
+        return (int(gaudi_envs.VLLM_HPU_MTP_DRAFT_GRAPH) == 1 and self.method == "mtp"
+                and self.draft_rank_stats is None and not bool(getattr(common_attn_metadata, "is_prompt", True)))
+
+    def _draft_graph_loop(self):
+        """The ``MtpDraftLoop`` of this drafter, in its own HPU graph in lazy mode (built once).
+
+        Each pass runs the draft adapter's own forward (``type(adapter).forward``: the metadata processing, the
+        RoPE tables and the forward context of that pass), not ``adapter.forward``, which ``wrap_in_hpu_graph``
+        replaced with its capture and replay: the passes are captured into the loop's graph, not into graphs of
+        their own.
+        """
+        if self._draft_graph is None:
+            import habana_frameworks.torch as htorch
+
+            adapter = self.model
+            adapter_forward = type(adapter).forward
+
+            def pass_forward(**kwargs):
+                return adapter_forward(adapter, **kwargs)
+
+            def draft_tokens(hidden_states):
+                return self._draft_tokens(hidden_states)[0]
+
+            loop = MtpDraftLoop(pass_forward, draft_tokens, self.num_speculative_tokens, self.max_model_len)
+            if htorch.utils.internal.is_lazy():
+                loop = htorch.hpu.wrap_in_hpu_graph(loop, disable_tensor_cache=True)
+            self._draft_graph = loop
+            logger.info("Flash-Next MTP: the %d draft passes of a decode step run in one HPU graph "
+                        "(VLLM_HPU_MTP_DRAFT_GRAPH=1, lazy mode %s)", self.num_speculative_tokens,
+                        bool(htorch.utils.internal.is_lazy()))
+        return self._draft_graph
+
+    def _propose_in_one_graph(self, target_token_ids, target_positions, target_hidden_states, last_token_indices,
+                              common_attn_metadata, block_table_cpu_tensor, model_runner):
+        """``propose`` for a decode draft with VLLM_HPU_MTP_DRAFT_GRAPH=1: the same drafts from one replay.
+
+        The host first takes the base positions (the runner's books with VLLM_HPU_MTP_DRAFT_LOOP=1, else a read of
+        the device's) and builds the attention metadata of the passes 1 .. k-1 (``prepare_attn_metadata`` at the
+        base positions + j, as the per-pass loop does between its passes); then ``MtpDraftLoop`` runs every pass.
+        """
+        batch_size = last_token_indices.shape[0]
+        k = int(self.num_speculative_tokens)
+        target_hidden_states = flat_token_rows(target_hidden_states)
+        timer = getattr(self, "mtp_step_timer", None)
+        step_metadata = ()
+        if k > 1:
+            positions_cpu = self._draft_positions_cpu(target_positions.view(-1), last_token_indices, batch_size)
+            if timer is not None:
+                timer.lap("graph_positions")
+            # The QSA raw-key ring is addressed by the request's GDN state slot (the lattice's column 0).
+            ring_slots = None
+            if getattr(common_attn_metadata, "load_indices_tensor", None) is not None:
+                ring_slots = ring_slots_from_lattice(common_attn_metadata.load_indices_tensor)
+            step_metadata = tuple(
+                self.prepare_attn_metadata(block_table_cpu_tensor, positions_cpu + step, model_runner, ring_slots)
+                for step in range(1, k))
+            if timer is not None:
+                timer.lap("graph_meta")
+        else:
+            self.host_base_positions = None
+        draft_token_ids = self._draft_graph_loop()(target_token_ids, target_positions, target_hidden_states,
+                                                   last_token_indices, common_attn_metadata, step_metadata)
+        self.draft_graph_calls += 1
+        if timer is not None:
+            timer.lap("graph")
+        return draft_token_ids
 
     def prepare_attn_metadata(
             self,

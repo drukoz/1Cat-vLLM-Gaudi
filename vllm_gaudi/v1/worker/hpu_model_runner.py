@@ -7652,10 +7652,17 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                     if mtp_step_timer.per_step:  # VLLM_HPU_MTP_TIMING=2: what each decode request committed
                         mtp_step_timer.step_tokens(self.input_batch.req_ids[:num_decodes],
                                                    [len(t) for t in postprocessed_sampled_token_ids[:num_decodes]])
-                    mtp_step_timer.draft_start(
-                        "prefill" if num_decodes == 0 else ("verify" if num_prefills == 0 else "mixed"),
-                        scheduler_output.total_num_scheduled_tokens, num_decodes + num_prefills,
-                        self.speculative_config.num_speculative_tokens)
+                    timer_kind = "prefill" if num_decodes == 0 else ("verify" if num_prefills == 0 else "mixed")
+                    if int(gaudi_envs.VLLM_HPU_MTP_DRAFT_GRAPH) == 1:
+                        # the one-graph drafts in records of their own (the flag can be switched at run time)
+                        timer_kind += "+graph"
+                    if (int(gaudi_envs.VLLM_HPU_FLASH_NEXT_DECODE_METADATA) == 1
+                            and self.flash_next_sparse_decode_metadata()):
+                        # the sparse decode metadata in force (also switchable): records of their own too
+                        timer_kind += "+md"
+                    mtp_step_timer.draft_start(timer_kind, scheduler_output.total_num_scheduled_tokens,
+                                               num_decodes + num_prefills,
+                                               self.speculative_config.num_speculative_tokens)
                 with self.profiler.record_event('internal', 'propose_draft_tokens'):
                     self._draft_token_ids = self.propose_draft_token_ids(
                         scheduler_output, postprocessed_sampled_token_ids, sampling_metadata,
