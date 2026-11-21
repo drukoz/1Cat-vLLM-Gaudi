@@ -208,6 +208,21 @@ a recipe compiled before the change keeps its kernel. A library built without
 the interleaved kernels (one that did not compile, or
 `-DGDN_FUSED_INTERLEAVE=OFF`) serves today's kernels. Any other value is `0`.
 
+`VLLM_HPU_GDN_VERIFY_VARIANT` (integer, default `0`) applies only with
+`VLLM_HPU_GDN_KERNEL_INTERLEAVE=1`. It picks a build of the interleaved verify
+kernel. `1` is the request-major build
+(`kernels/gdn_core_verify_interleaved_rmajor_gaudi2.c`): its index space is
+{requests, key heads} instead of {key heads, requests}; each point does the
+same work, only the split of the points over the TPC engines can change (at
+TP8 with 32 requests today's layout ran on 16 of the 24 engines). `2` is the
+lean build (`kernels/gdn_core_verify_interleaved_lean_gaudi2.c`): the
+recurrence takes a row's element of v with one broadcast and broadcasts the
+output sum with one shuffle, 11 % fewer instructions in the simulator. `3` is
+both. Outputs and states are bit-identical to the interleaved kernel's in every
+variant. Read by the kernel library's host glue like the interleave variable.
+A library built without a variant serves the interleaved kernel. Any other
+value is `0`. See `docs/design/flash-next/hc-kernels.md`. Not yet run on a card.
+
 `VLLM_HPU_GDN_GLUE_CACHE` (integer, default `0`) selects how a GDN layer
 prepares the inputs of the fused decode and verify ops. `0` makes them every
 step in every layer: the transposed conv weight, dt_bias cast to fp32, its cache

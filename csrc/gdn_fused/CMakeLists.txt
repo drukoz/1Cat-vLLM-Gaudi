@@ -146,6 +146,10 @@ set(GDN_INTERLEAVE_BUILT "")
 set(GDN_INTERLEAVE_CANDIDATES gdn_core_decode_interleaved_gaudi2)
 if(GDN_VERIFY_BUILT)
     list(APPEND GDN_INTERLEAVE_CANDIDATES gdn_core_verify_interleaved_gaudi2)
+    # The variant builds of the interleaved verify kernel (VLLM_HPU_GDN_VERIFY_VARIANT 1, 2, 3,
+    # docs/design/flash-next/hc-kernels.md, "GDN verify"): optional like the others.
+    list(APPEND GDN_INTERLEAVE_CANDIDATES gdn_core_verify_interleaved_rmajor_gaudi2
+         gdn_core_verify_interleaved_lean_gaudi2 gdn_core_verify_interleaved_rmajor_lean_gaudi2)
 endif()
 if(GDN_FUSED_INTERLEAVE)
     foreach(kernel IN LISTS GDN_INTERLEAVE_CANDIDATES)
@@ -153,6 +157,7 @@ if(GDN_FUSED_INTERLEAVE)
             "${CMAKE_CURRENT_SOURCE_DIR}/kernels/${kernel}.c"
             "${CMAKE_CURRENT_SOURCE_DIR}/kernels/gdn_core_decode_gaudi2.c"
             "${CMAKE_CURRENT_SOURCE_DIR}/kernels/gdn_core_verify_gaudi2.c"
+            "${CMAKE_CURRENT_SOURCE_DIR}/kernels/gdn_core_verify_interleaved_gaudi2.c"
             "${CMAKE_CURRENT_SOURCE_DIR}/kernels/gdn_core_decode_recurrence_interleaved.h"
             "${CMAKE_CURRENT_SOURCE_DIR}/kernels/gdn_core_verify_recurrence_interleaved.h"
             "${CMAKE_CURRENT_SOURCE_DIR}/kernels/gdn_core_decode_norm.h")

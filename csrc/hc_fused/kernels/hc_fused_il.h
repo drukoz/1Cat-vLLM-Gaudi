@@ -18,7 +18,8 @@
 // polynomial in Horner form (relative error 1.9e-9 before rounding, 8.4e-8 in fp32 Horner); 2^n by an integer
 // add to the exponent field. From n <= -126 (|x| >= 87.0) the result would leave the normal range and is 0:
 // sigmoid is then exactly 1 (x > 0) or exactly 0 (x < 0), the values the saturated-gate cases of
-// tests/unit_tests/hc_fused/hc_case.py need bit for bit. NaN propagates.
+// tests/unit_tests/hc_fused/hc_case.py need bit for bit. A NaN input gives NaN through the canonical NaN of the
+// arithmetic (its low bits are 0, so the exponent add leaves it a NaN); no test case holds a NaN.
 #define HC_IL_MAGIC 12582912.0f  // 1.5 * 2^23: adding it rounds a float in (-2^22, 2^22) to an integer
 
 static inline float64 hc_il_exp_neg(float64 a)
