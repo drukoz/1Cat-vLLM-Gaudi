@@ -366,9 +366,13 @@ the MTP draft layer's `flatten` view of its input. The values do not change
 (`test_copy_mode_leaves_out_copies_and_changes_no_bit` on a chain of two calls,
 `test_no_copy_mode_hands_a_fused_op_a_view` with views of the residual, the injection and the block output; over
 the whole tiny model `test_fewer_owned_copies_change_no_bit_and_hand_no_op_a_view`: 53, 26 and 12 copies per
-forward of the 4-layer model in modes 0, 1 and 2, and no fused op is given a view in any mode). Not yet run on a
-card: that a pending GEMM output or fused-op output needs no copy is what `probe_view_inputs.py` asks (line `OP
-OUTPUTS`), what `probe_hc_copies.py` times per mode, and what a served run with the mode shows.
+forward of the 4-layer model in modes 0, 1 and 2, and no fused op is given a view in any mode). On the card
+(2026-11-20): a pending op's, a GEMM's, a custom op's output and a clone need no copy, and an identity view raises
+like any other view (`probe_view_inputs.py`, job 00106: `OP OUTPUTS` 4 of 4, `IDENTITY VIEWS` 0 of 5); per
+hyper-connection the three modes are bit-identical and mode 2 is the cheapest at 1, 32 and 128 rows
+(`probe_hc_copies.py`, 00090); the tiny model at TP4 matches the CPU reference with mode 2 and the real model's
+1-stream texts equal the preset's (00089, 00091; those images had the first, unmarked form of mode 2, which relied
+on the residual and the injection being op outputs; the marked form above copies more and is the one to serve).
 
 ### 2. Layer (`vllm_gaudi/models/qwen4_exp/hyperconnection.py`)
 
