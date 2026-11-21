@@ -43,8 +43,13 @@ question answered on the CPU (section 14).
    number. Next PR: gate the branch (`bin/gate <snapshot>`, no `--tools`: the rental tool tests fail on this Mac for
    every track), merge the program head first.
 2. Read 00207 and 00169 when they land (table below); section 9 and the coordinator.
-3. Build 4 runs the `mtp-record` branch with `VLLM_HPU_MTP_TIMING=2`: read `mtp_step_record_r*.jsonl` (verify ms of
-   the steps whose `prev_committed` is `{"1": n}` against the others).
+3. Section 15 (the host's serial work, coordinator 08:10 UTC), in this order: (a) integration's build-5 round with
+   the unmatched-input logger (`HPU_GRAPH_UNMATCHED` lines): fix every named input (persistent base tensor, sliced
+   inside the forward; a slice that reaches a custom op gets an owned copy inside the graph, card rule 1); (b) I01
+   in the serve setting once 00207 and 00169 agree; (c) last, the packed upload (`VLLM_HPU_PACKED_INPUTS`) with
+   async-sched's per-input switch. Rank skew: native-replay's pin mode 3, seen per rank with `replay_first_ms`.
+4. Build 4's code with this track's card tools and flags is the local branch `engine-step-int4-card` (`4b180729`);
+   the CPU census tree is `reports/engine-step/trees/b4`.
 
 ### Card jobs
 
