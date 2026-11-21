@@ -620,6 +620,97 @@ def test_packed_mtp_full_query_fast_path_is_exact():
     torch.testing.assert_close(fast_pool, reference_pool, rtol=0, atol=0)
 
 
+def test_packed_mtp_store_indices_split_load_and_write_slots():
+    generator = torch.Generator().manual_seed(401)
+    batch, tokens, q_heads, value_heads, dim = 2, 4, 2, 4, 8
+    q = torch.randn(batch, tokens, q_heads, dim, generator=generator)
+    k = torch.randn(batch, tokens, q_heads, dim, generator=generator)
+    v = torch.randn(batch, tokens, value_heads, dim, generator=generator)
+    packed = torch.cat((q.flatten(2), k.flatten(2), v.flatten(2)), dim=-1)
+    log_decay = -torch.rand(batch, tokens, value_heads, generator=generator)
+    beta = torch.sigmoid(torch.randn(batch, tokens, value_heads, generator=generator))
+    pool = torch.randn(16, value_heads, dim, dim, generator=generator)
+    state_indices = torch.tensor([[1, 2, 3, 4], [5, 6, 7, 8]], dtype=torch.int32)
+    store_indices = torch.tensor([[9, 2, 3, 4], [10, 6, 7, 8]], dtype=torch.int32)
+    accepted = torch.tensor([2, 1], dtype=torch.int32)
+    query_lengths = torch.tensor([3, 4], dtype=torch.int32)
+
+    reference_pool = pool.clone()
+    reference, _ = gated_delta_rule_mtp_packed(packed, log_decay, beta, reference_pool, state_indices, accepted,
+                                               query_lengths)
+    store_pool = pool.clone()
+    store_pool[9].zero_()
+    store_pool[10].zero_()
+    actual, returned = gated_delta_rule_mtp_packed(packed, log_decay, beta, store_pool, state_indices, accepted,
+                                                   query_lengths, store_indices=store_indices)
+
+    assert returned is store_pool
+    # The accepted checkpoint loads from state_indices[:, accepted - 1] (rows 3 and 5): the zeroed
+    # store-only rows 9 and 10 are never read, so the outputs match exactly.
+    torch.testing.assert_close(actual, reference, rtol=0, atol=0)
+    # Token 0's state lands in store_indices[:, 0].
+    torch.testing.assert_close(store_pool[9], reference_pool[1], rtol=0, atol=0)
+    torch.testing.assert_close(store_pool[10], reference_pool[5], rtol=0, atol=0)
+    # state_indices[:, 0]'s slots are untouched: token 0 never overwrites the checkpoint block.
+    torch.testing.assert_close(store_pool[1], pool[1], rtol=0, atol=0)
+    torch.testing.assert_close(store_pool[5], pool[5], rtol=0, atol=0)
+    # Shared t >= 1 slots (store_indices[:, t] == state_indices[:, t]) receive identical writes.
+    torch.testing.assert_close(store_pool[2:4], reference_pool[2:4], rtol=0, atol=0)
+    torch.testing.assert_close(store_pool[6:9], reference_pool[6:9], rtol=0, atol=0)
+    # Bucket padding (request 0, query length 3) writes nothing to the shared row 4.
+    torch.testing.assert_close(store_pool[4], pool[4], rtol=0, atol=0)
+    torch.testing.assert_close(reference_pool[4], pool[4], rtol=0, atol=0)
+
+    # The load lattice is authoritative: corrupting its accepted slots changes the output.
+    load_pool = pool.clone()
+    load_pool[3].zero_()
+    load_pool[5].zero_()
+    corrupted, _ = gated_delta_rule_mtp_packed(packed, log_decay, beta, load_pool, state_indices, accepted,
+                                               query_lengths, store_indices=store_indices)
+    assert not torch.allclose(corrupted, reference)
+
+
+def test_packed_mtp_public_native_route_refuses_store_indices():
+    inputs = _qwen38_mtp_native_inputs(batch=2)
+    native = mock.Mock()
+    store = torch.zeros(2, 8, dtype=torch.int32)
+    set_backend_policy("public")
+
+    with (
+            mock.patch("flashinfer_gaudi.gdn_decode._device_is_hpu", return_value=True),
+            mock.patch("flashinfer_gaudi.gdn_decode.public_mtp_gdn_op", return_value=native),
+            pytest.raises(ValueError, match="store_indices is not supported"),
+    ):
+        gated_delta_rule_mtp_packed(*inputs, store_indices=store)
+
+    native.assert_not_called()
+
+
+def test_packed_mtp_prepared_route_refuses_store_indices():
+    inputs = _qwen38_mtp_native_inputs()
+    prepared = mock.Mock()
+    store = torch.zeros(1, 8, dtype=torch.int32)
+
+    with (
+            mock.patch("flashinfer_gaudi.gdn_decode.get_backend_policy", return_value="auto"),
+            mock.patch("flashinfer_gaudi.gdn_decode.mtp_prepared_enabled", return_value=True),
+            mock.patch("flashinfer_gaudi.gdn_decode._device_is_hpu", return_value=True),
+            mock.patch("torch.compiler.is_compiling", return_value=True),
+            mock.patch("flashinfer_gaudi.gdn_decode.public_mtp_gdn_auto_promoted", return_value=False),
+            mock.patch("flashinfer_gaudi.gdn_decode._gated_delta_rule_mtp_prepared", prepared),
+            pytest.raises(ValueError, match="store_indices is not supported"),
+    ):
+        gated_delta_rule_mtp_packed(*inputs, assume_full_query=True, store_indices=store)
+
+    prepared.assert_not_called()
+
+
+def test_packed_mtp_store_indices_rejects_bad_shape():
+    inputs = _qwen38_mtp_native_inputs()
+    with pytest.raises(ValueError, match=r"store_indices must have shape \[1,8\]"):
+        gated_delta_rule_mtp_packed(*inputs, store_indices=torch.zeros(1, 7, dtype=torch.int32))
+
+
 @pytest.mark.parametrize("batch", [1, 2])
 @pytest.mark.parametrize("use_qk_l2norm", [False, True])
 @pytest.mark.parametrize("scale", [None, 0.25])
@@ -1030,22 +1121,76 @@ def test_auto_policy_uses_reference_on_cpu():
     assert output.shape == (1, 4, 8)
 
 
-def test_native_loader_adds_kernel_database_file_to_gc_path(tmp_path, monkeypatch):
+def _fake_flashinfer_package_with_kernel_db(tmp_path, monkeypatch):
     package_dir = tmp_path / "flashinfer_gaudi"
     library_dir = package_dir / "lib"
     library_dir.mkdir(parents=True)
     kernel_database = library_dir / "libflashinfer_gaudi_kernels.so"
     kernel_database.touch()
-
     monkeypatch.setattr(_native, "__file__", str(package_dir / "_native.py"))
     monkeypatch.delenv("GC_KERNEL_PATH", raising=False)
-    _native._configure_kernel_database_path()
+    _native._reset_native_state_for_tests()
+    return package_dir, library_dir, kernel_database
+
+
+def test_native_loader_adds_kernel_database_file_to_gc_path(tmp_path, monkeypatch):
+    _, _, kernel_database = _fake_flashinfer_package_with_kernel_db(tmp_path, monkeypatch)
+    monkeypatch.delenv("PT_HPU_RECIPE_CACHE_CONFIG", raising=False)
+
+    assert _native._configure_kernel_database_path() is _native.KernelDbState.REGISTERED
 
     configured = os.environ["GC_KERNEL_PATH"].split(os.pathsep)
     assert configured[0] == str(kernel_database)
     system_kernel_database = Path("/usr/lib/habanalabs/libtpc_kernels.so")
     if system_kernel_database.is_file():
         assert configured[-1] == str(system_kernel_database)
+
+
+def test_native_loader_skips_the_kernel_database_next_to_a_recipe_cache(tmp_path, monkeypatch):
+    _fake_flashinfer_package_with_kernel_db(tmp_path, monkeypatch)
+    monkeypatch.setenv("PT_HPU_RECIPE_CACHE_CONFIG", "/tmp/rc,false,1024")
+
+    assert _native._configure_kernel_database_path() is _native.KernelDbState.BLOCKED
+    assert "GC_KERNEL_PATH" not in os.environ
+    (error, ) = _native._LOAD_ERRORS
+    assert "libflashinfer_gaudi_kernels.so" in error
+
+    assert _native._configure_kernel_database_path() is _native.KernelDbState.BLOCKED
+    assert len(_native._LOAD_ERRORS) == 1
+    assert "GC_KERNEL_PATH" not in os.environ
+
+
+def test_native_loader_loads_no_extension_next_to_a_recipe_cache(tmp_path, monkeypatch):
+    _, library_dir, _ = _fake_flashinfer_package_with_kernel_db(tmp_path, monkeypatch)
+    (library_dir / "flashinfer_gaudi_ops.so").touch()
+    monkeypatch.setenv("PT_HPU_RECIPE_CACHE_CONFIG", "/tmp/rc,false,1024")
+    calls: list[str] = []
+    monkeypatch.setattr(torch.ops, "load_library", lambda path: calls.append(path))
+    _native._LOAD_ATTEMPTED = False
+
+    assert _native.load_native_extensions() == ()
+    assert calls == []
+    assert _native.silu_and_mul_op() is None
+
+
+def test_native_loader_uses_the_combined_database_next_to_a_recipe_cache(tmp_path, monkeypatch):
+    _, library_dir, _ = _fake_flashinfer_package_with_kernel_db(tmp_path, monkeypatch)
+    combined = library_dir / _native.COMBINED_KERNEL_DB
+    combined.touch()
+    monkeypatch.delenv("FLASHINFER_GAUDI_COMBINED_KERNEL_DB", raising=False)
+    monkeypatch.setenv("PT_HPU_RECIPE_CACHE_CONFIG", "/tmp/rc,false,1024")
+
+    assert _native._configure_kernel_database_path() is _native.KernelDbState.COMBINED
+    assert os.environ["GC_KERNEL_PATH"] == str(combined)
+    assert _native._LOAD_ERRORS == []
+
+    (library_dir / "flashinfer_gaudi_ops.so").touch()
+    calls: list[str] = []
+    monkeypatch.setattr(torch.ops, "load_library", lambda path: calls.append(path))
+    _native._LOAD_ATTEMPTED = False
+
+    _native.load_native_extensions()
+    assert calls == [str(library_dir / "flashinfer_gaudi_ops.so")]
 
 
 def test_recurrent_state_is_continuous_across_many_steps():

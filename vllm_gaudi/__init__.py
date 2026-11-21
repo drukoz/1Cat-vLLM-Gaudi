@@ -48,8 +48,44 @@ def _uses_lmcache_connector() -> bool:
     return False
 
 
+_LAZY_ACC_PAR_ENV = "PT_HPU_LAZY_ACC_PAR_MODE"  # flashinfer_gaudi._native.LAZY_ACC_PAR_ENV
+_FUSED_CUSTOM_OP_FLAGS = ("VLLM_HPU_HC_FUSED", "VLLM_HPU_MOE_GLUE")  # both load the hc_fused_ops extension
+_QSA_FUSED_FLAG = "VLLM_HPU_QSA_FUSED"  # 2 and 3 load the qsa_fused_ops extension (0 and 1 are torch only)
+
+
+def _default_serial_lazy_accumulation(environ=None) -> str | None:
+    """With the fused hyper-connection, MoE glue or QSA kernels requested, default PT_HPU_LAZY_ACC_PAR_MODE to 0.
+
+    A custom HPU op is not safe next to the lazy bridge's accumulation thread
+    (``flashinfer_gaudi._native.lazy_accumulation_reason``), and the bridge may read the variable as soon as
+    it is imported. So this runs first in ``register``, before the platform module imports the bridge, in the
+    process that starts the workers; they inherit the value. Returns "0" when it set the variable and None
+    when it did nothing: no kernel flag asks for a custom op (``VLLM_HPU_HC_FUSED`` or ``VLLM_HPU_MOE_GLUE``
+    exactly 1, ``VLLM_HPU_QSA_FUSED`` 2 or 3), the process is eager (``PT_HPU_LAZY_MODE=0``), or the
+    variable is already set. A value the user set is never replaced; a lazy process that keeps the thread on
+    gets no fused kernels from the loader.
+    """
+    environ = os.environ if environ is None else environ
+    requested = False
+    for flag in _FUSED_CUSTOM_OP_FLAGS:
+        try:
+            requested = requested or int(environ.get(flag, "0")) == 1
+        except ValueError:
+            pass
+    try:
+        requested = requested or int(environ.get(_QSA_FUSED_FLAG, "0")) in (2, 3)
+    except ValueError:
+        pass
+    if not requested or environ.get("PT_HPU_LAZY_MODE", "1").strip() == "0" or _LAZY_ACC_PAR_ENV in environ:
+        return None
+    environ[_LAZY_ACC_PAR_ENV] = "0"
+    return "0"
+
+
 def register():
     """Register the HPU platform."""
+    # Before the platform module imports the Habana bridge.
+    _default_serial_lazy_accumulation()
     # Import lazily so that `import vllm_gaudi` (performed by vLLM's plugin
     # loader to obtain this `register` callable) does not pull in
     # `vllm_gaudi.platform` -> `vllm` at package-import time. Importing `vllm`
@@ -96,11 +132,194 @@ def register_utils():
     _hpu_patches.patch_hf3fs_mock_client()
 
 
+def _hpu_visible() -> bool:
+    """True when ``habana_frameworks.torch`` imports and torch sees a Gaudi device."""
+    try:
+        import habana_frameworks.torch  # noqa: F401
+        import torch
+
+        return bool(hasattr(torch, "hpu") and torch.hpu.is_available())
+    except Exception:
+        return False
+
+
+def _warn_gdn_core_decode_without_kernel(mode: int, loaded: bool, on_hpu: bool, errors, warn=None) -> str | None:
+    """Warn once at plugin start when a nonzero VLLM_HPU_GDN_CORE_DECODE runs without an HPU kernel.
+
+    Returns the logged message, or ``None`` when nothing was logged: mode 0, the extension loaded, or no HPU
+    (the ops' CPU kernels need no extension). ``warn`` defaults to the vLLM logger's ``warning``.
+    """
+    if not mode or loaded or not on_hpu:
+        return None
+    reason = "; ".join(errors) if errors else "no error recorded"
+    message = (f"GDN core decode (VLLM_HPU_GDN_CORE_DECODE={int(mode)}) has no HPU kernel: the gdn_fused_ops "
+               f"extension did not load ({reason}); every GDN layer runs the torch decode path. Build it with "
+               "tools/build_flashinfer_gaudi.py --gdn-fused-only, or set VLLM_HPU_GDN_CORE_DECODE=0.")
+    if warn is None:
+        from vllm.logger import init_logger
+
+        warn = init_logger(__name__).warning
+    warn(message)
+    return message
+
+
+def _warn_gdn_core_verify_without_kernel(verify_mode: int, decode_mode: int, loaded: bool, on_hpu: bool, errors,
+                                         warn=None) -> str | None:
+    """Warn once at plugin start when a nonzero VLLM_HPU_GDN_CORE_VERIFY runs without an HPU kernel.
+
+    Returns the logged message, or ``None`` when nothing was logged: verify off, decode nonzero (its warning
+    already reported the missing extension), the extension loaded, or no HPU (the ops' CPU kernels need no
+    extension). ``warn`` defaults to the vLLM logger's ``warning``.
+    """
+    if not verify_mode or decode_mode or loaded or not on_hpu:
+        return None
+    reason = "; ".join(errors) if errors else "no error recorded"
+    message = (f"GDN core verify (VLLM_HPU_GDN_CORE_VERIFY={int(verify_mode)}) has no HPU kernel: the gdn_fused_ops "
+               f"extension did not load ({reason}); every GDN verification step runs the torch path. Build it with "
+               "tools/build_flashinfer_gaudi.py --gdn-fused-only, or set VLLM_HPU_GDN_CORE_VERIFY=0.")
+    if warn is None:
+        from vllm.logger import init_logger
+
+        warn = init_logger(__name__).warning
+    warn(message)
+    return message
+
+
+def _warn_hc_fused_without_kernel(flag: int, loaded: bool, on_hpu: bool, errors, warn=None) -> str | None:
+    """Warn once at plugin start when VLLM_HPU_HC_FUSED=1 runs without an HPU kernel.
+
+    Returns the logged message, or ``None`` when nothing was logged: the flag is off, the extension loaded,
+    or no HPU. ``warn`` defaults to the vLLM logger's ``warning``.
+    """
+    if not flag or loaded or not on_hpu:
+        return None
+    reason = "; ".join(errors) if errors else "no error recorded"
+    message = (f"HC fused (VLLM_HPU_HC_FUSED={int(flag)}) has no HPU kernel: the hc_fused_ops extension did not "
+               f"load ({reason}); every hyper-connection runs the torch path. Build it with "
+               "tools/build_flashinfer_gaudi.py --hc-fused-only, or set VLLM_HPU_HC_FUSED=0.")
+    if warn is None:
+        from vllm.logger import init_logger
+
+        warn = init_logger(__name__).warning
+    warn(message)
+    return message
+
+
+def _load_hc_fused_if_requested(flag: int, warn=None) -> bool | None:
+    """With VLLM_HPU_HC_FUSED=1, load the fused hyper-connection kernels and warn once when they are not usable.
+
+    Returns the loader's result, or ``None`` when the flag is not 1: then nothing is imported, loaded or logged.
+    It must run before warmup, because the loader registers libhc_fused_gaudi2.so in GC_KERNEL_PATH and
+    SynapseAI reads that variable when its graph compiler starts. The loader never raises.
+    """
+    if flag != 1:
+        return None
+    from flashinfer_gaudi._native import hc_fused_extension_errors, load_hc_fused_extension
+
+    loaded = load_hc_fused_extension()
+    _warn_hc_fused_without_kernel(flag, loaded, _hpu_visible(), hc_fused_extension_errors(), warn=warn)
+    return loaded
+
+
+def _warn_moe_glue_without_kernel(flag: int, loaded: bool, on_hpu: bool, errors, warn=None) -> str | None:
+    """Warn once at plugin start when VLLM_HPU_MOE_GLUE=1 runs without an HPU kernel.
+
+    Returns the logged message, or ``None`` when nothing was logged: the flag is off, the kernels loaded,
+    or no HPU. ``warn`` defaults to the vLLM logger's ``warning``.
+    """
+    if not flag or loaded or not on_hpu:
+        return None
+    reason = "; ".join(errors) if errors else "no error recorded"
+    message = (f"MoE glue (VLLM_HPU_MOE_GLUE={int(flag)}) has no HPU kernel: the kernels of the hc_fused_ops "
+               f"extension are not usable ({reason}); every MoE block runs the torch path. Build them with "
+               "tools/build_flashinfer_gaudi.py --hc-fused-only, or set VLLM_HPU_MOE_GLUE=0.")
+    if warn is None:
+        from vllm.logger import init_logger
+
+        warn = init_logger(__name__).warning
+    warn(message)
+    return message
+
+
+def _load_moe_glue_if_requested(flag: int, warn=None) -> bool | None:
+    """With VLLM_HPU_MOE_GLUE=1, load the fused MoE glue kernels and warn once when they are not usable.
+
+    Returns the loader's result, or ``None`` when the flag is not 1: then nothing is imported, loaded or logged.
+    The kernels are in the hyper-connection kernel library, so this must run before warmup for the same reason
+    as that loader (GC_KERNEL_PATH is read when the graph compiler starts). The loader never raises.
+    """
+    if flag != 1:
+        return None
+    from flashinfer_gaudi._native import load_moe_glue_extension, moe_glue_extension_errors
+
+    loaded = load_moe_glue_extension()
+    _warn_moe_glue_without_kernel(flag, loaded, _hpu_visible(), moe_glue_extension_errors(), warn=warn)
+    return loaded
+
+
+def _load_qsa_fused_if_requested(flag: int, warn=None) -> bool | None:
+    """With VLLM_HPU_QSA_FUSED=2 or 3, load the fused QSA decode kernels and warn once when they are not usable.
+
+    Returns the loader's result, or ``None`` when the flag is not 2 or 3: then nothing is imported, loaded or logged.
+    Before warmup, for the reason of the hyper-connection loader (GC_KERNEL_PATH). The loader never raises; the
+    QSA layers then run the mode-1 torch data flow (qsa_fused_path).
+    """
+    if flag not in (2, 3):
+        return None
+    from flashinfer_gaudi._native import load_qsa_fused_extension, qsa_fused_extension_errors
+
+    loaded = load_qsa_fused_extension()
+    if not loaded and _hpu_visible():
+        reason = "; ".join(qsa_fused_extension_errors()) or "no error recorded"
+        # Not "has no HPU kernel": the rental's GDN fallback scan (gates.GDN_FALLBACK_RE) counts those lines.
+        message = (f"QSA fused (VLLM_HPU_QSA_FUSED={int(flag)}): the kernels are not loaded, the qsa_fused_ops "
+                   f"extension did not load ({reason}); the QSA layers run the torch data flow of mode 1. Build "
+                   "it with tools/build_flashinfer_gaudi.py --qsa-fused-only, or set VLLM_HPU_QSA_FUSED=1.")
+        if warn is None:
+            from vllm.logger import init_logger
+
+            warn = init_logger(__name__).warning
+        warn(message)
+    return loaded
+
+
 def register_ops():
     """Register custom PluggableLayers for the HPU platform"""
     from flashinfer_gaudi import load_native_extensions
 
     load_native_extensions()
+    from flashinfer_gaudi._native import KernelDbState, flashinfer_kernel_database_state, kernel_database_blocked_reason
+
+    if flashinfer_kernel_database_state() is KernelDbState.BLOCKED:
+        from vllm.logger import init_logger
+
+        init_logger(__name__).warning(kernel_database_blocked_reason("libflashinfer_gaudi_kernels.so"))
+    from vllm_gaudi import envs as _gaudi_envs
+
+    decode_mode = _gaudi_envs.VLLM_HPU_GDN_CORE_DECODE
+    verify_mode = _gaudi_envs.VLLM_HPU_GDN_CORE_VERIFY
+    if decode_mode or verify_mode:
+        # Before warmup: the loader prepends libgdn_fused_gaudi2.so to GC_KERNEL_PATH.
+        from flashinfer_gaudi._native import gdn_fused_extension_errors, load_gdn_fused_extension
+
+        loaded = load_gdn_fused_extension()
+        on_hpu = _hpu_visible()
+        errors = gdn_fused_extension_errors()
+        _warn_gdn_core_decode_without_kernel(decode_mode, loaded, on_hpu, errors)
+        _warn_gdn_core_verify_without_kernel(verify_mode, decode_mode, loaded, on_hpu, errors)
+    # The fused hyper-connection kernels, only with VLLM_HPU_HC_FUSED=1 (default 0: nothing happens here).
+    _load_hc_fused_if_requested(_gaudi_envs.VLLM_HPU_HC_FUSED)
+    # The fused MoE glue kernels, only with VLLM_HPU_MOE_GLUE=1 (default 0: nothing happens here).
+    _load_moe_glue_if_requested(_gaudi_envs.VLLM_HPU_MOE_GLUE)
+    # The fused QSA decode kernels, only with VLLM_HPU_QSA_FUSED=2 or 3 (default 0: nothing happens here).
+    _load_qsa_fused_if_requested(_gaudi_envs.VLLM_HPU_QSA_FUSED)
+    # One line per process with what the loader decided (state, GC_KERNEL_PATH, combined database, errors):
+    # the server log then shows which kernel database every worker really runs.
+    from flashinfer_gaudi._native import kernel_database_status
+    from vllm.logger import init_logger
+
+    init_logger(__name__).info("FlashInfer-Gaudi kernel database: %s",
+                               json.dumps(kernel_database_status(), sort_keys=True))
     import vllm_gaudi.attention.oot_mla  # noqa: F401
     """Register custom ops for the HPU platform."""
     import vllm_gaudi.v1.sample.hpu_rejection_sampler  # noqa: F401

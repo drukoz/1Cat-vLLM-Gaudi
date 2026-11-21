@@ -47,9 +47,10 @@ class CacheSwapUtils(torch.nn.Module):
 
 
 class OnlineDefragmenter:
-    """ Keeps track of assigned block_ids and remaps them if necessary """
+    """ Keeps track of assigned block_ids and remaps them if necessary.
+    A model with recurrent-state (Mamba/GDN/short-conv) caches gets a disabled defragmenter."""
 
-    def __init__(self, kv_caches: tuple[tuple[torch.tensor, torch.tensor]], block_size: int):
+    def __init__(self, kv_caches: tuple[tuple[torch.Tensor, ...], ...], block_size: int, recurrent: bool = False):
         config = get_config()
         self.threshold = with_default(config.VLLM_DEFRAG_THRESHOLD, 32)
         self.to_swap_pad_thresholds = [8, 16, 32, 64, 128, 256, 512]
@@ -57,11 +58,16 @@ class OnlineDefragmenter:
         self.req_blocks = {}
         self.fwd_mapping_table = []
         self.bwd_mapping_table = []
-        self.enabled = config.defrag
+        self.enabled = config.defrag and not recurrent
+        if config.defrag and recurrent:
+            logger.info(
+                "Defragmenter disabled: the model has recurrent-state (Mamba/GDN/short-conv) caches, "
+                "whose rows are state slots, not KV blocks")
         self.graphed = with_default(config.VLLM_DEFRAG_WITH_GRAPHS, config.bridge_mode == 'eager')
         self.debug = init_debug_logger('defrag')
         self.kv_caches = tuple(kv_caches)
-        self.is_mla = all([cache[1] is None for cache in self.kv_caches])
+        # A single-state cache (the Flash-Next PLE short-conv group) is a one-element tuple, not an MLA cache.
+        self.is_mla = all([len(cache) > 1 and cache[1] is None for cache in self.kv_caches])
         self.block_size = block_size
         self.cache_utils = CacheSwapUtils(block_size, kv_caches[0][0].device)
         if self.graphed:

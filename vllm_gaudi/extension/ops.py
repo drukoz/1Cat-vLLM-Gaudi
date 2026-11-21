@@ -767,6 +767,11 @@ class VllmMixtureOfExpertsOpBase(torch.nn.Module):
                 if tokens_num <= threshold:
                     chunk_size = self.chunk_size_list[idx]
                     break
+            # A chunk size of 0 (or less) in VLLM_MOE_CHUNK means the op's own default for that token range (no
+            # chunk_size and total_experts arguments), e.g. VLLM_MOE_CHUNK=0,64,8192 with
+            # VLLM_MOE_TOKEN_BOUNDARY=16,512,1000000: chunk_size 64 only for steps of 17 to 512 tokens.
+            if chunk_size <= 0:
+                return {}
             kwargs = {
                 "chunk_size": chunk_size,
                 "total_experts": self.global_num_experts,
@@ -1279,6 +1284,7 @@ def fp8_block_moe_prepare_weights(layer, force_channel_fp8=False):
         layer.moe_op.w2_list[index].set_weight(layer.w2_weight[index])
         layer.moe_op.w2_list[index].set_scale_inv_fp8(layer.w2_weight_scale_inv[index])
         layer.moe_op.w2_list[index].set_weight_block_size(layer.quant_config.weight_block_size)
+    _set_moe_dense_weights(layer)
     htorch.core.mark_step()
     return layer
 
@@ -1326,6 +1332,7 @@ def fp8_channel_moe_prepare_weights(layer):
     if hasattr(layer, "w2_input_scale"):
         layer.moe_op.w2_input_scale = layer.w2_input_scale
 
+    _set_moe_dense_weights(layer)
     htorch.core.mark_step()
     return layer
 
@@ -1458,6 +1465,62 @@ class VllmMixtureOfExpertsOpFP8(VllmMixtureOfExpertsOpBase):
         return final_hidden_states
 
 
+def moe_dense_fp8(x, topk_ids, topk_weights, w13, w2, s13, s2, experts_min):
+    """VLLM_HPU_MOE_DENSE=1: the routed experts of one step as two batched FP8 GEMMs over all local experts.
+
+    Every local expert runs on every row; the routing weight of a (row, expert) pair that is not routed is 0, so
+    the sum over the experts is the vendor op's ``sum over the routed local experts of weight * down(silu(gate) *
+    up)``. ``w13`` [E, 2I, H] and ``w2`` [E, H, I] are the layer's stacked FP8 experts (the per-expert weights the
+    vendor op gets are views of them), ``s13`` [E, 2I] and ``s2`` [E, H] their per-output-channel scales. The
+    activations are quantized per row with ``dynamic_quant``, as for the vendor op; each GEMM takes its row scales
+    ([E, T, 1]) and the experts' column scales ([E, 1, N]) itself and returns bf16 (job 00172 on one card, TP8
+    geometry: 275 / 374 / 1,088 us per layer at 32 / 128 / 512 rows against 486 / 1,244 / 1,625 for the vendor op,
+    1.3 to 3.6 % max difference; with the scales applied after fp32 outputs it was 308 / 512 / 1,821). The ids are
+    narrowed to int32 in the graph and consumed there (card rule 9: only a host read of such ids is wrong).
+    """
+    experts, two_i, hidden = w13.shape
+    inter = two_i // 2
+    rows = x.shape[0]
+    local = topk_ids.to(torch.int32) - int(experts_min)
+    expert_range = torch.arange(experts, dtype=torch.int32, device=x.device)
+    routed = (local.unsqueeze(-1) == expert_range).to(torch.float32)  # [T, K, E]
+    pair_weight = (routed * topk_weights.to(torch.float32).unsqueeze(-1)).sum(dim=1)  # [T, E]
+    x_fp8, x_scale = dynamic_quant(x)
+    a = x_fp8.unsqueeze(0).expand(experts, rows, hidden).contiguous()  # [E, T, H]
+    a_scale = x_scale.reshape(1, rows, 1).to(torch.float32).expand(experts, rows, 1).contiguous()
+    gate_up = torch.ops.hpu.fp8_gemm_v2(a, False, w13, True, None, torch.bfloat16, a_scale, s13.unsqueeze(1), None,
+                                        False)  # [E, T, 2I]
+    mid = (F.silu(gate_up[..., :inter].float()) * gate_up[..., inter:].float()).to(x.dtype)  # [E, T, I]
+    m_fp8, m_scale = dynamic_quant(mid.reshape(experts * rows, inter))
+    # The routing weight of each (expert, row) pair rides on the down GEMM's row scale (0 for a pair that is not
+    # routed), and the bf16 GEMM output is summed over the experts with fp32 accumulation: no [E, T, H] fp32 tensor.
+    m_scale = m_scale.reshape(experts, rows, 1).to(torch.float32) * pair_weight.t().unsqueeze(-1)
+    down = torch.ops.hpu.fp8_gemm_v2(m_fp8.reshape(experts, rows, inter), False, w2, True, None, torch.bfloat16,
+                                     m_scale, s2.unsqueeze(1), None, False)  # [E, T, H], weighted
+    return down.sum(dim=0, dtype=torch.float32).to(x.dtype)
+
+
+_MOE_DENSE_LOGGED = set()
+
+
+def _log_moe_dense_once(key, message, *args):
+    """One log line per process and event (VLLM_HPU_MOE_DENSE: kept, dropped, first use)."""
+    if key not in _MOE_DENSE_LOGGED:
+        _MOE_DENSE_LOGGED.add(key)
+        logger.warning(message, *args)
+
+
+def _set_moe_dense_weights(layer):
+    """VLLM_HPU_MOE_DENSE=1: give a per-channel FP8 MoE op the layer's stacked experts and their scales."""
+    op = getattr(layer, "moe_op", None)
+    if envs.VLLM_HPU_MOE_DENSE != 1 or not isinstance(op, VllmMixtureOfExpertsOpFP8PerChannel):
+        return
+    op._cache_weight_lists()
+    s13 = torch.stack([s.reshape(-1).to(torch.float32) for s in op._cached_w13_scale_views])
+    s2 = torch.stack([s.reshape(-1).to(torch.float32) for s in op._cached_w2_scale_views])
+    op.set_dense_weights(layer.w13_weight.data, layer.w2_weight.data, s13, s2)
+
+
 class VllmMixtureOfExpertsOpFP8PerChannel(VllmMixtureOfExpertsOpBase):
 
     def __init__(self,
@@ -1483,6 +1546,15 @@ class VllmMixtureOfExpertsOpFP8PerChannel(VllmMixtureOfExpertsOpBase):
         self._cached_w2_views = None
         self._cached_w13_scale_views = None
         self._cached_w2_scale_views = None
+        # VLLM_HPU_MOE_DENSE=1: (w13 [E, 2I, H], w2 [E, H, I], s13 [E, 2I], s2 [E, H]), set after the weights reach
+        # their device (_set_moe_dense_weights); None = the vendor op only.
+        self.dense_weights = None
+
+    def set_dense_weights(self, w13, w2, s13, s2):
+        self.dense_weights = (w13, w2, s13, s2)
+        _log_moe_dense_once("kept", "VLLM_HPU_MOE_DENSE=1: the per-channel FP8 MoE layers keep their stacked experts "
+                            "(%s, %s); steps of %d to %d tokens run the dense form", tuple(w13.shape), w13.device,
+                            envs.VLLM_HPU_MOE_DENSE_MIN_TOKENS, envs.VLLM_HPU_MOE_DENSE_MAX_TOKENS)
 
     def _cache_weight_lists(self):
         experts_range = range(self.num_experts)
@@ -1500,6 +1572,17 @@ class VllmMixtureOfExpertsOpFP8PerChannel(VllmMixtureOfExpertsOpBase):
     def _apply(self, fn):
         ret = super()._apply(fn)
         self._cache_weight_lists()
+        if self.dense_weights is not None:
+            # VLLM_HPU_MOE_DENSE: the HPU model runner calls model.to("hpu") after the weights were prepared, a no-op
+            # for tensors already there (fn returns the same tensor), so the stacked experts stay what the
+            # per-expert views point into. Clearing them here unconditionally (as 11bc2f6d and before did) dropped
+            # the dense form on every served model (jobs 00177 and 00190 ran the vendor op in both arms). A real
+            # move would copy them: then drop them and let the vendor op serve.
+            moved = tuple(fn(t) for t in self.dense_weights)
+            if not all(m is t for m, t in zip(moved, self.dense_weights)):
+                self.dense_weights = None
+                _log_moe_dense_once("dropped", "VLLM_HPU_MOE_DENSE=1: a device move after the weights were prepared; "
+                                    "the vendor MoE op serves")
         return ret
 
     def forward(
@@ -1512,6 +1595,11 @@ class VllmMixtureOfExpertsOpFP8PerChannel(VllmMixtureOfExpertsOpBase):
     ):
         tokens_num, _ = x.shape
         activation = _as_activation_str(activation)
+        if (self.dense_weights is not None and self.w13_input_scale is None and self.is_gated
+                and activation == "silu"
+                and envs.VLLM_HPU_MOE_DENSE_MIN_TOKENS <= tokens_num <= envs.VLLM_HPU_MOE_DENSE_MAX_TOKENS):
+            _log_moe_dense_once("used", "VLLM_HPU_MOE_DENSE=1: a step of %d tokens runs the dense MoE form", tokens_num)
+            return moe_dense_fp8(x, topk_ids, topk_weights, *self.dense_weights, self.experts_min)
         kwargs = self._get_extra_kwargs(tokens_num)
         # Non-gated experts tell the fused kernel to skip the gate split+multiply.
         # Added only when non-gated so gated layers pass the exact kwargs they did

@@ -68,9 +68,24 @@ Key subsystems:
 
 - **Unit tests**: `tests/unit_tests/` — test individual ops, workers, samplers
 - **Full tests**: `tests/full_tests/` — end-to-end model generation tests using model cards
-- **Run tests**: Tests require Intel Gaudi hardware (HPU). Use `pytest` to run
+- **Run tests**: Hardware tests need an Intel Gaudi (HPU); on a machine without one, use the CPU test gate below. Use `pytest` to run
 - When adding a new operator in `vllm_gaudi/ops/`, add corresponding unit tests in `tests/unit_tests/ops/`
 - When adding new model support, add model cards in `tests/models/`
+
+## Developing on this Mac without an HPU (Flash-Next program, RUK-2709)
+
+- **CPU environment**: `/Volumes/Storage/paperclip/tmp/vllm-cpu-dev/venv` (built by `spikes/mac-cpu-env/setup.sh`; vLLM pinned to commit `8f816a3f665489d7f0d222115d4f72ebab01076b`, torch 2.13.0, Python 3.12). It is shared by every task: never `pip install` into it.
+- **Import the worktree's plugin, not the venv's**: run from the worktree root with `PYTHONPATH="$PWD"` and check `python -c "import vllm_gaudi; print(vllm_gaudi.__file__)"` prints a path inside the worktree.
+- **Run a test file**: `PYTHONPATH="$PWD" /Volumes/Storage/paperclip/tmp/vllm-cpu-dev/venv/bin/python -m pytest -q -p no:cacheprovider tests/unit_tests/<file>`. The CPU regression over all unit tests is `spikes/mac-cpu-env/run_cpu_tests.sh <target-dir>` (`spikes/mac-cpu-env/cpu_tests.md` lists which files pass on CPU).
+- **HPU-only modules on CPU**: `tests/unit_tests/hpu_cpu_stubs.py` stubs `habana_frameworks` and `torch.hpu` and defaults `VLLM_PLUGINS` to empty, so `hpu_worker`, `hpu_model_runner`, `extension/defragmentation`, `ops/hpu_fused_moe`, `platform` and the NIXL connector import. A test imports it before any `vllm`/`vllm_gaudi` import (`from tests.unit_tests import hpu_cpu_stubs  # noqa: F401`); an existing HPU test file runs with `-p tests.unit_tests.hpu_cpu_stubs` (its tests that put tensors on `device="hpu"` still fail on CPU).
+- **Tensor-parallel checks on CPU**: `spikes/cpu-tp/harness.py` runs 1/2/4/8 `gloo` ranks through vLLM's parallel layers (`run_ranks`, `record_collectives`).
+- **No `timeout(1)` on macOS**: cap a command with `perl -e 'alarm N; exec @ARGV' <command>`.
+- **TPC compiler and simulator**: `tools/flash_next/tpcsim.sh <command>` (`docs/design/flash-next/tpcsim.md`).
+- **GDN decode default**: `VLLM_HPU_GDN_CORE_DECODE` defaults to `1` (FUSED), an exception to the default-off rule for new fast paths (next bullet), because the fused GDN decode kernel is the decode path (`docs/design/flash-next/gdn-core-decode.md`). On CPU, GDN decode steps therefore run the op's Python reference kernel by default; `0` selects the torch path.
+- **Program documents**: `docs/design/flash-next/` (system map, reuse ledger, plan, run sheets). New fast paths ship behind an env flag in `vllm_gaudi/envs.py`, default off; modes are integer enums.
+- **Rental harness**: lives in `tools/flash_next/rental/` (runs as `python -m tools.flash_next.rental.<module>` from the repository root).
+- **Rental harness tests**: `tests/unit_tests/tools/rental/` (run with the CPU environment above).
+- **Rental bundle**: `bash tools/flash_next/rental/make_rental_bundle.sh --out dist` builds `dist/flash-next-rental-<sha>.tar.gz` (plugin + vLLM at the pin + `run_rental.sh`); see `docs/design/flash-next/run-sheets/rental.md`.
 
 ## Environment Variables
 

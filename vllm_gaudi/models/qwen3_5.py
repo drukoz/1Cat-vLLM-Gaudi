@@ -1,7 +1,24 @@
 import os
 
 import torch
+from flashinfer_gaudi.gdn_core_decode import (
+    GdnCoreDecodeDebug,
+    GdnCoreDecodeMode,
+    GdnGateActivation,
+    check_gdn_core_decode_indices,
+    gdn_core_decode,
+    gdn_core_decode_available,
+    gdn_recurrent_decode,
+    gdn_recurrent_decode_available,
+)
+from flashinfer_gaudi.gdn_core_verify import (
+    GDN_CORE_VERIFY_MAX_NODES,
+    GdnCoreVerifyMode,
+    gdn_core_verify,
+    gdn_core_verify_available,
+)
 from flashinfer_gaudi.gdn_decode import gated_delta_rule_mtp_packed
+from vllm.logger import init_logger
 from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import QwenGatedDeltaNetAttention
 from vllm.forward_context import get_forward_context
 from vllm_gaudi import envs
@@ -53,6 +70,11 @@ if _triton_gaudi_mode in ("hybrid", "strict"):
 else:
     _triton_gdn_decode_conv_packed = None
     _triton_gdn_decode_packed = None
+
+logger = init_logger(__name__)
+
+# The one fallback reason vllm_gaudi._warn_gdn_core_decode_without_kernel already warns about at startup: debug here.
+_GDN_CORE_NO_EXTENSION = "the gdn_fused_ops extension is not loaded"
 
 
 def _try_triton_gdn_decode_conv_packed(
@@ -123,6 +145,11 @@ def _try_triton_gdn_decode_packed(
     )
 
 
+def _owned(x: torch.Tensor) -> torch.Tensor:
+    """``x`` as a contiguous tensor that is not a view: what a custom HPU op must be given."""
+    return x.clone(memory_format=torch.contiguous_format)
+
+
 def _save_ssm_state(core_attn_out, final_state, ssm_state, state_indices):
     """Persist GDN final_state into ssm_state cache for chunked prefill.
 
@@ -149,6 +176,23 @@ def _save_ssm_state(core_attn_out, final_state, ssm_state, state_indices):
 
 
 class HPUGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
+
+    @property
+    def cache_group_idx(self):
+        return self.__dict__.get("_hpu_cache_group_idx")
+
+    @cache_group_idx.setter
+    def cache_group_idx(self, value):
+        # The runner hands a device tensor made from a Python int (hpu_model_runner.py). Its value is kept as a
+        # Python int too, read here once at setup and never in a forward: the key of this layer's cache group in
+        # the per-step memo of VLLM_HPU_GDN_GLUE_CACHE=1.
+        self.__dict__["_hpu_cache_group_idx"] = value
+        key = None
+        if isinstance(value, int):
+            key = value
+        elif self.__dict__.get("gdn_glue_cache") and torch.is_tensor(value) and value.numel() == 1:
+            key = int(value.item())  # only with the flag: without it nothing reads the device here
+        self.__dict__["_hpu_cache_group_key"] = key
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -198,12 +242,17 @@ class HPUGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 compact_qk=self.gdn_compact_qk_input,
             )
 
+        # VLLM_HPU_GDN_GLUE_CACHE=1 (idea I25): the fused decode and verify ops get the transposed conv weight and
+        # dt_bias in fp32 from buffers built at load (the hooks below), their owned int32 state indices once per
+        # step and cache group (_gdn_glue_memo), and the dead zeros of the output buffer are not made.
+        self.gdn_glue_cache = envs.VLLM_HPU_GDN_GLUE_CACHE == 1
+
         # The split TPC kernels vector-load one convolution tap across channels.
         # Materialize that tap-major layout once while the checkpoint loader
         # writes the canonical [channels, 1, width] parameter.
         self._triton_conv_weight_ready = False
         self._triton_dt_bias_ready = False
-        if _triton_gaudi_mode in ("hybrid", "strict"):
+        if _triton_gaudi_mode in ("hybrid", "strict") or self.gdn_glue_cache:
             conv_weight = self.conv1d.weight
             self.register_buffer(
                 "_triton_conv_weight_t",
@@ -236,6 +285,282 @@ class HPUGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
 
             self.dt_bias.weight_loader = load_dt_bias_as_fp32
 
+        # Fused GDN core decode (track RUK-2812). GdnCoreDecodeMode(...) raises on an unknown value.
+        self.gdn_core_decode_mode = GdnCoreDecodeMode(envs.VLLM_HPU_GDN_CORE_DECODE)
+        self.gdn_core_decode_debug = GdnCoreDecodeDebug(envs.VLLM_HPU_GDN_CORE_DECODE_DEBUG)
+        self._gdn_core_gate = {"silu": GdnGateActivation.SILU, "sigmoid": GdnGateActivation.SIGMOID}.get(
+            getattr(getattr(self, "norm", None), "activation", None))
+        self._gdn_core_ok = None  # None = not checked yet; then True/False, once per layer
+
+        # Fused GDN verification (track phase 2): MTP verification steps and the plain step after one.
+        self.gdn_core_verify_mode = GdnCoreVerifyMode(envs.VLLM_HPU_GDN_CORE_VERIFY)
+        self._gdn_core_verify_ok = None  # None = not checked yet; then True/False, once per layer
+
+    def _gdn_core_decode_reason(self, conv_state: torch.Tensor, ssm_state: torch.Tensor) -> str | None:
+        """Why this layer's core-decode op (FUSED or RECURRENCE) cannot serve it, or ``None`` when it can."""
+        fused = self.gdn_core_decode_mode == GdnCoreDecodeMode.FUSED
+        if fused:
+            # RECURRENCE keeps the torch conv update and self.norm, so only FUSED needs these.
+            if self._gdn_core_gate is None:
+                return (f"output gate {getattr(getattr(self, 'norm', None), 'activation', None)!r} "
+                        "is not silu or sigmoid")
+            if self.conv1d.bias is not None:
+                return "conv1d has a bias"
+            if self.conv_kernel_size != 4:
+                return f"conv kernel size {self.conv_kernel_size} is not 4"
+        if self.head_k_dim != self.head_v_dim:
+            return f"head dims k={self.head_k_dim} v={self.head_v_dim} differ"
+        if fused and (conv_state.dim() != 3 or conv_state.shape[1] != 3):
+            return f"conv state rows {tuple(conv_state.shape)} are not [S, 3, C]"
+        if ssm_state.dtype != torch.float32:
+            return f"ssm state dtype {ssm_state.dtype} is not fp32"
+        if _triton_gaudi_mode == "strict":
+            return "Triton strict mode runs the Triton-only decode graph"
+        available = gdn_core_decode_available if fused else gdn_recurrent_decode_available
+        op_name = "gdn_core_decode" if fused else "gdn_recurrent_decode"
+        if ssm_state.device.type == "hpu":
+            if self.head_v_dim != 128:
+                return f"the HPU kernel requires head_v_dim 128, got {self.head_v_dim}"
+            if not available(ssm_state.device):
+                return _GDN_CORE_NO_EXTENSION
+        if not available(ssm_state.device):
+            return f"no {op_name} kernel for {ssm_state.device.type}"
+        return None
+
+    def _log_gdn_core_off(self, reason: str) -> None:
+        """Log once per layer why it runs the torch decode path (debug level for a missing HPU extension)."""
+        log = logger.debug if reason == _GDN_CORE_NO_EXTENSION else logger.warning
+        log("GDN core decode (VLLM_HPU_GDN_CORE_DECODE=%d) is off for %s: %s; using the torch decode path",
+            int(self.gdn_core_decode_mode), getattr(self, "prefix", type(self).__name__), reason)
+
+    def _gdn_core_decode_ready(self, load_state_indices, store_state_indices, num_tokens, num_accepted_tokens) -> bool:
+        """The per-step gate shared by FUSED and RECURRENCE; runs the precondition check once per layer."""
+        if self.gdn_core_decode_mode == GdnCoreDecodeMode.OFF:
+            return False
+        if num_accepted_tokens is not None or self._hpu_defer_ssm_writeback:
+            return False
+        if (load_state_indices is None or store_state_indices is None or load_state_indices.dim() != 1
+                or store_state_indices.dim() != 1 or load_state_indices.shape[0] != num_tokens
+                or store_state_indices.shape[0] != num_tokens):
+            return False
+        if self._gdn_core_ok is None:
+            reason = self._gdn_core_decode_reason(self.kv_cache[0], self.kv_cache[1])
+            self._gdn_core_ok = reason is None
+            if reason is not None:
+                self._log_gdn_core_off(reason)
+        return bool(self._gdn_core_ok)
+
+    def _check_gdn_core_decode_indices(self, load_state_indices, store_state_indices, query_start_loc,
+                                       num_tokens) -> None:
+        """With VLLM_HPU_GDN_CORE_DECODE_DEBUG=1, reject slot patterns the kernels cannot handle (host sync)."""
+        if self.gdn_core_decode_debug != GdnCoreDecodeDebug.CHECK:
+            return
+        # Every real decode row is one token and the runner's padding rows are zero tokens at the end,
+        # so the last query_start_loc entry is the real row count (num_decodes counts the padding too).
+        num_rows = int(query_start_loc[-1]) if query_start_loc is not None else num_tokens
+        check_gdn_core_decode_indices(load_state_indices, store_state_indices, self.kv_cache[1].shape[0], num_rows)
+
+    def _gdn_fused_constants(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """``(conv_weight_t [W, C], dt_bias fp32)`` for the fused ops.
+
+        With VLLM_HPU_GDN_GLUE_CACHE=1 and both load hooks run, the buffers they filled (no op per step);
+        otherwise the per-step copy and cast, as before."""
+        if self.gdn_glue_cache and self._triton_conv_weight_ready and self._triton_dt_bias_ready:
+            return self._triton_conv_weight_t, self._triton_dt_bias_f32
+        weight = self.conv1d.weight
+        return weight.view(weight.size(0), weight.size(2)).t().contiguous(), self.dt_bias.float()
+
+    def _gdn_glue_memo(self) -> dict | None:
+        """A dict that lives exactly as long as this forward (it hangs on the forward context), or None.
+
+        Only with VLLM_HPU_GDN_GLUE_CACHE=1. Its entries are shared by the GDN layers of one cache group:
+        each keeps the source tensor it was made from, and a layer whose source is another tensor makes
+        its own."""
+        if not self.gdn_glue_cache:
+            return None
+        try:
+            context = get_forward_context()
+        except Exception:  # noqa: BLE001 - no forward context, no memo
+            return None
+        memo = getattr(context, "_hpu_gdn_glue_memo", None)
+        if memo is None:
+            memo = {}
+            context._hpu_gdn_glue_memo = memo
+        return memo
+
+    def _gdn_memo_get(self, key, source, make):
+        """``make()`` once per forward for ``(key, this layer's cache group)`` and the same ``source`` tensor."""
+        memo = self._gdn_glue_memo()
+        if memo is None:
+            return make()
+        key = (key, self.__dict__.get("_hpu_cache_group_key"))
+        hit = memo.get(key)
+        if hit is not None and hit[0] is source:
+            return hit[1]
+        value = make()
+        memo[key] = (source, value)
+        return value
+
+    def _owned_state_indices(self, load_state_indices, store_state_indices):
+        """The owned int32 copies the fused decode op takes: one pair per step and cache group with the memo.
+
+        Two tensors even when load and store are one tensor (no prefix caching), as without the memo."""
+        load = self._gdn_memo_get("owned_load", load_state_indices,
+                                  lambda: _owned(load_state_indices.to(torch.int32)))
+        store = self._gdn_memo_get("owned_store", store_state_indices,
+                                   lambda: _owned(store_state_indices.to(torch.int32)))
+        return load, store
+
+    def _maybe_gdn_core_decode(self, mixed_qkv, z, a, b, load_state_indices, store_state_indices, num_tokens,
+                               num_accepted_tokens, query_start_loc):
+        """The fused core-decode op's ``[num_tokens, HV, D]`` fp32 output, or ``None`` for the torch path."""
+        if self.gdn_core_decode_mode != GdnCoreDecodeMode.FUSED:
+            return None
+        if not self._gdn_core_decode_ready(load_state_indices, store_state_indices, num_tokens, num_accepted_tokens):
+            return None
+        self._check_gdn_core_decode_indices(load_state_indices, store_state_indices, query_start_loc, num_tokens)
+        # The op indexes slots absolutely, so it always gets the full pools: a narrowed
+        # direct-state view would shift every index. The indices are absolute pool slots
+        # in every runner mode (compact pools pad with -1, which the op treats as padding).
+        conv_pool, ssm_pool = self.kv_cache[0], self.kv_cache[1]
+        # The per-step inputs are slices of the projections (split / chunk). contiguous() copies them
+        # only when the slice is not contiguous, and a slice of ONE row always is: at decode batch 1 the
+        # op got views, and the Habana lazy bridge cannot hand a view to a custom op ("ValidateSyncInput
+        # Tensors tensor_data is empty ... Strided Params Has Value: 1", first server run of the kernel,
+        # 2026-11-20). owned() always makes a tensor of its own.
+        if not self.gdn_glue_cache:
+            weight = self.conv1d.weight
+            conv_weight_t = weight.view(weight.size(0), weight.size(2)).t().contiguous()
+            return gdn_core_decode(conv_pool, ssm_pool, _owned(mixed_qkv),
+                                   _owned(z.reshape(num_tokens, -1)), _owned(a), _owned(b),
+                                   self.A_log.float(), self.dt_bias.float(), conv_weight_t, self.norm.weight,
+                                   _owned(load_state_indices.to(torch.int32)),
+                                   _owned(store_state_indices.to(torch.int32)),
+                                   self.head_k_dim**-0.5, self.norm.eps, int(self._gdn_core_gate))
+        # VLLM_HPU_GDN_GLUE_CACHE=1: the same tensors, the constants from load and the indices once per group.
+        conv_weight_t, dt_bias_f32 = self._gdn_fused_constants()
+        owned_load, owned_store = self._owned_state_indices(load_state_indices, store_state_indices)
+        return gdn_core_decode(conv_pool, ssm_pool, _owned(mixed_qkv),
+                               _owned(z.reshape(num_tokens, -1)), _owned(a), _owned(b),
+                               self.A_log.float(), dt_bias_f32, conv_weight_t, self.norm.weight,
+                               owned_load, owned_store,
+                               self.head_k_dim**-0.5, self.norm.eps, int(self._gdn_core_gate))
+
+    def _use_gdn_recurrent_decode(self, load_state_indices, store_state_indices, num_tokens,
+                                  num_accepted_tokens) -> bool:
+        """True when this decode step's recurrence runs through gdn_recurrent_decode (mode RECURRENCE)."""
+        if self.gdn_core_decode_mode != GdnCoreDecodeMode.RECURRENCE:
+            return False
+        return self._gdn_core_decode_ready(load_state_indices, store_state_indices, num_tokens, num_accepted_tokens)
+
+    def _gdn_core_verify_reason(self, conv_state: torch.Tensor, ssm_state: torch.Tensor) -> str | None:
+        """Why this layer's fused verification op cannot serve it, or ``None`` when it can."""
+        if self._gdn_core_gate is None:
+            return (f"output gate {getattr(getattr(self, 'norm', None), 'activation', None)!r} "
+                    "is not silu or sigmoid")
+        if self.conv1d.bias is not None:
+            return "conv1d has a bias"
+        if self.conv_kernel_size != 4:
+            return f"conv kernel size {self.conv_kernel_size} is not 4"
+        if self.head_k_dim != self.head_v_dim:
+            return f"head dims k={self.head_k_dim} v={self.head_v_dim} differ"
+        if conv_state.dim() != 3 or conv_state.shape[1] < 3:
+            return f"conv state rows {tuple(conv_state.shape)} are not [S, R >= 3, C]"
+        if ssm_state.dtype != torch.float32:
+            return f"ssm state dtype {ssm_state.dtype} is not fp32"
+        if _triton_gaudi_mode == "strict":
+            return "Triton strict mode runs the Triton-only decode graph"
+        if self.dflash_conv_round_before_activation:
+            return "VLLM_HPU_DFLASH2_CONV_ROUND_BEFORE_ACTIVATION rounds the conv output before SiLU"
+        if ssm_state.device.type == "hpu":
+            if self.head_v_dim != 128:
+                return f"the HPU kernel requires head_v_dim 128, got {self.head_v_dim}"
+            if not gdn_core_verify_available(ssm_state.device):
+                return _GDN_CORE_NO_EXTENSION
+        if not gdn_core_verify_available(ssm_state.device):
+            return f"no gdn_core_verify kernel for {ssm_state.device.type}"
+        return None
+
+    def _log_gdn_core_verify_off(self, reason: str) -> None:
+        """Log once per layer why it runs the torch verification path (debug level for a missing HPU extension)."""
+        log = logger.debug if reason == _GDN_CORE_NO_EXTENSION else logger.warning
+        log("GDN core verify (VLLM_HPU_GDN_CORE_VERIFY=%d) is off for %s: %s; using the torch verification path",
+            int(self.gdn_core_verify_mode), getattr(self, "prefix", type(self).__name__), reason)
+
+    def _maybe_gdn_core_verify(self, mixed_qkv, z, a, b, load_state_indices, store_state_indices, num_tokens,
+                               num_accepted_tokens, query_start_loc, lattice_store_differs, direct_gdn_state):
+        """The fused verification op's ``[num_tokens, HV, D]`` fp32 output, or ``None`` for the torch path."""
+        if self.gdn_core_verify_mode != GdnCoreVerifyMode.FUSED:
+            return None
+        load, store, qsl = load_state_indices, store_state_indices, query_start_loc
+        if num_accepted_tokens is None or load is None or qsl is None or self._hpu_defer_ssm_writeback:
+            return None
+        conv_pool, ssm_pool = self.kv_cache[0], self.kv_cache[1]
+        B = qsl.numel() - 1
+        R = conv_pool.shape[1] if conv_pool.dim() == 3 else 0
+        if load.dim() == 2:  # verification step: the [B, T] lattice
+            T = load.shape[1]
+            if load.shape[0] != B or num_tokens != B * T or (store is not None and store.shape != load.shape):
+                return None
+        elif load.dim() == 1:  # the plain step after a verification
+            T = 1
+            if (direct_gdn_state or load.shape[0] != B or num_tokens != B
+                    or (store is not None and store.shape != load.shape)):
+                return None  # direct state takes a narrowed conv view in mode 0, which the op does not reproduce
+        else:
+            return None
+        if not (1 <= T <= GDN_CORE_VERIFY_MAX_NODES and T + 2 <= R):
+            return None
+        if self._gdn_core_verify_ok is None:
+            reason = self._gdn_core_verify_reason(conv_pool, ssm_pool)
+            self._gdn_core_verify_ok = reason is None
+            if reason is not None:
+                self._log_gdn_core_verify_off(reason)
+        if not self._gdn_core_verify_ok:
+            return None
+        if not self.gdn_glue_cache:
+            row_indices, ssm_store = self._gdn_core_verify_rows(load, store, num_accepted_tokens, qsl, B, T, R,
+                                                                lattice_store_differs)
+            weight = self.conv1d.weight
+            conv_weight_t = weight.view(weight.size(0), weight.size(2)).t().contiguous()
+            # _owned, not contiguous(): a custom HPU op cannot be given a view (see _maybe_gdn_core_decode).
+            return gdn_core_verify(conv_pool, ssm_pool, _owned(mixed_qkv), _owned(z.reshape(num_tokens, -1)),
+                                   _owned(a), _owned(b), self.A_log.float(), self.dt_bias.float(), conv_weight_t,
+                                   self.norm.weight, _owned(row_indices), _owned(ssm_store.to(torch.int32)),
+                                   self.head_k_dim**-0.5, self.norm.eps, int(self._gdn_core_gate))
+        # VLLM_HPU_GDN_GLUE_CACHE=1: the constants from load, the owned row metadata once per group and step.
+        conv_weight_t, dt_bias_f32 = self._gdn_fused_constants()
+
+        def owned_rows():
+            rows, lattice = self._gdn_core_verify_rows(load, store, num_accepted_tokens, qsl, B, T, R,
+                                                       lattice_store_differs)
+            return _owned(rows), _owned(lattice.to(torch.int32))
+
+        row_indices, ssm_store = self._gdn_memo_get(("verify_rows", T, B, R, bool(lattice_store_differs)), load,
+                                                    owned_rows)
+        return gdn_core_verify(conv_pool, ssm_pool, _owned(mixed_qkv), _owned(z.reshape(num_tokens, -1)),
+                               _owned(a), _owned(b), self.A_log.float(), dt_bias_f32, conv_weight_t,
+                               self.norm.weight, row_indices, ssm_store,
+                               self.head_k_dim**-0.5, self.norm.eps, int(self._gdn_core_gate))
+
+    def _gdn_core_verify_rows(self, load, store, num_accepted_tokens, qsl, B, T, R, lattice_store_differs):
+        """The verify op's ``(row_indices [B, 5] int32, the SSM store lattice)``: the same for every layer of a group."""
+        acc = num_accepted_tokens[:B].long()
+        query_len = (qsl[1:B + 1] - qsl[:B]).long().clamp(0, T)
+        conv_offset = acc.clamp(1, R - 2) - 1           # the conv path's clamp
+        if load.dim() == 2:
+            store_lattice = store if (lattice_store_differs and store is not None) else load
+            conv_load, conv_store = load[:, 0], store_lattice[:, 0]
+            ssm_load = load.gather(1, (acc.clamp(1, T) - 1).unsqueeze(1)).squeeze(1)   # the SSM path's clamp
+            ssm_store = store_lattice
+        else:
+            base = store if store is not None else load     # conv reads and writes the base row
+            conv_load, conv_store, ssm_load = base, base, load
+            ssm_store = base.unsqueeze(1)
+        row_indices = torch.stack([conv_load.long(), conv_offset, conv_store.long(), ssm_load.long(), query_len],
+                                  dim=1).to(torch.int32).contiguous()
+        return row_indices, ssm_store
+
     def rearrange_mixed_qkv(self, mixed_qkv):
         """Pure-torch rearrange – avoids einops graph breaks on HPU."""
         if mixed_qkv is None:
@@ -255,12 +580,14 @@ class HPUGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         return query, key, value
 
     def _resolve_state_indices(self, attn_metadata, attribute):
-        """Resolve one state-index tensor, handling 2-D cache groups."""
+        """Resolve one state-index tensor, handling 2-D cache groups (once per step and group with the memo)."""
         indices = getattr(attn_metadata, attribute, None)
         if indices is not None and indices.dim() > 1:
             cg = self.cache_group_idx
             assert cg is not None
-            indices = indices.index_select(0, cg.view(1)).squeeze(0)
+            source = indices
+            indices = self._gdn_memo_get(("row", attribute), source,
+                                         lambda: source.index_select(0, cg.view(1)).squeeze(0))
         return indices
 
     def prepare_decode_state_view(self, attn_metadata, num_tokens: int) -> None:
@@ -305,7 +632,8 @@ class HPUGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         forward_context = get_forward_context()
         attn_metadata = forward_context.attn_metadata
         if attn_metadata is None:
-            return (False, None, None, None, None, None, None, None, 0, 0, 0, 0, None, False, None, False, False)
+            return (False, None, None, None, None, None, None, None, 0, 0, 0, 0, None, False, None, False, False,
+                    False)
 
         is_prompt = bool(getattr(attn_metadata, "is_prompt", False))
         load_state_indices = self._resolve_state_indices(attn_metadata, "load_indices_tensor")
@@ -331,6 +659,7 @@ class HPUGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         padding_mask_flat = getattr(attn_metadata, "padding_mask_flat", None)
         direct_gdn_state = bool(getattr(attn_metadata, "direct_gdn_state", False))
         dflash_full_query = bool(getattr(attn_metadata, "dflash_full_query", False))
+        lattice_store_differs = bool(getattr(attn_metadata, "lattice_store_differs", False))
 
         if not is_prompt:
             num_decodes = (query_start_loc.numel() - 1 if query_start_loc is not None else
@@ -359,16 +688,19 @@ class HPUGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 ).long()
                 initial_state = ssm_state.index_select(0, safe_load_indices).contiguous()
             if has_initial_state is not None:
-                mask = has_initial_state.bool().view(-1, 1, 1, 1)
+                # A load index of 0 is vLLM's null block: it never holds an
+                # initial state, so reading it must yield zeros (#1895).
+                keep = has_initial_state.bool().view(-1) & (load_state_indices.reshape(-1) != 0)
                 initial_state = torch.where(
-                    mask,
+                    keep.view(-1, 1, 1, 1),
                     initial_state,
                     torch.zeros_like(initial_state),
                 )
 
         return (is_prompt, conv_state, ssm_state, load_state_indices, store_state_indices, query_start_loc,
                 has_initial_state, padding_mask_flat, num_decodes, mamba_block_size, prefill_num_seqs, prefill_seq_len,
-                initial_state, direct_gdn_state, num_accepted_tokens, dflash_full_query, state_is_active_view)
+                initial_state, direct_gdn_state, num_accepted_tokens, dflash_full_query, state_is_active_view,
+                lattice_store_differs)
 
     def forward(
         self,
@@ -392,7 +724,7 @@ class HPUGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         (is_prompt, conv_state, ssm_state, load_state_indices, store_state_indices, query_start_loc, has_initial_state,
          padding_mask_flat, num_decodes, mamba_block_size, prefill_num_seqs, prefill_seq_len, initial_state,
          direct_gdn_state, num_accepted_tokens, dflash_full_query,
-         state_is_active_view) = self._extract_metadata(num_tokens)
+         state_is_active_view, lattice_store_differs) = self._extract_metadata(num_tokens)
 
         # === Part 1: Input Projection ================================
         if hasattr(self, 'in_proj_qkv'):
@@ -424,11 +756,37 @@ class HPUGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 b = b.contiguous()
                 a = a.contiguous()
 
-        core_attn_out = torch.zeros(
-            (num_tokens, self.num_v_heads // self.tp_size, self.head_v_dim),
-            dtype=hidden_states.dtype,
-            device=hidden_states.device,
-        )
+        core_attn_out = None
+        if not self.gdn_glue_cache:
+            core_attn_out = torch.zeros(
+                (num_tokens, self.num_v_heads // self.tp_size, self.head_v_dim),
+                dtype=hidden_states.dtype,
+                device=hidden_states.device,
+            )
+
+        gdn_core_out = None
+        use_gdn_recurrent = False
+        if conv_state is not None and not is_prompt:
+            gdn_core_out = self._maybe_gdn_core_decode(mixed_qkv, z, a, b, load_state_indices, store_state_indices,
+                                                       num_tokens, num_accepted_tokens, query_start_loc)
+            if gdn_core_out is None:
+                gdn_core_out = self._maybe_gdn_core_verify(mixed_qkv, z, a, b, load_state_indices, store_state_indices,
+                                                           num_tokens, num_accepted_tokens, query_start_loc,
+                                                           lattice_store_differs, direct_gdn_state)
+            use_gdn_recurrent = self._use_gdn_recurrent_decode(load_state_indices, store_state_indices, num_tokens,
+                                                               num_accepted_tokens)
+            if use_gdn_recurrent:
+                self._check_gdn_core_decode_indices(load_state_indices, store_state_indices, query_start_loc,
+                                                    num_tokens)
+
+        if core_attn_out is None and gdn_core_out is None:
+            # VLLM_HPU_GDN_GLUE_CACHE=1: the buffer only where a path below writes into it (the fused op's
+            # output replaces it).
+            core_attn_out = torch.zeros(
+                (num_tokens, self.num_v_heads // self.tp_size, self.head_v_dim),
+                dtype=hidden_states.dtype,
+                device=hidden_states.device,
+            )
 
         if conv_state is None:
             # No attn_metadata — skip core attention (profile run)
@@ -465,10 +823,10 @@ class HPUGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                     activation=self.activation,
                     conv_states=conv_state,
                     has_initial_state=has_initial_state,
-                    cache_indices=load_state_indices,
+                    cache_indices=store_state_indices,
                     block_idx_first_scheduled_token=None,
                     block_idx_last_scheduled_token=None,
-                    initial_state_idx=None,
+                    initial_state_idx=load_state_indices,
                     query_start_loc=query_start_loc,
                     block_size_to_align=mamba_block_size,
                     num_computed_tokens=None,
@@ -562,6 +920,11 @@ class HPUGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             non_spec_out = core_attn_out_result.squeeze(0)
             core_attn_out[:non_spec_out.shape[0]] = non_spec_out
 
+        elif gdn_core_out is not None:
+            # === Part 2c: fused core decode/verify (one op: conv, gates, recurrence, gated RMSNorm; serves
+            # gdn_core_decode and gdn_core_verify) ===
+            core_attn_out = gdn_core_out.to(hidden_states.dtype)
+
         else:
             # === Part 2b: Decode =====================================
             has_dflash_state = num_accepted_tokens is not None and load_state_indices is not None
@@ -591,7 +954,8 @@ class HPUGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                                                    or load_state_indices is not store_state_indices):
                 raise RuntimeError("Triton strict GDN requires identical load/store state-index tensors")
             flashinfer_result = None
-            if _triton_gaudi_mode != "strict" and not has_dflash_state:
+            # RECURRENCE keeps the torch conv below, so it skips the fork's fused conv-and-recurrence step.
+            if _triton_gaudi_mode != "strict" and not has_dflash_state and not use_gdn_recurrent:
                 flashinfer_result = maybe_run_gdn_fused_decode_step(
                     mixed_qkv=mixed_qkv,
                     a=a,
@@ -612,9 +976,10 @@ class HPUGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                     defer_state_writeback=self._hpu_defer_ssm_writeback,
                 )
             if flashinfer_result is None:
-                if state_is_active_view:
+                if state_is_active_view and not use_gdn_recurrent:
                     raise RuntimeError("Bound active GDN state requires the fused direct decode adapter")
-                if _triton_gaudi_mode != "strict":
+                if _triton_gaudi_mode != "strict" and not use_gdn_recurrent:
+                    # gdn_recurrent_decode computes the gates itself from a, b, A_log and dt_bias.
                     g, beta = hpu_fused_gdn_gating(self.A_log, a, b, self.dt_bias)
                 conv_indices = load_state_indices
                 if is_spec_decode:
@@ -644,8 +1009,23 @@ class HPUGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                     full_query_valid_state=(self.dflash_full_query_conv and is_spec_decode and dflash_full_query
                                             and self.compact_state_group_offset is not None
                                             and not getattr(self.cache_config, "enable_prefix_caching", True)),
+                    store_cache_indices=(store_state_indices[:num_decodes] if (store_state_indices is not None
+                                                                               and not direct_conv_state
+                                                                               and not is_spec_decode
+                                                                               and not is_dflash_transition)
+                                         else (store_state_indices[:num_decodes, 0] if (
+                                             is_spec_decode
+                                             and lattice_store_differs
+                                             and store_state_indices is not None) else None)),
                 )
-                if _triton_gaudi_mode == "strict":
+                if use_gdn_recurrent:
+                    # === RECURRENCE: the recurrence alone through gdn_recurrent_decode (full SSM pool, ===
+                    # === absolute slots); self.norm runs in Part 3 as in mode 0.                       ===
+                    core_attn_out_result = gdn_recurrent_decode(
+                        self.kv_cache[1], mixed_qkv_conv.contiguous(), a.contiguous(), b.contiguous(),
+                        self.A_log.float(), self.dt_bias.float(), load_state_indices.to(torch.int32),
+                        store_state_indices.to(torch.int32), self.head_k_dim**-0.5).unsqueeze(0)
+                elif _triton_gaudi_mode == "strict":
                     triton_out = _try_triton_gdn_decode_packed(
                         ssm_state,
                         mixed_qkv_conv,
@@ -687,6 +1067,11 @@ class HPUGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                         assume_distinct_checkpoints=(self.compact_state_group_offset is not None
                                                      and not getattr(self.cache_config, "enable_prefix_caching", True)),
                         checkpoint_start=checkpoint_start,
+                        # Align mode (M3-T10b): token t's checkpoint lands on the
+                        # store lattice so a block-boundary token cannot overwrite
+                        # a completed prefix-cache block.
+                        store_indices=(store_state_indices[:num_decodes, :tokens_per_request]
+                                       if (lattice_store_differs and store_state_indices is not None) else None),
                     )
                     core_attn_out_result = core_attn_out_result.reshape(1, num_tokens, core_attn_out_result.size(-2),
                                                                         core_attn_out_result.size(-1))
@@ -705,7 +1090,7 @@ class HPUGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                         direct_state_group_offset=self.compact_state_group_offset,
                         allow_indexed_reference=is_dflash_transition,
                     )
-                if flashinfer_result is None and not is_spec_decode:
+                if flashinfer_result is None and not is_spec_decode and not use_gdn_recurrent:
                     query, key, value = self.rearrange_mixed_qkv(mixed_qkv_conv)
                     core_attn_out_result, _ = hpu_fused_recurrent_gated_delta_rule(
                         q=query,
@@ -718,6 +1103,8 @@ class HPUGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                         cu_seqlens=(query_start_loc[:num_decodes + 1] if query_start_loc is not None else None),
                         ssm_state_indices=load_state_indices,
                         use_qk_l2norm_in_kernel=True,
+                        ssm_store_indices=(store_state_indices[:num_decodes] if store_state_indices is not None
+                                           else None),
                     )
             if flashinfer_result is not None:
                 core_attn_out_result, next_state = flashinfer_result
@@ -735,7 +1122,9 @@ class HPUGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         z_shape_og = z.shape
         core_attn_out = core_attn_out.reshape(-1, core_attn_out.shape[-1])
         z = z.reshape(-1, z.shape[-1])
-        if is_prompt and self.gdn_fused_rmsnorm_gated:
+        if gdn_core_out is not None:
+            pass  # gdn_core_decode already applied the gated RMSNorm
+        elif is_prompt and self.gdn_fused_rmsnorm_gated:
             core_attn_out = hpu_fused_rmsnorm_gated(
                 core_attn_out,
                 z,

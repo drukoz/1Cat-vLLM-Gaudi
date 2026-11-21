@@ -37,6 +37,14 @@ torch.accelerator.get_memory_info = _hpu_get_memory_info
 QWEN3_5_HYBRID_ARCHS = frozenset({
     "Qwen3_5ForConditionalGeneration",
     "Qwen3_5MoeForConditionalGeneration",
+    # Qwen3.8-Flash-Next shares the Qwen3.5 GDN hybrid layout
+    "Qwen4ExpForConditionalGeneration",
+    "Qwen4ExpForCausalLM",
+})
+
+FLASH_NEXT_ARCHS = frozenset({
+    "Qwen4ExpForConditionalGeneration",
+    "Qwen4ExpForCausalLM",
 })
 
 _QWEN38_DFLASH2_DRAFT_FIELDS = {
@@ -104,6 +112,108 @@ def is_qwen3_5_hybrid_model(model_config: Optional[ModelConfig]) -> bool:
         architectures.add(architecture)
 
     return any(arch in QWEN3_5_HYBRID_ARCHS for arch in architectures)
+
+
+def is_flash_next_model(model_config: Optional[ModelConfig]) -> bool:
+    if model_config is None:
+        return False
+
+    architectures = set(getattr(getattr(model_config, "hf_config", None), "architectures", []) or [])
+    architecture = getattr(model_config, "architecture", None)
+    if architecture is not None:
+        architectures.add(architecture)
+
+    return any(arch in FLASH_NEXT_ARCHS for arch in architectures)
+
+
+def resolve_flash_next_async_scheduling(vllm_config: "VllmConfig", requested: Optional[bool] = None) -> bool:
+    """Whether a Flash-Next server keeps vLLM's async scheduling (``VLLM_HPU_FLASH_NEXT_ASYNC_SCHED``); logs it.
+
+    ``0`` (default): async scheduling is turned off, as it was before the flag. ``1``: vLLM's decision stands
+    (on unless ``--no-async-scheduling``) without speculation; a speculative config has already turned it off above.
+    ``2``: as ``1``, and with the Flash-Next MTP draft too: ``requested`` is vLLM's decision before the HPU hook
+    turned it off for the speculative config (vLLM keeps async scheduling on for MTP). Under async scheduling the
+    runner carries the PLE n-gram context of the decode rows on the device, and with speculation it keeps its
+    synchronous step and hands the drafts over on the device (``v1/worker/flash_next_async.py``). ``3``: as ``2``
+    for the engine; the runner then issues a chained MTP step before the previous one's tokens reach the host
+    (stage 2, M2; ``v1/worker/flash_next_async_spec.py``).
+    """
+    scheduler_config = vllm_config.scheduler_config
+    mode = int(gaudi_envs.VLLM_HPU_FLASH_NEXT_ASYNC_SCHED)
+    speculative_config = getattr(vllm_config, "speculative_config", None)
+    if mode in (2, 3) and speculative_config is not None and requested and \
+            getattr(speculative_config, "method", None) == "mtp":
+        scheduler_config.async_scheduling = True
+        if mode == 2:
+            logger.info("[HPU] Async scheduling on for Flash-Next with MTP (VLLM_HPU_FLASH_NEXT_ASYNC_SCHED=2): the "
+                        "engine schedules during the step, the drafts stay on the device")
+        else:
+            logger.info("[HPU] Async scheduling on for Flash-Next with MTP (VLLM_HPU_FLASH_NEXT_ASYNC_SCHED=3): the "
+                        "engine schedules during the step; a chained step is issued before the previous one's "
+                        "tokens reach the host")
+        return True
+    if mode in (1, 2, 3):
+        if scheduler_config.async_scheduling:
+            logger.info("[HPU] Async scheduling on for Flash-Next (VLLM_HPU_FLASH_NEXT_ASYNC_SCHED=%d): the PLE "
+                        "n-gram context of the decode rows is carried on the device", mode)
+        elif speculative_config is not None:
+            logger.warning("[HPU] VLLM_HPU_FLASH_NEXT_ASYNC_SCHED=%d has no effect: async scheduling stays off with "
+                           "this speculative config on HPU (=2 keeps it for MTP)", mode)
+        else:
+            logger.info("[HPU] VLLM_HPU_FLASH_NEXT_ASYNC_SCHED=%d, but async scheduling is off for this server", mode)
+        return bool(scheduler_config.async_scheduling)
+    if scheduler_config.async_scheduling:
+        scheduler_config.async_scheduling = False
+        logger.warning("[HPU] Async scheduling disabled for Flash-Next: PLE n-gram context needs sampled tokens "
+                       "on the CPU (VLLM_HPU_FLASH_NEXT_ASYNC_SCHED=1 keeps it on)")
+    return False
+
+
+def _configure_recurrent_state(vllm_config: "VllmConfig") -> None:
+    """Compact-GDN rule and recurrent-state-pool resolution for GDN hybrids (M1-T1)."""
+    from vllm_gaudi.v1.core.recurrent_state_pool import (ENV_CACHE_SLOTS, ENV_MODE, ENV_SLOTS,
+                                                         LIVE_SLOTS_PER_REQUEST, RecurrentStatePoolMode,
+                                                         resolve_pool_slots)
+    model_config = vllm_config.model_config
+    if model_config is None or not getattr(model_config, "is_hybrid", False):
+        return
+    parallel_config = vllm_config.parallel_config
+    n_gdn = sum(
+        model_config.get_num_layers_by_block_type(parallel_config, bt) for bt in ("gdn_attention", "linear_attention"))
+    if n_gdn == 0:
+        return
+    prefix_caching = bool(vllm_config.cache_config.enable_prefix_caching)
+    compact = os.environ.get("VLLM_COMPACT_GDN", "").strip().lower()
+    if prefix_caching and compact in ("1", "true"):
+        raise ValueError("VLLM_COMPACT_GDN=1 does not support prefix caching: unset it (prefix caching uses the "
+                         "recurrent state pool) or disable prefix caching with --no-enable-prefix-caching")
+    if prefix_caching and compact == "":
+        os.environ["VLLM_COMPACT_GDN"] = "0"
+        logger.info("[HPU] Prefix caching with GDN layers: VLLM_COMPACT_GDN defaults to 0")
+    mode = RecurrentStatePoolMode(int(os.environ.get(ENV_MODE, "0")))
+    if mode != RecurrentStatePoolMode.POOL:
+        return
+    if not prefix_caching:
+        logger.warning("[HPU] VLLM_HPU_RECURRENT_STATE_POOL=1 ignored: the pool needs prefix caching "
+                       "(compact GDN serves the prefix-caching-off case)")
+        return
+    slots = int(os.environ.get(ENV_SLOTS, "0"))
+    n_attn = model_config.get_num_layers_by_block_type(parallel_config, "attention")
+    n_ple = len(getattr(model_config.hf_text_config, "ple_layer_ids", None) or [])
+    groups = (-(-n_gdn // n_attn) if n_attn > 0 else 1) + (1 if n_ple else 0)
+    cache_slots = int(os.environ.get(ENV_CACHE_SLOTS, "512"))
+    speculative_config = getattr(vllm_config, "speculative_config", None)
+    num_speculative_tokens = getattr(speculative_config, "num_speculative_tokens", None)
+    num_speculative_tokens = int(num_speculative_tokens) if num_speculative_tokens else 0
+    if slots <= 0:
+        slots = resolve_pool_slots(vllm_config.scheduler_config.max_num_seqs, groups, cache_slots,
+                                   num_speculative_tokens)
+        os.environ[ENV_SLOTS] = str(slots)
+    logger.info(
+        "[HPU] Recurrent state pool: %d slots (max_num_seqs=%d, recurrent groups=%d, "
+        "live slots per request=%d, speculative tokens=%d, cache slots=%d)", slots,
+        vllm_config.scheduler_config.max_num_seqs, groups, LIVE_SLOTS_PER_REQUEST, num_speculative_tokens,
+        cache_slots)
 
 
 def _enable_hpu_v1_dflash2_validation() -> None:
@@ -189,6 +299,70 @@ def _validate_hpu_dflash2_config(vllm_config: VllmConfig) -> None:
         raise ValueError("HPU DFlash2 does not yet support LoRA")
     if vllm_config.cache_config.enable_prefix_caching:
         raise ValueError("HPU DFlash2 requires prefix caching to be disabled")
+
+
+def _validate_flash_next_speculative_config(vllm_config: VllmConfig) -> None:
+    """Refuse the Flash-Next speculative configurations M3 cannot run correctly yet."""
+    speculative_config = vllm_config.speculative_config
+    if speculative_config is None or not is_flash_next_model(vllm_config.model_config):
+        return
+    draft_model_config = speculative_config.draft_model_config
+    draft_architectures = set(getattr(getattr(draft_model_config, "hf_config", None), "architectures", ()) or ())
+    if speculative_config.method == "ngram":
+        if vllm_config.cache_config.enable_prefix_caching:
+            raise ValueError("Flash-Next n-gram speculation runs with prefix caching disabled for now: add "
+                             "--no-enable-prefix-caching")
+    elif speculative_config.method != "mtp" or "Qwen4ExpMTP" not in draft_architectures:
+        raise ValueError("Flash-Next supports speculative decoding with its own MTP layer or n-gram prompt lookup "
+                         "only: use --speculative-config '{\"method\": \"mtp\", \"num_speculative_tokens\": 3}' or "
+                         "'{\"method\": \"ngram\", \"num_speculative_tokens\": 3, \"prompt_lookup_max\": 4, "
+                         "\"prompt_lookup_min\": 2}'")
+    # Under prefix caching the align-mode state pool replaces compact GDN (RUK-2798 T10c).
+    prefix_caching = bool(vllm_config.cache_config.enable_prefix_caching)
+    if not prefix_caching and os.environ.get("VLLM_COMPACT_GDN", "1").strip().lower() not in ("1", "true"):
+        raise ValueError("Flash-Next MTP needs compact GDN state for the per-token verification checkpoints: "
+                         "unset VLLM_COMPACT_GDN or set it to 1")
+    # 5 is the largest lattice (1 + k = 6 nodes) the fused GDN verification op takes (GDN_CORE_VERIFY_MAX_NODES);
+    # the CPU tests run the speculative path at k = 3, 4 and 5 (tests/unit_tests/flash_next_spec_sizes.py).
+    if not 1 <= speculative_config.num_speculative_tokens <= 5:
+        raise ValueError("Flash-Next MTP on HPU runs 1 to 5 speculative tokens (the recipe is 3)")
+    global _SPEC_GREEDY_ONLY, _SPECULATIVE_SERVER
+    _SPEC_GREEDY_ONLY = int(gaudi_envs.VLLM_HPU_SPEC_SAMPLED_VERIFY) not in (1, 2)
+    _SPECULATIVE_SERVER = True
+
+
+# Set by _validate_flash_next_speculative_config for a Flash-Next speculative server without
+# VLLM_HPU_SPEC_SAMPLED_VERIFY=1: HpuPlatform.validate_request then refuses a sampled request with an error, where the
+# worker's rejection sampler would otherwise stop the server on it.
+_SPEC_GREEDY_ONLY = False
+# Set for every Flash-Next speculative server: the HPU runner lays a verification step's rows out padded per request
+# (k rows each, -1 indices for missing drafts), while upstream's rejection sampler applies penalties, bad words and
+# allowed token ids over packed rows (repeat_interleave(num_draft_tokens)): the shapes differ whenever the batch is
+# padded or a request drafted fewer than k tokens. Such a request is refused with an error, not run into a worker
+# failure (INFERRED from the code: rejection_sampler.apply_logits_processors, _prepare_spec_decode_inputs).
+_SPECULATIVE_SERVER = False
+
+
+def _refuse_sampled_speculative_request(params) -> None:
+    from vllm.sampling_params import SamplingParams, SamplingType
+
+    if not isinstance(params, SamplingParams):
+        return
+    if _SPEC_GREEDY_ONLY and params.sampling_type != SamplingType.GREEDY:
+        raise ValueError("This Flash-Next server decodes speculatively (MTP) and verifies greedy requests only: "
+                         "send temperature 0 (a request without one takes the checkpoint's generation_config, "
+                         "temperature 1.0), or start the server with VLLM_HPU_SPEC_SAMPLED_VERIFY=1")
+    if _SPECULATIVE_SERVER:
+        unsupported = [name for name, used in (
+            ("presence_penalty", params.presence_penalty != 0.0),
+            ("frequency_penalty", params.frequency_penalty != 0.0),
+            ("repetition_penalty", params.repetition_penalty != 1.0),
+            ("bad_words", bool(getattr(params, "bad_words", None))),
+            ("allowed_token_ids", bool(params.allowed_token_ids)),
+        ) if used]
+        if unsupported:
+            raise ValueError("This Flash-Next server decodes speculatively (MTP), whose HPU verification does not "
+                             "apply %s yet: leave them at their defaults" % ", ".join(unsupported))
 
 
 class HpuPlatform(Platform):
@@ -456,6 +630,8 @@ class HpuPlatform(Platform):
             logger.info("[HPU] Overriding mamba_cache_mode from 'all' to 'align' "
                         "to ensure block-aligned chunked prefill splits.")
 
+        _configure_recurrent_state(vllm_config)
+
         if (vllm_config.model_config is not None and vllm_config.model_config.is_hybrid):
             logger.debug(
                 "[HPU] Hybrid model cache config: block_size=%s, "
@@ -483,9 +659,13 @@ class HpuPlatform(Platform):
 
         # NOTE: vLLM has default enabled async scheduling with speculative decoding is on.
         # However, for HPU, speculative decoding is not supported with async scheduling.
+        requested_async_scheduling = vllm_config.scheduler_config.async_scheduling
         vllm_config.scheduler_config.async_scheduling = \
             vllm_config.scheduler_config.async_scheduling and vllm_config.speculative_config is None
+        if is_flash_next_model(vllm_config.model_config):
+            resolve_flash_next_async_scheduling(vllm_config, requested_async_scheduling)
         _validate_hpu_dflash2_config(vllm_config)
+        _validate_flash_next_speculative_config(vllm_config)
 
     @classmethod
     def update_block_size_for_backend(cls, vllm_config: "VllmConfig") -> None:
@@ -598,6 +778,7 @@ class HpuPlatform(Platform):
 
     @classmethod
     def validate_request(cls, processed_inputs, params):
+        _refuse_sampled_speculative_request(params)
         if gaudi_envs.VLLM_HPU_DSV41_PREPARED_SHARDS:
             from vllm_gaudi.ops.deepseek_v41_config import validate_sampling
             validate_sampling(params)
@@ -633,6 +814,10 @@ class HpuPlatform(Platform):
 
     @classmethod
     def register_custom_kv_cache_specs(cls, vllm_config):
+        # The engine core calls this right before it groups the layers' KV cache specs and sizes the block
+        # pool: keep every attention layer in the one group whose block table the HPU runner reads.
+        from vllm_gaudi.v1.core.recurrent_state_pool import install_hpu_kv_cache_grouping
+        install_hpu_kv_cache_grouping()
         if gaudi_envs.VLLM_HPU_DSV41_PREPARED_SHARDS:
             from vllm_gaudi.ops.deepseek_v41_state import register_state_spec
             register_state_spec(vllm_config)
@@ -758,10 +943,10 @@ class HpuPlatform(Platform):
         if isinstance(dst_cache, tuple):
             _src_cache = src_cache[:, src_block_indices]
             _src_cache = _src_cache.to(dst_cache[0].device)
-            dst_cache[0].index_copy_(0, dst_block_indices,
-                                     _src_cache[0].view(original_src_dtype) if view_as_uint else _src_cache[0])
-            dst_cache[1].index_copy_(0, dst_block_indices,
-                                     _src_cache[1].view(original_src_dtype) if view_as_uint else _src_cache[1])
+            # A recurrent cache with one state (the Flash-Next PLE short-conv group) is a one-element tuple.
+            for i, dst in enumerate(dst_cache):
+                src = _src_cache[i]
+                dst.index_copy_(0, dst_block_indices, src.view(original_src_dtype) if view_as_uint else src)
         else:
             indexed_cache = src_cache[src_block_indices]
             if view_as_uint:

@@ -102,7 +102,8 @@ class HPUAttentionMetadataV1(HPUAttentionMetadata):
                               window_block_list=None,
                               direct_gdn_state=False,
                               causal=True,
-                              window_attn_bias=None):
+                              window_attn_bias=None,
+                              block_table=None):
         return cls(is_prompt=True,
                    block_list=block_list,
                    block_mapping=None,
@@ -130,7 +131,8 @@ class HPUAttentionMetadataV1(HPUAttentionMetadata):
                    window_block_list=window_block_list,
                    window_attn_bias=window_attn_bias,
                    direct_gdn_state=direct_gdn_state,
-                   causal=causal)
+                   causal=causal,
+                   block_table=block_table)
 
     @classmethod
     def make_decode_metadata(cls,
@@ -153,7 +155,9 @@ class HPUAttentionMetadataV1(HPUAttentionMetadata):
                              seq_lens_tensor=None,
                              direct_gdn_state=False,
                              dflash_full_query=False,
-                             causal=True):
+                             causal=True,
+                             block_table=None,
+                             lattice_store_differs=False):
         return cls(is_prompt=False,
                    block_mapping=None,
                    alibi_blocks=None,
@@ -180,4 +184,6 @@ class HPUAttentionMetadataV1(HPUAttentionMetadata):
                    query_start_loc_p=query_start_loc,
                    direct_gdn_state=direct_gdn_state,
                    dflash_full_query=dflash_full_query,
-                   causal=causal)
+                   causal=causal,
+                   block_table=block_table,
+                   lattice_store_differs=lattice_store_differs)

@@ -18,7 +18,8 @@ from vllm.model_executor.utils import replace_parameter
 import vllm_gaudi.extension.ops as hpu_ops
 from vllm_gaudi.extension.ops import (VllmMixtureOfExpertsOpFP8PerChannel, VllmMixtureOfExpertsOpFP8)
 from vllm_gaudi.extension.runtime import get_config
-from vllm_gaudi.ops.hpu_fused_moe import (_normalize_moe_activation, model_has_quant_config, select_experts_from_routed)
+from vllm_gaudi.ops.hpu_fused_moe import (_moe_glue_prepare, _normalize_moe_activation, model_has_quant_config,
+                                          select_experts_from_routed)
 from vllm_gaudi.v1.worker.hpu_dp_utils import dispatch_hidden_states, dispatch_tensor, get_hpu_dp_metadata
 
 from vllm.model_executor.kernels.linear import _POSSIBLE_FP8_BLOCK_KERNELS, _POSSIBLE_FP8_KERNELS
@@ -234,7 +235,40 @@ class HPUFp8OnlineLinearMethod(OrigFp8PerTensorOnlineLinearMethod):
         return output.narrow(0, 0, input_2d.shape[0]).reshape(output_shape)
 
 
+def _moe_glue_fp8_experts(moe_op, x, topk_ids, topk_weights, activation, moe_glue) -> torch.Tensor:
+    """The dynamic-scale branch of VllmMixtureOfExpertsOpFP8PerChannel.forward with a fused row quantization.
+
+    VLLM_HPU_MOE_GLUE=1 only. Every argument of the vendor op is the one that forward passes
+    (vllm_gaudi/extension/ops.py); the difference is where x_fp8 and x_scale come from: one moe_row_quant
+    op instead of dynamic_quant's abs, max, add, div, reciprocal, multiply, cast and cast.
+    """
+    tokens_num, _ = x.shape
+    activation = hpu_ops._as_activation_str(activation)
+    kwargs = moe_op._get_extra_kwargs(tokens_num)
+    if not moe_op.is_gated:
+        kwargs["is_gated"] = False
+    if moe_op._cached_w13_views is None or moe_op._cached_w2_views is None:
+        moe_op._cache_weight_lists()
+    x_fp8, x_scale = moe_glue.row_quant(x)
+    return torch.ops.hpu.mixture_of_experts(hidden_states=x_fp8,
+                                            expert_routing_table=topk_ids.to(torch.int64),
+                                            router_weights=topk_weights.to(x.dtype),
+                                            w12=moe_op._cached_w13_views,
+                                            w3=moe_op._cached_w2_views,
+                                            d_scale_hidden_states=x_scale,
+                                            d_scale_w12=moe_op._cached_w13_scale_views,
+                                            d_scale_w3=moe_op._cached_w2_scale_views,
+                                            permuted_weights=True,
+                                            activation=activation,
+                                            experts_min=moe_op.experts_min,
+                                            experts_max=moe_op.experts_max,
+                                            **kwargs)
+
+
 class HPUFp8MoEMethod(Fp8MoEMethod):
+
+    # VLLM_HPU_MOE_GLUE: this class (not a subclass) runs the fused glue with per-channel FP8 experts.
+    _hpu_moe_glue_kind = "fp8"
 
     def __init__(self, quant_config: Fp8Config, layer: torch.nn.Module):
         super().__init__(quant_config, layer)
@@ -296,6 +330,8 @@ class HPUFp8MoEMethod(Fp8MoEMethod):
                                      "activation scales are None.")
                 layer.w13_input_scale = torch.nn.Parameter(layer.w13_input_scale.max(), requires_grad=False)
             layer = hpu_ops.fp8_channel_moe_prepare_weights(layer)
+        # VLLM_HPU_MOE_GLUE=1: the merged gate weight of the block (nothing with the flag at 0).
+        _moe_glue_prepare(layer)
 
     def apply_monolithic(
         self,
@@ -307,7 +343,11 @@ class HPUFp8MoEMethod(Fp8MoEMethod):
         is_sequence_parallel = layer.moe_config.is_sequence_parallel
         input_shape = x.shape
         x = x.view(-1, x.shape[-1])
-        if layer.use_grouped_topk or getattr(layer, "custom_routing_function", None) is not None:
+        moe_glue = kwargs.get("moe_glue")
+        if moe_glue is not None:
+            # VLLM_HPU_MOE_GLUE=1: softmax, top-k, renormalization and the casts as one fused op.
+            topk_weights, topk_ids = moe_glue.route(router_logits, layer.top_k)
+        elif layer.use_grouped_topk or getattr(layer, "custom_routing_function", None) is not None:
             topk_weights, topk_ids = select_experts_from_routed(layer, x, router_logits)
         else:
             import torch.nn.functional as F
@@ -354,13 +394,20 @@ class HPUFp8MoEMethod(Fp8MoEMethod):
         topk_ids = topk_ids.view(-1, topk_ids.shape[-1])
         topk_weights = topk_weights.view(-1, topk_weights.shape[-1])
 
-        output = layer.moe_op(
-            x,
-            topk_ids,
-            topk_weights,
-            permuted_weights=True,
-            activation=_normalize_moe_activation(layer.activation),
-        )
+        if moe_glue is not None and moe_glue.fp8:
+            # The op wrapper's own call of the vendor op, with the row quantization as one fused op.
+            output = _moe_glue_fp8_experts(layer.moe_op, x, topk_ids, topk_weights,
+                                           _normalize_moe_activation(layer.activation), moe_glue)
+        else:
+            output = layer.moe_op(
+                x,
+                topk_ids,
+                topk_weights,
+                permuted_weights=True,
+                activation=_normalize_moe_activation(layer.activation),
+            )
+        if moe_glue is not None and output.shape == input_shape:
+            return output  # not output.view(...): moe_combine is a custom op (_MoeGlueState.row_quant)
         return output.view(*(output.size(0), *input_shape[1:]))
 
 
