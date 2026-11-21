@@ -11,39 +11,37 @@ This track's harness refuses report files outside the repository, so the handoff
 
 ## Handoff (if this agent stops)
 
-Last update: **2026-11-21 00:45 UTC** (fourth agent, Opus 5.5, stopping). Branch `feat/flash-next-gaudi-engine-step`,
-head `89cd8692` plus this document (program head `938dada4` merged in at `eaf2131f`), everything pushed. Scratch
-files, probes and card results: `/Volumes/Storage/Claude/gaudi-work/reports/engine-step/` (`card_job/` = submit logs,
-`card/` = fetched results, `logs/` = CPU test logs, `probes/` = Mac probes). Node mirror:
-`node-mirror/farm/engine-step/results/`.
+Last update: **2026-11-21 01:15 UTC** (fourth agent, Opus 5.5; the node was extended to about 00:00 UTC on
+2026-11-22). Branch `feat/flash-next-gaudi-engine-step`, head `d5ad5e67` plus documents (program head `5c1e8219`,
+PR 15, merged in at `425fb2ee`), pushed. Scratch files, probes and card results:
+`/Volumes/Storage/Claude/gaudi-work/reports/engine-step/` (`card_job/` = submit logs, `card/` = fetched results,
+`logs/` = CPU test and gate logs, `probes/` = Mac probes, `merge-wt/` = the gate's snapshot of the branch).
 
 ### State in one paragraph
 
-Card-proven (section 9): **`VLLM_HPU_CANDIDATE_SAMPLING=1`**: -4.9 ms per sampled step at 32 streams on TP4
-(00110: 114.6 -> 109.7 ms; every stream on task; a seeded request repeats itself; 00093: the sampler stage 3.18
-against 7.46 ms at 32 rows on one card); integration builds with it. **I01 (`VLLM_HPU_FLASH_NEXT_DECODE_METADATA=1`)
-is token-correct on a card** (00130, tiny model, 16 of 16) and neutral at a short context (00110); its host saving
-at a long context is unmeasured on a card (needs prefill's prefix-cache fix, see the next rental's jobs). I05
-(`VLLM_HPU_FUSED_GREEDY_LOGITS=1`) gave no measurable gain and resolves one near tie of the random-weight tiny model
-the other way (00130; not a defect). **`logprobs=5` no longer kills the server** (top-k ids out of an fp32 id table,
-`v1/sample/topk_ids.py`, `330f9413`; card-proven in 00130). **`prompt_logprobs` killed the engine** (an older
-defect: Flash-Next's flattened prefill hidden states were indexed per request): fixed at `e9032e68`, CPU-proven (the
-test reproduced the crash), not yet on a card. The sampled region now takes `vocab_parallel.top_k` (int32 ids) and
-logs once per server which path a sampled step took (`21d9eace`). `VLLM_HPU_VOCAB_PARALLEL_LOGITS=2` with candidates
-(`candvp`) has not run on a card: 00144 waits but gets no slot tonight. No pull request tonight (BRIEF.md 23:45).
+Card-proven: **`VLLM_HPU_CANDIDATE_SAMPLING=1`** (00110: -4.9 ms per sampled step at 32 streams on TP4; 00144:
+-1.2 ms, noisy) and **with `VLLM_HPU_VOCAB_PARALLEL_LOGITS=2`** (`candvp`, 00144: 110.7 against 114.2 ms per step
+at 32 sampled streams on TP4, -3.55 ms, -3.1 %, every stream on task; the log line confirms each rank's shard);
+**I01** token-correct (00130) and neutral at a short context (00110, 00144); **`logprobs=5` and `prompt_logprobs`
+no longer kill the server** (00130 tiny, 00144 real model: HTTP 200, valid ids, `/health` fine). CPU-proven, card
+job queued: **`VLLM_HPU_CANDIDATE_SAMPLING=2`** (`d5ad5e67`): with deterministic drafts (MTP, n-gram) every
+verification row and the bonus row draws in the candidate region with its own noise and the drafts are verified
+against those draws (`greedy_rejection_sample_from_tokens`), which is speculative sampling exactly for one-hot
+drafts (design and interface agreed with mtp-card-ready; it needs their `VLLM_HPU_SPEC_SAMPLED_VERIFY` at 1 or 2).
+Its 8-card check is 00164 (integration build 2 + `d5ad5e67`, MTP k = 2, sampled 32 and 1 streams). Pull request:
+the gate runs on `reports/engine-step/merge-wt` at `d5ad5e67` (waiting for the lock since 00:40 UTC), then PR and
+merge.
 
 ### If you take over, in this order
 
-1. After 04:00 UTC (node gone, Mac free): `bin/gate /Volumes/Storage/Claude/gaudi-work/wt/engine-step --tools`
-   (merge `origin/feat/flash-next-gaudi` into the branch first if it moved), then one pull request into
-   `feat/flash-next-gaudi` (`gh pr create --base feat/flash-next-gaudi`, `gh pr merge --merge`), all flags default
-   off. CPU tests green at `e9032e68`: `logs/t_fast_eaf.log` (18), `logs/t_logline.log` (22), `logs/t_plp_after.log`
-   (9), `logs/t_loop_plp.log` (18), `logs/t_track_3757.log` (29), `logs/t_platform_vp_3757.log` (73).
-2. A stale gate of this track (pid 25332, started 20:10 UTC on `reports/engine-step/merge-wt` = the old merged tree
-   `f0fd0a2b`) and a `bin/farm job` waiter for 00144 (pid 28597) are still running on this Mac; stopping them was
-   refused to this agent by the permission check (the owner was told). Both are harmless.
-3. The next rental: the two jobs under "Pending subtasks" item 0 (I01 at 32 x 120K with prefill's two prefix flags;
-   `candvp` at TP8), then 00144's content at TP4 if TP8 is not free.
+1. The gate: `tail -3 reports/engine-step/logs/gate_425fb2ee.log` (it tests `merge-wt` at `d5ad5e67`). When it
+   ends `gate exit 0`: from `wt/engine-step`, merge `origin/feat/flash-next-gaudi` again if it moved, push, `gh pr
+   create --base feat/flash-next-gaudi`, `gh pr merge --merge`; tell the coordinator.
+2. Read 00146 and 00164 when they land (table below); section 9 and the coordinator.
+3. Then: the general sampler's ignored `min_tokens` / `logit_bias` / `min_p` (item 5 below), and I01 at a long
+   context once prefill's prefix flags are on the program branch (item 0).
+4. Test branches in `wt/engine-step` (local, not pushed, not for a pull request): `engine-step-mtp-card` (mine +
+   mtp-card-ready's 05d2db66) and `engine-step-int2-card` (integration build 2 + `d5ad5e67`, the tree of 00164).
 
 ### Card jobs
 
@@ -52,7 +50,9 @@ logs once per server which path a sampled step took (`21d9eace`). `VLLM_HPU_VOCA
 | 00093 `hpu-ids-sampler-tiny-flags` (1 card) | id verdicts, sampler-stage times, tiny model with I01 + I05 | ended 20:29 UTC, exit 1 (the tiny 700-token prompt, a near tie) | done: section 9 |
 | 00110 `real4-ab3-greedy-sampled-long` (TP4) | greedy base / I01 / I05 / both, sampled base / cand, long prefix | ended 22:29 UTC, exit 5 (probe counting artifact; no prefix-cache hit) | done: section 9 |
 | 00130 `tiny-i01-i05-logprobs` (1 card, commit `0cb55ebb`) | `tiny_checks.py --arms i01,i05` | ended 00:25 UTC, exit 1 (the I05 arm's near tie, and both servers died on the `prompt_logprobs` request) | done: section 9; the prompt-logprobs defect fixed at `e9032e68` |
-| **00144** `real4-ab6-short-candvp` (any:4, 28m, commit `e9032e68`, `VLLM_GRAPH_RESERVED_MEM=0.5`; replaced 00131 (23:55 UTC) and 00137 (00:36 UTC) to carry the log lines and the prompt-logprobs fix, kept the place) | `serve_long_probe.sh --arms both --no-long --candvp --logprobs-check`: 32 greedy streams base / both (twice, in turn), text1 compared at 1 stream, 32 sampled streams base / cand / candvp (`VLLM_HPU_VOCAB_PARALLEL_LOGITS=2`), seeded requests, min_tokens round, the logprobs check last; hl-smi memory in `hlsmi.log` | waiting; the owner's 8-card runs go first (coordinator, 00:28 UTC): probably not tonight, then it is the next rental's first TP4 job | `probe.log`: `SUMMARY` (sampled cand and candvp against base, candvp against cand), `TASK` for candvp (must be 32 of 32), `TEXTS text1`, `LOGPROBS ok`; the job log's `Candidate sampling` lines ("drew in the logits region ... from the gathered logits" for cand, "... from each rank's vocabulary shard" for candvp); then tell the coordinator whether `VLLM_HPU_VOCAB_PARALLEL_LOGITS=2` with candidates is proven |
+| 00144 `real4-ab6-short-candvp` (TP4, `e9032e68`) | the short-context A/B with `candvp` and the logprobs check | ended 00:56 UTC, exit 0 | done: section 9 |
+| **00146** `real8-candvp-short` (all, 35m, `e9032e68`) | the same probe at TP8: greedy base / I01 + I05, sampled vLLM / cand / candvp, logprobs check | queued (8-card sequence) | `SUMMARY`, `TASK`, `LOGPROBS`, the `Candidate sampling` lines; tell the coordinator whether `candvp` holds at TP8 |
+| **00164** `real8-mtp2-cand2-sampled` (all, 40m, `3ed03d13` = integration build 2 + `d5ad5e67`) | `headline_job.sh mtp2` with `HEADLINE_MTP_SAMPLED=1 HEADLINE_MTP_SAMPLED_LEVELS=32,1 VLLM_HPU_SPEC_SAMPLED_VERIFY=2 VLLM_HPU_CANDIDATE_SAMPLING=2` | queued (8-card sequence) | step time and acceptance per draft position, sampled at 32 and 1 streams, against build 2's arm C (the same with `=2` of mtp-card-ready only); the `Candidate sampling` lines must say the region drew; no rejection-sampler error |
 
 ### Pending subtasks after those steps, in order
 
@@ -382,6 +382,23 @@ One server, flags flipped by the switch file, rounds in turn. Healthy after 426 
 - `prompt_logprobs=2` ended the engine in both arms (`matrix 1 and matrix 2 shapes cannot be multiplied (1x6 and
   128x248320)` in `_get_prompt_logprobs_dict`; `/health` 503 after). Fixed at `e9032e68`
   (`_prompt_hidden_states_per_request`, test `test_prompt_logprobs.py`, which reproduced the crash on the CPU).
+
+**00144 `real4-ab6-short-candvp`** (TP4 + EP4 on modules 4-7, commit `e9032e68`, 00:42 to 00:56 UTC, exit 0).
+MEASURED, steady ms per step at 32 streams, rounds in turn on one server. Card 0's hardware reset (00:46:19 to
+00:47:12, links of cards 3-6 to module 3 down and up) fell inside the server's start (healthy at about 00:49:30): no
+round overlapped it.
+
+| kind | base | arm |
+|---|---|---|
+| sampled, `cand` | 114.65, 113.83 | 113.50, 110.79, 114.76 (-1.2 ms on average, noisy) |
+| sampled, `candvp` (`VLLM_HPU_VOCAB_PARALLEL_LOGITS=2`) | (same base) | 110.79, 110.60 (**-3.55 ms, -3.1 %**; -2.3 ms against `cand`) |
+| greedy, I01 + I05 | 108.31, 109.50 | 107.99, 108.80 (-0.5 ms) |
+| greedy I01 + I05 with `min_tokens` | | 111.07 (+2.3 ms for the mask at 32 rows) |
+
+Every stream on task in every arm, greedy and sampled; the 1-stream text with I01 + I05 equals base's; seeded
+requests repeat themselves (cand and vLLM's sampler). The `Candidate sampling` lines: "drew in the logits region ...
+from the gathered logits" (cand) and "... from each rank's vocabulary shard (VLLM_HPU_VOCAB_PARALLEL_LOGITS=2)"
+(candvp). Logprobs check: `logprobs=5` and `prompt_logprobs=2` answered 200 with valid ids, `/health` fine after.
 
 ## 10. Time to first token of a cached-prefix turn: the runner's host part (MEASURED on the Mac)
 
