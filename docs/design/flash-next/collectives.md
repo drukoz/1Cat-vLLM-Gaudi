@@ -424,8 +424,12 @@ on, 00181's vendor arm 37 ms with it off: possibly the spread); the job keeps th
 greedy ms per step at 32 + 8 + 1 (`<job>-<name>-spinner.txt`) for real-rebuild (lean3a with the flag 0 and timers:
 our build on the stock path, the control 00181 lacked), real-lean (`lean3a-8f6f7faf88dc`, flag 1: lean3t + no GIL
 release for inputs whose event is done, no argument building for logs and traces that are off) and real-pin (the
-same + `VLLM_HPU_WORKER_CPU_PIN=1`, or native-replay's sibling-aware pin through `late/00189.env` `PIN_KV=...` if it
-is ready before the job starts). Pending.
+same + `VLLM_HPU_WORKER_CPU_PIN=1`; mode 2 would put the eight main threads on CPUs 19m, possibly four sibling pairs).
+If native-replay's sibling-map probe yields a placement script before 00189 starts: copy it to
+`~/farm/collectives/results/bench/place.sh` and write `PIN_PLACE=/results/bench/place.sh` into
+`~/farm/collectives/bridge/late/00189.env`; the pin arm then runs on its own through `place_wrap.sh` (the server and
+probe start at once; the script runs once the server answers `/health`; `placement.log` in the arm's results).
+Pending.
 
 ## Handoff (if this agent stops)
 
