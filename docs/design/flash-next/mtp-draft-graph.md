@@ -8,7 +8,7 @@ file), VERIFIED (CPU test or code line), INFERRED.
 
 ## Handoff (if this agent stopped)
 
-Last update: 2026-11-21 05:57 UTC (`date -u`), first agent of the track (Opus 5.5), started 04:35 UTC.
+Last update: 2026-11-21 06:35 UTC (`date -u`), first agent of the track (Opus 5.5), started 04:35 UTC.
 
 **Goal (coordinator, 04:45 UTC).** Run the k draft passes of an MTP decode draft in ONE HPU graph behind a default-off
 flag. Basis: build 3's timer (00178, TP8, k = 3) at 32 streams: the draft costs 16.3 to 18.2 ms of a 104 ms step
@@ -48,7 +48,8 @@ flag. Basis: build 3's timer (00178, TP8, k = 3) at 32 streams: the draft costs 
   identity per stream) and `tools/timer_ab.py <arm folder>` (the timer's records per kind and rows, first record of a
   key dropped). Build 3's per-pass draft by that script (00178 mtp3): 19.0 ms per step at 32 streams (pass0 4.9,
   pass1_meta 1.1, pass1 3.8, pass2_meta 1.0, pass2 3.7, final_wait 4.4), 15.3 ms at 1 stream.
-- Card: job 00194 below (00191, the two-server design, was replaced).
+- **Card (00194, MEASURED): correct; -8 % per token at 1 stream; no measurable gain at 32 streams on TP8.** Details
+  in "Card results". Verdict: keep it default-off, a low-concurrency (1 to 8 streams) setting.
 
 **Card job 00194 `real8-draft-graph-switch`** (all, 55 min; replaced 00191 at 05:37 UTC and kept its place: after
 integration's 00187, start by 06:46 UTC at the latest). Test branch `feat/flash-next-gaudi-mtp-draft-graph-b4` at
@@ -114,4 +115,52 @@ rounds, acceptance per position.
 
 ## Card results
 
-(none yet)
+**00194 `real8-draft-graph-switch`** (06:00 to 06:22 UTC, exit 0, all three arms ok; TP8 + EP8; build 4's code and env;
+MTP k = 3; greedy; 128 tokens; results `reports/mtp-draft-graph/card/00194-real8-draft-graph-switch/`, `headline.md`;
+analysis `tools/ab_summary.py`, `tools/timer_ab.py`). MEASURED:
+
+1. Tiny model at TP8, flag on, `--spec 3`: PASSED (`hc` and `hc+mtp3` on the fused verify rung: tokens equal the
+   reference). The workers log `Flash-Next MTP: the 3 draft passes of a decode step run in one HPU graph
+   (VLLM_HPU_MTP_DRAFT_GRAPH=1, lazy mode True)`.
+2. One server, the flag switched per round (`mtp3-switch`), steady ms per token (ms per step):
+
+| level | off (per-pass) rounds | on (one graph) rounds | mean off | mean on | change |
+|---|---|---|---|---|---|
+| 32 streams | 35.94 / 35.53 / 40.09 | 38.76 / 37.69 / 38.65 | 37.19 (97.8) | 38.37 (99.9) | +2.1 ms per step, inside the round spread |
+| 1 stream | 33.38 / 29.47 / 30.29 | 28.00 / 29.29 / 28.39 | 31.05 (86.4) | 28.56 (79.5) | **-6.9 ms per step, -8 % per token** (pairs -15.0 / -0.5 / -5.3) |
+
+   Acceptance at 32 streams off 0.756 / 0.533 / 0.384, 0.741 / 0.545 / 0.405, 0.745 / 0.526 / 0.371; on 0.747 /
+   0.526 / 0.382, 0.747 / 0.532 / 0.383, 0.748 / 0.537 / 0.391. At 1 stream all six rounds: 2.822 tokens per step,
+   0.756 / 0.644 / 0.422, 45 drafts, and stream 0's text identical: **the drafts are the same on the card**.
+   Every switch was taken (8 worker lines per switch, `switch_lines`).
+3. The MTP timer (steady records: the last two per rank and key, median of the 8 ranks):
+
+| | 1 stream (4 rows) | 32 streams (128 rows) |
+|---|---|---|
+| draft, per-pass | 17.1 ms (pass0 3.7, meta 0.8 + 0.7, pass1 2.8, pass2 2.7, final wait 6.4) | 17.7 ms (pass0 4.4, meta 1.1 + 1.0, pass1 3.4, pass2 3.4, final wait 3.9) |
+| draft, one graph | **12.4 ms** (positions 0.6, meta 1.1, graph 6.3, final wait 4.6) | **15.2 ms** (positions 0.7, meta 1.5, graph 8.2, final wait 4.6) |
+| verify, per-pass rounds / graph rounds | 65.6 / 67.5 ms | 78.0 / 81.5 ms |
+
+   The loop graph's first three 25-step records at 32 streams hold its compiles (draft 54 / 45 / 27 ms: the warm
+   round and the first measured round, new batch sizes as streams finish), which made the `on` arm's first 32-stream
+   round slow (pauses up to 8.2 s). The verification span of the graph rounds was 1.9 / 3.5 ms longer (cause not
+   known; INFERRED candidates: both graph sets live in the switch server, allocator state after the loop's replay):
+   it cancels the draft's 2.5 ms at 32 streams.
+4. A server started with the flag on (`mtp3-graph`): 32 streams 36.87 / 38.78 / 34.52 ms per token (mean 36.72,
+   95.6 ms per step; acceptance 0.73 to 0.75 / 0.53 to 0.55 / 0.37 to 0.40); 1 stream 21.03 / 20.67 / 21.34 (mean
+   21.01 = 47.6 tok/s, 57.2 ms per step; acceptance 0.826 / 0.565 / 0.391). Its 1-stream verification span was 47.8 ms
+   against 65.6 ms on the switch server in both arms: server-to-server spread (the host-bound 1-stream step), not
+   the flag. Draft span 9.2 ms (1 stream), 13.2 ms (32 streams). Device memory about 66 GB per card in both servers,
+   no `PT_DEVMEM`, no traceback.
+
+**Why short of the INFERRED 7 to 10 ms per 32-stream step:** merging the passes keeps every recipe launch (each
+collective splits a captured graph into recipes, and the bridge's host cost is per launch: about 150 us, BRIEF
+22:23 and 00174); it removes only the per-replay overhead of the two extra replay calls and the lazy LM-head and
+arg-max segments between them. The single replay still issues 8.2 ms at 32 streams.
+
+**Next levers for the draft (not built):** fewer collectives per draft pass (`VLLM_HPU_MTP_REPLICATED_FC=1`, the
+collectives track's flag: the two fc all-gathers of each pass), engine-step's I01 for the later passes' metadata
+(`VLLM_HPU_FLASH_NEXT_DECODE_METADATA=1`: 1.1 to 1.5 ms; CPU-proven together with the flag, `bf7cf32c`), k = 2 (one
+pass fewer), the bridge's per-launch path (native-replay). A follow-up job is ready on the test branch:
+`mtp2-async-switch` (the A/B on build 4's recommended serving form, `HEADLINE_ASYNC_MTP_TIMING=0`) and
+`HEADLINE_SWITCH_SET=graph-md` (the 2 x 2 with I01).
