@@ -204,6 +204,14 @@ while [ "$i_arm" -lt "${#ARMS[@]}" ]; do
                 --warm-tokens "$WARM" --repeat-top 2 --no-mintok-check --probe-arg "--sampled-levels=$LEVELS" \
                 --probe-arg --interleave-sampled --probe-arg "--rounds=$ROUNDS" $(barrier_args "$arm") $(guard_args)
             ;;
+        nospec-async-spin)
+            # async-sched job branch: nospec-async with the bridge's accumulation-queue thread back
+            # (PT_HPU_SYNCHRONOUS_ACC_QUEUE_FLUSHING=0): does synchronous flushing cost async scheduling its overlap?
+            PT_HPU_SYNCHRONOUS_ACC_QUEUE_FLUSHING=0 VLLM_HPU_FLASH_NEXT_ASYNC_SCHED=1 \
+                bash "$HERE/serve_probe.sh" --out "$OUT/$arm" --levels "$LEVELS" --tokens "$TOKENS" \
+                --warm-tokens "$WARM" --repeat-top 2 --no-mintok-check --probe-arg --no-sampled-check \
+                --probe-arg "--rounds=$ROUNDS"
+            ;;
         nospec-devids)
             # async-sched job branch: the nospec server (no async scheduling) with the PLE n-gram ids in the graph
             # (VLLM_HPU_PLE_HOST_NGRAM_IDS=0, what async scheduling must use): the ids' cost alone.
