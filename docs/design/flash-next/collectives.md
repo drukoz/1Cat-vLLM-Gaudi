@@ -527,7 +527,9 @@ on 2026-11-22** (BRIEF 00:50 UTC).
    `--require-log`, `--forbid-log`, `--probe-require-log runs.the.dense.MoE.form`) and `BRIDGE_REQUIRE_LOG="runs the
    dense MoE form"` (bridge_reuse_job.sh c9680081, node md5 c323c61b); the job script is `~/farm/q/jobs/00234/cmd.sh`.
    Late file `~/farm/collectives/bridge/late/00234.env` = `SPIN=on`, `REF_PAIR=1`, `PLACE=/results/bench/place.sh`
-   (place_wrap.sh there is now 363bcf9d), `LEAN4=0`, `LEAN5=lean6m-43fdd6850644`,
+   (place_wrap.sh there is now 98213f8c, md5 7b159d11: it also resets its mask to the container's cpuset before each
+   server, after integration found in 00222 that place.sh shrinks the CPU set of every later server of one container
+   by 16; one server per container here, so 00234 is not hit), `LEAN4=0`, `LEAN5=lean6m-43fdd6850644`,
    `VERIFY_KV=PT_HPU_HPUGRAPH_STATIC_PLAN_MISS_LOG=200`; no pin. This agent's waiters fetch every arm
    (`card/00234-real8-bridge-reuse3-*`, verdicts) and, as soon as real-lean5-verify ends, its `server0.log` with the miss
    table (`card/00234-early/real-lean5-verify/miss_table.txt`). Report: the verdicts, the spinner pair (real-ref against
