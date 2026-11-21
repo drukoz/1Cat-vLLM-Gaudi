@@ -395,6 +395,11 @@ while [ "$i_arm" -lt "${#ARMS[@]}" ]; do
                 # whether the chain served the tiny's decode steps (the runner logs its stage once), what it copied
                 grep -rhoE "chained behind its verification, stage [AB]|keeps the draft after the host read: .*|HPU graph replay copies .*" \
                     "$OUT/$arm" 2>/dev/null | cut -c1-400 | sort | uniq -c | head -20
+                want_stage=B
+                case "$arm" in tiny-chain | tiny-m1) want_stage=A ;; esac
+                if [ "$rc" -eq 0 ] && ! grep -rqE "chained behind its verification, stage $want_stage" "$OUT/$arm" 2>/dev/null; then
+                    echo "headline_job: WARNING: $arm passed but no step was chained in stage $want_stage (the gate did not test it)"
+                fi
                 echo "=== headline_job: arm $arm rc=$rc end $(date -u +%T)"
                 continue
             fi
