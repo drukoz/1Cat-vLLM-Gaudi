@@ -543,6 +543,7 @@ if TYPE_CHECKING:
     VLLM_HPU_MTP_DRAFT_LOOP: int = 0  # 0 draft positions read back from the device (default), 1 host books
     VLLM_HPU_MTP_DRAFT_IDS: int = 0  # 0 draft ids by argmax, int64 narrowed in the graph (default), 1 int32 ids
     VLLM_HPU_MTP_DRAFT_GRAPH: int = 0  # 0 one HPU graph per MTP draft pass (default), 1 the k passes in one graph
+    VLLM_HPU_MTP_DRAFT_CHAIN: int = 0  # 0 the MTP draft after the host read (default), 1 chained behind the verify
     VLLM_HPU_MTP_TIMING: int = 0  # 0 off (default), 1 time the verification part and the draft of every step
     VLLM_HPU_MTP_CHUNK_KV: int = 0  # 1 the MTP draft also runs over prefill chunks that complete no prompt
     VLLM_HPU_GDN_KERNEL_INTERLEAVE: int = 0  # 0 today's GDN decode/verify kernels, 1 four value rows per iteration
@@ -2046,6 +2047,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # decode draft. Prefill drafts and the draft-rank log (VLLM_FLASH_NEXT_DRAFT_RANK_LOG=1) keep the per-pass path.
     "VLLM_HPU_MTP_DRAFT_GRAPH":
     lambda: int(os.environ.get("VLLM_HPU_MTP_DRAFT_GRAPH", "0")),
+
+    # The Flash-Next MTP draft chained behind the verification. 0 (default) = the runner reads the verification's
+    # result on the host (parse_output), then builds the draft's inputs and issues it. 1 = right after the rejection
+    # sampler, before any host read, the drafter computes on the device each request's committed rows, the draft's
+    # inputs and its later passes' block tables and slots, and issues the draft (MtpDraftChain, one HPU graph; its
+    # device outputs stay in HPUModelRunner._mtp_chain_out for async scheduling's mode 3). Needs
+    # VLLM_HPU_MTP_DRAFT_GRAPH=1 and the sparse decode metadata (VLLM_HPU_FLASH_NEXT_DECODE_METADATA=1); a step with
+    # a prefill, a sampled request (greedy only so far), structured output or the draft-rank log keeps today's path.
+    "VLLM_HPU_MTP_DRAFT_CHAIN":
+    lambda: int(os.environ.get("VLLM_HPU_MTP_DRAFT_CHAIN", "0")),
 
     # What a speculative step is made of. 1 = the runner times every step of a speculative server: the verification
     # part (to the drafter call) and the draft, with the proposer's laps per draft pass and one device wait after

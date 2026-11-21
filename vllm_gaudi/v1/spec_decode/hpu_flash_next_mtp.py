@@ -271,6 +271,13 @@ class HpuFlashNextMtpProposer(HpuEagleProposer):
     _draft_graph = None
     draft_graph_calls = 0
 
+    def _draft_mode_key(self) -> tuple:
+        """The switchable flags a captured draft graph depends on (VLLM_HPU_VOCAB_PARALLEL_LOGITS: which LM head
+        and arg max the passes run): part of the graph's key, so a runtime switch captures a graph of its own."""
+        from vllm_gaudi.distributed import vocab_parallel
+
+        return (int(vocab_parallel.enabled(self.model)), )
+
     def _draft_graph_enabled(self, common_attn_metadata) -> bool:
         """True for a decode draft of an MTP drafter with VLLM_HPU_MTP_DRAFT_GRAPH=1 and no draft-rank log."""
         return (int(gaudi_envs.VLLM_HPU_MTP_DRAFT_GRAPH) == 1 and self.method == "mtp"
@@ -305,6 +312,78 @@ class HpuFlashNextMtpProposer(HpuEagleProposer):
                         bool(htorch.utils.internal.is_lazy()))
         return self._draft_graph
 
+    # VLLM_HPU_MTP_DRAFT_CHAIN=1: the draft chained behind the verification (MtpDraftChain), built at its first step.
+    _draft_chain = None
+    draft_chain_calls = 0
+
+    def _draft_chain_module(self, model_runner):
+        """The ``MtpDraftChain`` of this drafter, in its own HPU graph in lazy mode (built once). Its passes run the
+        draft adapter's own forward like ``_draft_graph_loop``'s; its ids are int32 from fp32 id tables (card rule
+        9: the next step reads them outside this graph); its later passes take the sparse-QSA metadata of
+        engine-step's I01 (block table and slots, no paged-attention buffers), built on the device."""
+        if self._draft_chain is None:
+            import habana_frameworks.torch as htorch
+            from vllm_gaudi.distributed import vocab_parallel
+            from vllm_gaudi.v1.spec_decode.flash_next_mtp_steps import MtpDraftChain, first_max_ids
+
+            adapter = self.model
+            adapter_forward = type(adapter).forward
+            block_size = int(model_runner.block_size)
+
+            def pass_forward(**kwargs):
+                return adapter_forward(adapter, **kwargs)
+
+            def draft_tokens(hidden_states):
+                if vocab_parallel.enabled(self.model):
+                    return vocab_parallel.vocab_parallel_argmax(self.model, hidden_states)
+                return first_max_ids(self.model.compute_logits(hidden_states))
+
+            def make_step_metadata(slot_mapping, block_table, ring_slots):
+                return HPUAttentionMetadataV1.make_decode_metadata(
+                    block_list=None,
+                    block_usage=None,
+                    block_groups=None,
+                    input_positions=None,
+                    slot_mapping=slot_mapping,
+                    block_size=block_size,
+                    window_block_list=None,
+                    window_block_usage=None,
+                    window_block_groups=None,
+                    chunked_block_list=None,
+                    chunked_block_usage=None,
+                    chunked_block_groups=None,
+                    block_table=block_table,
+                    load_indices_tensor=ring_slots,
+                    store_indices_tensor=ring_slots,
+                )
+
+            chain = MtpDraftChain(pass_forward, draft_tokens, self.num_speculative_tokens, self.max_model_len,
+                                  block_size, model_runner._PAD_BLOCK_ID, model_runner._PAD_SLOT_ID,
+                                  make_step_metadata)
+            if htorch.utils.internal.is_lazy():
+                chain = htorch.hpu.wrap_in_hpu_graph(chain, disable_tensor_cache=True)
+            self._draft_chain = chain
+            logger.info("Flash-Next MTP: the draft is chained behind the verification (VLLM_HPU_MTP_DRAFT_CHAIN=1, "
+                        "k = %d, lazy mode %s)", self.num_speculative_tokens, bool(htorch.utils.internal.is_lazy()))
+        return self._draft_chain
+
+    def propose_chain(self, sampled_token_ids, cu_num_draft_tokens, real, verify_positions, verify_hidden,
+                      common_attn_metadata, table_full, model_runner):
+        """The chained draft (VLLM_HPU_MTP_DRAFT_CHAIN=1): ``MtpDraftChain`` on the verification's device result.
+
+        ``sampled_token_ids`` the rejection sampler's ``[B, 1 + k]``; ``cu_num_draft_tokens`` the step's cumulative
+        draft counts; ``real`` bool ``[B]`` (the rows of real requests); ``verify_positions`` and ``verify_hidden``
+        (a tuple of the target's multi-stream outputs) of the verification rows; ``common_attn_metadata`` the
+        verification's metadata (pass 0's); ``table_full`` int32 ``[B, max_blocks]`` the requests' attention block
+        table. Returns ``MtpChainDrafts`` on the device; nothing is read back."""
+        self.last_draft_top_ids = None
+        self.host_base_positions = None
+        out = self._draft_chain_module(model_runner)(sampled_token_ids, cu_num_draft_tokens, real, verify_positions,
+                                                     tuple(verify_hidden), common_attn_metadata, table_full,
+                                                     self._draft_mode_key())
+        self.draft_chain_calls += 1
+        return out
+
     def _propose_in_one_graph(self, target_token_ids, target_positions, target_hidden_states, last_token_indices,
                               common_attn_metadata, block_table_cpu_tensor, model_runner):
         """``propose`` for a decode draft with VLLM_HPU_MTP_DRAFT_GRAPH=1: the same drafts from one replay.
@@ -322,19 +401,18 @@ class HpuFlashNextMtpProposer(HpuEagleProposer):
             positions_cpu = self._draft_positions_cpu(target_positions.view(-1), last_token_indices, batch_size)
             if timer is not None:
                 timer.lap("graph_positions")
-            # The QSA raw-key ring is addressed by the request's GDN state slot (the lattice's column 0).
-            ring_slots = None
-            if getattr(common_attn_metadata, "load_indices_tensor", None) is not None:
-                ring_slots = ring_slots_from_lattice(common_attn_metadata.load_indices_tensor)
+            # The QSA raw-key ring slots (the lattice's column 0) are sliced from pass 0's metadata inside the graph
+            # (MtpDraftLoop): a view made here would be an unmatched graph input, copied by its own launch.
             step_metadata = tuple(
-                self.prepare_attn_metadata(block_table_cpu_tensor, positions_cpu + step, model_runner, ring_slots)
+                self.prepare_attn_metadata(block_table_cpu_tensor, positions_cpu + step, model_runner, None)
                 for step in range(1, k))
             if timer is not None:
                 timer.lap("graph_meta")
         else:
             self.host_base_positions = None
         draft_token_ids = self._draft_graph_loop()(target_token_ids, target_positions, target_hidden_states,
-                                                   last_token_indices, common_attn_metadata, step_metadata)
+                                                   last_token_indices, common_attn_metadata, step_metadata,
+                                                   self._draft_mode_key())
         self.draft_graph_calls += 1
         if timer is not None:
             timer.lap("graph")

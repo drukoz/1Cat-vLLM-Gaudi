@@ -7392,6 +7392,10 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             self.event_start = self.profiler.get_timestamp_us()
             self.profiler.start("internal", "decode")
             fuse_greedy_sampling = self._can_fuse_plain_greedy_sampling(pd_info.decode_req_ids)
+            # VLLM_HPU_MTP_DRAFT_CHAIN=1: whether this step's draft is chained behind its verification (decided
+            # before the forward; async scheduling's mode 3 reads it too)
+            self._mtp_chain_step = self._mtp_chain_decision(decode_data, num_decodes, num_prefills, warmup_mode)
+            self._mtp_chain_out = None
             greedy_stop_ids = (self._fused_greedy_stop_ids(pd_info.decode_req_ids,
                                                            int(decode_data.logits_indices.shape[0]))
                                if fuse_greedy_sampling else None)
@@ -7535,41 +7539,13 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                                 )
                         if step_timer is not None:
                             step_timer.lap("sample")
-                        decode_sampled_token_ids = \
-                            self.rejection_sampler.parse_output(
-                                sampled_token_ids,
-                                self.input_batch.vocab_size,
-                        )
-                        if step_timer is not None:
-                            step_timer.lap("wait")  # the first host read of this step's device results
-                        if isinstance(decode_sampled_token_ids, tuple):
-                            decode_sampled_token_ids, _ = decode_sampled_token_ids
-                        # Trim output in case of dummy padding
-                        decode_sampled_token_ids = decode_sampled_token_ids[:num_decodes]
-                        if self._recurrent_spec:
-                            for req_id, accepted_tokens in zip(
-                                    self.input_batch.req_ids[:num_decodes],
-                                    decode_sampled_token_ids,
-                            ):
-                                self._gdn_num_accepted_by_req[req_id] = max(1, len(accepted_tokens))
-                            if decode_data is not None and decode_data.recurrent_boundary is not None:
-                                # Align mode (M3-T10b): accepted tokens that complete a
-                                # position block move their state from the store lattice
-                                # into that block's slot for prefix-cache reuse.
-                                self_commits = self._commit_recurrent_boundaries(
-                                    decode_data.recurrent_boundary,
-                                    [len(a) for a in decode_sampled_token_ids])
-                                # T10c: a commit into the running block itself replaced the
-                                # multi-token window, so the next step starts from one token.
-                                for i in self_commits:
-                                    self._gdn_num_accepted_by_req[self.input_batch.req_ids[i]] = 1
-                        # convert decode_sampled_token_ids as list of tensor
-                        spec_decode_num_tokens = [len(v) for v in decode_sampled_token_ids]
-                        decode_sampled_token_ids = [
-                            torch.tensor(v, device="cpu").int() for v in decode_sampled_token_ids
-                        ]
-                        decode_sampled_token_ids_device = \
-                            sampled_token_ids.to("hpu", non_blocking=True)
+                        if self._mtp_chain_step:
+                            # VLLM_HPU_MTP_DRAFT_CHAIN=1: the draft goes behind the verification now, before the
+                            # host reads anything (the books below read the result as before)
+                            self._mtp_chain_issue(sampled_token_ids, decode_data, non_flattened_hidden_states,
+                                                  aux_hidden_states, num_decodes)
+                        decode_sampled_token_ids, spec_decode_num_tokens, decode_sampled_token_ids_device = \
+                            self._mtp_chain_settle(sampled_token_ids, decode_data, num_decodes, step_timer)
                     decode_sampled_requests.extend(self.input_batch.req_ids[:num_decodes])
                     ##### Sampling End #####
 
@@ -7753,7 +7729,10 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                 mtp_step_timer = None if warmup_mode else self._mtp_step_timer
                 if mtp_step_timer is not None:
                     timer_kind = "prefill" if num_decodes == 0 else ("verify" if num_prefills == 0 else "mixed")
-                    if int(gaudi_envs.VLLM_HPU_MTP_DRAFT_GRAPH) == 1:
+                    if self._mtp_chain_step:
+                        # the draft was issued behind the verification (inside the "verify" span)
+                        timer_kind += "+chain"
+                    elif int(gaudi_envs.VLLM_HPU_MTP_DRAFT_GRAPH) == 1:
                         # the one-graph drafts in records of their own (the flag can be switched at run time)
                         timer_kind += "+graph"
                     if (int(gaudi_envs.VLLM_HPU_FLASH_NEXT_DECODE_METADATA) == 1
@@ -10659,7 +10638,10 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             assert isinstance(self.drafter, EagleProposer)
 
             draft_token_ids = None
-            if decode_data is not None:
+            if decode_data is not None and self._mtp_chain_step and self._mtp_chain_out is not None:
+                # VLLM_HPU_MTP_DRAFT_CHAIN=1: the chained draft already ran behind the verification
+                draft_token_ids = self._mtp_chain_out.drafts[:num_decodes]
+            elif decode_data is not None:
                 assert num_decodes is not None
                 draft_token_ids = self.propose_eagle_decode(
                     sampled_token_ids,
@@ -11010,6 +10992,118 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         active_rows_hpu = async_h2d_copy(torch.tensor(active_local_rows, dtype=torch.int64), device=self.device)
         output.index_copy_(0, active_rows_hpu, drafts)
         return output
+
+    # VLLM_HPU_MTP_DRAFT_CHAIN=1 (the draft chained behind the verification): this step's decision, taken before the
+    # verification's forward, and the chain's device outputs (MtpChainOut) from the draft's issue until the next
+    # step's decision. Async scheduling's mode 3 builds the next step's inputs from _mtp_chain_out.
+    _mtp_chain_step = False
+    _mtp_chain_out = None
+    _mtp_chain_refusals = None
+
+    def _mtp_chain_decision(self, decode_data, num_decodes: int, num_prefills: int, warmup_mode: bool) -> bool:
+        """Whether this step chains its draft behind its verification (VLLM_HPU_MTP_DRAFT_CHAIN=1). A step the
+        chain cannot serve takes today's path; each reason is logged once."""
+        if int(gaudi_envs.VLLM_HPU_MTP_DRAFT_CHAIN) != 1 or warmup_mode:
+            return False
+        if self.speculative_config is None or not is_flash_next_mtp(self.speculative_config):
+            return False
+        reason = None
+        if not hasattr(getattr(self, "drafter", None), "propose_chain"):
+            reason = "the drafter has no chained draft"
+        elif int(gaudi_envs.VLLM_HPU_MTP_DRAFT_GRAPH) != 1:
+            reason = "it needs VLLM_HPU_MTP_DRAFT_GRAPH=1"
+        elif getattr(self.drafter, "draft_rank_stats", None) is not None:
+            reason = "the draft-rank log is on"
+        elif decode_data is None or decode_data.spec_decode_metadata is None or num_decodes <= 0:
+            return False
+        elif num_prefills > 0:
+            reason = "a prefill in the step"
+        elif self.use_structured_output:
+            reason = "structured output"
+        elif not (int(gaudi_envs.VLLM_HPU_FLASH_NEXT_DECODE_METADATA) == 1
+                  and self.flash_next_sparse_decode_metadata()):
+            reason = "it needs the sparse decode metadata (VLLM_HPU_FLASH_NEXT_DECODE_METADATA=1 in force)"
+        else:
+            for req_id in self.input_batch.req_ids[:num_decodes]:
+                params = self.requests[req_id].sampling_params
+                if params is None or params.sampling_type != SamplingType.GREEDY:
+                    reason = "a sampled request (greedy only so far)"
+                    break
+        if reason is None:
+            return True
+        refusals = self._mtp_chain_refusals
+        if refusals is None:
+            refusals = self._mtp_chain_refusals = set()
+        if reason not in refusals:
+            refusals.add(reason)
+            logger.info("VLLM_HPU_MTP_DRAFT_CHAIN=1: a step keeps the draft after the host read: %s", reason)
+        return False
+
+    def _mtp_chain_issue(self, sampled_token_ids, decode_data, hidden_states, aux_hidden_states, num_decodes: int):
+        """Issue the chained draft (drafter.propose_chain) on the verification's device result and keep its device
+        outputs in ``self._mtp_chain_out``. Host work: a real-row mask and the requests' attention block table,
+        copied to the device whole (fresh tensors, not views: no unmatched graph input)."""
+        from vllm_gaudi.v1.spec_decode.flash_next_mtp_steps import MtpChainOut
+
+        spec = decode_data.spec_decode_metadata
+        batch = int(sampled_token_ids.shape[0])
+        real = async_h2d_copy(torch.arange(batch) < num_decodes, device=self.device)
+        table = self.input_batch.block_table[self._get_attention_group_id_for_hybrid()].get_cpu_tensor()
+        max_blocks = int(self._block_table_max_blocks)
+        width = min(int(table.shape[1]), max_blocks)
+        table_full = torch.full((batch, max_blocks), int(self._PAD_BLOCK_ID), dtype=torch.int32)
+        table_full[:num_decodes, :width] = table[:num_decodes, :width].to(torch.int32)
+        table_full = async_h2d_copy(table_full, device=self.device)
+        if self.use_aux_hidden_state_outputs and aux_hidden_states is not None:
+            verify_hidden = tuple(aux_hidden_states)
+        else:
+            verify_hidden = (hidden_states, )
+        drafts = self.drafter.propose_chain(sampled_token_ids, spec.cu_num_draft_tokens, real, decode_data.position_ids,
+                                            verify_hidden, decode_data.attn_metadata, table_full, self)
+        self._mtp_chain_out = MtpChainOut(accepted=drafts.accepted, next_ids=drafts.next_ids,
+                                          sampled=sampled_token_ids, last_row=drafts.last_row,
+                                          num_decodes=int(num_decodes), k=int(drafts.drafts.shape[1]),
+                                          drafts=drafts.drafts)
+
+    def _mtp_chain_settle(self, sampled_token_ids, decode_data, num_decodes: int, step_timer=None):
+        """The host read of a verification's result and the books after it (parse_output, the accepted counts of
+        the recurrent lattice, the align-mode commits): the runner's code after the rejection sampler, in a method
+        of its own so async scheduling's mode 3 can run it one step late behind the chained draft. Returns
+        ``(decode_sampled_token_ids, spec_decode_num_tokens, decode_sampled_token_ids_device)``."""
+        decode_sampled_token_ids = \
+            self.rejection_sampler.parse_output(
+                sampled_token_ids,
+                self.input_batch.vocab_size,
+        )
+        if step_timer is not None:
+            step_timer.lap("wait")  # the first host read of this step's device results
+        if isinstance(decode_sampled_token_ids, tuple):
+            decode_sampled_token_ids, _ = decode_sampled_token_ids
+        # Trim output in case of dummy padding
+        decode_sampled_token_ids = decode_sampled_token_ids[:num_decodes]
+        if self._recurrent_spec:
+            for req_id, accepted_tokens in zip(
+                    self.input_batch.req_ids[:num_decodes],
+                    decode_sampled_token_ids,
+            ):
+                self._gdn_num_accepted_by_req[req_id] = max(1, len(accepted_tokens))
+            if decode_data is not None and decode_data.recurrent_boundary is not None:
+                # Align mode (M3-T10b): accepted tokens that complete a
+                # position block move their state from the store lattice
+                # into that block's slot for prefix-cache reuse.
+                self_commits = self._commit_recurrent_boundaries(
+                    decode_data.recurrent_boundary,
+                    [len(a) for a in decode_sampled_token_ids])
+                # T10c: a commit into the running block itself replaced the
+                # multi-token window, so the next step starts from one token.
+                for i in self_commits:
+                    self._gdn_num_accepted_by_req[self.input_batch.req_ids[i]] = 1
+        # convert decode_sampled_token_ids as list of tensor
+        spec_decode_num_tokens = [len(v) for v in decode_sampled_token_ids]
+        decode_sampled_token_ids = [torch.tensor(v, device="cpu").int() for v in decode_sampled_token_ids]
+        decode_sampled_token_ids_device = \
+            sampled_token_ids.to("hpu", non_blocking=True)
+        return decode_sampled_token_ids, spec_decode_num_tokens, decode_sampled_token_ids_device
 
     def propose_eagle_decode(
         self,
