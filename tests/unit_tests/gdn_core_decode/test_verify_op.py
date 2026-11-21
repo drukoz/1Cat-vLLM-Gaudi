@@ -17,7 +17,7 @@ import torch
 import vllm_gaudi  # noqa: F401  (the plugin registers the platform the composed-path ops run on)
 from vllm.model_executor.layers.layernorm import RMSNormGated
 
-from flashinfer_gaudi.gdn_core_decode import GdnGateActivation
+from flashinfer_gaudi.gdn_core_decode import GdnGateActivation, gdn_core_decode_reference
 from flashinfer_gaudi.gdn_core_verify import (GDN_CORE_VERIFY_MAX_NODES, GdnCoreVerifyMode, gdn_core_verify,
                                               gdn_core_verify_available, gdn_core_verify_reference)
 from flashinfer_gaudi.gdn_decode import gated_delta_rule_mtp_packed
@@ -135,6 +135,41 @@ def test_matches_m3_composed_path(H, HV, dtype, align, trimmed, K):
     the contract: fp32 out/ssm ``atol=1e-5, rtol=1e-5``; bf16 out ``atol=5e-2, rtol=1e-2``, ssm ``atol=3e-2,
     rtol=1e-2``; conv state exact in both.
     """
+    _check_chain(H, HV, dtype, align, trimmed, K)
+
+
+@pytest.mark.parametrize("H,HV", [(8, 24), (4, 12)], ids=["tp2", "tp4"])
+@pytest.mark.parametrize("align", [False, True], ids=["noalign", "align"])
+def test_after_a_700_token_recurrence_matches_m3_composed_path(H, HV, align):
+    """As above, k = 3 and bf16, but every SSM slot first runs 700 decode steps of the recurrence.
+
+    mtp-card-ready's job 00105 (tiny model with the 128-wide GDN heads, TP2: 8 key and 24 value heads per rank,
+    k = 3) saw the fused verification rung differ at token 4 of its 700-token prompt; engine-step's 00093 (no
+    speculation) differed at the same prompt and token. The CPU side of the question: after a long recurrence
+    (states far from the tests' random 0.1-scale slots) the op's reference still is the torch verification path.
+    """
+    _check_chain(H, HV, torch.bfloat16, align, False, 3, prefill_steps=700)
+
+
+def _prefilled_ssm(ssm0, conv_width, A_log, dt_bias, wt, nw, steps):
+    """Every slot of ``ssm0`` after ``steps`` decode steps of the recurrence (gdn_core_decode_reference), bf16
+    inputs, its own [S, 3, C] conv pool; slot 0 stays as it is (the tests' unused slot)."""
+    S, HV = ssm0.shape[0], ssm0.shape[1]
+    rows = torch.arange(1, S, dtype=torch.int32)
+    conv = torch.randn(S, 3, conv_width).to(torch.bfloat16)
+    ssm = ssm0.clone()
+    for _ in range(steps):
+        n = rows.numel()
+        gdn_core_decode_reference(conv, ssm,
+                                  torch.randn(n, conv_width).to(torch.bfloat16),
+                                  torch.randn(n, HV * D).to(torch.bfloat16),
+                                  torch.randn(n, HV).to(torch.bfloat16),
+                                  torch.randn(n, HV).to(torch.bfloat16), A_log, dt_bias, wt.to(torch.bfloat16),
+                                  nw.to(torch.bfloat16), rows, rows, D**-0.5, 1e-6, GATE)
+    return ssm
+
+
+def _check_chain(H, HV, dtype, align, trimmed, K, prefill_steps=0):
     torch.manual_seed(0)
     C = 2 * H * D + HV * D
     T, R = 1 + K, 3 + K
@@ -146,6 +181,10 @@ def test_matches_m3_composed_path(H, HV, dtype, align, trimmed, K):
     dt_bias = torch.randn(HV).float()
     wt = bf(4, C) * 0.5
     nw = bf(D) * 0.1 + 1
+    if prefill_steps:
+        before = float(ssm0[1:].abs().max())
+        ssm0 = _prefilled_ssm(ssm0, C, A_log, dt_bias, wt, nw, prefill_steps)
+        assert float(ssm0[1:].abs().max()) != before  # the recurrence moved every slot's state
     c1, s1 = conv0.clone(), ssm0.clone()  # the reference's pools
     c2, s2 = conv0.clone(), ssm0.clone()  # the composed path's pools
     out_tol = dict(atol=1e-5, rtol=1e-5) if dtype == torch.float32 else dict(atol=5e-2, rtol=1e-2)

@@ -177,6 +177,23 @@ def _save_ssm_state(core_attn_out, final_state, ssm_state, state_indices):
 
 class HPUGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
 
+    @property
+    def cache_group_idx(self):
+        return self.__dict__.get("_hpu_cache_group_idx")
+
+    @cache_group_idx.setter
+    def cache_group_idx(self, value):
+        # The runner hands a device tensor made from a Python int (hpu_model_runner.py). Its value is kept as a
+        # Python int too, read here once at setup and never in a forward: the key of this layer's cache group in
+        # the per-step memo of VLLM_HPU_GDN_GLUE_CACHE=1.
+        self.__dict__["_hpu_cache_group_idx"] = value
+        key = None
+        if isinstance(value, int):
+            key = value
+        elif self.__dict__.get("gdn_glue_cache") and torch.is_tensor(value) and value.numel() == 1:
+            key = int(value.item())  # only with the flag: without it nothing reads the device here
+        self.__dict__["_hpu_cache_group_key"] = key
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         # cache_group_idx: set later by model runner for hybrid cache
@@ -225,12 +242,17 @@ class HPUGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 compact_qk=self.gdn_compact_qk_input,
             )
 
+        # VLLM_HPU_GDN_GLUE_CACHE=1 (idea I25): the fused decode and verify ops get the transposed conv weight and
+        # dt_bias in fp32 from buffers built at load (the hooks below), their owned int32 state indices once per
+        # step and cache group (_gdn_glue_memo), and the dead zeros of the output buffer are not made.
+        self.gdn_glue_cache = envs.VLLM_HPU_GDN_GLUE_CACHE == 1
+
         # The split TPC kernels vector-load one convolution tap across channels.
         # Materialize that tap-major layout once while the checkpoint loader
         # writes the canonical [channels, 1, width] parameter.
         self._triton_conv_weight_ready = False
         self._triton_dt_bias_ready = False
-        if _triton_gaudi_mode in ("hybrid", "strict"):
+        if _triton_gaudi_mode in ("hybrid", "strict") or self.gdn_glue_cache:
             conv_weight = self.conv1d.weight
             self.register_buffer(
                 "_triton_conv_weight_t",
@@ -338,6 +360,57 @@ class HPUGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         num_rows = int(query_start_loc[-1]) if query_start_loc is not None else num_tokens
         check_gdn_core_decode_indices(load_state_indices, store_state_indices, self.kv_cache[1].shape[0], num_rows)
 
+    def _gdn_fused_constants(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """``(conv_weight_t [W, C], dt_bias fp32)`` for the fused ops.
+
+        With VLLM_HPU_GDN_GLUE_CACHE=1 and both load hooks run, the buffers they filled (no op per step);
+        otherwise the per-step copy and cast, as before."""
+        if self.gdn_glue_cache and self._triton_conv_weight_ready and self._triton_dt_bias_ready:
+            return self._triton_conv_weight_t, self._triton_dt_bias_f32
+        weight = self.conv1d.weight
+        return weight.view(weight.size(0), weight.size(2)).t().contiguous(), self.dt_bias.float()
+
+    def _gdn_glue_memo(self) -> dict | None:
+        """A dict that lives exactly as long as this forward (it hangs on the forward context), or None.
+
+        Only with VLLM_HPU_GDN_GLUE_CACHE=1. Its entries are shared by the GDN layers of one cache group:
+        each keeps the source tensor it was made from, and a layer whose source is another tensor makes
+        its own."""
+        if not self.gdn_glue_cache:
+            return None
+        try:
+            context = get_forward_context()
+        except Exception:  # noqa: BLE001 - no forward context, no memo
+            return None
+        memo = getattr(context, "_hpu_gdn_glue_memo", None)
+        if memo is None:
+            memo = {}
+            context._hpu_gdn_glue_memo = memo
+        return memo
+
+    def _gdn_memo_get(self, key, source, make):
+        """``make()`` once per forward for ``(key, this layer's cache group)`` and the same ``source`` tensor."""
+        memo = self._gdn_glue_memo()
+        if memo is None:
+            return make()
+        key = (key, self.__dict__.get("_hpu_cache_group_key"))
+        hit = memo.get(key)
+        if hit is not None and hit[0] is source:
+            return hit[1]
+        value = make()
+        memo[key] = (source, value)
+        return value
+
+    def _owned_state_indices(self, load_state_indices, store_state_indices):
+        """The owned int32 copies the fused decode op takes: one pair per step and cache group with the memo.
+
+        Two tensors even when load and store are one tensor (no prefix caching), as without the memo."""
+        load = self._gdn_memo_get("owned_load", load_state_indices,
+                                  lambda: _owned(load_state_indices.to(torch.int32)))
+        store = self._gdn_memo_get("owned_store", store_state_indices,
+                                   lambda: _owned(store_state_indices.to(torch.int32)))
+        return load, store
+
     def _maybe_gdn_core_decode(self, mixed_qkv, z, a, b, load_state_indices, store_state_indices, num_tokens,
                                num_accepted_tokens, query_start_loc):
         """The fused core-decode op's ``[num_tokens, HV, D]`` fp32 output, or ``None`` for the torch path."""
@@ -350,18 +423,27 @@ class HPUGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         # direct-state view would shift every index. The indices are absolute pool slots
         # in every runner mode (compact pools pad with -1, which the op treats as padding).
         conv_pool, ssm_pool = self.kv_cache[0], self.kv_cache[1]
-        weight = self.conv1d.weight
-        conv_weight_t = weight.view(weight.size(0), weight.size(2)).t().contiguous()
         # The per-step inputs are slices of the projections (split / chunk). contiguous() copies them
         # only when the slice is not contiguous, and a slice of ONE row always is: at decode batch 1 the
         # op got views, and the Habana lazy bridge cannot hand a view to a custom op ("ValidateSyncInput
         # Tensors tensor_data is empty ... Strided Params Has Value: 1", first server run of the kernel,
         # 2026-11-20). owned() always makes a tensor of its own.
+        if not self.gdn_glue_cache:
+            weight = self.conv1d.weight
+            conv_weight_t = weight.view(weight.size(0), weight.size(2)).t().contiguous()
+            return gdn_core_decode(conv_pool, ssm_pool, _owned(mixed_qkv),
+                                   _owned(z.reshape(num_tokens, -1)), _owned(a), _owned(b),
+                                   self.A_log.float(), self.dt_bias.float(), conv_weight_t, self.norm.weight,
+                                   _owned(load_state_indices.to(torch.int32)),
+                                   _owned(store_state_indices.to(torch.int32)),
+                                   self.head_k_dim**-0.5, self.norm.eps, int(self._gdn_core_gate))
+        # VLLM_HPU_GDN_GLUE_CACHE=1: the same tensors, the constants from load and the indices once per group.
+        conv_weight_t, dt_bias_f32 = self._gdn_fused_constants()
+        owned_load, owned_store = self._owned_state_indices(load_state_indices, store_state_indices)
         return gdn_core_decode(conv_pool, ssm_pool, _owned(mixed_qkv),
                                _owned(z.reshape(num_tokens, -1)), _owned(a), _owned(b),
-                               self.A_log.float(), self.dt_bias.float(), conv_weight_t, self.norm.weight,
-                               _owned(load_state_indices.to(torch.int32)),
-                               _owned(store_state_indices.to(torch.int32)),
+                               self.A_log.float(), dt_bias_f32, conv_weight_t, self.norm.weight,
+                               owned_load, owned_store,
                                self.head_k_dim**-0.5, self.norm.eps, int(self._gdn_core_gate))
 
     def _use_gdn_recurrent_decode(self, load_state_indices, store_state_indices, num_tokens,
@@ -436,6 +518,33 @@ class HPUGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 self._log_gdn_core_verify_off(reason)
         if not self._gdn_core_verify_ok:
             return None
+        if not self.gdn_glue_cache:
+            row_indices, ssm_store = self._gdn_core_verify_rows(load, store, num_accepted_tokens, qsl, B, T, R,
+                                                                lattice_store_differs)
+            weight = self.conv1d.weight
+            conv_weight_t = weight.view(weight.size(0), weight.size(2)).t().contiguous()
+            # _owned, not contiguous(): a custom HPU op cannot be given a view (see _maybe_gdn_core_decode).
+            return gdn_core_verify(conv_pool, ssm_pool, _owned(mixed_qkv), _owned(z.reshape(num_tokens, -1)),
+                                   _owned(a), _owned(b), self.A_log.float(), self.dt_bias.float(), conv_weight_t,
+                                   self.norm.weight, _owned(row_indices), _owned(ssm_store.to(torch.int32)),
+                                   self.head_k_dim**-0.5, self.norm.eps, int(self._gdn_core_gate))
+        # VLLM_HPU_GDN_GLUE_CACHE=1: the constants from load, the owned row metadata once per group and step.
+        conv_weight_t, dt_bias_f32 = self._gdn_fused_constants()
+
+        def owned_rows():
+            rows, lattice = self._gdn_core_verify_rows(load, store, num_accepted_tokens, qsl, B, T, R,
+                                                       lattice_store_differs)
+            return _owned(rows), _owned(lattice.to(torch.int32))
+
+        row_indices, ssm_store = self._gdn_memo_get(("verify_rows", T, B, R, bool(lattice_store_differs)), load,
+                                                    owned_rows)
+        return gdn_core_verify(conv_pool, ssm_pool, _owned(mixed_qkv), _owned(z.reshape(num_tokens, -1)),
+                               _owned(a), _owned(b), self.A_log.float(), dt_bias_f32, conv_weight_t,
+                               self.norm.weight, row_indices, ssm_store,
+                               self.head_k_dim**-0.5, self.norm.eps, int(self._gdn_core_gate))
+
+    def _gdn_core_verify_rows(self, load, store, num_accepted_tokens, qsl, B, T, R, lattice_store_differs):
+        """The verify op's ``(row_indices [B, 5] int32, the SSM store lattice)``: the same for every layer of a group."""
         acc = num_accepted_tokens[:B].long()
         query_len = (qsl[1:B + 1] - qsl[:B]).long().clamp(0, T)
         conv_offset = acc.clamp(1, R - 2) - 1           # the conv path's clamp
@@ -450,13 +559,7 @@ class HPUGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             ssm_store = base.unsqueeze(1)
         row_indices = torch.stack([conv_load.long(), conv_offset, conv_store.long(), ssm_load.long(), query_len],
                                   dim=1).to(torch.int32).contiguous()
-        weight = self.conv1d.weight
-        conv_weight_t = weight.view(weight.size(0), weight.size(2)).t().contiguous()
-        # _owned, not contiguous(): a custom HPU op cannot be given a view (see _maybe_gdn_core_decode).
-        return gdn_core_verify(conv_pool, ssm_pool, _owned(mixed_qkv), _owned(z.reshape(num_tokens, -1)),
-                               _owned(a), _owned(b), self.A_log.float(), self.dt_bias.float(), conv_weight_t,
-                               self.norm.weight, _owned(row_indices), _owned(ssm_store.to(torch.int32)),
-                               self.head_k_dim**-0.5, self.norm.eps, int(self._gdn_core_gate))
+        return row_indices, ssm_store
 
     def rearrange_mixed_qkv(self, mixed_qkv):
         """Pure-torch rearrange – avoids einops graph breaks on HPU."""
@@ -477,12 +580,14 @@ class HPUGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         return query, key, value
 
     def _resolve_state_indices(self, attn_metadata, attribute):
-        """Resolve one state-index tensor, handling 2-D cache groups."""
+        """Resolve one state-index tensor, handling 2-D cache groups (once per step and group with the memo)."""
         indices = getattr(attn_metadata, attribute, None)
         if indices is not None and indices.dim() > 1:
             cg = self.cache_group_idx
             assert cg is not None
-            indices = indices.index_select(0, cg.view(1)).squeeze(0)
+            source = indices
+            indices = self._gdn_memo_get(("row", attribute), source,
+                                         lambda: source.index_select(0, cg.view(1)).squeeze(0))
         return indices
 
     def prepare_decode_state_view(self, attn_metadata, num_tokens: int) -> None:
@@ -651,11 +756,13 @@ class HPUGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 b = b.contiguous()
                 a = a.contiguous()
 
-        core_attn_out = torch.zeros(
-            (num_tokens, self.num_v_heads // self.tp_size, self.head_v_dim),
-            dtype=hidden_states.dtype,
-            device=hidden_states.device,
-        )
+        core_attn_out = None
+        if not self.gdn_glue_cache:
+            core_attn_out = torch.zeros(
+                (num_tokens, self.num_v_heads // self.tp_size, self.head_v_dim),
+                dtype=hidden_states.dtype,
+                device=hidden_states.device,
+            )
 
         gdn_core_out = None
         use_gdn_recurrent = False
@@ -671,6 +778,15 @@ class HPUGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             if use_gdn_recurrent:
                 self._check_gdn_core_decode_indices(load_state_indices, store_state_indices, query_start_loc,
                                                     num_tokens)
+
+        if core_attn_out is None and gdn_core_out is None:
+            # VLLM_HPU_GDN_GLUE_CACHE=1: the buffer only where a path below writes into it (the fused op's
+            # output replaces it).
+            core_attn_out = torch.zeros(
+                (num_tokens, self.num_v_heads // self.tp_size, self.head_v_dim),
+                dtype=hidden_states.dtype,
+                device=hidden_states.device,
+            )
 
         if conv_state is None:
             # No attn_metadata — skip core attention (profile run)
@@ -807,7 +923,7 @@ class HPUGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         elif gdn_core_out is not None:
             # === Part 2c: fused core decode/verify (one op: conv, gates, recurrence, gated RMSNorm; serves
             # gdn_core_decode and gdn_core_verify) ===
-            core_attn_out = gdn_core_out.to(core_attn_out.dtype)
+            core_attn_out = gdn_core_out.to(hidden_states.dtype)
 
         else:
             # === Part 2b: Decode =====================================

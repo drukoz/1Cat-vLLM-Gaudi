@@ -30,7 +30,9 @@ GUID_HOST_SOURCE = Path(__file__).resolve().parent / "guid_list_host.cpp"
 DECODE_GUID = "gdn_fused_core_decode_f32state_gaudi2"
 RECURRENT_GUID = "gdn_fused_recurrent_decode_f32state_gaudi2"
 VERIFY_GUID = "gdn_fused_core_verify_f32state_gaudi2"
-KERNELS = ("gdn_core_decode_gaudi2", "gdn_recurrent_decode_gaudi2", "gdn_core_verify_gaudi2")
+KERNELS = ("gdn_core_decode_gaudi2", "gdn_recurrent_decode_gaudi2", "gdn_core_verify_gaudi2",
+           "gdn_core_decode_interleaved_gaudi2", "gdn_core_verify_interleaved_gaudi2")
+INTERLEAVED = ("gdn_core_decode_interleaved_gaudi2", "gdn_core_verify_interleaved_gaudi2")
 TPC_FLAGS = ["-Wall", "-Werror", "-O2", "-march=gaudi2"]  # the decode kernel's flags
 GLUE_NODE_NOT_FOUND = 1
 
@@ -112,6 +114,35 @@ def test_build_compiles_every_kernel_with_the_default_flags(default_build) -> No
     assert flags["gdn_core_decode_gaudi2"] == TPC_FLAGS
     assert flags["gdn_core_verify_gaudi2"] == flags["gdn_core_decode_gaudi2"]
     assert flags["gdn_recurrent_decode_gaudi2"] == flags["gdn_core_decode_gaudi2"]
+    for kernel in INTERLEAVED:
+        assert flags[kernel] == flags["gdn_core_decode_gaudi2"], kernel
+
+
+def _interleaved_symbols(build: Path) -> list[str]:
+    """The interleaved kernels whose embedded ELF the built library defines."""
+    symbols = _run(["nm", build / "libgdn_fused_gaudi2.so"]).stdout
+    return [kernel for kernel in INTERLEAVED
+            if re.search(rf"\s[A-Za-z]\s_binary_{kernel}_o_start$", symbols, re.MULTILINE)
+            and not re.search(rf"\sw\s_binary_{kernel}_o_start$", symbols, re.MULTILINE)]
+
+
+def test_build_carries_the_interleaved_kernels(default_build) -> None:
+    """VLLM_HPU_GDN_KERNEL_INTERLEAVE=1 needs both interleaved ELFs in the library, defined, not weak."""
+    build, configure, _ = default_build
+    assert ("interleaved kernels in the library: gdn_core_decode_interleaved_gaudi2;"
+            "gdn_core_verify_interleaved_gaudi2") in configure
+    assert _interleaved_symbols(build) == list(INTERLEAVED)
+
+
+def test_interleave_switched_off_keeps_the_three_guids(tmp_path: Path, guid_host: Path) -> None:
+    build = tmp_path / "build"
+    configure, built = _cmake_build(build, "-DGDN_FUSED_INTERLEAVE=OFF")
+    assert re.search(r"interleaved kernels in the library: *$", configure, re.MULTILINE), configure[-2000:]
+    assert not [kernel for kernel in INTERLEAVED if kernel in _kernel_compiles(built)]
+    assert _interleaved_symbols(build) == []
+    guids, codes = _served(guid_host, build)
+    assert guids == [DECODE_GUID, RECURRENT_GUID, VERIFY_GUID]
+    assert all(code != GLUE_NODE_NOT_FOUND for code in codes.values()), codes
 
 
 def test_build_serves_the_three_guids(default_build, guid_host: Path) -> None:
@@ -129,7 +160,9 @@ def test_build_does_not_strip_the_verify_bitcode(default_build) -> None:
 
 
 def _assert_decode_and_recurrent_only(guid_host: Path, build: Path, built: str) -> None:
-    assert sorted(_kernel_compiles(built)) == ["gdn_core_decode_gaudi2", "gdn_recurrent_decode_gaudi2"]
+    # the interleaved decode kernel stays; the interleaved verify kernel is built only with the verify kernel
+    assert sorted(_kernel_compiles(built)) == ["gdn_core_decode_gaudi2", "gdn_core_decode_interleaved_gaudi2",
+                                               "gdn_recurrent_decode_gaudi2"]
     guids, codes = _served(guid_host, build)
     assert guids == [DECODE_GUID, RECURRENT_GUID]
     assert codes[VERIFY_GUID] == GLUE_NODE_NOT_FOUND
@@ -140,7 +173,7 @@ def test_verify_compile_failure_keeps_decode_and_recurrent(tmp_path: Path, guid_
     """A verify kernel that does not compile costs only the verify GUID, not the library."""
     wrapper = tmp_path / "tpc-clang"  # the real compiler for every source but the verify kernel
     wrapper.write_text("#!/bin/sh\n"
-                       'case "$*" in *gdn_core_verify_gaudi2.c*)\n'
+                       'case "$*" in *gdn_core_verify_gaudi2.c*|*gdn_core_verify_interleaved_gaudi2.c*)\n'
                        '    echo "fatal error: error in backend: too much vector memory is used for statically '
                        'allocated data: 24576 is allocated, but only 16384 is available" >&2\n'
                        "    exit 1;;\n"
