@@ -443,6 +443,37 @@ def _record_draft_calls(runner) -> list[dict]:
     return calls
 
 
+def probe_recurrent_pools(runner) -> dict:
+    """``--slice-write-probe``: the pools the align-mode state copies write (``runner._recurrent_commit_registry``,
+    the GDN conv and ssm pools) become ``SliceWriteProbe`` tensors over the same storage, so a write through a slice
+    of a pool is recorded (card job 00133); the copies that ran are counted (``commit_conv`` / ``commit_ssm`` pairs,
+    the boundary commit after sampling and the pre-step copy before the forward)."""
+    import vllm_gaudi.v1.worker.hpu_model_runner as runner_module
+    import vllm_gaudi.v1.worker.recurrent_commit as commit_module
+    from tests.unit_tests.models.flash_next.slice_write_probe import SliceWriteProbe
+
+    SliceWriteProbe.violations = []
+    record = {"conv_pairs": 0, "ssm_pairs": 0, "violations": SliceWriteProbe.violations}
+    registry = getattr(runner, "_recurrent_commit_registry", None) or {}
+    for gid, entries in list(registry.items()):
+        registry[gid] = [(tensor.as_subclass(SliceWriteProbe), kind, window) for tensor, kind, window in entries]
+    record["pools"] = sum(len(entries) for entries in registry.values())
+
+    def counting(key, function):
+
+        def wrapper(state, pairs, *args, **kwargs):
+            record[key] += len(pairs)
+            return function(state, pairs, *args, **kwargs)
+
+        return wrapper
+
+    conv, ssm = commit_module.commit_conv, commit_module.commit_ssm
+    for module in (runner_module, commit_module):
+        module.commit_conv = counting("conv_pairs", conv)
+        module.commit_ssm = counting("ssm_pairs", ssm)
+    return record
+
+
 def install_oracle_drafts(llm, runner, oracle: dict, k: int) -> list[dict]:
     """Replace the drafter's tokens with the reference stream, so the verification accepts a chosen count.
 
@@ -520,6 +551,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--top-p", type=float, default=1.0, help="top_p of a sampled run")
     parser.add_argument("--seed", type=int, default=None, help="per-request seed of a sampled run")
     parser.add_argument("--logprobs", type=int, default=None, help="record the top-N logprobs of every generated token")
+    parser.add_argument("--slice-write-probe", action="store_true",
+                        help="record writes through a slice of the recurrent pools the align-mode copies write")
     parser.add_argument("--op-audit", action="store_true",
                         help="record every dispatched op and the custom ops' view and int64 arguments (make_op_audit)")
     args = parser.parse_args(argv)
@@ -542,6 +575,7 @@ def main(argv: list[str] | None = None) -> int:
         kwargs["speculative_config"] = {"method": "mtp", "num_speculative_tokens": args.k}
     llm = LLM(**kwargs)
     runner = find_runner(llm)
+    pool_probe = probe_recurrent_pools(runner) if args.slice_write_probe else None
     steps = _record_steps(runner)
     committed = _record_committed(runner)
     draft_calls = _record_draft_calls(runner) if args.k else []
@@ -562,7 +596,8 @@ def main(argv: list[str] | None = None) -> int:
         for batch in batches:
             outputs = llm.generate([{"prompt_token_ids": prompt} for prompt in batch], params, use_tqdm=False)
             for prompt, output in zip(batch, outputs):
-                stream = {"prompt_ids": prompt, "generated_ids": list(output.outputs[0].token_ids)}
+                stream = {"prompt_ids": prompt, "generated_ids": list(output.outputs[0].token_ids),
+                          "num_cached_tokens": getattr(output, "num_cached_tokens", None)}
                 if args.logprobs:
                     stream["top_logprobs"] = [{str(t): float(lp.logprob) for t, lp in step.items()}
                                               for step in (output.outputs[0].logprobs or [])]
@@ -577,6 +612,7 @@ def main(argv: list[str] | None = None) -> int:
               "oracle": oracle_record,
               "index_events": guard.events(),
               "op_audit": audit.record() if audit is not None else None,
+              "slice_write_probe": pool_probe,
               "runner": runner_facts(runner)}
     Path(args.out).write_text(json.dumps(record), encoding="utf-8")
     return 0
