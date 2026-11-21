@@ -544,6 +544,7 @@ if TYPE_CHECKING:
     VLLM_HPU_HC_FUSED_COPY_MODE: int = 0  # copies before a fused HC op: 0 all, 1 not its own outputs, 2 block output
     VLLM_HPU_MOE_DENSE: int = 0  # 0 vendor MoE op (default), 1 dense batched FP8 experts up to MAX_TOKENS rows
     VLLM_HPU_MOE_DENSE_MAX_TOKENS: int = 512  # with VLLM_HPU_MOE_DENSE=1: the most tokens a step runs dense
+    VLLM_HPU_MOE_DENSE_MIN_TOKENS: int = 17  # with VLLM_HPU_MOE_DENSE=1: the fewest tokens a step runs dense
     VLLM_HPU_COLLECTIVE_MARK_STEP: int = 1  # 1 (default) mark_step() before every HPU collective, 0 none
     VLLM_HPU_VOCAB_PARALLEL_LOGITS: int = 0  # VocabParallelMode: 0 logits all-gather (default), 1 greedy, 2 candidates
     VLLM_HPU_REPLICATED_EMBEDDING: int = 0  # 0 vocabulary-sharded token embedding (default), 1 one full copy per rank
@@ -2013,6 +2014,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     lambda: int(os.environ.get("VLLM_HPU_MOE_DENSE", "0")),
     "VLLM_HPU_MOE_DENSE_MAX_TOKENS":
     lambda: int(os.environ.get("VLLM_HPU_MOE_DENSE_MAX_TOKENS", "512")),
+    # With VLLM_HPU_MOE_DENSE=1: steps with fewer tokens keep the vendor op, which reads only the experts the rows
+    # hit (the dense form reads every local expert: job 00177 lost at 1 stream).
+    "VLLM_HPU_MOE_DENSE_MIN_TOKENS":
+    lambda: int(os.environ.get("VLLM_HPU_MOE_DENSE_MIN_TOKENS", "17")),
 
     # The htorch.core.mark_step() that HpuCommunicator issues before every all-reduce and all-gather
     # (a workaround for a Habana bridge bug with PT_HPU_ENABLE_LAZY_COLLECTIVES). 1 (default) keeps it.
