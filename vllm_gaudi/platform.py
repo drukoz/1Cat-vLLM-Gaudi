@@ -205,6 +205,12 @@ def _configure_recurrent_state(vllm_config: "VllmConfig") -> None:
     speculative_config = getattr(vllm_config, "speculative_config", None)
     num_speculative_tokens = getattr(speculative_config, "num_speculative_tokens", None)
     num_speculative_tokens = int(num_speculative_tokens) if num_speculative_tokens else 0
+    # The runner commits the state at every block boundary a speculative step completes
+    # (HPUModelRunner._commit_recurrent_boundaries: recurrent_spec_enabled, prefix caching): the engine core's
+    # decode-end keep may keep speculative groups then (recurrent_pool_coordinator.keep_last_decode_boundary).
+    from vllm_gaudi.v1.core.recurrent_pool_coordinator import ENV_BOUNDARY_COMMITS
+    from vllm_gaudi.v1.worker.recurrent_spec import recurrent_spec_enabled
+    os.environ[ENV_BOUNDARY_COMMITS] = "1" if recurrent_spec_enabled(speculative_config) else "0"
     if slots <= 0:
         slots = resolve_pool_slots(vllm_config.scheduler_config.max_num_seqs, groups, cache_slots,
                                    num_speculative_tokens)

@@ -82,6 +82,14 @@ def select_hpu_gdn_prefill_state_fp32(
 # accuracy issues to the solver vs other sources.
 _USE_EXACT_SOLVE = os.getenv("VLLM_GDN_EXACT_SOLVE", "0") == "1"
 
+# Newton steps X <- X (2I - L X) after the recursive block inverse (VLLM_GDN_RECURSIVE_SOLVER_BASE > 0).
+# The base-16 inverse leaves an error near 3e-4 on ill-conditioned chunks (nearly repeated keys, beta
+# near 1, slow decay); one step squares it to today's 14-step accuracy for 2 batched matmuls.
+_RECURSIVE_SOLVER_REFINE = gaudi_envs.VLLM_GDN_RECURSIVE_SOLVER_REFINE
+if _RECURSIVE_SOLVER_REFINE < 0:
+    raise ValueError("VLLM_GDN_RECURSIVE_SOLVER_REFINE must be 0 or a positive number of Newton steps, "
+                     f"got {_RECURSIVE_SOLVER_REFINE}.")
+
 # FlashQLA's portable algebra removes the pairwise gate exponential from the
 # triangular solve and phase-B local attention. Keep these import-time flags
 # next to the other graph-shaping switches so torch.compile sees one static
@@ -1513,10 +1521,18 @@ def _hpu_solve_lower_triangular_batched(
                 "matrix size must be a power-of-two multiple of "
                 f"recursive_base, got recursive_base={recursive_base}, n={n}."
             )
-        return _hpu_recursive_unit_lower_inverse(
+        inv_flat = _hpu_recursive_unit_lower_inverse(
             lflat,
             recursive_base,
-        ).reshape(lmat.shape)
+        )
+        if _RECURSIVE_SOLVER_REFINE:
+            refine_mask = torch.tril(
+                torch.ones((n, n), dtype=lflat.dtype, device=lflat.device),
+                diagonal=-1,
+            ).unsqueeze(0)
+            for _ in range(_RECURSIVE_SOLVER_REFINE):
+                inv_flat = inv_flat - torch.bmm(inv_flat, torch.bmm(lflat, inv_flat) * refine_mask)
+        return inv_flat.reshape(lmat.shape)
 
     # Same strict-lower mask behavior as torch_chunk_gated_delta_rule_opt.
     lower_mask = torch.tril(
