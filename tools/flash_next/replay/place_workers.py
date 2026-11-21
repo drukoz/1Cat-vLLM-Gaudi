@@ -11,11 +11,10 @@ Run once inside the server's container, as root, right after the server is healt
 - every worker's main thread (the process's first thread, which runs the model) gets one vCPU of its own, in the
   worker's share of the container's CPUs (the same equal shares as ``VLLM_HPU_WORKER_CPU_PIN=1``);
 - that vCPU's sibling (by ``PLACE_SIBLING_RULE``: ``a+N/2``, ``a^1``, or empty when unknown) gets no thread at all;
-- the worker's other threads keep to the rest of its share; every other process of the server's own process tree
-  (the API server, the engine core, their helpers) keeps off the reserved vCPUs. Processes outside it, such as the
-  job's shells, keep their CPUs: a shell that starts the next server must hand it the whole CPU set (integration's
-  job 00222 started six servers in one container, and each one inherited fewer CPUs from the shells the first
-  version had moved);
+- the worker's other threads keep to the rest of its share; every other process of the container keeps off the
+  reserved vCPUs (the API server, the engine core, probe clients, monitors), except shells and the server's own
+  ancestors: they start the next server, which must get the whole CPU set (integration's job 00222 started six
+  servers in one container, and each one inherited fewer CPUs from the shells the first version had moved);
 - a background copy re-applies it every 2 s (a thread started later inherits its creator's mask) until the workers
   are gone.
 
@@ -137,6 +136,30 @@ def _is_shell(pid: int, proc: str) -> bool:
     return comm in ("bash", "sh", "dash", "zsh", "tini", "dumb-init", "timeout", "su", "sudo", "docker-init")
 
 
+def keep_out(workers: dict[int, int], proc: str = "/proc") -> set[int]:
+    """Processes never moved: every shell, and every ancestor of the server (the processes that may start the next
+    server); the workers themselves are placed separately."""
+    roots = set()
+    for pid in workers.values():
+        node = pid
+        while True:
+            parent = _parent(node, proc)
+            if parent is None or parent <= 1 or _is_shell(parent, proc):
+                break
+            node = parent
+        roots.add(node)
+    out = set()
+    for root in roots:
+        node = _parent(root, proc)
+        while node is not None and node > 0 and node not in out:
+            out.add(node)
+            node = _parent(node, proc) if node > 1 else None
+    for pid in all_pids(proc):
+        if _is_shell(pid, proc):
+            out.add(pid)
+    return out
+
+
 def server_tree(workers: dict[int, int], proc: str = "/proc") -> set[int]:
     """The server's processes: the topmost ancestor of the workers that is not a shell (the API server), and every
     process below it. Shells and other processes of the container are not in it."""
@@ -189,8 +212,12 @@ def apply(the_plan: dict, workers: dict[int, int], *, setaffinity=None, getaffin
         for tid in tids(pid):
             put(tid, {main[rank]} if tid == pid else set(helpers[rank]))
     free = allowed - reserved
-    for pid in (pids() if pids is not None else server_tree(workers)):
-        if pid in worker_pids or pid == os.getpid():
+    if pids is not None:
+        candidates, skip = pids(), set()
+    else:
+        candidates, skip = all_pids(), keep_out(workers)
+    for pid in candidates:
+        if pid in worker_pids or pid == os.getpid() or pid in skip:
             continue
         for tid in tids(pid):
             try:

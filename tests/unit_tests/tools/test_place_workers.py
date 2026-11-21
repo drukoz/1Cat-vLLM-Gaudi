@@ -85,3 +85,20 @@ def test_server_tree_leaves_the_job_shells_alone(tmp_path):
         (d / "comm").write_text(comm + "\n")
     tree = pw.server_tree({0: 50, 1: 51}, proc=str(tmp_path))
     assert tree == {30, 40, 50, 51}
+
+
+def test_keep_out_spares_shells_and_server_ancestors_only(tmp_path):
+    # 1 init, 10 job shell, 15 a python job driver that started the serve shell, 20 serve shell, 30 API server,
+    # 40 engine core, 50/51 workers, 60 a probe client (python, child of the serve shell), 70 hl-smi loop (python)
+    procs = {1: (0, "tini"), 10: (1, "bash"), 15: (10, "python3"), 20: (15, "bash"), 30: (20, "python3"),
+             40: (30, "python3"), 50: (40, "python3"), 51: (40, "python3"), 60: (20, "python3"),
+             70: (1, "python3")}
+    for pid, (ppid, comm) in procs.items():
+        d = tmp_path / str(pid)
+        d.mkdir()
+        (d / "stat").write_text("%d (%s) S %d 0 0 0" % (pid, comm, ppid))
+        (d / "comm").write_text(comm + "\n")
+    out = pw.keep_out({0: 50, 1: 51}, proc=str(tmp_path))
+    # the shells, and the driver above the server (it may start the next one); not the client, not the monitor
+    assert {10, 20, 15, 1}.issubset(out)
+    assert not ({30, 40, 60, 70} & out)
