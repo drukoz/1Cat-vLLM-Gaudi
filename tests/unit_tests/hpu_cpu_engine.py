@@ -367,6 +367,8 @@ def runner_facts(runner) -> dict:
             "prefix_caching": bool(cache_config.enable_prefix_caching),
             "recurrent_pool_slots": int(runner._recurrent_pool_slots),
             "candidate_verify_steps": int(getattr(runner, "_candidate_verify_steps", 0)),
+            # VLLM_HPU_MTP_DRAFT_GRAPH=1: decode drafts whose k passes ran in one HPU graph (MtpDraftLoop)
+            "draft_graph_calls": int(getattr(getattr(runner, "drafter", None), "draft_graph_calls", 0)),
             "attention_group": runner._get_attention_group_id_for_hybrid(),
             "num_blocks": int(runner.kv_cache_config.num_blocks),
             "groups": groups}
@@ -419,6 +421,7 @@ def _record_draft_calls(runner) -> list[dict]:
         attn_table = runner.input_batch.block_table[runner._get_attention_group_id_for_hybrid()].get_cpu_tensor()
         rows = int(block_table_cpu_tensor.shape[0])
         calls.append({"rows": rows,
+                      "decode": not bool(getattr(common_attn_metadata, "is_prompt", True)),
                       "width": int(block_table_cpu_tensor.shape[1]),
                       "attention_width": int(attn_table.shape[1]),
                       "is_attention_table": bool(block_table_cpu_tensor.shape[1] == attn_table.shape[1]
