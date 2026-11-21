@@ -1467,9 +1467,11 @@ def moe_dense_fp8(x, topk_ids, topk_weights, w13, w2, s13, s2, experts_min):
     the sum over the experts is the vendor op's ``sum over the routed local experts of weight * down(silu(gate) *
     up)``. ``w13`` [E, 2I, H] and ``w2`` [E, H, I] are the layer's stacked FP8 experts (the per-expert weights the
     vendor op gets are views of them), ``s13`` [E, 2I] and ``s2`` [E, H] their per-output-channel scales. The
-    activations are quantized per row with ``dynamic_quant``, as for the vendor op; the scales are applied after
-    each GEMM (a row scale and a column scale factor out of the dot product). The ids are narrowed to int32 in the
-    graph and consumed there (card rule 9: only a host read of such ids is wrong).
+    activations are quantized per row with ``dynamic_quant``, as for the vendor op; each GEMM takes its row scales
+    ([E, T, 1]) and the experts' column scales ([E, 1, N]) itself and returns bf16 (job 00172 on one card, TP8
+    geometry: 275 / 374 / 1,088 us per layer at 32 / 128 / 512 rows against 486 / 1,244 / 1,625 for the vendor op,
+    1.3 to 3.6 % max difference; with the scales applied after fp32 outputs it was 308 / 512 / 1,821). The ids are
+    narrowed to int32 in the graph and consumed there (card rule 9: only a host read of such ids is wrong).
     """
     experts, two_i, hidden = w13.shape
     inter = two_i // 2
@@ -1480,14 +1482,15 @@ def moe_dense_fp8(x, topk_ids, topk_weights, w13, w2, s13, s2, experts_min):
     pair_weight = (routed * topk_weights.to(torch.float32).unsqueeze(-1)).sum(dim=1)  # [T, E]
     x_fp8, x_scale = dynamic_quant(x)
     a = x_fp8.unsqueeze(0).expand(experts, rows, hidden).contiguous()  # [E, T, H]
-    gate_up = torch.ops.hpu.fp8_gemm_v2(a, False, w13, True, None, torch.float32, None, None, None, False)
-    gate_up = gate_up * x_scale.reshape(1, rows, 1).to(torch.float32) * s13.unsqueeze(1)
-    mid = (F.silu(gate_up[..., :inter]) * gate_up[..., inter:]).to(x.dtype)  # [E, T, I]
+    a_scale = x_scale.reshape(1, rows, 1).to(torch.float32).expand(experts, rows, 1).contiguous()
+    gate_up = torch.ops.hpu.fp8_gemm_v2(a, False, w13, True, None, torch.bfloat16, a_scale, s13.unsqueeze(1), None,
+                                        False)  # [E, T, 2I]
+    mid = (F.silu(gate_up[..., :inter].float()) * gate_up[..., inter:].float()).to(x.dtype)  # [E, T, I]
     m_fp8, m_scale = dynamic_quant(mid.reshape(experts * rows, inter))
-    down = torch.ops.hpu.fp8_gemm_v2(m_fp8.reshape(experts, rows, inter), False, w2, True, None, torch.float32, None,
-                                     None, None, False)
-    down = down * m_scale.reshape(experts, rows, 1).to(torch.float32) * s2.unsqueeze(1)  # [E, T, H]
-    return (down * pair_weight.t().unsqueeze(-1)).sum(dim=0).to(x.dtype)
+    down = torch.ops.hpu.fp8_gemm_v2(m_fp8.reshape(experts, rows, inter), False, w2, True, None, torch.bfloat16,
+                                     m_scale.reshape(experts, rows, 1).to(torch.float32), s2.unsqueeze(1), None,
+                                     False)  # [E, T, H]
+    return (down.float() * pair_weight.t().unsqueeze(-1)).sum(dim=0).to(x.dtype)
 
 
 def _set_moe_dense_weights(layer):
