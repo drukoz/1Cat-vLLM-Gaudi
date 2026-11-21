@@ -23,6 +23,7 @@ the host's inputs. Tensor ops only (int32, ``index_select``), no host read outsi
 
 from __future__ import annotations
 
+import collections
 from dataclasses import dataclass, field
 from typing import Optional, Sequence
 
@@ -207,3 +208,56 @@ class VerifyInputAdvance:
         if bad:
             self.stats.mismatched_steps += 1
         return bad
+
+
+# ---- M2 (VLLM_HPU_FLASH_NEXT_ASYNC_SCHED=3): a chained step issued before the previous one's tokens reach the host ----
+
+
+def trim_verified(row: Sequence[int], vocab_size: int) -> list:
+    """A verification step's row of tokens as the rejection sampler's ``parse_output`` keeps them: every entry that
+    is not the placeholder -1 and is below ``vocab_size``."""
+    return [int(t) for t in row if t != -1 and t < vocab_size]
+
+
+@dataclass
+class PendingBooks:
+    """The host's books of a step issued before its tokens reached the host, applied later in step order."""
+    step: int
+    req_ids: tuple  # the decode rows, in input-batch order
+    cpu: torch.Tensor  # [B, 1 + k] the step's tokens, copied to the host asynchronously
+    event: object  # the copy's event
+    seeds: dict  # request -> its true num_computed_tokens at the step's start, when the host knew it (else absent)
+
+
+@dataclass
+class EarlyStats:
+    issued: int = 0  # steps issued before the previous step's tokens reached the host
+    settled_late: int = 0  # books applied without waiting
+    waited: int = 0  # books applied after waiting for the device
+    sync_steps: int = 0  # chained steps that kept the synchronous order
+    reasons: dict = field(default_factory=dict)
+
+
+class SpecEarlyBooks:
+    """The queue of pending books and each request's true ``num_computed_tokens`` through the last applied step."""
+
+    MAX_PENDING = 2
+
+    def __init__(self) -> None:
+        self.pending: collections.deque = collections.deque()
+        self.true_computed: dict = {}
+        self.stats = EarlyStats()
+
+    def push(self, books: PendingBooks) -> None:
+        for req_id, value in books.seeds.items():
+            self.true_computed.setdefault(req_id, value)
+        self.pending.append(books)
+
+    def apply(self, books: PendingBooks, vocab_size: int) -> list:
+        """The step's token lists per decode row; advances the true counts."""
+        rows = books.cpu.tolist()
+        tokens = [trim_verified(rows[r], vocab_size) for r in range(len(books.req_ids))]
+        for req_id, row in zip(books.req_ids, tokens):
+            if req_id in self.true_computed:
+                self.true_computed[req_id] += len(row)
+        return tokens
