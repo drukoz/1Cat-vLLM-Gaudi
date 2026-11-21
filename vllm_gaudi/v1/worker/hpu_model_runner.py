@@ -7034,6 +7034,9 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             else:
                 mtp_step_timer = None if warmup_mode else self._mtp_step_timer
                 if mtp_step_timer is not None:
+                    if mtp_step_timer.per_step:  # VLLM_HPU_MTP_TIMING=2: what each decode request committed
+                        mtp_step_timer.step_tokens(self.input_batch.req_ids[:num_decodes],
+                                                   [len(t) for t in postprocessed_sampled_token_ids[:num_decodes]])
                     mtp_step_timer.draft_start(
                         "prefill" if num_decodes == 0 else ("verify" if num_prefills == 0 else "mixed"),
                         scheduler_output.total_num_scheduled_tokens, num_decodes + num_prefills,

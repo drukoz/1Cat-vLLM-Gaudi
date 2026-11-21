@@ -172,7 +172,12 @@ shows draft positions 2 to k collapsing with more than one stream.
 draft, with a lap per draft pass and one device wait after the draft; every 25 steps of
 a row count the means go to a log line (`MTP step timing: ...`) and to
 `mtp_step_timing_r<rank>_<pid>.jsonl` in the server's working directory, with
-`Ft_ms` (the verification part) and `Fd_ms` (the draft divided by k).
+`Ft_ms` (the verification part) and `Fd_ms` (the draft divided by k). `2`: as `1`,
+and one JSON line per step in `mtp_step_record_r<rank>_<pid>.jsonl` with the step's
+row and request counts, `verify_ms`, `draft_ms`, and per decode request how many
+tokens it committed in this step (`committed`) and in its previous step
+(`prev_committed`, `none` when it had none), as histograms: whether the steps that
+follow a step without an accepted draft cost more.
 
 `VLLM_HPU_MTP_CHUNK_KV` decides whether the Flash-Next MTP draft runs over the
 prefill chunks that complete no prompt, as an integer. `0` (default): it runs

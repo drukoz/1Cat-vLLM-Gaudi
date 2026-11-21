@@ -626,9 +626,11 @@ def main(argv: list[str] | None = None) -> int:
     return 0
 
 
-def run(ckpt: Path, out: Path, *options: str, env: dict | None = None, timeout_s: float = 1800.0) -> dict:
+def run(ckpt: Path, out: Path, *options: str, env: dict | None = None, timeout_s: float = 1800.0,
+        cwd: Path | None = None) -> dict:
     """Run one rehearsal in a process of its own and return its record. ``options`` are CLI options of
-    :func:`main`; ``env`` is added to the engine's environment (plugin flags). A run that fails raises
+    :func:`main`; ``env`` is added to the engine's environment (plugin flags); ``cwd`` is the engine's working
+    directory (default the repository root), where files a server writes there land. A run that fails raises
     ``RuntimeError`` with the end of its output."""
     run_env = dict(os.environ)
     run_env.update(ENGINE_ENV)
@@ -638,7 +640,7 @@ def run(ckpt: Path, out: Path, *options: str, env: dict | None = None, timeout_s
     command = [sys.executable, "-m", "tests.unit_tests.hpu_cpu_engine", "--ckpt", str(ckpt), "--out", str(out), *options]
     log = Path(str(out) + ".log")
     with open(log, "wb") as stream:
-        done = subprocess.run(command, cwd=REPO_ROOT, env=run_env, stdout=stream, stderr=subprocess.STDOUT,
+        done = subprocess.run(command, cwd=cwd or REPO_ROOT, env=run_env, stdout=stream, stderr=subprocess.STDOUT,
                               timeout=timeout_s, check=False)
     if done.returncode != 0 or not Path(out).is_file():
         tail = log.read_text(encoding="utf-8", errors="replace")[-6000:]
