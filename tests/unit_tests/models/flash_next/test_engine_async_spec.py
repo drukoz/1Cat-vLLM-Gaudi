@@ -10,7 +10,9 @@ tensor, as the MTP drafter returns them (the tiny model's own drafts are never a
 continuation, with a wrong token every few steps so that every accepted count happens. The tokens must be the
 reference's in both modes, and the async run must have corrected counts and written drafts. Negative controls:
 without the correction the tokens go wrong; without the scatter they stay right (a wrong draft is rejected) but
-fewer drafts are accepted.
+fewer drafts are accepted. Two more runs: requests joining a verifying batch every second step, and four requests of
+300 tokens that the KV budget admits as room frees up (equal to the synchronous engine token for token; this
+harness does not provoke a preemption: its scheduler holds a request back until it fits).
 
 The program head's speculative path runs here with whole-prompt prefills and prefix caching off (as in
 engine-step's speculative harness tests); n-gram is the speculative method because the harness loads no drafter
@@ -122,3 +124,60 @@ def test_without_the_scatter_fewer_drafts_are_accepted(tiny_checkpoint, referenc
                                    scatter_drafts=lambda self, token_ids, *args, **kwargs: token_ids)
     assert tokens == want  # a draft slot left at -1 (token 0) is rejected: still the reference
     assert without["steps"] > with_scatter["steps"], (with_scatter, without)
+
+
+def _serve_staggered(tiny_checkpoint, reference, async_scheduling: bool, **option_overrides):
+    """A request arrives every second engine step, so prompts enter batches that are verifying drafts.
+
+    The 1-token prompt is left out: on the program head's speculative path it goes wrong from its second token when
+    it joins a verifying batch, with and without async scheduling (a defect of that path, not of the handoff;
+    mtp-card-ready's rehearsal engine on the integration tree runs it right with MTP).
+    """
+    options = eh.Options(max_num_seqs=4, async_scheduling=async_scheduling, speculative_config=SPEC,
+                         prefix_caching=False, max_num_batched_tokens=4096, **option_overrides)
+    with eh.open_engine(tiny_checkpoint, options) as engine:
+        want = {f"join-{i}": reference[i]["generated_ids"] for i in (3, 1, 2)}
+        pending = list(want)
+        _install_oracle(engine, want)
+        for _ in range(10000):
+            if pending and engine.steps % 2 == 0:
+                request_id = pending.pop(0)
+                index = int(request_id.split("-")[1])
+                engine.add(request_id, reference[index]["prompt_ids"], max_tokens=len(want[request_id]))
+            if not pending and not engine.has_work():
+                break
+            engine.step()
+        handoff = engine.runner._spec_draft_handoff
+        return dict(engine.tokens), want, (handoff.corrections, handoff.scattered) if handoff else None
+
+
+def test_requests_joining_while_others_verify(tiny_checkpoint, reference):
+    tokens, want, counts = _serve_staggered(tiny_checkpoint, reference, True)
+    assert tokens == want
+    assert counts[0] > 0 and counts[1] > 0, counts
+
+
+def _serve_long(tiny_checkpoint, reference, async_scheduling: bool):
+    """Four requests of 300 tokens (the 700-token prompt among them) under a KV budget that admits them as room
+    frees up: requests join and leave verifying batches for hundreds of steps, past the reference's 16 tokens
+    (there the oracle drafts are wrong and rejected)."""
+    options = eh.Options(max_num_seqs=4, async_scheduling=async_scheduling, speculative_config=SPEC,
+                         prefix_caching=False, max_num_batched_tokens=4096, kv_cache_bytes=1536 << 10,
+                         max_model_len=1024)
+    with eh.open_engine(tiny_checkpoint, options) as engine:
+        want = {f"long-{i}": reference[i]["generated_ids"] for i in (3, 1, 2, 4)}
+        _install_oracle(engine, want)
+        for request_id in want:
+            engine.add(request_id, reference[int(request_id.split("-")[1])]["prompt_ids"], max_tokens=300)
+        engine.run()
+        handoff = engine.runner._spec_draft_handoff
+        return dict(engine.tokens), want, (handoff.corrections, handoff.scattered) if handoff else None
+
+
+def test_long_generations_equal_the_synchronous_engine(tiny_checkpoint, reference):
+    sync_tokens, want, _ = _serve_long(tiny_checkpoint, reference, False)
+    tokens, _, counts = _serve_long(tiny_checkpoint, reference, True)
+    assert all(len(v) == 300 for v in tokens.values())
+    assert all(sync_tokens[k][:len(want[k])] == want[k] for k in want)
+    assert tokens == sync_tokens
+    assert counts[0] > 100 and counts[1] > 100, counts
