@@ -11,7 +11,7 @@ This track's harness refuses report files outside the repository, so the handoff
 
 ## Handoff (if this agent stops)
 
-Last update: **2026-11-21 08:01 UTC** (fourth agent, Opus 5.5; the node was extended to about 00:00 UTC on
+Last update: **2026-11-21 08:20 UTC** (fourth agent, Opus 5.5; the node was extended to about 00:00 UTC on
 2026-11-22). Branch `feat/flash-next-gaudi-engine-step`, head after `bcef8aa5` (merged into the program branch as PR #20;
 code of this track up to `01d66e31`), pushed. A second branch of this track,
 **`feat/flash-next-gaudi-engine-step-mtp-record`** (`2b90707f`, worktree `reports/engine-step/trees/mtp-record`):
@@ -532,3 +532,34 @@ accepting 1,0,2,1,1, the prefix flags on; runs in `probes/mtp_ops/`):
   or of a path. INFERRED from four rounds: the span tracks the share of steps whose first draft was rejected (0.25:
   51.5 ms, 0.37: 64-66, 0.40: 67-71; k = 3 0.17: 54). The timer keeps 25-step means; a per-step record keyed by
   the previous step's accepted count would show it directly.
+
+## 15. The host's serial work in a 32-stream MTP step (coordinator, 08:10 UTC; step-anatomy's 00205 trace)
+
+00205 (integration build 4b, TP8, dense MoE, sync MTP k = 3, 32 streams, I01 off, no worker CPU pin): 84.9 ms per
+step, prepare 6.2 ms, 154 launches, 178 host-to-device DMA rows, 13 copy-only graphs; the device idles about 30 ms per
+step while the host works.
+
+- **Rank skew (MEASURED, step-anatomy's per-rank extracts `reports/step-anatomy/trace_work/ext_00205d_r*.json`):** the
+  8 ranks' step markers are within 80 us every step (the broadcast is not the cause), but ranks 0 and 1 reach their
+  first graph launch 18.5 ms after the step start against 10.8-11.6 ms on ranks 2-7, every step, and then launch
+  20-30 % slower (rank 1 is 22 ms behind rank 7 at the verify forward's 119th launch): two systematically slow hosts.
+  Fix to measure: native-replay's `VLLM_HPU_WORKER_CPU_PIN=3` + `VLLM_HPU_WORKER_CPU_SIBLINGS` (the model thread on
+  its own vCPU, its hyperthread sibling free). The per-step record has `t` + `replay_first_ms` per rank (`07932956`
+  on the `mtp-record` branch, for build 5) to see the skew in every job.
+- **H2D census (MEASURED on the CPU engine, `reports/engine-step/probes/h2d_census.py`, build 4's code):** our Python
+  issues 31 host-to-device copies per steady MTP k = 3 step at 4 and at 32 streams (13 in `_create_decode_input_data`,
+  4 in `_prepare_spec_decode_inputs`, 2 PLE, 10 from the drafter's `prepare_attn_metadata` on 2 passes, 2 blocking
+  in `hpu_eagle.prepare_inputs`), 29 non-blocking, none from a pinned buffer, each with a fresh device allocation (25
+  per step); 4 scalar operands in lazy ops between the graphs. With I01: 22 copies, 16 allocations. So the trace's
+  178 rows are about 5 DMA commands per copy call (INFERRED; native-replay's H2D timer build will count both).
+- **Copy-only graphs:** between the captured graphs our Python issues 8 recipes per step, all with compute (the
+  speculative input gather, the LM head, the rejection sampler, 2 in `parse_output`, 1 per draft pass). The 13
+  copy-only graphs are the replay wrapper's copies of unmatched inputs (native-replay, bridge source: an input that is
+  not the captured graph's own input value is copied by `graphs.copy_to`, flushed as its own recipe before the
+  replay). To name them: `VLLM_HPU_LOG_UNMATCHED_GRAPH_INPUTS=1` (`ca52fa33`), and the same logger as a Python-only
+  sitecustomize for build 5 (`reports/engine-step/probes/hpu_graph_input_log/`, sent to integration at 08:19 UTC).
+- **Plan (coordinator's order, 08:18 UTC):** (1) name and remove the copy-only graphs (persistent base tensors,
+  sliced inside the forward), about 13 launches, 2-4 ms per step (INFERRED); (2) I01 in the serve setting once 00207
+  (MTP, 32 streams) and 00169 (32 x 120K) agree (integration got the runtime-switch recipe); (3) last: the packed
+  upload (`VLLM_HPU_PACKED_INPUTS`, 22-31 calls to 1-3 from pinned buffers, about 0.5-1.5 ms per step), with
+  async-sched's per-input host-made / device-made switch agreed (08:29 UTC).
