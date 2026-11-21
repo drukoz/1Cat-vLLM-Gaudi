@@ -890,13 +890,52 @@ def get_target_layer_suffix_list(model_type) -> list[str]:
     return [decoder_layer_table.get(model_type, "DecoderLayer"), "EncoderLayer", "BertLayer"]
 
 
-def modify_model_layers(module: torch.nn.Module, suffix_list: list[str], n=1, counter=None):
+def _forward_is_decode() -> bool:
+    """True when the current forward's attention metadata says ``is_prompt=False`` (decode or verification).
+
+    A forward without a context, with per-layer (dict) metadata or with metadata that has no ``is_prompt``
+    counts as a prompt forward, which keeps the ``VLLM_CONFIG_HIDDEN_LAYERS`` cuts.
+    """
+    from vllm.forward_context import get_forward_context, is_forward_context_available
+    if not is_forward_context_available():
+        return False
+    metadata = get_forward_context().attn_metadata
+    if metadata is None or isinstance(metadata, Mapping):
+        return False
+    return getattr(metadata, "is_prompt", None) is False
+
+
+# The kinds of forward (decode True, prompt False) whose cut interval this process has logged once.
+_DECODE_CUT_LOGGED: set[bool] = set()
+
+
+def modify_model_layers(module: torch.nn.Module, suffix_list: list[str], n=1, counter=None, decode_n=0):
     """Currently add mark_step at the end of specified layers.
+
+    ``decode_n`` (``VLLM_HPU_DECODE_CUT_INTERVAL``): 0 registers a cut after every ``n``-th layer for every
+    forward, as always. ``decode_n >= 1`` hooks every layer and decides per forward: a decode forward cuts after
+    every ``decode_n``-th layer, any other forward after every ``n``-th. The hook runs while an HPU graph is
+    captured (or on a step outside graphs), so the decision is taken once per captured decode graph.
     """
 
     def forward_hook(module, args, output):
         htorch.core.mark_step()
         return output
+
+    def interval_hook(index):
+
+        def hook(module, args, output):
+            decode = _forward_is_decode()
+            if index == 1 and decode not in _DECODE_CUT_LOGGED:
+                # Once per process and kind, on the first layer: the server log shows the flag took effect.
+                _DECODE_CUT_LOGGED.add(decode)
+                logger.info("VLLM_HPU_DECODE_CUT_INTERVAL=%d: a %s forward cuts after every %d-th decoder layer",
+                            decode_n, "decode" if decode else "prompt", decode_n if decode else n)
+            if index % (decode_n if decode else n) == 0:
+                htorch.core.mark_step()
+            return output
+
+        return hook
 
     if counter is None:
         counter = [0]
@@ -904,10 +943,12 @@ def modify_model_layers(module: torch.nn.Module, suffix_list: list[str], n=1, co
     for child_name, child_module in module.named_children():
         if any(child_module.__class__.__name__.endswith(layer) for layer in suffix_list):
             counter[0] += 1
-            if counter[0] % n == 0:
+            if decode_n > 0:
+                child_module.register_forward_hook(interval_hook(counter[0]))
+            elif counter[0] % n == 0:
                 child_module.register_forward_hook(forward_hook)
         else:
-            modify_model_layers(child_module, suffix_list, n, counter)
+            modify_model_layers(child_module, suffix_list, n, counter, decode_n)
 
 
 def is_mm_optimized(model):
@@ -1928,6 +1969,19 @@ def _mark_unbacked_dim0(tensor: torch.Tensor):
     torch._dynamo.decorators.mark_unbacked(tensor, 0)
 
 
+def _hpu_graph_wrap_kwargs() -> dict:
+    """The ``wrap_in_hpu_graph`` arguments of the model's graph.
+
+    ``VLLM_HPU_GRAPH_ASYNC_REPLAY=1`` adds ``asynchronous=True``: the replay is queued and the forward returns,
+    instead of the caller's thread issuing every captured recipe and collective before it returns.
+    """
+    kwargs = {"disable_tensor_cache": True}
+    if gaudi_envs.VLLM_HPU_GRAPH_ASYNC_REPLAY:
+        kwargs["asynchronous"] = True
+        logger.info("VLLM_HPU_GRAPH_ASYNC_REPLAY=1: the model's HPU graph replays asynchronously")
+    return kwargs
+
+
 def _prompt_hidden_states_per_request(hidden_states: torch.Tensor, token_ids: torch.Tensor) -> torch.Tensor:
     """The prefill hidden states with one row per request of the prompt batch: ``[batch, seq, hidden]``.
 
@@ -1942,9 +1996,9 @@ def _prompt_hidden_states_per_request(hidden_states: torch.Tensor, token_ids: to
 
 
 def _maybe_wrap_in_hpu_graph(*args, **kwargs):
-    return htorch.hpu.wrap_in_hpu_graph(HpuModelAdapter(
-        *args, **kwargs), disable_tensor_cache=True) if htorch.utils.internal.is_lazy() else HpuModelAdapter(
-            *args, **kwargs)
+    return htorch.hpu.wrap_in_hpu_graph(HpuModelAdapter(*args, **kwargs), **
+                                        _hpu_graph_wrap_kwargs()) if htorch.utils.internal.is_lazy() else HpuModelAdapter(
+                                            *args, **kwargs)
 
 
 def subtuple(obj: object, typename: str, to_copy: list[str], to_override: Optional[dict[str, object]] = None):
@@ -7527,7 +7581,8 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         model_config = getattr(self.model, "config", None)
         modify_model_layers(self.model,
                             get_target_layer_suffix_list(model_config.model_type if model_config is not None else None),
-                            hidden_layer_markstep_interval)
+                            hidden_layer_markstep_interval,
+                            decode_n=gaudi_envs.VLLM_HPU_DECODE_CUT_INTERVAL)
         torch.hpu.synchronize()
         if self.is_pooling_model:
             self.set_causal_option(self.model)
