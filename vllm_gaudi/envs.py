@@ -565,7 +565,8 @@ if TYPE_CHECKING:
     VLLM_HPU_STEP_TIMING_DIR: str = ""  # folder of the step timer's JSON files ("" = the working directory)
     VLLM_HPU_DECODE_CUT_INTERVAL: int = 0  # 0 (default) decode keeps the per-layer cuts, N cut every N-th layer
     VLLM_HPU_GRAPH_ASYNC_REPLAY: int = 0  # 0 (default) the model's HPU graph replays synchronously, 1 asynchronously
-    VLLM_HPU_WORKER_CPU_PIN: int = 0  # WorkerCpuPin: 0 off (default), 1 each worker on its CPU share, 2 and its own CPU
+    VLLM_HPU_WORKER_CPU_PIN: int = 0  # WorkerCpuPin: 0 off (default), 1 each worker on its CPU share, 2 and its own CPU, 3 and its own host core
+    VLLM_HPU_WORKER_CPU_SIBLINGS: str = "xor1"  # mode 3: which vCPUs share a host core (xor1: 2k, 2k+1; none)
     VLLM_HPU_VOCAB_PARALLEL_LOGITS: int = 0  # VocabParallelMode: 0 logits all-gather (default), 1 greedy, 2 candidates
     VLLM_HPU_REPLICATED_EMBEDDING: int = 0  # 0 vocabulary-sharded token embedding (default), 1 one full copy per rank
     VLLM_HPU_MTP_REPLICATED_FC: int = 0  # 0 the MTP fc linears shard and all-gather (default), 1 unsharded
@@ -2203,10 +2204,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # them to the kernel. 1: after torch.hpu.set_device every thread of a worker keeps to one equal share of the
     # CPUs the server may use, the share at its module's position among HABANA_VISIBLE_MODULES (the rank's
     # without them); threads started later inherit it. 2: as 1, and after load and warmup the thread that runs
-    # the model has the share's first CPU for itself, the worker's other threads the rest.
+    # the model has the share's first CPU for itself, the worker's other threads the rest. 3: as 2 on a CPU whose host
+    # hyperthread sibling (VLLM_HPU_WORKER_CPU_SIBLINGS) is kept free of the worker's and its parent's threads.
     # docs/design/flash-next/native-replay.md.
     "VLLM_HPU_WORKER_CPU_PIN":
     lambda: int(os.environ.get("VLLM_HPU_WORKER_CPU_PIN", "0")),
+    # VLLM_HPU_WORKER_CPU_PIN=3 only: which vCPUs share a host core. xor1 (default): 2k and 2k+1 (the rented node,
+    # section 7.12 of the design document); none: no sibling known (mode 3 then keeps only its own CPU free).
+    "VLLM_HPU_WORKER_CPU_SIBLINGS":
+    lambda: os.environ.get("VLLM_HPU_WORKER_CPU_SIBLINGS", "xor1"),
 
     # Collective cuts of a tensor-parallel Flash-Next step (docs/design/flash-next/collectives.md). All default 0.
     # VLLM_HPU_VOCAB_PARALLEL_LOGITS: 0 = every consumer gets the all-gathered logits; 1 = arg-max consumers
