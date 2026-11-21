@@ -27,9 +27,13 @@ the report. Labels: MEASURED (card), VERIFIED (simulator or CPU test named), INF
   `tools/flash_next/hc_kernels/card_hc_quick.sh`: HC op card test, the TP1 tiny gate with `VLLM_HPU_HC_FUSED_IL=1`
   (stands in for TP8, coordinator 09:33), the HC bench at 4/32/96/128 rows, traces at 128 rows). Job B =
   `gdn-variants` (`tools/flash_next/hc_kernels/card_gdn_verify.sh`, hold 35 min, placed by the coordinator about
-  15:00-16:00 beside step-anatomy's 4-card trace): op card test with variant 6 first, then the chained bench with
-  on-card bits against variant 0 for 0, 6, 1, 4, 7, the traces of 0, 1, 4, then 2, 3, 5 and the op test with 3. Its
-  id: the latest `reports/hc-kernels/logs/farm_gdn-variants*.out` (00232 was the image without the fold build).
+  15:00-16:00 beside step-anatomy's 4-card trace): op card test with variant 6 first (the job stops there if it
+  fails), then the chained bench with on-card bits against variant 0 for 0, 6, 1, 4, 7 (out and both pools after one
+  call, and every set's pools and outputs after the whole chained recurrence of replays), the traces of 0, 6, 1, 4,
+  7, then 2, 3, 5 and the op test with 3 (kernel-fixes reviewed `d528a38f` at 10:50 UTC: no objection, on these
+  three conditions; if any bit differs on the card, 6/7 are not bit-identical and need the prompt-logprob accuracy
+  check of `moe_rt_driver.py`'s ACC harness before anyone serves them). Its id: the latest
+  `reports/hc-kernels/logs/farm_gdn-variants*.out` (00232 was the image without the fold build).
   When a job ends: `bin/farm fetch hc-kernels <id> <id>-<name>` if its waiter is gone; read `pytest_il.log`,
   `tiny.log`, `bench.log` (VERDICT), `gdn_bench_variant*.log` (us per call and "bit-identical" lines),
   `gdn_optest_variant6.log`; traces with `python3 tools/flash_next/hc_kernels/kernel_engines.py <trace> <kernel>`;

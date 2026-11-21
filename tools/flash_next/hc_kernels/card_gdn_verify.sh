@@ -4,11 +4,12 @@
 # card_gdn_verify.sh: the one-card A/B of the GDN verify variants (VLLM_HPU_GDN_VERIFY_VARIANT 0 to 7 with
 # VLLM_HPU_GDN_KERNEL_INTERLEAVE=1; docs/design/flash-next/hc-kernels.md, "GDN verify"), run from the tree inside a
 # farm container (farm job hc-kernels <name> any:1 <hold> -- bash tools/flash_next/hc_kernels/card_gdn_verify.sh):
-# most important first, so that a hold that runs out loses the least:
-#   1. the verify op card tests with variant 6 (the fold build)
+# most important first, so that a hold that runs out loses the least (kernel-fixes' conditions, 10:50 UTC):
+#   1. the verify op card tests with variant 6 (the fold build); if they fail, the job stops here
 #   2. bench_gdn_verify.py (us per call at batch 1, 8, 32, T = 4, TP8 geometry, chained calls; the bits of every
-#      variant compared with variant 0's) for variants 0 and 6, then the index-space layouts 1, 4 and 7
-#   3. profiler traces of variants 0, 1, 4 at batch 1 and 32 (the TPC engines a call runs on)
+#      variant compared with variant 0's: out and both pools after one call, and every set's pools and outputs after
+#      the whole chained recurrence of replays) for variants 0 and 6, then the index-space layouts 1, 4 and 7
+#   3. profiler traces of variants 0, 6, 1, 4, 7 at batch 1 and 32 (device time and the TPC engines of a call)
 #   4. the lean variants 2, 3, 5 (bench), and the op card tests with variant 3
 # One process per variant: the glue reads the variables when the graph compiler instantiates the op. Logs and
 # results go to $FARM_OUT. Every step runs; the exit code is the first failing step's.
@@ -42,9 +43,14 @@ bench() {
         python tools/flash_next/hc_kernels/bench_gdn_verify.py --label "variant$1" --out "$OUT" ${compare[@]+"${compare[@]}"}
 }
 optest 6
+if [ "$rc" -ne 0 ]; then
+    echo "=== hc-kernels: the op card test of variant 6 failed; no benches (kernel-fixes' condition 3)"
+    exit "$rc"
+fi
 for v in 0 6 1 4 7; do bench "$v"; done
-# device traces (engines per call) of the layouts: today's (0), request-major (1), preferred key-head split (4)
-for v in 0 1 4; do
+# device traces (device time and engines per call): today's layout (0), the fold build (6), request-major (1),
+# the preferred key-head split (4), the fold build with that split (7)
+for v in 0 6 1 4 7; do
     step "gdn_trace_variant$v" "$IL" "VLLM_HPU_GDN_VERIFY_VARIANT=$v" HABANA_PROFILE=profile_api_light -- \
         python tools/flash_next/hc_kernels/bench_gdn_verify.py --label "trace_variant$v" --out "$OUT" --trace \
         --batches 1,32 --iters 3
