@@ -301,16 +301,20 @@ def _hpu_gather_logprobs(
     """
     from vllm.v1.outputs import LogprobsTensors
     import vllm.v1.sample.sampler as _sampler_mod
+    from vllm_gaudi.v1.sample.topk_ids import topk_with_ids
 
     assert token_ids.dtype == torch.int64
-    topk_logprobs, topk_indices = torch.topk(logprobs, num_logprobs, dim=-1)
+    # The top-k ids come out of an fp32 id table (v1/sample/topk_ids.py): upstream's cat of the top-k indices
+    # and their int32 cast in this graph gave garbled ids on the card, and the detokenizer then raised
+    # OverflowError in the output handler, which ended the server (spec-lookup job 00086).
+    topk_logprobs, topk_ids = topk_with_ids(logprobs, num_logprobs)
     token_ids = token_ids.unsqueeze(-1)
     token_logprobs = logprobs.gather(-1, token_ids)
     # mark_unbacked calls intentionally omitted — forbidden on HPU dynamo.
     token_ranks = _sampler_mod.batched_count_greater_than(logprobs, token_logprobs)
-    indices = torch.cat((token_ids, topk_indices), dim=1)
+    # The sampled ids are arg max ids: their int32 cast in one graph is right on the card (jobs 00021, 00093).
+    indices = torch.cat((token_ids.to(torch.int32), topk_ids), dim=1)
     logprobs = torch.cat((token_logprobs, topk_logprobs), dim=1)
-    indices = indices.to(torch.int32)
     return LogprobsTensors(indices, logprobs, token_ranks)
 
 

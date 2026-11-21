@@ -1,0 +1,44 @@
+35c35,39
+< #     place in the queue of your own waiting job ID, which is cancelled; up to its card count in total)
+---
+> #     place in the queue of your own waiting job ID, which is cancelled; up to its card count in total),
+> #     --bridge BUILD_ID (our own build of the Gaudi PyTorch bridge, ~/farm/native-replay/bridge-build/out/
+> #     BUILD_ID on the node, installed over the image's at the container's start by the collectives track's
+> #     with_bridge.py, which checks what the processes load and writes bridge.json into the results; added
+> #     2026-11-21 by the collectives track, see docs/design/flash-next/collectives.md section 7 on its branch)
+269,270c273,274
+<     local kind="$1" track="${2:-}" name="${3:-}" cards="${4:-}" hold="${5:-}" sync=1 script replaces=""
+<     local -a fj=() inner=() extra=()
+---
+>     local kind="$1" track="${2:-}" name="${3:-}" cards="${4:-}" hold="${5:-}" sync=1 script replaces="" bridge=""
+>     local -a fj=() inner=() extra=() wrap=()
+297a302,307
+>             --bridge)
+>                 [ $# -ge 2 ] || die "--bridge needs a build id (a folder of ~/farm/native-replay/bridge-build/out on the node)"
+>                 need_word BUILD_ID "$2"
+>                 bridge="$2"
+>                 shift 2
+>                 ;;
+354c364,375
+<     script="# farm $kind $track $name $cards $hold (commit $SYNCED), written $(date -u +%Y-%m-%dT%H:%M:%SZ)"$'\n'
+---
+>     script="# farm $kind $track $name $cards $hold (commit $SYNCED${bridge:+, bridge $bridge}), written $(date -u +%Y-%m-%dT%H:%M:%SZ)"$'\n'
+>     if [ -n "$bridge" ]; then
+>         # The build goes into the job's own results folder (the container's $FARM_OUT/bridge) when the job
+>         # starts; with_bridge.py installs it there and then runs the job's command (exit 7 or 8 if it cannot).
+>         node "test -f ~/farm/collectives/bridge/with_bridge.py" || die "--bridge: no ~/farm/collectives/bridge/with_bridge.py on the node (the collectives track deploys it)"
+>         node "test -f ~/farm/native-replay/bridge-build/out/$bridge/manifest.json" \
+>             || echo "farm: warning: bridge build $bridge is not on the node yet; the job fails at its start if it is still missing" >&2
+>         script="${script}B=~/farm/native-replay/bridge-build/out/$bridge; D=~/farm/$track/results/\$CARDQ_JOB-\$CARDQ_NAME/bridge"$'\n'
+>         script="${script}[ -f \"\$B/manifest.json\" ] || { echo \"farm: bridge build $bridge is not on the node\"; exit 2; }"$'\n'
+>         script="${script}mkdir -p \"\$D\" && cp -r \"\$B/.\" \"\$D/\" && cp ~/farm/collectives/bridge/with_bridge.py \"\$D/\" || { echo \"farm: cannot copy bridge build $bridge\"; exit 2; }"$'\n'
+>         wrap=(bash -c 'exec python3 "$FARM_OUT/bridge/with_bridge.py" "$FARM_OUT/bridge" -- "$@"' with-bridge)
+>     fi
+356,358c377,379
+<         job) script="${script}exec ~/farm/farm_job.sh $(job_line "${fj[@]}" -- "${extra[@]}")" ;;
+<         tiny) script="${script}exec ~/farm/farm_job.sh $(job_line "${fj[@]}" -- python /farm/farm_tiny.py ${inner[@]+"${inner[@]}"})" ;;
+<         serve) script="${script}exec ~/farm/farm_job.sh $(job_line "${fj[@]}" -- bash /farm/serve_probe.sh ${inner[@]+"${inner[@]}"} -- ${extra[@]+"${extra[@]}"})" ;;
+---
+>         job) script="${script}exec ~/farm/farm_job.sh $(job_line "${fj[@]}" -- ${wrap[@]+"${wrap[@]}"} "${extra[@]}")" ;;
+>         tiny) script="${script}exec ~/farm/farm_job.sh $(job_line "${fj[@]}" -- ${wrap[@]+"${wrap[@]}"} python /farm/farm_tiny.py ${inner[@]+"${inner[@]}"})" ;;
+>         serve) script="${script}exec ~/farm/farm_job.sh $(job_line "${fj[@]}" -- ${wrap[@]+"${wrap[@]}"} bash /farm/serve_probe.sh ${inner[@]+"${inner[@]}"} -- ${extra[@]+"${extra[@]}"})" ;;
