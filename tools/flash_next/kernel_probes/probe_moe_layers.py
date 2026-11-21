@@ -126,7 +126,36 @@ def moe(torch, weights, local, x8, scale, ids, router_weights, chunk, slices=1):
     return out
 
 
-def measure(torch, htcore, dev, sets, local, rows, mode, chunk, iters, results, slices=1):
+def replay_times(torch, dev, run, iters):
+    """Wall time of ``iters`` replays of ``run`` captured in an HPU graph (as the server's decode runs), each one
+    synchronized: a replay costs the host one launch, so its wall time is the device time of the K layers plus that
+    launch. The lazy timing (mark + wait after issuing the K calls) misses device work that starts during a long
+    issue: job 00132 got 6 TB/s "if read once", which no HBM read gives."""
+
+    class Layers(torch.nn.Module):
+
+        def forward(self, dummy):
+            return run()
+
+    module = Layers()
+    if dev == "hpu":
+        import habana_frameworks.torch as htorch
+
+        module = htorch.hpu.wrap_in_hpu_graph(module)
+    dummy = torch.zeros(1).to(dev)
+    for _ in range(2):  # capture, then the first replay
+        module(dummy)
+        torch.hpu.synchronize()
+    samples = []
+    for _ in range(iters):
+        t0 = time.perf_counter()
+        module(dummy)
+        torch.hpu.synchronize()
+        samples.append(time.perf_counter() - t0)
+    return sorted(samples)
+
+
+def measure(torch, htcore, dev, sets, local, rows, mode, chunk, iters, results, slices=1, replay=False):
     key = f"local{local}_rows{rows}_{mode}_chunk{chunk}" + (f"_slices{slices}" if slices > 1 else "")
     layers = len(sets)
     try:
@@ -136,23 +165,33 @@ def measure(torch, htcore, dev, sets, local, rows, mode, chunk, iters, results, 
         inputs = quantized_inputs(torch, rows, layers, dev, seed=rows)
         htcore.mark_step()
         torch.hpu.synchronize()
-        samples = []
-        for it in range(iters + 2):  # two untimed: the compile, then the first run of the recipe
-            t0 = time.perf_counter()
-            outs = [moe(torch, sets[layer], local, x8, s, ids, router_weights, chunk, slices)
-                    for layer, (x8, s) in enumerate(inputs)]
-            t1 = time.perf_counter()
-            htcore.mark_step()
-            t2 = time.perf_counter()
-            torch.hpu.synchronize()
-            t3 = time.perf_counter()
-            if it >= 2:
-                samples.append((t1 - t0, t2 - t1, t3 - t2))
-            del outs
-        samples.sort(key=lambda s: s[1] + s[2])
-        issue, mark, wait = samples[len(samples) // 2]
-        us = (mark + wait) / layers * 1e6
-        best = min(s[1] + s[2] for s in samples) / layers * 1e6
+
+        def run():
+            return tuple(moe(torch, sets[layer], local, x8, s, ids, router_weights, chunk, slices)
+                         for layer, (x8, s) in enumerate(inputs))
+
+        if replay:
+            walls = replay_times(torch, dev, run, iters)
+            issue, mark, wait = 0.0, 0.0, walls[len(walls) // 2]
+            us = wait / layers * 1e6
+            best = walls[0] / layers * 1e6
+        else:
+            samples = []
+            for it in range(iters + 2):  # two untimed: the compile, then the first run of the recipe
+                t0 = time.perf_counter()
+                outs = run()
+                t1 = time.perf_counter()
+                htcore.mark_step()
+                t2 = time.perf_counter()
+                torch.hpu.synchronize()
+                t3 = time.perf_counter()
+                if it >= 2:
+                    samples.append((t1 - t0, t2 - t1, t3 - t2))
+                del outs
+            samples.sort(key=lambda s: s[1] + s[2])
+            issue, mark, wait = samples[len(samples) // 2]
+            us = (mark + wait) / layers * 1e6
+            best = min(s[1] + s[2] for s in samples) / layers * 1e6
         results[key] = dict(local=local, rows=rows, mode=mode, chunk=chunk, slices=slices, local_experts_hit=hit,
                             layers=layers,
                             us_per_layer=us, best_us_per_layer=best, issue_ms=issue * 1e3, mark_ms=mark * 1e3,
@@ -182,6 +221,13 @@ def main():
     ap.add_argument("--iters", type=int, default=6)
     ap.add_argument("--rows", default="1,8,32,128")
     ap.add_argument("--chunks", default="32,64,128,256,512,1024", help="chunk_size values at 32 and 128 rows")
+    ap.add_argument("--served-locals", default="128,64", help="local expert counts of the served-form sweep")
+    ap.add_argument("--chunk-locals", default="128", help="local expert counts of the chunk_size sweep")
+    ap.add_argument("--chunk-rows", default="32,128", help="row counts of the chunk_size sweep")
+    ap.add_argument("--skip-routing", action="store_true", help="leave out the none / dense routing arms")
+    ap.add_argument("--skip-slices", action="store_true", help="leave out the 2- and 4-slice arms")
+    ap.add_argument("--replay", action="store_true",
+                    help="time HPU-graph replays of the K layers (wall per replay / K) instead of mark + wait")
     a = ap.parse_args()
     a.out.mkdir(parents=True, exist_ok=True)
     os.environ.setdefault("PT_HPU_LAZY_MODE", "1")
@@ -192,30 +238,37 @@ def main():
     sets = build_layers(torch, htcore, dev, a.layers, 128)
     torch.hpu.synchronize()
     say(f"device {dev}; {a.layers} weight sets of 128 experts built in {time.perf_counter() - t0:.1f} s "
-        f"({a.layers * 128 * EXPERT_BYTES / 1e9:.1f} GB)")
+        f"({a.layers * 128 * EXPERT_BYTES / 1e9:.1f} GB); timing: "
+        f"{'HPU-graph replay, wall per replay / K' if a.replay else 'lazy, (mark + wait) / K'}")
     results = {}
 
     def save():
         (a.out / "moe_layers.json").write_text(json.dumps(results, indent=1) + "\n")
 
     # 1. The served form (no chunk_size) at TP4 (128 local experts) and TP8 (the first 64 of each set).
-    for local in (128, 64):
+    served_locals = [int(v) for v in a.served_locals.split(",") if v]
+    chunk_locals = [int(v) for v in a.chunk_locals.split(",") if v]
+    chunk_rows = [int(v) for v in a.chunk_rows.split(",") if v]
+    for local in served_locals:
         for rows in rows_list:
-            measure(torch, htcore, dev, sets, local, rows, "uniform", None, a.iters, results)
+            measure(torch, htcore, dev, sets, local, rows, "uniform", None, a.iters, results, replay=a.replay)
             save()
     # 2. What the routing does at 32 rows, TP4: no local expert hit, and all of them.
-    for mode in ("none", "dense"):
-        measure(torch, htcore, dev, sets, 128, 32, mode, None, a.iters, results)
+    for mode in () if a.skip_routing else ("none", "dense"):
+        measure(torch, htcore, dev, sets, 128, 32, mode, None, a.iters, results, replay=a.replay)
         save()
     # 3. chunk_size at 32 and 128 rows, TP4; then the expert range in 2 and 4 slices (64 and 32 experts per call).
-    for rows in (32, 128):
+    for local in chunk_locals:
+        for rows in chunk_rows:
+            for chunk in chunks:
+                measure(torch, htcore, dev, sets, local, rows, "uniform", chunk, a.iters, results, replay=a.replay)
+                save()
+    for rows in () if a.skip_slices else (32, 128):
         if rows not in rows_list:
             continue
-        for chunk in chunks:
-            measure(torch, htcore, dev, sets, 128, rows, "uniform", chunk, a.iters, results)
-            save()
         for slices in (2, 4):
-            measure(torch, htcore, dev, sets, 128, rows, "uniform", None, a.iters, results, slices=slices)
+            measure(torch, htcore, dev, sets, 128, rows, "uniform", None, a.iters, results, slices=slices,
+                    replay=a.replay)
             save()
 
     def us(local, rows, mode="uniform", chunk=None, slices=1):
@@ -231,15 +284,16 @@ def main():
     line2 = (f"routing at 32 rows, TP4: none {fmt(us(128, 32, 'none'))}, uniform {fmt(us(128, 32))}, "
              f"dense {fmt(us(128, 32, 'dense'))} us per layer")
     parts = []
-    for rows in (32, 128):
-        timed = {c: us(128, rows, chunk=c) for c in [None] + chunks}
-        timed = {c: v for c, v in timed.items() if v is not None}
-        if timed:
-            best = min(timed, key=timed.get)
-            parts.append(f"{rows} rows: " + ", ".join(f"{'none' if c is None else c} {v:.1f}"
-                                                      for c, v in timed.items()) +
-                         f" -> best chunk_size {best} ({timed[best]:.1f} us)")
-    line3 = "chunk_size (TP4, uniform), us per layer: " + ("; ".join(parts) or "n/a")
+    for local in chunk_locals:
+        for rows in chunk_rows:
+            timed = {c: us(local, rows, chunk=c) for c in [None] + chunks}
+            timed = {c: v for c, v in timed.items() if v is not None}
+            if timed:
+                best = min(timed, key=timed.get)
+                parts.append(f"{local} local, {rows} rows: " + ", ".join(f"{'none' if c is None else c} {v:.1f}"
+                                                                        for c, v in timed.items()) +
+                             f" -> best chunk_size {best} ({timed[best]:.1f} us)")
+    line3 = "chunk_size (uniform), us per layer: " + ("; ".join(parts) or "n/a")
     line4 = ("expert range in slices (TP4, uniform), us per layer, 1 / 2 / 4 calls: " +
              "; ".join(f"{r} rows {fmt(us(128, r))} / {fmt(us(128, r, slices=2))} / {fmt(us(128, r, slices=4))}"
                        for r in (32, 128) if r in rows_list))
