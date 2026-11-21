@@ -358,6 +358,17 @@ while [ "$i_arm" -lt "${#ARMS[@]}" ]; do
                 # async-sched's M1 gate: the device-made inputs made and checked against the host's every step
                 tiny-m1) tiny_graph=1; tiny_md=1; tiny_chain=1; tiny_vp=0; tiny_vlg=0; tiny_m1=1 ;;
             esac
+            # HEADLINE_TINY_IRLOG_ARMS (comma list of tiny arms): the bridge's IR-graph and lazy logs of that gate into
+            # <arm>/habana_logs (engine-step's census of the step's cuts, reports/engine-step/probes/cutlog; a gate is
+            # never measured)
+            tiny_irlog=()
+            case ",${HEADLINE_TINY_IRLOG_ARMS:-}," in
+                *",$arm,"*)
+                    mkdir -p "$OUT/$arm/habana_logs"
+                    tiny_irlog=(LOG_LEVEL_PT_IRGRAPH=1 LOG_LEVEL_PT_LAZY=1 HABANA_LOGS="$OUT/$arm/habana_logs")
+                    echo "headline_job: $arm with the bridge's IR-graph and lazy logs in $OUT/$arm/habana_logs"
+                    ;;
+            esac
             # the MTP server's own flags too (they act only on the speculative mode)
             tiny_sv="${VLLM_HPU_SPEC_SAMPLED_VERIFY:-0}"
             if [ "${HEADLINE_MTP_SAMPLED:-0}" = 1 ]; then tiny_sv="${VLLM_HPU_SPEC_SAMPLED_VERIFY:-1}"; fi
@@ -369,7 +380,7 @@ while [ "$i_arm" -lt "${#ARMS[@]}" ]; do
                 VLLM_HPU_FLASH_NEXT_DECODE_METADATA="$tiny_md" VLLM_HPU_MTP_DRAFT_CHAIN="$tiny_chain" \
                 VLLM_HPU_VOCAB_PARALLEL_LOGITS="$tiny_vp" VLLM_HPU_VERIFY_LOGITS_IN_GRAPH="$tiny_vlg" \
                 VLLM_HPU_LOG_UNMATCHED_GRAPH_INPUTS="$tiny_log" VLLM_HPU_FLASH_NEXT_SPEC_DEVICE_INPUTS="$tiny_m1" \
-                "$PYTHON" /farm/farm_tiny.py --gdn hc ${spec[@]+"${spec[@]}"} --out "$OUT/$arm"
+                env ${tiny_irlog[@]+"${tiny_irlog[@]}"} "$PYTHON" /farm/farm_tiny.py --gdn hc ${spec[@]+"${spec[@]}"} --out "$OUT/$arm"
             rc=$?
             if [ "$arm" != tiny ]; then
                 # a chain gate: a failure drops that stage's chain arms, the job goes on
