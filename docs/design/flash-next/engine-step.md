@@ -67,12 +67,15 @@ between the graphs are listed there; 00226 (TP2) is to name the TP8 front cuts.
    (d) 00226's TP2 cut log: name the cuts of 00205's `embed` and `ple` segments (`python3
    reports/engine-step/probes/cutlog/cuts.py reports/engine-step/card/00226-*/habana_logs`, then `seq.py` on the
    verify and draft captures) and tell the coordinator. (e) The chain job (coordinator 09:19 UTC) is
-   mtp-draft-graph's 00228, after 00222 (about 13:00 UTC), on its branch `feat/flash-next-gaudi-mtp-draft-graph-b5`
-   (build 5 `eb21ac75` + the chain + async-sched's M1 + this track's `844a37f2` and `ca52fa33`); arms `on-md`,
-   `chain-md`, `vlg`, `chain-vlg`, `all`, `chain-all` on one server (`vlg` against `on-md` is this track's flag
-   alone). Its tiny gate `tiny-chain-vlg` (asked at 09:32 UTC to carry `LOG_LEVEL_PT_IRGRAPH=1` and
-   `LOG_LEVEL_PT_LAZY=1`) is where `window.py` shows which of the nine step-level cuts of section 15 are gone; tell
-   the coordinator.
+   mtp-draft-graph's 00230 `real8-chain-b5b` (it replaced 00228), after 00222 (about 13:00 UTC), on its branch
+   `feat/flash-next-gaudi-mtp-draft-graph-b5` (build 5 `eb21ac75` + the chain + async-sched's M1 + this track's
+   `844a37f2` and `ca52fa33`); arms `on-md`, `chain-md`, `vlg`, `chain-vlg`, `all`, `chain-all` on one server (`vlg`
+   against `on-md` is this track's flag alone). Its tiny gate `tiny-chain-vlg` (TP8 tiny, k = 2, draft graph + I01 +
+   chain + VLG, VP 0, `REPLICATED_FC` and `REPLICATED_EMBEDDING` on, the unmatched-input log) carries
+   `LOG_LEVEL_PT_IRGRAPH=1` and `LOG_LEVEL_PT_LAZY=1`: `window.py` on
+   `reports/mtp-draft-graph/card/00230-real8-chain-b5b/tiny-chain-vlg/habana_logs` (one rank's main thread: 8 ranks
+   write there) shows which of the nine step-level cuts of section 15 are gone; tell the coordinator. The
+   unmatched-input lines of the three chain gates are in the job log, after each gate's `arm ... start` line.
 4. Build 4's code with this track's card tools and flags is the local branch `engine-step-int4-card` (`4b180729`);
    the CPU census tree is `reports/engine-step/trees/b4`.
 
