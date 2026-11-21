@@ -13,7 +13,8 @@ and the generated answer (the needle check at that length).
 
 ``--passes 2`` (default) sends each prompt twice and keeps the second: the server's prompt-logprob gather narrows
 top-k ids to int32 and reads them on the host, which card rule 9 makes wrong on the FIRST run of a recipe; the
-second run of the same shapes replays it. Both passes' top-1 ids are compared (``first_pass_top1_agree``).
+second run of the same shapes replays it. Both passes' top-1 ids are compared (``first_pass_top1_agree``), and their
+teacher logprobs (``pass_noise``: mean, p99 and max |delta| on the same server: the noise floor of a comparison).
 
 With ``--reference`` (a file this script wrote on the same build with bf16 K/V) it compares, per length, over the
 same positions: mean, p99 and max |delta| of the teacher-token logprobs, the top-1 agreement, and each run's mean
@@ -172,6 +173,14 @@ def main():
             if len(runs) > 1:
                 p = [(x, y) for x, y in zip(runs[0]["top1"], keep["top1"]) if x is not None and y is not None]
                 rec["first_pass_top1_agree"] = (sum(1 for x, y in p if x == y) / len(p)) if p else None
+                # The noise floor of the comparison (coordinator, build 5): the teacher-token logprobs of the first
+                # pass against the kept one on the same server, same prompt, same K/V form.
+                d = sorted(abs(x - y) for x, y in zip(runs[0]["teacher_logprob"], keep["teacher_logprob"])
+                           if x is not None and y is not None)
+                if d:
+                    rec["pass_noise"] = {"positions": len(d), "mean_abs_delta": sum(d) / len(d),
+                                         "p99_abs_delta": d[min(len(d) - 1, int(0.99 * len(d)))],
+                                         "max_abs_delta": d[-1]}
             valid = [v for v in keep["teacher_logprob"] if v is not None]
             rec["mean_teacher_logprob"] = sum(valid) / len(valid) if valid else None
             line = "%s L=%d tokens=%d sha=%s walls=%s needle=%s answer=%r mean_lp=%s missing=%d" % (
@@ -194,6 +203,11 @@ def main():
                                                                                          float("nan")),
                                                c.get("top1_agree", float("nan")), c.get("ppl", float("nan")),
                                                c.get("ref_ppl", float("nan"))))
+            noise = rec.get("pass_noise")
+            if noise:
+                line += " PASSNOISE positions=%d mean|d|=%.4f p99|d|=%.4f max|d|=%.4f top1_agree=%s" % (
+                    noise["positions"], noise["mean_abs_delta"], noise["p99_abs_delta"], noise["max_abs_delta"],
+                    "%.4f" % rec["first_pass_top1_agree"] if rec.get("first_pass_top1_agree") is not None else None)
             say(line)
         except Exception as e:  # noqa: BLE001 - a probe records every failure
             rec["error"] = repr(e)[:800]
