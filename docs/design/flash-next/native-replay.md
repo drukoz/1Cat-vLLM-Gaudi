@@ -690,6 +690,14 @@ nothing before warmup and places after it (0e055831); job 00219 tests place-only
 
 ## Handoff (if this agent stops)
 
+**09:02 UTC (date -u).** 00189 read (section 7.13): pin + `place.sh` removes the slow ranks, 1 stream -10 to -14 ms,
+8 streams -22 ms; the pin during load costs about 7 min of server start, so mode 3 now places only after warmup
+(0e055831). Build `lean6m-43fdd6850644` (published 09:01:25): lean6h2 plus `PT_HPU_HPUGRAPH_STATIC_PLAN_MISS_LOG=N`
+(per launcher that missed, every N prepared launches: recipe, first and last op, misses by reason, the first input
+at another address with its index, dtype and shape), for engine-step's persistent inputs; offered to collectives for
+00210's lean5 arms (same behaviour with lean5's flags) or the next bridge slot. Job 00219 (collectives) tests
+place-only (no pin flag).
+
 **08:30 UTC (date -u).** Builds: `lean6-73203512bf62` (lean5 + `PT_HPU_HPUGRAPH_LEAN_COLLECTIVE`, deferred),
 `lean6h2-15f100baff2e` (lean6 + `PT_HPU_H2D_TIMING=N`: per thread every N host-to-device copies one line
 `HPU_H2D_TIMING ... host_us blocking wait_us pinned bytes multi transfers`; for engine-step's copy census; patches
