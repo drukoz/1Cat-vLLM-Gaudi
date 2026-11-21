@@ -263,12 +263,33 @@ barrier_args() {
     fi
 }
 
+# The job's CPUs, read once here before any server: native-replay's place.sh moves EVERY process of the container off
+# the vCPUs it reserves (each worker's main thread and its sibling: 16 at TP8), this script included, so every later
+# server inherited 16 CPUs fewer (job 00222: 144, 128, 112, 96, 80, 64 CPUs over its six servers, 16 to 6 helper CPUs
+# per rank). restore_cpus gives this shell its whole set back before each server starts (a no-op where the platform
+# has no sched_getaffinity, e.g. a Mac dry run).
+JOB_CPUS="$("$PYTHON" -c 'import os; print(",".join(map(str, sorted(os.sched_getaffinity(0)))))' 2>/dev/null)"
+restore_cpus() {
+    [ -n "$JOB_CPUS" ] || return 0
+    "$PYTHON" - "$$" "$JOB_CPUS" <<'PY4' || echo "headline_job: could not give this shell its CPUs back"
+import os
+import sys
+pid, cpus = int(sys.argv[1]), {int(c) for c in sys.argv[2].split(",")}
+before = os.sched_getaffinity(pid)
+if before != cpus:
+    os.sched_setaffinity(pid, cpus)
+    print("headline_job: this shell's CPUs %d -> %d (given back after the last placement)" % (len(before), len(cpus)))
+PY4
+}
+
 # placed DIR COMMAND...: one real-model server (COMMAND, a serve_probe.sh run whose out folder is DIR), under the
 # placement when the pin switch said "place" (above): place_wrap.sh runs COMMAND and, once the server answers /health
-# on the job's port, place.sh with the server's log; its output goes to DIR/placement.log.
+# on the job's port, place.sh with the server's log; its output goes to DIR/placement.log. Every server starts with
+# the job's whole CPU set (restore_cpus).
 placed() {
     local dir="$1"
     shift
+    restore_cpus
     if [ "$PLACE_ON" = 1 ]; then
         mkdir -p "$dir"
         PLACE_ARGS="--log $dir/server0.log" PLACE_LOG="$dir/placement.log" bash "$PLACE_WRAP" "$PLACE_SCRIPT" -- "$@"
