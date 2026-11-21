@@ -137,6 +137,24 @@ def dense_moe(torch, layer, local, x, ids32, weights, expert_ids):
     return (down * wmat.t().unsqueeze(-1)).sum(dim=0).to(torch.bfloat16)  # [T, H]
 
 
+def dense_moe_fused(torch, layer, local, x, ids32, weights, expert_ids):
+    """The dense form with the scales inside the two GEMMs (A_scale_inv per row [E, T, 1], B_scale_inv per column
+    [E, 1, N], as vllm_gaudi/ops/deepseek_v41_grouped_prefill.py passes them) and bf16 GEMM outputs."""
+    w13, w2, s13, s2 = layer
+    rows = x.shape[0]
+    routed = (ids32.unsqueeze(-1) == expert_ids).to(torch.float32)
+    wmat = (routed * weights.float().unsqueeze(-1)).sum(dim=1)  # [T, E]
+    x8, xs = quantize_rows(torch, x)
+    a = x8.unsqueeze(0).expand(local, rows, H).contiguous()
+    a_scale = xs.unsqueeze(0).expand(local, rows, 1).contiguous()
+    gate_up = torch.ops.hpu.fp8_gemm_v2(a, False, w13, True, None, torch.bfloat16, a_scale, s13.unsqueeze(1), None,
+                                        False)
+    mid = (torch.nn.functional.silu(gate_up[..., :I].float()) * gate_up[..., I:].float()).to(torch.bfloat16)
+    m8, ms = quantize_rows(torch, mid)
+    down = torch.ops.hpu.fp8_gemm_v2(m8, False, w2, True, None, torch.bfloat16, ms, s2.unsqueeze(1), None, False)
+    return (down.float() * wmat.t().unsqueeze(-1)).sum(dim=0).to(torch.bfloat16)
+
+
 def replay_us(torch, dev, run, layers, iters):
     class Layers(torch.nn.Module):
 
@@ -169,6 +187,7 @@ def main():
     ap.add_argument("--iters", type=int, default=6)
     ap.add_argument("--rows", default="32,128")
     ap.add_argument("--locals", default="64,128")
+    ap.add_argument("--forms", default="vendor,vendor-chunk64,dense,dense-fused")
     a = ap.parse_args()
     a.out.mkdir(parents=True, exist_ok=True)
     os.environ.setdefault("PT_HPU_LAZY_MODE", "1")
@@ -187,20 +206,23 @@ def main():
             # parity on layer 0
             try:
                 y_vendor = vendor_moe(torch, sets[0], local, xs[0], ids_d, w_d).float().cpu()
-                y_dense = dense_moe(torch, sets[0], local, xs[0], ids32_d, w_d, expert_ids).float().cpu()
                 ref = float(y_vendor.abs().max()) or 1.0
-                diff = float((y_vendor - y_dense).abs().max())
-                say(f"local {local:3d} rows {rows:3d} parity dense vs vendor: max abs diff {diff:.3e}, "
-                    f"relative {diff / ref:.3e} (vendor max {ref:.3e}; {hit} local experts hit)")
-                results[f"parity_local{local}_rows{rows}"] = dict(max_abs=diff, rel=diff / ref, hit=hit)
+                for name, fn in (("dense", dense_moe), ("dense-fused", dense_moe_fused)):
+                    y = fn(torch, sets[0], local, xs[0], ids32_d, w_d, expert_ids).float().cpu()
+                    diff = float((y_vendor - y).abs().max())
+                    say(f"local {local:3d} rows {rows:3d} parity {name} vs vendor: max abs diff {diff:.3e}, "
+                        f"relative {diff / ref:.3e} (vendor max {ref:.3e}; {hit} local experts hit)")
+                    results[f"parity_{name}_local{local}_rows{rows}"] = dict(max_abs=diff, rel=diff / ref, hit=hit)
             except Exception as error:  # noqa: BLE001 - a probe reports every failure
                 say(f"local {local:3d} rows {rows:3d} parity: ERROR {' '.join(repr(error).split())[:300]}")
-            for form in ("vendor", "vendor-chunk64", "dense"):
+            for form in a.forms.split(","):
                 key = f"local{local}_rows{rows}_{form}"
                 try:
-                    if form == "dense":
-                        def run(sets=sets, xs=xs):
-                            return tuple(dense_moe(torch, layer, local, x, ids32_d, w_d, expert_ids)
+                    if form in ("dense", "dense-fused"):
+                        fn = dense_moe if form == "dense" else dense_moe_fused
+
+                        def run(sets=sets, xs=xs, fn=fn):
+                            return tuple(fn(torch, layer, local, x, ids32_d, w_d, expert_ids)
                                          for layer, x in zip(sets, xs))
                     else:
                         chunk = 64 if form == "vendor-chunk64" else None
@@ -218,12 +240,13 @@ def main():
                 (a.out / "moe_dense.json").write_text(json.dumps(results, indent=1) + "\n")
         del sets
     lines = []
-    for key in sorted(k for k in results if k.endswith("_dense")):
-        base = key[:-len("dense")]
-        v, c, d = (results.get(base + f, {}).get("us_per_layer") for f in ("vendor", "vendor-chunk64", "dense"))
-        if v and d:
+    for key in sorted(k for k in results if k.endswith("_vendor")):
+        base = key[:-len("vendor")]
+        v, c, d, f = (results.get(base + n, {}).get("us_per_layer")
+                      for n in ("vendor", "vendor-chunk64", "dense", "dense-fused"))
+        if v:
             lines.append(f"{base.rstrip('_')}: vendor {v:.1f}, vendor chunk 64 {c or float('nan'):.1f}, "
-                         f"dense {d:.1f} us ({d / v:.2f}x the vendor op)")
+                         f"dense {d or float('nan'):.1f}, dense-fused {f or float('nan'):.1f} us")
     print("VERDICT moe-dense: " + ("; ".join(lines) or "no dense form ran"), flush=True)
     results["verdict"] = lines
     (a.out / "moe_dense.json").write_text(json.dumps(results, indent=1) + "\n")

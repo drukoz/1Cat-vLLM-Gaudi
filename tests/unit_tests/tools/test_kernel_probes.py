@@ -87,9 +87,9 @@ def test_moe_dense_probe_matches_the_vendor_stand_in_and_times_every_form(tmp_pa
                       "--rows", "32", "--locals", "8"], tmp_path)
     assert proc.returncode == 0, out[-3000:]
     forms = [line for line in out.splitlines() if line.startswith("PROBE moe-dense local") and " form " in line]
-    assert len(forms) == 3 and not any("ERROR" in line for line in forms), forms
-    parity = [line for line in out.splitlines() if " parity dense vs vendor: " in line]
-    assert len(parity) == 1 and float(parity[0].split("relative ")[1].split()[0]) < 0.05, parity
+    assert len(forms) == 4 and not any("ERROR" in line for line in forms), forms
+    parity = [line for line in out.splitlines() if " parity dense" in line and " vs vendor: " in line]
+    assert len(parity) == 2 and all(float(line.split("relative ")[1].split()[0]) < 0.05 for line in parity), parity
     assert "VERDICT moe-dense: local8_rows32:" in out
 
 
