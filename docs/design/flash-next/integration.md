@@ -9,7 +9,7 @@ Labels: MEASURED (card, with its file), VERIFIED (CPU test or code line), INFERR
 
 ## Handoff (if this agent stops)
 
-**Build 5 (fifth agent of the track, Opus 5.5, started 08:04 UTC on 2026-11-21; updated 09:47 UTC).**
+**Build 5 (fifth agent of the track, Opus 5.5, started 08:04 UTC on 2026-11-21; updated 12:10 UTC: job 00222 measured, results below).**
 
 - **Tree.** Base = build 4 (`8cdc5999`) with the program head `adbcff30` (PRs #18 to #22) merged in, so the tree is the
   program head plus what build 4 carried that the head lacks (qsa-fused's branch, mtp-card-ready + the per-step record,
@@ -257,6 +257,13 @@ checkpoint's temperature 1.0, top_k 20, top_p 0.95). Reference (program head, 00
 | 4 (00186) | no spec, async (ASYNC_SCHED=1) | 1 / 8 / 32 | 53.5, 55.7 / 69.6, 63.8 / 54.4, 72.4 | 53.5 / 63.8 / 54.4 | 52.0, 54.3 / 66.3, 67.5 / 53.9, 49.8 | 52.0 / 66.3 / 49.8 | |
 | 4 (00186) | MTP k = 2 (sync, MTP_TIMING=2) | 1 / 8 / 32 | 63, 64 / 71, 72 / 88, 79 | 26.1 / 30.3 / 35.0 (28.6) | 63, 64 / 69, 72 / 103, 85 | 26.5 / 33.2 / 40.0 (25.0) | 2.42 / 2.29-2.35 / 2.27-2.29 |
 | 4 (00186) | MTP k = 2, async (ASYNC_SCHED=2) | 1 / 8 / 32 | 55, 57 / 65, 67 / 77, 77 | 27.5 / 27.4 / **33.7 (29.7)** | 81, 77 / 94, 90 / 82, 98 | 35.3 / 42.1 / **38.9 (25.7)** | 2.00 / 2.29-2.37 / 2.29 |
+| 5 (00222) | A: MTP k = 2, async =2, dense from 1 token, chunk, placement | 1 / 8 / 32 | 35.1, 34.9 / 42.5, 42.0 / 65.3, 64.7 | 15.3 / 17.6 / **28.3 (35.3)** | 35.8, 36.0 / 43.0, 43.2 / 70.5, 70.8 | 18.0 / 19.6 / **33.3 (30.0)** | 2.29 / 2.33-2.39 / 2.29-2.31 |
+| 5 (00222) | A-spin (spinner on) | 1 / 8 / 32 | 34.5, 34.9 / 40.3, 40.7 / 64.0, 63.8 | 15.1 / 17.3 / 27.9 | 35.6, 36.0 / 42.2, 43.2 / 70.7, 70.4 | 16.0 / 20.8 / 32.3 | 2.29 / 2.33 / 2.29 |
+| 5 (00222) | B: MTP k = 3, async =2 | 1 / 8 / 32 | 40.7, 39.7 / 48.0, 48.2 / 80.9, 80.0 | 15.2 / 17.6 / 30.3 | 40.0, 40.1 / 50.2, 50.7 / 89.9, 88.8 | 15.0 / 21.2 / 37.5 | 2.61 / 2.59-2.72 / 2.64-2.67 |
+| 5 (00222) | C: MTP k = 2 sync (MTP_TIMING=2) | 1 / 8 / 32 | 36.7, 36.8 / 43.8, 42.7 / 68.5, 67.6 | 16.1 / 18.7 / 29.6 | 38.6, 38.4 / 45.0, 48.3 / 73.5, 73.6 | 17.5 / 21.1 / 34.5 | 2.29 / 2.29-2.33 / 2.29 |
+| 5 (00222) | A-inline (PT_HPU_DISABLE_ASYNC_COLLECTIVE=1), greedy | 1 / 8 / 32 | 34.7, 34.3 / 40.6, 40.4 / 62.8, 63.6 | 15.0 / 17.4 / **27.0** | | | 2.29 / 2.33 / 2.29-2.33 |
+| 5 (00222) | A's server, per round: off / draft graph / I01 | 1 / 8 / 32 | off 35.5, 35.6 / 41.2, 40.9 / 64.8, 65.0; dg 34.3, 34.3 / 39.5, 39.2 / 63.5, 63.7; md 34.9, 35.9 / 41.2, 41.3 / 64.9, 64.9 | dg 15.0 / 16.2 / 27.4 | | | |
+| 5 (00222) | FP8 K/V (A + fp8_inc + the copy_to logger), greedy | 32 | 65.2, 66.3 | 29.5 | | | 2.21-2.25 |
 
 Build 2 readings (arm A, two measured rounds per level, `a / b` = round 1 / round 2; the better round in the
 ms-per-token column): sampled equals greedy now (server0.log: `Candidate sampling (VLLM_HPU_CANDIDATE_SAMPLING=1): a
@@ -280,6 +287,31 @@ MTP k = 3 at 1 stream is 24.5 to 27.9 ms per token with `VLLM_HPU_SPEC_SAMPLED_V
 slowdown was k = 2 on that server; `VLLM_MOE_CHUNK` wins at 32 streams (00161: -12 ms per MTP step), the dense form
 loses on the served model (00177). Single-server numbers at 32 streams vary by about 10 ms (00178: greedy 69 / 67
 against sampled 54 / 55 on the same server).
+
+Build 5 (00222, image eb21ac75a7c8, late: `VLLM_HPU_MOE_DENSE_MIN_TOKENS=1`, placement `place`; 10:32-11:57 UTC,
+0 of 7 arms failed, no kernel error lines; table `reports/integration/b5/table-00222.md`, made by
+`reports/integration/b5/b5_compare.py`). MEASURED: **A (serve candidate) 28.3 / 28.3 ms per token at 32 streams greedy
+(35.3 tok/s per stream; -16 % against build 4's 33.7, -13 % against 00205's 32.4), 17.6 to 18.3 at 8 (-36 %), 15.3 at
+1 (-44 %: 65 tok/s); sampled 33.3 / 33.7, 19.6 / 19.8, 18.0 / 19.0** (build 4: 38.9, 42.1, 35.3). Spinner on against
+off: within about 1 ms both ways (a wash). k = 3 (B) loses at 32 streams (30.3 greedy, 37.5 to 40.4 sampled) and ties
+at 8 and 1. Async against sync (C, with the per-step record): about -1.5 ms per token at 32 and 8; sampled at 8 async is
+now faster (43 against 45 to 48 ms per step; build 4 had 92 against 71). Inline collectives: -1.8 / -1.7 / -0.5 ms per
+step at 32 / 8 / 1. On A's server, rounds alternated through the switch file: the draft graph -1.3 / -1.7 / -1.2 ms per
+step at 32 / 8 / 1 with identical 1-stream texts; I01 no change at short context (engaged: 13 QSA layers). FP8 K/V:
+speed at 32 streams equal to A (65.2 / 66.3 ms per step); teacher-forced logprobs against A's bf16 at 16K / 64K / 120K:
+mean |delta| 0.357 / 0.085 / 0.174, p99 4.12 / 0.72 / 1.51, top-1 91.3 / 96.3 / 90.5 %, perplexity 6.10 / 3.816 / 5.26
+against 6.56 / 3.817 / 5.29; PASSNOISE (two passes, one server) exactly 0 on both servers; the cross-server bf16 floor
+is unmeasured (the kvlpfb fallback did not fire); the probe's own needle is void (1 token, empty text, both runs); the
+chat needle at 64K hit 1 of 1 and 32 of 32 on the FP8 server; 1-stream decode at 64K 16.1 ms per token; the 32 x 64K
+round (153 ms per token, TTFT 33 s) overlaps the prefill tails (not a decode number). Tiny gate passed; dense kept and
+running in all six servers; texts coherent; peak card memory 78.9 GiB; the only traceback is C's shutdown
+(EngineDeadError at the stop). **Defect (VERIFIED, fixed in b71b396f): place.sh moved the job script off its reserved
+vCPUs, so the servers ran on 144, 128, 112, 96, 80, 64 CPUs (helpers per rank 16 to 6); loads 328 to 471 s; decode did
+not visibly suffer (the 80-CPU arm was the fastest).** Sampled MTP still takes vLLM's sampler
+(`VLLM_HPU_CANDIDATE_SAMPLING=1`; =2 is engine-step's lever). Recommended serve setting (INFERRED, not yet run as one
+combination): MTP k = 2 + async =2 + dense from 1 token + chunk + placement (place only, with the CPU fix) +
+`PT_HPU_DISABLE_ASYNC_COLLECTIVE=1` + `VLLM_HPU_MTP_DRAFT_GRAPH=1` (each about -1.5 ms per step alone; INFERRED 26 to 27
+ms per token at 32 streams together), bf16 K/V until a cross-server floor puts the FP8 differences in context.
 
 Build 4 (00186, image 30f4e37ef08c): **best at 32 streams so far: MTP k = 2 with async scheduling
 (`VLLM_HPU_FLASH_NEXT_ASYNC_SCHED=2`, `VLLM_HPU_MTP_TIMING=0`), greedy 33.7 ms per token = 29.7 tok/s per stream (803
