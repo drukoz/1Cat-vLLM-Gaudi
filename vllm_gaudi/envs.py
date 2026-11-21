@@ -556,6 +556,7 @@ if TYPE_CHECKING:
     VLLM_HPU_GDN_GLUE_CACHE: int = 0  # 0 per-step glue of the fused GDN ops (default), 1 constants and indices cached
     VLLM_HPU_FLASH_NEXT_ASYNC_SCHED: int = 0  # 0 off (default), 1 on, 2 also MTP, 3 MTP step issued before the read
     VLLM_HPU_FLASH_NEXT_SPEC_DEVICE_INPUTS: int = 0  # 0 host-made (default), 1 device-made + check, 2 device-made
+    VLLM_HPU_FLASH_NEXT_SPEC_DEVICE_ALIGN: int = 0  # prefix-cache align mode: 0 host (default), 1 + device check, 2 device
     VLLM_HPU_PLE_HOST_NGRAM_IDS: int = 0  # 0 PLE n-gram ids computed in the graph (default), 1 on the host
     VLLM_HPU_HC_FUSED: int = 0  # 0 torch hyper-connections (default), 1 the fused hyper-connection kernels
     VLLM_HPU_MOE_GLUE: int = 0  # 0 torch MoE glue (default), 1 the fused MoE glue kernels
@@ -2156,6 +2157,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # with the host-made ones every step (a host read), 2 uses them. Needs VLLM_HPU_FLASH_NEXT_DECODE_METADATA=1.
     "VLLM_HPU_FLASH_NEXT_SPEC_DEVICE_INPUTS":
     lambda: int(os.environ.get("VLLM_HPU_FLASH_NEXT_SPEC_DEVICE_INPUTS", "0")),
+    # Flash-Next MTP (async-sched stage 2, M3) with prefix caching: a verification step's align mode made on the device
+    # (the pre-step state copy, the lattices, the load counts, the boundary commits). 1 also checks it against the
+    # host's every step, 2 uses it (mode 3 then serves with prefix caching on).
+    "VLLM_HPU_FLASH_NEXT_SPEC_DEVICE_ALIGN":
+    lambda: int(os.environ.get("VLLM_HPU_FLASH_NEXT_SPEC_DEVICE_ALIGN", "0")),
 
     # Flash-Next hyper-connections through the fused TPC kernels (flashinfer_gaudi.hc_fused: hc_norm,
     # hc_silu, hc_silu_split, hc_gate_mix, hc_combine, hc_combine_norm). 0 (default) = the torch path,

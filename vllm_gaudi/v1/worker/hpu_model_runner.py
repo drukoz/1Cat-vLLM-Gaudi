@@ -64,8 +64,9 @@ from vllm_gaudi.v1.spec_decode.flash_next_mtp_steps import is_flash_next_mtp
 from vllm_gaudi.distributed import vocab_parallel
 from vllm_gaudi.platform import is_flash_next_model
 from vllm_gaudi.v1.worker.flash_next_async_spec import (ChainOut, PendingBooks, SpecEarlyBooks, VerifyInputAdvance,
-                                                        VerifyInputs, stand_in_chain, trim_verified,
-                                                        use_scheduled_drafts)
+                                                        VerifyInputs, align_commits, align_gather, align_lattice_rows,
+                                                        align_precopy, device_commit_conv, device_commit_ssm,
+                                                        stand_in_chain, trim_verified, use_scheduled_drafts)
 from vllm_gaudi.v1.worker.flash_next_async import (AsyncOutputLedger, PleContextCarry, SpecDraftHandoff,
                                                    needs_output_token_values)
 
@@ -768,8 +769,9 @@ class AsyncSpecModelRunnerOutput(AsyncModelRunnerOutput):
     worker's output thread reads them, and the runner's books read the same host copy one step later."""
 
     def __init__(self, model_runner_output: ModelRunnerOutput, sampled_token_ids: torch.Tensor, num_decodes: int,
-                 vocab_size: int, copy_stream):
+                 vocab_size: int, copy_stream, extra: Optional[torch.Tensor] = None):
         self._model_runner_output = model_runner_output
+        self._extra = extra  # M3: [2, B] int32 next load counts and running blocks, copied with the tokens
         self._sampled_token_ids = sampled_token_ids  # kept until the copy is done
         self._num_decodes = num_decodes
         self._vocab_size = vocab_size
@@ -778,6 +780,7 @@ class AsyncSpecModelRunnerOutput(AsyncModelRunnerOutput):
         with torch.hpu.stream(copy_stream):
             copy_stream.wait_stream(default_stream)
             self.sampled_cpu = sampled_token_ids.to('cpu', non_blocking=True)
+            self.extra_cpu = extra.to('cpu', non_blocking=True) if extra is not None else None
             self.ready_event.record()
 
     def get_output(self) -> ModelRunnerOutput:
@@ -2570,6 +2573,15 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                                 else None)
         self._verify_step = 0
         self._verify_refusals: set = set()
+        # VLLM_HPU_FLASH_NEXT_SPEC_DEVICE_ALIGN (stage 2, M3): a verification step's prefix-cache align mode (the
+        # pre-step copy, the lattices, the load count, the boundary commits) made on the device; 1 also checks it
+        # against the host's, 2 uses it (flash_next_async_spec.align_*).
+        self._align_flag = (int(gaudi_envs.VLLM_HPU_FLASH_NEXT_SPEC_DEVICE_ALIGN)
+                            if self._verify_advance is not None and self.cache_config.enable_prefix_caching else 0)
+        self._align_dev = None  # the last verification step's device state for the next one: step, rows, prev, n
+        self._align_step = None  # this verification step's align inputs, for the commits after it
+        self._align_pre_books = None  # =1: the host's running blocks and load counts before its pre-step copy
+        self._align_stats = {"steps": 0, "checked": 0, "differences": 0}
         # VLLM_HPU_FLASH_NEXT_ASYNC_SCHED=3 (stage 2, M2): a chained verification step is issued before the previous
         # one's tokens reach the host; its books follow one step late (flash_next_async_spec.SpecEarlyBooks).
         self._spec_early = None
@@ -2583,8 +2595,9 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                     ("VLLM_HPU_FLASH_NEXT_SPEC_DEVICE_INPUTS=2",
                      int(gaudi_envs.VLLM_HPU_FLASH_NEXT_SPEC_DEVICE_INPUTS) == 2),
                     ("VLLM_HPU_FLASH_NEXT_DECODE_METADATA=1", int(gaudi_envs.VLLM_HPU_FLASH_NEXT_DECODE_METADATA) == 1),
-                    ("prefix caching off (its align-mode commits are stage M3)",
-                     not self.cache_config.enable_prefix_caching),
+                    ("prefix caching off or VLLM_HPU_FLASH_NEXT_SPEC_DEVICE_ALIGN=2 (the align mode on the device)",
+                     not self.cache_config.enable_prefix_caching
+                     or int(gaudi_envs.VLLM_HPU_FLASH_NEXT_SPEC_DEVICE_ALIGN) == 2),
                 ) if not ok
             ]
             if missing or self._verify_advance is None:
@@ -4920,7 +4933,7 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                                     VerifyInputs(token_ids, positions, slot_mapping, num_accepted, context))
         return ple_inputs
 
-    def _set_verify_chain(self, num_decodes, sampled_token_ids) -> None:
+    def _set_verify_chain(self, num_decodes, sampled_token_ids, defer_books: bool = False):
         """The acceptance this step leaves for the next verification step: mtp-draft-graph's chain output
         (``_mtp_chain_out``) when the step chained, else a stand-in from the host's read and the device drafts."""
         advance = self._verify_advance
@@ -4944,6 +4957,136 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             out = stand_in_chain(sampled_token_ids[:num_decodes], drafts.to(self.device), recorded.padded,
                                  recorded.k)
         advance.set_chain(self._verify_step, out)
+        if self._align_flag in (1, 2):
+            return self._align_after_step(out, defer_books)
+        return None
+
+    def _align_verify_step(self, num_decodes, padded, num_tokens, block_size, positions, load_indices, store_indices,
+                           num_accepted, boundary):
+        """VLLM_HPU_FLASH_NEXT_SPEC_DEVICE_ALIGN (stage 2, M3): this verification step's align mode on the device:
+        the running block curr from the true context (the step's device positions), the pre-step copy plan, the
+        lattices of every group and the load counts. =2 runs the pre-step copies on the device and returns the
+        device lattices and counts (no host boundary commits: they run on the device after the step); =1 compares
+        them with the host's and returns the host's."""
+        k = num_tokens - 1
+        dev = positions.device
+        real = torch.arange(padded, dtype=torch.int32, device=dev) < num_decodes
+        ctx = positions.reshape(padded, num_tokens)[:, 0].to(torch.int32)
+        ctx = torch.where(real, ctx, torch.zeros_like(ctx))
+        ids = tuple(self.input_batch.req_ids[:num_decodes])
+        carried = self._align_dev
+        if (self._align_flag == 2 and carried is not None and carried["step"] == self._verify_step - 1
+                and carried["ids"] == ids and carried["padded"] == padded):
+            prev, n = carried["prev"], carried["n"]
+        else:  # the host's books, exact here (the step before was synchronous or every pending book is applied)
+            pre_blocks, pre_counts = self._align_pre_books
+            prev_cpu = torch.zeros(padded, dtype=torch.int32)
+            n_cpu = torch.ones(padded, dtype=torch.int32)
+            prev_cpu[:num_decodes] = torch.tensor([-1 if b is None else int(b) for b in pre_blocks], dtype=torch.int32)
+            n_cpu[:num_decodes] = torch.tensor([int(c) for c in pre_counts], dtype=torch.int32)
+            prev, n = async_h2d_copy(prev_cpu, device=self.device), async_h2d_copy(n_cpu, device=self.device)
+        curr, planned, src, ssm_src, n_after = align_precopy(ctx, prev, n, k, block_size, real)
+        rows = {}
+        for gid in range(len(self.input_batch.block_table.block_tables)):
+            table = self.input_batch.block_table[gid].get_cpu_tensor()
+            rows_cpu = torch.zeros((padded, table.shape[1]), dtype=torch.int32)
+            m = min(num_decodes, table.shape[0])
+            rows_cpu[:m] = table[:m].to(torch.int32)
+            rows[gid] = async_h2d_copy(rows_cpu, device=self.device)
+        # the recurrent groups' lattices (the commit registry: GDN and PLE); any other group keeps the host's rows
+        recurrent = set(self._recurrent_commit_registry)
+        lattice = torch.stack([
+            align_lattice_rows(rows[gid], curr, k, real, self._MAMBA_PAD_BLOCK_ID)
+            if gid in recurrent else load_indices[gid].to(torch.int32) for gid in range(len(rows))
+        ], dim=0)
+        self._align_stats["steps"] += 1
+        self._align_step = {"step": self._verify_step, "ids": ids, "padded": padded, "k": k, "ctx": ctx,
+                            "curr": curr, "real": real, "rows": rows, "lattice": lattice, "block_size": block_size}
+        if self._align_flag == 1:
+            host_curr = [self._align_running_block_by_req.get(r) for r in ids]
+            bad = {}
+            groups = sorted(recurrent)
+            mine_cpu = lattice[groups].to("cpu").to(torch.int64)
+            if not torch.equal(mine_cpu, load_indices[groups].to("cpu").to(torch.int64)):
+                bad["lattice"] = 1
+            if not torch.equal(mine_cpu, store_indices[groups].to("cpu").to(torch.int64)):
+                bad["store_lattice"] = 1
+            if n_after[:num_decodes].to("cpu").tolist() != num_accepted[:num_decodes].to("cpu").tolist():
+                bad["load_count"] = 1
+            if curr[:num_decodes].to("cpu").tolist() != host_curr:
+                bad["running_block"] = 1
+            self._log_align(bad)
+            return load_indices, store_indices, num_accepted, boundary
+        pad_slot = int(self._MAMBA_PAD_BLOCK_ID)
+        for gid, entries in self._recurrent_commit_registry.items():
+            group_rows = rows[gid]
+            conv_src = align_gather(group_rows, src[:, None])[:, 0]
+            ssm_slot = align_gather(group_rows, ssm_src[:, None])[:, 0]
+            dst = align_gather(group_rows, curr[:, None])[:, 0]
+            for tensor, kind, window in entries:
+                if kind == "ssm":
+                    device_commit_ssm(tensor, ssm_slot, dst, planned, pad_slot)
+                else:
+                    device_commit_conv(tensor, conv_src, dst, n - 1, planned, window, pad_slot)
+        self._log_align({})
+        return lattice.to(load_indices.dtype), lattice.to(store_indices.dtype), n_after.to(num_accepted.dtype), None
+
+    def _align_after_step(self, chain, defer_books: bool):
+        """=1/=2 after the step's acceptance (``chain.accepted``): the boundary commits and the next load counts on
+        the device. =2 runs the commits and keeps (prev, n) for the next step; its host books are set now on a
+        synchronous step, or returned ([2, B] next counts and running blocks) to travel with mode 3's async copy.
+        =1 compares the next counts with the host's books (set by the step's own read)."""
+        step = self._align_step
+        if step is None or step["step"] != self._verify_step:
+            self._align_dev = None
+            return None
+        padded, real, ctx, curr = step["padded"], step["real"], step["ctx"], step["curr"]
+        committed = torch.where(real, chain.accepted[:padded].to(torch.int32) + 1, torch.zeros_like(ctx))
+        registry = self._recurrent_commit_registry
+        if not registry:
+            self._align_dev = None
+            return None
+        self_commit = None
+        pad_slot = int(self._MAMBA_PAD_BLOCK_ID)
+        for gid, entries in registry.items():
+            store = step["lattice"][gid]
+            mask, t, ssm_src, conv_src, dst, group_self = align_commits(ctx, committed, step["block_size"], store,
+                                                                        step["rows"][gid], real)
+            self_commit = group_self if self_commit is None else (self_commit | group_self)
+            if self._align_flag == 2:
+                for tensor, kind, window in entries:
+                    if kind == "ssm":
+                        device_commit_ssm(tensor, ssm_src, dst, mask, pad_slot)
+                    else:
+                        device_commit_conv(tensor, conv_src, dst, t, mask, window, pad_slot)
+        next_n = torch.where(self_commit, torch.ones_like(committed), torch.clamp(committed, min=1))
+        ids = step["ids"]
+        if self._align_flag == 1:
+            host_n = [self._gdn_num_accepted_by_req.get(r, 1) for r in ids]
+            self._log_align({} if next_n[:len(ids)].to("cpu").tolist() == host_n else {"next_load_count": 1})
+            return None
+        self._align_dev = {"step": self._verify_step, "ids": ids, "padded": padded, "prev": curr, "n": next_n}
+        books = torch.stack([next_n, curr], dim=0)
+        if defer_books:
+            return books
+        values = books.to("cpu").tolist()
+        for r, req_id in enumerate(ids):
+            self._gdn_num_accepted_by_req[req_id] = int(values[0][r])
+            self._align_running_block_by_req[req_id] = int(values[1][r])
+        return None
+
+    def _log_align(self, bad: dict) -> None:
+        stats = self._align_stats
+        if self._align_flag == 1:
+            stats["checked"] += 1
+        if bad:
+            stats["differences"] += 1
+            if stats["differences"] <= 8:
+                logger.warning("VLLM_HPU_FLASH_NEXT_SPEC_DEVICE_ALIGN=%d: step %d's device-made align mode differs "
+                               "from the host's: %s", self._align_flag, self._verify_step, bad)
+        if stats["steps"] == 1 or stats["steps"] % 16 == 0:
+            logger.info("VLLM_HPU_FLASH_NEXT_SPEC_DEVICE_ALIGN=%d: %d verification steps made, %d checked, %d with "
+                        "differences", self._align_flag, stats["steps"], stats["checked"], stats["differences"])
 
     def _log_verify_advance(self, bad: dict) -> None:
         stats = self._verify_advance.stats
@@ -4996,6 +5139,12 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                 self.requests[req_id].output_token_ids.extend(row)
                 if self._recurrent_spec:
                     self._gdn_num_accepted_by_req[req_id] = max(1, len(row))
+            if pending.align is not None:  # M3: the next load counts (self commits) and running blocks
+                values = pending.align.tolist()
+                for r, req_id in enumerate(pending.req_ids):
+                    if req_id in self.requests:
+                        self._gdn_num_accepted_by_req[req_id] = int(values[0][r])
+                        self._align_running_block_by_req[req_id] = int(values[1][r])
             if block:
                 books.stats.waited += 1
             else:
@@ -5045,7 +5194,8 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         chain = self._mtp_chain_out
         req_ids = list(self.input_batch.req_ids[:num_decodes])
         self._draft_token_ids = chain.drafts
-        self._set_verify_chain(num_decodes, None)  # the next step's device-made inputs (M1) from the chain
+        # the next step's device-made inputs (M1) from the chain; with M3 its align books travel with the copy
+        align_books = self._set_verify_chain(num_decodes, None, defer_books=True)
         output = ModelRunnerOutput(req_ids=req_ids,
                                    req_id_to_index={req_id: i
                                                     for i, req_id in enumerate(req_ids)},
@@ -5055,10 +5205,11 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                                    pooler_output=[],
                                    kv_connector_output=KVConnectorOutput(finished_sending=None, finished_recving=None))
         early = AsyncSpecModelRunnerOutput(output, chain.sampled, num_decodes, self.input_batch.vocab_size,
-                                           self._spec_early_stream)
+                                           self._spec_early_stream, extra=align_books)
         seeds = {req_id: int(self.input_batch.num_computed_tokens_cpu[i])
                  for i, req_id in enumerate(req_ids)} if not books.pending else {}
-        books.push(PendingBooks(self._verify_step, tuple(req_ids), early.sampled_cpu, early.ready_event, seeds))
+        books.push(PendingBooks(self._verify_step, tuple(req_ids), early.sampled_cpu, early.ready_event, seeds,
+                                align=early.extra_cpu))
         books.stats.issued += 1
         if books.stats.issued == 1 or books.stats.issued % 32 == 0:
             logger.info("VLLM_HPU_FLASH_NEXT_ASYNC_SCHED=3: %d steps issued before the previous step's tokens reached "
@@ -5755,8 +5906,13 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                 if self.use_prefix_caching:
                     # Align mode (M3-T10c): move each request's running state into its running block first, so
                     # num_accepted below is the post-copy count (upstream vLLM preprocess_mamba).
-                    self._precopy_align_states(num_decodes, list(context_lens), list(num_scheduled_tokens),
-                                               mamba_block_size, normalize=not is_spec_batch)
+                    if self._align_flag in (1, 2) and is_spec_batch:
+                        ids = self.input_batch.req_ids[:num_decodes]
+                        self._align_pre_books = ([self._align_running_block_by_req.get(r) for r in ids],
+                                                 [self._gdn_num_accepted_by_req.get(r, 1) for r in ids])
+                    if not (self._align_flag == 2 and is_spec_batch):
+                        self._precopy_align_states(num_decodes, list(context_lens), list(num_scheduled_tokens),
+                                                   mamba_block_size, normalize=not is_spec_batch)
                 decode_req_ids = self.input_batch.req_ids[:num_decodes]
                 decode_accepted = accepted_counts(decode_req_ids, self._gdn_num_accepted_by_req, num_decodes)
                 load_offsets = load_checkpoint_offsets(decode_accepted, is_spec_batch)
@@ -5950,6 +6106,13 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                                                                 token_ids_device, positions_device,
                                                                 slot_mapping_device, num_accepted_tokens,
                                                                 scheduler_output, block_table_device)
+        if (self._align_flag in (1, 2) and verify_ok and self.use_prefix_caching and self._recurrent_spec
+                and num_tokens > 1 and load_indices_tensor is not None and not self._compact_gdn_group_ids):
+            (load_indices_tensor, store_indices_tensor, num_accepted_tokens,
+             recurrent_boundary) = self._align_verify_step(num_decodes, padded_batch_size, num_tokens,
+                                                           self.cache_config.mamba_block_size, positions_device,
+                                                           load_indices_tensor, store_indices_tensor,
+                                                           num_accepted_tokens, recurrent_boundary)
         # call prepare_spec_decode_inputs to get the logits indices and
         if scheduler_output is not None:
             logits_indices, spec_decode_metadata = self._prepare_spec_decode_inputs(scheduler_output, logits_indices,
