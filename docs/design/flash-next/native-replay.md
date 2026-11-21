@@ -803,10 +803,10 @@ all-reduces already split every layer).
 
 ### Pending, in order
 
-0. **lean2.** `lean2-81b9b47e3599` builds in the dev container `nr-bridge-dev` (incremental, started 03:19 UTC, node pid
-   3268156, log `~/farm/native-replay/bridge-build/out-logs/lean2-81b9b47e3599.log`; about 8 min). When
-   `out/lean2-81b9b47e3599/manifest.json` exists: check the strings in the wheel (python zipfile: `RunPrepared`,
-   `PT_HPU_HPUGRAPH_PREPARED_REPLAY`), then send the id to the collectives track (agent a3344386b2bc11c38). It submits
+0. **lean2: published 03:24:56 UTC** (`out/lean2-81b9b47e3599/`, 7 min incremental; VERIFIED in the wheel:
+   `ReleaseLaunchState` and `RunPrepared` in the backend and both plugin .so files, the flag and timer strings in the
+   backend .so) and **in the collectives track's job 00180** `real8-bridge-headline` (all cards, 45 min, after
+   integration's 00177, which ends by 03:56 UTC). The collectives track (agent a3344386b2bc11c38) submitted
    `~/farm/collectives/bridge/bridge_headline_job.sh LEAN IMAGE` (its branch 04f690be; all cards, about 45 min):
    integration build 3's image `farm-integration:d00c0a9a3e18` (also tagged `farm-collectives-int:d00c0a9a3e18`), the
    headline's no-speculation env (QSA fused + shard, GDN interleave + glue cache, HC copy mode 2,
@@ -821,12 +821,25 @@ all-reduces already split every layer).
    (`tools/flash_next/bridge/patches/lean3*.patch`, ids `<name>-<12 hex of the patch's sha256>`). Qualification: tiny
    TP8 tokens and `bench_replay.py` at TP8, then a real A/B at 1, 8 and 32 streams. The stock
    `PT_HPU_DISABLE_ASYNC_COLLECTIVE=1` as one arm when it is cheap.
-2. **Pull request (owner's rule).** The gate runs on the snapshot of `c556e47b` (`reports/native-replay/trees/
-   gate-c556e47b`, log `reports/native-replay/logs/gate_c556e47b.log`). On green: `gh pr create --base
-   feat/flash-next-gaudi` (body `reports/native-replay/probes/pr_body_2.txt`; no absolute performance numbers),
-   `gh pr merge --merge`, tell the coordinator the number. Commits after `c556e47b` (this handoff, `lean2.patch`,
-   `dev_build.sh`) are pushed after the merge and go into the next pull request.
-3. **Background: the lean path's first plan (next-week item 1, the coordinator's choice of the program's best fixed-cost plan): a bridge-only lean replay
+2. **Pull request (owner's rule).** The program head moved to `d9791183` (pull request #16); merged in as `75b1de32`
+   (no conflict; my four test files pass on its snapshot: 31 + 13 + 4 + 26). The gate runs on that snapshot
+   (`reports/native-replay/trees/gate-75b1de32`, log `reports/native-replay/logs/gate_75b1de32.log`; the gate on
+   `c556e47b` was stopped while it still waited for a slot). Known red elsewhere: the rental files
+   (`tests/unit_tests/tools/rental/test_sh_run_rental.py`, `test_sh_tiny_smoke.py`, `test_rental_scripts.py`,
+   `test_tiny_smoke.py`, sometimes `test_sh_rent.py`) fail alone in other tracks' gates too (engine-step `425fb2ee`); if
+   they are the only red files, check them on a snapshot of the program head before calling the gate green. On green:
+   push, `gh pr create --base feat/flash-next-gaudi` (body `reports/native-replay/probes/pr_body_2.txt`; no absolute
+   performance numbers), `gh pr merge --merge`, tell the coordinator the number.
+3. **lean3t** (`lean3t-412153bbab3e`, `patches/lean3t.patch`: lean2 plus the sub-timers of section 7.10, printed after
+   the tensor counts as `| sub in_registry .. in_refs .. in_waits .. in_future .. in_streamwait .. syn_mem ..
+   syn_workspace .. syn_lock .. syn_trace .. syn_call .. syn_after .. patch_alloc .. patch_table .. patch_info ..
+   post_holder .. post_events .. post_record .. post_coll ..`; nested, not in the phase sum) builds from 03:3x UTC (node
+   pid 3387075, log `out-logs/lean3t-412153bbab3e.log`). `probes/replay_timing.py` prints the sub-phases; the collectives
+   track's parser reads them as `sub_*`. Arms to ask for (collectives track places the job): tiny-lean3t and
+   tiny-lean3t-inline (tokens), real-lean3t and real-lean3t-inline (`PT_HPU_DISABLE_ASYNC_COLLECTIVE=1`, VERIFIED in
+   `habana_kernels/hccl_kernels.cpp:354`: the collective runs inline instead of `JobThreadLazyHCCL::addJob` +
+   `submit_future`), all with the spinner off, the flag and the headline env.
+4. **Background: the lean path's first plan (next-week item 1, the coordinator's choice of the program's best fixed-cost plan): a bridge-only lean replay
    path.** Read from the bridge source at `5176b1b2`. What a replayed launch does on the main thread today, per
    captured segment (step-anatomy: 148 per step at 1 stream, 209 at 32; about 150 us of bridge work each under the
    profiler, of which the Synapse enqueue `enqueueWithExternalEventsExt` is 37 us; the all-reduces go out on a
@@ -858,7 +871,7 @@ all-reduces already split every layer).
    model at 1 and 32 streams. Precondition: item 2 (we can build and load our own bridge on this stack).
    The existing switch `PT_HPU_DISABLE_HPUGRAPH_REPLAY_HASHCHECK=1` (`HPUGraph.cpp:535-561`) removes c) only; 00134's
    `cuthash` arm measures it.
-4. Next rental, the fork's full native runtime (coordinator, 23:46 UTC; lower than item 3 since the bridge-only path
+5. Next rental, the fork's full native runtime (coordinator, 23:46 UTC; lower than item 3 since the bridge-only path
    needs no Synapse snapshot): (a) checked: farm-base has the SDK's public headers (`synapse_api.h`, `hccl.h`,
    `hlthunk.h`, ...; no `scal.h`), the runtime libraries (`libSynapse.so`, `libhcl.so`, `libscal.so`,
    `libSynapseMme.so`, ...), cmake, g++ 13, build-essential, protobuf-compiler (the distro's) and pybind11, no `-dev`
@@ -875,7 +888,7 @@ all-reduces already split every layer).
    in eager mode, capture under `collect_prepared_group_replays` with `DecoderTopology("deepseek_v4", (24, 24), 2,
    False)`, then `replay_native_decoder` per step) and `tools/flash_next/replay/native_tp4_job.sh` (the 30-minute
    `any:4` job: stock and native, each with and without collectives).
-5. What is left of the fixed cost (written before 00174; section 7.10 has the measured split) (INFERRED, TP8, 1 stream, about 36 ms per step): the replay's launches on the main
+6. What is left of the fixed cost (written before 00174; section 7.10 has the measured split) (INFERRED, TP8, 1 stream, about 36 ms per step): the replay's launches on the main
    thread (148 x about 130 us, about 20 ms on the fastest rank: item 3 takes about 13 ms of it), about 10 ms of
    per-rank spread (the pin, if 00134 shows it), about 3.5 ms of Python around the forward (engine-step), and the
    device time of the ops behind it. The collectives' count is a floor at TP8 + EP8 and they leave on a separate
