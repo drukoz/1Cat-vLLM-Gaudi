@@ -2458,6 +2458,11 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                                                                    is_driver=is_driver_worker, log=logger.info,
                                                                    device_type=str(self.device).split(":")[0])
                     self.drafter.mtp_step_timer = self._mtp_step_timer
+                    if self._mtp_step_timer is not None and self._mtp_step_timer.per_step:
+                        # VLLM_HPU_MTP_TIMING=2: the collector's pauses of each step go into its record.
+                        from vllm_gaudi.v1.worker.gc_control import GcPauses
+                        self._mtp_step_timer.gc_pauses = GcPauses()
+                        self._mtp_step_timer.gc_pauses.install()
                     self.use_aux_hidden_state_outputs = True
                 else:
                     from vllm_gaudi.v1.spec_decode.hpu_eagle import HpuEagleProposer
@@ -6042,6 +6047,8 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             # Full-graph Dynamo cannot trace setattr on LoraMask, while doing
             # it immediately before the call preserves the existing lifetime.
             LoraMask.setLoraMask(lora_mask)
+            replay_timer = self._mtp_step_timer if not warmup_mode else None
+            replay_t0 = time.perf_counter() if replay_timer is not None and replay_timer.per_step else None
             hidden_states = self.model.forward(input_ids=token_ids,
                                                positions=position_ids,
                                                attn_metadata=trimmed_attn_metadata,
@@ -6049,6 +6056,8 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                                                inputs_embeds=inputs_embeds,
                                                model_mm_kwargs=model_mm_kwargs,
                                                **additional_kwargs)
+            if replay_t0 is not None:  # VLLM_HPU_MTP_TIMING=2: the replay call of the target forward, per step
+                replay_timer.replay(time.perf_counter() - replay_t0)
         if step_timer is not None:
             step_timer.lap("forward")
             step_timer.phase = "logits"
