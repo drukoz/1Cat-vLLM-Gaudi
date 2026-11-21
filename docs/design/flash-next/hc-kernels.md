@@ -109,7 +109,9 @@ stream per point: 1,073 per (stream, token).
 - `vllm_gaudi/models/qwen4_exp/hyperconnection.py`: with `VLLM_HPU_HC_FUSED=1` and `VLLM_HPU_HC_FUSED_IL=1` a layer
   decides once, at its first fused call, and calls the interleaved ops in `mix`, `combine_and_mix` (both use
   gate_mix; combine_and_mix uses combine_norm); a layer whose interleaved ops or kernels are not served logs one line
-  (`HC interleaved kernels (VLLM_HPU_HC_FUSED_IL=1) are off for <layer>: ...`) and keeps the shipped fused ops.
+  (`HC fused interleaved kernels (VLLM_HPU_HC_FUSED_IL=1) is off for <layer>: ...`, matched by the rental gates'
+  HC fallback pattern, so a tiny gate run with the flag fails when the interleaved kernels did not run) and keeps
+  the shipped fused ops.
 
 ## 4. Tests (VERIFIED on this Mac)
 

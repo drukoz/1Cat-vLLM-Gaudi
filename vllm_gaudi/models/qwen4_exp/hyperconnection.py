@@ -355,9 +355,11 @@ class HpuGatedResidual(nn.Module):
         reason = self._hc_fused_il_reason(ops, device)
         self._hc_il = reason is None
         if reason is not None:
+            # "HC fused ... is off for": the rental gates' HC fallback pattern (tools/flash_next/rental/gates.py), so
+            # a gate run with the flag fails when the interleaved kernels did not run.
             logger.warning(
-                "HC interleaved kernels (VLLM_HPU_HC_FUSED_IL=1) are off for %s: %s; using the shipped fused "
-                "kernels", self.layer_name, reason)
+                "HC fused interleaved kernels (VLLM_HPU_HC_FUSED_IL=1) is off for %s: %s; the shipped fused "
+                "kernels run", self.layer_name, reason)
 
     def _hc_fused(self, hidden_states: torch.Tensor, combine: bool = False, block_output=None, injection=None):
         """The fused op module when this call runs the fused kernels, else ``None`` (the torch path).

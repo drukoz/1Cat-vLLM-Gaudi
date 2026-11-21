@@ -38,7 +38,7 @@ TINY = (128, 16)  # hidden_size, hc_lowrank of the tiny checkpoint
 REAL = (2560, 320)  # of the real model
 FUSED_PREFIX = "flashinfer_gaudi::"
 IL_FLAG = "VLLM_HPU_HC_FUSED_IL"
-IL_OFF = "HC interleaved kernels (VLLM_HPU_HC_FUSED_IL=1) are off for"
+IL_OFF = "HC fused interleaved kernels (VLLM_HPU_HC_FUSED_IL=1) is off for"
 
 
 @pytest.fixture(scope="module")
@@ -253,8 +253,18 @@ def test_missing_interleaved_ops_keep_the_shipped_fused_ops(world1, vllm_ctx, fl
         assert _same_tuple(got, _torch_path(module, "combine_and_mix", hidden, block, injection))
     assert module._hc_il is False and module._hc_fused_ok is True
     assert len(warnings) == 1
-    assert warnings[0].startswith(f"{IL_OFF} layers.3.mlp_hyper_connection: the hc_fused_ops extension has no cpu "
-                                  "kernel for hc_gate_mix_il; using the shipped fused kernels")
+    assert warnings[0] == (f"{IL_OFF} layers.3.mlp_hyper_connection: the hc_fused_ops extension has no cpu kernel "
+                           "for hc_gate_mix_il; the shipped fused kernels run")
+
+
+def test_the_fallback_line_is_a_rental_gate_hc_fallback(world1, vllm_ctx, flags_on, warnings, monkeypatch):
+    """A gate run with the flag fails when the interleaved kernels did not run (gates.HC_FALLBACK_RE)."""
+    from tools.flash_next.rental import gates
+    monkeypatch.setattr(hc_fused, "hc_fused_il_missing_ops", lambda device: ("hc_gate_mix_il", ))
+    module = _module()
+    hidden, _, _ = _inputs(module, 2)
+    _run(lambda: module.mix(hidden))
+    assert len(warnings) == 1 and gates.HC_FALLBACK_RE.search(warnings[0])
 
 
 def test_decision_is_made_once_per_layer(world1, vllm_ctx, flags_on, warnings, monkeypatch):

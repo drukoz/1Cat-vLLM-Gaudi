@@ -2061,7 +2061,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # residual_out bit for bit, the gated mix and the norm inside the HC contract of
     # tests/unit_tests/hc_fused/hc_case.py). Any other value is 0. Read once per layer at construction. A layer
     # whose interleaved ops are not served (an older extension, or a kernel library built without them) logs one
-    # line and keeps the shipped fused ops. Not yet run on a card.
+    # line ("HC fused interleaved kernels ... is off for <layer>", a rental-gate HC fallback) and keeps the shipped
+    # fused ops. Not yet run on a card.
     "VLLM_HPU_HC_FUSED_IL":
     lambda: int(os.environ.get("VLLM_HPU_HC_FUSED_IL", "0")),
 

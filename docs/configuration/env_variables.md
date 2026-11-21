@@ -280,9 +280,10 @@ hyper-connection kernels' tolerance (at most one bf16 step from the torch
 oracle, at least 99 % of the elements bit-exact; 99.99 % bit-equal to the
 shipped kernels in the simulator). The interleaved kernels are optional members
 of `libhc_fused_gaudi2.so`: a layer whose extension has no interleaved op, or
-whose kernel library does not list the GUID, logs one warning (`HC interleaved
-kernels (VLLM_HPU_HC_FUSED_IL=1) are off for <layer>: <reason>; using the
-shipped fused kernels`) and keeps the shipped ops. Any other value is `0`. The
+whose kernel library does not list the GUID, logs one warning (`HC fused
+interleaved kernels (VLLM_HPU_HC_FUSED_IL=1) is off for <layer>: <reason>; the
+shipped fused kernels run`, which the rental gates count as a hyper-connection
+fallback) and keeps the shipped ops. Any other value is `0`. The
 flag is read once per layer at construction. See
 `docs/design/flash-next/hc-kernels.md`. Not yet run on a card.
 
