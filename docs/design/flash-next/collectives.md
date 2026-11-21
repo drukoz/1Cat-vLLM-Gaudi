@@ -386,7 +386,7 @@ together; accsync on the image's bridge (it is a stock setting). Results:
 
 ## Handoff (if this agent stops)
 
-State at 03:30 UTC on 2026-11-21 (fourth agent of this track, Opus 5.5). **The node stays until about 00:00 UTC
+State at 04:10 UTC on 2026-11-21 (fourth agent of this track, Opus 5.5). **The node stays until about 00:00 UTC
 on 2026-11-22** (BRIEF 00:50 UTC). Branch `feat/flash-next-gaudi-collectives` (and `-dev`, the same head), worktree
 `/Volumes/Storage/Claude/gaudi-work/wt/collectives`; card results and logs in
 `/Volumes/Storage/Claude/gaudi-work/reports/collectives/` (`card/<id>-<name>/`, `logs/`, `probes/`). This section is
@@ -442,9 +442,10 @@ Next, in order (section 7's table):
    `python3 -I reports/collectives/probes/replay_timing_table.py <real-lean folder>` (phases; `n_*` tensor counts;
    `sub_*` sub-timers, nested): `run_prep` should be back near 2 us; if `unattributed` (total minus the phase sum; 4.3 us for lean in 00174) rises by about 12 us instead,
    the frees only moved (native-replay).
-2. Pull request: the gate runs on the snapshot worktree `reports/collectives/gate-snap-04f690be` (program head
-   merged at 90fdeec3; log `reports/collectives/logs/gate_04f690be.log`; my tool tests 10 pass on it). When green:
-   push the snapshot commit to its own branch, open the pull request from it, merge (owner's rule 03:07 UTC).
+2. **PR #19 merged at 04:05 UTC** (program head 22ec5ea3): the gated snapshot 04f690be (gate 88 files, 0 red; tool
+   tests 10 pass; card 00160 and 00174) from its own branch `feat/flash-next-gaudi-collectives-bridge-gated`. The
+   branch has merged the new head (214125e7). The next PR: the scripts' later features (late-bound settings,
+   `--ref-arm`, the inline and `EXTRA` pairs) and this note, after 00181 proves them.
 1b. native-replay's next builds: `timers-c281d8b53d08` (phase timers: `PT_HPU_HPUGRAPH_REPLAY_TIMING=N` prints one
    `HPUGRAPH_REPLAY_TIMING` line per N replayed launches per thread; about 01:47 UTC) and, about 20 minutes later,
    `lean-e1dbb4942fb8` (the timers plus the first prepared-replay step behind `PT_HPU_HPUGRAPH_PREPARED_REPLAY=1`;
