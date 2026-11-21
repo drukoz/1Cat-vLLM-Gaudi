@@ -767,6 +767,11 @@ class VllmMixtureOfExpertsOpBase(torch.nn.Module):
                 if tokens_num <= threshold:
                     chunk_size = self.chunk_size_list[idx]
                     break
+            # A chunk size of 0 (or less) in VLLM_MOE_CHUNK means the op's own default for that token range (no
+            # chunk_size and total_experts arguments), e.g. VLLM_MOE_CHUNK=0,64,8192 with
+            # VLLM_MOE_TOKEN_BOUNDARY=16,512,1000000: chunk_size 64 only for steps of 17 to 512 tokens.
+            if chunk_size <= 0:
+                return {}
             kwargs = {
                 "chunk_size": chunk_size,
                 "total_experts": self.global_num_experts,
@@ -1487,10 +1492,22 @@ def moe_dense_fp8(x, topk_ids, topk_weights, w13, w2, s13, s2, experts_min):
                                         False)  # [E, T, 2I]
     mid = (F.silu(gate_up[..., :inter].float()) * gate_up[..., inter:].float()).to(x.dtype)  # [E, T, I]
     m_fp8, m_scale = dynamic_quant(mid.reshape(experts * rows, inter))
+    # The routing weight of each (expert, row) pair rides on the down GEMM's row scale (0 for a pair that is not
+    # routed), and the bf16 GEMM output is summed over the experts with fp32 accumulation: no [E, T, H] fp32 tensor.
+    m_scale = m_scale.reshape(experts, rows, 1).to(torch.float32) * pair_weight.t().unsqueeze(-1)
     down = torch.ops.hpu.fp8_gemm_v2(m_fp8.reshape(experts, rows, inter), False, w2, True, None, torch.bfloat16,
-                                     m_scale.reshape(experts, rows, 1).to(torch.float32), s2.unsqueeze(1), None,
-                                     False)  # [E, T, H]
-    return (down.float() * pair_weight.t().unsqueeze(-1)).sum(dim=0).to(x.dtype)
+                                     m_scale, s2.unsqueeze(1), None, False)  # [E, T, H], weighted
+    return down.sum(dim=0, dtype=torch.float32).to(x.dtype)
+
+
+_MOE_DENSE_LOGGED = set()
+
+
+def _log_moe_dense_once(key, message, *args):
+    """One log line per process and event (VLLM_HPU_MOE_DENSE: kept, dropped, first use)."""
+    if key not in _MOE_DENSE_LOGGED:
+        _MOE_DENSE_LOGGED.add(key)
+        logger.warning(message, *args)
 
 
 def _set_moe_dense_weights(layer):
@@ -1535,6 +1552,9 @@ class VllmMixtureOfExpertsOpFP8PerChannel(VllmMixtureOfExpertsOpBase):
 
     def set_dense_weights(self, w13, w2, s13, s2):
         self.dense_weights = (w13, w2, s13, s2)
+        _log_moe_dense_once("kept", "VLLM_HPU_MOE_DENSE=1: the per-channel FP8 MoE layers keep their stacked experts "
+                            "(%s, %s); steps of %d to %d tokens run the dense form", tuple(w13.shape), w13.device,
+                            envs.VLLM_HPU_MOE_DENSE_MIN_TOKENS, envs.VLLM_HPU_MOE_DENSE_MAX_TOKENS)
 
     def _cache_weight_lists(self):
         experts_range = range(self.num_experts)
@@ -1552,7 +1572,17 @@ class VllmMixtureOfExpertsOpFP8PerChannel(VllmMixtureOfExpertsOpBase):
     def _apply(self, fn):
         ret = super()._apply(fn)
         self._cache_weight_lists()
-        self.dense_weights = None  # VLLM_HPU_MOE_DENSE: references to the old tensors; the vendor op serves
+        if self.dense_weights is not None:
+            # VLLM_HPU_MOE_DENSE: the HPU model runner calls model.to("hpu") after the weights were prepared, a no-op
+            # for tensors already there (fn returns the same tensor), so the stacked experts stay what the
+            # per-expert views point into. Clearing them here unconditionally (as 11bc2f6d and before did) dropped
+            # the dense form on every served model (jobs 00177 and 00190 ran the vendor op in both arms). A real
+            # move would copy them: then drop them and let the vendor op serve.
+            moved = tuple(fn(t) for t in self.dense_weights)
+            if not all(m is t for m, t in zip(moved, self.dense_weights)):
+                self.dense_weights = None
+                _log_moe_dense_once("dropped", "VLLM_HPU_MOE_DENSE=1: a device move after the weights were prepared; "
+                                    "the vendor MoE op serves")
         return ret
 
     def forward(
@@ -1566,7 +1596,9 @@ class VllmMixtureOfExpertsOpFP8PerChannel(VllmMixtureOfExpertsOpBase):
         tokens_num, _ = x.shape
         activation = _as_activation_str(activation)
         if (self.dense_weights is not None and self.w13_input_scale is None and self.is_gated
-                and activation == "silu" and tokens_num <= envs.VLLM_HPU_MOE_DENSE_MAX_TOKENS):
+                and activation == "silu"
+                and envs.VLLM_HPU_MOE_DENSE_MIN_TOKENS <= tokens_num <= envs.VLLM_HPU_MOE_DENSE_MAX_TOKENS):
+            _log_moe_dense_once("used", "VLLM_HPU_MOE_DENSE=1: a step of %d tokens runs the dense MoE form", tokens_num)
             return moe_dense_fp8(x, topk_ids, topk_weights, *self.dense_weights, self.experts_min)
         kwargs = self._get_extra_kwargs(tokens_num)
         # Non-gated experts tell the fused kernel to skip the gate split+multiply.

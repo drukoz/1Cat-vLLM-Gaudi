@@ -70,8 +70,13 @@ def _batch(rows, seed=1, local_only=None):
     return x, ids.to(torch.int64), weights
 
 
+@pytest.fixture
+def _dense_from_one_row(monkeypatch):
+    monkeypatch.setenv("VLLM_HPU_MOE_DENSE_MIN_TOKENS", "1")
+
+
 @pytest.mark.parametrize("rows", [1, 7, 32])
-def test_dense_form_matches_the_vendor_op_to_fp8_rounding(rows):
+def test_dense_form_matches_the_vendor_op_to_fp8_rounding(rows, _dense_from_one_row):
     op, dense = _op()
     x, ids, weights = _batch(rows)
     vendor = op(x, ids, weights).float()
@@ -86,20 +91,30 @@ def test_dense_form_matches_the_vendor_op_to_fp8_rounding(rows):
     assert torch.equal(got[no_local], torch.zeros_like(got[no_local]))
 
 
-def test_rows_routed_only_to_other_ranks_give_zeros():
+def test_rows_routed_only_to_other_ranks_give_zeros(_dense_from_one_row):
     op, dense = _op()
     op.set_dense_weights(*dense)
     x, ids, weights = _batch(5, local_only=False)
     assert torch.equal(op(x, ids, weights), torch.zeros(5, H, dtype=torch.bfloat16))
 
 
-def test_more_tokens_than_the_limit_keep_the_vendor_op(monkeypatch):
+def test_more_tokens_than_the_limit_keep_the_vendor_op(monkeypatch, _dense_from_one_row):
     op, dense = _op()
     op.set_dense_weights(*dense)
-    monkeypatch.setattr(envs, "VLLM_HPU_MOE_DENSE_MAX_TOKENS", 16, raising=False)
     monkeypatch.setenv("VLLM_HPU_MOE_DENSE_MAX_TOKENS", "16")
     op(*_batch(16))
     assert len(moe_block.VENDOR_CALLS) == 0
+    op(*_batch(17))
+    assert len(moe_block.VENDOR_CALLS) == 1
+
+
+def test_fewer_tokens_than_the_minimum_keep_the_vendor_op():
+    """Default minimum 17: a step of 1 to 16 rows reads only the hit experts through the vendor op."""
+    op, dense = _op()
+    op.set_dense_weights(*dense)
+    assert envs.VLLM_HPU_MOE_DENSE_MIN_TOKENS == 17
+    op(*_batch(16))
+    assert len(moe_block.VENDOR_CALLS) == 1
     op(*_batch(17))
     assert len(moe_block.VENDOR_CALLS) == 1
 
@@ -123,5 +138,17 @@ def test_weights_are_kept_only_with_the_flag(monkeypatch):
     # the layer's stacked tensors themselves (no copy of the experts)
     assert w13.data_ptr() == layer.w13_weight.data_ptr() and w2.data_ptr() == layer.w2_weight.data_ptr()
     assert torch.equal(s13, dense[2].float()) and torch.equal(s2, dense[3].float())
-    op._apply(lambda t: t)  # a device move leaves the references behind: the vendor op serves again
+    op._apply(lambda t: t)  # model.to("hpu") on tensors already there (the runner does it after loading): kept
+    assert op.dense_weights is not None and op.dense_weights[0].data_ptr() == layer.w13_weight.data_ptr()
+    op._apply(lambda t: t.clone())  # a real move would copy the stacked experts: dropped, the vendor op serves
     assert op.dense_weights is None
+
+
+@pytest.mark.parametrize("tokens,expected", [(1, {}), (16, {}), (17, {"chunk_size": 64, "total_experts": GLOBAL}),
+                                             (512, {"chunk_size": 64, "total_experts": GLOBAL}),
+                                             (513, {"chunk_size": 8192, "total_experts": GLOBAL})])
+def test_a_zero_chunk_size_leaves_the_vendor_op_its_default(tokens, expected):
+    """VLLM_MOE_CHUNK=0,64,8192 VLLM_MOE_TOKEN_BOUNDARY=16,512,1000000: no chunk_size up to 16 tokens."""
+    op, _ = _op()
+    op.chunk_size_list, op.token_boundary_list = [0, 64, 8192], [16, 512, 1000000]
+    assert op._get_extra_kwargs(tokens) == expected

@@ -126,6 +126,42 @@ def is_flash_next_model(model_config: Optional[ModelConfig]) -> bool:
     return any(arch in FLASH_NEXT_ARCHS for arch in architectures)
 
 
+def resolve_flash_next_async_scheduling(vllm_config: "VllmConfig", requested: Optional[bool] = None) -> bool:
+    """Whether a Flash-Next server keeps vLLM's async scheduling (``VLLM_HPU_FLASH_NEXT_ASYNC_SCHED``); logs it.
+
+    ``0`` (default): async scheduling is turned off, as it was before the flag. ``1``: vLLM's decision stands
+    (on unless ``--no-async-scheduling``) without speculation; a speculative config has already turned it off above.
+    ``2``: as ``1``, and with the Flash-Next MTP draft too: ``requested`` is vLLM's decision before the HPU hook
+    turned it off for the speculative config (vLLM keeps async scheduling on for MTP). Under async scheduling the
+    runner carries the PLE n-gram context of the decode rows on the device, and with speculation it keeps its
+    synchronous step and hands the drafts over on the device (``v1/worker/flash_next_async.py``).
+    """
+    scheduler_config = vllm_config.scheduler_config
+    mode = int(gaudi_envs.VLLM_HPU_FLASH_NEXT_ASYNC_SCHED)
+    speculative_config = getattr(vllm_config, "speculative_config", None)
+    if mode == 2 and speculative_config is not None and requested and \
+            getattr(speculative_config, "method", None) == "mtp":
+        scheduler_config.async_scheduling = True
+        logger.info("[HPU] Async scheduling on for Flash-Next with MTP (VLLM_HPU_FLASH_NEXT_ASYNC_SCHED=2): the "
+                    "engine schedules during the step, the drafts stay on the device")
+        return True
+    if mode in (1, 2):
+        if scheduler_config.async_scheduling:
+            logger.info("[HPU] Async scheduling on for Flash-Next (VLLM_HPU_FLASH_NEXT_ASYNC_SCHED=%d): the PLE "
+                        "n-gram context of the decode rows is carried on the device", mode)
+        elif speculative_config is not None:
+            logger.warning("[HPU] VLLM_HPU_FLASH_NEXT_ASYNC_SCHED=%d has no effect: async scheduling stays off with "
+                           "this speculative config on HPU (=2 keeps it for MTP)", mode)
+        else:
+            logger.info("[HPU] VLLM_HPU_FLASH_NEXT_ASYNC_SCHED=%d, but async scheduling is off for this server", mode)
+        return bool(scheduler_config.async_scheduling)
+    if scheduler_config.async_scheduling:
+        scheduler_config.async_scheduling = False
+        logger.warning("[HPU] Async scheduling disabled for Flash-Next: PLE n-gram context needs sampled tokens "
+                       "on the CPU (VLLM_HPU_FLASH_NEXT_ASYNC_SCHED=1 keeps it on)")
+    return False
+
+
 def _configure_recurrent_state(vllm_config: "VllmConfig") -> None:
     """Compact-GDN rule and recurrent-state-pool resolution for GDN hybrids (M1-T1)."""
     from vllm_gaudi.v1.core.recurrent_state_pool import (ENV_CACHE_SLOTS, ENV_MODE, ENV_SLOTS,
@@ -279,8 +315,47 @@ def _validate_flash_next_speculative_config(vllm_config: VllmConfig) -> None:
     if not prefix_caching and os.environ.get("VLLM_COMPACT_GDN", "1").strip().lower() not in ("1", "true"):
         raise ValueError("Flash-Next MTP needs compact GDN state for the per-token verification checkpoints: "
                          "unset VLLM_COMPACT_GDN or set it to 1")
-    if not 1 <= speculative_config.num_speculative_tokens <= 4:
-        raise ValueError("Flash-Next MTP on HPU runs 1 to 4 speculative tokens (the recipe is 3)")
+    # 5 is the largest lattice (1 + k = 6 nodes) the fused GDN verification op takes (GDN_CORE_VERIFY_MAX_NODES);
+    # the CPU tests run the speculative path at k = 3, 4 and 5 (tests/unit_tests/flash_next_spec_sizes.py).
+    if not 1 <= speculative_config.num_speculative_tokens <= 5:
+        raise ValueError("Flash-Next MTP on HPU runs 1 to 5 speculative tokens (the recipe is 3)")
+    global _SPEC_GREEDY_ONLY, _SPECULATIVE_SERVER
+    _SPEC_GREEDY_ONLY = int(gaudi_envs.VLLM_HPU_SPEC_SAMPLED_VERIFY) not in (1, 2)
+    _SPECULATIVE_SERVER = True
+
+
+# Set by _validate_flash_next_speculative_config for a Flash-Next speculative server without
+# VLLM_HPU_SPEC_SAMPLED_VERIFY=1: HpuPlatform.validate_request then refuses a sampled request with an error, where the
+# worker's rejection sampler would otherwise stop the server on it.
+_SPEC_GREEDY_ONLY = False
+# Set for every Flash-Next speculative server: the HPU runner lays a verification step's rows out padded per request
+# (k rows each, -1 indices for missing drafts), while upstream's rejection sampler applies penalties, bad words and
+# allowed token ids over packed rows (repeat_interleave(num_draft_tokens)): the shapes differ whenever the batch is
+# padded or a request drafted fewer than k tokens. Such a request is refused with an error, not run into a worker
+# failure (INFERRED from the code: rejection_sampler.apply_logits_processors, _prepare_spec_decode_inputs).
+_SPECULATIVE_SERVER = False
+
+
+def _refuse_sampled_speculative_request(params) -> None:
+    from vllm.sampling_params import SamplingParams, SamplingType
+
+    if not isinstance(params, SamplingParams):
+        return
+    if _SPEC_GREEDY_ONLY and params.sampling_type != SamplingType.GREEDY:
+        raise ValueError("This Flash-Next server decodes speculatively (MTP) and verifies greedy requests only: "
+                         "send temperature 0 (a request without one takes the checkpoint's generation_config, "
+                         "temperature 1.0), or start the server with VLLM_HPU_SPEC_SAMPLED_VERIFY=1")
+    if _SPECULATIVE_SERVER:
+        unsupported = [name for name, used in (
+            ("presence_penalty", params.presence_penalty != 0.0),
+            ("frequency_penalty", params.frequency_penalty != 0.0),
+            ("repetition_penalty", params.repetition_penalty != 1.0),
+            ("bad_words", bool(getattr(params, "bad_words", None))),
+            ("allowed_token_ids", bool(params.allowed_token_ids)),
+        ) if used]
+        if unsupported:
+            raise ValueError("This Flash-Next server decodes speculatively (MTP), whose HPU verification does not "
+                             "apply %s yet: leave them at their defaults" % ", ".join(unsupported))
 
 
 class HpuPlatform(Platform):
@@ -577,12 +652,11 @@ class HpuPlatform(Platform):
 
         # NOTE: vLLM has default enabled async scheduling with speculative decoding is on.
         # However, for HPU, speculative decoding is not supported with async scheduling.
+        requested_async_scheduling = vllm_config.scheduler_config.async_scheduling
         vllm_config.scheduler_config.async_scheduling = \
             vllm_config.scheduler_config.async_scheduling and vllm_config.speculative_config is None
-        if vllm_config.scheduler_config.async_scheduling and is_flash_next_model(vllm_config.model_config):
-            vllm_config.scheduler_config.async_scheduling = False
-            logger.warning("[HPU] Async scheduling disabled for Flash-Next: "
-                           "PLE n-gram context needs sampled tokens on the CPU")
+        if is_flash_next_model(vllm_config.model_config):
+            resolve_flash_next_async_scheduling(vllm_config, requested_async_scheduling)
         _validate_hpu_dflash2_config(vllm_config)
         _validate_flash_next_speculative_config(vllm_config)
 
@@ -697,6 +771,7 @@ class HpuPlatform(Platform):
 
     @classmethod
     def validate_request(cls, processed_inputs, params):
+        _refuse_sampled_speculative_request(params)
         if gaudi_envs.VLLM_HPU_DSV41_PREPARED_SHARDS:
             from vllm_gaudi.ops.deepseek_v41_config import validate_sampling
             validate_sampling(params)

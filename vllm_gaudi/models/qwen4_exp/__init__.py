@@ -84,6 +84,37 @@ class _MtpTargetOutputs:
         super().__init__(vllm_config=vllm_config, prefix=prefix)
         sc = vllm_config.speculative_config
         self._hpu_mtp_outputs = sc is not None and getattr(sc, "method", None) == "mtp"
+        object.__setattr__(self, "_hpu_mtp_multi", None)
+        if self._hpu_mtp_outputs:
+            self._hpu_tap_mtp_multi()
+
+    def _hpu_tap_mtp_multi(self) -> None:
+        """Keep the multi-stream state the final mixer returns in a forward (``combine_and_mix``'s first output).
+
+        The engine copies that tensor into ``_mtp_hidden_buffer[:T]`` and the aux-hidden output used to be a view
+        of the buffer. On the card neither survives an HPU graph: the copy is an in-place write through a slice of
+        a persistent tensor, and the view left the graph as a view of a tensor that is no graph output, so the
+        first decode step of a speculative server failed in the drafter's gathers with ``Empty tensor optional``
+        (job 00021, tiny model, TP8). The aux-hidden output is now the mixer's own output tensor, a real output
+        of the forward's graph; on an HPU device the buffer is dropped, so the engine's copy does not run.
+        """
+        owner = getattr(self, "language_model", self)
+        inner = getattr(owner, "model", None)
+        mixer = getattr(inner, "hyper_connection_mixer", None)
+        if mixer is None:
+            return
+        combine_and_mix = mixer.combine_and_mix
+        holder = self
+
+        def tapped_combine_and_mix(*args, **kwargs):
+            out = combine_and_mix(*args, **kwargs)
+            object.__setattr__(holder, "_hpu_mtp_multi", out[0])
+            return out
+
+        mixer.combine_and_mix = tapped_combine_and_mix
+        buffer = getattr(inner, "_mtp_hidden_buffer", None)
+        if buffer is not None and buffer.device.type == "hpu":
+            inner._mtp_hidden_buffer = None
 
     def forward(self,
                 input_ids: torch.Tensor | None,
@@ -114,6 +145,10 @@ class _MtpTargetOutputs:
             for module, name in riders:  # nothing a forward did not consume may reach the next one
                 module.__dict__.pop(name, None)
         if self._hpu_mtp_outputs and isinstance(hidden, torch.Tensor):
+            multi = self._hpu_mtp_multi
+            object.__setattr__(self, "_hpu_mtp_multi", None)
+            if multi is not None:
+                return hidden, [multi.reshape(*hidden.shape[:-1], -1)]
             return hidden, [mtp_aux_hidden(hidden, self.get_mtp_target_hidden_states())]
         return hidden
 

@@ -19,11 +19,14 @@ from typing import Optional
 
 # VLLM_HPU_VOCAB_PARALLEL_LOGITS is read at every call of the logits region (distributed/vocab_parallel.mode()),
 # which runs as lazy ops after the replayed decode graph: switching it changes the region's graph, not a captured one.
+# VLLM_HPU_MTP_DRAFT_GRAPH is read at every decode draft (HpuFlashNextMtpProposer._draft_graph_enabled): 1 runs the
+# k draft passes in the one-graph loop (built at its first draft), 0 the per-pass graphs; both keep their graphs.
+# VLLM_HPU_MTP_DRAFT_CHAIN is decided before every verification (HPUModelRunner._mtp_chain_decision).
 # VLLM_HPU_VERIFY_LOGITS_IN_GRAPH is read at every decode step (_can_fuse_plain_greedy_sampling,
 # _verify_logits_in_graph); on, the forward takes one more argument, so the verify graph is captured again for it.
 SWITCHABLE = ("VLLM_HPU_FLASH_NEXT_DECODE_METADATA", "VLLM_HPU_FUSED_GREEDY_LOGITS", "VLLM_HPU_CANDIDATE_SAMPLING",
-              "VLLM_HPU_VOCAB_PARALLEL_LOGITS", "VLLM_HPU_VERIFY_LOGITS_IN_GRAPH",
-              "VLLM_HPU_WORKER_GC_FREEZE")
+              "VLLM_HPU_VOCAB_PARALLEL_LOGITS", "VLLM_HPU_MTP_DRAFT_GRAPH", "VLLM_HPU_MTP_DRAFT_CHAIN",
+              "VLLM_HPU_VERIFY_LOGITS_IN_GRAPH", "VLLM_HPU_WORKER_GC_FREEZE")
 
 
 def parse_switches(text: str) -> dict[str, str]:

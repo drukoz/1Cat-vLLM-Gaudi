@@ -172,3 +172,12 @@ def test_a_check_that_does_not_stop_costs_the_container_after_a_bounded_wait(tmp
         "stop -t 10 fn-smoke")
     assert not (tmp_path / "state" / "check-alive").exists()
     assert "new container" in out + err  # the next call starts over: said, not silent
+
+
+def test_spec_reaches_the_check(tmp_path):
+    _start, _install, smoke = _dry_run(tmp_path, "--gdn", "hc", "--spec", "3")
+    check = smoke[smoke.index("tools.flash_next.rental.tiny_smoke"):]
+    assert check[check.index("--spec") + 1] == "3"
+    assert check[check.index("--gdn") + 1] == "hc"
+    _start, _install, smoke = _dry_run(tmp_path)
+    assert "--spec" not in smoke

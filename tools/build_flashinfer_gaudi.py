@@ -230,6 +230,35 @@ def _remove_hc_fused_outputs(output_dir: Path) -> None:
             path.unlink()
 
 
+def build_qsa_fused(repository_root: Path, build_root: Path, output_dir: Path) -> Path:
+    """Build the fused QSA decode kernel database and its HPU op extension into output_dir (as build_hc_fused)."""
+    source_root = repository_root / "csrc" / "qsa_fused"
+    cmake_build = build_root / "qsa_fused_kernel_db"
+    _run(["cmake", "-S", str(source_root), "-B", str(cmake_build), "-DCMAKE_BUILD_TYPE=Release"], cwd=source_root)
+    _run(["cmake", "--build", str(cmake_build), "--target", "qsa_fused_gaudi2", "--parallel"], cwd=source_root)
+    built = cmake_build / "libqsa_fused_gaudi2.so"
+    if not built.is_file():
+        raise FileNotFoundError(f"CMake did not produce {built}.")
+    kernel_db = output_dir / built.name
+    shutil.copy2(built, kernel_db)
+    pytorch_root = source_root / "pytorch"
+    extension_build = build_root / "qsa_fused_pytorch"
+    _run([sys.executable, "setup.py", "build_ext", "--build-lib", str(output_dir), "--build-temp", str(extension_build)],
+         cwd=pytorch_root)
+    matches = sorted(output_dir.glob("qsa_fused_ops*.so"))
+    if len(matches) != 1:
+        raise FileNotFoundError(f"Expected one qsa_fused_ops extension in {output_dir}, found {matches}.")
+    check_kernel_library(kernel_db)
+    return matches[0]
+
+
+def _remove_qsa_fused_outputs(output_dir: Path) -> None:
+    """Delete both fused QSA libraries from output_dir, and nothing else."""
+    for path in [output_dir / "libqsa_fused_gaudi2.so", *sorted(output_dir.glob("qsa_fused_ops*.so"))]:
+        if path.is_file():
+            path.unlink()
+
+
 def build_combined_kernel_db(repository_root: Path, build_root: Path, output_dir: Path) -> Path:
     """Build the combined kernel database adapter that forwards to the member libraries."""
     source_root = repository_root / "csrc" / "kernel_db_adapter"
@@ -281,6 +310,7 @@ def main() -> None:
     parser.add_argument("--extension-only", action="store_true")
     parser.add_argument("--gdn-fused-only", action="store_true")
     parser.add_argument("--hc-fused-only", action="store_true")
+    parser.add_argument("--qsa-fused-only", action="store_true")
     parser.add_argument("--combined-only", action="store_true")
     args = parser.parse_args()
     if args.kernel_only and args.extension_only:
@@ -299,7 +329,10 @@ def main() -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     build_root.mkdir(parents=True, exist_ok=True)
 
-    if not (args.gdn_fused_only or args.hc_fused_only or args.combined_only):
+    if args.qsa_fused_only and (args.kernel_only or args.extension_only or args.gdn_fused_only or args.combined_only
+                                or args.hc_fused_only):
+        parser.error("--qsa-fused-only is mutually exclusive with the other --*-only options")
+    if not (args.gdn_fused_only or args.hc_fused_only or args.qsa_fused_only or args.combined_only):
         if not args.extension_only:
             build_kernel_database(source_root, build_root, output_dir)
         if not args.kernel_only:
@@ -330,12 +363,27 @@ def main() -> None:
                 file=sys.stderr,
             )
 
+    # The fused QSA decode kernels (VLLM_HPU_QSA_FUSED=2 at run time): the rule of the hyper-connection
+    # libraries, a failure removes only the two QSA files.
+    if args.qsa_fused_only or os.environ.get("VLLM_GAUDI_BUILD_QSA_FUSED") == "1":
+        try:
+            build_qsa_fused(repository_root, build_root, output_dir)
+        except Exception as exc:  # noqa: BLE001 - an optional library never fails the install
+            print(f"QSA fused build failed (the other libraries are unaffected): {type(exc).__name__}: {exc}",
+                  file=sys.stderr)
+            _remove_qsa_fused_outputs(output_dir)
+            if args.qsa_fused_only:
+                sys.exit(3)
+            print("Continuing without libqsa_fused_gaudi2.so: the QSA layers will run the torch data flow.",
+                  file=sys.stderr)
+
     # The combined kernel database is only useful once at least one member library was built;
     # --combined-only asks for it explicitly (e.g. over a member copied into output_dir). It is built
     # last, over the folder as the steps above left it: a member that failed to build is not in it.
     members_present = any(
         (output_dir / name).is_file()
-        for name in ("libgdn_fused_gaudi2.so", "libhc_fused_gaudi2.so", "libflashinfer_gaudi_kernels.so"))
+        for name in ("libgdn_fused_gaudi2.so", "libhc_fused_gaudi2.so", "libqsa_fused_gaudi2.so",
+                     "libflashinfer_gaudi_kernels.so"))
     if args.combined_only or members_present:
         try:
             build_combined_kernel_db(repository_root, build_root, output_dir)
