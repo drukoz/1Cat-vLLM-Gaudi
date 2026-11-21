@@ -227,6 +227,7 @@ class PendingBooks:
     cpu: torch.Tensor  # [B, 1 + k] the step's tokens, copied to the host asynchronously
     event: object  # the copy's event
     seeds: dict  # request -> its true num_computed_tokens at the step's start, when the host knew it (else absent)
+    align: Optional[torch.Tensor] = None  # M3: [2, B] next load counts and running blocks (host copy)
 
 
 @dataclass
@@ -261,3 +262,102 @@ class SpecEarlyBooks:
             if req_id in self.true_computed:
                 self.true_computed[req_id] += len(row)
         return tokens
+
+
+# ---- M3 (VLLM_HPU_FLASH_NEXT_SPEC_DEVICE_ALIGN): the prefix-cache align mode of a verification step on the device ----
+#
+# Under align mode (prefix caching on) a request's recurrent state lives in its block-table row of each recurrent
+# group: a verification step keeps it in the block of its last scheduled token, curr = cdiv(ctx + 1 + k, bs) - 1, and
+# its load and store lattices are row[curr : curr + 1 + k] (recurrent_lattice.align_lattices). Before the step the
+# state moves into row[curr] when the window moved (recurrent_commit.align_precopy_plan: conv from row[prev] at row
+# offset n - 1, ssm from row[prev + n - 1]; the next load count n becomes 1); after the step every committed token t
+# (t < a + 1) whose position completes a block copies its state into that block (recurrent_commit.boundary_commits:
+# ssm from store[t], conv from store[0] at row offset t), and a commit into row[curr] itself (store[0]) makes the next
+# load count 1 (self_commit_requests), else it is a + 1. These are the same rules on device tensors, masked per row,
+# for a block larger than 1 + k (then at most one token of a step completes a block).
+
+
+def align_curr(ctx: torch.Tensor, k: int, block_size: int) -> torch.Tensor:
+    """cdiv(ctx + 1 + k, block_size) - 1 per row (int32)."""
+    return torch.div(ctx + k + block_size, block_size, rounding_mode="floor").to(torch.int32) - 1
+
+
+def align_gather(rows: torch.Tensor, index: torch.Tensor) -> torch.Tensor:
+    """rows[r, index[r, j]] for an int32 ``[B, W]`` table and ``[B, J]`` index (an ``index_select`` on the flat
+    table; indices clamped into the row)."""
+    batch, width = rows.shape
+    index = torch.clamp(index, 0, width - 1)
+    flat = torch.arange(batch, dtype=torch.int32, device=rows.device)[:, None] * width + index
+    return rows.reshape(-1).index_select(0, flat.reshape(-1)).reshape(index.shape)
+
+
+def align_lattice_rows(rows: torch.Tensor, curr: torch.Tensor, k: int, real: torch.Tensor,
+                       pad_block_id: int) -> torch.Tensor:
+    """The ``[B, 1 + k]`` int32 load (= store) lattice ``row[curr : curr + 1 + k]``; padded rows ``pad_block_id``."""
+    cols = torch.arange(1 + k, dtype=torch.int32, device=rows.device)
+    lattice = align_gather(rows.to(torch.int32), curr[:, None] + cols[None, :])
+    return torch.where(real[:, None], lattice, torch.full_like(lattice, int(pad_block_id)))
+
+
+def align_precopy(ctx: torch.Tensor, prev: torch.Tensor, n: torch.Tensor, k: int, block_size: int,
+                  real: torch.Tensor) -> tuple:
+    """The pre-step plan: (curr, planned, source block, ssm source block, n after the copy). ``prev`` < 0 means the
+    host's default (ctx - 1) // bs. A verification step plans a copy when ctx > 0 and the window moved."""
+    curr = align_curr(ctx, k, block_size)
+    prev = torch.where(prev < 0, torch.div(ctx - 1, block_size, rounding_mode="floor").to(torch.int32), prev)
+    planned = real & (ctx > 0) & (prev != curr)
+    return curr, planned, prev, prev + n - 1, torch.where(planned, torch.ones_like(n), n)
+
+
+def device_commit_ssm(state: torch.Tensor, src: torch.Tensor, dst: torch.Tensor, mask: torch.Tensor,
+                      pad_slot: int) -> None:
+    """state[dst[r]] = state[src[r]] for the rows in ``mask`` (whole rows, one ``index_copy_``); the other rows copy
+    the pad slot onto itself."""
+    pad = torch.full_like(src, int(pad_slot))
+    src = torch.where(mask, src, pad).to(torch.int64)
+    dst = torch.where(mask, dst, pad).to(torch.int64)
+    state.index_copy_(0, dst, state.index_select(0, src))
+
+
+def device_commit_conv(state: torch.Tensor, src: torch.Tensor, dst: torch.Tensor, offset: torch.Tensor,
+                       mask: torch.Tensor, window_len: int, pad_slot: int) -> None:
+    """The plain conv window rows ``[offset[r], offset[r] + window_len)`` of ``state[src[r]]`` into rows
+    ``[0, window_len)`` of ``state[dst[r]]`` (the rest of the dst rows kept), for the rows in ``mask``; whole rows
+    written with one ``index_copy_`` (recurrent_commit.commit_conv's layouts: rows on dim 1 or dim 2)."""
+    if state.shape[1] >= window_len and state.shape[2] < window_len:
+        row_dim = 1
+    elif state.shape[2] >= window_len and state.shape[1] < window_len:
+        row_dim = 2
+    else:
+        row_dim = 1
+    pad = torch.full_like(src, int(pad_slot))
+    src = torch.where(mask, src, pad).to(torch.int64)
+    dst = torch.where(mask, dst, pad).to(torch.int64)
+    offset = torch.where(mask, offset, torch.zeros_like(offset)).to(torch.int64)
+    src_rows = state.index_select(0, src)
+    dst_rows = state.index_select(0, dst)
+    rows = offset[:, None] + torch.arange(window_len, dtype=torch.int64, device=state.device)[None, :]
+    if row_dim == 1:
+        index = rows[:, :, None].expand(-1, -1, state.shape[2])
+        window = torch.gather(src_rows, 1, index)
+    else:
+        index = rows[:, None, :].expand(-1, state.shape[1], -1)
+        window = torch.gather(src_rows, 2, index)
+    rest = dst_rows.narrow(row_dim, window_len, dst_rows.shape[row_dim] - window_len)
+    state.index_copy_(0, dst, torch.cat((window, rest), dim=row_dim))
+
+
+def align_commits(ctx: torch.Tensor, committed: torch.Tensor, block_size: int, store: torch.Tensor,
+                  rows: torch.Tensor, real: torch.Tensor) -> tuple:
+    """After the step: (mask, t, ssm source slot, conv source slot, destination slot, self commit) per row, for the
+    committed token t < ``committed`` (accepted drafts + 1) whose position completes a block (at most one per row
+    when the block is larger than the step)."""
+    width = store.shape[1]
+    t = torch.remainder(block_size - 1 - torch.remainder(ctx, block_size), block_size)  # the first t completing one
+    mask = real & (t < committed) & (t < width)
+    t = torch.where(mask, t, torch.zeros_like(t))
+    ssm_src = align_gather(store.to(torch.int32), t[:, None])[:, 0]
+    conv_src = store[:, 0].to(torch.int32)
+    dst = align_gather(rows.to(torch.int32), torch.div(ctx + t, block_size, rounding_mode="floor")[:, None])[:, 0]
+    self_commit = mask & (dst == conv_src)
+    return mask, t, ssm_src, conv_src, dst, self_commit
