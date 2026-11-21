@@ -1664,7 +1664,10 @@ class VllmMixtureOfExpertsOpFP8PerChannel(VllmMixtureOfExpertsOpBase):
         w2_weight_scale = self._cached_w2_scale_views
 
         if self.w13_input_scale is None:
-            x_fp8, x_scale = dynamic_quant(x)
+            # VLLM_HPU_MOE_TENSOR_SCALE_MAX_TOKENS: a short step quantizes with one scale; the vendor op validates a
+            # per-row scale on the host (4 graph cuts per layer, qsa-fused job 00217), a per-tensor one it does not.
+            single_scale = 0 < tokens_num <= int(envs.VLLM_HPU_MOE_TENSOR_SCALE_MAX_TOKENS)
+            x_fp8, x_scale = dynamic_quant(x, single_scale=single_scale)
             final_hidden_states = torch.ops.hpu.mixture_of_experts(hidden_states=x_fp8,
                                                                    expert_routing_table=topk_ids.to(torch.int64),
                                                                    router_weights=topk_weights.to(x.dtype),

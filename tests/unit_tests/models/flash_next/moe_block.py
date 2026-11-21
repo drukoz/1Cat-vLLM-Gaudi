@@ -124,8 +124,9 @@ def _mixture_of_experts(**kwargs) -> torch.Tensor:
     assert len(w12) == len(w3) == experts_max - experts_min + 1, "one weight pair per local expert"
     scale = kwargs.get("d_scale_hidden_states")
     if hidden.dtype == torch.float8_e4m3fn:
-        assert scale is not None and scale.dtype == torch.float32 and tuple(scale.shape) == (hidden.shape[0], 1)
-        x = hidden.float() * scale
+        assert scale is not None and scale.dtype == torch.float32
+        assert tuple(scale.shape) == (hidden.shape[0], 1) or scale.numel() == 1, "a per-row or one per-tensor scale"
+        x = hidden.float() * scale.reshape(-1, 1) if scale.numel() > 1 else hidden.float() * scale.reshape(())
     else:
         assert hidden.dtype == weights.dtype and scale is None
         x = hidden.float()

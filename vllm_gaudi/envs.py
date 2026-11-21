@@ -549,6 +549,7 @@ if TYPE_CHECKING:
     VLLM_HPU_MOE_DENSE: int = 0  # 0 vendor MoE op (default), 1 dense batched FP8 experts up to MAX_TOKENS rows
     VLLM_HPU_MOE_DENSE_MAX_TOKENS: int = 512  # with VLLM_HPU_MOE_DENSE=1: the most tokens a step runs dense
     VLLM_HPU_MOE_DENSE_MIN_TOKENS: int = 17  # with VLLM_HPU_MOE_DENSE=1: the fewest tokens a step runs dense
+    VLLM_HPU_MOE_TENSOR_SCALE_MAX_TOKENS: int = 0  # vendor MoE op: steps of at most N tokens quantize with one scale
     VLLM_HPU_MOE_ROUTE_STATS: str = ""  # a folder: per-step per-expert pair counts of every MoE op (stats jobs)
     VLLM_HPU_COLLECTIVE_MARK_STEP: int = 1  # 1 (default) mark_step() before every HPU collective, 0 none
     VLLM_HPU_STEP_TIMING: int = 0  # StepTimingMode: 0 off (default), 1 spans, 2 sync counters, 3 device waits
@@ -2070,6 +2071,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # hit (the dense form reads every local expert: job 00177 lost at 1 stream).
     "VLLM_HPU_MOE_DENSE_MIN_TOKENS":
     lambda: int(os.environ.get("VLLM_HPU_MOE_DENSE_MIN_TOKENS", "17")),
+    # The per-channel FP8 MoE op's vendor path (torch.ops.hpu.mixture_of_experts): a step of at most this many
+    # tokens quantizes its input with ONE per-tensor scale instead of one per row. The vendor op validates a per-row
+    # activation scale on the host (isfinite, nonzero, then abs / ceil / min / max / ne, gt and lt, each read back:
+    # 4 extra graph launches per MoE layer, qsa-fused job 00217); with one scale it runs in one graph. It changes
+    # the numerics (one amax for all rows; tests/unit_tests/models/flash_next/test_moe_tensor_scale.py states by how
+    # much). 0 (default) = per-row scales always. A fallback only: the dense form from one row (VLLM_HPU_MOE_DENSE=1
+    # with VLLM_HPU_MOE_DENSE_MIN_TOKENS=1) also runs in one graph and keeps per-row scales.
+    "VLLM_HPU_MOE_TENSOR_SCALE_MAX_TOKENS":
+    lambda: int(os.environ.get("VLLM_HPU_MOE_TENSOR_SCALE_MAX_TOKENS", "0")),
     # A folder (stats jobs only; default unset = off). With VLLM_HPU_MOE_DENSE=1, every per-channel FP8 MoE op
     # writes the per-expert pair counts of its last call (local experts, and its row count) into one row of a
     # process-wide buffer inside its graph, and the runner appends the buffer to <folder>/rank<r>.jsonl after every
