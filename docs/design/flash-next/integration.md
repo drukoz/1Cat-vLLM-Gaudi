@@ -9,7 +9,7 @@ Labels: MEASURED (card, with its file), VERIFIED (CPU test or code line), INFERR
 
 ## Handoff (if this agent stops)
 
-Updated 2026-11-21 01:20 UTC (fourth agent of the track, Opus 5.5, started 23:12 UTC).
+Updated 2026-11-21 01:50 UTC (fourth agent of the track, Opus 5.5, started 23:12 UTC).
 
 **Now (00:58 UTC):** build 1 is measured (job **00128**, tables below; job **00121** tiny gate passed). **Build 2 is
 job 00156** `real8-build2b` (all cards, hold 60 min, commit `b2a7f62f` = plugin code `a39d1f48` + mtp-card-ready's
@@ -148,7 +148,12 @@ checkpoint's temperature 1.0, top_k 20, top_p 0.95). Reference (program head, 00
 | 2 (00156) | no spec (A) | 1 | 44.0 / 33.0 | 33.0 (30.3) | 43.2 / 31.6 | 31.6 (31.7) | |
 | 2 (00156) | no spec (A) | 8 | 70.0 / 69.9 | 69.9 (14.3) | 58.8 / 69.3 | 58.8 (17.0) | |
 | 2 (00156) | no spec (A) | 32 | 53.7 / 62.6 | 53.7 (18.6) | 58.9 / 52.7 | 52.7 (19.0) | |
-| 2 (00156) | B, C | (pending) | | | | | |
+| 2 (00156) | B: A + CPU pin + hash check off | 1 | 41.2 / 41.1 | 41.1 (24.3) | not run | | |
+| 2 (00156) | B: A + CPU pin + hash check off | 32 | 68.5 / 69.0 | 68.5 (14.6) | not run | | |
+| 2 (00156) | MTP k = 2 (C) | 1 | 84 / 84 | 41.7 (24.0) | 65 / 77 | 29.0 (34.5) | 2.00 greedy, 2.25 / 1.88 sampled |
+| 2 (00156) | MTP k = 2 (C) | 8 | 99 / 91 | 39.8 (25.1) | not run | | 2.29 |
+| 2 (00156) | MTP k = 2 (C) | 32 | 91 / 104 | **40.1 (24.9)** | 97 / 111 | **46.7 (21.4)** | 2.27 / 2.29 greedy, 2.08 sampled |
+| 2 (00156) | MTP k = 2 (C), 8 x 14.8K prompts | 8 | 86 | 35.0 (28.5) steady | | | 2.46 (acceptance 0.80 / 0.63) |
 
 Build 2 readings (arm A, two measured rounds per level, `a / b` = round 1 / round 2; the better round in the
 ms-per-token column): sampled equals greedy now (server0.log: `Candidate sampling (VLLM_HPU_CANDIDATE_SAMPLING=1): a
@@ -157,6 +162,14 @@ by about 10 ms between rounds of one server (also in build 1: 67.3 / 51.1); **8 
 builds** (70.0 / 69.9 here, 58.7 in build 1, 45.9 on the program head): systematic, unexplained (candidates: the QSA
 request shard at 1 request per rank with its 12 all-gathers, grouped attention from 8 rows). Arm B's eight
 `VLLM_HPU_WORKER_CPU_PIN=1: rank r module m: share r of 8, CPUs 19r-(19r+17)` lines are in its server0.log.
+
+Build 2, arms B and C: B (native-replay's `VLLM_HPU_WORKER_CPU_PIN=1` + `PT_HPU_DISABLE_HPUGRAPH_REPLAY_HASHCHECK=1`)
+is slower (32 streams 68.5 / 69.0 against A's 53.7 / 62.6; server load 811 s against 477): drop both. C (MTP k = 2,
+`VLLM_HPU_SPEC_SAMPLED_VERIFY=2`): at 32 streams 40.1 / 45.7 ms per token greedy and 46.7 / 53.1 sampled, the
+candidate verification path's first real-model run (no fallback line, coherent texts, acceptance 0.66 / 0.44); timer at
+96 rows verify 82-86 ms + draft 16-19 ms (k = 3 at 128 rows verified in about 85 ms: k barely moves the verification
+cost); the 8 x 14.8K long-prompt round ran without a crash (5c770d96 in the image) with acceptance 0.80 / 0.63. At 1
+and 8 streams k = 2 on build 2 is slower than k = 3 on build 1 (part of it the 8-stream regression of arm A).
 
 ## Merge log (what the conflicts were)
 
