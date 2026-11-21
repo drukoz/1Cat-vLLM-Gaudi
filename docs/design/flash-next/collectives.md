@@ -358,18 +358,23 @@ patch and makes the builds). Done:
   `farm install` from wt/card-farm would undo it).
 - Interface agreed with native-replay (section 7). The coordinator has the plan and was asked for places.
 
-Waiting for: native-replay's unpatched build `stock-5176b1b2` (`~/farm/native-replay/bridge-build/out/`; its
-build was at 769 of 840 objects at 00:51 UTC), then a lean build `lean-<12 hex>`, and native-replay's minimal
-`bench_replay.py` command line for step b.
+The unpatched build `stock-5176b1b2` landed at 00:57 UTC (wheels `habana_torch_plugin-1.24.1+git5176b1b`, 44 MB,
+23 `.so`: the three main libraries and `fork_pybind/`, no `.upstream` twins; `habana_torch_dataloader`).
+**Job 00160 `tiny8-bridge-check`** (all, 20 min, queued 00:58 UTC; the coordinator places it after the 8-card job
+running then) is the deployment check (the coordinator merged a1 and a2 into it: 8-card jobs first):
+`ab_bridge_job.sh --sha 0a66722b7a55 --cmd 'python /farm/farm_tiny.py --gdn hc' stock:- build:stock-5176b1b2`.
+Results: `card/00160-tiny8-bridge-check-{stock,build}/` (fetched by this agent's waiter, or `bin/farm fetch
+collectives 00160 00160-tiny8-bridge-check-stock 00160-tiny8-bridge-check-build`). Pass: the job's exit code 0 =
+both smokes pass, `BRIDGE stock-5176b1b2 ok`, and the line `tokens EQUAL to the stock arm's`.
+Step b is staged: `~/farm/collectives/results/bench/{bench_replay.py (md5 a62658ce, native-replay's late copy),
+run_bench.sh}`; with the lean build: `printf 'exec bash ~/farm/collectives/bridge/ab_bridge_job.sh --sha
+0a66722b7a55 --cmd "bash /results/bench/run_bench.sh" stock:- lean:<lean id>\n' | bin/farm submit collectives
+bench8-bridge all 30m` (each arm pairs the flag off and on in one bench run; summary:
+`python3 reports/native-replay/probes/knob_table.py bench_r8.json`).
 
 Next, in order (section 7's table):
-1. a1, when `out/stock-5176b1b2/manifest.json` exists, two 1-card jobs side by side on the synced commit
-   0a66722b (no new image needed: the wrapper comes from `~/farm/collectives/bridge/`):
-   `bin/farm tiny collectives br-tiny1-stock any:1 12m --no-sync --gdn hc` and
-   `bin/farm tiny collectives br-tiny1-build any:1 12m --no-sync --bridge stock-5176b1b2 --gdn hc`.
-   Pass: `BRIDGE stock-5176b1b2 ok` in the second job's log, `bridge.json` ok, both smokes pass with the same
-   tokens (equal reference matches; the near-tie prompts' `got` lists equal in both `details.json`).
-2. a2: `bin/farm tiny collectives br-tiny8-build all 15m --no-sync --bridge stock-5176b1b2 --gdn hc`.
+1. Read 00160 (above) and send the verdict to the coordinator and native-replay.
+2. (Replaced by 00160: the 1-card pair a1 and the single TP8 arm a2.)
 3. a3 and b with the lean build (flag 0 and 1); c with `ab_bridge_job.sh` through `bin/farm submit`:
    `printf 'exec bash ~/farm/collectives/bridge/ab_bridge_job.sh --sha 0a66722b7a55 stock:- lean0:<id>:PT_HPU_HPUGRAPH_PREPARED_REPLAY=0 lean1:<id>:PT_HPU_HPUGRAPH_PREPARED_REPLAY=1\n' | bin/farm submit collectives real8-bridge-ab all 45m`,
    then `bin/farm wait <id>` and `bin/farm fetch collectives <id> <id>-real8-bridge-ab-stock <id>-real8-bridge-ab-lean0 <id>-real8-bridge-ab-lean1`.
