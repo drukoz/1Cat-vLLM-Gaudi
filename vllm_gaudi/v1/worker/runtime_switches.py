@@ -21,8 +21,9 @@ from typing import Optional
 # which runs as lazy ops after the replayed decode graph: switching it changes the region's graph, not a captured one.
 # VLLM_HPU_MTP_DRAFT_GRAPH is read at every decode draft (HpuFlashNextMtpProposer._draft_graph_enabled): 1 runs the
 # k draft passes in the one-graph loop (built at its first draft), 0 the per-pass graphs; both keep their graphs.
+# VLLM_HPU_MTP_DRAFT_CHAIN is decided before every verification (HPUModelRunner._mtp_chain_decision).
 SWITCHABLE = ("VLLM_HPU_FLASH_NEXT_DECODE_METADATA", "VLLM_HPU_FUSED_GREEDY_LOGITS", "VLLM_HPU_CANDIDATE_SAMPLING",
-              "VLLM_HPU_VOCAB_PARALLEL_LOGITS", "VLLM_HPU_MTP_DRAFT_GRAPH")
+              "VLLM_HPU_VOCAB_PARALLEL_LOGITS", "VLLM_HPU_MTP_DRAFT_GRAPH", "VLLM_HPU_MTP_DRAFT_CHAIN")
 
 
 def parse_switches(text: str) -> dict[str, str]:
