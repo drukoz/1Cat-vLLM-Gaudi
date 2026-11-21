@@ -6,7 +6,7 @@
 # (CARDQ_* set); each arm is one container started by ~/farm/farm_job.sh (cards, CPUs, ports, labels as for every
 # job), probed by the farm's serve_probe.sh + decode_scaling.py. Deployed to ~/farm/collectives/bridge/.
 #
-#   ab_bridge_job.sh [--sha SHA12] ARM...      ARM = name:BUILD[:KEY=VALUE[,KEY=VALUE...]]
+#   ab_bridge_job.sh [--sha SHA12] [--cmd 'COMMAND WORDS'] ARM...      ARM = name:BUILD[:KEY=VALUE[,KEY=VALUE...]]
 #     BUILD "-" = the image's bridge; otherwise a build id of ~/farm/native-replay/bridge-build/out/, installed by
 #     with_bridge.py at the container's start (exit 7 or 8 and the arm fails if it is not what loads).
 #   e.g. stock:-  lean0:lean-0123456789ab:PT_HPU_HPUGRAPH_PREPARED_REPLAY=0
@@ -14,7 +14,9 @@
 #
 # PROBE_OPTS: serve_probe.sh's options (default: 1 and 32 streams, 256 tokens, two measured rounds at 32, no
 # MINTOK round). Every arm also gets VLLM_GRAPH_RESERVED_MEM (default 0.4 at 8 cards, 0.5 below; the 23:50 UTC
-# rule) unless its KEY=VALUE list sets it. Results: ~/farm/<track>/results/<job>-<name>-<arm>/ (scaling.json,
+# rule) unless its KEY=VALUE list sets it. --cmd runs that command in every arm instead of the server and probe
+# (for example 'python /farm/farm_tiny.py --gdn hc': the tiny model at TP = the job's cards; its arms are then
+# compared prompt by prompt, and the job fails unless every arm passed with the same tokens). Results: ~/farm/<track>/results/<job>-<name>-<arm>/ (scaling.json,
 # server0.log, probe.log, versions.txt, summary.json, bridge.json), and one summary line per arm and level here.
 # Exit code 0 when every arm's server answered and its probe ended well.
 set -u
@@ -23,7 +25,14 @@ TRACK="${CARDQ_TRACK:?not inside a job of the card queue}"
 JOB="${CARDQ_JOB:?}"
 NAME="${CARDQ_NAME:-bridge-ab}"
 SHA=""
-if [ "${1:-}" = "--sha" ]; then SHA="$2"; shift 2; fi
+CMD=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --sha) SHA="$2"; shift 2 ;;
+        --cmd) CMD="$2"; shift 2 ;;
+        *) break ;;
+    esac
+done
 [ -n "$SHA" ] || SHA="$(basename "$(readlink "$F/$TRACK/current")")"
 [ $# -ge 1 ] || { echo "usage: ab_bridge_job.sh [--sha SHA12] name:BUILD[:K=V,...]..."; exit 2; }
 PROBE_OPTS="${PROBE_OPTS:---levels 1,32 --tokens 256 --warm-tokens 64 --repeat-top 2 --no-mintok-check}"
@@ -52,7 +61,7 @@ for arm in "$@"; do
             case "$kv" in VLLM_GRAPH_RESERVED_MEM=*) has_reserved=1 ;; esac
         done
     fi
-    [ "$has_reserved" -eq 1 ] || envs+=(--env "VLLM_GRAPH_RESERVED_MEM=$RESERVED")
+    [ "$has_reserved" -eq 1 ] || [ -n "$CMD" ] || envs+=(--env "VLLM_GRAPH_RESERVED_MEM=$RESERVED")
     wrap=()
     if [ "$build" != "-" ]; then
         src="$F/native-replay/bridge-build/out/$build"
@@ -68,23 +77,54 @@ for arm in "$@"; do
     label="$build"
     [ "$build" = "-" ] && label="the image's"
     echo "ab_bridge: arm $name: bridge $label, env ${kvs:-none} [$(now)]"
-    # shellcheck disable=SC2086  # PROBE_OPTS is a list of options
-    bash "$F/farm_job.sh" --sha "$SHA" --run-id "$run" --suffix "$name" "${envs[@]}" -- \
-        ${wrap[@]+"${wrap[@]}"} bash /farm/serve_probe.sh $PROBE_OPTS >"$out/arm.log" 2>&1
+    if [ -n "$CMD" ]; then
+        # shellcheck disable=SC2086  # CMD is a list of words
+        bash "$F/farm_job.sh" --sha "$SHA" --run-id "$run" --suffix "$name" ${envs[@]+"${envs[@]}"} -- \
+            ${wrap[@]+"${wrap[@]}"} $CMD >"$out/arm.log" 2>&1
+    else
+        # shellcheck disable=SC2086  # PROBE_OPTS is a list of options
+        bash "$F/farm_job.sh" --sha "$SHA" --run-id "$run" --suffix "$name" ${envs[@]+"${envs[@]}"} -- \
+            ${wrap[@]+"${wrap[@]}"} bash /farm/serve_probe.sh $PROBE_OPTS >"$out/arm.log" 2>&1
+    fi
     rc=$?
-    grep -E "^BRIDGE |serve_probe: (SERVER-|PROBE-RC|DONE|fallback)|^MEAS|^SAMPLED|^TEXT" "$out/arm.log" | cut -c1-220 | head -40
+    grep -E "^BRIDGE |serve_probe: (SERVER-|PROBE-RC|DONE|fallback)|^MEAS|^SAMPLED|^TEXT|tiny smoke|decode_ms" "$out/arm.log" \
+        | cut -c1-220 | head -40
     echo "ab_bridge: arm $name ended rc $rc [$(now)]"
     [ "$rc" -eq 0 ] || rc_all=$rc
     sleep "${CARD_RELEASE_S:-15}"  # the cards are not free the moment the server's processes end
 done
-# one line per arm and level: the steady ms per token (median gap between chunks) of the measured rounds
-python3 - "$F/$TRACK/results" "$JOB-$NAME" "$@" <<'PY'
-import json, sys, os
+# one line per arm and level: the steady ms per token (median gap between chunks) of the measured rounds; with
+# --cmd and the tiny smoke: each arm's result and its tokens against the first arm's, prompt by prompt
+python3 - "$F/$TRACK/results" "$JOB-$NAME" "$@" <<'PY' || rc_all=$?
+import json, sys, os, glob
 root, prefix, arms = sys.argv[1], sys.argv[2], sys.argv[3:]
+tiny, first, bad = {}, None, False
 for arm in arms:
     name = arm.split(":")[0]
+    folder = os.path.join(root, "%s-%s" % (prefix, name))
+    details = sorted(glob.glob(os.path.join(folder, "*", "details.json")))
+    if os.path.exists(os.path.join(folder, "summary.json")) and details:
+        s = json.load(open(os.path.join(folder, "summary.json")))
+        modes = {}
+        for path in details:
+            d = json.load(open(path))
+            modes[d.get("mode") or os.path.basename(os.path.dirname(path))] = {
+                p["index"]: (p.get("match"), p.get("expected"), tuple(p.get("got") or ()), bool(p.get("near_tie")))
+                for p in d.get("prompts", [])}
+        print("ab_bridge: %-8s tiny smoke passed=%s; %s" % (name, s.get("passed"), "; ".join(
+            "%s: %s" % (m, " ".join("%s:%s/%s%s" % (i, v[0], v[1], "~" if v[3] else "") for i, v in sorted(r.items())))
+            for m, r in modes.items())))
+        bad = bad or not s.get("passed")
+        if first is None:
+            first = (name, modes)
+        else:
+            same = modes == first[1]
+            print("ab_bridge: %-8s tokens %s the %s arm's, prompt by prompt" % (
+                name, "EQUAL to" if same else "DIFFER from", first[0]))
+            bad = bad or not same
+        continue
     try:
-        d = json.load(open(os.path.join(root, "%s-%s" % (prefix, name), "scaling.json")))
+        d = json.load(open(os.path.join(folder, "scaling.json")))
     except Exception as exc:
         print("ab_bridge: %-8s no scaling.json (%s)" % (name, exc))
         continue
@@ -94,6 +134,7 @@ for arm in arms:
                   name, lv.get("streams"), lv.get("rep"), lv.get("steady_ms_per_token_p50"),
                   lv.get("tokens_per_chunk_p50"), lv.get("ms_per_token_p50"), lv.get("aggregate_tok_s"),
                   lv.get("ok"), lv.get("errors")))
+sys.exit(3 if bad else 0)
 PY
 echo "ab_bridge: DONE rc $rc_all [$(now)]"
 exit "$rc_all"
