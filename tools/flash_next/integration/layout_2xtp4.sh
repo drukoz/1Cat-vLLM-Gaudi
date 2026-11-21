@@ -46,9 +46,16 @@ one() {  # LABEL CARD_INDICES CPUS PORT
         "$IMG" bash /bundle/plugin/tools/flash_next/integration/headline_job.sh $ARMS
 }
 
-one tp4a 0,1,2,7 0-17,19-36,38-55,57-74 "$PB" >"$R/tp4a.log" 2>&1 &
+# Each module group's CPUs from the queue's own rule (never hard-coded: the layout changed at 06:58 UTC 2026-11-21,
+# whole host cores, the image-build cores left out; CARD.md): ~/farm/cardq.sh cpus <modules>.
+CPUS_A="$("$HOME/farm/cardq.sh" cpus 0,1,2,3 2>/dev/null)"
+CPUS_B="$("$HOME/farm/cardq.sh" cpus 4,5,6,7 2>/dev/null)"
+case "$CPUS_A$CPUS_B" in *[!0-9,-]* | "") echo "layout_2xtp4: no CPU sets from ~/farm/cardq.sh cpus ('$CPUS_A' / '$CPUS_B')" >&2; exit 2 ;; esac
+[ -n "$CPUS_A" ] && [ -n "$CPUS_B" ] || { echo "layout_2xtp4: an empty CPU set ('$CPUS_A' / '$CPUS_B')" >&2; exit 2; }
+echo "layout_2xtp4: CPUs modules 0-3: $CPUS_A; modules 4-7: $CPUS_B"
+one tp4a 0,1,2,7 "$CPUS_A" "$PB" >"$R/tp4a.log" 2>&1 &
 PA=$!
-one tp4b 3,4,5,6 76-93,95-112,114-131,133-150 "$((PB + 10))" >"$R/tp4b.log" 2>&1 &
+one tp4b 3,4,5,6 "$CPUS_B" "$((PB + 10))" >"$R/tp4b.log" 2>&1 &
 PBID=$!
 wait "$PA"
 RA=$?
