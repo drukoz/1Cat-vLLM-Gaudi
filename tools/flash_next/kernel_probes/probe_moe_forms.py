@@ -14,6 +14,10 @@ Big rows (the verify rows of 32 streams):
                 served activation, quantization, batched down GEMM and sum (mid moved to [E, T, I])
   flat13-mmsum  flat13 with the sum over E as a matmul with a ones row ([1, E] x [E, T*H]; the c1 question: is the
                 TPC sum the slow part)
+  dense-triton  (b) via Gaudi Triton: the served batched gate / up, then the activation and the mid quantization as
+                one fused node (vllm_gaudi/ops/triton_gaudi silu_and_mul_dynamic_quant; ERROR when the image has no
+                Gaudi Triton backend)
+  flat13-triton the same after the 2-D gate / up GEMM (rows (t, e); the FP8 mid then moved to [E, T, I])
   flat13-bf16act  flat13 with the activation in bf16 (silu(gate) * up on the bf16 GEMM output, no fp32 copies; the
                 (b) question: how much of the glue is the fp32 path)
   flatdown      (c2, NOT exact, parity only) W2 requantized once to a per-channel scale shared by the experts, so the
@@ -106,6 +110,44 @@ def flat13_moe(torch, layer, local, x, ids32, weights, expert_ids, mmsum=False, 
     if mmsum:
         ones = torch.ones(1, local, dtype=torch.bfloat16, device=x.device)
         return torch.matmul(ones, down.reshape(local, rows * H)).reshape(rows, H)
+    return down.sum(dim=0, dtype=torch.float32).to(torch.bfloat16)
+
+
+def _triton_act_quant():
+    """The Gaudi-Triton fused SwiGLU + per-row E4M3 quantization (vllm_gaudi/ops/triton_gaudi, one TPC node), called
+    directly: VLLM_HPU_TRITON_MODE is set to strict in this probe process only, to prepare the Triton runtime."""
+    os.environ["VLLM_HPU_TRITON_MODE"] = "strict"
+    from vllm_gaudi.ops.triton_gaudi import runtime
+
+    runtime.prepare_if_enabled()  # raises FastPathUnavailable when the image has no Gaudi Triton backend
+    from vllm_gaudi.ops.triton_gaudi.kernels import silu_and_mul_dynamic_quant
+
+    return silu_and_mul_dynamic_quant
+
+
+def dense_triton_moe(torch, layer, local, x, ids32, weights, expert_ids, flat=False):
+    """(b) with Triton: the activation and the per-(expert, row) quantization of mid as one fused node; batched
+    (rows (e, t)) or after the 2-D gate / up GEMM (rows (t, e), then the FP8 mid is moved to [E, T, I])."""
+    _, w2, _, s2 = layer
+    rows = x.shape[0]
+    fused = _triton_act_quant()
+    wmat = _pair_weights(torch, ids32, weights, expert_ids)
+    if flat:
+        gu = _flat_gate_up(torch, layer, local, x)  # [T, E, 2I]
+        m8, ms = fused(gu.reshape(rows * local, 2 * I))
+        m8 = m8.reshape(rows, local, I).transpose(0, 1).contiguous()
+        ms = ms.reshape(rows, local).t().unsqueeze(-1)
+    else:
+        w13, _, s13, _ = layer
+        x8, xs = dp.quantize_rows(torch, x)
+        a = x8.unsqueeze(0).expand(local, rows, H).contiguous()
+        a_scale = xs.unsqueeze(0).expand(local, rows, 1).contiguous()
+        gate_up = torch.ops.hpu.fp8_gemm_v2(a, False, w13, True, None, torch.bfloat16, a_scale, s13.unsqueeze(1), None,
+                                            False)  # [E, T, 2I]
+        m8, ms = fused(gate_up.reshape(local * rows, 2 * I))
+        m8, ms = m8.reshape(local, rows, I), ms.reshape(local, rows, 1)
+    m_scale = ms.float() * wmat.t().unsqueeze(-1)
+    down = torch.ops.hpu.fp8_gemm_v2(m8, False, w2, True, None, torch.bfloat16, m_scale, s2.unsqueeze(1), None, False)
     return down.sum(dim=0, dtype=torch.float32).to(torch.bfloat16)
 
 
@@ -250,6 +292,9 @@ def main():
                                                                  bf16_act=True),
                 "flatdown": lambda layer, x, i: flatdown_moe(torch, layer, prep[i], local, x, ids32_d, w_d,
                                                              expert_ids),
+                "dense-triton": lambda layer, x, i: dense_triton_moe(torch, layer, local, x, ids32_d, w_d, expert_ids),
+                "flat13-triton": lambda layer, x, i: dense_triton_moe(torch, layer, local, x, ids32_d, w_d, expert_ids,
+                                                                      flat=True),
                 "vendor-chunk64": lambda layer, x, i: dp.vendor_moe(torch, layer, local, x, ids_d, w_d, 64),
             }
         else:
