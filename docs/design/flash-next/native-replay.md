@@ -36,6 +36,15 @@ This file is the design; measurements land in section 7 as the card jobs end.
    INFERRED). The ranks' host times for the same replayed step differ by about 10 ms in the server (not in the
    benchmark), which is what `VLLM_HPU_WORKER_CPU_PIN` (build step 7, job 00122) targets.
 
+8. **Update 2026-11-21 03:40 UTC (bridge job 00174; section 7.10).** Our own builds of the Gaudi bridge load at TP8 and
+   keep every token (00160, 00174). On the real model at TP8 a replayed launch costs about 155 us of host time per
+   rank (Synapse launch path 49, input handling 30, patching 22, post 15, launch bookkeeping 16; about 145 launches per
+   1-stream step, so about 22 ms of the 38 ms step). The prepared replay (lean step 1, `PT_HPU_HPUGRAPH_PREPARED_REPLAY=1`)
+   and the stock spinner-off setting (`PT_HPU_SYNCHRONOUS_ACC_QUEUE_FLUSHING=1`) each cut about 17 us per launch with the
+   same tokens: 1-stream step 38.2 -> 30.8 ms (lean) and 34.6 ms (spinner off), one round each; at 32 streams the step is
+   device-bound (-0.8 and -2.2 ms). Lean step 1 gave back 12 us in run_prep (fixed in lean2). Next: lean2 with the
+   spinner off on the headline env, then lean3 (sub-timers, then four cuts of -20 to -35 us per launch; section 7.10).
+
 ## 1. The question
 
 The target (32 streams, at most 10 ms per token per stream) needs the fixed cost of a step, Ft, at about 5 to 10 ms
@@ -232,6 +241,12 @@ call (about 3 ms for 98; today's TP8 stock replay is 4-6 times that), and host w
 (async scheduling with speculation). Whether E1's TP4 collectives or a cheaper call form get there is the open
 measurement (00019, 00027).
 
+Update 2026-11-21 03:40 UTC (section 7.10, MEASURED on the real model at TP8): a replayed launch costs about 155 us of
+host time per rank and a 1-stream step issues about 145 of them, about 22 ms of the 38 ms step. The bridge-only lean
+path takes the bridge's share: lean step 1 and the spinner-off setting about 17 us each, lean2 about 12 more
+(INFERRED), lean3 -20 to -35 (INFERRED); what stays is about 50 us per launch (Synapse's own launch, allocations, the
+collective hand-off), about 7 ms per 1-stream step.
+
 ## 6. The deciding experiments
 
 The cheapest experiment that separates O1 from O2 and sizes what O1 can still remove does not need the model: a
@@ -394,6 +409,10 @@ Readings:
    65-90 us is about 19-20 ms, the fastest rank's replay call in step-anatomy's 00013 and 00117.
 3. The calling thread is on a CPU for 60-75 % of a replay call with collectives (thread CPU 3.4-6.7 ms in a 5-7 ms
    call at 1 row): the host time is mostly work, partly waiting.
+4. A lead, not a finding: with the tensor cache kept (`replay_seg_cache`, `wrap_in_hpu_graph` without
+   `disable_tensor_cache`) one launch cost 41 / 9 us at 1 / 32 rows against 72 / 65 us without it at 8 ranks
+   (`replay_r8`), but nothing less on one card (00067). The runner wraps with `disable_tensor_cache=True`; with the
+   cache kept the intermediates keep fixed addresses, which is also what a lean replay path (Handoff, item 3) needs.
 
 ### 7.5 What the host does inside a replay (1-card sampler, 00067)
 
@@ -467,6 +486,178 @@ PCI devices, two NUMA nodes 0-75 and 76-151), so the farm's module-to-CPU table 
 to one slice still keeps its threads and its memory together. Build step 7 (`VLLM_HPU_WORKER_CPU_PIN`) and job 00122
 test it on the real model.
 
+### 7.9 The worker CPU pin and the hash switch at TP8 (integration track's job 00156, arm B against arm A)
+
+MEASURED (integration's report; `~/farm/integration/results/00156-real8-build2b/{nospec,nospec-pin}/`; the CPU watcher
+`reports/native-replay/card/cpuwatch-00156/`): TP8 + EP8, integration build 2, greedy, steady ms per step (round 1 /
+round 2): 1 stream B (`VLLM_HPU_WORKER_CPU_PIN=1 PT_HPU_DISABLE_HPUGRAPH_REPLAY_HASHCHECK=1`) 41.15 / 41.06 against A
+(neither) 43.95 / 33.01; 32 streams B 68.45 / 69.01 against A 53.74 / 62.63. Server healthy after 811 s (B) against 477 s
+(A), the weights at about 6 s against 2 s per shard. All 8 pin lines (rank r: share r of 8, CPUs 19r to 19r+17, 35
+threads moved), no fallback line; B's 1-stream text equals A's. **No gain, worse at 32 streams and at load: both flags
+stay off.**
+
+The watcher (MEASURED): unpinned, each worker's main thread uses 82-94 % of a CPU at 1 stream and 67-77 % at 32 streams
+and drifts over both NUMA halves; pinned, it stays in its slice at 83-97 % and 83-86 %, with the worker's AccThreadPool
+thread spinning at 100 % on a neighbouring CPU of the same slice. At 32 streams the pinned main thread therefore spent
+about 0.85 x 69 = 59 ms of CPU per step against about 0.70 x 58 = 41 ms unpinned (INFERRED): it runs about 45 % slower,
+it does not wait more. Reading (INFERRED): the VM's vCPUs are host hyperthreads (lscpu hides it: "1 thread per core"),
+and packing a worker's busy threads into 18 neighbouring vCPUs puts the main thread next to (or on the sibling of) a
+spinner. A different pin cannot avoid that without the host's sibling map. The slower weight loading under the pin is
+not explained (more loader threads than the slice's 18 CPUs, or NUMA).
+
+The spinner (VERIFIED in the bridge source at 5176b1b2, `pytorch_helpers/habana_helpers/thread_pool/acc_thread_pool.cpp`):
+`CreateAccThreadPool()` (line 35) picks `AccThreadPool` by default (`PT_HPU_ACC_THREAD_VERSION=0`), whose `main_loop`
+(line 158) is `while (task_count_ == 0 && !stop_) {}`, a busy-wait without pause: one CPU per worker, forever, also in
+accumulation mode 0 (51 % of all samples of the 1-card profile, section 7.5). Stock switches remove it:
+`PT_HPU_SYNCHRONOUS_ACC_QUEUE_FLUSHING=1` (`AccNoThread`, no thread) or `PT_HPU_ACC_THREAD_VERSION=1` (a blocking-queue
+pool that sleeps when idle). On one card (00067, "accsync") the first gave right values and no change, as expected
+on an otherwise idle host.
+
+### 7.10 Where a replayed launch spends its host time: bridge job 00174 (real model at TP8)
+
+MEASURED (the collectives track's job 00174 `real8-bridge-phase`, all cards, 02:30-03:06 UTC; our bridge builds
+`timers-c281d8b53d08` and `lean-e1dbb4942fb8`, build steps 9 and 10; results
+`reports/collectives/card/00174-real8-bridge-phase-<arm>/`; one `HPUGRAPH_REPLAY_TIMING` line per rank every 5000
+replayed launches, 2000 on the tiny model). Base env of the collectives track's real runs (QSA mode 1, GDN core decode,
+fused HC, recurrent state pool, no collective mark step, `VLLM_SKIP_WARMUP=true`, greedy; about 84 ms at 32 streams,
+so read it relatively). Every arm ok. Tokens: on the tiny model at TP8, spinner off and lean equal timers prompt by
+prompt; on the real model the 1-stream text is identical in all three arms.
+
+Steady ms per step (the probe's median gap; 1 stream one round, 32 streams two rounds):
+
+| arm | 1 stream | 32 streams |
+|---|---|---|
+| timers build (reference) | 38.22 | 84.24 / 84.73 |
+| spinner off (`PT_HPU_SYNCHRONOUS_ACC_QUEUE_FLUSHING=1`) | 34.62 | 82.37 / 82.17 |
+| prepared replay, lean step 1 (`PT_HPU_HPUGRAPH_PREPARED_REPLAY=1`) | 30.76 | 83.71 / 83.56 |
+
+Per replayed launch, us, the median over every line after each rank's first (the collectives track's parser
+`reports/collectives/probes/replay_timing_table.py`, 287-322 lines from 8-9 pids; `probes/replay_timing.py` gives
+means over the ranks, same direction):
+
+| phase | timers | lean step 1 | spinner off |
+|---|---|---|---|
+| total | 155.4 | 137.8 | 138.8 |
+| exec_setup | 6.78 | 1.52 | 5.83 |
+| launch_hashes | 4.76 | 0 | 3.99 |
+| create_launcher | 1.95 | 0 | 1.79 |
+| run_spec | 0.13 | 0 | 0.13 |
+| run_lookup | 4.08 | 0 | 3.59 |
+| run_prep | 1.75 | 14.05 | 1.38 |
+| run_patching | 22.4 | 16.9 | 19.2 |
+| launcher_inputs | 29.7 | 33.3 | 29.6 |
+| syn_launch | 48.9 | 41.0 | 43.7 |
+| launcher_post | 14.6 | 13.0 | 12.8 |
+
+Readings:
+1. **The real model's split is not the tiny model's.** launcher_post is 15 us per launch here (tiny model: 118 us, 45 %,
+   its recipes all end in a collective). On the real model the big phases are the Synapse launch path (syn_launch, 49),
+   the input handling (launcher_inputs, 30), the patching (22) and the post (15); the phases lean step 1 removes are 16.
+2. **The prepared path engages** (hashes, launcher, spec and lookup at 0 in the lean arm), and the thread-local state is
+   shared between the two libraries as built (exec_setup, launch_hashes, create_launcher nonzero in the timers arm).
+3. **Lean step 1's run_prep rose from 1.75 to 14.05 us.** Cause (code reading, INFERRED until lean2's timers): the kept
+   launcher held the previous replay's tensors (output handles, input copies, intermediates) until its next replay,
+   one step later, when it held the last references, so RunPrepared's clears freed them in run_prep. The stock
+   launcher drops the same references at the end of each launch (its destructor, while the stack and the launch's own
+   holders still own the tensors). Fixed in lean2 (build step 10): `ReleaseLaunchState()` right after each prepared
+   launch and after the first kept one.
+4. **The spinner-off setting lowers almost every phase by 10-20 %** (the AccThreadPool spinner's CPU contention,
+   section 7.9). It is a stock setting; the coordinator put it into integration build 3.
+5. **About 140-150 launches per 1-stream step** (rough: 5000-launch lines against the 10 s throughput lines of the
+   log; step-anatomy counted 148), so the replay path is about 22 ms of the 38 ms 1-stream step on each rank.
+6. **Lean's 1-stream gain (-7.5 ms) is larger than its timed saving explains** (17.6 us x about 145 = 2.6 ms). 1-stream
+   TP8 rounds spread 33-44 ms between rounds (RESULTS.md) and this job measured one round: the next job's two rounds
+   per level decide it. At 32 streams the step is device-bound (-0.8 ms).
+
+What the big phases hold (VERIFIED in the bridge source at 5176b1b2):
+- syn_launch, `backend/synapse_helpers/graph.cpp` `graph::launch`: two allocator walks over all ~17 addresses
+  (`get_total_memory_required`; the second only feeds `habana_lazy::log_dev_mem_stats`, its argument evaluated even
+  with logging off), the workspace check and buffer, `lock_addresses`, two trace-vector copies
+  (`towl::emitRecipeLaunch`), then `synLaunchWithExternalEvents`.
+- launcher_inputs, `backend/kernel/hpu_habana_cache.cpp` `RecipeLauncher::Launch`: the profile registry's per-launch
+  insert (`RecipeRegistry::registerRecipe`), per input `add_wait_events_on_stream` (a producer-event lookup per
+  address, and the wait for a collective's output still queued on the HCCL job thread), the intermediates' refs.
+- launcher_post: the producer registration of the outputs, the resource holder, `GenericRecordStream` of inputs and
+  outputs (stream allocator), the collective launch handed to the HCCL job thread.
+- run_patching, `UpdatePatchingInformation`: `RecipeValueSpec::update_patching_table` (new outputs and intermediates
+  allocated, every tensor info walked) and `patch_launch_info` (the whole launch info rebuilt).
+
+**Step 2 (coordinator approved, 03:35 UTC): `lean3`** = lean2 plus sub-timers inside syn_launch, run_patching and
+launcher_inputs first, then in this order, each measured (gains per launch INFERRED):
+(a) a launch-info template per prepared launcher: each launch rewrites only the addresses of its new inputs, outputs
+and intermediates, no walk over tensor infos or maps (allocation stays): -8 to -12 us;
+(b) syn_launch's bridge part: the tensor-memory total cached per prepared recipe, the logging walk and the trace
+copies skipped: -4 to -8 us;
+(c) no producer-event lookup for inputs written on the same compute stream (stream order covers them), the
+cross-stream waits on collective outputs kept: -5 to -10 us; plus one arm with the stock
+`PT_HPU_DISABLE_ASYNC_COLLECTIVE=1` (the collective issued inline, no future wait; never measured, sign unknown);
+(d) one producer event per launch for all outputs, a lighter resource holder, no profile-registry insert when
+profiling is off: -3 to -6 us.
+Step 2 in all: -20 to -35 us per launch, about -3 to -5 ms per 1-stream step, little at 32 streams. What stays is
+about 50 us per launch (Synapse's own launch, INFERRED 30-35 of syn_launch; allocations; the collective hand-off),
+about 7 ms per 1-stream step; lower needs fewer launches per step (fewer collectives, bigger segments).
+
+### 7.11 lean3t with sub-timers against the image's bridge: job 00181 (real model at TP8, integration build 3)
+
+MEASURED (the collectives track's job 00181 `real8-bridge-headline2`, ended 04:56 UTC, all six arms ok; integration build
+3's image and env, the spinner off (`PT_HPU_SYNCHRONOUS_ACC_QUEUE_FLUSHING=1`) in every arm; reference = the image's own,
+vendor-built bridge; results `reports/collectives/card/00181-real8-bridge-headline2-*/`). Tokens: tiny-lean and
+tiny-lean-inline equal tiny-stock prompt by prompt; the 1-stream texts of both rounds are equal in all three real arms.
+
+Steady ms per step, two rounds (greedy 32 / 8 / 1 streams; sampled 32 / 8 / 1):
+
+| arm | greedy 32 | greedy 8 | greedy 1 | sampled 32 | sampled 8 | sampled 1 |
+|---|---|---|---|---|---|---|
+| image bridge | 49.4, 56.4 | 53.3, 53.5 | 37.6, 37.2 | 57.6, 63.5 | 59.3, 57.7 | 36.2, 38.2 |
+| lean3t (`lean3t-412153bbab3e`, flag 1) | 46.2, 47.0 | 63.1, 61.3 | 43.5, 43.6 | 47.9, 50.7 | 59.4, 59.6 | 44.5, 44.7 |
+| lean3t + `PT_HPU_DISABLE_ASYNC_COLLECTIVE=1` | 45.5, 46.4 | 61.1, 59.9 | 42.2, 43.4 | 51.8, 51.0 | 63.2, 60.5 | 44.0, 44.5 |
+
+Per launch, us (medians over all lines after each rank's first; lean3t / inline): total 143.8 / 133.7; run_prep 2.14 /
+2.20 (**the lean2 fix works**: 14.05 in 00174); unattributed 5.0 / 5.3 (the frees did not move); run_patching 24.4 /
+24.4; launcher_inputs 40.1 / 6.0; syn_launch 43.6 / 48.3; launcher_post 13.7 / 35.9; exec_setup 1.5; hashes, launcher,
+spec, lookup 0. Sub-timers (nested): in_registry 0.54, in_refs 0.52, **in_waits 39.0 of which in_future 34.2** (inline
+0.0) and in_streamwait 3.5; syn_mem 3.1, syn_workspace 0.78, **syn_lock 9.9**, syn_trace 1.0, **syn_call 27.9**,
+syn_after 0.32; **patch_alloc 14.4**, patch_table 22.8 (holds patch_alloc), patch_info 1.3; post_holder 1.05,
+post_events 6.0, post_record 0, post_coll 6.1.
+
+Readings:
+1. **The collective futures are the biggest bridge item**: the main thread waits 34 us per launch for the HCCL job
+   thread (`habana_helpers::JobThread`, a condition-variable sleeper, `pytorch_helpers/habana_helpers/job_thread.h`)
+   to issue the previous launch's collective. Inline issue removes the wait and adds 22 us of issue cost to the post
+   phase: net -10 us per launch, same tokens.
+2. What is left is mostly outside the bridge's bookkeeping: the Synapse call (28 us), the allocator's address lock
+   (10 us: handle to device address for every tensor), the allocations of outputs and intermediates (14 us).
+3. **The step-time flips between jobs are the ranks, not lean.** In every real arm exactly two of the 8 ranks run about
+   2x slower per launch for long stretches, and which two changes with every server start (real-lean 1-stream windows:
+   six ranks 117-158 us, two 229-238; real-lean-inline: six 130-159, two 233-243). Every phase is 2x in the slow ranks: a
+   slower CPU, not more bridge work. At 1 stream the slowest rank sets the step: about 150 x 90 us = 13 ms, more than
+   any per-launch gain (lean about -30 us, inline -10 us: 1.5-4.5 ms). INFERRED: pairs of busy main threads on vCPUs that
+   are hyperthread siblings on the host (the VM hides the sibling map; section 7.9).
+4. Our rebuild is the vendor's binary in all but the patch: `libhabana_pytorch_backend.so` 58,176,608 bytes (image)
+   against 58,158,528 (lean3a), `.text` within 0.002 %, the same GCC 13.4.0, no LTO in either (0 `lto_priv` symbols),
+   the same number of `isra` clones; the plugin likewise. A slower build is unlikely; job 00188 measures it (real-rebuild
+   against the image's bridge).
+
+### 7.12 The host's hyperthread pairs: job 00193 (CPU only, all cards held)
+
+MEASURED (`tools/flash_next/replay/cpu_siblings.py` in job 00193, 281 s, the 144 CPUs of an all-card job; results
+`reports/native-replay/card/00193-cpu-sibs/cpu_siblings.json`): a pinned C loop per vCPU, alone and in pairs. The VM
+reports 152 sockets of one core each (lscpu: KVM, Icelake, 2 NUMA nodes 0-75 / 76-151, `numa_balancing=1`), but
+**vCPUs 2k and 2k+1 share a host core**: all 12 tested a^1 pairs (0-1, 12-13, 24-25, 38-39, 50-51, 62-63, 76-77, 88-89,
+100-101, 114-115, 126-127, 138-139) slow each other by 7-9 % on both sides; a+-76 pairs 0.00 (12 of 12); a+-1 only when
+it is a^1; a full scan of vCPUs 0, 12, 25 against all 143 others puts the a^1 partner at 0.07-0.10 and the rest at a
+median 0.000, 95th percentile 0.02, max 0.06. The small size is the loop's (one dependent chain leaves most of a core
+free; fixed to four chains in 61ad3d1+); two busy decode main threads lose far more (INFERRED from the 2x slow ranks of
+section 7.11, slow only at 1 and 8 streams, where the main threads are busy all the step). The tool's own verdict
+printed "rule: None" (its absolute threshold 0.2 was meant for a core-filling loop; now relative).
+
+Use: `tools/flash_next/replay/place_workers.py` with rule a^1 (`~/farm/native-replay/late/place.sh`, md5
+7e54f2de93590d2478bf5a94dbca7d75) runs in 00189's pin arm after health: each worker's main thread alone on one vCPU
+of its share, the sibling vCPU kept free, the worker's other threads on the rest of the share, every other process off
+the reserved vCPUs, re-applied every 2 s. Also a rule for every placement here: never put two busy threads on 2k and
+2k+1; `VLLM_HPU_WORKER_CPU_PIN=2` puts the main thread on its share's first CPU (19r) and lets other threads use its
+sibling (19r xor 1), so mode 2 needs the sibling kept free (a fix for the flag, after 00189 says it pays).
+
 ## 8. Build steps
 
 | Step | What | Proof off the card | Card | State |
@@ -478,8 +669,54 @@ test it on the real model.
 | 5 | `VLLM_HPU_GRAPH_ASYNC_REPLAY` (default 0): the model's HPU graph wrapped with `asynchronous=True`, so the forward returns once the replay is queued | `tests/unit_tests/worker/test_hpu_graph_async_replay.py` (4 tests) | tokens equal at TP4 (00066); not faster at 8 ranks or on the tiny model at TP4 (section 7.7) | committed `6966226e`; keep off |
 | 6 | Bench regimes for grouped collectives (`replay_par2`, `replay_fused2`, `replay_coalesce`), a sampler tail, a torch.profiler trace of a replay, the knob names of the bridge and HCL | `test_bench_replay.py` (11 tests); gloo self-test | job 00027 step A | committed `d85d9730`, `e2726c41` |
 | 7 | `VLLM_HPU_WORKER_CPU_PIN` (default 0): 1 = every thread of a worker on one equal share of the server's CPUs, the share at its module's position among the visible modules, set right after `torch.hpu.set_device`; 2 = 1 and the model's thread on a CPU of its own after warmup (`vllm_gaudi/v1/worker/hpu_worker_cpus.py`) | `tests/unit_tests/worker/test_worker_cpu_pin.py` (29 tests); a Linux check with real threads is in `reports/native-replay/probes/pin/linuxcheck/` (the colima VM's Docker daemon did not answer, not run) | job 00122: TP4, base / cut / cut + pin at 1 and 32 streams, every rank's busy threads' CPUs recorded (`late/cpu_watch.py`) | committed `6884fc07` |
+| 8 | Our own build of the Gaudi bridge (gaudi-pytorch-bridge `5176b1b2`, the head of `v1.24.1`): `tools/flash_next/bridge/` (build scripts, `package_out.py`; `bin/farm ... --bridge <build-id>` installs it in a job) | wheels and their sha256 in each build's `manifest.json` | 00160: `stock-5176b1b2` loads at TP8, tiny tokens equal to the image bridge's | published `stock-5176b1b2` |
+| 9 | Phase timers, `PT_HPU_HPUGRAPH_REPLAY_TIMING=N` (`patches/timers.patch`; off unless set) | the strings in the wheel | 00174: the per-phase split on the tiny and the real model at TP8 (section 7.10) | published `timers-c281d8b53d08` |
+| 10 | Prepared replay, `PT_HPU_HPUGRAPH_PREPARED_REPLAY=1` (off unless set): lean step 1 (`patches/lean1.patch`) and 1b (`patches/lean2.patch`: the kept launcher releases its launch state after each launch; one write per timer line) | tiny TP8 tokens equal (00174) | 00174 lean step 1: -17.6 us per launch, same tokens, run_prep +12 (fixed in lean2); lean2 in the collectives track's lean + spinner-off job | `lean-e1dbb4942fb8` published 02:17 UTC; `lean2-81b9b47e3599` building from 03:19 UTC |
+| 11 | lean3: sub-timers, then cuts (a)-(d) of section 7.10 | | | planned |
 
 ## Handoff (if this agent stops)
+
+**State at 2026-11-21 05:35 UTC (newest first).** 00181 is read (section 7.11: run_prep fixed; the collective
+futures are the biggest bridge item; inline collectives -10 us per launch; **two slow ranks per server at 1 and 8
+streams** decide the 1-stream step, not lean). In flight:
+- **00189** `real8-bridge-vendor2` (collectives track, all cards, 95 min, build 4's image and no-speculation env, after
+  integration's 00186/00187): tiny gates (vendor, lean3a flag 0, lean3a flag 1); vendor spinner on against off, the
+  better one kept; then real-rebuild (`lean3a-8f6f7faf88dc`, `PT_HPU_HPUGRAPH_PREPARED_REPLAY=0`, timing 5000: our build
+  on the stock path, per-rank timers), real-lean (flag 1), real-pin (flag 1 + `VLLM_HPU_WORKER_CPU_PIN=1`, or the
+  sibling-aware placement below if 00193 finds a stable map before 00189 starts, about 07:10 UTC at the latest). The
+  collectives parser now splits per-rank medians by level (N=1, 8, 32 from the metrics lines); headline = the per-rank
+  spread. No bridge builds while 00189 runs (the build CPUs may be siblings of the chosen vCPUs).
+- **00193** `cpu-sibs` (this track, all cards held but not opened, 15 min hold, right after 00186):
+  `tools/flash_next/replay/cpu_siblings.py` (pinned C loops alone and in pairs; rules a+-N/2, a^1, a+-1; verify on all
+  144 job CPUs or scan; stability re-run) -> `reports/native-replay/card/00193-cpu-sibs/cpu_siblings.json`. 00192 was the
+  same job with a 15-second hold by mistake (bare MAX_HOLD is seconds), replaced.
+- **Sibling-aware placement** `tools/flash_next/replay/place_workers.py` (038a32dd; CPU tests; checked in the dev
+  container with two fake workers: main threads alone on their vCPUs, the other threads and processes moved off). For
+  00189: generate `place.sh` (bash wrapper around the script with `PLACE_SIBLING_RULE` set to the rule 00193 finds),
+  put it on the node under `~/farm/native-replay/late/`, send its path and md5 to the collectives track (agent
+  a3344386b2bc11c38): it copies it to `~/farm/collectives/results/bench/place.sh` and sets `PIN_PLACE` in
+  `~/farm/collectives/bridge/late/00189.env`; its `place_wrap.sh` runs it as root in the pin arm's container right
+  after health (log `$FARM_OUT/placement.log`).
+- **Pull request.** Gate on `75b1de32` (branch + program head d9791183): 88 files, 2 red = exactly the two rental
+  tests that also fail on the program head's own snapshot (`test_make_rental_bundle`: "not a git repository" in a
+  snapshot; `test_dry_run_defaults_and_bundle_build_options`); the coordinator agreed that counts as green (state it
+  in the PR). The program head then moved to 2e9f9196 (#17, #19, #20); merged as `63693b83` with one conflict in
+  `hpu_model_runner.py` (two functions added at the same place: both kept); my test files pass on it; its gate
+  (`reports/native-replay/logs/gate_63693b83.log`) is queued. On the same two reds: push, `gh pr create --base
+  feat/flash-next-gaudi --body-file reports/native-replay/probes/pr_body_2.txt` (GATE_RESULT filled in), `gh pr merge
+  --merge`, the number to the coordinator.
+
+**State at 2026-11-21 03:45 UTC (the older state below stays for its details).** 00174 is read (section
+7.10). The coordinator approved the step-2 plan (03:35 UTC): lean2 (the run_prep fix) into the collectives track's
+lean + spinner-off job, then lean3 with sub-timers first, then cuts (a)-(d), each measured, and the stock
+`PT_HPU_DISABLE_ASYNC_COLLECTIVE=1` as one arm when cheap. **Owner's rule (BRIEF.md 03:07 UTC): a track merges its own
+pull request as soon as its gate is green and its change is card-proven or default-off, then tells the coordinator the
+number** (this replaces "no pull request before the node is gone" below). Bridge source with the lean2 edits:
+`reports/native-replay/bridge-src/` (uncommitted on 5176b1b2; `git diff` there = `patches/lean2.patch`). Near miss at
+03:14 UTC: the first lean2 start found no patch on the node (wrong `bin/node-scp` target: the remote path starts with
+`:`, not `node:`) and `dev_build.sh` silently built the stock tree under the lean2 id; stopped before anything was
+published (package_out.py refused the missing patch; `out/` has no lean2 entry). `dev_build.sh` now refuses a missing
+patch (exit 10).
 
 State at 2026-11-20 23:50 UTC by the real clock (fourth agent of this track, Opus 5.5, started 23:15 UTC). Branch
 `feat/flash-next-gaudi-native-replay` (worktree `/Volumes/Storage/Claude/gaudi-work/wt/native-replay`), pushed; the
@@ -522,7 +759,112 @@ directly. This harness keeps the handoff here (earlier harnesses refused report 
   one-at-a-time gate has five tracks queued for hours, and the coordinator said to leave the queue unless one's gate
   already runs.
 
-### The card job in the queue: 00134 `real4-cut-pin-hash-ab`
+### Lean replay work on this node (from 00:40 UTC: the owner extended the node to about 00:00 UTC on 2026-11-22)
+
+The coordinator started next-week item 1 (the bridge-only prepared replay, Pending item 3) on this node, as a
+default-off bridge setting `PT_HPU_HPUGRAPH_PREPARED_REPLAY`, qualified by the tiny model's tokens and
+`bench_replay.py` at TP8, then a real-model A/B at 1 and 32 streams; card jobs 8-card where possible (owner's rule).
+State at 00:57 UTC:
+- **Our own bridge build.** The UNPATCHED gaudi-pytorch-bridge at 5176b1b2 (head of `v1.24.1`) built in `farm-base` in
+  container `nr-bridge-build` (CPUs 18,37,56,75, nice 19, no card; `late/bridge-build/build_bridge.sh`; 840 build steps,
+  23:43 to about 00:58 UTC). `keep_tree.sh` snapshots the container when the log says `build end` as image
+  `farm-bridge-build:5176b1b2` (the build tree in `/tmp/builds`, sources in `/tmp/gaudi-pytorch-bridge`), log
+  `~/farm/native-replay/bridge-build/commit.log`. Next builds: a long-lived dev container `nr-bridge-dev` from that image
+  (same CPUs, `-v ~/farm/native-replay/bridge-build:/out`, `sleep infinity`) and `late/bridge-build/dev_build.sh BUILD_ID
+  PATCH` (reset to 5176b1b2, apply `patches/PATCH`, incremental `build.py -r -l -j 4`, `package_out.py`).
+- **Deployment interface, agreed with the collectives track (agent a3344386b2bc11c38), live on the node:** builds in
+  `~/farm/native-replay/bridge-build/out/<build-id>/` (`wheels/*.whl`, `build.log`, `manifest.json` written last, the
+  folder renamed into place); ids `stock-5176b1b2` and `<name>-<12 hex of the patch's sha256>`; `bin/farm job|tiny|serve
+  ... --bridge <build-id>` installs a build's wheels in the job's container, checks the sha256 and that the loaded .so
+  files are the wheel's, and keeps a per-build recipe cache (exit 7: install failed, 8: wrong bridge loaded).
+- **Incident 00148 (00:46 UTC):** `perf record --call-graph dwarf` on the benchmark's replay loop, card 0 (module 3):
+  `PCIE_ADDR_DEC_ERR ... read from unmapped reg, addr 0x1000007ffd9200a8` = Gaudi2 CFG_BASE (0x1000007FF8000000) +
+  0x59200A8, inside `NIC10_UMR1_0_UNSECURE_DOORBELL1` (a write-only NIC doorbell page mapped into the process); the
+  driver reset the card (done 00:47:00), the peers' links flapped (19 down, 19 up by 00:47:12). Likely cause
+  (INFERRED): perf's DWARF user-stack copy (8 KB above the stack pointer, clamped to the address-space end, not to the
+  stack mapping) read the mapped doorbell page. **BRIEF rule 12: no perf call graphs (dwarf or -g) on processes that
+  have a card open; IP-only perf and gdb are fine.**
+- **Profile of a replayed launch (00148's samples before the fault, 1 card, small recipes, about 22 us per launch):**
+  ExecuteSynapseCache -> RecipeLauncher::Launch about 2/3 (the bridge's per-address event bookkeeping plus Synapse's
+  launch), UpdatePatchingInformation about 1/4 (half of it allocating outputs and intermediates), per-launch object churn
+  about 1/6 (HlExec's constructor builds two empty JIT graphs; lazy tensors; hashes; the launcher), the spec and the
+  LRU lookup under 1/20. The AccThreadPool thread spins at 100 % of a CPU. Reports:
+  `reports/native-replay/card/perf1/perf_bench.{self,dso}.txt`, inclusive `~/farm/native-replay/results/perf1/
+  perf_bench.incl.txt`.
+- **First patch: phase timers** (`late/bridge-build/timers.patch`, the bridge tree with it in
+  `reports/native-replay/bridge-src/`): `PT_HPU_HPUGRAPH_REPLAY_TIMING=N` prints every N replayed launches per thread a line
+  `HPUGRAPH_REPLAY_TIMING ... total_us ... graph_prep ... syn_launch ... | per launch inputs ... externals ...` (16
+  phases of SingleHPUGraph::replayGraph, ExecuteCachedGraph, HlExec::Launch, HabanaLaunchOpPT::run,
+  ExecuteSynapseCache, RecipeLauncher::Launch; only synchronously replayed launches; about 20 ns per stamp). Plan
+  (coordinator, approved): build it as `timers-<hash>`, then one all-card job with `--bridge`: the tiny model at TP8 and
+  the real model at TP8 with the timers, giving the real per-phase split per launch; then the lean path aims at what
+  dominates.
+- **Build state at 01:10 UTC.** `out/stock-5176b1b2` published (the unpatched wheels: `habana_torch_plugin-1.24.1+git5176b1b
+  -cp310-cp310-linux_x86_64.whl` 44 MB, `habana_torch_dataloader-...whl`; nothing outside the wheels); the collectives
+  track's job 00160 checks it (tiny TP8, image bridge against ours, token parity, our .so loaded). The snapshot of that
+  build tree failed (the container ended within a second of the build), so `timers-c281d8b53d08` builds from scratch in
+  the persistent dev container `nr-bridge-dev` (CPUs 18,37,56,75,94,113,132,151 for this one build, coordinator's word;
+  log `~/farm/native-replay/bridge-build/out-logs/timers-c281d8b53d08.log`, about 01:47 UTC). Chained after it
+  (`chain_lean.sh`, node pids 1361605/1361606, log `out-logs/chain.log`): the dev container back to 4 CPUs, then the
+  incremental build of `lean-e1dbb4942fb8` (`tools/flash_next/bridge/patches/lean1.patch`: the timers plus
+  `PT_HPU_HPUGRAPH_PREPARED_REPLAY=1`, each captured segment keeps its `HabanaLaunchOpPT` and recipe holder from its
+  first replay in a side table in HPUGraph.cpp, later replays call `HabanaLaunchOpPT::RunPrepared`: no HlExec, no new
+  launcher, no recipe spec, no recipe lookup; the patching and the launch unchanged; never compiled before this build).
+  Proposed to the collectives track: one all-card job with four arms (tiny TP8 timers, tiny TP8 lean + flag, real TP8
+  timers, real TP8 lean + flag), each only if the one before passed. Per-phase report:
+  `python3 reports/native-replay/probes/replay_timing.py <server0.log>...`.
+- **The four-arm job is armed on the collectives side** (agent a3344386b2bc11c38, 01:10 UTC): once 00160 ends with exit 0 and
+  `out/timers-c281d8b53d08/manifest.json` exists, it waits up to 25 min for `out/lean-e1dbb4942fb8/` and submits
+  `real8-bridge-timers-lean` (all cards, 50 min): tiny-timers (`PT_HPU_HPUGRAPH_REPLAY_TIMING=2000`), tiny-lean (+
+  `PT_HPU_HPUGRAPH_PREPARED_REPLAY=1`, tokens equal to tiny-timers prompt by prompt), real-timers (`...=5000`, greedy 1 and
+  32 streams), real-lean (+ the flag); each arm only if every arm before passed. Without the lean build: the timers job
+  alone (`real8-bridge-timers`, 30 min). Logs: `<id>-<name>-<arm>/server0.log` (tiny: `hc/server0.log` in the same
+  folder). The collectives agent sends the id to this track and the coordinator.
+- **02:15 UTC.** **00160 PASSED** (collectives track, all cards): `stock-5176b1b2` loads at TP8 (all 14 mapped bridge
+  .so files are our wheel's; 18 of its 23 .so differ from the image's; nothing needed the image's `.upstream` twins) and
+  the tiny model's tokens equal the image bridge's prompt by prompt: we can build and load our own bridge on this stack.
+  `timers-c281d8b53d08` published 01:39 UTC. The chain (`chain_lean.sh`) never started the lean build: it ran as the node
+  user while `out-logs/` was root-owned (the dev container created it), every redirection failed, so no command ran.
+  Fixed by `chown` of `out-logs/`, `out/`, `dev-wheels/` to the node user (always run host-side scripts' logs there after
+  this); the dev container is back to CPUs 18,37,56,75; `lean-e1dbb4942fb8` started by hand 02:10 UTC (incremental, 52
+  build steps; the prepared-replay sources compiled clean; **published 02:17:35 UTC**, 7 min). VERIFIED in the wheels
+  (python zipfile): stock has none of the patch strings; timers has `HPUGRAPH_REPLAY_TIMING` in
+  libhabana_pytorch_backend.so; lean has it plus `PT_HPU_HPUGRAPH_PREPARED_REPLAY` and `RunPrepared`. VERIFIED with `nm -DC`
+  in the dev container: the thread-local state shared between libhabana_pytorch_backend.so (HPUGraph.cpp) and
+  libhabana_pytorch_plugin.so (hpu_lazy_tensors.cpp, hlexec.cpp), i.e. `PreparedSlot()::slot`, `ThreadTotals()::totals`,
+  `InReplay()::in_replay`, is exported STB_GNU_UNIQUE in both (one copy per thread at run time); default visibility. The
+  job confirms it at run time: in the timers arms `exec_setup`, `launch_hashes`, `create_launcher` must be nonzero; in the
+  lean arms `launch_hashes`, `create_launcher`, `run_spec`, `run_lookup` about 0 (the prepared path engaged). The bridge job is
+  **00174** `real8-bridge-phase` (65 min, after integration's 00161, so after 02:48): tiny-timers, tiny-accsync, tiny-lean
+  (last; it looks for the lean build when it starts), then real-timers, real-accsync, real-lean; each real arm only if
+  its tiny arm passed; verdicts `<id>-real8-bridge-phase-verdicts.txt`, arm results `<id>-real8-bridge-phase-<arm>/`.
+- The integration track's build 2 runs as **00156** (`real8-build2b`; 00142 was cancelled and resubmitted): arms tiny,
+  nospec (A), nospec-pin (B: `VLLM_HPU_WORKER_CPU_PIN=1 PT_HPU_DISABLE_HPUGRAPH_REPLAY_HASHCHECK=1`), mtp2. The read-only
+  CPU watcher was moved to it (`late/watch_job.sh 00156 ... nospec nospec-pin`, node pids 1372497/1372500, attached to
+  nospec's workers at 01:08:37 UTC; results `~/farm/native-replay/results/cpuwatch-00156/<arm>/`).
+
+### Where the two host levers are tested now (coordinator, 00:28 UTC)
+
+The owner put 8-card runs first (BRIEF.md 00:28 UTC): the TP4 job 00134 below waits behind the TP8 jobs and will
+probably not run tonight; keep its plan for the next rental. The worker CPU pin and the hash switch are tested at TP8
+instead, as **arm B of the integration track's build 2** (`VLLM_HPU_WORKER_CPU_PIN=1
+PT_HPU_DISABLE_HPUGRAPH_REPLAY_HASHCHECK=1` on top of its proven env, greedy 1 and 32 streams, text compared with arm
+A). The integration track (agent a81792d74f2de0f60) has from this track (00:29 UTC): the commits (6884fc07 + the
+fallback 0835754e, both in its 9b0e7655), how mode 1 splits an all-card container's 144 CPUs (8 shares of 18, rank r
+on CPUs 19r to 19r+17, its own module's slice; the engine and API server unpinned; weight loading unchanged), the
+8 log lines to check, the watcher (`~/farm/native-replay/late/cpu_watch.py ... --cpu 151 --window 2`, in arms A and
+B) and the hash switch's caveats (set at server start; never on a card here, no token parity yet, so arm B's
+1-stream text against A decides; it removes only the spec construction per launch; arm B combines two levers). It
+was asked to send back per arm the steady ms per step at 1 and 32 streams, the text, the pin lines and the
+watcher's per-rank main-thread share during the measured 1-stream round: write them into section 7.9. It runs arm B
+in job 00142 (TP8, image 2de56804 with 9b0e7655; arm folders `tiny`, `nospec` = A, `nospec-pin` = B, `mtp2` = C under
+`~/farm/integration/results/00142-real8-build2/`, fetched to `reports/integration/card/00142-real8-build2/`), without a
+watcher inside its job. With its agreement (00:35 UTC: read-only, /proc and `docker ps` only, CPU 151, writing only
+under this track's folder) this track runs `late/watch_job.sh 00142 ~/farm/integration/results/00142-real8-build2 nospec
+nospec-pin` on the node (started 00:36:22 UTC, pids 817765 and 817768; it ends by itself after B's workers exit):
+results in `~/farm/native-replay/results/cpuwatch-00142/<arm>/cpus_series.txt|.jsonl`, log `watch_job.log`.
+
+### The TP4 job 00134 `real4-cut-pin-hash-ab`: cancelled 01:35 UTC (made moot by 00156 arm B and the bridge job's accsync arms; its plan below stays for reference)
 
 `any:4`, 58 min, replaces 00122 (which replaced 00084) and keeps the coordinator's bump; starts by 01:55 UTC at the
 latest, on cards 0,1,2,7 (modules 0-3). Stub: `reports/native-replay/late/stub_real4_cut_pin_hash.sh`. First the tiny
@@ -534,10 +876,13 @@ lost if the hold runs short): `base`, `cutpin` (`VLLM_HPU_DECODE_CUT_INTERVAL=10
 passed), `cut` (`VLLM_HPU_DECODE_CUT_INTERVAL=1000`); each with `VLLM_GRAPH_RESERVED_MEM=0.5` (BRIEF.md 23:50 UTC), one
 server start per arm. Per arm: `real4-<arm>/scaling.json`, `server0.log`, `probe.log`, `hostwatch/` (rank 0's threads
 every 2 s, stacks after the second 32-stream round), `cpuwatch/cpus_series.txt` and `.jsonl` (`late/cpu_watch.py` on
-CPU 151: per rank every 5 s the main thread and the two busiest other threads, their CPU share, the CPUs they ran on
+CPU 151: per rank every 2 s the main thread and the two busiest other threads, their CPU share, the CPUs they ran on
 and their CPU changes; asked for by the coordinator: whether a worker needs about 3 CPUs of its own), `hlsmi.txt`
 (device memory every 15 s). When it ends: `bin/farm fetch native-replay 00134 real4-hashtiny real4-hashtiny-hash
-real4-base real4-cutpin real4-cuthash real4-cut`, then report to the coordinator per arm (as asked): ms per step at
+real4-base real4-cutpin real4-cuthash real4-cut`, then `python3 reports/native-replay/probes/ab_report.py
+reports/native-replay/card base cutpin cuthash cut` (per arm and level the steady ms per step, the 1-stream text against
+`base`, the pin and cut log lines, per rank the main thread's CPU share and CPUs in the measured 1-stream round and
+the 32-stream rounds), then report to the coordinator per arm (as asked): ms per step at
 1 and 32 streams (the probe's median gap), the 1-stream text against `base`, the per-rank spread (`cpuwatch`: the
 main thread's CPU share per rank at 1 stream; a fast rank waits blocked at the read). Read also: `cutpin/server0.log`
 has one line per worker `VLLM_HPU_WORKER_CPU_PIN=1: rank r module m: share i of 4, CPUs a-b (18 of the 72 ...)`.
@@ -549,17 +894,64 @@ all-reduces already split every layer).
 
 ### Pending, in order
 
-1. 00134 as above; write its numbers into a section 7.9 and sections 0 and 5; tell the coordinator.
-2. The coordinator's bridge build (23:43 UTC): the UNPATCHED bridge at `5176b1b2` (head of `v1.24.1`, the node's
-   version) builds in container `nr-bridge-build` from `farm-base:latest` on the node, `--cpuset-cpus 18,37,56,75`, nice
-   19, no card, without the C++ tests (`.devops/build.py -c -r -l -j 4 --no-iwyu --no-swig`); script
-   `reports/native-replay/late/bridge-build/build_bridge.sh` (on the node `~/farm/native-replay/bridge-build/`, log
-   `build.log`; at its end the wheels in `wheels/`, the libraries it wrote in `lib/`). 215 of 840 build steps at 23:47
-   UTC. If it ends before about 03:00 UTC: one 1-card job that installs those wheels in the job's container
-   (`pip install --no-deps --force-reinstall`) and serves the tiny model (`python /farm/farm_tiny.py --gdn hc`, TP1):
-   PASSED with the same tokens as every tiny run proves we can build and load our own bridge on this stack (the
-   precondition of item 3). Skip it if the build is not done by about 02:30 UTC. Tell the coordinator either way.
-3. **Next week, item 1 (the coordinator's choice of the program's best fixed-cost plan): a bridge-only lean replay
+0. **lean2: published 03:24:56 UTC** (`out/lean2-81b9b47e3599/`, 7 min incremental; VERIFIED in the wheel:
+   `ReleaseLaunchState` and `RunPrepared` in the backend and both plugin .so files, the flag and timer strings in the
+   backend .so) and **in the collectives track's job 00180** `real8-bridge-headline` (all cards, 45 min, after
+   integration's 00177, which ends by 03:56 UTC). The collectives track (agent a3344386b2bc11c38) submitted
+   `~/farm/collectives/bridge/bridge_headline_job.sh LEAN IMAGE` (its branch 04f690be; all cards, about 45 min):
+   integration build 3's image `farm-integration:d00c0a9a3e18` (also tagged `farm-collectives-int:d00c0a9a3e18`), the
+   headline's no-speculation env (QSA fused + shard, GDN interleave + glue cache, HC copy mode 2,
+   `VLLM_HPU_DECODE_CUT_INTERVAL=1000`, candidate sampling, the two prefix flags, `VLLM_GRAPH_RESERVED_MEM=0.4`), the
+   spinner off in every arm, build 3's probe (levels 32, 8, 1; 128 tokens; two rounds per level; greedy and sampled).
+   Arms: tiny-stock (the image's bridge), tiny-lean (lean2, the flag, timing 2000; tokens equal to tiny-stock), then
+   real-stock and real-lean (timing 5000). Read in real-lean: run_prep back to about 2 us (if instead the unattributed
+   time, total minus the phase sum, rises by about 12 us, the frees only moved: say so), the step at 1, 8 and 32
+   streams against real-stock. Write it into section 7.10; tell the coordinator.
+1. **lean3** (section 7.10, step 2): sub-timers inside syn_launch, run_patching and launcher_inputs first (one build,
+   qualified by tiny tokens), then (a) to (d) in order, each measured, each a new patch on top
+   (`tools/flash_next/bridge/patches/lean3*.patch`, ids `<name>-<12 hex of the patch's sha256>`). Qualification: tiny
+   TP8 tokens and `bench_replay.py` at TP8, then a real A/B at 1, 8 and 32 streams. The stock
+   `PT_HPU_DISABLE_ASYNC_COLLECTIVE=1` as one arm when it is cheap.
+2. **Pull request (owner's rule).** The program head moved to `d9791183` (pull request #16); merged in as `75b1de32`
+   (no conflict; my four test files pass on its snapshot: 31 + 13 + 4 + 26). The gate runs on that snapshot
+   (`reports/native-replay/trees/gate-75b1de32`, log `reports/native-replay/logs/gate_75b1de32.log`; the gate on
+   `c556e47b` was stopped while it still waited for a slot). Known red elsewhere: the rental files
+   (`tests/unit_tests/tools/rental/test_sh_run_rental.py`, `test_sh_tiny_smoke.py`, `test_rental_scripts.py`,
+   `test_tiny_smoke.py`, sometimes `test_sh_rent.py`) fail alone in other tracks' gates too (engine-step `425fb2ee`); if
+   they are the only red files, check them on a snapshot of the program head before calling the gate green. On green:
+   push, `gh pr create --base feat/flash-next-gaudi` (body `reports/native-replay/probes/pr_body_2.txt`; no absolute
+   performance numbers), `gh pr merge --merge`, tell the coordinator the number.
+3. **lean3t** (`lean3t-412153bbab3e`, `patches/lean3t.patch`: lean2 plus the sub-timers of section 7.10, printed after
+   the tensor counts as `| sub in_registry .. in_refs .. in_waits .. in_future .. in_streamwait .. syn_mem ..
+   syn_workspace .. syn_lock .. syn_trace .. syn_call .. syn_after .. patch_alloc .. patch_table .. patch_info ..
+   post_holder .. post_events .. post_record .. post_coll ..`; nested, not in the phase sum) **published 03:34:04 UTC**
+   (7 min incremental; VERIFIED in the wheel: the sub-timer strings in the backend .so, `ReleaseLaunchState` in all
+   three .so files; the bridge clone's local branch `native-replay-lean` commit 6edcb0f = this patch). Sent to the
+   collectives track at 03:35 UTC. **Now job 00181 `real8-bridge-headline2`** (65 min, replaces 00180 in its place; starts
+   after integration's 00178, by 04:53 UTC at the latest): tiny-stock, tiny-lean, real-stock, real-lean, then
+   tiny-lean-inline and real-lean-inline; lean3t in every lean arm. Earlier note: **00180 ran lean3t in its tiny-lean and real-lean arms** (the collectives
+   track's `bridge_headline_job.sh` reads `~/farm/collectives/bridge/late/00180.env` at start: `LEAN=lean3t-412153bbab3e`;
+   the job log prints it). `INLINE=1` in that file adds tiny-lean-inline and real-lean-inline (+
+   `PT_HPU_DISABLE_ASYNC_COLLECTIVE=1`, the real one only if its tiny one passed); the collectives track asked the
+   coordinator for a 65-minute resubmit that keeps the place. From real-lean (and real-lean-inline) the collectives
+   track sends the medians of every `sub_*`, the phases, run_prep, unattributed and the step times at 32, 8 and 1
+   streams, greedy and sampled; then choose among cuts (a)-(d) by the measured sub-phases. `probes/replay_timing.py` prints the sub-phases; the collectives
+   track's parser reads them as `sub_*`. Arms to ask for (collectives track places the job): tiny-lean3t and
+   tiny-lean3t-inline (tokens), real-lean3t and real-lean3t-inline (`PT_HPU_DISABLE_ASYNC_COLLECTIVE=1`, VERIFIED in
+   `habana_kernels/hccl_kernels.cpp:354`: the collective runs inline instead of `JobThreadLazyHCCL::addJob` +
+   `submit_future`), all with the spinner off, the flag and the headline env.
+3b. **lean3a** (`lean3a-8f6f7faf88dc`, `patches/lean3a.patch`, published 03:47:54 UTC, VERIFIED in the wheel; the
+   bridge clone's local commit after 6edcb0f): lean3t plus two cuts under the flag, written before 00181's data because
+   they remove pure overhead. (1) `backend/synapse_helpers/event.cpp` `event::stream_wait_event`: the stock code
+   releases and re-takes the GIL (`AutoNoGIL`) for every input that has a producer event, also when the event is done
+   or on the same stream; the HPU-graph replay binding (`replayV3`, `python_packages/.../csrc/bindings.cpp:311`) holds
+   the GIL during the whole replay, so a replayed launch does about one GIL release and re-take per such input (and
+   any other Python thread can take the GIL in between: INFERRED, a possible source of the ranks' random multi-ms
+   stalls). Now: `try_lock`; done or same stream returns at once; otherwise the stock path. (2) `graph::launch`: the
+   logs and traces that are off are skipped before their arguments are built. Measured by the sub-timers
+   (in_streamwait, in_waits, syn_workspace, syn_trace, syn_after) against lean3t in 00181. Offered for 00181 or the
+   next bridge job.
+4. **Background: the lean path's first plan (next-week item 1, the coordinator's choice of the program's best fixed-cost plan): a bridge-only lean replay
    path.** Read from the bridge source at `5176b1b2`. What a replayed launch does on the main thread today, per
    captured segment (step-anatomy: 148 per step at 1 stream, 209 at 32; about 150 us of bridge work each under the
    profiler, of which the Synapse enqueue `enqueueWithExternalEventsExt` is 37 us; the all-reduces go out on a
@@ -591,7 +983,7 @@ all-reduces already split every layer).
    model at 1 and 32 streams. Precondition: item 2 (we can build and load our own bridge on this stack).
    The existing switch `PT_HPU_DISABLE_HPUGRAPH_REPLAY_HASHCHECK=1` (`HPUGraph.cpp:535-561`) removes c) only; 00134's
    `cuthash` arm measures it.
-4. Next rental, the fork's full native runtime (coordinator, 23:46 UTC; lower than item 3 since the bridge-only path
+5. Next rental, the fork's full native runtime (coordinator, 23:46 UTC; lower than item 3 since the bridge-only path
    needs no Synapse snapshot): (a) checked: farm-base has the SDK's public headers (`synapse_api.h`, `hccl.h`,
    `hlthunk.h`, ...; no `scal.h`), the runtime libraries (`libSynapse.so`, `libhcl.so`, `libscal.so`,
    `libSynapseMme.so`, ...), cmake, g++ 13, build-essential, protobuf-compiler (the distro's) and pybind11, no `-dev`
@@ -600,19 +992,15 @@ all-reduces already split every layer).
    the fork's 347 KB patch carries the backports); (b) the unattended build recipe is drafted, never run:
    `tools/flash_next/native_runtime/build_native_runtime.sh` (stages: versions, sources at the pins, the fork's patches
    through `apply_native_runtime.py`, HCL, Synapse through the snapshot's own environment and build order, the bridge,
-   the plugin's adapter, a tarball with a manifest); (c) not drafted yet: `tools/flash_next/replay/bench_native_tp4.py`,
-   the same TP4 body (2 plans of 48 x (x + c; `tp2_allreduce_plain`) on `[rows, 2560]` bf16, rows 1 and 32) under stock
-   lazy HPU-graph replay and under the fork's native joint replay, written on the pattern of
-   `tools/communication/check_dsv4_native_allreduce.py` (load the patched bridge, `set_prepared_communication(True)`,
-   `register_tp2_prepared_group_pass()`, `torch.compile(..., backend="hpu_backend")` in eager mode, capture under
-   `collect_prepared_group_replays`, then `replay_native_decoder` per step), plus a 30-minute `any:4` stub.
-5. After the node is gone (after 04:00 UTC): a snapshot of HEAD (`git archive HEAD | tar -x -C
-   reports/native-replay/trees/gate-<sha>`), `bin/gate <snapshot> --tools`, the three worker test files and
-   `tests/unit_tests/tools/test_bench_replay.py`, then `gh pr create --base feat/flash-next-gaudi --title "Replay
-   benchmark, decode graphs without per-layer cuts, worker CPU placement, and the native-replay design" --body-file
-   <body>` (draft: `reports/native-replay/probes/pr_body_1.txt`; add the pin flag; no absolute performance numbers in
-   pull request text, AGENTS.md), `gh pr merge --merge`.
-6. What is left of the fixed cost (INFERRED, TP8, 1 stream, about 36 ms per step): the replay's launches on the main
+   the plugin's adapter, a tarball with a manifest); (c) drafted, never run: `tools/flash_next/replay/bench_native_tp4.py`
+   (the same TP4 body, 2 plans of 24 layers x 2 sub-blocks `x = all_reduce((x + 1) * 0.25) - 1` on `[rows, 2560]` bf16,
+   rows 1 and 32, value-checked, under stock lazy HPU-graph replay or under the fork's native joint replay, written on
+   the pattern of `tools/communication/check_dsv4_native_allreduce.py`: the patched bridge's adapter,
+   `set_prepared_communication(True)`, `register_tp2_prepared_group_pass()`, `torch.compile(..., backend="hpu_backend")`
+   in eager mode, capture under `collect_prepared_group_replays` with `DecoderTopology("deepseek_v4", (24, 24), 2,
+   False)`, then `replay_native_decoder` per step) and `tools/flash_next/replay/native_tp4_job.sh` (the 30-minute
+   `any:4` job: stock and native, each with and without collectives).
+6. What is left of the fixed cost (written before 00174; section 7.10 has the measured split) (INFERRED, TP8, 1 stream, about 36 ms per step): the replay's launches on the main
    thread (148 x about 130 us, about 20 ms on the fastest rank: item 3 takes about 13 ms of it), about 10 ms of
    per-rank spread (the pin, if 00134 shows it), about 3.5 ms of Python around the forward (engine-step), and the
    device time of the ops behind it. The collectives' count is a floor at TP8 + EP8 and they leave on a separate

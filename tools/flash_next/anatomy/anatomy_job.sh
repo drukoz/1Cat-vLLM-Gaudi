@@ -20,6 +20,10 @@
 # MME row sweep (G1-1) and the small lazy-op cases, then VLLM_CONFIG_HIDDEN_LAYERS 4 (and 12 with time left).
 # Q = one server, one short phase (a check of this script's plumbing). T = the profiler capture with the Habana
 # SDK in API-controlled mode (HABANA_PROFILE=1 and a profiler configuration file).
+# P = the device time per model component against the rows (MTP's verification rows): one server with room for
+# 128 sequences and the torch profiler, timer rounds, then one capture each in a 32- and a 128-stream decode round
+# (read on the workstation with trace_components.py). P8 = P on the target layout: 32 and 1 streams first, 128 rows
+# after them when the hold leaves time.
 #
 # A stage-2 job reads the file anatomy_late.sh next to its results folder (on the node:
 # ~/farm/<track>/results/anatomy_late.sh) before its plan starts: it may set ANATOMY_S_PHASES, ANATOMY_C_PHASES,
@@ -119,8 +123,9 @@ serve() {
     { echo "label $label"; echo "phases $phases"; echo "trace $trace"; echo "extra args: $*"
       env | grep -E '^(VLLM_|PT_HPU|HABANA_|FLASHINFER)' | sort; } > versions.txt
     say "$label: starting the server"
+    # shellcheck disable=SC2086  # ANATOMY_SERVE_EXTRA: vllm serve options of the plan (P: --max-num-seqs 128)
     vllm serve "$MODEL" --served-model-name fn --host 127.0.0.1 --port "$PORT" \
-        --tensor-parallel-size "$TP" "${MODEL_ARGS[@]}" "$@" > server0.log 2>&1 &
+        --tensor-parallel-size "$TP" "${MODEL_ARGS[@]}" "$@" ${ANATOMY_SERVE_EXTRA:-} > server0.log 2>&1 &
     SP=$!
     t0=$(date +%s)
     while :; do
@@ -146,6 +151,21 @@ serve() {
         ${trace:+--trace "$trace"} ${PROBE_EXTRA:-} ${ANATOMY_PROBE_ARGS:-} --out "$out/probe.json" 2>&1 | tee "$out/probe.log"
     rc=${PIPESTATUS[0]}
     say "$label: probe rc $rc"
+    # A second probe on the same server (plan P8: 128 rows after the 1- and 32-stream captures, so a failure at 128
+    # rows cannot cost them), only when the job's hold leaves ANATOMY_PROBE2_MIN_S seconds.
+    if [ -n "${ANATOMY_PROBE2_PHASES:-}" ] && [ "$rc" -eq 0 ]; then
+        local left=$(( ${ANATOMY_HOLD_S:-1500} - SECONDS ))
+        if [ "$left" -ge "${ANATOMY_PROBE2_MIN_S:-420}" ]; then
+            say "$label: second probe ($left s left): $ANATOMY_PROBE2_PHASES, trace ${ANATOMY_PROBE2_TRACE:-none}"
+            # shellcheck disable=SC2086  # PROBE_EXTRA is a list of probe options
+            python3 "$PROBE" --port "$PORT" --model fn --timing-dir "$out/timing" --phases "$ANATOMY_PROBE2_PHASES" \
+                ${ANATOMY_PROBE2_TRACE:+--trace "$ANATOMY_PROBE2_TRACE"} ${PROBE_EXTRA:-} ${ANATOMY_PROBE_ARGS:-} \
+                --out "$out/probe2.json" 2>&1 | tee "$out/probe2.log"
+            say "$label: second probe rc ${PIPESTATUS[0]}"
+        else
+            say "$label: no time for the second probe ($left s left, ${ANATOMY_PROBE2_MIN_S:-420} needed)"
+        fi
+    fi
     [ -f "$HERE/summarize_timing.py" ] && python3 "$HERE/summarize_timing.py" "$out" --json "$out/timing_summary.json" \
         > "$out/timing_summary.md" 2>&1 && head -n 70 "$out/timing_summary.md" | cut -c1-400
     grep -E "step timing: worker rank 0 decode" server0.log | tail -n 14 | cut -c1-700
@@ -266,7 +286,8 @@ plan_r() {
     MODEL_ARGS=(--max-model-len "${len:-512}" --max-num-seqs 4 --language-model-only --trust-remote-code)
     say "tiny model $MODEL, model length ${len:-512}"
     export ANATOMY_PROBE_ARGS="--prompt-ids 8"
-    ANATOMY_S_PHASES="${ANATOMY_S_PHASES:-warm:1,4:24;1:1,4:24;1:4:24:min;1:4,1:24:tag=perf;3:4,1:16;2:4:8}" plan_s
+    # 400-token rounds: a tiny step takes milliseconds, and the node's sampler needs seconds of steady decode.
+    ANATOMY_S_PHASES="${ANATOMY_S_PHASES:-warm:1,4:400;1:1,4:400;1:4:24:min;1:4,1:400:tag=perf;1:1:400:tag=strace;3:4,1:16;2:4:8}" plan_s
     ANATOMY_E_PHASES="${ANATOMY_E_PHASES:-warm:1,4:12;3:1,4:16}" eager_server
 }
 
@@ -333,6 +354,32 @@ run_benches() {
     tail -n 30 "$RESULTS/lazy_ops_mode0.log" 2>/dev/null | cut -c1-250
 }
 
+plan_p() {
+    # P: what a decode row costs per model component, at 32 and 128 rows (MTP k = 3 verifies 4 rows per stream:
+    # 128 rows at 32 streams). One server with room for 128 sequences and the torch profiler (HPU activities): warm
+    # rounds at the capture's length (no bucket compile inside a capture), timer rounds, then one capture in the
+    # middle of a 32-stream and of a 128-stream round. The traces are read on the workstation with
+    # trace_components.py (device time per component, graph launches per step). The profiler's stop takes minutes
+    # (job 00113: 140 s at 32 streams on 4 cards): the probe waits up to 600 s for a stream's next chunk.
+    ANATOMY_SERVE_EXTRA="--max-num-seqs ${ANATOMY_MAX_SEQS:-128}" \
+        ANATOMY_PROBE_ARGS="${ANATOMY_PROBE_ARGS:---measured-timeout 600 --trace-seconds 1.0}" \
+        ANATOMY_TRACE_PHASES="${ANATOMY_P_PHASES:-warm:32,128:160;1:32,128:128}" \
+        ANATOMY_TRACE_LEVELS="${ANATOMY_P_LEVELS:-32,128}" trace_server p-trace
+}
+
+plan_p8() {
+    # P8 (the owner's 8-card directive, 00:28 UTC): the component trace of the target layout. One server with room
+    # for 128 sequences: warm rounds, timer rounds and one capture each at 32 and at 1 stream first; then, with the
+    # hold's time left, a second probe warms 128 streams and captures them (MTP k = 3 at 32 streams verifies 128 rows).
+    # The server's flags come from the job's --env (the integration build's set); the plan adds none.
+    ANATOMY_SERVE_EXTRA="--max-num-seqs ${ANATOMY_MAX_SEQS:-128}" \
+        ANATOMY_PROBE_ARGS="${ANATOMY_PROBE_ARGS:---measured-timeout 600 --trace-seconds 0.8}" \
+        ANATOMY_TRACE_PHASES="${ANATOMY_P8_PHASES:-warm:32,1:160;1:32,1:128}" \
+        ANATOMY_TRACE_LEVELS="${ANATOMY_P8_LEVELS:-32,1}" \
+        ANATOMY_PROBE2_PHASES="${ANATOMY_P8_PHASES2-warm:128:160}" \
+        ANATOMY_PROBE2_TRACE="${ANATOMY_P8_LEVELS2-128}" trace_server p8-trace
+}
+
 plan_b() {
     run_benches 600
     # I10 / G4-2: the per-decoder-layer mark_step every 4 layers (default every layer). A bigger recipe compiles
@@ -378,6 +425,8 @@ case "$PLAN" in
     B) plan_b ;;
     Q) plan_q ;;
     T) plan_t ;;
+    P) plan_p ;;
+    P8) plan_p8 ;;
     *) say "unknown plan $PLAN"; exit 2 ;;
 esac
 say "plan $PLAN done"

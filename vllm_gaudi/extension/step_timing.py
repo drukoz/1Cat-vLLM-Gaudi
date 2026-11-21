@@ -16,7 +16,9 @@ Modes (``VLLM_HPU_STEP_TIMING``, an integer; any other value is 0):
 * ``3`` spans with device attribution: the host waits for the device (``mark_step()`` then ``synchronize()``)
   before and after every collective and after the forward and the sampler, so the device time of every segment
   between two collectives and of every collective is measured on its own. A step is slower in this mode (one
-  extra launch and wait per segment); the segments, not the step total, are the result. With
+  extra launch and wait per segment); the segments, not the step total, are the result. A wait also reads one
+  element of a tensor that depends on the work back to the host: ``synchronize()`` alone can return while launches
+  still sit behind a collective that another rank has not reached (native-replay, job 00012). With
   ``VLLM_HPU_STEP_TIMING_COMPONENTS=1`` the host also waits where a model component starts and ends
   (hyper-connection, GDN mixer, QSA with its indexer and its sparse attention, MoE block with its expert op, PLE
   layer), so the device time, the collective time and the host time of each component are measured on their own
@@ -388,11 +390,11 @@ class StepTimer:
             self._flush_window(key)
 
     # ---------------------------------------------------------------------------------- collectives
-    def collective_begin(self) -> int:
+    def collective_begin(self, tensor=None) -> int:
         """Before a collective of the open step. Mode 3 first runs what is accumulated so far on its own and
-        records it as the compute segment in front of this collective."""
+        records it as the compute segment in front of this collective (``tensor``: the collective's input)."""
         if self.mode == MODE_SYNC and self._runtime is not None:
-            return self._sync_cut(1)
+            return self._sync_cut(1, tensor)
         return self._clock()
 
     def collective_end(self, token: int, name: str, tensor=None) -> None:
@@ -408,7 +410,7 @@ class StepTimer:
             except Exception:  # noqa: BLE001 - sizes are a courtesy
                 pass
         if self.mode == MODE_SYNC and self._runtime is not None:
-            self._device_wait()
+            self._device_wait(tensor)
             now = self._clock()
             collective = now - self._t_last
             self._spans["seg_collective"] = self._spans.get("seg_collective", 0) + collective
@@ -418,16 +420,28 @@ class StepTimer:
             return
         self._nested["collective_host"] = self._nested.get("collective_host", 0) + self._clock() - token
 
-    def device_wait(self, span: str) -> None:
-        """Mode 3 only: wait for everything launched so far and give the wait to ``span``."""
+    def device_wait(self, span: str, tensor=None) -> None:
+        """Mode 3 only: wait for everything launched so far (and for ``tensor``) and give the wait to ``span``."""
         if self._open and self.mode == MODE_SYNC and self._runtime is not None:
-            self._device_wait()
+            self._device_wait(tensor)
             self.lap(span)
 
-    def _device_wait(self) -> None:
+    def _device_wait(self, tensor=None) -> None:
+        """Launch what is accumulated and wait for the device. ``synchronize()`` can return while launches still sit
+        behind a collective that another rank has not reached (native-replay's replay benchmark, job 00012: seven of
+        eight ranks reported a body with 96 all-reduces as done in less time than the body without them takes). A
+        host read always waits, so with a ``tensor`` that depends on the work one element of it is read back."""
         htorch, torch = self._runtime
         htorch.core.mark_step()
         torch.hpu.synchronize()
+        tensor = first_tensor(tensor)
+        if tensor is not None:
+            try:
+                tensor.reshape(-1)[:1].cpu()
+                self._counts["read_back"] = self._counts.get("read_back", 0) + 1
+            except Exception as exc:  # noqa: BLE001 - a wait is never worth a step
+                self._warn_once("read_back", "mode 3 cannot read a %s back: %s: %s" %
+                                (type(tensor).__name__, type(exc).__name__, exc))
 
     # -------------------------------------------------------------------------- mode 3: components
     def _component_entry(self) -> list:
@@ -439,7 +453,7 @@ class StepTimer:
             entry = self._components[owner] = [0, 0, 0, 0]
         return entry
 
-    def _sync_cut(self, slot: int) -> int:
+    def _sync_cut(self, slot: int, tensor=None) -> int:
         """Mode 3: run what is accumulated so far on its own. The host time since the last boundary stays in the
         span of the phase; the wait is ``seg_compute``; both are credited to the innermost open component. Returns
         the wait."""
@@ -448,7 +462,7 @@ class StepTimer:
         host = now - self._t_last
         spans[self.phase] = spans.get(self.phase, 0) + host
         self._t_last = now
-        self._device_wait()
+        self._device_wait(tensor)
         now = self._clock()
         wait = now - self._t_last
         spans["seg_compute"] = spans.get("seg_compute", 0) + wait
@@ -458,17 +472,19 @@ class StepTimer:
         entry[slot] += wait
         return wait
 
-    def component_begin(self, name: str) -> None:
-        """Mode 3, before a model component runs: what the enclosing component has accumulated runs first."""
+    def component_begin(self, name: str, tensor=None) -> None:
+        """Mode 3, before a model component runs: what the enclosing component has accumulated runs first
+        (``tensor``: an input of the component, read back so that the wait is one)."""
         if self._open and self.mode == MODE_SYNC and self._runtime is not None:
-            self._sync_cut(1)
+            self._sync_cut(1, tensor)
             self._stack.append(name)
             self._component_entry()[3] += 1
 
-    def component_end(self) -> None:
-        """Mode 3, after a model component ran: its accumulated ops run and their device time is its own."""
+    def component_end(self, tensor=None) -> None:
+        """Mode 3, after a model component ran: its accumulated ops run and their device time is its own
+        (``tensor``: what the component returned)."""
         if self._open and self.mode == MODE_SYNC and self._runtime is not None and self._stack:
-            self._sync_cut(1)
+            self._sync_cut(1, tensor)
             self._stack.pop()
 
     # ------------------------------------------------------------------------- mode 2: sync counters
@@ -711,6 +727,22 @@ class StepTimer:
         return line
 
 
+def first_tensor(value):
+    """The first tensor in ``value`` (a tensor, or a tuple, list or dict that holds one at its top level), else
+    ``None``. A tensor is what has ``reshape`` and ``cpu``: the timer imports no torch."""
+    if value is None:
+        return None
+    if hasattr(value, "reshape") and hasattr(value, "cpu"):
+        return value
+    if isinstance(value, dict):
+        value = list(value.values())
+    if isinstance(value, (tuple, list)):
+        for item in value:
+            if item is not None and hasattr(item, "reshape") and hasattr(item, "cpu"):
+                return item
+    return None
+
+
 # VLLM_HPU_STEP_TIMING_COMPONENTS: the components of a Flash-Next decoder layer, by the attribute that holds them.
 COMPONENT_CHILDREN = (("linear_attn", "gdn"), ("self_attn", "qsa"), ("mlp", "moe"), ("ple", "ple"))
 COMPONENT_PARTS = {"qsa": (("indexer", "select", "qsa_indexer"), ("sparse_attn", "forward", "qsa_attention")),
@@ -740,11 +772,14 @@ def install_component_cuts(timer: StepTimer | None, model) -> dict:
             stack = timer._stack
             if stack and stack[-1] == component:  # an entry point that calls another of its own component
                 return original(*args, **kwargs)
-            timer.component_begin(component)
+            given = first_tensor(args)
+            timer.component_begin(component, first_tensor(kwargs) if given is None else given)
+            out = None
             try:
-                return original(*args, **kwargs)
+                out = original(*args, **kwargs)
+                return out
             finally:
-                timer.component_end()
+                timer.component_end(out)
 
         wrapper._step_timing_component = component
         try:

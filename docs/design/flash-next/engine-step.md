@@ -11,7 +11,7 @@ This track's harness refuses report files outside the repository, so the handoff
 
 ## Handoff (if this agent stops)
 
-Last update: **2026-11-21 02:50 UTC** (fourth agent, Opus 5.5; the node was extended to about 00:00 UTC on
+Last update: **2026-11-21 03:07 UTC** (fourth agent, Opus 5.5; the node was extended to about 00:00 UTC on
 2026-11-22). Branch `feat/flash-next-gaudi-engine-step`, head `fe4cac24` (the program head with PR 16 merged in; code of
 this track up to `01d66e31`), pushed. A second branch of this track,
 **`feat/flash-next-gaudi-engine-step-mtp-record`** (`2b90707f`, worktree `reports/engine-step/trees/mtp-record`):
@@ -36,17 +36,17 @@ question answered on the CPU (section 14).
 
 ### If you take over, in this order
 
-1. The gates. The program head moved (PR 16 qsa-dataflow); it is merged in at **`fe4cac24`** (conflicts in
+1. The gate. The program head moved (PR 16 qsa-dataflow); it is merged in at **`fe4cac24`** (conflicts in
    `envs.py`, `env_variables.md` and the decode block table, resolved keeping both sides: the sparse decode
-   metadata's table takes PR 16's `VLLM_HPU_QSA_TABLE_WIDTH` width too). **Gate of `fe4cac24`**: snapshot
-   `reports/engine-step/merge-wt2`, log `reports/engine-step/logs/gate_fe4cac24.log` (wrapper pid 30235, no
-   `--tools`), waiting for a gate slot at 02:50 UTC. The older gate of `01d66e31` (`merge-wt`, log
-   `gate_425fb2ee.log`, outputs `/tmp/gate.mSyEA1`, wrapper pid 35065, with `--tools`) had all flash_next files
-   green in its parallel pass except `test_collective_cuts.py` (killed by the 1,500 s alarm under the load of two
-   gates), plus three rental tool files ("not a git repository", container signals; kernel-fixes' gate
-   `/tmp/gate.tZJ4wz` fails the same three); its alone reruns decide. When the `fe4cac24` gate ends `gate exit 0`:
-   from `wt/engine-step`, merge `origin/feat/flash-next-gaudi` again if it moved, push, `gh pr create --base
-   feat/flash-next-gaudi`, `gh pr merge --merge`; tell the coordinator.
+   metadata's table takes PR 16's `VLLM_HPU_QSA_TABLE_WIDTH` width too; test at `ba1441b7`). **Gate of
+   `ba1441b7`**: snapshot `reports/engine-step/merge-wt2`, log `reports/engine-step/logs/gate_ba1441b7.log`
+   (wrapper pid 19401, no `--tools`), started 03:07 UTC (the first try died in the /Volumes/Storage outage of 03:01
+   to 03:05). The gate of `01d66e31` (`--tools`) ended with every flash_next file green and 4 red rental tool
+   files (environment: "not a git repository", container signals, the outage; kernel-fixes' gate fails the same).
+   Owner's rule (03:07): merge the PR as soon as its gate is green (everything in it is default-off or
+   card-proven); PR text in the scratchpad `pr_engine_step.md` of this session (summary below). When green: from
+   `wt/engine-step`, merge `origin/feat/flash-next-gaudi` again if it moved, push, `gh pr create --base
+   feat/flash-next-gaudi`, `gh pr merge --merge`; tell the coordinator the number.
 2. Read 00164, 00166 and 00169 when they land (table below); section 9 and the coordinator.
 3. Build 4 runs the `mtp-record` branch with `VLLM_HPU_MTP_TIMING=2`: read `mtp_step_record_r*.jsonl` (verify ms of
    the steps whose `prev_committed` is `{"1": n}` against the others).
