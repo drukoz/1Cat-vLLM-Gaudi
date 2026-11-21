@@ -11,50 +11,58 @@ This track's harness refuses report files outside the repository, so the handoff
 
 ## Handoff (if this agent stops)
 
-Last update: **2026-11-21 01:15 UTC** (fourth agent, Opus 5.5; the node was extended to about 00:00 UTC on
-2026-11-22). Branch `feat/flash-next-gaudi-engine-step`, head `d5ad5e67` plus documents (program head `5c1e8219`,
-PR 15, merged in at `425fb2ee`), pushed. Scratch files, probes and card results:
-`/Volumes/Storage/Claude/gaudi-work/reports/engine-step/` (`card_job/` = submit logs, `card/` = fetched results,
-`logs/` = CPU test and gate logs, `probes/` = Mac probes, `merge-wt/` = the gate's snapshot of the branch).
+Last update: **2026-11-21 02:50 UTC** (fourth agent, Opus 5.5; the node was extended to about 00:00 UTC on
+2026-11-22). Branch `feat/flash-next-gaudi-engine-step`, head `fe4cac24` (the program head with PR 16 merged in; code of
+this track up to `01d66e31`), pushed. A second branch of this track,
+**`feat/flash-next-gaudi-engine-step-mtp-record`** (`2b90707f`, worktree `reports/engine-step/trees/mtp-record`):
+mtp-card-ready's head `7c4d65e3` plus `VLLM_HPU_MTP_TIMING=2` (one record per speculative step, section 14), for
+integration build 4 in place of mtp-card-ready's branch (the timer exists only there). Scratch files, probes and
+card results: `/Volumes/Storage/Claude/gaudi-work/reports/engine-step/` (`card_job/` = submit logs, `card/` =
+fetched results, `logs/` = CPU test and gate logs, `probes/` = Mac probes (`mtp_step_ops.py` and `mtp_ops/` for
+section 14), `merge-wt/` = the gate's snapshot of the branch, `trees/b1`, `trees/b2` = builds 1 and 2 detached).
 
 ### State in one paragraph
 
 Card-proven: **`VLLM_HPU_CANDIDATE_SAMPLING=1`** (00110: -4.9 ms per sampled step at 32 streams on TP4; 00144:
--1.2 ms, noisy) and **with `VLLM_HPU_VOCAB_PARALLEL_LOGITS=2`** (`candvp`, 00144: 110.7 against 114.2 ms per step
-at 32 sampled streams on TP4, -3.55 ms, -3.1 %, every stream on task; the log line confirms each rank's shard);
-**I01** token-correct (00130) and neutral at a short context (00110, 00144); **`logprobs=5` and `prompt_logprobs`
-no longer kill the server** (00130 tiny, 00144 real model: HTTP 200, valid ids, `/health` fine). CPU-proven, card
-job queued: **`VLLM_HPU_CANDIDATE_SAMPLING=2`** (`d5ad5e67`): with deterministic drafts (MTP, n-gram) every
-verification row and the bonus row draws in the candidate region with its own noise and the drafts are verified
-against those draws (`greedy_rejection_sample_from_tokens`), which is speculative sampling exactly for one-hot
-drafts (design and interface agreed with mtp-card-ready; it needs their `VLLM_HPU_SPEC_SAMPLED_VERIFY` at 1 or 2).
-Its 8-card check is 00164 (integration build 2 + `d5ad5e67`, MTP k = 2, sampled 32 and 1 streams).
-CPU-proven, not yet on a card: **`VLLM_HPU_SAMPLER_REQUEST_PARAMS=1`** (`299856cd`): a request's `min_tokens`,
-`logit_bias` and `min_p` take effect on the general sampler path (they were ignored on HPU), applied per row from
-each row's own request before vLLM's sampler. Pull request: the gate runs on `reports/engine-step/merge-wt` at
-`299856cd` (waiting for the lock since 00:40 UTC), then PR and merge.
+-1.2 ms, noisy) and **with `VLLM_HPU_VOCAB_PARALLEL_LOGITS=2`** (`candvp`, 00144: -3.55 ms, -3.1 % at 32 sampled
+streams on TP4); **I01** token-correct (00130) and neutral at a short context (00110, 00144); **`logprobs=5` and
+`prompt_logprobs` no longer kill the server** (00130, 00144); **`VLLM_HPU_SAMPLER_REQUEST_PARAMS=1`** (`299856cd`,
+00167 on the tiny model: `logit_bias`, `min_tokens` and `min_p` take effect on the general sampler path).
+CPU-proven, card job queued: **`VLLM_HPU_CANDIDATE_SAMPLING=2`** (sampled MTP verification in the candidate
+region, 00164). Host time per decode step outside the forward is spread thin (section 13; the copy bench 00173:
+packing the 11 copies saves 0.2 ms at 32 rows, not built; the coordinator leaves the rest to async-sched). The
+candidate region no longer refuses async scheduling (`01d66e31`, async-sched's request). Build 2's 1-stream MTP
+question answered on the CPU (section 14).
 
 ### If you take over, in this order
 
-1. The gate: `tail -3 reports/engine-step/logs/gate_425fb2ee.log` (it tests `merge-wt` at `d5ad5e67`). When it
-   ends `gate exit 0`: from `wt/engine-step`, merge `origin/feat/flash-next-gaudi` again if it moved, push, `gh pr
-   create --base feat/flash-next-gaudi`, `gh pr merge --merge`; tell the coordinator.
-2. Read 00146 and 00164 when they land (table below); section 9 and the coordinator.
-3. Then: the general sampler's ignored `min_tokens` / `logit_bias` / `min_p` (item 5 below), and I01 at a long
-   context once prefill's prefix flags are on the program branch (item 0).
-4. Test branches in `wt/engine-step` (local, not pushed, not for a pull request): `engine-step-mtp-card` (mine +
-   mtp-card-ready's 05d2db66) and `engine-step-int2-card` (integration build 2 + `d5ad5e67`, the tree of 00164).
+1. The gates. The program head moved (PR 16 qsa-dataflow); it is merged in at **`fe4cac24`** (conflicts in
+   `envs.py`, `env_variables.md` and the decode block table, resolved keeping both sides: the sparse decode
+   metadata's table takes PR 16's `VLLM_HPU_QSA_TABLE_WIDTH` width too). **Gate of `fe4cac24`**: snapshot
+   `reports/engine-step/merge-wt2`, log `reports/engine-step/logs/gate_fe4cac24.log` (wrapper pid 30235, no
+   `--tools`), waiting for a gate slot at 02:50 UTC. The older gate of `01d66e31` (`merge-wt`, log
+   `gate_425fb2ee.log`, outputs `/tmp/gate.mSyEA1`, wrapper pid 35065, with `--tools`) had all flash_next files
+   green in its parallel pass except `test_collective_cuts.py` (killed by the 1,500 s alarm under the load of two
+   gates), plus three rental tool files ("not a git repository", container signals; kernel-fixes' gate
+   `/tmp/gate.tZJ4wz` fails the same three); its alone reruns decide. When the `fe4cac24` gate ends `gate exit 0`:
+   from `wt/engine-step`, merge `origin/feat/flash-next-gaudi` again if it moved, push, `gh pr create --base
+   feat/flash-next-gaudi`, `gh pr merge --merge`; tell the coordinator.
+2. Read 00164, 00166 and 00169 when they land (table below); section 9 and the coordinator.
+3. Build 4 runs the `mtp-record` branch with `VLLM_HPU_MTP_TIMING=2`: read `mtp_step_record_r*.jsonl` (verify ms of
+   the steps whose `prev_committed` is `{"1": n}` against the others).
 
 ### Card jobs
 
 | Job | What | State | To do when it ends |
 |---|---|---|---|
-| 00093 `hpu-ids-sampler-tiny-flags` (1 card) | id verdicts, sampler-stage times, tiny model with I01 + I05 | ended 20:29 UTC, exit 1 (the tiny 700-token prompt, a near tie) | done: section 9 |
-| 00110 `real4-ab3-greedy-sampled-long` (TP4) | greedy base / I01 / I05 / both, sampled base / cand, long prefix | ended 22:29 UTC, exit 5 (probe counting artifact; no prefix-cache hit) | done: section 9 |
-| 00130 `tiny-i01-i05-logprobs` (1 card, commit `0cb55ebb`) | `tiny_checks.py --arms i01,i05` | ended 00:25 UTC, exit 1 (the I05 arm's near tie, and both servers died on the `prompt_logprobs` request) | done: section 9; the prompt-logprobs defect fixed at `e9032e68` |
-| 00144 `real4-ab6-short-candvp` (TP4, `e9032e68`) | the short-context A/B with `candvp` and the logprobs check | ended 00:56 UTC, exit 0 | done: section 9 |
-| **00146** `real8-candvp-short` (all, 35m, `e9032e68`) | the same probe at TP8: greedy base / I01 + I05, sampled vLLM / cand / candvp, logprobs check | queued (8-card sequence) | `SUMMARY`, `TASK`, `LOGPROBS`, the `Candidate sampling` lines; tell the coordinator whether `candvp` holds at TP8 |
-| **00164** `real8-mtp2-cand2-sampled` (all, 40m, `3ed03d13` = integration build 2 + `d5ad5e67`) | `headline_job.sh mtp2` with `HEADLINE_MTP_SAMPLED=1 HEADLINE_MTP_SAMPLED_LEVELS=32,1 VLLM_HPU_SPEC_SAMPLED_VERIFY=2 VLLM_HPU_CANDIDATE_SAMPLING=2` | queued (8-card sequence) | step time and acceptance per draft position, sampled at 32 and 1 streams, against build 2's arm C (the same with `=2` of mtp-card-ready only); the `Candidate sampling` lines must say the region drew; no rejection-sampler error |
+| 00093, 00110, 00130, 00144 | (earlier jobs) | ended | done: section 9 |
+| 00146 `real8-candvp-short` | candvp at TP8 | replaced by 00166 | - |
+| 00158 `real4-mtp3-cand2-sampled` | | cancelled | - |
+| 00167 `tiny-request-params` (1 card, `9a3ed1d1`) | `tiny_checks.py --arms params` | ended 01:46 UTC, exit 0 | done: section 9 (`PARAMS ok`) |
+| 00173 `h2d-copies-1card` (1 card, `01d66e31`) | `h2d_copies_bench.py` at 32 and 1 rows | ended 02:02 UTC, exit 0 | done: section 13 |
+| **00164** `real8-mtp2-cand2-sampled` (all, 40m, `3ed03d13` = integration build 2 + `d5ad5e67`) | `headline_job.sh mtp2` with `HEADLINE_MTP_SAMPLED=1 HEADLINE_MTP_SAMPLED_LEVELS=32,1 VLLM_HPU_SPEC_SAMPLED_VERIFY=2 VLLM_HPU_CANDIDATE_SAMPLING=2` | queued (8-card sequence) | step time and acceptance per draft position, sampled at 32 and 1 streams, against build 2's arm C; the `Candidate sampling` lines must say the region drew; no rejection-sampler error |
+| **00166** `real8-candvp-short2` (all, 35m) | `serve_long_probe.sh --arms both --no-long --candvp --logprobs-check` at TP8 | queued | `SUMMARY`, `TASK`, `LOGPROBS`, the `Candidate sampling` lines: does `candvp` hold at TP8 |
+| **00169** `real8-i01-long120k` (all, 50m) | I01 at 32 x 120K over a shared prefix with prefill's prefix flags, and an MTP k = 2 part (`probe.log`, `mtp2/probe.log`) | queued | `prepare_inputs` and step time base against I01 at a long context |
 
 ### Pending subtasks after those steps, in order
 
@@ -98,6 +106,13 @@ each row's own request before vLLM's sampler. Pull request: the gate runs on `re
    stable.
 4. The brief's later items, none started: device tensors kept in place, async scheduling with speculation (the PLE
    layer needs the sampled tokens on the device), the worker round trip. CPU pinning belongs to native-replay.
+   MEASURED on the Mac (01:30 UTC, the engine harness forcing `async_scheduling=True` past the platform's refusal,
+   tiny model, four reference prompts): every prompt's tokens leave the reference at token 2, with the PLE n-gram
+   ids on the host and on the device alike: under async scheduling the step's n-gram context (built from the host's
+   token table) lacks the previous step's token, which is still on the device. Async scheduling for Flash-Next
+   needs that context on the device first (the last n - 1 tokens of each request kept and shifted in the graph);
+   it would hide the host time outside the replay call (about 5 ms per step at 32 streams on TP8, step-anatomy),
+   but not under speculation, which the HPU runner refuses with async scheduling.
 5. **Done on the CPU at `299856cd`** (`VLLM_HPU_SAMPLER_REQUEST_PARAMS=1`, default 0): the general sampler path's
    ignored `min_tokens`, `logit_bias` and `min_p`. A card check is a 1-card tiny job (a `logit_bias` of +100 must
    make a greedy request write only that token; a stop token before `min_tokens` must not appear; `min_p` must not
@@ -405,6 +420,11 @@ requests repeat themselves (cand and vLLM's sampler). The `Candidate sampling` l
 from the gathered logits" (cand) and "... from each rank's vocabulary shard (VLLM_HPU_VOCAB_PARALLEL_LOGITS=2)"
 (candvp). Logprobs check: `logprobs=5` and `prompt_logprobs=2` answered 200 with valid ids, `/health` fine after.
 
+**00167 `tiny-request-params`** (one card, `9a3ed1d1`, 01:45 UTC, exit 0): the tiny model with
+`VLLM_HPU_SAMPLER_REQUEST_PARAMS=1` on the general sampler path: `logit_bias` +100 gives 6 of 6 biased tokens,
+`min_tokens` 6 with a stop token the model emits at token 3 gives 6 tokens without it, `min_p` 0.5 answers,
+`/health` 200 after; the greedy smoke still matches the reference; logprobs and prompt logprobs fine.
+
 ## 10. Time to first token of a cached-prefix turn: the runner's host part (MEASURED on the Mac)
 
 `reports/engine-step/probes/ttft_cached_prefix.py` (output `ttft_cached_prefix_out.txt`): the engine harness with
@@ -421,3 +441,98 @@ So the runner and the scheduler spend 2 to 4 ms on the host before such a turn's
 7.6 s per 501-token chunk over a 34K cached prefix (job 00063, warm) is in the model's prompt forward. The harness
 hits the 120,832-token prefix because its engine core cuts chunks at multiples of 896; the card's engine cut them
 at multiples of 2,048 and missed (prefill's root cause, `VLLM_HPU_PREFIX_ALIGN_SPLIT`).
+
+## 11. Sampled speculative steps in the candidate region (`VLLM_HPU_CANDIDATE_SAMPLING=2`, `d5ad5e67`)
+
+Design from mtp-card-ready, interface agreed on 2026-11-21. With deterministic drafts (MTP's arg max, n-gram) the
+draft distribution is one-hot at the draft d, and speculative sampling equals: draw every verification row and
+the bonus row from the target distribution, each with its own noise, then verify the drafts against those draws.
+A draw y accepted when y = d is accepted with probability p(d); a rejected row's draw follows p(x) / (1 - p(d)) for
+x != d, which is the residual distribution max(p - q, 0) renormalized when q is one-hot at d; the rows draw
+independently.
+
+- `_candidate_sampling_decision` serves a decode step of a speculative server when the flag is 2, the method is
+  `mtp` or `ngram`, `VLLM_HPU_SPEC_SAMPLED_VERIFY` (mtp-card-ready's) is 1 or 2, and every request has k drafts:
+  request i owns rows `i * (1 + k) .. i * (1 + k) + k` (the layout of `_prepare_spec_decode_inputs`), each with
+  the request's temperature, top-k and top-p and its own noise row (a seeded request draws its rows from its own
+  generator, in row order). A greedy request's rows take `first_maximum`, its arg max. Anything else (fewer
+  drafts, `min_tokens` below its count, logprobs, ...) is refused and logged once; mtp-card-ready's flag then
+  serves the step.
+- The region returns the per-row tokens as `fused_sampled_token_ids`; the runner's speculative branch already
+  passes them to `greedy_rejection_sample_from_tokens` (accept while a row's draw equals the draft, then the first
+  unequal draw, or the bonus row's draw). That function now clamps the `-1` of padded draft positions before its
+  `index_select` (the CPU refuses `-1`; the positions are masked out anyway).
+- The non-seeded noise comes from one host generator per server (`candidate_sampling.NOISE_SEED`), seeded alike on
+  every TP rank and used by nothing else, so every rank draws the same tokens (also for `=1`).
+- VERIFIED on the CPU (`test_candidate_verification.py`): over 200,000 rows the acceptance rate equals p(d) and
+  the rejected draws equal p without d, renormalized, within 5 sigma; the greedy rejection on draws, padded
+  positions included; the serving loop with n-gram k = 3 and drafts on every step: every verification step with a
+  sampled request runs in the region, the rejection sampler never runs, a greedy request in the batch gives the HF
+  reference's tokens. Card check: job 00164 (TP8, MTP k = 2, integration build 2 + `d5ad5e67`).
+
+## 12. `min_tokens`, `logit_bias` and `min_p` on the general sampler path (`VLLM_HPU_SAMPLER_REQUEST_PARAMS=1`, `299856cd`)
+
+vLLM applies the three through logits processors whose per-row state the input batch feeds (`update_state`); the
+HPU input batch never does, and the HPU samples prefills and decodes in separate calls whose rows are not the
+batch's rows, so all three were ignored on HPU's general path (section 3). With the flag the runner builds them
+per row from each row's own request at every sampling call (`_apply_sampler_request_params`,
+`v1/sample/request_params.py`) and applies them before vLLM's sampler: the min-tokens mask of `fused_greedy`
+(gather, where, scatter of a host-made int64 index), `logit_bias` by `scatter_add`, and vLLM's min_p cut at the
+row's temperature (equal to vLLM's `MinPLogitsProcessor` on the temperature-scaled logits; greedy rows untouched).
+One difference: a request with logprobs gets them after its own bias and masks (vLLM's raw logprobs come first).
+VERIFIED on the CPU (`test_sampler_request_params.py`): the adjustments equal vLLM's rules; in the serving loop a
+`logit_bias` of +100 makes a greedy request write only that token and a stop token before `min_tokens` is not
+emitted, and without the flag both are ignored. Card check: job 00167 (tiny model, one card).
+
+## 13. Host time per decode step outside the forward (MEASURED on the Mac, 2026-11-21 01:45 UTC)
+
+`reports/engine-step/probes/step_phases.py` and `step_profile.py`: the engine harness with the stub model at the
+real geometry (TP8: five hybrid KV groups, 4 Mamba and 1 full attention, block 512), 32 requests at a 1K context,
+median wall ms per engine step over 60 steps, flags as noted.
+
+| configuration | step | `schedule` | `update_from_output` | runner `sample_tokens` | of which `_prepare_inputs` |
+|---|---|---|---|---|---|
+| greedy, vLLM's sampler | 2.14 | 0.56 | 0.09 | 1.14 | |
+| greedy, `VLLM_HPU_FUSED_GREEDY_LOGITS=1` | 0.98 | 0.40 | 0.06 | 0.50 | |
+| greedy, I05 + I01 | 1.00 | 0.40 | 0.06 | 0.50 | 0.32 |
+| sampled, `VLLM_HPU_CANDIDATE_SAMPLING=1` | 1.18 | 0.41 | 0.06 | 0.67 | |
+| 1 request, I05 | 0.30 | 0.03 | 0.01 | 0.24 | |
+
+- About 70 % of `schedule` is `KVCacheManager.allocate_slots` for each of the 32 requests across the five groups,
+  also on the steps where nothing changes (no block boundary, no newly full block). A decode fast path would have
+  to reproduce Mamba align mode's per-step partial-tail caching (`MambaManager.cache_blocks` re-marks the prompt
+  tail in `cached_blocks_this_step`); not done.
+- The card's `prepare` is about 2 ms at 32 rows (step-anatomy 00013) against 0.32 ms here. **Job 00173**
+  (`h2d_copies_bench.py`, one card, MEASURED, host us per step, median of 200): the eleven small copies of a
+  32-row step one by one cost 473 us to issue (about 43 us each) plus 790 us at the `mark_step` (with the bench's
+  consumer ops); one packed int32 copy with device slices costs 409 + 638 us (with clones of the slices 650 + 573);
+  at 1 row 345 + 571 against 362 + 587. So packing saves about 0.2 ms per step at 32 rows and nothing at 1 row: the
+  host-side packing and the slice ops eat most of what one copy saves. Not built (about 0.3 % of a step).
+
+## 14. Build 2's 1-stream MTP step (coordinator's question, 2026-11-21 02:30 UTC)
+
+00156 (build 2, MTP k = 2, `VLLM_HPU_SPEC_SAMPLED_VERIFY=2`) ran 1 stream at 84 ms per step with first-position
+acceptance 0.60, against 00128 (build 1, k = 3) at 66 ms and 0.83. Integration's 00161 (build 2, k = 3, `=2` unset)
+ran like build 1. CPU checks with `reports/engine-step/probes/mtp_step_ops.py` (the CPU engine: vLLM's engine, the
+HPU runner, the MTP proposer, the tiny checkpoint; one request, 240-token prompt, 600 greedy tokens, oracle drafts
+accepting 1,0,2,1,1, the prefix flags on; runs in `probes/mtp_ops/`):
+
+- **`=2` changes nothing for greedy rows (MEASURED):** with `VLLM_HPU_SPEC_SAMPLED_VERIFY` 0, 1 and 2 all 300 steps
+  take `_prepare_sampling`, vLLM's rejection sampler and its greedy `rejection_sample`; `_candidate_verify` is
+  never called; `all_greedy` is True on every step; 433 host ops per step outside the two forwards, equal op by op;
+  the same 600 tokens, equal to the stream without speculation. A sampled request on `=2` calls
+  `_candidate_verify` every step.
+- **The align-mode copies run once per recurrent block (MEASURED):** a boundary commit after sampling and a pre-step
+  copy when the running block moves, at contexts 252/253, 508 and 763 on the CPU's 256-token block (once per 512
+  tokens at TP8). The headline's short rounds (23-token prompts, 128 tokens) never leave the first block: no copy
+  ran in 00156's 1-, 8- or 32-stream rounds. `5c770d96` adds 24 ops per copy event (66 against 42).
+- Host ops per step outside the forwards: k = 2 433, k = 3 493 (one more draft pass).
+- **The 1-stream acceptance compares two texts (MEASURED on the card's records):** stream 0's greedy text changes
+  with the batch and with k (00128 nospec N=1 against N=8; 00156 mtp2 N=8 rep 0 against rep 1; k = 3 against k = 2
+  from about token 13). At 8 and 32 streams the first-position rate is equal: k = 3 0.77 / 0.74, k = 2 0.76 / 0.76.
+- **Where the time went (MEASURED, the card's MTP timer files):** the verify span (step start to the drafter call),
+  54.4 ms at k = 3 against 67-71 ms in k = 2's greedy rounds; the draft is 14.5 against 13.2-14.2 ms. On the same
+  k = 2 server the sampled 1-stream rounds verified at 51.5 ms (rep 0) and 64-66 ms (rep 1): not a fixed cost of k
+  or of a path. INFERRED from four rounds: the span tracks the share of steps whose first draft was rejected (0.25:
+  51.5 ms, 0.37: 64-66, 0.40: 67-71; k = 3 0.17: 54). The timer keeps 25-step means; a per-step record keyed by
+  the previous step's accepted count would show it directly.

@@ -5318,21 +5318,20 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         logits_indices[:num_decodes] = query_start_loc_cpu[1:num_decodes + 1] - 1
 
         positions_device = async_h2d_copy(positions, dtype=position_dtype, device=self.device)
+        # VLLM_HPU_QSA_TABLE_WIDTH=1: as wide as the batch's longest request needs, not as the engine's longest
+        # context (the QSA indexer scores every column's keys); the same width with the sparse decode metadata.
+        table_width = decode_block_table_width(num_blocks, self._block_table_max_blocks,
+                                               gaudi_envs.VLLM_HPU_QSA_TABLE_WIDTH)
         if sparse_md:
             # One row per request (the pages of its last scheduled token), repeated over its verification rows.
             block_table_cpu = request_block_table(block_table_cpu_tensor, num_blocks, num_tokens,
-                                                  padded_batch_size * num_tokens, self._block_table_max_blocks,
-                                                  self._PAD_BLOCK_ID)
+                                                  padded_batch_size * num_tokens, table_width, self._PAD_BLOCK_ID)
             block_list = block_groups = block_usage = None
         else:
             block_tables_list = self._resolve_all_blocks(block_tables_list)
 
             block_table_cpu = None
             if getattr(self, '_needs_block_table', False):
-                # VLLM_HPU_QSA_TABLE_WIDTH=1: as wide as the batch's longest request needs, not as the engine's
-                # longest context (the QSA indexer scores every column's keys).
-                table_width = decode_block_table_width(num_blocks, self._block_table_max_blocks,
-                                                       gaudi_envs.VLLM_HPU_QSA_TABLE_WIDTH)
                 block_table_cpu = build_block_table(block_tables_list, padded_batch_size * num_tokens, table_width,
                                                     self._PAD_BLOCK_ID)
 
@@ -6482,8 +6481,9 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                 rows_per_request = 1 + int(self.speculative_config.num_speculative_tokens)
         if self.use_structured_output:
             return None, "structured output"
-        if self.use_async_scheduling:
-            return None, "async scheduling"
+        # Async scheduling (async-sched track, feat/flash-next-gaudi-async-sched): the region's draws do not read the
+        # step's own output and its noise comes from the host; seeded and greedy requests give the synchronous
+        # tokens there (CPU, 2026-11-21), so it is not refused.
         builtin_processors = (LogitBiasLogitsProcessor, MinTokensLogitsProcessor)
         custom = [type(processor).__name__ for processor in self.input_batch.logitsprocs.non_argmax_invariant
                   if not isinstance(processor, builtin_processors)]

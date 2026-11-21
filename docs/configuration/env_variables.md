@@ -124,8 +124,8 @@ top 64 of its vocabulary shard and the ranks gather `[rows, 128]` fp32 instead o
 (a tie group at the k-th value that reaches past 64 candidates is cut there); the random stream differs,
 so a seeded request is reproducible but not equal to its output with `0`. A step with a request outside
 the conditions (`top_k` unset or above 64, `min_p`, penalties, `logit_bias`, `allowed_token_ids`,
-`bad_words`, logprobs, a custom logits processor, speculative decoding, structured output, async
-scheduling) keeps vLLM's sampler; an all-greedy step is not affected. The server logs one INFO line
+`bad_words`, logprobs, a custom logits processor, speculative decoding unless `2`, structured output) keeps
+vLLM's sampler; an all-greedy step is not affected. The server logs one INFO line
 (`Candidate sampling (VLLM_HPU_CANDIDATE_SAMPLING=1): a sampled decode step drew in the logits region ...`)
 the first time a sampled step takes the region, and one (`... took vLLM's sampler instead: <reason>`) the
 first time a sampled step falls back; a change of the runtime switch file logs them again. `2` is `1`, and the
