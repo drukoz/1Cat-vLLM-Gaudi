@@ -6,7 +6,7 @@ This file is the track's report. The harness of the track's agents does not writ
 
 ## Handoff (if this agent stops)
 
-Last update: 2026-11-21 01:48 UTC by `date -u` (fourth agent of the track, Opus 5.5, 23:15 UTC to 01:50 UTC; it ended its run here). **The node runs until
+Last update: 2026-11-21 04:42 UTC by `date -u` (fourth agent of the track, Opus 5.5; resumed 04:35 UTC for the next MTP speed work, see "Next MTP speed work"). **The node runs until
 about 00:00 UTC on 2026-11-22 (BRIEF 00:50); merges allowed again.** Coordinator's plan for this track (00:42 UTC):
 (1) the verify-op crash of 00133, cause and fix, CPU first, then its card check (00162, mine); (2) the pull request
 of the card-proven MTP fixes (gate, merge); (3) with engine-step (agent a8a87f4c2008bde9c): sampled MTP verification
@@ -290,6 +290,42 @@ short-prompt numbers.
    concurrency`), I43 / k = 4 and 5 (`tools/flash_next/mtp_k_choice.py`).
 6. Merge proven steps per the protocol: merge `origin/feat/flash-next-gaudi` into the branch (one conflict, in
    `hpu_flash_next_mtp.py`), `bin/gate <worktree> --tools`, PR to `feat/flash-next-gaudi`.
+
+## Next MTP speed work (coordinator, 04:35 UTC): estimates and designs (04:40 UTC, from the timer data)
+
+**(1) One graph for the k draft passes.** TP8 timer, build 3 (00178, k = 3, steady records): at 128 rows (32
+streams) the draft costs 16.3 to 18.2 ms of a 104 ms step: pass 0 issue 4.9 to 5.1 ms, pass 1 and 2 metadata 1.2 to
+1.3 ms each, pass 1 and 2 issue 3.9 to 4.1 ms each, final device wait 0.7 to 2.8 ms. At 4 rows (1 stream) 13.5 to
+14.7 ms of about 68: issues 3.0 to 4.0 ms each, metadata 0.9 ms each, final wait 1.4 to 2.9 ms. The final wait is
+small, so the draft is host-bound: three wrapper calls (`self.model(...)`, the HPU-graph wrapper, `_draft_tokens`'
+LM head and arg max outside the graph) and two metadata builds. INFERRED saving with the k passes in one replay
+(the in-graph collectives of the three passes stay, about 3 x 4 x 0.15 ms at TP8): about 7 to 10 ms per step at 32
+streams (7 to 10 %: 40.6 -> about 37 ms per token) and 6 to 8 ms at 1 stream (about 10 %). Design:
+- With `VLLM_HPU_MTP_DRAFT_LOOP=1` every pass's positions are known on the host before pass 0, so the attention
+  metadata of all k passes (slot mapping of the draft KV writes, block tables, QSA lens) can be built once, as
+  stacked tensors with a pass axis.
+- A module `MtpDraftLoop(mtp_model, k)` runs, in one forward: for each pass, the MTP layer on (ids, positions,
+  hidden) with that pass's metadata, the LM head, the arg max (int32 ids from an fp32 id table as in
+  `vocab_parallel`, or `vocab_parallel_argmax` with `VLLM_HPU_VOCAB_PARALLEL_LOGITS=1`), and feeds ids and the
+  multi-stream hidden to the next pass. It returns the k draft ids [batch, k] and the last hidden. It is wrapped in
+  one HPU graph (`_maybe_wrap_in_hpu_graph`) beside today's per-pass wrapper; a flag selects it (default 0).
+- What needs care: the forward context per pass (`set_forward_context` around each pass inside the captured
+  function), the QSA layer's per-step caches keyed by the metadata (`step_cached`), the indexer's
+  `set_skip_topk` (pass 0 selects, later passes reuse) and `compact_topk_indices`, and the draft QSA KV / key-ring
+  writes (`index_copy_`: ordered in one graph by the lazy bridge, rule 10b does not bite).
+- CPU proof: the CPU engine rehearsal (`hpu_cpu_engine.py`, oracle drafts) gives the same drafts and tokens with
+  the flag on and off at k = 1..5; the tiny model's token check on a card; then an 8-card arm against build 4.
+
+**(2) Dynamic draft length.** Estimate from 00178 (TP8, 32 streams: acceptance 0.74 / 0.54 / 0.39; Ft 98 to 100 ms
+at 128 rows, 55 at 4 rows, so about 0.35 ms per verification row): it does not pay in today's layout. The HPU
+verification batch is padded to the batch's largest draft count (`_prepare_spec_decode_inputs`: every request gets
+1 + max rows, missing drafts are -1), so a request that stops early saves no verification row unless every request
+of the batch stops; the third draft pass runs for the others anyway. With packed rows (a larger change: the GDN
+verify lattice, QSA verify and the attention metadata assume [batch, 1 + k]) dropping the lower-confidence half of
+the position-3 rows would save about 16 x 0.35 = 5.6 ms (5 %) and lose about 16 x 0.54 x (conditional acceptance of
+those rows, perhaps 0.5) = 4 tokens of about 83 per step (5 %): break-even at TP8, as the tie of k = 2 and k = 3
+says. Not worth building now; if wanted, first log per row the draft head's top-1 probability next to its
+acceptance on the card (one counter pair per probability bin) to see whether low confidence predicts rejection.
 
 ## I07, sampled verification: what is built and where it should end
 
