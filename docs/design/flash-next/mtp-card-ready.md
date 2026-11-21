@@ -6,6 +6,29 @@ This file is the track's report. The harness of the track's agents does not writ
 
 ## Handoff (if this agent stops)
 
+**State at 2026-11-21 12:22 UTC (`date -u`; fourth agent, resumed 12:10 UTC).**
+- **Everything on this branch through `8f977256` is on the program branch** (it went in with PR #23, mtp-draft-graph's
+  branch merged it; checked with `git merge-base --is-ancestor`): the card-proven MTP fixes, `5c770d96` (the 00133
+  fix), `0d1be6fc`, `1f2dc38e` (`VLLM_HPU_SPEC_SAMPLED_VERIFY=2`), `950608fc`, the tools. No separate pull request is
+  needed. Not on the program branch yet: the answer-reuse change, merged by prefill as `92e65144` on
+  `feat/flash-next-gaudi-prefill` (prefill's second pull request).
+- **00170 (TP4, card build `3026297f`, prefix flags on) verdict: the 00133 fix holds on the card.** No crash and no
+  `tensor_data is empty` in either arm after a decode across 896 (677 + 1,100 tokens), new graph captures at 2 / 3 /
+  5 / 8 streams and two 8-stream crossing rounds; the same prompt again at 1 stream gives identical tokens over 1,100
+  at k = 3 and k = 0; acceptance before and after the crossings unchanged (k = 3: 0.66 / 0.41 / 0.20 first and again,
+  0.67 / 0.39 / 0.22 and 0.68 / 0.38 / 0.21 for the 8-stream rounds). 8-stream repeats differ in both arms (k = 3 0 of
+  8, k = 0 2 of 8: batch nondeterminism, BRIEF 08:41). Next turn: k = 0 hit 896; k = 3 hit 0, as designed for ONE
+  crossed decode boundary (the prompt came out 677 tokens, not about 717, so 1,792 was not reached and the EAGLE drop
+  needs the state one block earlier). The two-boundary keep (`92e65144`) was not exercised on the card; a later MTP
+  job with prefill's flags and `commit_turns_probe.py --decode 1300` would show the 896 hit at k = 3.
+- **engine-step's 00235 (tiny TP2, fused-verify rung, the 700-token prompt at token 4): a near tie, not a defect**
+  (INFERRED): its diverging stream is token for token the one of this track's 00105 (both arms), three builds with
+  different flag sets; only the fused verify at TP2 flips (hc and torch-verify at TP2, TP1 and TP8 pass); the same
+  random-weight checkpoint has first-token near ties of 2.7e-05 and 0.0009 on two other prompts.
+- Coordinate with engine-step (verify logits in graph) and mtp-draft-graph (the chained draft) before touching the
+  drafter. The "Next MTP speed work" section below was written before PR #23; the one-graph draft is mtp-draft-graph's.
+
+
 Last update: 2026-11-21 04:42 UTC by `date -u` (fourth agent of the track, Opus 5.5; resumed 04:35 UTC for the next MTP speed work, see "Next MTP speed work"). **The node runs until
 about 00:00 UTC on 2026-11-22 (BRIEF 00:50); merges allowed again.** Coordinator's plan for this track (00:42 UTC):
 (1) the verify-op crash of 00133, cause and fix, CPU first, then its card check (00162, mine); (2) the pull request
@@ -366,6 +389,7 @@ acceptance on the card (one counter pair per probability bin) to see whether low
 | 00126 arm `k1` | the same with k = 1 | 1 stream: 50.1 ms per step, 1.75 tokens per step, 28.6 ms per token, acceptance 0.76; **32 streams greedy: 95.7 ms per step, 1.74 tokens per step, 55.2 ms per token (1.15 times the reference's 63.7; k = 3: 61.9)**, acceptance 0.75; 32 streams sampled (`=1`): 109.1 ms per step, 1.66, **65.8 ms per token (reference 76.2, k = 3: 82.4)**, acceptance 0.66. Timer: Ft 42-47 / 84-86 (sampled 98-100) ms at 2 / 64 rows, Fd 4.8-5.9 / 5.2-7.6 ms. KV cache 868,867 tokens (k = 3: 657,714). hl-smi peak 73.7 GiB per card (MTP), 70.7 without |
 | 00135 `cand-verify-bench` | one card, `1f2dc38e`, sampled verification per call (k = 3, the real vocabulary, temperature 1 / top_k 20 / top_p 0.95, lazy mode, mark_step + sync) | exact path (`=1`) 5.4 / 11.9 / 27.6 ms, candidate path (`=2`) 3.7 / 6.0 / 13.3 ms at 1 / 8 / 32 requests; tokens valid, k-th candidate value equal to the CPU's, first-draft acceptance of both within 1.5 sigma of the CPU's exact expectation (0.097 at 32 requests: card 0.080 exact, 0.114 candidates); the id-set and greedy checks failed on bf16 ties only |
 | 00139 `cand-verify-bench2` | the same with the id checks by value (`b66e1131`) | every candidate id holds its value in the CPU's logits, tokens above the k-th value equal the CPU's (4/4, 32/32, 128/128), greedy holds the max: **ids VERIFIED on the card**; 3.3 / 10.3 / 19.1 ms against 5.0 / 18.5 / 33.3 ms (a busier node) |
+| 00170 `real4-commit-turns-check2` | TP4, card build `3026297f` (this branch + prefill with `92e65144`), prefix flags on, k = 3 and k = 0, `commit_turns_probe.py --block 896 --decode 1100` | **the 00133 fix holds**: no crash after a decode across 896 and new graph captures (2 / 3 / 5 / 8 streams), the 1-stream repeat equal over 1,100 tokens in both arms, acceptance unchanged before and after the crossings; next turn: k = 0 hit 896, k = 3 hit 0 (only one decode boundary was crossed: designed result) |
 
 ## How the jobs of this track run (late-bound)
 
