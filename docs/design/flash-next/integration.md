@@ -27,7 +27,10 @@ then A6, A6+il, A6+shift, A6+pi, A6+gv6, pin3-noplace last. The GDN variant is l
 make_run6.sh a --gv 7` or `--no-gv` (default 6). Its waiter: `reports/integration/card/submit-real8-build6a.log`;
 results `reports/integration/card/00249-real8-build6a/` (else `bin/farm fetch integration 00249 00249-real8-build6a`).
 6b waits for 00230's verdict (chain arms), 00240's (mode 3, "all"), 00241's (scaled FP8) and engine-step's
-KV_CACHES_IN_GRAPH_ARGS commit. CPU: the async loop test with `VLLM_HPU_PERSISTENT_INPUTS=1` 7 passed. Build 5's record
+KV_CACHES_IN_GRAPH_ARGS commit; its stacked arm carries prefill's prompt-graph flags (kit word `pg`,
+`HEADLINE_PG_ENV="VLLM_HPU_PROMPT_GRAPH_MAX_TOKENS=64000;VLLM_GRAPH_RESERVED_MEM=0.4"`; check line "Prompt forwards up to
+64000 tokens ... replay HPU graphs") and, like A6, the post step `pf` (a 64K-token prompt, so the step timer records
+2,048-token prompt chunks: build 5 had 1.64 to 1.97 s per chunk op by op). CPU: the async loop test with `VLLM_HPU_PERSISTENT_INPUTS=1` 7 passed. Build 5's record
 (00222) is below.
 
 **Build 5 (fifth agent of the track, Opus 5.5, started 08:04 UTC on 2026-11-21; updated 12:10 UTC: job 00222 measured, results below).**
