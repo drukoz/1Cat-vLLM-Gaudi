@@ -158,3 +158,24 @@ def test_the_stand_in_takes_the_host_read_and_the_scheduled_drafts():
     assert use_scheduled_drafts(theirs, ["a", "b"], {"a": [61, 62], "b": [71, 72]})
     assert theirs.next_ids[:2].tolist() == [[9, 61, 62], [8, 71, 72]]
     assert original[:2].tolist() == [[9, 41, 42], [8, 51, 52]]  # the chain's own tensor is not written
+
+
+def test_trim_verified_keeps_what_parse_output_keeps():
+    from vllm_gaudi.v1.worker.flash_next_async_spec import trim_verified
+    assert trim_verified([5, 7, 9], 100) == [5, 7, 9]
+    assert trim_verified([5, -1, -1], 100) == [5]
+    assert trim_verified([5, 120, 3], 100) == [5, 3]  # an id past the vocabulary is dropped, as parse_output does
+
+
+def test_early_books_seed_once_and_count_every_applied_step():
+    from vllm_gaudi.v1.worker.flash_next_async_spec import PendingBooks, SpecEarlyBooks
+    books = SpecEarlyBooks()
+    first = PendingBooks(1, ("a", "b"), torch.tensor([[4, 5, -1], [6, -1, -1]]), None, {"a": 10, "b": 20})
+    second = PendingBooks(2, ("a", "b"), torch.tensor([[7, 8, 9], [1, 2, -1]]), None, {"a": 99})  # a seeded already
+    books.push(first)
+    books.push(second)
+    assert books.true_computed == {"a": 10, "b": 20}
+    assert books.apply(books.pending.popleft(), 100) == [[4, 5], [6]]
+    assert books.true_computed == {"a": 12, "b": 21}
+    assert books.apply(books.pending.popleft(), 100) == [[7, 8, 9], [1, 2]]
+    assert books.true_computed == {"a": 15, "b": 23}

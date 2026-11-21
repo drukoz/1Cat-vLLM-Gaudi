@@ -134,18 +134,25 @@ def resolve_flash_next_async_scheduling(vllm_config: "VllmConfig", requested: Op
     ``2``: as ``1``, and with the Flash-Next MTP draft too: ``requested`` is vLLM's decision before the HPU hook
     turned it off for the speculative config (vLLM keeps async scheduling on for MTP). Under async scheduling the
     runner carries the PLE n-gram context of the decode rows on the device, and with speculation it keeps its
-    synchronous step and hands the drafts over on the device (``v1/worker/flash_next_async.py``).
+    synchronous step and hands the drafts over on the device (``v1/worker/flash_next_async.py``). ``3``: as ``2``
+    for the engine; the runner then issues a chained MTP step before the previous one's tokens reach the host
+    (stage 2, M2; ``v1/worker/flash_next_async_spec.py``).
     """
     scheduler_config = vllm_config.scheduler_config
     mode = int(gaudi_envs.VLLM_HPU_FLASH_NEXT_ASYNC_SCHED)
     speculative_config = getattr(vllm_config, "speculative_config", None)
-    if mode == 2 and speculative_config is not None and requested and \
+    if mode in (2, 3) and speculative_config is not None and requested and \
             getattr(speculative_config, "method", None) == "mtp":
         scheduler_config.async_scheduling = True
-        logger.info("[HPU] Async scheduling on for Flash-Next with MTP (VLLM_HPU_FLASH_NEXT_ASYNC_SCHED=2): the "
-                    "engine schedules during the step, the drafts stay on the device")
+        if mode == 2:
+            logger.info("[HPU] Async scheduling on for Flash-Next with MTP (VLLM_HPU_FLASH_NEXT_ASYNC_SCHED=2): the "
+                        "engine schedules during the step, the drafts stay on the device")
+        else:
+            logger.info("[HPU] Async scheduling on for Flash-Next with MTP (VLLM_HPU_FLASH_NEXT_ASYNC_SCHED=3): the "
+                        "engine schedules during the step; a chained step is issued before the previous one's "
+                        "tokens reach the host")
         return True
-    if mode in (1, 2):
+    if mode in (1, 2, 3):
         if scheduler_config.async_scheduling:
             logger.info("[HPU] Async scheduling on for Flash-Next (VLLM_HPU_FLASH_NEXT_ASYNC_SCHED=%d): the PLE "
                         "n-gram context of the decode rows is carried on the device", mode)

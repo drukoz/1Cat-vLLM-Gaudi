@@ -63,8 +63,9 @@ from vllm_gaudi.v1.worker.recurrent_spec import (accepted_counts, load_checkpoin
 from vllm_gaudi.v1.spec_decode.flash_next_mtp_steps import is_flash_next_mtp
 from vllm_gaudi.distributed import vocab_parallel
 from vllm_gaudi.platform import is_flash_next_model
-from vllm_gaudi.v1.worker.flash_next_async_spec import (ChainOut, VerifyInputAdvance, VerifyInputs,
-                                                        stand_in_chain, use_scheduled_drafts)
+from vllm_gaudi.v1.worker.flash_next_async_spec import (ChainOut, PendingBooks, SpecEarlyBooks, VerifyInputAdvance,
+                                                        VerifyInputs, stand_in_chain, trim_verified,
+                                                        use_scheduled_drafts)
 from vllm_gaudi.v1.worker.flash_next_async import (AsyncOutputLedger, PleContextCarry, SpecDraftHandoff,
                                                    needs_output_token_values)
 
@@ -758,6 +759,35 @@ class AsyncHPUModelRunnerOutput(AsyncModelRunnerOutput):
 
         output = self._model_runner_output
         output.sampled_token_ids[:len(valid_sampled_token_ids)] = valid_sampled_token_ids
+        return output
+
+
+class AsyncSpecModelRunnerOutput(AsyncModelRunnerOutput):
+    """VLLM_HPU_FLASH_NEXT_ASYNC_SCHED=3 (async-sched stage 2, M2): a chained verification step's output, returned
+    before its tokens reach the host. The tokens ``[B, 1 + k]`` (-1 after the bonus) are copied on a side stream; the
+    worker's output thread reads them, and the runner's books read the same host copy one step later."""
+
+    def __init__(self, model_runner_output: ModelRunnerOutput, sampled_token_ids: torch.Tensor, num_decodes: int,
+                 vocab_size: int, copy_stream):
+        self._model_runner_output = model_runner_output
+        self._sampled_token_ids = sampled_token_ids  # kept until the copy is done
+        self._num_decodes = num_decodes
+        self._vocab_size = vocab_size
+        self.ready_event = torch.hpu.Event()
+        default_stream = torch.hpu.current_stream()
+        with torch.hpu.stream(copy_stream):
+            copy_stream.wait_stream(default_stream)
+            self.sampled_cpu = sampled_token_ids.to('cpu', non_blocking=True)
+            self.ready_event.record()
+
+    def get_output(self) -> ModelRunnerOutput:
+        self.ready_event.synchronize()
+        rows = self.sampled_cpu.tolist()
+        self._sampled_token_ids = None
+        output = self._model_runner_output
+        output.sampled_token_ids[:self._num_decodes] = [
+            trim_verified(rows[r], self._vocab_size) for r in range(self._num_decodes)
+        ]
         return output
 
 
@@ -2540,6 +2570,29 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                                 else None)
         self._verify_step = 0
         self._verify_refusals: set = set()
+        # VLLM_HPU_FLASH_NEXT_ASYNC_SCHED=3 (stage 2, M2): a chained verification step is issued before the previous
+        # one's tokens reach the host; its books follow one step late (flash_next_async_spec.SpecEarlyBooks).
+        self._spec_early = None
+        self._spec_early_stream = None
+        self._spec_early_waited = False
+        self._spec_early_logged: set = set()
+        if int(gaudi_envs.VLLM_HPU_FLASH_NEXT_ASYNC_SCHED) == 3 and self._spec_draft_handoff is not None:
+            missing = [
+                name for name, ok in (
+                    ("VLLM_HPU_MTP_DRAFT_CHAIN=1", int(getattr(gaudi_envs, "VLLM_HPU_MTP_DRAFT_CHAIN", 0)) == 1),
+                    ("VLLM_HPU_FLASH_NEXT_SPEC_DEVICE_INPUTS=2",
+                     int(gaudi_envs.VLLM_HPU_FLASH_NEXT_SPEC_DEVICE_INPUTS) == 2),
+                    ("VLLM_HPU_FLASH_NEXT_DECODE_METADATA=1", int(gaudi_envs.VLLM_HPU_FLASH_NEXT_DECODE_METADATA) == 1),
+                    ("prefix caching off (its align-mode commits are stage M3)",
+                     not self.cache_config.enable_prefix_caching),
+                ) if not ok
+            ]
+            if missing or self._verify_advance is None:
+                logger.warning("VLLM_HPU_FLASH_NEXT_ASYNC_SCHED=3 acts as 2: it needs %s",
+                               ", ".join(missing) or "the device-made verification inputs")
+            else:
+                self._spec_early = SpecEarlyBooks()
+                self._spec_early_stream = torch.hpu.Stream()
         self.use_structured_output: bool = False  # Default to false. Set to true when needed during a run
         # Cache token ids on device to avoid h2d copies
         self.input_ids_hpu = torch.zeros(
@@ -4903,6 +4956,117 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                         "device, %d checked, %d with differences %s", mode, stats.verify_steps, stats.advanced,
                         stats.checked, stats.mismatched_steps, stats.mismatches)
 
+    def _spec_continues(self, scheduler_output) -> bool:
+        """=3: whether this step's batch is the last early step's (no request new, resumed or finished; each with
+        its 1 + k verification tokens), so its inputs can come from the device without the previous step's books."""
+        last = self._spec_early.pending[-1]
+        if scheduler_output.scheduled_new_reqs or scheduler_output.finished_req_ids:
+            return False
+        cached = scheduler_output.scheduled_cached_reqs
+        if any(getattr(cached, "resumed_from_preemption", None) or []):
+            return False
+        scheduled = scheduler_output.num_scheduled_tokens
+        if set(scheduled) != set(last.req_ids):
+            return False
+        width = int(self.speculative_config.num_speculative_tokens) + 1
+        return all(int(n) == width for n in scheduled.values())
+
+    def _settle_spec_books(self, block: bool) -> None:
+        """=3: apply the pending books in step order: each step's tokens into the batch's token rows, the counts,
+        the requests' output tokens and the recurrent lattice's accepted counts. Without ``block`` only the books
+        whose copy is done (at most two stay pending)."""
+        books = self._spec_early
+        while books.pending:
+            pending = books.pending[0]
+            if not block and len(books.pending) <= books.MAX_PENDING:
+                query = getattr(pending.event, "query", None)
+                if callable(query) and not query():
+                    break
+            pending.event.synchronize()
+            books.pending.popleft()
+            for req_id, row in zip(pending.req_ids, books.apply(pending, self.input_batch.vocab_size)):
+                index = self.input_batch.req_id_to_index.get(req_id)
+                if index is None or req_id not in self.requests or not row:
+                    continue
+                start = int(self.input_batch.num_tokens_no_spec[index])
+                end = start + len(row)
+                self.input_batch.token_ids_cpu[index, start:end] = row
+                self.input_batch.num_tokens_no_spec[index] = end
+                self.input_batch.num_tokens[index] = end
+                self.requests[req_id].output_token_ids.extend(row)
+                if self._recurrent_spec:
+                    self._gdn_num_accepted_by_req[req_id] = max(1, len(row))
+            if block:
+                books.stats.waited += 1
+            else:
+                books.stats.settled_late += 1
+        if block:
+            self._spec_early_waited = True
+
+    def _spec_override_computed(self) -> None:
+        """=3, after waiting for every pending book: the batch's num_computed_tokens are the true ones (the
+        scheduler's still count the early steps' drafts as accepted)."""
+        books = self._spec_early
+        for req_id, index in self.input_batch.req_id_to_index.items():
+            if req_id in books.true_computed:
+                self.input_batch.num_computed_tokens_cpu[index] = books.true_computed[req_id]
+        books.true_computed.clear()
+        self._spec_early_waited = False
+
+    def _issue_early_output(self, num_decodes, num_prefills, warmup_mode, sampling_metadata):
+        """=3: this chained step's output now, before its tokens reach the host, or None when the step keeps the
+        synchronous order (logged once per reason)."""
+        books = self._spec_early
+        reason = None
+        if num_prefills:
+            reason = "a prefill in the batch"
+        elif warmup_mode:
+            reason = "warmup"
+        elif self.profiler.enabled:
+            reason = "the profiler"
+        elif sampling_metadata is not None and sampling_metadata.max_num_logprobs is not None:
+            reason = "logprobs"
+        elif needs_output_token_values(self.input_batch):
+            reason = "penalties or bad words"
+        elif any((self.requests[r].sampling_params is not None and (self.requests[r].sampling_params.min_tokens or 0) > 0)
+                 for r in self.input_batch.req_ids[:num_decodes]):
+            reason = "min_tokens"
+        elif self.use_structured_output:
+            reason = "structured output"
+        elif has_kv_transfer_group():
+            reason = "a KV transfer"
+        if reason is not None:
+            books.stats.sync_steps += 1
+            books.stats.reasons[reason] = books.stats.reasons.get(reason, 0) + 1
+            if reason not in self._spec_early_logged:
+                self._spec_early_logged.add(reason)
+                logger.info("VLLM_HPU_FLASH_NEXT_ASYNC_SCHED=3: a chained step reads its tokens first: %s", reason)
+            return None
+        chain = self._mtp_chain_out
+        req_ids = list(self.input_batch.req_ids[:num_decodes])
+        self._draft_token_ids = chain.drafts
+        self._set_verify_chain(num_decodes, None)  # the next step's device-made inputs (M1) from the chain
+        output = ModelRunnerOutput(req_ids=req_ids,
+                                   req_id_to_index={req_id: i
+                                                    for i, req_id in enumerate(req_ids)},
+                                   sampled_token_ids=[[] for _ in req_ids],
+                                   logprobs=None,
+                                   prompt_logprobs_dict={},
+                                   pooler_output=[],
+                                   kv_connector_output=KVConnectorOutput(finished_sending=None, finished_recving=None))
+        early = AsyncSpecModelRunnerOutput(output, chain.sampled, num_decodes, self.input_batch.vocab_size,
+                                           self._spec_early_stream)
+        seeds = {req_id: int(self.input_batch.num_computed_tokens_cpu[i])
+                 for i, req_id in enumerate(req_ids)} if not books.pending else {}
+        books.push(PendingBooks(self._verify_step, tuple(req_ids), early.sampled_cpu, early.ready_event, seeds))
+        books.stats.issued += 1
+        if books.stats.issued == 1 or books.stats.issued % 32 == 0:
+            logger.info("VLLM_HPU_FLASH_NEXT_ASYNC_SCHED=3: %d steps issued before the previous step's tokens reached "
+                        "the host; books applied %d late, %d after a wait; %d chained steps read first %s",
+                        books.stats.issued, books.stats.settled_late, books.stats.waited, books.stats.sync_steps,
+                        books.stats.reasons)
+        return early
+
     def _flash_next_async_begin_step(self, scheduler_output=None) -> None:
         """Under async scheduling, once per engine step before its batches are built: the last step's decode
         contexts become this step's (no wait for the device: see flash_next_async.AsyncOutputLedger). With
@@ -4914,6 +5078,8 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                 self._spec_draft_handoff.correct_computed(self.input_batch.req_ids,
                                                           self.input_batch.num_computed_tokens_cpu, self.requests,
                                                           scheduler_output.scheduled_spec_decode_tokens)
+            if self._spec_early is not None and self._spec_early_waited:
+                self._spec_override_computed()
             return
         if not self._flash_next_async_checked:
             self._flash_next_async_checked = True
@@ -7015,6 +7181,12 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         knob = getattr(self, "_prompt_graph_knob", None)
         if knob is not None:
             self.prompt_graph_max_tokens = knob()
+        if self._spec_early is not None:
+            # =3: the books of steps issued before their tokens reached the host; a step that does not continue
+            # the batch waits for all of them first (then its inputs are the host's, from exact books)
+            self._spec_early_waited = False
+            if self._spec_early.pending:
+                self._settle_spec_books(block=not self._spec_continues(scheduler_output))
         self.run_defragmenter(scheduler_output, warmup_mode)
 
         batch_changed = self._update_states(scheduler_output)
@@ -7221,6 +7393,7 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         warmup_mode = self.warmup_mode
         self.scheduler_output = None
         self.warmup_mode = False
+        early_output = None  # VLLM_HPU_FLASH_NEXT_ASYNC_SCHED=3: this step's output before its tokens reach the host
         if self.use_async_scheduling or self._spec_draft_handoff is not None:
             self._flash_next_async_begin_step(scheduler_output)
         if self._verify_advance is not None:
@@ -7638,9 +7811,18 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                             # the host reads anything (the books below read the result as before)
                             self._mtp_chain_issue(sampled_token_ids, decode_data, non_flattened_hidden_states,
                                                   aux_hidden_states, num_decodes)
-                        decode_sampled_token_ids, spec_decode_num_tokens, decode_sampled_token_ids_device = \
-                            self._mtp_chain_settle(sampled_token_ids, decode_data, num_decodes, step_timer)
+                            if self._spec_early is not None:
+                                early_output = self._issue_early_output(num_decodes, num_prefills, warmup_mode,
+                                                                        sampling_metadata)
+                        if early_output is None:
+                            if self._spec_early is not None and self._spec_early.pending:
+                                self._settle_spec_books(block=True)  # the books of earlier steps before this read
+                                self._spec_early.true_computed.clear()  # the host's books are exact again
+                            decode_sampled_token_ids, spec_decode_num_tokens, decode_sampled_token_ids_device = \
+                                self._mtp_chain_settle(sampled_token_ids, decode_data, num_decodes, step_timer)
                     decode_sampled_requests.extend(self.input_batch.req_ids[:num_decodes])
+                    if early_output is not None:
+                        return early_output
                     ##### Sampling End #####
 
             if self.is_driver_worker and self.profiler.enabled:

@@ -554,7 +554,7 @@ if TYPE_CHECKING:
     VLLM_HPU_MTP_CHUNK_KV: int = 0  # 1 the MTP draft also runs over prefill chunks that complete no prompt
     VLLM_HPU_GDN_KERNEL_INTERLEAVE: int = 0  # 0 today's GDN decode/verify kernels, 1 four value rows per iteration
     VLLM_HPU_GDN_GLUE_CACHE: int = 0  # 0 per-step glue of the fused GDN ops (default), 1 constants and indices cached
-    VLLM_HPU_FLASH_NEXT_ASYNC_SCHED: int = 0  # 0 Flash-Next without async scheduling (default), 1 with it, 2 also MTP
+    VLLM_HPU_FLASH_NEXT_ASYNC_SCHED: int = 0  # 0 off (default), 1 on, 2 also MTP, 3 MTP step issued before the read
     VLLM_HPU_FLASH_NEXT_SPEC_DEVICE_INPUTS: int = 0  # 0 host-made (default), 1 device-made + check, 2 device-made
     VLLM_HPU_PLE_HOST_NGRAM_IDS: int = 0  # 0 PLE n-gram ids computed in the graph (default), 1 on the host
     VLLM_HPU_HC_FUSED: int = 0  # 0 torch hyper-connections (default), 1 the fused hyper-connection kernels
