@@ -14,7 +14,7 @@
 # Exit code 0 when all four passed; verdicts in ~/farm/<track>/results/<job>-<name>-verdicts.txt.
 set -u
 L="${1:?LEAN build id}"
-IMG="${2:?image, e.g. farm-integration:d00c0a9a3e18}"
+IMG="${2:?image, e.g. farm-collectives-int:d00c0a9a3e18 (a second tag of integration build 3, kept from pruning)}"
 S="${3:-$(basename "$(readlink "$HOME/farm/${CARDQ_TRACK:?}/current")")}"
 J="$HOME/farm/collectives/bridge/ab_bridge_job.sh"
 V="$HOME/farm/${CARDQ_TRACK:?}/results/${CARDQ_JOB:?}-${CARDQ_NAME:?}-verdicts.txt"
