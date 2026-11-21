@@ -384,9 +384,39 @@ is 10 to 20 % cheaper (the spinner's CPU contention). The launch's host time is 
 together; accsync on the image's bridge (it is a stock setting). Results:
 `reports/collectives/card/00174-real8-bridge-phase-*/`.
 
+**Job 00181 `real8-bridge-headline2` (MEASURED, all 8 cards, 04:24-04:56 UTC, exit 0, six arms ok):** integration
+build 3's image and no-speculation env with the accumulation thread off in every arm, build 3's probe; the reference
+is the image's own (vendor-built) bridge. Tokens: tiny-lean and tiny-lean-inline equal tiny-stock prompt by prompt;
+the 1-stream texts (both rounds) are equal in all three real arms. Steady ms per step, two rounds each:
+
+| arm | greedy 32 | greedy 8 | greedy 1 | sampled 32 | sampled 8 | sampled 1 |
+|---|---|---|---|---|---|---|
+| vendor bridge | 49.4, 56.4 | 53.3, 53.5 | 37.6, 37.2 | 57.6, 63.5 | 59.3, 57.7 | 36.2, 38.2 |
+| lean3t (prepared replay) | 46.2, 47.0 | 63.1, 61.3 | 43.5, 43.6 | 47.9, 50.7 | 59.4, 59.6 | 44.5, 44.7 |
+| lean3t + `PT_HPU_DISABLE_ASYNC_COLLECTIVE=1` | 45.5, 46.4 | 61.1, 59.9 | 42.2, 43.4 | 51.8, 51.0 | 63.2, 60.5 | 44.0, 44.5 |
+
+Per launch (us; lean3t / inline): total 143.8 / 133.7; `run_prep` 2.14 / 2.20 (native-replay's fix works);
+unattributed 5.0 / 5.3; `launcher_inputs` 40.1 / 6.0 (the waits on the async collectives' futures: `sub_in_waits`
+39.0, `sub_in_future` 34.2, gone inline); `launcher_post` 13.7 / 35.9 (the collective runs there inline);
+`syn_launch` 43.6 / 48.3 (`sub_syn_call` 27.9, `sub_syn_lock` 9.9); `run_patching` 24.4 (`sub_patch_table` 22.8,
+`sub_patch_alloc` 14.4). Readings (INFERRED): against the vendor's bridge, lean is faster at 32 streams (3 to 10 ms
+greedy, 8 to 13 sampled; the vendor arm's own rounds differ by 6 to 7 ms) but about 6 ms slower at 1 stream and 8 ms
+at 8 streams, the opposite of 00174 (where the reference was our own rebuild); per-launch host time cannot explain a
+6 ms step difference, so either our rebuild as such is slower than the vendor's build in this env or the cost lies
+outside the timed launch path. The vendor bridge stays in the headline builds (coordinator).
+
+**Job 00188 `real8-bridge-vendor`** (all, 75 min, queued 05:00 UTC after integration's 00186 and 00187; build 4's
+image `farm-integration:30f4e37ef08c`, second tag `farm-collectives-int:30f4e37ef08c`; `bridge_vendor_job.sh`):
+build 4's no-speculation env without the accumulation-thread setting; tiny gates (vendor, our unpatched rebuild
+`stock-5176b1b2`, lean3a); then (1) the vendor bridge with the accumulation thread on (default) against off (the
+coordinator: 00178 ran 29.4 to 29.7 ms at 1 stream with it on, 00181's vendor arm 37 ms with it off); the job keeps
+the setting with the lower sum of greedy ms per step at 32 + 8 + 1 (`<job>-<name>-spinner.txt`) for (2) our rebuild
+and (3) `lean3a-8f6f7faf88dc` (lean3t + no GIL release for inputs whose event is done, no argument building for logs
+and traces that are off). Pending.
+
 ## Handoff (if this agent stops)
 
-State at 04:10 UTC on 2026-11-21 (fourth agent of this track, Opus 5.5). **The node stays until about 00:00 UTC
+State at 05:05 UTC on 2026-11-21 (fourth agent of this track, Opus 5.5). **The node stays until about 00:00 UTC
 on 2026-11-22** (BRIEF 00:50 UTC). Branch `feat/flash-next-gaudi-collectives` (and `-dev`, the same head), worktree
 `/Volumes/Storage/Claude/gaudi-work/wt/collectives`; card results and logs in
 `/Volumes/Storage/Claude/gaudi-work/reports/collectives/` (`card/<id>-<name>/`, `logs/`, `probes/`). This section is
@@ -418,30 +448,14 @@ bench8-bridge all 30m` (each arm pairs the flag off and on in one bench run; sum
 `python3 reports/native-replay/probes/knob_table.py bench_r8.json`).
 
 Next, in order (section 7's table):
-1. 00160 PASSED and 00174 ended ok (section 7); both sent to the coordinator and native-replay (03:10 UTC).
-   **Next (coordinator, 03:15 UTC): lean with native-replay's `run_prep` fix + the accumulation thread off, on the
-   integration build's env, so the numbers compare with the headline.** Ready since 03:25 UTC:
-   `bridge_headline_job.sh LEAN IMAGE SHA` (deployed): every arm in integration build 3's image (second tag
-   `farm-collectives-int:d00c0a9a3e18`, so integration's image pruning cannot remove it; drop the tag with
-   `sudo -n docker rmi farm-collectives-int:d00c0a9a3e18` on the node when done), the headline's no-speculation
-   env (headline_job.sh's build flags + 00178's prefix flags) + `PT_HPU_SYNCHRONOUS_ACC_QUEUE_FLUSHING=1`, build 3's
-   own probe pair staged at `~/farm/collectives/results/bench/intprobe/` (levels 32, 8, 1; 128 tokens; two rounds
-   per level; greedy and sampled interleaved). Arms tiny-stock, tiny-lean, then real-stock and real-lean.
-   Submitted as job 00180 at 03:25 UTC with native-replay's `lean2-81b9b47e3599` (the `run_prep` fix), then, on the
-   coordinator's word (03:40 UTC), **replaced by job 00181 `real8-bridge-headline2`** (all, 65 min, same place,
-   starts after integration's 00178, by 04:53 UTC at the latest): `lean3t-412153bbab3e` (lean2 + sub-timers,
-   appended to each timing line as `| sub ...`, nested in the phases) and the inline-collective pair
-   (`BRIDGE_INLINE=1`: `PT_HPU_DISABLE_ASYNC_COLLECTIVE=1`). Arm order: tiny-stock, tiny-lean; real-stock,
-   real-lean (the main comparison first); tiny-lean-inline (tokens against tiny-stock, `--ref-arm`);
-   real-lean-inline if its tiny arm passed. This agent's waiter fetches `00181-real8-bridge-headline2-<arm>/` and
-   the verdicts. Not in 00181 (coordinator, 03:50 UTC: its hold stays 65 min, build 4's headline follows):
-   native-replay's `lean3a-8f6f7faf88dc` (lean3t + no GIL release for inputs whose event is done, no argument
-   building for logs and traces that are off); it goes into the next bridge job with whatever 00181's sub-timers say
-   to cut next, ideally on build 4's image (`bridge_headline_job.sh` takes the image and `EXTRA=<build id>`). To read: the steady ms per step at 32, 8, 1 (greedy and sampled) of
-   both real arms from their `scaling.json` (or the `MEAS`/`SAMPLED` lines of `arm.log`), and
-   `python3 -I reports/collectives/probes/replay_timing_table.py <real-lean folder>` (phases; `n_*` tensor counts;
-   `sub_*` sub-timers, nested): `run_prep` should be back near 2 us; if `unattributed` (total minus the phase sum; 4.3 us for lean in 00174) rises by about 12 us instead,
-   the frees only moved (native-replay).
+1. Card results so far: 00160 PASS, 00174 and 00181 ok (section 7), each sent to the coordinator and
+   native-replay. **Waiting: 00188** (section 7; this agent's waiter fetches its seven arms, the verdicts and
+   `00188-real8-bridge-vendor-spinner.txt` into `reports/collectives/card/`; else `bin/farm fetch collectives 00188
+   00188-real8-bridge-vendor-<arm>...` and `bin/node-scp :farm/collectives/results/00188-real8-bridge-vendor-
+   {verdicts,spinner}.txt <dir>/`). Report (1) and (2) to the coordinator first, then lean3a's sub-timers
+   (`python3 -I reports/collectives/probes/replay_timing_table.py <real-lean folder>`) to native-replay. Drop the
+   protective image tags when no job needs them: `sudo -n docker rmi farm-collectives-int:d00c0a9a3e18
+   farm-collectives-int:30f4e37ef08c` on the node.
 2. **PR #19 merged at 04:05 UTC** (program head 22ec5ea3): the gated snapshot 04f690be (gate 88 files, 0 red; tool
    tests 10 pass; card 00160 and 00174) from its own branch `feat/flash-next-gaudi-collectives-bridge-gated`. The
    branch has merged the new head (214125e7). The next PR: the scripts' later features (late-bound settings,
