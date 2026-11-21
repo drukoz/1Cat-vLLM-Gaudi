@@ -31,13 +31,16 @@ from pathlib import Path
 
 RECIPE_K = 3
 SPEC_SIZES = (3, 4, 5)  # drafted tokens per step: the recipe and the sizes above it
-PROVEN_NOT_SERVED = ()  # of those, the sizes the platform's validator still refuses at startup
+PROVEN_NOT_SERVED = ()  # of those, the sizes the platform's validator still refuses at startup (MTP)
+# n-gram lookup has no draft layer, so its server takes deeper drafts (platform.FLASH_NEXT_MAX_SPECULATIVE_TOKENS):
+# the n-gram tests also run k = 8, past the fused verify op's 6 nodes (the torch recurrence verifies 9 rows).
+NGRAM_SPEC_SIZES = (3, 4, 5, 8)
+NGRAM_PROVEN_NOT_SERVED: tuple[int, ...] = ()
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 
-# (method, prefix caching) of the configurations the tests run; n-gram with prefix caching is refused for
-# another reason and no test runs it.
-_CONFIGURATIONS = (("mtp", False), ("mtp", True), ("ngram", False))
+# (method, prefix caching) of the configurations the tests run.
+_CONFIGURATIONS = (("mtp", False), ("mtp", True), ("ngram", False), ("ngram", True))
 
 _CHILD = r"""
 import json, os, sys
@@ -93,7 +96,8 @@ def startup_refusal(k: int, method: str = "mtp", prefix_caching: bool = False) -
     ``method``: ``None`` when it starts, else the validator's error message."""
     key = f"{method}/{int(prefix_caching)}/{k}"
     if key not in _answers:
-        cases = [(m, pc, size) for (m, pc) in _CONFIGURATIONS for size in SPEC_SIZES]
+        cases = [(m, pc, size) for (m, pc) in _CONFIGURATIONS
+                 for size in (NGRAM_SPEC_SIZES if m == "ngram" else SPEC_SIZES)]
         if (method, prefix_caching, k) not in cases:
             cases.append((method, prefix_caching, k))
         _ask(cases)
@@ -104,10 +108,11 @@ def require_startup(k: int, method: str = "mtp", prefix_caching: bool = False) -
     """Fail when the HPU platform's answer for this speculative size is not the one the tests assume:
     a served size it refuses, or a ``PROVEN_NOT_SERVED`` size it has started to accept."""
     reason = startup_refusal(k, method, prefix_caching)
-    if k in PROVEN_NOT_SERVED:
+    if k in (NGRAM_PROVEN_NOT_SERVED if method == "ngram" else PROVEN_NOT_SERVED):
         if reason is None:
             raise AssertionError(f"the HPU platform now starts Flash-Next with {method} and "
-                                 f"num_speculative_tokens={k}: remove {k} from PROVEN_NOT_SERVED in "
+                                 f"num_speculative_tokens={k}: remove {k} from "
+                                 f"{'NGRAM_PROVEN_NOT_SERVED' if method == 'ngram' else 'PROVEN_NOT_SERVED'} in "
                                  "tests/unit_tests/flash_next_spec_sizes.py")
         return
     if reason is not None:

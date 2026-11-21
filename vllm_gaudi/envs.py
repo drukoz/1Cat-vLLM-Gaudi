@@ -560,6 +560,11 @@ if TYPE_CHECKING:
     VLLM_HPU_DECODE_CUT_INTERVAL: int = 0  # 0 (default) decode keeps the per-layer cuts, N cut every N-th layer
     VLLM_HPU_GRAPH_ASYNC_REPLAY: int = 0  # 0 (default) the model's HPU graph replays synchronously, 1 asynchronously
     VLLM_HPU_WORKER_CPU_PIN: int = 0  # WorkerCpuPin: 0 off (default), 1 each worker on its CPU share, 2 and its own CPU
+    VLLM_HPU_FLASH_NEXT_SPEC_LOOKUP: int = 0  # SpecLookupMode: 0 off (MTP drafts), 1 hybrid, 2 lookup only
+    VLLM_HPU_FLASH_NEXT_LOOKUP_MIN_NGRAM: int = 3  # hybrid lookup: shortest suffix n-gram matched
+    VLLM_HPU_FLASH_NEXT_LOOKUP_MAX_NGRAM: int = 8  # hybrid lookup: longest suffix n-gram matched
+    VLLM_HPU_FLASH_NEXT_LOOKUP_ORACLE: str = ""  # rehearsals only: a file of recorded streams answers the search
+    VLLM_HPU_FLASH_NEXT_NGRAM_PLAIN_STEPS: int = 0  # 0 an n-gram step always verifies, 1 plain when nobody drafts
     VLLM_HPU_VOCAB_PARALLEL_LOGITS: int = 0  # VocabParallelMode: 0 logits all-gather (default), 1 greedy, 2 candidates
     VLLM_HPU_REPLICATED_EMBEDDING: int = 0  # 0 vocabulary-sharded token embedding (default), 1 one full copy per rank
     VLLM_HPU_MTP_REPLICATED_FC: int = 0  # 0 the MTP fc linears shard and all-gather (default), 1 unsharded
@@ -2169,6 +2174,33 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_HPU_WORKER_CPU_PIN":
     lambda: int(os.environ.get("VLLM_HPU_WORKER_CPU_PIN", "0")),
 
+    # Flash-Next speculation: prompt lookup beside the MTP drafter (vllm_gaudi/v1/spec_decode/flash_next_lookup.py).
+    # 0 (default) = the MTP drafts, the lookup hook is not installed. 1 = hybrid: with the MTP method, a decode request
+    # whose last n tokens (n from VLLM_HPU_FLASH_NEXT_LOOKUP_MAX_NGRAM down to VLLM_HPU_FLASH_NEXT_LOOKUP_MIN_NGRAM)
+    # occur earlier in its prompt or output gets the continuation after the earliest occurrence of the longest
+    # match (vLLM's n-gram search; up to k tokens, padded with the empty draft -1 to k) instead of the MTP drafts;
+    # the MTP drafter still runs every step. 2 = lookup only (the continuation, else k empty drafts), for
+    # measurements. With 1 or 2 a request may pick its own mode with vllm_xargs {"spec_lookup": 0, 1 or 2}. Any
+    # other value is 0.
+    "VLLM_HPU_FLASH_NEXT_SPEC_LOOKUP":
+    lambda: int(os.environ.get("VLLM_HPU_FLASH_NEXT_SPEC_LOOKUP", "0")),
+    "VLLM_HPU_FLASH_NEXT_LOOKUP_MIN_NGRAM":
+    lambda: int(os.environ.get("VLLM_HPU_FLASH_NEXT_LOOKUP_MIN_NGRAM", "3")),
+    "VLLM_HPU_FLASH_NEXT_LOOKUP_MAX_NGRAM":
+    lambda: int(os.environ.get("VLLM_HPU_FLASH_NEXT_LOOKUP_MAX_NGRAM", "8")),
+    # Card rehearsals on the tiny model only (flash_next_lookup.LookupOracle): the path of a JSON file of token
+    # streams recorded without speculation; the n-gram search (the ngram method, and the lookup beside MTP) then
+    # drafts each stream's own continuation, so drafts are accepted on a model that never repeats its context.
+    # Empty (default) = no oracle. Never set on a production server.
+    "VLLM_HPU_FLASH_NEXT_LOOKUP_ORACLE":
+    lambda: os.environ.get("VLLM_HPU_FLASH_NEXT_LOOKUP_ORACLE", ""),
+    # The n-gram method on Flash-Next: 0 (default) gives a request without a match the 1-token placeholder draft
+    # (-1, never accepted), so every decode step is a verification step at least 2 rows wide per request; 1 keeps
+    # the placeholder only when another request of the step drafts, and a step in which no request drafts runs as
+    # a plain decode step (1 row per request; the runner's plain-step path after a verification). Any other value
+    # is 0.
+    "VLLM_HPU_FLASH_NEXT_NGRAM_PLAIN_STEPS":
+    lambda: int(os.environ.get("VLLM_HPU_FLASH_NEXT_NGRAM_PLAIN_STEPS", "0")),
     # Collective cuts of a tensor-parallel Flash-Next step (docs/design/flash-next/collectives.md). All default 0.
     # VLLM_HPU_VOCAB_PARALLEL_LOGITS: 0 = every consumer gets the all-gathered logits; 1 = arg-max consumers
     # (plain greedy decode, MTP drafts, greedy MTP verification) reduce each rank's vocabulary shard first and
