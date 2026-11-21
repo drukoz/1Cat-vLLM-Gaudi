@@ -30,9 +30,11 @@ def _f(value, fmt="%.1f"):
 
 def rows_of(arm: str, data: dict) -> list:
     rows = []
-    for kind in ("levels", "sampled"):
+    for kind in ("levels", "sampled", "ctx"):
         for r in data.get(kind) or []:
-            row = {"arm": arm, "mode": "sampled" if kind == "sampled" else "greedy", "streams": r.get("streams"),
+            mode = {"levels": "greedy", "sampled": "sampled"}.get(kind) or "greedy, ~%s-token prompts" % (
+                r.get("prompt_tokens_p50") or r.get("ctx_tokens"))
+            row = {"arm": arm, "mode": mode, "streams": r.get("streams"),
                    "rep": r.get("rep", 0), "ok": r.get("ok"), "errors": r.get("errors")}
             if r.get("ok"):
                 steady = r.get("steady_ms_per_token_p50")

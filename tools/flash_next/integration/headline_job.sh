@@ -44,7 +44,9 @@
 # HEADLINE_ROUNDS (measured rounds per level, greedy and sampled, after the warm round; default 2; 0 = one per level
 # and two at the top level, as in job 00128), HEADLINE_LEVELS (default 32,8,1: the 32-stream numbers first),
 # HEADLINE_MTP_SAMPLED=1 (the MTP server with VLLM_HPU_SPEC_SAMPLED_VERIFY=1 and a SAMPLED 32-stream level last;
-# HEADLINE_MTP_SAMPLED_LEVELS), HEADLINE_TINY_SPEC=K (the tiny gate with --spec K). MTP arms are mtp<K>
+# HEADLINE_MTP_SAMPLED_LEVELS), HEADLINE_MTP_CTX=N:TOKENS (one greedy round of N streams with long prompts on
+# the MTP server, after its short greedy levels and before its sampled levels), HEADLINE_TINY_SPEC=K (the tiny gate
+# with --spec K). MTP arms are mtp<K>
 # (k = K drafted tokens), mtp<K>-32 (32 streams only) and mtp<K>-noshard.
 # Results: $FARM_OUT/<arm>/ (versions.txt, server0.log, scaling.json, probe.log, summary.json) and
 # $FARM_OUT/headline.md + headline.json (headline_table.py), written after every arm.
@@ -201,7 +203,7 @@ while [ "$i_arm" -lt "${#ARMS[@]}" ]; do
                 VLLM_HPU_MTP_DRAFT_LOOP="${VLLM_HPU_MTP_DRAFT_LOOP:-1}" VLLM_HPU_MTP_CHUNK_KV="${VLLM_HPU_MTP_CHUNK_KV:-1}" \
                 bash "$HERE/serve_probe.sh" --out "$OUT/$arm" --mtp "$k" --levels "$levels" --tokens "$TOKENS" \
                 --warm-tokens "$WARM" --repeat-top 1 --no-mintok-check "${sampled_args[@]}" \
-                --probe-arg "--rounds=$ROUNDS"
+                --probe-arg "--rounds=$ROUNDS" ${HEADLINE_MTP_CTX:+--ctx "$HEADLINE_MTP_CTX"}
             ;;
         *)
             echo "headline_job: unknown arm $arm (nospec, mtp3, mtp3-32)"

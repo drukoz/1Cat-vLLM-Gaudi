@@ -64,7 +64,8 @@ def measured_round(args, n, ntok, **kw):
         s = m["spec"] or {}
         rates = ", ".join("%.3f" % r for r in (s.get("position_rates") or []) if r is not None)
         print("SPEC  N=%-3d%s acceptance length %s, tokens per chunk %s, draft acceptance %s, per position [%s], "
-              "drafts %s" % (n, " sampled" if kw.get("sampled") else "",
+              "drafts %s" % (n, (" sampled" if kw.get("sampled") else "") +
+                             ((" ctx%d" % kw["ctx_tokens"]) if kw.get("ctx_tokens") else ""),
                              ("%.3f" % s["acceptance_length"]) if s.get("acceptance_length") else "-",
                              ("%.2f" % m["tokens_per_chunk_p50"]) if m.get("tokens_per_chunk_p50") else "-",
                              ("%.3f" % s["draft_acceptance_rate"]) if s.get("draft_acceptance_rate") else "-",
@@ -75,7 +76,7 @@ WORDS = ("lighthouse keeper harbour storm lantern rope gull tide anchor compass 
          "orchard river signal mapmaker bridge clock").split()
 
 
-def prompt_for(i, ctx_tokens=0):
+def prompt_for(i, ctx_tokens=0, salt=""):
     head = "Stream %d. Write a long, detailed story about a %s named %s who finds a %s. Begin:" % (
         i, WORDS[i % len(WORDS)], WORDS[(i * 7 + 3) % len(WORDS)].title(), WORDS[(i * 3 + 5) % len(WORDS)])
     if ctx_tokens <= 0:
@@ -89,7 +90,8 @@ def prompt_for(i, ctx_tokens=0):
         filler.append(w)
         n += 1.3
         k += 1
-    return "Stream %d notes: " % i + " ".join(filler) + "\n\n" + head
+    # salt: the warm and the measured long-prompt round start differently, so neither reads the other's prefix cache.
+    return "%sStream %d notes: " % (salt, i) + " ".join(filler) + "\n\n" + head
 
 
 def one_stream(host, port, model, prompt, ntok, out, idx, barrier, timeout_s, mintok=False, sampled=False):
@@ -138,12 +140,12 @@ def one_stream(host, port, model, prompt, ntok, out, idx, barrier, timeout_s, mi
     out[idx] = rec
 
 
-def run_round(args, n, ntok, ctx_tokens=0, mintok=None, sampled=False):
+def run_round(args, n, ntok, ctx_tokens=0, mintok=None, sampled=False, salt=""):
     mintok = args.min_tokens if mintok is None else mintok
     out = [None] * n
     barrier = threading.Barrier(n)
     threads = [threading.Thread(target=one_stream,
-                                args=(args.host, args.port, args.model, prompt_for(i, ctx_tokens), ntok, out, i,
+                                args=(args.host, args.port, args.model, prompt_for(i, ctx_tokens, salt), ntok, out, i,
                                       barrier, args.timeout, mintok, sampled), daemon=True) for i in range(n)]
     t_start = time.perf_counter()
     for t in threads:
@@ -309,13 +311,10 @@ def main():
                       m["aggregate_tok_s"] or 0), flush=True)
         else:
             print("MINTOK N=%d FAILED: %s" % (n, m.get("error_samples")), flush=True)
-    if not args.interleave_sampled:
-        for n in (sampled_levels if levels and not args.no_sampled_check else []):
-            sampled_level(n)
     if args.ctx:
         n, ctx = (int(x) for x in args.ctx.split(":"))
-        w = run_round(args, n, args.warm_tokens, ctx)
-        m = run_round(args, n, args.tokens, ctx)
+        w = run_round(args, n, args.warm_tokens, ctx, salt="Warm round. ")
+        m = measured_round(args, n, args.tokens, ctx_tokens=ctx, salt="Measured round. ")
         m["warm"] = {k: w.get(k) for k in ("ok", "errors", "wall_s", "ms_per_token_p50", "ttft_p50_s")}
         results["ctx"].append(m)
         save()
@@ -327,6 +326,9 @@ def main():
                       w.get("ttft_p50_s")), flush=True)
         else:
             print("CTX FAILED: %s" % m.get("error_samples"), flush=True)
+    if not args.interleave_sampled:
+        for n in (sampled_levels if levels and not args.no_sampled_check else []):
+            sampled_level(n)
     save()
     return 0
 
