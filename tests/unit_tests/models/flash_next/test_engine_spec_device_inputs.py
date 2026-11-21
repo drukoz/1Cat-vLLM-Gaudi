@@ -7,7 +7,9 @@ which the device-made inputs need), prefix caching on and off.
 * ``=1``: every verification step that continues the previous one gets its ids, positions, KV slots, GDN accepted
   counts and PLE context made on the device from the previous step's, and they equal the host-made ones;
 * ``=2``: the model gets the device-made ones, and the streams equal the engine's without the flag;
-* off: nothing is made and nothing is logged.
+* off: nothing is made and nothing is logged;
+* with mtp-draft-graph's chain (``VLLM_HPU_MTP_DRAFT_CHAIN=1``): the acceptance comes from the chain's device output
+  (``_mtp_chain_out``) instead of the host's read, with the same results.
 
 Each engine run is a child process of about 20 s.
 """
@@ -25,6 +27,7 @@ from tests.unit_tests import hpu_cpu_engine
 K = 2
 ACCEPT = [2, 0, 1, 2, 1, 0]
 ENV = {"VLLM_HPU_FLASH_NEXT_DECODE_METADATA": "1", "VLLM_HPU_MTP_DRAFT_LOOP": "1"}
+CHAIN = {"VLLM_HPU_MTP_DRAFT_GRAPH": "1", "VLLM_HPU_MTP_DRAFT_CHAIN": "1"}
 FLAG = "VLLM_HPU_FLASH_NEXT_SPEC_DEVICE_INPUTS"
 STATS = re.compile(FLAG + r"=(\d): (\d+) verification steps, (\d+) advanced on the device, (\d+) checked, (\d+) with")
 
@@ -43,6 +46,12 @@ def runs(tiny_checkpoint, tmp_path_factory):
             record = hpu_cpu_engine.run(tiny_checkpoint, out / f"{name}.json", *options, env={**ENV, FLAG: mode})
             record["log"] = Path(str(out / f"{name}.json") + ".log").read_text(encoding="utf-8", errors="replace")
             result[name] = record
+    options = ("--k", str(K), "--oracle", str(oracle))
+    for mode in ("0", "1", "2"):
+        name = f"m{mode}_chain"
+        record = hpu_cpu_engine.run(tiny_checkpoint, out / f"{name}.json", *options, env={**ENV, **CHAIN, FLAG: mode})
+        record["log"] = Path(str(out / f"{name}.json") + ".log").read_text(encoding="utf-8", errors="replace")
+        result[name] = record
     return result
 
 
@@ -56,7 +65,7 @@ def _last_stats(log: str) -> tuple:
     return tuple(int(v) for v in found[-1])
 
 
-@pytest.mark.parametrize("suffix", ["", "_nopc"], ids=["prefix_caching", "no_prefix_caching"])
+@pytest.mark.parametrize("suffix", ["", "_nopc", "_chain"], ids=["prefix_caching", "no_prefix_caching", "chain"])
 def test_check_mode_finds_every_device_made_input_equal_to_the_hosts(runs, suffix):
     log = runs["m1" + suffix]["log"]
     assert "device-made inputs differ" not in log
@@ -66,7 +75,7 @@ def test_check_mode_finds_every_device_made_input_equal_to_the_hosts(runs, suffi
     assert "keeps the host's inputs" not in log  # nothing refused the device-made inputs
 
 
-@pytest.mark.parametrize("suffix", ["", "_nopc"], ids=["prefix_caching", "no_prefix_caching"])
+@pytest.mark.parametrize("suffix", ["", "_nopc", "_chain"], ids=["prefix_caching", "no_prefix_caching", "chain"])
 def test_use_mode_gives_the_streams_of_the_engine_without_the_flag(runs, suffix):
     off, check, use = runs["m0" + suffix], runs["m1" + suffix], runs["m2" + suffix]
     assert _streams(check) == _streams(off)
@@ -74,6 +83,14 @@ def test_use_mode_gives_the_streams_of_the_engine_without_the_flag(runs, suffix)
     mode, _, advanced, checked, _ = _last_stats(use["log"])
     assert mode == 2 and advanced >= 16 and checked == 0
     assert use["committed"], "no verification step ran"
+
+
+def test_the_chain_ran_and_gave_the_acceptance(runs):
+    for mode in ("0", "1", "2"):
+        log = runs[f"m{mode}_chain"]["log"]
+        assert "the draft is chained behind the verification" in log, mode
+        assert "keeps the draft after the host read" not in log, mode  # every decode step chained
+    assert _streams(runs["m0_chain"]) == _streams(runs["m0"])
 
 
 def test_the_flag_off_makes_nothing(runs):
