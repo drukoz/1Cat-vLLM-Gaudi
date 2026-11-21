@@ -529,6 +529,10 @@ if TYPE_CHECKING:
     VLLM_HPU_FUSED_GREEDY_LOGITS: bool = False
     VLLM_HPU_FLASH_NEXT_QSA_MODE: int = 0
     VLLM_HPU_FLASH_NEXT_QSA_PREFILL_TILE: int = 2048
+    VLLM_HPU_FLASH_NEXT_DECODE_METADATA: int = 0  # 0 dense paged-attention buffers (default), 1 sparse-QSA only
+    VLLM_HPU_RUNTIME_SWITCH_FILE: str = ""  # a file of per-step flags a running server rereads (an A/B on one server)
+    VLLM_HPU_CANDIDATE_SAMPLING: int = 0  # 0 vLLM's sampler (default), 1 sampling over candidates, 2 also speculative steps
+    VLLM_HPU_SAMPLER_REQUEST_PARAMS: int = 0  # 0 as before (ignored on HPU), 1 min_tokens/logit_bias/min_p per row
     VLLM_HPU_QSA_FUSED: int = 0  # QsaFusedMode: 0 torch (default), 1 torch data flow, 2 TPC kernels, 3 + top-k kernels
     VLLM_HPU_QSA_INDEXER_SHARD: int = 0  # QsaShardMode: 0 replicated (default), 1 by request (int32), 2 by request (fp32)
     VLLM_HPU_QSA_TABLE_WIDTH: int = 0  # decode block-table columns: 0 the engine's longest context (default), 1 the batch's
@@ -546,6 +550,13 @@ if TYPE_CHECKING:
     VLLM_HPU_MOE_DENSE_MAX_TOKENS: int = 512  # with VLLM_HPU_MOE_DENSE=1: the most tokens a step runs dense
     VLLM_HPU_MOE_DENSE_MIN_TOKENS: int = 17  # with VLLM_HPU_MOE_DENSE=1: the fewest tokens a step runs dense
     VLLM_HPU_COLLECTIVE_MARK_STEP: int = 1  # 1 (default) mark_step() before every HPU collective, 0 none
+    VLLM_HPU_STEP_TIMING: int = 0  # StepTimingMode: 0 off (default), 1 spans, 2 sync counters, 3 device waits
+    VLLM_HPU_STEP_TIMING_COMPONENTS: int = 0  # 0 (default) none, 1 mode 3 also waits around every model component
+    VLLM_HPU_STEP_TIMING_EVERY: int = 100  # steps per log line and JSON record of the step timer
+    VLLM_HPU_STEP_TIMING_DIR: str = ""  # folder of the step timer's JSON files ("" = the working directory)
+    VLLM_HPU_DECODE_CUT_INTERVAL: int = 0  # 0 (default) decode keeps the per-layer cuts, N cut every N-th layer
+    VLLM_HPU_GRAPH_ASYNC_REPLAY: int = 0  # 0 (default) the model's HPU graph replays synchronously, 1 asynchronously
+    VLLM_HPU_WORKER_CPU_PIN: int = 0  # WorkerCpuPin: 0 off (default), 1 each worker on its CPU share, 2 and its own CPU
     VLLM_HPU_VOCAB_PARALLEL_LOGITS: int = 0  # VocabParallelMode: 0 logits all-gather (default), 1 greedy, 2 candidates
     VLLM_HPU_REPLICATED_EMBEDDING: int = 0  # 0 vocabulary-sharded token embedding (default), 1 one full copy per rank
     VLLM_HPU_MTP_REPLICATED_FC: int = 0  # 0 the MTP fc linears shard and all-gather (default), 1 unsharded
@@ -1885,6 +1896,46 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_HPU_FLASH_NEXT_QSA_PREFILL_TILE":
     lambda: int(os.environ.get("VLLM_HPU_FLASH_NEXT_QSA_PREFILL_TILE", "2048")),
 
+    # Flash-Next decode metadata under sparse QSA (VLLM_HPU_FLASH_NEXT_QSA_MODE=1). 0 (default) = a decode or
+    # verification step builds the dense paged-attention buffers (block_list, block_groups, block_usage and,
+    # in the graph, block_mapping and attn_bias) like any model. 1 = it does not build them, since sparse QSA
+    # decode reads only block_table and slot_mapping: one block-table row per request built with numpy, no
+    # identity block resolve, the decode bucket chosen by batch size only, and the same for the MTP drafter's
+    # per-step metadata (v1/worker/flash_next_decode_metadata.py). A runner that cannot use it (another model,
+    # dense QSA, defragmenter on, ...) logs the reason once and keeps the dense buffers. Any other value is 0.
+    "VLLM_HPU_FLASH_NEXT_DECODE_METADATA":
+    lambda: int(os.environ.get("VLLM_HPU_FLASH_NEXT_DECODE_METADATA", "0")),
+
+    # An operator's A/B on one server (v1/worker/runtime_switches.py). Unset (default): nothing. A path: every
+    # worker looks at that file before each step and, when it changed, takes the flags it lists (NAME=VALUE lines).
+    # Only flags the runner reads at every step can be switched: VLLM_HPU_FLASH_NEXT_DECODE_METADATA,
+    # VLLM_HPU_FUSED_GREEDY_LOGITS, VLLM_HPU_CANDIDATE_SAMPLING and VLLM_HPU_VOCAB_PARALLEL_LOGITS. Replace the
+    # file with a rename while no request runs.
+    "VLLM_HPU_RUNTIME_SWITCH_FILE":
+    lambda: os.environ.get("VLLM_HPU_RUNTIME_SWITCH_FILE", "").strip(),
+
+    # The sampled decode step (requests with a temperature above zero: the checkpoint's default sampling is
+    # temperature 1.0, top_k 20, top_p 0.95). 0 (default) = vLLM's sampler: a full sort of [rows, vocabulary],
+    # a scatter back and noise over the vocabulary on every step. 1 = sampling over candidates
+    # (v1/sample/candidate_sampling.py): the 64 largest logits per row are taken in the LM-head region and
+    # temperature, top-k, top-p and the draw run on [rows, 64] with noise made on the host; no sampler graph. A
+    # step whose requests are outside its conditions (top_k unset or above 64, min_p, penalties, logit_bias,
+    # logprobs, a custom logits processor, speculation unless 2, structured output) keeps vLLM's sampler. Same
+    # distribution as vLLM's; the random stream differs. 2 = 1, and the decode steps of a speculative server with
+    # deterministic drafts (MTP, n-gram) sample every verification row and the bonus row in the region, then the
+    # runner verifies the drafts against those draws (greedy_rejection_sample_from_tokens): speculative sampling
+    # exactly for one-hot drafts. Needs mtp-card-ready's VLLM_HPU_SPEC_SAMPLED_VERIFY at 1 or 2, which admits
+    # sampled requests and serves the steps the region refuses; without it 2 acts as 1. Any other value is 0.
+    "VLLM_HPU_CANDIDATE_SAMPLING":
+    lambda: int(os.environ.get("VLLM_HPU_CANDIDATE_SAMPLING", "0")),
+
+    # min_tokens, logit_bias and min_p on the general sampler path (v1/sample/request_params.py). 0 (default) = as
+    # before: on HPU vLLM's processors for them never receive the batch's state, so all three are ignored. 1 = the
+    # runner applies each row's own request's min_tokens mask, logit_bias and min_p cut to the logits before vLLM's
+    # sampler (fixed shapes, host-made int64 indices). Any other value is 0.
+    "VLLM_HPU_SAMPLER_REQUEST_PARAMS":
+    lambda: int(os.environ.get("VLLM_HPU_SAMPLER_REQUEST_PARAMS", "0")),
+
     # Flash-Next sparse QSA decode (QsaFusedMode, vllm_gaudi/models/qwen4_exp/qsa_fused_path.py).
     # 0 (default) = the torch path. 1 = the restructured torch data flow: the indexer scores each
     # request's compressed keys once for all its rows (one whole-block gather per request, not one
@@ -2025,6 +2076,54 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # so 99 graph cuts; only use it when the served tokens still match a reference (tiny_smoke.sh --env).
     "VLLM_HPU_COLLECTIVE_MARK_STEP":
     lambda: int(os.environ.get("VLLM_HPU_COLLECTIVE_MARK_STEP", "1")),
+
+    # Step timer of the HPU worker, model runner and engine core (vllm_gaudi/extension/step_timing.py).
+    # 0 (default) = off: no timer exists and nothing is timed, patched or written. 1 = the host spans of
+    # every step (input preparation, the forward call, the launches, sampling, the wait for the device,
+    # the engine's turn between steps), tagged with the step kind and the row count, plus the collectives
+    # per step. 2 = 1 and the debug counters of host synchronisation points (.item(), .cpu(), .tolist(),
+    # copies between host and device, mark_step calls) with their source lines. 3 = 1 with a wait for the
+    # device around every collective and after the forward and the sampler, which gives the device time
+    # of every segment (the step itself is slower in this mode). Any other value is 0 (there is no mode 4:
+    # its op counting hung a TP8 server, job 00013). A process started with a nonzero value rereads
+    # <dir>/step_timing.mode (one integer) when a step starts after two idle seconds.
+    "VLLM_HPU_STEP_TIMING":
+    lambda: int(os.environ.get("VLLM_HPU_STEP_TIMING", "0")),
+    # 1 = mode 3 of the step timer also waits for the device where a model component starts and ends
+    # (hyper-connection, GDN, QSA indexer and attention, MoE and its expert op, PLE), so each component's
+    # device, collective and host time is measured on its own. For a server without HPU graphs
+    # (--enforce-eager): a replayed graph runs no Python. 0 (default) = the model is not touched.
+    "VLLM_HPU_STEP_TIMING_COMPONENTS":
+    lambda: int(os.environ.get("VLLM_HPU_STEP_TIMING_COMPONENTS", "0")),
+    # Steps of one kind and row count per log line and JSON record of the step timer.
+    "VLLM_HPU_STEP_TIMING_EVERY":
+    lambda: int(os.environ.get("VLLM_HPU_STEP_TIMING_EVERY", "100")),
+    # Folder of the step timer's files (step_timing_<role>_r<rank>_<pid>.jsonl); "" is the working directory.
+    "VLLM_HPU_STEP_TIMING_DIR":
+    lambda: os.environ.get("VLLM_HPU_STEP_TIMING_DIR", ""),
+    # The mark_step() that modify_model_layers hooks after every VLLM_CONFIG_HIDDEN_LAYERS-th decoder layer,
+    # in decode and verification forwards (attention metadata with is_prompt=False). 0 (default) keeps the
+    # hooks as they are for every forward. N >= 1 cuts a decode forward after every N-th layer only; a value
+    # above the layer count (1000) leaves a captured decode graph with no per-layer cut. Prompt forwards keep
+    # VLLM_CONFIG_HIDDEN_LAYERS. docs/design/flash-next/native-replay.md.
+    "VLLM_HPU_DECODE_CUT_INTERVAL":
+    lambda: int(os.environ.get("VLLM_HPU_DECODE_CUT_INTERVAL", "0")),
+
+    # The model's HPU graph (wrap_in_hpu_graph in lazy mode): 0 (default) replays synchronously, the caller's
+    # thread issuing every captured recipe and collective before the forward returns; 1 passes asynchronous=True,
+    # so the forward returns once the replay is queued and the logits and sampler ops are issued meanwhile.
+    # docs/design/flash-next/native-replay.md.
+    "VLLM_HPU_GRAPH_ASYNC_REPLAY":
+    lambda: int(os.environ.get("VLLM_HPU_GRAPH_ASYNC_REPLAY", "0")),
+
+    # Where the HPU worker processes run on the host (vllm_gaudi/v1/worker/hpu_worker_cpus.py). 0 (default) leaves
+    # them to the kernel. 1: after torch.hpu.set_device every thread of a worker keeps to one equal share of the
+    # CPUs the server may use, the share at its module's position among HABANA_VISIBLE_MODULES (the rank's
+    # without them); threads started later inherit it. 2: as 1, and after load and warmup the thread that runs
+    # the model has the share's first CPU for itself, the worker's other threads the rest.
+    # docs/design/flash-next/native-replay.md.
+    "VLLM_HPU_WORKER_CPU_PIN":
+    lambda: int(os.environ.get("VLLM_HPU_WORKER_CPU_PIN", "0")),
 
     # Collective cuts of a tensor-parallel Flash-Next step (docs/design/flash-next/collectives.md). All default 0.
     # VLLM_HPU_VOCAB_PARALLEL_LOGITS: 0 = every consumer gets the all-gathered logits; 1 = arg-max consumers
