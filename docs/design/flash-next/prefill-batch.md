@@ -5,33 +5,38 @@ Track `prefill-batch`, worktree `/Volumes/Storage/Claude/gaudi-work/wt/prefill-b
 forward for Flash-Next's hybrid stack, behind a default-off flag. The track's report lives here (the harness refuses
 report files under `reports/`); scratch tools are in `/Volumes/Storage/Claude/gaudi-work/reports/prefill-batch/tools/`.
 
-## Handoff (if this agent stops) - updated 13:13 UTC 2026-11-21
+## Handoff (if this agent stops) - updated 13:27 UTC 2026-11-21
 
 - **v1 is built and CPU-proven; two card jobs are queued.** Flag `VLLM_HPU_PREFILL_BATCH=N` (default 0), switchable
   at run time through `VLLM_HPU_RUNTIME_SWITCH_FILE` (a server started at N; the switch file caps it, 0 = off).
-- **Branches.** `feat/flash-next-gaudi-prefill-batch` (base `8ead88c7` = program head 4d66755e + prefill's work):
-  `ad91fa5e` design note, `41dae6de` v1, `0c482379` chunk KV fill shape, `3a8b710c` runtime switch + merge counter +
-  refusal under `VLLM_HPU_PREFILL_CHECKPOINT`, `f3286aaf` card tools, then the engine test (section "CPU proof").
-  Card branch `feat/flash-next-gaudi-prefill-batch-b5` = build 5 (`eb21ac75`) + the same four code/tool commits
-  cherry-picked (`b51c25c5`, `cbe419f5`, `d4285cce` with the switch-list conflict resolved to build 5's list +
-  this flag, `e79272b6`); its worktree is `reports/prefill-batch/b5-tree`. Image `farm-prefill-batch:e79272b6dab4`.
-- **Card jobs (submitted 13:05 UTC, both `all`, placed by the coordinator):**
-  - `00257 tiny8-gate-b5` (25 min): `python3 tools/flash_next/prefill_batch/tiny_gate.py --mtp 0,2`. Pass = every
-    merged reference copy reproduces the HF reference, on equals off, merged forwards in on and none in off.
-    Fetch: `bin/farm fetch prefill-batch 00257 00257-tiny8-gate-b5`; read `summary.json`, `<server>/streams.json`.
-  - `00258 real8-b5-pb-ab` (70 min hold): `ab_job.sh b5_ab.plan` under the placement wrap, 00243's settings
+- **Branches.** `feat/flash-next-gaudi-prefill-batch` (base `8ead88c7` = program head 4d66755e + prefill's work,
+  pushed): design note, v1 (`41dae6de`), chunk KV fill shape (`0c482379`), runtime switch + merge counter + refusal
+  under `VLLM_HPU_PREFILL_CHECKPOINT` (`3a8b710c`), card tools (`f3286aaf`, `818f1dcb`), engine test (`2d977977`),
+  op counts (`e5bf9b8b`), switch hardening (`74c9cd41`). Card branch `feat/flash-next-gaudi-prefill-batch-b5`
+  (pushed) = build 5 `eb21ac75` + the code and tool commits cherry-picked (the switch-list conflict resolved to build
+  5's list + this flag); head `46c3d2ad`, image `farm-prefill-batch:46c3d2adb11c`; worktree
+  `reports/prefill-batch/b5-tree`.
+- **Card jobs (both `all`; the coordinator placed them after integration's 00263, about 18:00 to 21:30 UTC):**
+  - `00257 tiny8-gate-b5` (25 min, image e79272b6dab4; same code): `python3 tools/flash_next/prefill_batch/
+    tiny_gate.py --mtp 0,2`. Pass = every merged reference copy reproduces the HF reference, on equals off (near
+    ties recorded), merged forwards in on and none in off. Read `summary.json`, `<server>/streams.json`.
+  - `00267 real8-b5-pb-ab2` (75 min hold, replaced 00258): `ab_job.sh b5_ab.plan` under the placement wrap
+    (`~/farm/prefill-batch/results/place/`, place_wrap 7b159d11 + place.sh 44273de4), 00243's settings
     (`reports/prefill/slot2/b5_common.env` + `b5_i01off.env`, MTP k = 2, graphs 64,000), `PB_ROWS=8`. Lines: burst
-    probes `b2k` (context 2,048, K = 1, 2, 4, 8) and `b10k` (context 10,240, K = 1, 2, 4, graph knob 70,000), then
-    agent loops `a32-off`, `a32-on`, `a16-on`, `a16-off`. Read: `<line>/burst_probe.json` (saved per removed
-    forward), `<line>/prefill_sweep.md` (TTFT p50/p90/p99, ITL max, uncached tokens per turn, tok/s per stream),
-    `merged.log`, rank-0 `server_events_*.json` (`reports/prefill-batch/tools/bucket_cost.py`, `fwd_table.py`).
-    Fetch: `bin/farm fetch prefill-batch 00258 00258-real8-b5-pb-ab`.
-  - Submit waiters (my pids, in `reports/prefill-batch/logs/submit_*.pid`) copy the results when the jobs end.
+    probes `b2k` (context 2,048, K = 1, 2, 4, 8) and `b10k` (10,240, K = 1, 2, 4, knob 70,000); agent loops
+    `a32-off`, `a32-on`, `a16-on`, `a16-off`; last (may run out of memory) `b10k8` (K = 8, knob 140,000) and
+    `a32-on-g128k` (arm on, knob 128,000). Digest: `python3 -I reports/prefill-batch/tools/digest_ab.py <results>`
+    (burst spans, saved per removed forward, agent tables, merge lines); per-forward costs from the rank-0
+    `server_events_*.json` with `tools/bucket_cost.py`; memory `hlsmi_mem.csv`.
+  - Submit waiters (my pids 36972 for 00257 and 56583 for 00267, files `reports/prefill-batch/logs/submit_*`) copy
+    the results to `reports/prefill-batch/card/` when the jobs end; else `bin/farm fetch prefill-batch <id> <id>-<name>`.
 - **To submit again from the card branch:** `farm sync` takes the committed HEAD of `wt/prefill-batch`; detach it at
   the b5 commit (`git -C wt/prefill-batch checkout --detach <b5 sha>`), submit, wait for the `farm: job` line, then
   `git checkout feat/flash-next-gaudi-prefill-batch` again (never two syncs of this track at once).
 - **Condition (prefill):** the flag is refused while `VLLM_HPU_PREFILL_CHECKPOINT` is on, until prefill's per-row
   checkpoint maps ([groups, target_bs, nphysical_chunks]) land; then drop `prefill_checkpoint_on()` from the refusal.
+- **PR:** after prefill's PR (its branch is my base) is merged: merge the program head, gate (`bin/gate`), open and
+  merge (default off). Gate notes: `tests/unit_tests/test_qwen3_next.py` has two gated-FP8 tests red on the base too.
 - **Split agreed with prefill (a9a36e0116ed6cb7d), sent to the coordinator at about 12:25 UTC.** prefill (a, one
   forward per turn, `VLLM_HPU_PREFILL_CHECKPOINT`): `vllm_gaudi/v1/core/*`, `compute_prefix_caching_block_indices`
   and the mamba / prefix-caching branch of `_form_prefill_batch` (made per row, [target_bs, K]),
