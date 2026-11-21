@@ -4806,6 +4806,8 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         return query_start_loc, ngram_context, host_ngram_ids(tables, token_ids, query_start_loc, ngram_context)
 
     _persistent_inputs = None
+    # VLLM_HPU_VERIFY_LOGITS_IN_GRAPH: the verify graph's [rows] int32 greedy ids of this step, else None.
+    _verify_ids_raw = None
 
     def _upload(self, name: str, source, dtype=None):
         """One per-step input to the device. ``VLLM_HPU_PERSISTENT_INPUTS=1``: into a persistent device tensor per
@@ -6542,6 +6544,9 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             verify_selected = verify_ids = None
             if verify_in_graph:
                 hidden_states, verify_selected, verify_ids = hidden_states
+                # The graph's own [rows] int32 ids, for a consumer's graph that takes them as an input (the MTP draft
+                # chain): a view of them made here would be an unmatched input, one copy per replay.
+                self._verify_ids_raw = verify_ids
         if step_timer is not None:
             step_timer.lap("forward")
             step_timer.phase = "logits"
@@ -7380,6 +7385,7 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             return self.kv_connector_no_forward(scheduler_output, self.vllm_config)
         if not warmup_mode:
             self._gc_step_begin()
+        self._verify_ids_raw = None  # set by this step's verification forward when its ids are made in the graph
         if self._persistent_inputs is not None:
             self._persistent_inputs.begin_step()  # VLLM_HPU_PERSISTENT_INPUTS: this step's uploads, own pairs
 

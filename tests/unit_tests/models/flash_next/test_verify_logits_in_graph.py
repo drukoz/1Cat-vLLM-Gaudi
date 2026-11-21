@@ -66,6 +66,17 @@ def _serve(tiny_checkpoint, reference, flag: int):
             return forward(*args, **kwargs)
 
         runner.model.forward = recording_forward
+        execute_generic = runner._execute_model_generic
+
+        def recording_execute(*args, **kwargs):
+            out = execute_generic(*args, **kwargs)
+            raw = runner._verify_ids_raw
+            if raw is not None:  # the graph's own ids for a consumer graph (the draft chain): int32 [rows]
+                assert raw.dtype == torch.int32 and raw.dim() == 1
+                counts["raw"] = counts.get("raw", 0) + 1
+            return out
+
+        runner._execute_model_generic = recording_execute
 
         class CountingSampler:
 
@@ -94,7 +105,7 @@ def test_the_same_tokens_with_the_region_in_the_forward(tiny_checkpoint, referen
     off_tokens, want, off = _serve(tiny_checkpoint, reference, 0)
     on_tokens, _, on = _serve(tiny_checkpoint, reference, 1)
     assert on_tokens == off_tokens
-    assert off["in_graph"] == 0 and off["rejection"] > 0
-    assert on["in_graph"] >= 4 and on["rejection"] == 0, on
+    assert off["in_graph"] == 0 and off["rejection"] > 0 and off.get("raw", 0) == 0
+    assert on["in_graph"] >= 4 and on["rejection"] == 0 and on.get("raw", 0) == on["in_graph"], on
     # the oracle drafts keep the reference streams (up to the tiny model's near ties, compared off against on above)
     assert sum(off_tokens[r] == want[r] for r in want) >= len(want) - 1
