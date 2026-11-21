@@ -553,10 +553,12 @@ if TYPE_CHECKING:
     VLLM_HPU_HC_FUSED: int = 0  # 0 torch hyper-connections (default), 1 the fused hyper-connection kernels
     VLLM_HPU_MOE_GLUE: int = 0  # 0 torch MoE glue (default), 1 the fused MoE glue kernels
     VLLM_HPU_MOE_GLUE_MERGE_GATE_UP: int = 0  # with VLLM_HPU_MOE_GLUE=1: 1 merges the gate_up GEMM into the gate GEMM
+    VLLM_HPU_FLASH_NEXT_ASYNC_SCHED: int = 0  # 0 Flash-Next without async scheduling (default), 1 with it, 2 also MTP
     VLLM_HPU_HC_FUSED_COPY_MODE: int = 0  # copies before a fused HC op: 0 all, 1 not its own outputs, 2 block output
     VLLM_HPU_HC_FUSED_IL: int = 0  # with VLLM_HPU_HC_FUSED=1: 0 shipped kernels, 1 interleaved gate_mix + combine_norm
     VLLM_HPU_MOE_DENSE: int = 0  # 0 vendor MoE op (default), 1 dense batched FP8 experts up to MAX_TOKENS rows
     VLLM_HPU_MOE_DENSE_MAX_TOKENS: int = 512  # with VLLM_HPU_MOE_DENSE=1: the most tokens a step runs dense
+    VLLM_HPU_MOE_DENSE_MIN_TOKENS: int = 17  # with VLLM_HPU_MOE_DENSE=1: the fewest tokens a step runs dense
     VLLM_HPU_COLLECTIVE_MARK_STEP: int = 1  # 1 (default) mark_step() before every HPU collective, 0 none
     VLLM_HPU_STEP_TIMING: int = 0  # StepTimingMode: 0 off (default), 1 spans, 2 sync counters, 3 device waits
     VLLM_HPU_STEP_TIMING_COMPONENTS: int = 0  # 0 (default) none, 1 mode 3 also waits around every model component
@@ -2120,6 +2122,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_HPU_MOE_GLUE_MERGE_GATE_UP":
     lambda: int(os.environ.get("VLLM_HPU_MOE_GLUE_MERGE_GATE_UP", "0")),
 
+    # Flash-Next and vLLM's async scheduling (the engine schedules step N+1 while step N runs; the worker
+    # prepares and issues step N+1 before step N's sampled tokens reach the host). 0 (default) = the
+    # platform turns async scheduling off for Flash-Next, as before. 1 = Flash-Next keeps vLLM's decision
+    # (on unless --no-async-scheduling) when there is no speculative config; with one it stays off. The
+    # runner then carries the PLE n-gram context of the decode rows on the device and keeps placeholders
+    # for the in-flight tokens. 2 = as 1, and with the Flash-Next MTP draft too: the runner keeps its
+    # synchronous speculative step, the drafts stay on the device for the next step and the scheduler's
+    # optimistic num_computed_tokens is corrected with the accepted counts (v1/worker/flash_next_async.py).
+    # Any other value is 0. See docs/design/flash-next/async-sched.md.
+    "VLLM_HPU_FLASH_NEXT_ASYNC_SCHED":
+    lambda: int(os.environ.get("VLLM_HPU_FLASH_NEXT_ASYNC_SCHED", "0")),
+
     # (Declared here because tests pin GDN_CORE_VERIFY, HC_FUSED, MOE_GLUE and MOE_GLUE_MERGE_GATE_UP as
     # neighbours.) With VLLM_HPU_HC_FUSED=1 only: which activations get an owned copy before a fused
     # hyper-connection op (a custom HPU op is never given a view: card job 00043, 2026-11-20, and a view that
@@ -2153,6 +2167,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     lambda: int(os.environ.get("VLLM_HPU_MOE_DENSE", "0")),
     "VLLM_HPU_MOE_DENSE_MAX_TOKENS":
     lambda: int(os.environ.get("VLLM_HPU_MOE_DENSE_MAX_TOKENS", "512")),
+    # With VLLM_HPU_MOE_DENSE=1: steps with fewer tokens keep the vendor op, which reads only the experts the rows
+    # hit (the dense form reads every local expert: job 00177 lost at 1 stream).
+    "VLLM_HPU_MOE_DENSE_MIN_TOKENS":
+    lambda: int(os.environ.get("VLLM_HPU_MOE_DENSE_MIN_TOKENS", "17")),
 
     # The htorch.core.mark_step() that HpuCommunicator issues before every all-reduce and all-gather
     # (a workaround for a Habana bridge bug with PT_HPU_ENABLE_LAZY_COLLECTIVES). 1 (default) keeps it.
