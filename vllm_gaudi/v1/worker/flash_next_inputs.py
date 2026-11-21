@@ -73,6 +73,28 @@ def build_block_table(block_tables: list[list[int]], padded_batch_size: int, max
     return torch.from_numpy(table)
 
 
+BLOCK_TABLE_MIN_WIDTH = 64  # blocks (8,192 tokens at block size 128): the narrowest context-sized decode table
+
+
+def decode_block_table_width(num_blocks: list[int], max_blocks: int, mode: int) -> int:
+    """Columns of the sparse-QSA decode block table for a batch whose requests use ``num_blocks`` blocks each.
+
+    ``mode`` is ``VLLM_HPU_QSA_TABLE_WIDTH``. 0 (and any other value): ``max_blocks``, the engine's longest
+    context. 1: the smallest power of two, from ``BLOCK_TABLE_MIN_WIDTH`` up, that holds the longest request of
+    the batch, capped at ``max_blocks``. The QSA indexer scores ``width * (block_size / ratio)`` block keys per
+    request, so the width is what makes its cost follow the context in use; a few widths (64, 128, ..., the
+    engine's) keep the number of decode graphs small.
+    """
+    max_blocks = int(max_blocks)
+    if mode != 1 or not num_blocks:
+        return max_blocks
+    need = max(int(n) for n in num_blocks)
+    width = BLOCK_TABLE_MIN_WIDTH
+    while width < need:
+        width *= 2
+    return min(width, max_blocks)
+
+
 def _to_numpy(tensor: TensorLike) -> np.ndarray:
     if isinstance(tensor, torch.Tensor):
         return tensor.detach().cpu().numpy()

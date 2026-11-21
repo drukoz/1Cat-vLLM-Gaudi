@@ -2,8 +2,13 @@
 // moe_glue_silu_mul: the activation of the shared expert, between its two GEMMs. Replaces
 // SiluAndMul (F.silu(x[..., :d]) * x[..., d:]).
 //
-//   gate_up  {2 * width, tokens} bf16   the gate_up GEMM output: gate columns, then up columns
-//   act_out  {width, tokens} bf16       bf16(bf16(silu(gate)) * up)
+//   gate_up  {first + 2 * width, tokens} bf16   columns [first, first + width) are the gate columns,
+//                                               the next width columns the up columns
+//   act_out  {width, tokens} bf16               bf16(bf16(silu(gate)) * up)
+//
+// first is the scalar gate_column: 0 when the input is the gate_up GEMM output itself, and the first
+// column of the gate_up block when that GEMM is merged into the block's gate GEMM (the router logits
+// and the shared-gate logit then come first). The columns before first are not read.
 //
 // Rounding points: torch computes silu of a bf16 tensor in fp32 and stores it as bf16, then
 // multiplies two bf16 tensors. The product of two bf16 values is exact in fp32, so the second
@@ -25,8 +30,9 @@ void main(tensor gate_up, tensor act_out, int experts, int top_k, int gate_colum
     for (int token = index_start[0]; token < index_end[0]; ++token) {
         for (int feature = 0; feature < width; feature += MOE_GLUE_LANES) {
             const int5 coords = {feature, token, 0, 0, 0};
-            const int5 up_coords = {width + feature, token, 0, 0, 0};
-            const float128 gate = v_convert_bf16_to_f32_all_b(v_bf16_ld_tnsr_b(coords, gate_up));
+            const int5 gate_coords = {gate_column + feature, token, 0, 0, 0};
+            const int5 up_coords = {gate_column + width + feature, token, 0, 0, 0};
+            const float128 gate = v_convert_bf16_to_f32_all_b(v_bf16_ld_tnsr_b(gate_coords, gate_up));
             float128 silu;
             silu.v1 = v_f32_mul_b(gate.v1, hc_sigmoid(gate.v1));
             silu.v2 = v_f32_mul_b(gate.v2, hc_sigmoid(gate.v2));

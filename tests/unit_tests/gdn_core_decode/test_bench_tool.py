@@ -54,6 +54,17 @@ def test_main_small_cpu(capsys):
         assert RESULT_RE.match(line), line
 
 
+def test_main_verify_op_cpu(capsys):
+    """``--ops verify``: the fused verification op at T nodes per row (a CPU smoke of the bench path)."""
+    assert floor_bytes("verify", 8, 2, 4) == floor_bytes("core", 8, 8)
+    assert main(["--device", "cpu", "--ops", "verify", "--tp", "8", "--batches", "1,2", "--iters", "1", "--warmup",
+                 "1", "--repeat", "1", "--verify-tokens", "4"]) == 0
+    results = [line for line in capsys.readouterr().out.splitlines()[1:] if line.strip()]
+    assert len(results) == 3
+    assert all(line.startswith("verify(T=4) tp8 ") for line in results), results
+    assert main(["--device", "cpu", "--ops", "verify", "--tp", "8", "--batches", "1", "--verify-tokens", "7"]) == 2
+
+
 def test_main_bad_args():
     base = ["--device", "cpu", "--tp", "8", "--batches", "1,2", "--iters", "1", "--warmup", "1", "--repeat", "1"]
     assert main([*base[:2], "--tp", "3"]) == 2

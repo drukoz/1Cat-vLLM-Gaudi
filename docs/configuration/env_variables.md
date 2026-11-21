@@ -59,6 +59,41 @@ selection, added in M2): `HpuQsaIndexer.select` picks the attended
 positions per query and attention runs only over them. Sparse prefill needs a
 4-aligned context. MTP verification steps (M3) score their draft rows on the sparse path too.
 
+`VLLM_HPU_QSA_FUSED` selects the sparse QSA decode path (with
+`VLLM_HPU_FLASH_NEXT_QSA_MODE=1`) as an integer. `0` (default) keeps the torch path.
+`1` is the restructured torch data flow: the indexer gathers each request's
+compressed keys once for all its rows (whole kernel blocks, one table row per
+request) instead of once per query row, and the decode attention multiplies the
+grouped query heads with the gathered K and V instead of repeating them. `2` adds
+two TPC kernels, `torch.ops.flashinfer_gaudi.qsa_index_prepare` (indexer queries,
+ring and compressed-key writes) and `qsa_index_emit` (the attended K/V slots); they
+ship in `libqsa_fused_gaudi2.so` with the extension `qsa_fused_ops*.so`, built by
+`tools/build_flashinfer_gaudi.py --qsa-fused-only` or `VLLM_GAUDI_BUILD_QSA_FUSED=1`
+(`QSA_FUSED_GAUDI_KERNEL_LIBRARY` and `QSA_FUSED_GAUDI_NATIVE_LIBRARY` name the two
+files when they are not in the package's `lib` folder). When they do not load the
+plugin logs one warning at startup, and a layer they cannot serve logs `QSA fused
+... is off for <layer>: <reason>` and runs mode `1`. `3` is mode `2` plus two more
+kernels, `qsa_index_threshold` and `qsa_index_select`, in place of `torch.topk`: the
+same selected blocks except among scores equal at the cut, where the lowest blocks
+win. Any other value is `0`. See `docs/design/flash-next/qsa-fused.md`.
+
+`VLLM_HPU_QSA_INDEXER_SHARD` (with `VLLM_HPU_QSA_FUSED` `1` or `2`): `0` (default)
+scores every decode row on every TP rank; `1` scores each rank's share of the
+requests and all-gathers the int32 block selections once per QSA layer, so every rank
+holds the same selection. A decode bucket whose batch is not a multiple of the TP size
+stays replicated. `2` is `1` with the selections sent as fp32 (exact: block ids are
+below 2^24), the dtype of every other collective of the served model. Any other value
+is `0`.
+
+`VLLM_HPU_QSA_TABLE_WIDTH` sets the columns of the Flash-Next sparse QSA decode block
+table. `0` (default) is `ceil(max_model_len / block_size)`, fixed per engine: the
+indexer then gathers and scores every compressed key of a full context for every decode
+row (32,768 keys at `--max-model-len 131072`), whatever the row's own context. `1` is
+the longest request of the decode batch, rounded up to a power of two (at least 64
+blocks, at most the engine's): the key scan follows the context in use, a quarter of
+the keys at 32K tokens. The selections are the same; each (decode bucket, width) met
+compiles its own decode graph. Any other value is `0`.
+
 `VLLM_HPU_GDN_CORE_DECODE` selects the GDN decode core path as an integer.
 `1` (default) is fused: every non-speculative decode step runs through the
 fused core op `torch.ops.flashinfer_gaudi.gdn_core_decode` (conv, gates,
@@ -96,6 +131,31 @@ step, and the plain step after one, through
 (`GDN core verify ... is off for <layer>: <reason>`) and runs the torch path.
 It stays off until the rental's gate G1b has checked the op on a card.
 
+`VLLM_HPU_GDN_KERNEL_INTERLEAVE` (integer, default `0`) selects the TPC kernels
+behind `gdn_core_decode` and `gdn_core_verify`. `1` hands the graph compiler
+their interleaved builds (`kernels/gdn_core_decode_interleaved_gaudi2.c`,
+`kernels/gdn_core_verify_interleaved_gaudi2.c`), which carry four value rows
+per iteration of the recurrence instead of one: every row's operations and
+their order are unchanged, so outputs and states are bit-identical, and the
+Gaudi2 simulator executes 2.91x (decode) and 2.7x (verify) fewer instructions.
+The kernel library's host glue reads the variable when the graph compiler
+instantiates a kernel, so it must be set in the serving process's environment;
+a recipe compiled before the change keeps its kernel. A library built without
+the interleaved kernels (one that did not compile, or
+`-DGDN_FUSED_INTERLEAVE=OFF`) serves today's kernels. Any other value is `0`.
+
+`VLLM_HPU_GDN_GLUE_CACHE` (integer, default `0`) selects how a GDN layer
+prepares the inputs of the fused decode and verify ops. `0` makes them every
+step in every layer: the transposed conv weight, dt_bias cast to fp32, its cache
+group's row of the state indices and their int32 copies (and the verify step's
+row metadata), and an output buffer that the fused op's output replaces. `1`
+takes the conv weight and dt_bias from buffers that the weight-loader hooks
+fill at load, makes the state indices and their copies (and the verify row
+metadata) once per step and cache group for all of its layers, and makes no
+dead buffer. The ops get the same values, so the outputs are bit-identical. A
+layer whose hooks did not run makes the per-step copies. Any other value is
+`0`.
+
 `VLLM_HPU_HC_FUSED` selects the path of the Flash-Next hyper-connections as an
 integer. `0` (default) keeps the torch path. `1` runs the element-wise parts of
 every hyper-connection (the grouped norm, the silu with the injection split, the
@@ -122,6 +182,26 @@ instruction simulator and their card test (90 of 90 on 2026-11-20 with the
 thread off); see `docs/design/flash-next/hc-fused.md` and
 `docs/design/flash-next/native-extensions.md`.
 
+`VLLM_HPU_HC_FUSED_COPY_MODE` (integer, default `0`) applies only with
+`VLLM_HPU_HC_FUSED=1`. A custom HPU op is never given a view (on a card every
+view raised `Empty tensor optional ... Strided Params Has Value: 1`, also with
+the accumulation thread off, and the refusal comes when the graph is launched:
+the step fails, a layer cannot fall back), so the fused ops get owned copies of
+their activations. `0` copies every activation: six copies per hyper-connection
+(residual, block output and injection for the combine, the down GEMM output for
+the silu, the norm output and the up GEMM output for the gated mix), about 580
+graph nodes per decode step of the 48-layer model. `1` leaves out the three
+tensors the hyper-connection makes inside the call (its norm output and its two
+GEMM outputs), which are op outputs and never views. `2` also leaves out a
+residual or an injection that is the very tensor a fused hyper-connection op
+returned (the ops mark their outputs), which is how the model's layers chain
+them: one copy per hyper-connection is left, the block output's (an attention
+or MoE block may return a view of its result). Whatever else a caller hands in
+is copied as in mode `1`: the first hidden state, a residual that went through
+another op, the MTP draft layer's `flatten` view of its input. Any other value
+is `0`. The flag is read once per layer at construction. The values are the
+same in every mode. Not yet run on a card.
+
 `VLLM_HPU_MOE_GLUE` selects the path of the element-wise ops of the Flash-Next
 MoE block as an integer. `0` (default) keeps the torch path. `1` computes the
 router logits and the shared-gate logit with one merged GEMM (the weight is
@@ -145,6 +225,18 @@ logits the routing kernel takes the lowest expert id, where `torch.topk`
 leaves the choice open. With `0` nothing is loaded, registered or logged. The
 kernels pass the Gaudi2 instruction simulator and have not run on a card; see
 `docs/design/flash-next/hc-fused.md` ("MoE glue kernels").
+
+`VLLM_HPU_MOE_GLUE_MERGE_GATE_UP` (integer, default `0`) applies only with
+`VLLM_HPU_MOE_GLUE=1`. `1` appends the shared expert's gate_up rows of this
+rank to the block's merged gate weight (built once at load, a second
+non-persistent buffer), so one GEMM gives the router logits, the shared-gate
+logit and the shared expert's gate_up output, and `moe_silu_mul` reads the
+gate_up block in that output from column `experts + 1` on: one GEMM per MoE
+block less (48 per decode step on Flash-Next). `0` keeps the separate gate_up
+GEMM; any other value is `0`. A block whose gate_up projection is not a plain
+bfloat16 linear without bias logs one warning (`MoE glue
+(VLLM_HPU_MOE_GLUE_MERGE_GATE_UP=1) keeps the separate gate_up GEMM for
+<layer>: <reason>`) and runs the rest of the glue unchanged.
 
 `VLLM_HPU_RECURRENT_STATE_POOL` selects the allocation mode for the recurrent
 (GDN / short-conv) state slots as an integer. `0` (default) keeps today's

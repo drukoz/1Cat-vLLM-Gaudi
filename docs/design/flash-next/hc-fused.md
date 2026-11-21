@@ -349,6 +349,31 @@ one process raises) and nothing imports it unless the flag is 1. It registers no
 come from `hc_fused_ops*.so`, and a process without that extension has no kernel for any device. The CPU tests import
 `tests/unit_tests/hc_fused/hc_ops.py`, which adds the oracle as the CPU kernels.
 
+**Owned copies (`VLLM_HPU_HC_FUSED_COPY_MODE`).** A custom op takes no view (card job 00043: every view raised,
+also with the accumulation thread off), and a view that reaches one fails the step: in lazy mode an op is only
+recorded when it is called, the refusal comes when the graph is launched, outside the layer's `try` (the first
+servers that passed views died). So the wrappers copy activations (`_owned`). Mode 0, the default, copies every
+one: six copies per `combine_and_mix` (residual, block output, injection; the down GEMM output; the norm output and
+the up GEMM output), twelve per decoder layer next to its six fused ops, about 580 graph nodes per decode step of
+the 48-layer model, three of the six of width `4H`. Only a tensor that is handed to the layer can be a view. Mode 1
+leaves out the three the hyper-connection makes inside the call (its norm output and its two GEMM outputs). Mode 2
+also leaves out a residual or an injection that is the very tensor a fused hyper-connection op returned: the
+wrappers mark their outputs (`_FUSED_OUTPUT`, an attribute of the Python object, which a view, a slice or another
+op's result does not have), and the model's layers hand those objects on unchanged, so one copy per
+hyper-connection is left, the block output's (a MoE block returns `final_hidden_states.reshape(orig_shape)`).
+Whatever else is handed in is copied as in mode 1: the repeated embedding, the residual after the PLE layer's add,
+the MTP draft layer's `flatten` view of its input. The values do not change
+(`test_copy_mode_leaves_out_copies_and_changes_no_bit` on a chain of two calls,
+`test_no_copy_mode_hands_a_fused_op_a_view` with views of the residual, the injection and the block output; over
+the whole tiny model `test_fewer_owned_copies_change_no_bit_and_hand_no_op_a_view`: 53, 26 and 12 copies per
+forward of the 4-layer model in modes 0, 1 and 2, and no fused op is given a view in any mode). On the card
+(2026-11-20): a pending op's, a GEMM's, a custom op's output and a clone need no copy, and an identity view raises
+like any other view (`probe_view_inputs.py`, job 00106: `OP OUTPUTS` 4 of 4, `IDENTITY VIEWS` 0 of 5); per
+hyper-connection the three modes are bit-identical and mode 2 is the cheapest at 1, 32 and 128 rows
+(`probe_hc_copies.py`, 00090); the tiny model at TP4 matches the CPU reference with mode 2 and the real model's
+1-stream texts equal the preset's (00089, 00091; those images had the first, unmarked form of mode 2, which relied
+on the residual and the injection being op outputs; the marked form above copies more and is the one to serve).
+
 ### 2. Layer (`vllm_gaudi/models/qwen4_exp/hyperconnection.py`)
 
 `HpuGatedResidual.__init__` reads the flag once (`hc_fused_requested`; exactly 1 means fused) and keeps the layer's
@@ -628,7 +653,7 @@ experts stay expert-parallel, exactly as on the torch path. The all-reduce after
 
 ```
 moe_route(Tensor gates, int experts, int top_k) -> (Tensor, Tensor)
-moe_silu_mul(Tensor gate_up) -> Tensor
+moe_silu_mul(Tensor gate_up, int first_column=0) -> Tensor
 moe_combine(Tensor shared, Tensor gates, Tensor routed, int gate_column) -> Tensor
 moe_row_quant(Tensor x, float fp8_max) -> (Tensor, Tensor)
 ```
@@ -640,7 +665,7 @@ TP1; 8 and 64 on the tiny model). No op writes an input; every output is a new t
 | Arg | Torch shape, dtype (HPU) | TPC dims | Meaning |
 |---|---|---|---|
 | `gates` | `[T, C]`, bf16 | `{C, T}` | merged gate GEMM output: router logits in columns `[0, E)`, the shared-gate logit in column `gate_column` |
-| `gate_up` | `[T, 2D]`, bf16 | `{2D, T}` | the shared expert's gate_up GEMM output: gate columns, then up columns |
+| `gate_up` | `[T, F + 2D]`, bf16 | `{F + 2D, T}` | the shared expert's gate_up columns from column `F = first_column` on: gate columns, then up columns. `F` is 0 for the gate_up GEMM output itself and `E + 1` when that GEMM is merged into the gate GEMM (the router and shared-gate columns come first and are not read) |
 | `shared`, `routed`, `x` | `[T, H]`, bf16 | `{H, T}` | the shared expert's down GEMM output; the vendor op's output; the block input |
 | `moe_route` -> | `([T, K] int32, [T, K] bf16)` | | expert ids, largest logit first, and their renormalized softmax weights |
 | `moe_silu_mul` -> | `[T, D]` bf16 | | `bf16(bf16(silu(gate)) * up)` |
@@ -649,7 +674,7 @@ TP1; 8 and 64 on the tiny model). No op writes an input; every output is a new t
 
 HPU gates, checked by the op's validation callback and again by the glue: rank-2 contiguous bf16 inputs with
 `T > 0`; `1 <= K <= 64` (one int32 vector holds a row's ids), `K <= E <= 32767` (int16 lane ids), `E <= C`; an even
-number of `gate_up` columns; `H % 128 == 0` for `moe_combine` and `moe_row_quant`; `0 <= gate_column < C`;
+number of `gate_up` columns from `first_column` on, `0 <= first_column <` the columns of `gate_up`; `H % 128 == 0` for `moe_combine` and `moe_row_quant`; `0 <= gate_column < C`;
 `fp8_max == 240` (Gaudi2's fp8 range; the kernel takes no other). `D` need not be a multiple of 128.
 
 ## What `mixture_of_experts` takes (the contract the routing op must meet)
@@ -775,15 +800,15 @@ The rules of the table above ("TPC rules this relies on") hold here too. In addi
 tools/flash_next/tpcsim.sh 'python3 -m pytest -q -p no:cacheprovider --noconftest tests/standalone/hc_fused'
 ```
 
-`test_moe_simulation.py` runs the 52 cases of `moe_case.SIM_CASES` through the library's entry points and the
+`test_moe_simulation.py` runs the 73 cases of `moe_case.SIM_CASES` through the library's entry points and the
 simulator (mapping test and partition shuffle on), compiles each kernel alone with `-reg-mem-count`, and checks the
 CMake build log for the flags. `test_moe_library.py` runs `moe_lib_check.cpp` (every entry point and every
 rejection for the four GUIDs, directly and through the real combined kernel database) and the build guard: every
 kernel of the library compiled with the one flag list and no local-memory override, a routing kernel that does not
 compile costs only its own GUID, and `-DHC_FUSED_MOE_GLUE=OFF` leaves the six hyper-connection kernels. It also
 runs the Python loader's `kernel_library_guids` on the real library (the ten GUIDs, and the six of a build without
-the MoE kernels): the fakes of the CPU loader test cannot show that the ctypes call is right. 136 tests in the folder,
-65 of them in the two MoE files.
+the MoE kernels): the fakes of the CPU loader test cannot show that the ctypes call is right. 157 tests in the folder
+(2026-11-20, with the merged-block and verify-row cases).
 
 Cases (`tests/unit_tests/hc_fused/moe_case.py`): per kernel, the tiny geometry, the real geometry at 1, 2, 16 and 32
 rows and at 2048 rows; for the routing: ties at the cut by construction, all-equal logits, one to three huge logits
@@ -809,7 +834,7 @@ output may differ at all; differences below the fp32 normal range do not count.
 | `.../hc_fused/test_moe_ops.py` | schemas, fake kernels, the stand-in is the torch path as CPU torch runs it (the kernel's oracle for three ops, `moe_row_quant_cpu_reference` for the fourth), the package registers no CPU kernel and is not imported by default |
 | `.../hc_fused/test_moe_card_arithmetic.py`, `hpu_arithmetic.py` | the card's scalar division as a CPU emulation (a `TorchDispatchMode`); the card log of 2026-11-20 reproduced with it (22 scales, 3,378 fp8 values, largest difference 16) and not with a neighbouring constant; the kernel's oracle is the copied code under that division; the CPU stand-in keeps the CPU's |
 | `.../hc_fused/test_moe_sources.py` | GUIDs, ABI, scalar order, limits and build switches agree across the C++, TPC-C, CMake and Python sources |
-| `.../hc_fused/test_moe_op_callbacks_host.py` | the real `hpu_hc_fused.cpp` under ASan + UBSan: output metadata (int32 ids, fp8 values), GUID and the 16 parameter bytes of all 72 HPU cases, 14 rejections |
+| `.../hc_fused/test_moe_op_callbacks_host.py` | the real `hpu_hc_fused.cpp` under ASan + UBSan: output metadata (int32 ids, fp8 values), GUID and the 16 parameter bytes of all 93 HPU cases, 18 rejections |
 | `.../hc_fused/test_moe_glue_loader.py` | the loader and the startup call |
 | `tests/unit_tests/ops/test_hpu_moe_glue_cpu.py` | the helpers without a model: one log line per block, the input check, the merged weight on a bare runner, the wrapper that reads the flag, and that the FP8 branch calls the vendor op with the keywords of the plugin's op wrapper |
 | `.../hc_fused/test_moe_hpu_op.py`, `test_moe_hpu_op_dry_run.py` | the card test, and a CPU dry run of it run the way the gate runs it (the file runs, no test skips, the `MOEHPU` lines of passed tests are in the output). In the dry run `dynamic_quant` runs with the card's scalar division and Gaudi2's fp8 range, so it fails with the card's own line for a kernel that has CPU torch's scale |
@@ -866,6 +891,36 @@ The log of that run held the `MOEHPU` lines of the failed tests only: the gate r
 the output of passed tests (the tie rule of the card's `torch.topk` among them). The card test now prints every
 measurement once more after its last test, outside pytest's capture.
 
+### Second card session (2026-11-20, 18:43 UTC, one card, accumulation mode 0)
+
+**Item 2 is closed: the reference was wrong, not the kernel** (job 00038, `tools/flash_next/kernel_probes/
+probe_moe_route.py`, 27 s). `torch.topk`'s int64 ids, narrowed with `.to(torch.int32)` on the device in the lazy
+graph that holds the top-k, come back as every second id of the true table (an 8-byte read of 4-byte ids; the
+second half of the table is out of range): `got row 0 [380, 200, 180, 268, 192, 478, ...]` against
+`want row 0 [380, 197, 200, 493, 180, 242, ...]`. That alone gives "0 of 16". Every other construct is right: the
+production routing (softmax and top-k of its own logits tensor, int64 ids) returns CPU torch's set on 16 of 16 rows,
+so does the routing on the view `gates[:, :experts]` with int64 ids; a host-made int64 table narrowed on the device
+is right, and so are top-k ids narrowed in a second graph. `moe_route` returns its rule on 16 of 16 rows alone and
+in every shared graph, and selects the production routing's experts on every row without a tie (15 of 15 at 512
+experts and top 10, 13 of 13 on router-only logits, 16 of 16 at 16 experts and top 2), with bit-identical weights.
+The card's top-k takes the lowest ids among all-equal values, but expert 511 among five equal values at the cut
+(the kernel: the lowest id), so rows that tie at the cut can route to another expert of equal weight. The card
+test's torch side now keeps its int64 ids on the device and narrows them on the host
+(`_torch_path_on_the_device`), and prints what the in-graph narrowing returns as a measurement.
+The same pattern, top-k ids narrowed in the graph, is in the served sparse-QSA indexer
+(`qsa_sparse_ops.select_blocks`); `probe_index_narrowing.py` checks it and the argmax paths on a card.
+
+**A custom op takes no view, also with the accumulation thread off** (job 00043, `probe_view_inputs.py`, 26 s):
+seven of seven view cases (a row slice at offset 0 and at offset 2, a reshape of a 1-D tensor, a column slice of
+one row, and the three of a pending op) raise `Empty tensor optional ... Strided Params Has Value: 1` on five of
+five calls; a fresh tensor and a clone of a slice pass five of five. Two places of the block handed an op a view,
+and a served block would not have fallen back but failed its step (the op is only recorded when it is called; the
+refusal comes when the graph is launched, outside the block's `try`): `moe_row_quant` got
+`x.view(-1, H)` (it now gets a copy, one node), and `moe_combine` got the monolithic method's
+`output.view(...)` of the vendor op's output (on the glue path the methods now return the vendor op's output
+itself: no node). `test_no_glue_op_is_ever_given_a_view` holds both, with bf16 and FP8 experts and with the
+merged gate_up GEMM.
+
 ## What is wired
 
 1. **Startup** (`vllm_gaudi/__init__.py::register_ops`): after the hyper-connection block and before the kernel
@@ -898,7 +953,7 @@ measurement once more after its last test, outside pytest's capture.
    path off for good; a call the kernels do not take costs that call only.
 6. **Rental gate** (`tools/flash_next/rental/gates.py::moe_glue`): `tests/unit_tests/hc_fused/test_moe_hpu_op.py`
    on the card in lazy mode, recorded as G1b's `details["moe_glue"]`. 86 tests: every op has a kernel and the
-   library serves it; 72 cases against the CPU oracle; the routing op's outputs through the vendor op against the
+   library serves it; 93 cases against the CPU oracle; the routing op's outputs through the vendor op against the
    torch routing through the vendor op; the vendor op with the slots reversed; the card's own tie rule, printed;
    `moe_row_quant` against the plugin's `dynamic_quant` on the card, bit for bit; five cases against the torch path
    on the card; the routing op against the production routing at both geometries; repeat calls; one whole block
@@ -912,6 +967,30 @@ measurement once more after its last test, outside pytest's capture.
    mismatch or on a `MoE glue ... is off for` / `has no HPU kernel` line. The workstation command passes both on:
    `rent.sh --moe-glue` and `rent.sh --smoke-modes pytorch,fused,moe`.
    The tiny checkpoint has bf16 experts, so the smoke mode does not run `moe_row_quant`: the card test does.
+
+## Merged gate_up GEMM (`VLLM_HPU_MOE_GLUE_MERGE_GATE_UP`, 2026-11-20)
+
+With the glue on, a block's GEMMs are the merged gate GEMM, the shared expert's gate_up GEMM and its down GEMM. All
+three read `x` or its product, and the first two read the same `x`: with `VLLM_HPU_MOE_GLUE_MERGE_GATE_UP=1` the
+merged gate weight also carries this rank's gate_up rows (`[E + 1 + 2D, H]`: router rows, the shared-gate row, the
+gate rows, the up rows; at TP8 513 + 160 rows), built at load as a second non-persistent buffer
+(`_hpu_moe_glue_gate_up_weight`) next to the `[E + 1, H]` one. One GEMM then gives the router logits, the shared-gate
+logit and the gate_up output; `moe_route` reads columns `[0, E)`, `moe_combine` column `E`, and
+`moe_silu_mul(gates, E + 1)` its block from column `E + 1` on (the kernel's `first_column`, the `gate_column`
+scalar of the node parameters; simulator cases `silu_mul_merged_*`). One GEMM and its transposed-weight view per
+block less: 48 GEMMs per decode step on Flash-Next. The router and shared-gate rows are replicated, the gate_up rows
+are TP-sharded, so each rank's buffer differs in its last `2D` rows only and every rank still routes identically.
+
+A block whose gate_up projection is not a plain bf16 linear without bias, whose buffer is missing or of another
+shape, or whose op build has no `first_column`, logs once `MoE glue (VLLM_HPU_MOE_GLUE_MERGE_GATE_UP=1) keeps the
+separate gate_up GEMM for <layer>: <reason>` and runs the glue as without the flag. A call whose shared expert input
+is not the hidden states (a routed input transform) takes the separate GEMM too. Without `VLLM_HPU_MOE_GLUE=1` the
+flag does nothing. Memory: the second buffer, (E + 1 + 2D) x H bf16 per block (3.4 MB at TP8, 165 MB per card
+for 48 blocks), next to the first one.
+Tests (CPU, tiny model): `tests/unit_tests/models/flash_next/test_moe_glue_merge_gate_up.py` (bit-identical to
+the torch path at 1, 2, 32, 300 rows, bf16 and FP8 experts, two ops per block less, the buffer, what the ops get,
+every fallback with its line) and `test_moe_glue_tp.py::test_merged_gate_up_equals_flag_off_bit_for_bit_on_every_rank`
+(eight gloo ranks, TP8 with expert parallelism).
 
 ## Graph safety of the fused path
 
@@ -939,7 +1018,9 @@ the SiLU and sigmoid comparisons passed. Items 5 and 6 are the two open ones, 8 
    same ids and weights; max abs diff ...`: the same-row outputs must be bit-identical.
 4. **Slot order.** `MOEHPU vendor op with the routing slots reversed: bit-identical ...`. `False` would mean the
    vendor op's sum depends on the slot order, which matters only on rows with equal logits.
-5. **The routing against the torch path, and the tie rule of the card's `torch.topk`.** `MOEHPU route_real_r16
+5. **The routing against the torch path, and the tie rule of the card's `torch.topk`.** Closed by job 00038
+   ("Second card session" above): the kernel routes as production does; the failing reference narrowed its ids on
+   the device. What the lines mean, for a later run: `MOEHPU route_real_r16
    ids: moe_route returns the kernel's rule (CPU) on 16 of 16 rows; the card's torch path returns CPU torch.topk's
    set on N of the 15 rows that do not tie at the cut`, and `MOEHPU route_* production routing on the card ...: CPU
    torch.topk's set on N of M rows`, `MOEHPU route_* moe_route against the production routing on the card: the same
@@ -973,16 +1054,16 @@ the SiLU and sigmoid comparisons passed. Items 5 and 6 are the two open ones, 8 
 - The ids stay int32 from the kernel and are widened by one cast; an int64 output was not tried.
 - `moe_route`, `moe_combine` and the merged gate GEMM are only used together; a block that fails one check runs
   the whole torch path.
-- The gate_up GEMM of the shared expert is not merged into the gate GEMM (it could be: both are bf16 and read `x`).
+- The gate_up GEMM of the shared expert is merged into the gate GEMM only with `VLLM_HPU_MOE_GLUE_MERGE_GATE_UP=1`
+  (below, "Merged gate_up GEMM"); by default it stays its own GEMM.
 - 3-D inputs, non-bf16 dtypes, `gpt_oss`, grouped top-k, sequence-parallel and data-parallel MoE, block-FP8 experts
   (`VLLM_HPU_FORCE_CHANNEL_FP8=0`) and static input scales are left to the torch path.
 - The merged gate weight is built at load only; a block whose weights are post-processed by another expert method
   has none and logs its line.
 - `moe_row_quant` is Gaudi2 only (fp8 range 240).
-- The MoE op wrappers (`flashinfer_gaudi/moe_glue.py`) hand their tensors to the ops as they are; the
-  hyper-connection and GDN wrappers clone every activation first, because a custom op that was given a view stopped
-  a server (`flashinfer_gaudi/hc_fused.py`, `_owned`). In a block three of the four MoE ops get GEMM or vendor-op
-  outputs, but `moe_row_quant` gets `x.view(-1, x.shape[-1])` (`HPUFp8MoEMethod.apply_monolithic`), a view object on
-  every call, and the card test only hands the ops tensors of their own. Whether the op takes a view with the
-  parallel graph accumulation off has not been tried; if it raises, the FP8 block logs its line and runs torch.
+- The MoE op wrappers (`flashinfer_gaudi/moe_glue.py`) hand their tensors to the ops as they are; the block gives
+  them GEMM outputs and the vendor op's output, and one copy: the input of `moe_row_quant` (a view on every call,
+  and a card refuses views: "Second card session"). Whether a view that changes nothing (`x.view(-1, H)` of a
+  `[tokens, H]` tensor) is refused like a slice is what `probe_view_inputs.py` now also asks (line `IDENTITY
+  VIEWS`); if it is taken, that copy can go.
 - No case has NaN router logits. `-inf` logits are covered (they are selected last, lowest id first, with weight 0).
