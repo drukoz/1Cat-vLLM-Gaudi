@@ -566,6 +566,20 @@ State at 00:57 UTC:
   (coordinator, approved): build it as `timers-<hash>`, then one all-card job with `--bridge`: the tiny model at TP8 and
   the real model at TP8 with the timers, giving the real per-phase split per launch; then the lean path aims at what
   dominates.
+- **Build state at 01:10 UTC.** `out/stock-5176b1b2` published (the unpatched wheels: `habana_torch_plugin-1.24.1+git5176b1b
+  -cp310-cp310-linux_x86_64.whl` 44 MB, `habana_torch_dataloader-...whl`; nothing outside the wheels); the collectives
+  track's job 00160 checks it (tiny TP8, image bridge against ours, token parity, our .so loaded). The snapshot of that
+  build tree failed (the container ended within a second of the build), so `timers-c281d8b53d08` builds from scratch in
+  the persistent dev container `nr-bridge-dev` (CPUs 18,37,56,75,94,113,132,151 for this one build, coordinator's word;
+  log `~/farm/native-replay/bridge-build/out-logs/timers-c281d8b53d08.log`, about 01:47 UTC). Chained after it
+  (`chain_lean.sh`, node pids 1361605/1361606, log `out-logs/chain.log`): the dev container back to 4 CPUs, then the
+  incremental build of `lean-e1dbb4942fb8` (`tools/flash_next/bridge/patches/lean1.patch`: the timers plus
+  `PT_HPU_HPUGRAPH_PREPARED_REPLAY=1`, each captured segment keeps its `HabanaLaunchOpPT` and recipe holder from its
+  first replay in a side table in HPUGraph.cpp, later replays call `HabanaLaunchOpPT::RunPrepared`: no HlExec, no new
+  launcher, no recipe spec, no recipe lookup; the patching and the launch unchanged; never compiled before this build).
+  Proposed to the collectives track: one all-card job with four arms (tiny TP8 timers, tiny TP8 lean + flag, real TP8
+  timers, real TP8 lean + flag), each only if the one before passed. Per-phase report:
+  `python3 reports/native-replay/probes/replay_timing.py <server0.log>...`.
 
 ### Where the two host levers are tested now (coordinator, 00:28 UTC)
 
