@@ -9,38 +9,42 @@ Labels: MEASURED (card, with its file), VERIFIED (CPU test or code line), INFERR
 
 ## Handoff (if this agent stops)
 
-Updated 2026-11-21 01:50 UTC (fourth agent of the track, Opus 5.5, started 23:12 UTC).
+Updated 2026-11-21 02:25 UTC (fourth agent of the track, Opus 5.5, started 23:12 UTC).
 
-**Now (00:58 UTC):** build 1 is measured (job **00128**, tables below; job **00121** tiny gate passed). **Build 2 is
-job 00156** `real8-build2b` (all cards, hold 60 min, commit `b2a7f62f` = plugin code `a39d1f48` + mtp-card-ready's
-conv-pool fix `5c770d96` cherry-picked; it replaced 00142 with `--replaces`, same place and bump), at the head of the
-8-card queue (starts by about 01:12 UTC). Its waiting `farm job` command copies the results to
-`reports/integration/card/00156-real8-build2b/` (if the agent is gone: `bin/farm fetch integration 00156
-00156-real8-build2b`). The node now runs until about 00:00 UTC on 2026-11-22 (owner, BRIEF 00:50): after build 2,
-keep a build N+1 ready and submit a TP8 headline every 3 to 4 hours or when a lever lands (coordinator 00:43). Build 2 = build 1 + engine-step `ddc6bbbf`
-(candidate-path log lines), native-replay `9b0e7655` (`VLLM_HPU_WORKER_CPU_PIN`), prefill `2abf636a` (prefix flags,
-prompt graphs), mtp-card-ready `6f5004f6` (sampled-verification fix 0d1be6fc, candidate verification `=2`); CPU run
-`reports/integration/cpu/out-b6/summary.txt`: 152 files, 148 green, 3 card-only skips, the known flaky
-`test_gdn_core_decode_batch[negative]` passes alone. Late-bound: the job runs `~/farm/integration/results/late/run.sh`
-(source `reports/integration/late/run.sh`, written by `reports/integration/late/make_run.sh`), which exports
-`HEADLINE_MTP_CTX=8:16000 VLLM_HPU_PREFIX_ALIGN_SPLIT=1 VLLM_HPU_PREFIX_KEEP_PROMPT_END=1` (prefix flags: coordinator GO
-00:37 from prefill's 00080) on top of the job's `--env HEADLINE_TINY_SPEC=2 HEADLINE_MTP_SAMPLED=1
-HEADLINE_MTP_SAMPLED_LEVELS=32,1 VLLM_HPU_SPEC_SAMPLED_VERIFY=2 HEADLINE_HOLD_S=3600` and runs the kit of commit
-`61b32ec6` from `~/farm/integration/results/late/kit/` with the arms `tiny nospec nospec-pin mtp2`:
-- tiny: the tiny model at TP8 with every flag, `--spec 2`; a failure ends the job (exit 7).
-- A `nospec`: 32, 8, 1 streams; per level 2 greedy rounds, then 2 sampled rounds (after a warm round each).
-- B `nospec-pin`: A's env + `VLLM_HPU_WORKER_CPU_PIN=1 PT_HPU_DISABLE_HPUGRAPH_REPLAY_HASHCHECK=1`, greedy 1 and 32
-  streams, 2 rounds: compare its 1-stream text with A's (a difference or an error: drop B's flags and say so);
-  server0.log must hold 8 lines `VLLM_HPU_WORKER_CPU_PIN=1: rank r module m: share r of 8, CPUs a-b`.
-- C `mtp2`: MTP k = 2 (coordinator: k = 3 greedy is measured; TP4 favoured fewer rows), greedy 32, 8, 1 (2 rounds),
-  then 8 x 16K-token greedy (acceptance at long prompts), then sampled 32 and 1 LAST with
-  `VLLM_HPU_SPEC_SAMPLED_VERIFY=2` (candidate verification, first run on a real-model server: check texts and that
-  acceptance is near =1's 0.64 / 0.38 at TP4). A crash reruns C without the request shard if 15 min are left.
-Send the coordinator each arm's table as soon as it is read. Left out on purpose: prompt graphs (device memory),
-mtp-card-ready `409c83e5` (a log line) and engine-step `e9032e68` (prompt_logprobs fix, not exercised by the probe):
-both would have needed a new image.
+**Now (02:25 UTC), for whoever takes the track next.** Builds 1 and 2 are measured (tables below: 00128, 00156).
+Three jobs of this track wait or run on the node; the `farm job` commands that submitted them ran in the fourth
+agent's background shells and may be gone, so fetch each result with `bin/farm fetch integration <id> <id>-<name>`
+when `bin/farm ledger | grep -w integration` shows it ended:
+- **00161** `moe-chunk-ab` (running since about 02:00 UTC; kernel-fixes' A/B, image `b2a7f62f` = build 2): kernel-fixes'
+  `moe_chunk_ab.sh` (f8fe517c) runs the kit's `mtp3` arm twice, base and `VLLM_MOE_CHUNK=64,8192
+  VLLM_MOE_TOKEN_BOUNDARY=512,1000000`, 32 and 1 streams + a 1 x 16K round. Its base arm already shows MTP k = 3 on
+  build 2 (prefix flags on, `SPEC_SAMPLED_VERIFY` unset) at **24.9 / 24.2 ms per token at 1 stream and 43.2 / 40.8 at
+  32 streams**: build 2's code and the prefix flags do not cause the 1-stream slowdown of 00156's arm C (k = 2 with
+  `SPEC_SAMPLED_VERIFY=2`: 41.7 ms per token). Kernel-fixes reads the A/B.
+- **00177** `moe-ab` (waiting; image `d00c0a9a` = build 3): kernel-fixes' `moe_ab.sh` (6b960231, md5 1c34d795) with the
+  arms `dense-mtp3 base-mtp3 dense-nospec` (`VLLM_HPU_MOE_DENSE=1`, kernel-fixes' 86104c9d + b773ad72 in the build).
+- **00178** `real8-build3` (waiting, placed after the async A/B 00171, about 05:00 UTC; 75 min): build 3's headline.
+  Late-bound: `reports/integration/late/make_run3.sh KEY=VALUE...` writes `~/farm/integration/results/late/run3.sh`
+  (exports + the image kit's `headline_job.sh tiny nospec mtp3 nospec-noshard nospec-noprefix nospec-noprefix-nocut`);
+  switch on what landed before it starts (MoE dense or chunk from 00177 / 00161, `PT_HPU_SYNCHRONOUS_ACC_QUEUE_FLUSHING=1`
+  if the bridge job shows it, an async-scheduling setting if 00171 shows it). Its `--env`: prefix flags on,
+  `HEADLINE_TINY_SPEC=3 HEADLINE_MTP_SAMPLED=1 HEADLINE_MTP_SAMPLED_LEVELS=32,1 VLLM_HPU_SPEC_SAMPLED_VERIFY=2
+  HEADLINE_HOLD_S=4500`. Arms in priority order: tiny gate (`--spec 3`); no spec 32 / 8 / 1 (2 greedy + 2 sampled
+  rounds); MTP k = 3 (greedy 32 / 8 / 1, then sampled 32 and 1 with `=2`); the low-stream bisect (greedy 8 and 1, 96
+  tokens): `VLLM_HPU_QSA_INDEXER_SHARD=0`, then prefix flags off, then also `VLLM_HPU_DECODE_CUT_INTERVAL=0`.
+**Build 3** = commit `d00c0a9a` (plugin `848deb15`): build 2 (`b2a7f62f`) + engine-step `3e568842` (both server-killer
+fixes e9032e68 / logprobs, candidates on the vocabulary shard `VLLM_HPU_VOCAB_PARALLEL_LOGITS=2` (not set), sampled
+speculative steps in the candidate region, request parameters on the general sampler) + kernel-fixes 86104c9d and
+b773ad72 (`VLLM_HPU_MOE_DENSE`, default 0). CPU: `reports/integration/cpu/out-b8/summary.txt` (157 files: 152 green, 3
+card-only skips, `test_main_evidence.py` and `test_main_moe_glue.py` failed once in the parallel run and pass alone:
+`out-b8/rerun_alone.txt`; `test_moe_dense.py` 6 passed on 848deb15). The program branch has since merged the QSA data
+flow (PR #16, d9791183): not merged into this branch (the same code via qsa-fused).
+**Open questions for the next builds** (coordinator, 01:50-02:00 UTC): the no-speculation 8-stream step (70 ms in
+build 2, 58.7 in build 1, 45.9 on the program head) and MTP at 1 stream under k = 2 with `=2` (84 ms per step against
+66): 00178's bisect and its MTP arm answer them. Keep a build N+1 ready and submit a TP8 headline every 3 to 4 hours
+(the node runs until about 00:00 UTC on 2026-11-22); the coordinator gives TP8 headlines the head of the queue.
 
-**Build commit `fbb685ac`** (pushed; the headline job runs it). The plugin code is final since `b691faa8`; the later commits only add the
+**Build 1 commit `fbb685ac`** (pushed; job 00128 ran it). The plugin code is final since `b691faa8`; the later commits only add the
 job kit `tools/flash_next/integration/` and this file. What is in it (first-parent merges on top of the qsa-fused
 branch the first agent started from):
 
