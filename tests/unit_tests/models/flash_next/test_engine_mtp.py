@@ -250,6 +250,51 @@ def test_the_draft_graph_and_the_sparse_metadata_switched_together(engine_runs):
     _check_oracle(engine_runs, run, accept, 2)
 
 
+CHAIN_BASE = {"VLLM_HPU_MTP_DRAFT_LOOP": "1", "VLLM_HPU_FLASH_NEXT_DECODE_METADATA": "1"}
+CHAIN = {**CHAIN_BASE, "VLLM_HPU_MTP_DRAFT_GRAPH": "1", "VLLM_HPU_MTP_DRAFT_CHAIN": "1"}
+
+
+@pytest.mark.parametrize("k,accept", [(1, [1, 0]), (2, [2, 0, 1]), (3, [2, 0, 3, 1])], ids=["k1", "k2", "k3"])
+def test_the_chained_draft_gives_the_drafts_of_the_per_pass_drafter(engine_runs, k, accept):
+    # VLLM_HPU_MTP_DRAFT_CHAIN=1: the draft is issued behind the verification before the host reads its result;
+    # its inputs (committed rows, last row, tokens, positions) and its later passes' block tables and slots come
+    # from the device. Against the per-pass drafter with the same sparse decode metadata: the drafter's own ids and
+    # every stream are the same at every accepted count, and no decode draft took the host-prepared path.
+    per_pass = _oracle_run(engine_runs, accept, k=k, env=CHAIN_BASE, tag="_loop_md")
+    chain = _oracle_run(engine_runs, accept, k=k, env=CHAIN, tag="_chain")
+    assert [e["drafter"] for e in chain["oracle"]] == [e["drafter"] for e in per_pass["oracle"]]
+    assert [p["generated_ids"] for p in chain["prompts"]] == [p["generated_ids"] for p in per_pass["prompts"]]
+    assert chain["runner"]["draft_chain_calls"] > 0 and per_pass["runner"]["draft_chain_calls"] == 0
+    assert not [c for c in chain["draft_calls"] if c.get("decode")]
+    _check_oracle(engine_runs, chain, accept, k)
+
+
+def test_the_chained_draft_with_several_requests_at_once(engine_runs):
+    # Every prompt in one generate call: padded batch rows, requests at different positions and acceptance counts.
+    accept = [3, 1, 0, 2]
+    per_pass = _oracle_run(engine_runs, accept, "--concurrent", env=CHAIN_BASE, tag="_loop_md")
+    chain = _oracle_run(engine_runs, accept, "--concurrent", env=CHAIN, tag="_chain")
+    assert [e["drafter"] for e in chain["oracle"]] == [e["drafter"] for e in per_pass["oracle"]]
+    assert [p["generated_ids"] for p in chain["prompts"]] == [p["generated_ids"] for p in per_pass["prompts"]]
+    assert chain["runner"]["draft_chain_calls"] > 0
+    assert not [c for c in chain["draft_calls"] if c.get("decode")]
+
+
+def test_a_sampled_request_keeps_the_draft_after_the_host_read(engine_runs):
+    # The chain is greedy only so far: a step with a sampled request keeps today's path (logged once), and its
+    # stream gets its tokens.
+    env = {**CHAIN, "VLLM_HPU_SPEC_SAMPLED_VERIFY": "1"}
+    run = hpu_cpu_engine.run(engine_runs["ckpt"], engine_runs["dir"] / "chain_sampled.json", "--k", str(K),
+                             "--temperature", "1.0", "--max-tokens", "8", env=env)
+    for prompt in run["prompts"]:
+        assert len(prompt["generated_ids"]) == 8
+        assert all(0 <= t < 248320 for t in prompt["generated_ids"])
+    assert run["runner"]["draft_chain_calls"] == 0
+    assert [c for c in run["draft_calls"] if c.get("decode")]
+    log = (engine_runs["dir"] / "chain_sampled.json.log").read_text(encoding="utf-8", errors="replace")
+    assert "a sampled request (greedy only so far)" in log
+
+
 @pytest.mark.parametrize("k", [4, 5], ids=["k4", "k5"])
 def test_oracle_drafts_at_the_sizes_above_the_recipe(engine_runs, k):
     # k + 1 lattice entries exceed the kernel blocks of a request's first block (two per 256-token block here, four
