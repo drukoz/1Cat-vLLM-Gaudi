@@ -18,17 +18,21 @@
 #                     (the stock bridge setting that issues each collective inline instead of through a job thread);
 #                     after the main comparison; the real one only if its tiny one passed (about 16 more minutes:
 #                     give the job the hold); BRIDGE_INLINE=1 in the job's environment does the same
+#   EXTRA=<build id>  one more prepared-replay build, its tiny arm (tokens against tiny-stock) and real arm right
+#                     after the main comparison, named after the build id's first word (lean3a-... -> tiny-lean3a,
+#                     real-lean3a); BRIDGE_EXTRA=<build id> in the job's environment does the same
 set -u
 L="${1:?LEAN build id}"
 INLINE="${BRIDGE_INLINE:-0}"
+EXTRA="${BRIDGE_EXTRA:-}"
 LATE="$HOME/farm/collectives/bridge/late/${CARDQ_JOB:-none}.env"
 if [ -s "$LATE" ]; then
     while IFS='=' read -r k v; do
         v="${v//[[:space:]]/}"
         case "$v" in *[!A-Za-z0-9._-]*) echo "bridge_headline: ignored a bad value in $LATE: $k"; continue ;; esac
-        case "$k" in LEAN) [ -n "$v" ] && L="$v" ;; INLINE) INLINE="$v" ;; esac
+        case "$k" in LEAN) [ -n "$v" ] && L="$v" ;; INLINE) INLINE="$v" ;; EXTRA) EXTRA="$v" ;; esac
     done <"$LATE"
-    echo "bridge_headline: late-bound settings from $LATE: LEAN=$L INLINE=$INLINE"
+    echo "bridge_headline: late-bound settings from $LATE: LEAN=$L INLINE=$INLINE EXTRA=${EXTRA:-none}"
 fi
 IMG="${2:?image, e.g. farm-collectives-int:d00c0a9a3e18 (a second tag of integration build 3, kept from pruning)}"
 S="${3:-$(basename "$(readlink "$HOME/farm/${CARDQ_TRACK:?}/current")")}"
@@ -54,6 +58,17 @@ fi
 # 2. the main comparison first, so it exists even if the inline arms run out of hold (coordinator, 03:40 UTC)
 bash "$J" --sha "$S" --image "$IMG" "${ENV[@]}" --cmd "$PROBE" \
     "real-stock:-" "real-lean:$L:PT_HPU_HPUGRAPH_PREPARED_REPLAY=1,PT_HPU_HPUGRAPH_REPLAY_TIMING=5000"
+# 2b. one more build (EXTRA), its tiny arm against tiny-stock's tokens, its real arm only if that passed
+case "$EXTRA" in *[!A-Za-z0-9._-]*) echo "bridge_headline: bad EXTRA '$EXTRA': ignored"; EXTRA="" ;; esac
+if [ -n "$EXTRA" ]; then
+    X="${EXTRA%%-*}"
+    bash "$J" --sha "$S" --image "$IMG" "${ENV[@]}" --cmd 'python /farm/farm_tiny.py --gdn hc' --ref-arm tiny-stock \
+        "tiny-$X:$EXTRA:PT_HPU_HPUGRAPH_PREPARED_REPLAY=1,PT_HPU_HPUGRAPH_REPLAY_TIMING=2000"
+    if grep -q "^tiny-$X ok" "$V"; then
+        bash "$J" --sha "$S" --image "$IMG" "${ENV[@]}" --cmd "$PROBE" \
+            "real-$X:$EXTRA:PT_HPU_HPUGRAPH_PREPARED_REPLAY=1,PT_HPU_HPUGRAPH_REPLAY_TIMING=5000"
+    fi
+fi
 # 3. the inline-collective pair, its tiny arm against tiny-stock's tokens
 if [ "$INLINE" = 1 ]; then
     bash "$J" --sha "$S" --image "$IMG" "${ENV[@]}" --cmd 'python /farm/farm_tiny.py --gdn hc' --ref-arm tiny-stock \
