@@ -640,7 +640,7 @@ under this track's folder) this track runs `late/watch_job.sh 00142 ~/farm/integ
 nospec-pin` on the node (started 00:36:22 UTC, pids 817765 and 817768; it ends by itself after B's workers exit):
 results in `~/farm/native-replay/results/cpuwatch-00142/<arm>/cpus_series.txt|.jsonl`, log `watch_job.log`.
 
-### The card job in the queue: 00134 `real4-cut-pin-hash-ab` (probably not run tonight)
+### The TP4 job 00134 `real4-cut-pin-hash-ab`: cancelled 01:35 UTC (made moot by 00156 arm B and the bridge job's accsync arms; its plan below stays for reference)
 
 `any:4`, 58 min, replaces 00122 (which replaced 00084) and keeps the coordinator's bump; starts by 01:55 UTC at the
 latest, on cards 0,1,2,7 (modules 0-3). Stub: `reports/native-replay/late/stub_real4_cut_pin_hash.sh`. First the tiny
@@ -673,7 +673,10 @@ all-reduces already split every layer).
 0. **Item 3a (proposed to the coordinator, 01:20 UTC): `PT_HPU_SYNCHRONOUS_ACC_QUEUE_FLUSHING=1`** (no AccThreadPool
    spinner; section 7.9) as one arm at TP8, unpinned, 1 and 32 streams, after a tiny token-parity check; if the 1-stream
    step and the per-rank spread drop, retry a pin on top. No bridge build needed.
-1. 00134 as above; write its numbers into a section 7.9 and sections 0 and 5; tell the coordinator.
+1. The bridge job `real8-bridge-phase` (collectives track, after 00160): the per-phase split of a replayed launch on
+   the real model at TP8 (`real-timers`), the first prepared-replay step (`real-lean`), the spinner switch
+   (`real-accsync`); write the numbers into section 7.10 and sections 0 and 5; decide the next lean step from the
+   dominant phase; tell the coordinator.
 2. The coordinator's bridge build (23:43 UTC): the UNPATCHED bridge at `5176b1b2` (head of `v1.24.1`, the node's
    version) builds in container `nr-bridge-build` from `farm-base:latest` on the node, `--cpuset-cpus 18,37,56,75`, nice
    19, no card, without the C++ tests (`.devops/build.py -c -r -l -j 4 --no-iwyu --no-swig`); script
