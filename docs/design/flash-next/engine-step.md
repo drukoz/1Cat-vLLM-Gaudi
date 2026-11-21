@@ -11,16 +11,20 @@ This track's harness refuses report files outside the repository, so the handoff
 
 ## Handoff (if this agent stops)
 
-Last update: **2026-11-21 09:22 UTC** (fourth agent, Opus 5.5; the node was extended to about 00:00 UTC on
+Last update: **2026-11-21 09:33 UTC** (fourth agent, Opus 5.5; the node was extended to about 00:00 UTC on
 2026-11-22). Branch `feat/flash-next-gaudi-engine-step`, pushed; merged into the program branch up to `bcef8aa5` (PR
 #20); since then, not yet in a PR, all default-off: `ff160409` (`VLLM_HPU_WORKER_GC_FREEZE`), `ca52fa33`
 (`VLLM_HPU_LOG_UNMATCHED_GRAPH_INPUTS`), `844a37f2` (`VLLM_HPU_VERIFY_LOGITS_IN_GRAPH`), `8efc6969`
 (`VLLM_HPU_PERSISTENT_INPUTS` and the block-table width guard), the probe's `--spec-arms` (`6d5b8eef`), docs; the
 program head `adbcff30` (PRs #18, #21, #22) merged in at `a0bd1753` (two conflicts in `hpu_model_runner.py`, both
 sides kept), and `83a3fa35` (the logger wraps the `sys.modules` graphs module; its test failed after the host
-n-gram test in one session). Next PR: gate of `83a3fa35` in `reports/engine-step/merge-wt`
-(`logs/gate_83a3fa35.log`), the worker tests by hand (`logs/worker_tests_83a3fa35.log`); open and merge the PR when
-green. A fix branch, `fix/flash-next-gaudi-block-table-width-guard` (`33eb7cb1`, on `adbcff30`), waits for its gate
+n-gram test in one session), `e4c442ef` (`VLLM_HPU_VERIFY_LOGITS_IN_GRAPH` runtime-switchable, the entry
+mtp-draft-graph's build-5 card branch has as `64656082`; when that branch merges, the `SWITCHABLE` tuple conflicts
+on one line: take the union). Next PR: gate of `e4c442ef` in `reports/engine-step/merge-wt`
+(`logs/gate_e4c442ef.log`); the worker tests by hand at `83a3fa35` (`logs/worker_tests_83a3fa35.log`) are as on the
+program head (9 files need the card, `test_gdn_state_layout` has 1 card-only test, `test_draft_rank_stats` expects
+3 `.topk(`, stale since collectives' `2d644ce9`), the rest green; open and merge the PR when the gate is green. A fix
+branch, `fix/flash-next-gaudi-block-table-width-guard` (`33eb7cb1`, on `adbcff30`), waits for its gate
 (section 15). A second branch of this track,
 **`feat/flash-next-gaudi-engine-step-mtp-record`** (`2b90707f`, worktree `reports/engine-step/trees/mtp-record`):
 mtp-card-ready's head `7c4d65e3` plus `VLLM_HPU_MTP_TIMING=2` (one record per speculative step, section 14), for
@@ -62,9 +66,13 @@ between the graphs are listed there; 00226 (TP2) is to name the TP8 front cuts.
    async-sched's per-input switch. Rank skew: native-replay's pin mode 3, seen per rank with `replay_first_ms`.
    (d) 00226's TP2 cut log: name the cuts of 00205's `embed` and `ple` segments (`python3
    reports/engine-step/probes/cutlog/cuts.py reports/engine-step/card/00226-*/habana_logs`, then `seq.py` on the
-   verify and draft captures) and tell the coordinator. (e) When the chain job runs (mtp-draft-graph's chain with
-   `VLLM_HPU_VERIFY_LOGITS_IN_GRAPH`, after 00226; coordinator 09:19 UTC): check with `window.py` which of the nine
-   step-level cuts of section 15 are gone, and tell the coordinator.
+   verify and draft captures) and tell the coordinator. (e) The chain job (coordinator 09:19 UTC) is
+   mtp-draft-graph's 00228, after 00222 (about 13:00 UTC), on its branch `feat/flash-next-gaudi-mtp-draft-graph-b5`
+   (build 5 `eb21ac75` + the chain + async-sched's M1 + this track's `844a37f2` and `ca52fa33`); arms `on-md`,
+   `chain-md`, `vlg`, `chain-vlg`, `all`, `chain-all` on one server (`vlg` against `on-md` is this track's flag
+   alone). Its tiny gate `tiny-chain-vlg` (asked at 09:32 UTC to carry `LOG_LEVEL_PT_IRGRAPH=1` and
+   `LOG_LEVEL_PT_LAZY=1`) is where `window.py` shows which of the nine step-level cuts of section 15 are gone; tell
+   the coordinator.
 4. Build 4's code with this track's card tools and flags is the local branch `engine-step-int4-card` (`4b180729`);
    the CPU census tree is `reports/engine-step/trees/b4`.
 
