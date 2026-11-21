@@ -1,21 +1,26 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
-"""One-card bench of the fused GDN verify op per index-space layout (docs/design/flash-next/hc-kernels.md, "GDN verify").
+"""One-card bench of the fused GDN verify op per variant (docs/design/flash-next/hc-kernels.md, "GDN verify").
 
     bash tools/flash_next/kernel_probes/with_kernels.sh env VLLM_HPU_GDN_KERNEL_INTERLEAVE=1 \
-        VLLM_HPU_GDN_VERIFY_REQUEST_MAJOR=1 python tools/flash_next/hc_kernels/bench_gdn_verify.py --label rmajor --out "$FARM_OUT"
+        VLLM_HPU_GDN_VERIFY_VARIANT=1 python tools/flash_next/hc_kernels/bench_gdn_verify.py --label variant1 \
+        --out "$FARM_OUT"
     PROBE_DEVICE=cpu PYTHONPATH=<tree> python tools/flash_next/hc_kernels/bench_gdn_verify.py --quick   # dry run
 
 The glue picks the kernel build and its index-space layout from VLLM_HPU_GDN_KERNEL_INTERLEAVE and
-VLLM_HPU_GDN_VERIFY_REQUEST_MAJOR when the graph compiler instantiates the op, so one process measures one layout:
+VLLM_HPU_GDN_VERIFY_VARIANT when the graph compiler instantiates the op, so one process measures one variant:
 run the script once per layout (``card_gdn_verify.sh`` does) and compare the ``--label``ed results.
 
 At the TP8 geometry (2 key heads, 6 value heads per rank) with T nodes per request (default 4, MTP k = 3) and
 each batch size (default 1, 8, 32): K verify calls, EACH ON ITS OWN conv and SSM pools (two calls on one pool in
-one graph have no declared order: kernel-fixes' rule-10 note), captured in one HPU graph and replayed with a
-synchronize; the median wall of a replay at two K (``--k``, default 4 and 12), and the slope is the device time per
-call. The output and both pools of the first set are saved for a bit comparison between layouts
-(``--compare-to DIR``: another run's out folder).
+one graph have no declared order: kernel-fixes' rule-10 note), CHAINED (call i + 1's gate input ``a`` gets
+1e-30 x one element of call i's output, so the graph compiler cannot run two calls side by side on idle engines, as
+consecutive layers cannot), captured in one HPU graph and replayed with a synchronize; the median wall of a replay at
+two K (``--k``, default 4 and 12), and the slope is the device time per call (with one tiny add). The output and both
+pools of the first set (one eager call, no chain) are saved for a bit comparison between variants (``--compare-to
+DIR``: another run's out folder). ``--trace``: a torch-profiler trace of three replays at the larger K per batch size
+(the process must start with HABANA_PROFILE=profile_api_light), for the TPC engines each call runs on
+(reports/hc-kernels/tools/kernel_engines.py).
 """
 from __future__ import annotations
 
@@ -47,7 +52,10 @@ def main() -> int:
     ap.add_argument("--iters", type=int, default=10)
     ap.add_argument("--compare-to", type=Path, default=None)
     ap.add_argument("--quick", action="store_true")
+    ap.add_argument("--trace", action="store_true")
     a = ap.parse_args()
+    if a.trace and DEVICE == "hpu" and os.environ.get("HABANA_PROFILE") != "profile_api_light":
+        ap.error("--trace needs HABANA_PROFILE=profile_api_light in the environment before torch is imported")
     out = a.out / a.label
     out.mkdir(parents=True, exist_ok=True)
 
@@ -68,7 +76,7 @@ def main() -> int:
     k_lo, k_hi = (int(v) for v in a.k.split(","))
     if a.quick:
         k_lo, k_hi, a.iters = 1, 2, 1
-    env = {key: os.environ.get(key) for key in ("VLLM_HPU_GDN_KERNEL_INTERLEAVE", "VLLM_HPU_GDN_VERIFY_REQUEST_MAJOR")}
+    env = {key: os.environ.get(key) for key in ("VLLM_HPU_GDN_KERNEL_INTERLEAVE", "VLLM_HPU_GDN_VERIFY_VARIANT")}
     results = {"label": a.label, "env": env, "tp": a.tp, "tokens": a.tokens, "k": [k_lo, k_hi], "batches": {}}
     say(f"label {a.label}, env {env}")
 
@@ -105,7 +113,16 @@ def main() -> int:
             class Calls(torch.nn.Module):
 
                 def forward(self, dummy, k=k):
-                    return tuple(step(*args) for step, args in sets[:k])
+                    outs = []
+                    previous = None
+                    for step, args in sets[:k]:
+                        if previous is not None:  # a real dependency on the previous call (a layer chain)
+                            conv, ssm, mixed, z, gate_a, gate_b = args
+                            gate_a = gate_a + (previous.reshape(-1)[:1] * 1e-30).to(gate_a.dtype)
+                            args = (conv, ssm, mixed, z, gate_a, gate_b)
+                        previous = step(*args)
+                        outs.append(previous)
+                    return tuple(outs)
 
             module = Calls()
             if htorch is not None:
@@ -121,6 +138,15 @@ def main() -> int:
                 sync()
                 times.append((time.perf_counter() - t0) * 1e3)
             walls[k] = statistics.median(times)
+            if a.trace and k == k_hi and DEVICE == "hpu":
+                with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU,
+                                                        torch.profiler.ProfilerActivity.HPU]) as profiler:
+                    for _ in range(3):
+                        module(dummy)
+                    sync()
+                trace_path = out / f"trace_b{batch}_k{k}.json"
+                profiler.export_chrome_trace(str(trace_path))
+                say(f"{a.label} batch {batch:3d}: trace {trace_path}")
         per_call = (walls[k_hi] - walls[k_lo]) / (k_hi - k_lo) * 1e3
         entry.update(wall_ms=walls, us_per_call=per_call)
         say(f"{a.label} batch {batch:3d} T {a.tokens}: {per_call:8.1f} us per call (replay {walls[k_lo]:.3f} ms at "

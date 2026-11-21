@@ -41,11 +41,13 @@ def test_flag_is_documented():
 def test_the_glue_reads_exactly_this_variable_with_the_interleave_variable():
     header = (GDN / "host" / "gdn_kernel_variant.hpp").read_text()
     assert f'std::getenv("{FLAG}")' in header
-    for value in ("1", "2", "3"):
+    for value in ("1", "2", "3", "4", "5"):
         assert f'std::strcmp(value, "{value}") == 0) return {value};' in header
     glue = (GDN / "host" / "gdn_core_verify_gaudi2.cpp").read_text()
     assert "const int asked = GdnKernelInterleaveRequested() ? GdnVerifyVariantRequested() : 0;" in glue
     assert "const bool requestMajor = variant && (asked == 1 || asked == 3);" in glue
+    assert "const bool splitKeyHeads = variant && (asked == 4 || asked == 5);" in glue
+    assert "instance->preferredSplitDim = 1;" in glue and "dim.allRequired = true;" in glue
     for name in VARIANTS:
         for edge in ("start", "end"):
             assert f"extern unsigned char _binary_{name}_o_{edge} __attribute__((weak));" in glue

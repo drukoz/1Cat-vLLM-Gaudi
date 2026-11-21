@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: Apache-2.0
 #
-# card_gdn_verify.sh: the one-card A/B of the GDN verify variants (VLLM_HPU_GDN_VERIFY_VARIANT 0 to 3 with
+# card_gdn_verify.sh: the one-card A/B of the GDN verify variants (VLLM_HPU_GDN_VERIFY_VARIANT 0 to 5 with
 # VLLM_HPU_GDN_KERNEL_INTERLEAVE=1; docs/design/flash-next/hc-kernels.md, "GDN verify"), run from the tree inside a
 # farm container (farm job hc-kernels <name> any:1 <hold> -- bash tools/flash_next/hc_kernels/card_gdn_verify.sh):
 #   1. the verify op card tests with variant 3 (the request-major index space and the lean broadcasts)
-#   2. bench_gdn_verify.py per variant 0, 1, 2, 3 (us per call at batch 1, 8, 32, T = 4, TP8 geometry), the bits
-#      of variants 1 to 3 compared with variant 0's
+#   2. bench_gdn_verify.py per variant 0 to 5 (us per call at batch 1, 8, 32, T = 4, TP8 geometry, chained calls),
+#      the bits of variants 1 to 5 compared with variant 0's
+#   3. profiler traces of variants 0, 1, 4 at batch 1 and 32 (the TPC engines a call runs on)
 # One process per variant: the glue reads the variables when the graph compiler instantiates the op. Logs and
 # results go to $FARM_OUT. Every step runs; the exit code is the first failing step's.
 set -u
@@ -32,10 +33,16 @@ step gdn_optest_variant3 "$IL" VLLM_HPU_GDN_VERIFY_VARIANT=3 -- \
     python -m pytest -q -rs -p no:cacheprovider tests/unit_tests/gdn_core_decode/test_hpu_verify_op.py
 step gdn_bench_variant0 "$IL" VLLM_HPU_GDN_VERIFY_VARIANT=0 -- \
     python tools/flash_next/hc_kernels/bench_gdn_verify.py --label variant0 --out "$OUT"
-for v in 1 2 3; do
+for v in 1 2 3 4 5; do
     step "gdn_bench_variant$v" "$IL" "VLLM_HPU_GDN_VERIFY_VARIANT=$v" -- \
         python tools/flash_next/hc_kernels/bench_gdn_verify.py --label "variant$v" --out "$OUT" \
         --compare-to "$OUT/variant0"
+done
+# device traces (engines per call) of the layouts: today's (0), request-major (1), preferred key-head split (4)
+for v in 0 1 4; do
+    step "gdn_trace_variant$v" "$IL" "VLLM_HPU_GDN_VERIFY_VARIANT=$v" HABANA_PROFILE=profile_api_light -- \
+        python tools/flash_next/hc_kernels/bench_gdn_verify.py --label "trace_variant$v" --out "$OUT" --trace \
+        --batches 1,32 --iters 3
 done
 grep -h "passed\|failed\|VERDICT\|DIFFERS" "$OUT"/gdn_*.log 2>/dev/null | tail -n 10
 exit "$rc"

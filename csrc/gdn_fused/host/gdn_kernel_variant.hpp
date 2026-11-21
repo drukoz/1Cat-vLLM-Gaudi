@@ -26,6 +26,10 @@ struct GdnKernelElf {
 //   1 the request-major index space {requests, key heads} (kernels/gdn_core_verify_interleaved_rmajor_gaudi2.c)
 //   2 the lean broadcasts of the recurrence (kernels/gdn_core_verify_interleaved_lean_gaudi2.c)
 //   3 both (kernels/gdn_core_verify_interleaved_rmajor_lean_gaudi2.c)
+//   4 today's index space and ELF, with the graph compiler asked to split the key-head dimension into partitions
+//     of one (preferredSplitDim) and to go on with the request dimension, so that every (key head, request) point
+//     can land on its own TPC engine
+//   5 as 4, with the lean ELF
 // Any other value, or none, is 0: the interleaved kernel as it is.
 inline int GdnVerifyVariantRequested()
 {
@@ -34,6 +38,8 @@ inline int GdnVerifyVariantRequested()
     if (std::strcmp(value, "1") == 0) return 1;
     if (std::strcmp(value, "2") == 0) return 2;
     if (std::strcmp(value, "3") == 0) return 3;
+    if (std::strcmp(value, "4") == 0) return 4;
+    if (std::strcmp(value, "5") == 0) return 5;
     return 0;
 }
 

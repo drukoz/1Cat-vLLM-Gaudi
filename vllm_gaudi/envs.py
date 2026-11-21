@@ -540,7 +540,7 @@ if TYPE_CHECKING:
     VLLM_HPU_GDN_CORE_DECODE_DEBUG: int = 0  # GdnCoreDecodeDebug: 0 off, 1 check slot indices every step (host sync)
     VLLM_HPU_GDN_CORE_VERIFY: int = 0  # GdnCoreVerifyMode: 0 off (default), 1 fused verification steps
     VLLM_HPU_GDN_KERNEL_INTERLEAVE: int = 0  # 0 today's GDN decode/verify kernels, 1 four value rows per iteration
-    VLLM_HPU_GDN_VERIFY_VARIANT: int = 0  # with the interleave flag: 1 request-major, 2 lean broadcasts, 3 both
+    VLLM_HPU_GDN_VERIFY_VARIANT: int = 0  # with the interleave flag: 1 request-major, 2 lean, 3 both, 4/5 split hint
     VLLM_HPU_GDN_GLUE_CACHE: int = 0  # 0 per-step glue of the fused GDN ops (default), 1 constants and indices cached
     VLLM_HPU_PLE_HOST_NGRAM_IDS: int = 0  # 0 PLE n-gram ids computed in the graph (default), 1 on the host
     VLLM_HPU_HC_FUSED: int = 0  # 0 torch hyper-connections (default), 1 the fused hyper-connection kernels
@@ -1996,8 +1996,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # (docs/design/flash-next/hc-kernels.md, "GDN verify"). 0 (default) the interleaved kernel; 1 its request-major
     # index space {requests, key heads} instead of {key heads, requests} (the same points: the graph compiler can
     # spread them over more TPC engines); 2 lean broadcasts in the recurrence (11 % fewer instructions in the
-    # simulator); 3 both. Every variant's outputs and states are the interleaved kernel's bit for bit. Any other value
-    # is 0. A library built without a variant serves the interleaved kernel. Not yet run on a card.
+    # simulator); 3 both; 4 today's index space with the graph compiler asked to split the key heads into partitions
+    # of one (preferredSplitDim); 5 as 4 with the lean build. Every variant's outputs and states are the interleaved
+    # kernel's bit for bit. Any other value is 0. A library built without a variant serves the interleaved kernel.
+    # Not yet run on a card.
     "VLLM_HPU_GDN_VERIFY_VARIANT":
     lambda: int(os.environ.get("VLLM_HPU_GDN_VERIFY_VARIANT", "0")),
 

@@ -81,6 +81,11 @@ VARIANT_VERIFY_SOURCES = {
     3: REPO_ROOT / "csrc" / "gdn_fused" / "kernels" / "gdn_core_verify_interleaved_rmajor_lean_gaudi2.c",
 }
 VARIANT_ENV = "VLLM_HPU_GDN_VERIFY_VARIANT"
+# Variants 4 and 5 use the interleaved and the lean ELF with today's index space and the graph compiler's
+# preferred split of the key-head dimension (glue only; the simulator runs the whole index space on one TPC).
+VARIANTS = (1, 2, 3, 4, 5)
+REQUEST_MAJOR_VARIANTS = (1, 3)
+LEAN_VARIANTS = (2, 3, 5)
 # Instructions of the lean variants over the interleaved kernel, at most (measured 2026-11-21: 0.887 to 0.925).
 LEAN_VERIFY_RATIO = 0.94
 # Instructions of the interleaved kernel over today's, at most (measured 2026-11-20, tpc-clang 2.7.33: decode
@@ -322,12 +327,13 @@ def _run_verify(binary: Path, case, inputs, run_dir: Path, env_values: dict) -> 
     return count, geometry, {name: (run_dir / name).read_bytes() for name in files}
 
 
-@pytest.mark.parametrize("variant", sorted(VARIANT_VERIFY_SOURCES))
+@pytest.mark.parametrize("variant", VARIANTS)
 @pytest.mark.parametrize("case", VERIFY_CASES, ids=[case.name for case in VERIFY_CASES])
 def test_verify_variant_is_bit_identical_to_the_interleaved_kernel(interleaved_verify_sim_binary: Path, case,
                                                                    variant: int, tmp_path: Path) -> None:
-    """VLLM_HPU_GDN_VERIFY_VARIANT 1 (request-major index space), 2 (lean broadcasts), 3 (both): every output and
-    state byte is the interleaved kernel's; 1 runs the same instructions, 2 and 3 fewer."""
+    """VLLM_HPU_GDN_VERIFY_VARIANT 1 (request-major index space), 2 (lean broadcasts), 3 (both), 4 (preferred split
+    of the key heads), 5 (4 with the lean ELF): every output and state byte is the interleaved kernel's; 1 and 4 run
+    the same instructions, 2, 3 and 5 fewer."""
     binary = interleaved_verify_sim_binary / "verify_sim_host"
     inputs = make_verify_inputs(case)
     base = _run_verify(binary, case, inputs, tmp_path / "interleaved", {INTERLEAVE_ENV: "1"})
@@ -338,30 +344,30 @@ def test_verify_variant_is_bit_identical_to_the_interleaved_kernel(interleaved_v
     print(f"{case.name} variant {variant}: index space {base[1]} -> {got[1]}, instructions {base[0]} -> {got[0]} "
           f"({got[0] / base[0]:.3f})")
     first, second = (int(v) for v in base[1].split(","))
-    want = [second, first] if variant in (1, 3) else [first, second]
+    want = [second, first] if variant in REQUEST_MAJOR_VARIANTS else [first, second]
     assert [int(v) for v in got[1].split(",")] == want
     for name in base[2]:
         assert base[2][name] == got[2][name], f"{name}: variant {variant}'s bytes differ"
-    if variant == 1:
-        assert abs(got[0] - base[0]) <= 0.02 * base[0]
-    else:
+    if variant in LEAN_VARIANTS:
         assert got[0] <= LEAN_VERIFY_RATIO * base[0]
+    else:
+        assert abs(got[0] - base[0]) <= 0.02 * base[0]
 
 
 def test_a_variant_needs_the_interleave_variable_and_an_exact_value(interleaved_verify_sim_binary: Path,
                                                                     tmp_path: Path) -> None:
-    """The glue takes a variant build only with the interleave variable at "1" and the variant at "1", "2" or "3"."""
+    """The glue takes a variant only with the interleave variable at "1" and the variant at exactly "1" to "5"."""
     binary = interleaved_verify_sim_binary / "verify_sim_host"
     case = VERIFY_CASES[0]
     inputs = make_verify_inputs(case)
     runs = {}
     for label, values in (("none", {}), ("variant_only", {VARIANT_ENV: "3"}),
-                          ("interleaved", {INTERLEAVE_ENV: "1"}), ("variant_4", {INTERLEAVE_ENV: "1", VARIANT_ENV: "4"}),
+                          ("interleaved", {INTERLEAVE_ENV: "1"}), ("variant_6", {INTERLEAVE_ENV: "1", VARIANT_ENV: "6"}),
                           ("variant_x", {INTERLEAVE_ENV: "1", VARIANT_ENV: "1 "}),
                           ("variant_3", {INTERLEAVE_ENV: "1", VARIANT_ENV: "3"})):
         runs[label] = _run_verify(binary, case, inputs, tmp_path / label, values)
     assert runs["none"][0] == runs["variant_only"][0] and runs["none"][1] == runs["variant_only"][1]
-    assert runs["interleaved"][0] == runs["variant_4"][0] == runs["variant_x"][0]
+    assert runs["interleaved"][0] == runs["variant_6"][0] == runs["variant_x"][0]
     assert runs["variant_3"][0] < runs["interleaved"][0] and runs["variant_3"][1] != runs["interleaved"][1]
 
 

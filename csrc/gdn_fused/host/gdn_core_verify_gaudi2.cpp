@@ -168,21 +168,27 @@ tpc_lib_api::GlueCodeReturn GdnCoreVerifyGaudi2::GetGcDefinitions(
     // is linked in; otherwise the interleave variable's choice as before. Today's index space is
     // {key heads, requests}; variants 1 and 3 take {requests, key heads}: every mapping to an index dimension below
     // goes through keyHeadDim / requestDim.
+    // Variants 4 and 5 keep today's index space and ask the graph compiler for a split of the key-head dimension
+    // into partitions of one (preferredSplitDim, which needs every tensor dimension mapped to it allRequired).
     const int asked = GdnKernelInterleaveRequested() ? GdnVerifyVariantRequested() : 0;
     const unsigned char* variantStart = nullptr;
     const unsigned char* variantEnd = nullptr;
     if (asked == 1) {
         variantStart = &_binary_gdn_core_verify_interleaved_rmajor_gaudi2_o_start;
         variantEnd = &_binary_gdn_core_verify_interleaved_rmajor_gaudi2_o_end;
-    } else if (asked == 2) {
+    } else if (asked == 2 || asked == 5) {
         variantStart = &_binary_gdn_core_verify_interleaved_lean_gaudi2_o_start;
         variantEnd = &_binary_gdn_core_verify_interleaved_lean_gaudi2_o_end;
     } else if (asked == 3) {
         variantStart = &_binary_gdn_core_verify_interleaved_rmajor_lean_gaudi2_o_start;
         variantEnd = &_binary_gdn_core_verify_interleaved_rmajor_lean_gaudi2_o_end;
+    } else if (asked == 4) {
+        variantStart = &_binary_gdn_core_verify_interleaved_gaudi2_o_start;
+        variantEnd = &_binary_gdn_core_verify_interleaved_gaudi2_o_end;
     }
     const bool variant = asked != 0 && GdnElfLinked(variantStart, variantEnd);
     const bool requestMajor = variant && (asked == 1 || asked == 3);
+    const bool splitKeyHeads = variant && (asked == 4 || asked == 5);
     const unsigned keyHeadDim = requestMajor ? 1 : 0;
     const unsigned requestDim = requestMajor ? 0 : 1;
     instance->indexSpaceRank = 2;
@@ -251,6 +257,21 @@ tpc_lib_api::GlueCodeReturn GdnCoreVerifyGaudi2::GetGcDefinitions(
     MapDimension(outputPattern, 0, 0, 0, 0, 127);
     MapDimension(outputPattern, 1, keyHeadDim, static_cast<int>(repetition), 0, static_cast<int>(repetition - 1));
     MapDimension(outputPattern, 2, requestDim, static_cast<int>(nodes), 0, static_cast<int>(nodes - 1));
+
+    if (splitKeyHeads) {
+        // Index dimension 0 (the key heads) in partitions of one: every tensor dimension mapped to it is declared
+        // allRequired, as preferredSplitDim requires (tpc_kernel_lib_interface.h); the kernel itself reads only its
+        // own key head's columns, as before.
+        for (unsigned input = 0; input < kInputCount; ++input) {
+            for (auto& dim : instance->inputTensorAccessPattern[input].mapping) {
+                if (dim.indexSpaceDim == 0) dim.allRequired = true;
+            }
+        }
+        for (auto& dim : outputPattern.mapping) {
+            if (dim.indexSpaceDim == 0) dim.allRequired = true;
+        }
+        instance->preferredSplitDim = 1;  // 1 = index dimension 0
+    }
 
     instance->kernel.paramsNr = sizeof(GdnCoreVerifyParams) / sizeof(uint32_t);
     std::memcpy(instance->kernel.scalarParams, &scalar, sizeof(scalar));
