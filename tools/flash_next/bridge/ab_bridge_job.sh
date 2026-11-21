@@ -6,7 +6,8 @@
 # (CARDQ_* set); each arm is one container started by ~/farm/farm_job.sh (cards, CPUs, ports, labels as for every
 # job), probed by the farm's serve_probe.sh + decode_scaling.py. Deployed to ~/farm/collectives/bridge/.
 #
-#   ab_bridge_job.sh [--sha SHA12] [--cmd 'COMMAND WORDS'] ARM...      ARM = name:BUILD[:KEY=VALUE[,KEY=VALUE...]]
+#   ab_bridge_job.sh [--sha SHA12] [--cmd 'COMMAND WORDS'] [--stop-on-fail] ARM...
+#     ARM = name:BUILD[:KEY=VALUE[,KEY=VALUE...]]; --stop-on-fail: no further arm after one that failed
 #     BUILD "-" = the image's bridge; otherwise a build id of ~/farm/native-replay/bridge-build/out/, installed by
 #     with_bridge.py at the container's start (exit 7 or 8 and the arm fails if it is not what loads).
 #   e.g. stock:-  lean0:lean-0123456789ab:PT_HPU_HPUGRAPH_PREPARED_REPLAY=0
@@ -26,10 +27,12 @@ JOB="${CARDQ_JOB:?}"
 NAME="${CARDQ_NAME:-bridge-ab}"
 SHA=""
 CMD=""
+STOP_ON_FAIL=0
 while [ $# -gt 0 ]; do
     case "$1" in
         --sha) SHA="$2"; shift 2 ;;
         --cmd) CMD="$2"; shift 2 ;;
+        --stop-on-fail) STOP_ON_FAIL=1; shift ;;
         *) break ;;
     esac
 done
@@ -92,6 +95,10 @@ for arm in "$@"; do
     echo "ab_bridge: arm $name ended rc $rc [$(now)]"
     [ "$rc" -eq 0 ] || rc_all=$rc
     sleep "${CARD_RELEASE_S:-15}"  # the cards are not free the moment the server's processes end
+    if [ "$rc" -ne 0 ] && [ "$STOP_ON_FAIL" -eq 1 ]; then
+        echo "ab_bridge: --stop-on-fail: no further arm"
+        break
+    fi
 done
 # one line per arm and level: the steady ms per token (median gap between chunks) of the measured rounds; with
 # --cmd and the tiny smoke: each arm's result and its tokens against the first arm's, prompt by prompt
