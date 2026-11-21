@@ -150,18 +150,26 @@ outside a git checkout).
   streams greedy and sampled, k = 3 against k = 1 against the reference, Ft / Fd at 128 rows, which verification
   rung ran (the fused one, `VLLM_HPU_GDN_CORE_VERIFY=1`).
 
-**Pending, in order**
-1. DONE 00:24 UTC: 00126 / 00127 read, sent to the coordinator, in "Card results" (digest:
-   `python3 reports/mtp-card-ready/analyze_arms.py reports/mtp-card-ready/card/00126-real4-qsa-mtp-k3-k1`).
-2. I07 fast path on the card: the 1-card bench job (`cand-verify-bench`, below), then a real-model arm with
-   `VLLM_HPU_SPEC_SAMPLED_VERIFY=2` (sampled rounds at 1 and 32 streams) against 00126's `=1` sampled rounds:
-   `mtp_arms.sh 'cand|K||--levels 32 --tokens 256 --repeat-top 1 --sampled-levels 1,32'` with 00126's flags,
-   `VLLM_HPU_SPEC_SAMPLED_VERIFY=2` and K the best k at 32 streams.
-3. k from arithmetic (`tools/flash_next/mtp_k_choice.py`): E(k) = 1 + r1 + ... + rk with the unconditional
-   per-position rates; cost Ft(rows(k)) + k Fd. k = 4 / 5 only where Fd stays small against Ft (1 stream).
-4. Pull request after 04:00 UTC: gate (`bin/gate <worktree> --tools`) on a snapshot, PR to
-   `feat/flash-next-gaudi` (the merges of qsa-fused and kernel-fixes are then on the program branch or not: if
-   not, the PR carries them, say so).
+**Pending, in order (for whoever takes the track next)**
+1. 00170 (the 00133 fix's card check with prefill's flags, above): read it when it ends (`bin/farm fetch
+   mtp-card-ready 00170 00170-real4-commit-turns-check2` if no waiter copied it), report `COMPARE` lines, the
+   next-turn cached tokens at k = 3 (896 expected) and k = 0, acceptance before and after the crossings, any
+   `tensor_data is empty` in `server0.log`.
+2. 00138 (TP4, `=2` candidate path at k = 3 and k = 1, plus 8 x 16K-token prompts with CHUNK_KV): read it, compare
+   its sampled step time with 00126's `=1` (184.3 ms at 32 streams, k = 3; 109.1 at k = 1); report acceptance at long
+   prompts. engine-step's 00164 (TP8, its region) and integration's build 2 runs are the other `=2` / region data.
+3. The pull request: when `reports/mtp-card-ready/gate/gate-558277d2.txt` ends (the gate on a snapshot of
+   `558277d2`), judge its reds (the known tools/rental signal and git reds are not this branch's; anything in
+   flash_next or the sampler is), then merge `origin/feat/flash-next-gaudi` again, push, `gh pr create --base
+   feat/flash-next-gaudi` with `reports/mtp-card-ready/pr/pr2_body.md` (update its numbers: 00126 / 00127 / 00135 /
+   00139, the 00133 fix), `gh pr merge --merge`. The branch carries the qsa-fused merge (`697bffed`): if qsa-fused's
+   pull request has not landed first, say so in the body.
+4. k at TP8: integration's 00128 (k = 3: 40.7 ms per token at 32 streams) and 00156 (build 2b, k = 2); by arithmetic
+   on 00128's Ft (0.24 ms per row) k = 2 to 4 are all about 40-41 ms per token at 32 streams.
+5. Leftover scratch trees (safe to delete once 00170 has run): `reports/mtp-card-ready/scratch-prefill`,
+   `scratch-merge2` (the card build's merges; a stash holds the SCRATCH_* probe patches), `snap-0d1be6fc`,
+   `snap-cand`, `prefix-spec` (prefill's reviewed commit, now `92e65144` on their branch). Keep `gate-558277d2`
+   until its gate has run.
 
 **Results of the jobs the third agent left (read 23:20 UTC)** are in "Card results" (00099, 00104, 00105).
 The fused verify rung's mismatch on the tiny model at TP2 (00105, 700-token prompt, token 4) is a near tie: the
