@@ -67,7 +67,7 @@ def test_expert_bytes_probe_runs_every_arm(tmp_path):
 @pytest.mark.parametrize("timing", [[], ["--replay"]], ids=["lazy", "replay"])
 def test_moe_layers_probe_runs_every_arm(tmp_path, timing):
     proc, out = _run([PROBES / "probe_moe_layers.py", "--out", tmp_path / "ml", "--layers", "2", "--iters", "1",
-                      "--rows", "1,32", "--chunks", "64", *timing], tmp_path)
+                      "--rows", "1,32", "--chunks", "64", "--chunk-rows", "32", *timing], tmp_path)
     assert proc.returncode == 0, out[-3000:]
     arms = [line for line in out.splitlines() if line.startswith("PROBE moe-layers local")]
     # TP4 and TP8 at 1 and 32 rows, none and dense at 32, one chunk_size, 2 and 4 slices at 32 rows

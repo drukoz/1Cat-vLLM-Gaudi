@@ -221,6 +221,11 @@ def main():
     ap.add_argument("--iters", type=int, default=6)
     ap.add_argument("--rows", default="1,8,32,128")
     ap.add_argument("--chunks", default="32,64,128,256,512,1024", help="chunk_size values at 32 and 128 rows")
+    ap.add_argument("--served-locals", default="128,64", help="local expert counts of the served-form sweep")
+    ap.add_argument("--chunk-locals", default="128", help="local expert counts of the chunk_size sweep")
+    ap.add_argument("--chunk-rows", default="32,128", help="row counts of the chunk_size sweep")
+    ap.add_argument("--skip-routing", action="store_true", help="leave out the none / dense routing arms")
+    ap.add_argument("--skip-slices", action="store_true", help="leave out the 2- and 4-slice arms")
     ap.add_argument("--replay", action="store_true",
                     help="time HPU-graph replays of the K layers (wall per replay / K) instead of mark + wait")
     a = ap.parse_args()
@@ -241,21 +246,26 @@ def main():
         (a.out / "moe_layers.json").write_text(json.dumps(results, indent=1) + "\n")
 
     # 1. The served form (no chunk_size) at TP4 (128 local experts) and TP8 (the first 64 of each set).
-    for local in (128, 64):
+    served_locals = [int(v) for v in a.served_locals.split(",") if v]
+    chunk_locals = [int(v) for v in a.chunk_locals.split(",") if v]
+    chunk_rows = [int(v) for v in a.chunk_rows.split(",") if v]
+    for local in served_locals:
         for rows in rows_list:
             measure(torch, htcore, dev, sets, local, rows, "uniform", None, a.iters, results, replay=a.replay)
             save()
     # 2. What the routing does at 32 rows, TP4: no local expert hit, and all of them.
-    for mode in ("none", "dense"):
+    for mode in () if a.skip_routing else ("none", "dense"):
         measure(torch, htcore, dev, sets, 128, 32, mode, None, a.iters, results, replay=a.replay)
         save()
     # 3. chunk_size at 32 and 128 rows, TP4; then the expert range in 2 and 4 slices (64 and 32 experts per call).
-    for rows in (32, 128):
+    for local in chunk_locals:
+        for rows in chunk_rows:
+            for chunk in chunks:
+                measure(torch, htcore, dev, sets, local, rows, "uniform", chunk, a.iters, results, replay=a.replay)
+                save()
+    for rows in () if a.skip_slices else (32, 128):
         if rows not in rows_list:
             continue
-        for chunk in chunks:
-            measure(torch, htcore, dev, sets, 128, rows, "uniform", chunk, a.iters, results, replay=a.replay)
-            save()
         for slices in (2, 4):
             measure(torch, htcore, dev, sets, 128, rows, "uniform", None, a.iters, results, slices=slices,
                     replay=a.replay)
@@ -274,15 +284,16 @@ def main():
     line2 = (f"routing at 32 rows, TP4: none {fmt(us(128, 32, 'none'))}, uniform {fmt(us(128, 32))}, "
              f"dense {fmt(us(128, 32, 'dense'))} us per layer")
     parts = []
-    for rows in (32, 128):
-        timed = {c: us(128, rows, chunk=c) for c in [None] + chunks}
-        timed = {c: v for c, v in timed.items() if v is not None}
-        if timed:
-            best = min(timed, key=timed.get)
-            parts.append(f"{rows} rows: " + ", ".join(f"{'none' if c is None else c} {v:.1f}"
-                                                      for c, v in timed.items()) +
-                         f" -> best chunk_size {best} ({timed[best]:.1f} us)")
-    line3 = "chunk_size (TP4, uniform), us per layer: " + ("; ".join(parts) or "n/a")
+    for local in chunk_locals:
+        for rows in chunk_rows:
+            timed = {c: us(local, rows, chunk=c) for c in [None] + chunks}
+            timed = {c: v for c, v in timed.items() if v is not None}
+            if timed:
+                best = min(timed, key=timed.get)
+                parts.append(f"{local} local, {rows} rows: " + ", ".join(f"{'none' if c is None else c} {v:.1f}"
+                                                                        for c, v in timed.items()) +
+                             f" -> best chunk_size {best} ({timed[best]:.1f} us)")
+    line3 = "chunk_size (uniform), us per layer: " + ("; ".join(parts) or "n/a")
     line4 = ("expert range in slices (TP4, uniform), us per layer, 1 / 2 / 4 calls: " +
              "; ".join(f"{r} rows {fmt(us(128, r))} / {fmt(us(128, r, slices=2))} / {fmt(us(128, r, slices=4))}"
                        for r in (32, 128) if r in rows_list))
