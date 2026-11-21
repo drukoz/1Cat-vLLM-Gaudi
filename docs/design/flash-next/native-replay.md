@@ -526,7 +526,22 @@ directly. This harness keeps the handoff here (earlier harnesses refused report 
   one-at-a-time gate has five tracks queued for hours, and the coordinator said to leave the queue unless one's gate
   already runs.
 
-### The card job in the queue: 00134 `real4-cut-pin-hash-ab`
+### Where the two host levers are tested now (coordinator, 00:28 UTC)
+
+The owner put 8-card runs first (BRIEF.md 00:28 UTC): the TP4 job 00134 below waits behind the TP8 jobs and will
+probably not run tonight; keep its plan for the next rental. The worker CPU pin and the hash switch are tested at TP8
+instead, as **arm B of the integration track's build 2** (`VLLM_HPU_WORKER_CPU_PIN=1
+PT_HPU_DISABLE_HPUGRAPH_REPLAY_HASHCHECK=1` on top of its proven env, greedy 1 and 32 streams, text compared with arm
+A). The integration track (agent a81792d74f2de0f60) has from this track (00:29 UTC): the commits (6884fc07 + the
+fallback 0835754e, both in its 9b0e7655), how mode 1 splits an all-card container's 144 CPUs (8 shares of 18, rank r
+on CPUs 19r to 19r+17, its own module's slice; the engine and API server unpinned; weight loading unchanged), the
+8 log lines to check, the watcher (`~/farm/native-replay/late/cpu_watch.py ... --cpu 151 --window 2`, in arms A and
+B) and the hash switch's caveats (set at server start; never on a card here, no token parity yet, so arm B's
+1-stream text against A decides; it removes only the spec construction per launch; arm B combines two levers). It
+was asked to send back per arm the steady ms per step at 1 and 32 streams, the text, the pin lines and the
+watcher's per-rank main-thread share during the measured 1-stream round: write them into section 7.9.
+
+### The card job in the queue: 00134 `real4-cut-pin-hash-ab` (probably not run tonight)
 
 `any:4`, 58 min, replaces 00122 (which replaced 00084) and keeps the coordinator's bump; starts by 01:55 UTC at the
 latest, on cards 0,1,2,7 (modules 0-3). Stub: `reports/native-replay/late/stub_real4_cut_pin_hash.sh`. First the tiny
