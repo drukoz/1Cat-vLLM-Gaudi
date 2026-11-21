@@ -9,7 +9,7 @@ Labels: MEASURED (card, with its file), VERIFIED (CPU test or code line), INFERR
 
 ## Handoff (if this agent stops)
 
-Updated 2026-11-21 04:56 UTC (fourth agent of the track, Opus 5.5, started 23:12 UTC).
+Updated 2026-11-21 06:30 UTC (fourth agent of the track, Opus 5.5, started 23:12 UTC).
 
 **Now (02:25 UTC), for whoever takes the track next.** Builds 1 and 2 are measured (tables below: 00128, 00156).
 Three jobs of this track wait or run on the node; the `farm job` commands that submitted them ran in the fourth
@@ -202,6 +202,10 @@ checkpoint's temperature 1.0, top_k 20, top_p 0.95). Reference (program head, 00
 | 3 (00178) bisect, greedy | no spec, prefix off, cut 0 | 8 / 1 | 51.7, 48.3 / 40.6, 37.1 | | | | |
 | MoE A/B 00161 (build 2 image) | MTP k = 3, base / VLLM_MOE_CHUNK | 32 | | 40.8 / **38.0 (26.3)** | | | |
 | MoE A/B 00177 (build 3 image) | MTP k = 3, base / VLLM_HPU_MOE_DENSE | 32 | | 40.2 / 43.4 | | | |
+| 4 (00186) | no spec (sync) | 1 / 8 / 32 | 33.1, 34.3 / 52.5, 48.4 / 64.1, 62.3 | 33.1 / 48.4 / 62.3 | 38.5, 34.3 / 54.1, 48.6 / 60.0, 55.9 | 34.3 / 48.6 / 55.9 | |
+| 4 (00186) | no spec, async (ASYNC_SCHED=1) | 1 / 8 / 32 | 53.5, 55.7 / 69.6, 63.8 / 54.4, 72.4 | 53.5 / 63.8 / 54.4 | 52.0, 54.3 / 66.3, 67.5 / 53.9, 49.8 | 52.0 / 66.3 / 49.8 | |
+| 4 (00186) | MTP k = 2 (sync, MTP_TIMING=2) | 1 / 8 / 32 | 63, 64 / 71, 72 / 88, 79 | 26.1 / 30.3 / 35.0 (28.6) | 63, 64 / 69, 72 / 103, 85 | 26.5 / 33.2 / 40.0 (25.0) | 2.42 / 2.29-2.35 / 2.27-2.29 |
+| 4 (00186) | MTP k = 2, async (ASYNC_SCHED=2) | 1 / 8 / 32 | 55, 57 / 65, 67 / 77, 77 | 27.5 / 27.4 / **33.7 (29.7)** | 81, 77 / 94, 90 / 82, 98 | 35.3 / 42.1 / **38.9 (25.7)** | 2.00 / 2.29-2.37 / 2.29 |
 
 Build 2 readings (arm A, two measured rounds per level, `a / b` = round 1 / round 2; the better round in the
 ms-per-token column): sampled equals greedy now (server0.log: `Candidate sampling (VLLM_HPU_CANDIDATE_SAMPLING=1): a
@@ -225,6 +229,12 @@ MTP k = 3 at 1 stream is 24.5 to 27.9 ms per token with `VLLM_HPU_SPEC_SAMPLED_V
 slowdown was k = 2 on that server; `VLLM_MOE_CHUNK` wins at 32 streams (00161: -12 ms per MTP step), the dense form
 loses on the served model (00177). Single-server numbers at 32 streams vary by about 10 ms (00178: greedy 69 / 67
 against sampled 54 / 55 on the same server).
+
+Build 4 (00186, image 30f4e37ef08c): **best at 32 streams so far: MTP k = 2 with async scheduling
+(`VLLM_HPU_FLASH_NEXT_ASYNC_SCHED=2`, `VLLM_HPU_MTP_TIMING=0`), greedy 33.7 ms per token = 29.7 tok/s per stream (803
+tok/s aggregate in round 2), sampled 38.9**; acceptance unchanged under async (0.75 / 0.55). Async without speculation is
+worse at 1 and 8 streams (1 stream 54 against 33 ms per step): under async `VLLM_HPU_PLE_HOST_NGRAM_IDS` has no effect
+(the n-gram ids go back into the graph; INFERRED cause). Every arm had the MoE chunk and synchronous queue flushing.
 
 ## Merge log (what the conflicts were)
 
