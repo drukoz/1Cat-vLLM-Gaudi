@@ -6,7 +6,7 @@ This file is the track's report. The harness of the track's agents does not writ
 
 ## Handoff (if this agent stops)
 
-Last update: 2026-11-21 01:02 UTC (fourth agent of the track, Opus 5.5, started 23:15 UTC). **The node runs until
+Last update: 2026-11-21 01:36 UTC (fourth agent of the track, Opus 5.5, started 23:15 UTC). **The node runs until
 about 00:00 UTC on 2026-11-22 (BRIEF 00:50); merges allowed again.** Coordinator's plan for this track (00:42 UTC):
 (1) the verify-op crash of 00133, cause and fix, CPU first, then its card check (00162, mine); (2) the pull request
 of the card-proven MTP fixes (gate, merge); (3) with engine-step (agent a8a87f4c2008bde9c): sampled MTP verification
@@ -50,6 +50,22 @@ ran, no slice write (`hpu_cpu_engine --slice-write-probe`).
   could be lifted for the HPU MTP path), and upstream's EAGLE / MTP rule drops the last matched block of every hit.
   Asked the coordinator who takes it.
 
+**Answer reuse with MTP (agreed with prefill, agent a9a36e0116ed6cb7d; coordinator 01:05 UTC: mine).** With
+prefill's flags on, MTP's next turn reused nothing of the previous answer (CPU engine, `--next-turn` on the engine's
+own answer: cached 512 without speculation, 0 with MTP k = 3): prefill's `keep_last_decode_boundary` refused
+speculative groups, and upstream's EAGLE / MTP rule drops the last matched block of every hit. Fix, for prefill to
+review and cherry-pick: **`ac7153b7` on `feat/flash-next-gaudi-mtp-card-ready-prefix-spec`** (based on prefill's
+`4a77ec46`): the platform hook records `recurrent_spec_enabled` in `VLLM_HPU_RECURRENT_BOUNDARY_COMMITS`
+(internal), a speculative group is kept only then, with its last two decode boundaries; harness
+(`flash_next_sched_harness.Settings.speculative_blocks / eagle_drop / boundary_commits`) at engine block 128 with
+ALIGN_SPLIT: the next turn hits 24,576 (one block before 25,088), no violation; 114 prefill-area tests passed. CPU
+engine with the change: MTP's next turn 256 cached (`reports/mtp-card-ready/cpu4/turns3.log`, driver
+`reports/mtp-card-ready/turns_prefix_check3.py`).
+
+**engine-step's candidate region for MTP** (`VLLM_HPU_CANDIDATE_SAMPLING=2`, with `VLLM_HPU_SPEC_SAMPLED_VERIFY` 1 or
+2 for admission and fallback): CPU-green at d5ad5e67; its TP4 job runs from its test branch engine-step-mtp-card
+(c7669410 = d5ad5e67 + this branch's 05d2db66); compare with 00126 (=1) and 00138 (=2).
+
 **Pull request.** Gate queued at 00:58 UTC on a snapshot of `558277d2` (the program head `5c1e8219`, PR #15, merged
 in; contains `5c770d96`): `bin/gate reports/mtp-card-ready/gate-558277d2 --tools`, output
 `reports/mtp-card-ready/gate/gate-558277d2.txt`; it waits in the lock behind about seven gates. PR body draft:
@@ -58,7 +74,11 @@ request first, or say in the PR that it carries it. Known tools/rental reds that
 and git tests (`test_sh_run_rental`, `test_sh_tiny_smoke` signal cases, `test_rental_scripts::test_make_rental_bundle`
 outside a git checkout).
 
-**Branch** (pushed: `origin/feat/flash-next-gaudi-mtp-card-ready` = `05d2db66` and this handoff):
+**Branch** (pushed: `origin/feat/flash-next-gaudi-mtp-card-ready` = `61db722d` and this handoff):
+- `61db722d` `hpu_cpu_engine.py --next-turn` (the agent's next turn on the engine's own answer); the block-commit
+  engine test uses it and checks that the same prompt twice gives the same tokens after a commit.
+- `44a8ad02` + `950608fc`: spec-lookup's fix of the exact sampled path for -1 (lookup padding) drafts,
+  cherry-picked (`2dd6bc75`), and a test that the candidate path never accepts a -1 draft (it needs no change).
 - `05d2db66` `commit_turns_probe.py` (the block-commit card check) and `MTP_PROBE_SCRIPT` in `mtp_real_card.sh`.
 - `558277d2` merge of the program head `5c1e8219` (PR #15 kernel-fixes), clean.
 - `5c770d96` the 00133 fix (above) with its tests; `hpu_cpu_engine.py --slice-write-probe` and `num_cached_tokens`.
