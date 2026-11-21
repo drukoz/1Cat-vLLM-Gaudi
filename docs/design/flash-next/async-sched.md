@@ -6,7 +6,7 @@ results are under `/Volumes/Storage/Claude/gaudi-work/reports/async-sched/card/`
 
 ## Handoff (if this agent stops)
 
-Updated 2026-11-21 09:25 UTC.
+Updated 2026-11-21 09:50 UTC.
 
 - **Two branches.**
   - `feat/flash-next-gaudi-async-sched`: modes 1 and 2 of `VLLM_HPU_FLASH_NEXT_ASYNC_SCHED` (default 0). Commits:
@@ -61,9 +61,24 @@ Updated 2026-11-21 09:25 UTC.
     platform 60, moe_glue 3 files.
   - M1's card A/B is told to the coordinator a day ahead: tiny check at =1 and =2 with the chain, then TP8 =2
     against =0, 40 min.
-  - M2 is CPU-green at `cef6fd98` (`VLLM_HPU_FLASH_NEXT_ASYNC_SCHED=3`, section 2.6). M1 rides in mtp-draft-graph's
-    build-5 chain job (branch `feat/flash-next-gaudi-async-sched-m1-b5`). M2's card A/B was asked of the
-    coordinator: tiny gate at mode 3, then TP8 mode 3 against 2 at 32/8/1 with prefix caching off, 50 min.
+  - M2 is CPU-green at `cef6fd98` (`VLLM_HPU_FLASH_NEXT_ASYNC_SCHED=3`, section 2.6). `959890bf` puts the M1 flag in
+    `SWITCHABLE`, without which the runtime switch file rejects it and is ignored as a whole (found by mtp-draft-graph).
+  - Card jobs for stage 2 (the coordinator places both after build 5's 00222):
+    - **00228** is mtp-draft-graph's chain job on their `feat/flash-next-gaudi-mtp-draft-graph-b5` at `ea1715fa`. That
+      is build 5 `eb21ac75` + their chain + my M1 as `249647f7`, `c1906d33` and `70d41eb9`, the cherry-picks of
+      `feat/flash-next-gaudi-async-sched-m1-b5`. It carries M1's A/B: the `tiny-m1` gate at `=1`, and `m1sw`, one
+      server started at `=2` with arms `=0` and `=2` and the chain on.
+    - **00229** `real8-async-m3` is mine, on `feat/flash-next-gaudi-async-sched-m2-b5` at `44a51fcd`: `ea1715fa` + M2
+      + a fix so mode 3 also follows stage B's chain + harness changes (`tiny-m3` gate, words `async3` and `nopc`,
+      the tiny server's prefix-caching opt-out `FARM_SERVE_NO_PREFIX_CACHING=1` in `rental/serve.py`).
+      - Arms: `tiny-m3 mtp2-async3-cuts-nopc-greedy mtp2-async-cuts-nopc-greedy`.
+      - Env: build 5's dense env (`VLLM_HPU_MOE_DENSE=1 VLLM_MOE_CHUNK=0,64,8192 VLLM_MOE_TOKEN_BOUNDARY=16,512,1000000
+        HEADLINE_REQUIRE_DENSE=1`, prefix flags, `PT_HPU_SYNCHRONOUS_ACC_QUEUE_FLUSHING=1`,
+        `VLLM_HPU_QSA_SLOT_SHIFT=0`), chain + draft graph + I01 + `SPEC_DEVICE_INPUTS=2`, levels 32/8/1, greedy, 2
+        rounds, step timer mode 1, MTP timers 0, `HEADLINE_PLACE_SWITCH=/results/switches/place`.
+      - Waiter: `reports/async-sched/logs/wait_00229.out`; else `bin/farm fetch async-sched 00229 00229-real8-async-m3`.
+      - Read: the `tiny-m3` line in the job log; `ab_table.py <dir> --pairs mtp2-async3-cuts-nopc-greedy:mtp2-async-cuts-nopc-greedy`;
+        the spans with `timer_spans.py`. The gain shows as prepare and forward issue under the device's busy time.
   - **Next: M3**, the align-mode pre-step copy and boundary commits from the device acceptance, so mode 3 serves
     with prefix caching on. Then sampled, with mtp-draft-graph's D2.
 - The 1-token prompt note: spec-lookup's `005e1ff9` is not on the program branch yet. When it is, put prompt 0 back
