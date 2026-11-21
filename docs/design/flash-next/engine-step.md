@@ -11,8 +11,8 @@ This track's harness refuses report files outside the repository, so the handoff
 
 ## Handoff (if this agent stops)
 
-Last update: **2026-11-20 23:55 UTC** (fourth agent, Opus 5.5). Branch `feat/flash-next-gaudi-engine-step`,
-head `ddc6bbbf` (code: `21d9eace`; program head `938dada4` merged in, `eaf2131f`). Scratch files, probes and card results:
+Last update: **2026-11-21 00:35 UTC** (fourth agent, Opus 5.5). Branch `feat/flash-next-gaudi-engine-step`,
+head `e9032e68` (program head `938dada4` merged in at `eaf2131f`). Scratch files, probes and card results:
 `/Volumes/Storage/Claude/gaudi-work/reports/engine-step/` (`card_job/` = submit logs, `card/` = fetched results,
 `logs/` = CPU test logs). Node mirror of this track's results: `node-mirror/farm/engine-step/results/`.
 
@@ -30,6 +30,12 @@ the host reads (logprobs, prompt logprobs, the sampled region) now come out of a
 (`v1/sample/topk_ids.py`): the `logprobs=5` crash of spec-lookup's 00086 (OverflowError in the detokenizer, the
 server died) is fixed on the CPU model of the card rule; the sampled region now takes `vocab_parallel.top_k`, so
 with `VLLM_HPU_VOCAB_PARALLEL_LOGITS=2` it gathers each rank's top 64 instead of the logits (job 00137 measures it).
+Job 00130 (tiny model, one card): **I01 alone passes** 16 of 16 on every prompt (I01 is token-correct on a card);
+**I05 alone takes the 700-token near tie** (token 4): the near tie is the in-graph greedy region's, no defect.
+**`logprobs=5` is fixed on the card** (every id valid, the sampled token first, the top 5 equal the CPU's).
+**A request with `prompt_logprobs` ended the engine** (an older defect: the prefill hidden states of Flash-Next are
+flattened, the runner indexed them per request): fixed at `e9032e68` with a CPU test that reproduced the crash;
+integration's build 2 carries it (told at 00:32 UTC).
 No pull request tonight (BRIEF.md 23:45): push and tell the coordinator the commit and the proven flags.
 `21d9eace` (asked by the coordinator for the integration build): TP rank 0 logs once "Candidate sampling
 (VLLM_HPU_CANDIDATE_SAMPLING=1): a sampled decode step drew in the logits region ..." and once "... took vLLM's
@@ -54,11 +60,24 @@ sampler instead: <reason>" (integration was told at 23:55 UTC).
 |---|---|---|---|
 | 00093 `hpu-ids-sampler-tiny-flags` (1 card) | id verdicts, sampler-stage times, tiny model with I01 + I05 | ended 20:29 UTC, exit 1 (the tiny 700-token prompt, a near tie) | done: section 9 |
 | 00110 `real4-ab3-greedy-sampled-long` (TP4) | greedy base / I01 / I05 / both, sampled base / cand, long prefix | ended 22:29 UTC, exit 5 (probe counting artifact; no prefix-cache hit) | done: section 9 |
-| **00130** `tiny-i01-i05-logprobs` (any:1, 15m, commit `0cb55ebb`) | `tools/flash_next/engine_step/tiny_checks.py --arms i01,i05`: the tiny smoke with I01 alone and I05 alone; while each server is up, every reference prompt with `logprobs=5` and one with `prompt_logprobs=2`, then `/health` | queued 23:39 UTC; placed by the coordinator beside kernel-fixes' 00123, about 01:00 UTC | `TOKENS` lines (I05 alone should show the 700-token near tie, I01 alone should pass: then record the near tie, no more card time on it) and `LOGPROBS` lines (must be `ok` with `/health after: 200` in both arms: the crash fix is card-proven) |
+| 00130 `tiny-i01-i05-logprobs` (1 card, commit `0cb55ebb`) | `tiny_checks.py --arms i01,i05` | ended 00:25 UTC, exit 1 (the I05 arm's near tie, and both servers died on the `prompt_logprobs` request) | done: section 9; the prompt-logprobs defect fixed at `e9032e68` |
 | **00137** `real4-ab5-short-candvp` (any:4, 28m, commit `ddc6bbbf`, `VLLM_GRAPH_RESERVED_MEM=0.5`; replaced 00131 at 23:55 UTC to carry the candidate path's log lines, kept its place) | `serve_long_probe.sh --arms both --no-long --candvp --logprobs-check`: 32 greedy streams base / both (twice, in turn), text1 compared at 1 stream, 32 sampled streams base / cand / candvp (`VLLM_HPU_VOCAB_PARALLEL_LOGITS=2`), seeded requests, min_tokens round, the logprobs check last; hl-smi memory in `hlsmi.log` | queued 23:39 UTC; placed after step-anatomy's 00119, about 02:00 to 02:30 UTC | `probe.log`: `SUMMARY` (sampled cand and candvp against base, candvp against cand), `TASK` for candvp (must be 32 of 32), `TEXTS text1`, `LOGPROBS ok`; the job log's `Candidate sampling` lines ("drew in the logits region ... from the gathered logits" for cand, "... from each rank's vocabulary shard" for candvp); then tell the coordinator whether `VLLM_HPU_VOCAB_PARALLEL_LOGITS=2` with candidates is proven |
 
 ### Pending subtasks after those steps, in order
 
+0. **For the next rental (the coordinator's list):**
+   - **I01 at a long context.** 32 streams over one shared 120,832-token prefix, base against I01 (and I01 + I05),
+     on TP4 or TP8: `farm job engine-step real-i01-long any:4 45m --env VLLM_HPU_PREFIX_ALIGN_SPLIT=1 --env
+     VLLM_HPU_PREFIX_KEEP_PROMPT_END=1 --env VLLM_GRAPH_RESERVED_MEM=0.5 -- bash
+     tools/flash_next/engine_step/serve_long_probe.sh --arms both,i01 --no-sampled` (prefill's two flags make the
+     prefix cache hit: without them every long round re-prefills 120K per stream). Expected from the Mac (32 x 120K,
+     CPU-timed): `prepare_inputs` 5.83 -> 0.39 ms per step without speculation, 21.8 -> 1.09 ms with MTP k = 3. The
+     first long round prefills 32 suffixes over the cached prefix (about 6 to 20 s each, serialized): plan the hold.
+   - **`candvp` at TP8**: the sampled rounds with `VLLM_HPU_VOCAB_PARALLEL_LOGITS=2` (each rank's top 64 of a
+     31,040-column shard, one `[rows, 128]` fp32 all-gather) against `cand` and vLLM's sampler on an 8-card server:
+     `farm job engine-step real8-candvp all 35m --env VLLM_GRAPH_RESERVED_MEM=0.4 -- bash
+     tools/flash_next/engine_step/serve_long_probe.sh --arms both --no-long --candvp --logprobs-check` (also checks
+     the logprobs and prompt-logprobs fixes on the real model, and the candidate path's log lines).
 1. **Time to first token of a turn with a cached prefix** (coordinator: 6 to 9 s at TP4 for 300 to 500 new tokens
    on a 34.5K or 64K cached prefix): the runner's host part is 2 to 4 ms (section 10), so the time is in the model's
    prompt forward (device, or the lazy issue of the prompt graph): prefill's. A step timer or a device trace of
@@ -73,6 +92,9 @@ sampler instead: <reason>" (integration was told at 23:55 UTC).
    `min_p` (section 3); `test_general_sampler_path_tracks_no_min_tokens_request` pins it.
 6. For mtp-card-ready (not this track's file): `hpu_flash_next_mtp.py` reads `logits.topk(DRAFT_RANK_TOP).indices`
    back as data for its draft-rank statistics (off by default); under the card rule those ids may be wrong.
+   kernel-fixes' 00123 widened the rule: any `.to(int32)` of ids from `topk`, `sort` or `max(dim).indices` read on
+   the host is garbage on the first run of each new graph; `argmax` forms are right. This track's id paths follow it
+   (`v1/sample/topk_ids.py`; vLLM's sampler uses its sort indices only as a scatter index inside the graph).
 
 ### How to run the CPU tests
 
@@ -341,6 +363,17 @@ One server, flags flipped by the switch file, rounds in turn. Healthy after 426 
   against 133 s for the first; hit rate 0.0 % all job), so no long-context round ran. Prefill owns it.
 - 1-stream steps varied from 27 to 44 ms within the job (host-bound; a neighbour job loaded its weights, load
   average up to 132).
+
+**00130 `tiny-i01-i05-logprobs`** (one card, TP1, commit `0cb55ebb`, 00:23 to 00:25 UTC, exit 1). MEASURED.
+- I01 alone: the tiny smoke PASSES (16 of 16 on the 7-, 33-, 700- and 2600-token prompts; the 1- and 100-token
+  prompts are the reference's own near ties at token 0, the same as every baseline). I05 alone: the 700-token prompt
+  takes 139797 at token 4, the stream of job 00093 with both flags: the near tie is the in-graph greedy region's.
+- `logprobs=5` on all six reference prompts, both arms: HTTP 200, every top-logprob id valid, the generated token
+  first among its position's top logprobs, the first position's top 5 equal to the CPU reference's (5 of 5, or 4
+  of 5 where the reference's 4th and 5th are near ties). The fix of `330f9413` works on the card.
+- `prompt_logprobs=2` ended the engine in both arms (`matrix 1 and matrix 2 shapes cannot be multiplied (1x6 and
+  128x248320)` in `_get_prompt_logprobs_dict`; `/health` 503 after). Fixed at `e9032e68`
+  (`_prompt_hidden_states_per_request`, test `test_prompt_logprobs.py`, which reproduced the crash on the CPU).
 
 ## 10. Time to first token of a cached-prefix turn: the runner's host part (MEASURED on the Mac)
 
