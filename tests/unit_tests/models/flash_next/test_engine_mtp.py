@@ -299,18 +299,21 @@ def test_the_chain_runs_the_greedy_rejection_in_its_graph(engine_runs):
 
 
 def test_the_chain_switched_at_run_time(engine_runs):
-    # The card's chain set on one server (headline_job.sh mtp<K>-chain-switch): VLLM_HPU_MTP_DRAFT_CHAIN and
-    # VLLM_HPU_VOCAB_PARALLEL_LOGITS switched between prompts at k = 2 on the draft graph and I01 (stage A with VP 0,
-    # stage B with VP 1). Every draft and every stream equal the per-pass drafter's with I01; the decode drafts were
-    # chained exactly where the switch file put it, and no prefill draft's step was taken as chained.
+    # The card's chain set on one server (headline_job.sh, probe word chainsw): VLLM_HPU_MTP_DRAFT_CHAIN with the
+    # three verifications it chains behind, switched between prompts at k = 2 on the draft graph and I01: the
+    # rejection sampler over gathered logits (stage A), the verify graph's own ids (VLLM_HPU_VERIFY_LOGITS_IN_GRAPH,
+    # stage B) and the vocabulary-parallel ids (stage B). Every draft and every stream equal the per-pass drafter's
+    # with I01; the decode drafts were chained exactly where the switch file put it, and no prefill draft's step was
+    # taken as chained.
     accept = [2, 0, 1]
     per_pass = _oracle_run(engine_runs, accept, k=2, env=CHAIN_BASE, tag="_loop_md")
     switch_file = engine_runs["dir"] / "chain.switches"
-    arms = {1: ("1", "0"), 2: ("0", "1"), 3: ("1", "1"), 4: ("0", "0")}  # (chain, vp) from the next prompt on
+    # (chain, vp, vlg) from the next prompt on; prompt 1 runs with the start values (0, 0, 0)
+    arms = {1: ("1", "0", "0"), 2: ("0", "0", "1"), 3: ("1", "0", "1"), 4: ("0", "1", "0"), 5: ("1", "1", "0")}
     options = []
-    for after, (chain, vp) in arms.items():
-        options += ["--switch-after", str(after),
-                    f"VLLM_HPU_MTP_DRAFT_CHAIN={chain};VLLM_HPU_VOCAB_PARALLEL_LOGITS={vp}"]
+    for after, (chain, vp, vlg) in arms.items():
+        options += ["--switch-after", str(after), f"VLLM_HPU_MTP_DRAFT_CHAIN={chain};VLLM_HPU_VOCAB_PARALLEL_LOGITS={vp};"
+                    f"VLLM_HPU_VERIFY_LOGITS_IN_GRAPH={vlg}"]
     env = {**CHAIN_BASE, "VLLM_HPU_MTP_DRAFT_GRAPH": "1", "VLLM_HPU_RUNTIME_SWITCH_FILE": str(switch_file)}
     run = _oracle_run(engine_runs, accept, *options, k=2, env=env, tag="_chain_switch")
     assert [e["drafter"] for e in run["oracle"]] == [e["drafter"] for e in per_pass["oracle"]]
@@ -319,7 +322,7 @@ def test_the_chain_switched_at_run_time(engine_runs):
     for number, prompt in enumerate(run["prompts"], 1):
         calls = [c for c in run["draft_calls"][start:prompt["draft_calls_end"]] if not c.get("fill")]
         start = prompt["draft_calls_end"]
-        chained = arms.get(number - 1, ("0", "0"))[0] == "1"  # the switch after prompt n acts from prompt n + 1
+        chained = arms.get(number - 1, ("0", "0", "0"))[0] == "1"  # the switch after prompt n acts from prompt n + 1
         decode = [c for c in calls if c.get("decode")]
         assert bool(decode) != chained, (number, decode)
         assert all(c["graph"] for c in decode), (number, decode)
@@ -329,6 +332,22 @@ def test_the_chain_switched_at_run_time(engine_runs):
                                       + "_chain_switch.json.log").read_text(encoding="utf-8", errors="replace")
     assert "stage A" in log and "stage B" in log
     _check_oracle(engine_runs, run, accept, 2)
+
+
+def test_the_chain_takes_the_verify_graphs_ids(engine_runs):
+    # Stage B without the vocabulary-parallel arg max: engine-step's VLLM_HPU_VERIFY_LOGITS_IN_GRAPH=1 returns every
+    # verification row's greedy id from the forward, and the chained draft's graph runs the greedy rejection on them.
+    accept = [2, 0, 3, 1]
+    vlg = {"VLLM_HPU_VERIFY_LOGITS_IN_GRAPH": "1"}
+    per_pass = _oracle_run(engine_runs, accept, env={**CHAIN_BASE, **vlg}, tag="_loop_md_vlg")
+    chain = _oracle_run(engine_runs, accept, env={**CHAIN, **vlg}, tag="_chain_vlg")
+    assert [e["drafter"] for e in chain["oracle"]] == [e["drafter"] for e in per_pass["oracle"]]
+    assert [p["generated_ids"] for p in chain["prompts"]] == [p["generated_ids"] for p in per_pass["prompts"]]
+    assert chain["runner"]["draft_chain_calls"] > 0
+    assert not [c for c in chain["draft_calls"] if c.get("decode")]
+    log = (engine_runs["dir"] / "k3_accept_2031_chain_vlg.json.log").read_text(encoding="utf-8", errors="replace")
+    assert "stage B" in log and "stage A" not in log
+    _check_oracle(engine_runs, chain, accept, K)
 
 
 def test_a_sampled_request_keeps_the_draft_after_the_host_read(engine_runs):

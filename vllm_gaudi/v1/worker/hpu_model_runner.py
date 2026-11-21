@@ -11019,6 +11019,11 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             verify_hidden = tuple(aux_hidden_states)
         else:
             verify_hidden = (hidden_states, )
+        base = getattr(verify_ids, "_base", None)
+        if base is not None and base.numel() == verify_ids.numel() and base.dtype == verify_ids.dtype:
+            # the verify graph's own [rows] output, not the [rows, 1] view the runner made of it outside the chain's
+            # graph (a view would be an unmatched graph input: one copy launch per replay)
+            verify_ids = base
         drafts = self.drafter.propose_chain(sampled_token_ids, spec.cu_num_draft_tokens, real, decode_data.position_ids,
                                             verify_hidden, decode_data.attn_metadata, table_full, self,
                                             verify_ids=verify_ids, spec_decode_metadata=spec)

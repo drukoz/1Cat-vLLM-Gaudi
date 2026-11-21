@@ -35,7 +35,8 @@ def write(path, text: str) -> None:
 def test_switch_file_format():
     assert set(SWITCHABLE) == {"VLLM_HPU_FLASH_NEXT_DECODE_METADATA", "VLLM_HPU_FUSED_GREEDY_LOGITS",
                                "VLLM_HPU_CANDIDATE_SAMPLING", "VLLM_HPU_VOCAB_PARALLEL_LOGITS",
-                               "VLLM_HPU_MTP_DRAFT_GRAPH", "VLLM_HPU_MTP_DRAFT_CHAIN"}
+                               "VLLM_HPU_MTP_DRAFT_GRAPH", "VLLM_HPU_MTP_DRAFT_CHAIN",
+                               "VLLM_HPU_VERIFY_LOGITS_IN_GRAPH"}
     assert parse_switches("# arm B\n\nVLLM_HPU_FUSED_GREEDY_LOGITS = 1  # in-graph greedy\n") == {
         "VLLM_HPU_FUSED_GREEDY_LOGITS": "1"
     }
