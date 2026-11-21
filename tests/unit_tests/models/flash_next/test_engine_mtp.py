@@ -198,6 +198,21 @@ def test_the_draft_passes_in_one_graph_with_several_requests_at_once(engine_runs
     assert graph["runner"]["draft_graph_calls"] == len([c for c in graph["draft_calls"] if c.get("decode")])
 
 
+def test_the_one_graph_draft_with_the_sparse_decode_metadata(engine_runs):
+    # VLLM_HPU_FLASH_NEXT_DECODE_METADATA=1 (engine-step's I01): the drafter's later passes take the sparse-QSA
+    # metadata (block table and slots, no paged-attention buffers), which the one-graph path builds before its
+    # replay through the same prepare_attn_metadata. Drafts and streams equal the per-pass drafter's with I01.
+    env = {"VLLM_HPU_MTP_DRAFT_LOOP": "1", "VLLM_HPU_FLASH_NEXT_DECODE_METADATA": "1"}
+    accept = [2, 0, 3, 1]
+    per_pass = _oracle_run(engine_runs, accept, env=env, tag="_loop_md")
+    graph = _oracle_run(engine_runs, accept, env={**env, "VLLM_HPU_MTP_DRAFT_GRAPH": "1"}, tag="_graph_md")
+    assert per_pass["runner"]["sparse_decode_md"] is True and graph["runner"]["sparse_decode_md"] is True
+    assert [e["drafter"] for e in graph["oracle"]] == [e["drafter"] for e in per_pass["oracle"]]
+    assert [p["generated_ids"] for p in graph["prompts"]] == [p["generated_ids"] for p in per_pass["prompts"]]
+    assert graph["runner"]["draft_graph_calls"] == len([c for c in graph["draft_calls"] if c.get("decode")])
+    _check_oracle(engine_runs, graph, accept, K)
+
+
 def test_the_one_graph_draft_switched_at_run_time(engine_runs):
     # VLLM_HPU_MTP_DRAFT_GRAPH in the runtime switch file (VLLM_HPU_RUNTIME_SWITCH_FILE, an A/B on one server):
     # the server starts with the per-pass drafter, takes the one-graph draft after the second prompt and drops it
