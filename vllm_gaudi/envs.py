@@ -552,6 +552,8 @@ if TYPE_CHECKING:
     VLLM_HPU_MOE_GLUE: int = 0  # 0 torch MoE glue (default), 1 the fused MoE glue kernels
     VLLM_HPU_MOE_GLUE_MERGE_GATE_UP: int = 0  # with VLLM_HPU_MOE_GLUE=1: 1 merges the gate_up GEMM into the gate GEMM
     VLLM_HPU_HC_FUSED_COPY_MODE: int = 0  # copies before a fused HC op: 0 all, 1 not its own outputs, 2 block output
+    VLLM_HPU_MOE_DENSE: int = 0  # 0 vendor MoE op (default), 1 dense batched FP8 experts up to MAX_TOKENS rows
+    VLLM_HPU_MOE_DENSE_MAX_TOKENS: int = 512  # with VLLM_HPU_MOE_DENSE=1: the most tokens a step runs dense
     VLLM_HPU_COLLECTIVE_MARK_STEP: int = 1  # 1 (default) mark_step() before every HPU collective, 0 none
     VLLM_HPU_DECODE_CUT_INTERVAL: int = 0  # 0 (default) decode keeps the per-layer cuts, N cut every N-th layer
     VLLM_HPU_GRAPH_ASYNC_REPLAY: int = 0  # 0 (default) the model's HPU graph replays synchronously, 1 asynchronously
@@ -2108,6 +2110,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # value is 0. Read once per layer at construction. Not yet run on a card.
     "VLLM_HPU_HC_FUSED_COPY_MODE":
     lambda: int(os.environ.get("VLLM_HPU_HC_FUSED_COPY_MODE", "0")),
+
+    # FP8 per-channel routed experts (VllmMixtureOfExpertsOpFP8PerChannel) only. 1 = a step of at most
+    # VLLM_HPU_MOE_DENSE_MAX_TOKENS tokens runs every local expert on every row as two batched FP8 GEMMs over the
+    # layer's stacked experts (the routing weight of a pair that is not routed is 0) instead of
+    # torch.ops.hpu.mixture_of_experts; longer steps (prefill) keep the vendor op. 0 (default) or any other value:
+    # the vendor op. Read once per layer when its weights are prepared (the stacked weights are kept then) and the
+    # limit at every call.
+    "VLLM_HPU_MOE_DENSE":
+    lambda: int(os.environ.get("VLLM_HPU_MOE_DENSE", "0")),
+    "VLLM_HPU_MOE_DENSE_MAX_TOKENS":
+    lambda: int(os.environ.get("VLLM_HPU_MOE_DENSE_MAX_TOKENS", "512")),
 
     # The htorch.core.mark_step() that HpuCommunicator issues before every all-reduce and all-gather
     # (a workaround for a Habana bridge bug with PT_HPU_ENABLE_LAZY_COLLECTIVES). 1 (default) keeps it.
