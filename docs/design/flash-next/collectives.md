@@ -524,10 +524,15 @@ on 2026-11-22** (BRIEF 00:50 UTC).
    open the PR to `feat/flash-next-gaudi`, merge when green (test-only). Not ours: `test_flash_next_host_ngram.py`
    fails 4 on the head (`HPUModelRunner` stub without `_block_table_max_blocks`, from 121c88b0); 9 worker files need
    `habana_frameworks` (not on the Mac).
-4. Offers outstanding: engine-step's `VLLM_HPU_PERSISTENT_INPUTS` (8efc6969) A/B with lean5 once it is in an image
-   (build 6 preferred); native-replay's `lean6m-43fdd6850644` (lean5 + `PT_HPU_HPUGRAPH_STATIC_PLAN_MISS_LOG=N`: one
-   stderr line per missing launcher with the miss reason and the first moved input) for a later arm, or for 00210's
-   lean5 arms if the coordinator wants it (`LEAN5=` is late-bound; the log env would need a script change). Branch `feat/flash-next-gaudi-collectives` (and `-dev`, the same head), worktree
+4. **00210 qualifies lean6m (coordinator 08:57 UTC)**: native-replay's `lean6m-43fdd6850644` (lean5 +
+   `PT_HPU_HPUGRAPH_STATIC_PLAN_MISS_LOG=N`: per missing launcher one stderr line per N launches with the misses by
+   reason and the first moved input), the log only in real-lean5-verify (`VERIFY_KV`, bridge_reuse_job.sh f65e0226,
+   node md5 13a1a439). When `~/farm/native-replay/bridge-build/out/lean6m-43fdd6850644/manifest.json` exists, add
+   `LEAN5=lean6m-43fdd6850644` and `VERIFY_KV=PT_HPU_HPUGRAPH_STATIC_PLAN_MISS_LOG=200` to the late file (not before:
+   an absent wheel fails every lean arm). When real-lean5-verify ends (`ab_bridge: arm real-lean5-verify ended` in
+   `~/farm/q/jobs/00210/log`): `python3 -I reports/collectives/probes/plan_miss_table.py <its server0.log or folder>`
+   to engine-step and native-replay at once (this agent's waiter puts it in `card/00210-early/real-lean5-verify/`).
+   engine-step's `VLLM_HPU_PERSISTENT_INPUTS` goes into build 6's job (coordinator), not ours. Branch `feat/flash-next-gaudi-collectives` (and `-dev`, the same head), worktree
 `/Volumes/Storage/Claude/gaudi-work/wt/collectives`; card results and logs in
 `/Volumes/Storage/Claude/gaudi-work/reports/collectives/` (`card/<id>-<name>/`, `logs/`, `probes/`). This section is
 the track's report: the harness refuses a REPORT.md.
