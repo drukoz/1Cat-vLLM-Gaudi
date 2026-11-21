@@ -133,13 +133,22 @@ def test_fp32_block_ids_equal_select_blocks(t, n, topk):
 
 
 def test_the_trace_sees_the_cast_that_card_rule_9_forbids():
-    # the guard on the guard: the served selection narrows the top-k's ids in its own graph
+    # the guard on the guard: top-k ids narrowed in the same graph show as the forbidden cast
+    import torch
+
+    scores, _ = _scores_case(8, 64)
+    casts, topks = _topk_id_casts(lambda: torch.topk(scores, 16, dim=-1).indices.to(torch.int32))
+    assert topks == 1
+    assert casts == ["_to_copy: torch.int64 -> torch.int32"]
+
+
+def test_the_served_selection_no_longer_casts_the_top_k_ids():
+    # program head (qsa-fused): select_blocks narrows through topk_ids_int32, never through a cast (card rule 9)
     from vllm_gaudi.models.qwen4_exp.qsa_sparse_ops import select_blocks
 
     scores, visible = _scores_case(8, 64)
-    casts, topks = _topk_id_casts(lambda: select_blocks(scores, visible, 16))
-    assert topks == 1
-    assert casts == ["_to_copy: torch.int64 -> torch.int32"]
+    casts, _ = _topk_id_casts(lambda: select_blocks(scores, visible, 16))
+    assert casts == []
 
 
 def test_fp32_block_ids_never_cast_the_top_k_ids():

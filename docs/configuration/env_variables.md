@@ -39,6 +39,10 @@ are in progress.
 | Parameter name                            | Description                                                                                                                                                                                                                                                                                                                                                                                                             | Default value |
 | ----------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------- |
 | `VLLM_PROFILER_ENABLED`                   | Enables the high-level profiler. You can view resulting JSON traces at [perfetto.habana.ai](https://perfetto.habana.ai/#!/viewer).                                                                                                                                                                                                                                                                                      | `false`       |
+| `VLLM_HPU_STEP_TIMING`                    | Step timer of the HPU worker, the model runner and the engine core, as an integer mode. `0` is off: nothing is timed, patched or written. `1` records the host spans of every step (`execute_model`, input preparation, the forward call, which is graph accumulation in lazy mode, the launches, logits, sampling, the wait for the device, the engine's turn between two steps) and the collectives per step, grouped by step kind (`prefill`, `decode`, `verify`, `mixed`) and row count. `2` adds debug counters of host synchronisation points (`.item()`, `.cpu()`, `.tolist()`, copies between host and device, `mark_step` calls) with their source lines. `3` waits for the device around every collective and after the forward and the sampler, so the device time of each segment is measured on its own (a step is slower in this mode; the segments exist only when the forward runs in Python, that is with `--enforce-eager`; every wait also reads one element of a dependent tensor back to the host, because `synchronize()` alone can return while launches still sit behind a collective). Any other value is `0`; there is no mode `4` (its op counting hung a TP8 server). Every N steps each process writes one log line (p50 / p90 per span; the driver rank only) and one JSON record to `step_timing_<role>_r<rank>_<pid>.jsonl`. A process started with a nonzero mode rereads `<dir>/step_timing.mode` (one integer) when a step starts after two idle seconds, so the mode can change without a restart. | `0`           |
+| `VLLM_HPU_STEP_TIMING_COMPONENTS`         | `1`: mode `3` of the step timer also waits for the device where a model component starts and ends (hyper-connection, GDN mixer, QSA with its indexer and its sparse attention, MoE block with its expert op, PLE layer) and records the device, collective and host time of each (`components` in the JSON record). For a diagnostic server without HPU graphs (`--enforce-eager`); `0` leaves the model untouched. | `0`           |
+| `VLLM_HPU_STEP_TIMING_EVERY`              | Steps of one kind and row count per log line and JSON record of the step timer. Whatever is collected is also written when a step starts after two idle seconds, and at exit. | `100`         |
+| `VLLM_HPU_STEP_TIMING_DIR`                | Folder of the step timer's JSON files and of its mode file. Empty means the working directory of the server. | empty         |
 | `VLLM_HPU_LOG_STEP_GRAPH_COMPILATION`     | Logs graph compilations for each vLLM engine step, only when a compilation occurs. We recommend using it in conjunction with `PT_HPU_METRICS_GC_DETAILS=1`.                                                                                                                                                                                                                                                             | `false`       |
 | `VLLM_HPU_LOG_STEP_GRAPH_COMPILATION_ALL` | Logs graph compilations for every vLLM engine step, even if no compilation occurs.                                                                                                                                                                                                                                                                                                                                      | `false`       |
 | `VLLM_HPU_LOG_STEP_CPU_FALLBACKS`         | Logs CPU fallbacks for each vLLM engine step, only when a fallback occurs.                                                                                                                                                                                                                                                                                                                                              | `false`       |
@@ -58,6 +62,101 @@ loaded only for checkpoint compatibility. `1` is sparse (indexer top-k
 selection, added in M2): `HpuQsaIndexer.select` picks the attended
 positions per query and attention runs only over them. Sparse prefill needs a
 4-aligned context. MTP verification steps (M3) score their draft rows on the sparse path too.
+
+`VLLM_HPU_FLASH_NEXT_DECODE_METADATA` (integer, default `0`) applies only with sparse QSA
+(`VLLM_HPU_FLASH_NEXT_QSA_MODE=1`). A sparse-QSA decode or verification step reads only the
+per-request `block_table` and the `slot_mapping` of the attention metadata. `0` still builds the
+dense paged-attention buffers of every decode step (`block_list`, `block_groups`, `block_usage`,
+and in the graph the `block_mapping` one-hot and `attn_bias`), as for any model. `1` does not build
+them: the block table is one row per request (numpy, repeated over its verification rows), block
+ids are not resolved (the defragmenter is off for this model), the decode bucket depends on the
+batch size only (one decode graph per batch size instead of one per block bucket), and the MTP
+drafter's per-step metadata follows the same rules. A runner that cannot use it (another model,
+dense QSA, the defragmenter on, a draft method other than MTP or n-gram) logs the reason once and
+keeps the dense buffers. CPU-checked (bit-identical tokens and logits on the whole serving loop,
+decode and k = 3 verification); not yet checked on a card.
+
+`VLLM_HPU_CANDIDATE_SAMPLING` (integer, default `0`) selects how a sampled decode step draws its tokens
+(requests with a temperature above zero; a request without a temperature gets the checkpoint's default
+sampling, temperature 1.0, top_k 20, top_p 0.95). `0` is vLLM's sampler: on every step a full sort of
+`[rows, vocabulary]`, a scatter back and exponential noise over the vocabulary. `1` samples over
+candidates (`vllm_gaudi/v1/sample/candidate_sampling.py`): the 64 largest logits of every row are taken in
+the LM-head region, and temperature, top-k, top-p and the draw run on `[rows, 64]` with noise made on the
+host (one small copy to the device, a seeded request's row from its own generator); there is no sampler
+graph, and rows x 4 bytes of token ids come back (int32 ids read out of an fp32 id table: top-k indices are
+never cast or read back as data on the card). With `VLLM_HPU_VOCAB_PARALLEL_LOGITS=2` each rank takes the
+top 64 of its vocabulary shard and the ranks gather `[rows, 128]` fp32 instead of the logits. It is vLLM's distribution whenever `0 < top_k <= 64`
+(a tie group at the k-th value that reaches past 64 candidates is cut there); the random stream differs,
+so a seeded request is reproducible but not equal to its output with `0`. A step with a request outside
+the conditions (`top_k` unset or above 64, `min_p`, penalties, `logit_bias`, `allowed_token_ids`,
+`bad_words`, logprobs, a custom logits processor, speculative decoding unless `2`, structured output) keeps
+vLLM's sampler; an all-greedy step is not affected. The server logs one INFO line
+(`Candidate sampling (VLLM_HPU_CANDIDATE_SAMPLING=1): a sampled decode step drew in the logits region ...`)
+the first time a sampled step takes the region, and one (`... took vLLM's sampler instead: <reason>`) the
+first time a sampled step falls back; a change of the runtime switch file logs them again. `2` is `1`, and the
+decode steps of a speculative server with deterministic drafts (MTP's arg max, n-gram) sample in the region too:
+every verification row and the bonus row of a request draws from the target distribution with its own noise, and
+the drafts are verified against those draws (`hpu_greedy_verify.greedy_rejection_sample_from_tokens`): accepted
+while a row's draw equals the draft, else the first unequal draw, else the bonus draw. For drafts that are one-hot
+that is speculative sampling exactly (acceptance p(draft), a rejected row follows p without the draft,
+renormalized), at about the cost of a greedy verification step. It needs `VLLM_HPU_SPEC_SAMPLED_VERIFY` at `1` or
+`2` (mtp-card-ready), which admits sampled requests to a speculative server and serves the steps the region refuses
+(a request with fewer drafts, `min_tokens`, logprobs, ...); without it `2` acts as `1`. CPU-checked
+against vLLM's `apply_top_k_top_p_pytorch`; on the card (TP4, 32 sampled streams) 4.9 ms less per step
+than vLLM's sampler (engine-step job 00110).
+
+`VLLM_HPU_SAMPLER_REQUEST_PARAMS` (integer, default `0`) makes a request's `min_tokens`, `logit_bias` and
+`min_p` take effect on the general sampler path. With `0` they are ignored on HPU: vLLM applies them through logits
+processors whose per-row state the HPU input batch never feeds (and the HPU samples prefills and decodes in calls
+whose rows are not the batch's rows). With `1` the runner applies each row's own request's values to the logits
+before vLLM's sampler (`vllm_gaudi/v1/sample/request_params.py`): the stop ids of a request below its
+`min_tokens` get `-inf`, each `logit_bias` entry is added, and tokens below `min_p` times the row's largest
+probability at its temperature get `-inf`. One difference from vLLM: a request with logprobs gets them after its
+own bias and masks (vLLM's raw logprobs come before them). Any other value is `0`. CPU-checked; not yet on a card.
+
+`VLLM_HPU_RUNTIME_SWITCH_FILE` (a path, default unset) is an operator's tool for an A/B on one server.
+When set, every worker looks at that file before each step (one `stat`) and, when the file changed, takes
+the flags it lists, one `NAME=VALUE` per line. Only flags the runner reads at every step can be switched:
+`VLLM_HPU_FLASH_NEXT_DECODE_METADATA`, `VLLM_HPU_FUSED_GREEDY_LOGITS`, `VLLM_HPU_CANDIDATE_SAMPLING` and
+`VLLM_HPU_VOCAB_PARALLEL_LOGITS` (read at every call of the logits region, which runs after the replayed graph);
+any other name is reported and the file is ignored. Replace the file with a rename while no request runs, so every worker sees the change
+at the same step. `tools/flash_next/engine_step/long_context_probe.py` measures two arms of one server
+this way.
+
+`VLLM_HPU_QSA_FUSED` selects the sparse QSA decode path (with
+`VLLM_HPU_FLASH_NEXT_QSA_MODE=1`) as an integer. `0` (default) keeps the torch path.
+`1` is the restructured torch data flow: the indexer gathers each request's
+compressed keys once for all its rows (whole kernel blocks, one table row per
+request) instead of once per query row, and the decode attention multiplies the
+grouped query heads with the gathered K and V instead of repeating them. `2` adds
+two TPC kernels, `torch.ops.flashinfer_gaudi.qsa_index_prepare` (indexer queries,
+ring and compressed-key writes) and `qsa_index_emit` (the attended K/V slots); they
+ship in `libqsa_fused_gaudi2.so` with the extension `qsa_fused_ops*.so`, built by
+`tools/build_flashinfer_gaudi.py --qsa-fused-only` or `VLLM_GAUDI_BUILD_QSA_FUSED=1`
+(`QSA_FUSED_GAUDI_KERNEL_LIBRARY` and `QSA_FUSED_GAUDI_NATIVE_LIBRARY` name the two
+files when they are not in the package's `lib` folder). When they do not load the
+plugin logs one warning at startup, and a layer they cannot serve logs `QSA fused
+... is off for <layer>: <reason>` and runs mode `1`. `3` is mode `2` plus two more
+kernels, `qsa_index_threshold` and `qsa_index_select`, in place of `torch.topk`: the
+same selected blocks except among scores equal at the cut, where the lowest blocks
+win. Any other value is `0`. See `docs/design/flash-next/qsa-fused.md`.
+
+`VLLM_HPU_QSA_INDEXER_SHARD` (with `VLLM_HPU_QSA_FUSED` `1` or `2`): `0` (default)
+scores every decode row on every TP rank; `1` scores each rank's share of the
+requests and all-gathers the int32 block selections once per QSA layer, so every rank
+holds the same selection. A decode bucket whose batch is not a multiple of the TP size
+stays replicated. `2` is `1` with the selections sent as fp32 (exact: block ids are
+below 2^24), the dtype of every other collective of the served model. Any other value
+is `0`.
+
+`VLLM_HPU_QSA_TABLE_WIDTH` sets the columns of the Flash-Next sparse QSA decode block
+table. `0` (default) is `ceil(max_model_len / block_size)`, fixed per engine: the
+indexer then gathers and scores every compressed key of a full context for every decode
+row (32,768 keys at `--max-model-len 131072`), whatever the row's own context. `1` is
+the longest request of the decode batch, rounded up to a power of two (at least 64
+blocks, at most the engine's): the key scan follows the context in use, a quarter of
+the keys at 32K tokens. The selections are the same; each (decode bucket, width) met
+compiles its own decode graph. Any other value is `0`.
 
 `VLLM_HPU_GDN_CORE_DECODE` selects the GDN decode core path as an integer.
 `1` (default) is fused: every non-speculative decode step runs through the
@@ -95,6 +194,87 @@ step, and the plain step after one, through
 `libgdn_fused_gaudi2.so`. A layer the op does not fit logs one warning
 (`GDN core verify ... is off for <layer>: <reason>`) and runs the torch path.
 It stays off until the rental's gate G1b has checked the op on a card.
+
+`VLLM_HPU_SPEC_SAMPLED_VERIFY` decides what a Flash-Next MTP server does with a
+sampled request (temperature above 0, which the checkpoint's
+`generation_config.json` makes the default for a request that sets none), as an
+integer. `0` (default) refuses it at request validation with an error naming
+this flag: the HPU rejection sampler verifies greedy requests only, and before
+this flag a sampled request stopped the worker. `1` verifies the drafts of
+sampled requests by speculative sampling in torch (accept the draft with the
+target's probability of it after temperature, top-k and top-p; on a rejection
+draw from the target with the draft removed), exact in distribution;
+`vllm_gaudi/v1/sample/hpu_rejection_sampler.py`, `sampled_rejection_sample`. `2` does
+the same over the 64 largest logits of every verification and bonus row
+(`vllm_gaudi/v1/sample/hpu_candidate_verify.py`): with `top_k` at most 64 (the
+checkpoint's default is 20) the target distribution lives on those, so the step needs
+one `topk` over the vocabulary instead of vLLM's sort, softmax and noise over it; ids
+come from an fp32 id table (no top-k index leaves the graph) and the noise from the
+host, seeded alike on every rank. A step with a seeded request, logprobs or a `top_k`
+outside 1..64 takes the exact path of `1`; a greedy request of a mixed batch runs as
+`top_k` 1.
+
+`VLLM_HPU_MTP_DRAFT_LOOP` selects how the Flash-Next MTP draft loop gets the
+positions of its steps 1 to k-1, as an integer. `0` (default) reads them back
+from the device after draft step 0, a host sync in the middle of the draft. `1`
+takes them from the runner's host books (the position of each request's last
+accepted token, `num_tokens_no_spec - 2` once the step's tokens are counted),
+so the host builds the next step's metadata while the device runs draft step 0;
+the drafts are the same.
+
+`VLLM_HPU_MTP_DRAFT_IDS` selects how the Flash-Next MTP draft turns its logits into
+token ids, as an integer. `0` (default): `argmax`, whose int64 ids the draft loop
+narrows to int32 in the same lazy graph before they feed the next draft pass. `1`:
+int32 ids from an fp32 id table (the first index of the row maximum), so no int64 id
+exists on the device. For card rule 9: `torch.topk` ids narrowed to int32 in the same
+lazy graph came back as every second id (job 00038). The sampler's `argmax` narrowing
+is sound at 8 and 32 rows (job 00021, by the streams' texts); set `1` only if the card
+shows draft positions 2 to k collapsing with more than one stream.
+
+`VLLM_HPU_MTP_DRAFT_GRAPH` selects how the Flash-Next MTP draft runs its k passes
+after a decode step, as an integer. `0` (default): every pass is its own HPU-graph
+replay, the LM head and the arg max run lazily between the replays, and the host
+builds each later pass's attention metadata between them (at 32 streams on TP8 the
+draft cost 16 to 18 ms of a 104 ms step, almost all of it host issue). `1`: the host
+builds the metadata of every later pass first, then one HPU graph runs pass 0, the LM
+head, the arg max and passes 1 to k-1 (`MtpDraftLoop` in
+`vllm_gaudi/v1/spec_decode/flash_next_mtp_steps.py`): one replay per decode draft,
+the same drafts. Use it with `VLLM_HPU_MTP_DRAFT_LOOP=1` (without it the host reads
+the draft positions back from the device before the replay). Drafts after a prefill
+and the draft-rank log (`VLLM_FLASH_NEXT_DRAFT_RANK_LOG=1`) keep the per-pass path.
+With `VLLM_HPU_MTP_TIMING=1` the draft's laps are `graph_positions`, `graph_meta`
+(the metadata of the later passes) and `graph` (the replay's issue).
+
+`VLLM_HPU_MTP_DRAFT_CHAIN` chains the Flash-Next MTP draft behind the verification, as
+an integer. `0` (default): the runner reads the verification's result on the host,
+then builds the draft's inputs and issues it. `1`: right after the rejection sampler,
+before any host read, the drafter computes on the device each request's committed
+rows, the draft's inputs and the later passes' block tables and slots, and issues the
+draft in one HPU graph (`MtpDraftChain`); the host then reads the result and keeps its
+books as before. When the verification's per-row greedy ids are on the device (the
+vocabulary-parallel path, or `VLLM_HPU_VERIFY_LOGITS_IN_GRAPH=1`), the greedy rejection
+runs inside the chain's graph too. Needs `VLLM_HPU_MTP_DRAFT_GRAPH=1` and the sparse
+decode metadata (`VLLM_HPU_FLASH_NEXT_DECODE_METADATA=1` in force); a step with a
+prefill, a sampled request (greedy only so far), structured output or the draft-rank
+log keeps today's path (each reason logged once). Switchable at run time
+(`VLLM_HPU_RUNTIME_SWITCH_FILE`). The chained step's device outputs stay in
+`HPUModelRunner._mtp_chain_out` (accepted counts, the next step's ids, the result)
+for async scheduling.
+
+`VLLM_HPU_MTP_TIMING` times the steps of a Flash-Next MTP server, as an integer. `0`
+(default): no timer. `1`: per step the verification part (to the drafter call) and the
+draft, with a lap per draft pass and one device wait after the draft; every 25 steps of
+a row count the means go to a log line (`MTP step timing: ...`) and to
+`mtp_step_timing_r<rank>_<pid>.jsonl` in the server's working directory, with
+`Ft_ms` (the verification part) and `Fd_ms` (the draft divided by k).
+
+`VLLM_HPU_MTP_CHUNK_KV` decides whether the Flash-Next MTP draft runs over the
+prefill chunks that complete no prompt, as an integer. `0` (default): it runs
+only over the chunk that completes a prompt, so its attention layer has no KV
+for the earlier chunks of a prompt above the chunk threshold, and every later
+draft attends to whatever those blocks hold. `1`: it also runs over each such
+chunk (one draft forward per chunk, the prompt's next token as the input at the
+chunk's last token, nothing sampled), so its KV covers the whole prompt.
 
 `VLLM_HPU_GDN_KERNEL_INTERLEAVE` (integer, default `0`) selects the TPC kernels
 behind `gdn_core_decode` and `gdn_core_verify`. `1` hands the graph compiler
@@ -190,6 +370,33 @@ logits the routing kernel takes the lowest expert id, where `torch.topk`
 leaves the choice open. With `0` nothing is loaded, registered or logged. The
 kernels pass the Gaudi2 instruction simulator and have not run on a card; see
 `docs/design/flash-next/hc-fused.md` ("MoE glue kernels").
+
+`VLLM_MOE_CHUNK` and `VLLM_MOE_TOKEN_BOUNDARY` (lists of integers of equal
+length, default empty) pass `chunk_size` and `total_experts` to
+`torch.ops.hpu.mixture_of_experts`: a step of at most `VLLM_MOE_TOKEN_BOUNDARY[i]`
+tokens (the first that fits) gets `VLLM_MOE_CHUNK[i]`, a longer one the last
+value. A value of `0` keeps the op's own default for that range (no
+arguments). On Flash-Next at TP8 (MTP k = 3, 32 streams) `chunk_size` 64 made
+the step about 12 ms shorter (job 00161); `VLLM_MOE_CHUNK=0,64,8192
+VLLM_MOE_TOKEN_BOUNDARY=16,512,1000000` applies it from 17 to 512 tokens only.
+
+`VLLM_HPU_MOE_DENSE` (integer, default `0`) applies to the routed experts of a
+per-channel FP8 MoE (`VllmMixtureOfExpertsOpFP8PerChannel`, Flash-Next's experts
+with `VLLM_HPU_FORCE_CHANNEL_FP8`). `1` keeps the layer's stacked FP8 experts
+when its weights are prepared and runs a step of at most
+`VLLM_HPU_MOE_DENSE_MAX_TOKENS` tokens (integer, default `512`) and at least
+`VLLM_HPU_MOE_DENSE_MIN_TOKENS` tokens (integer, default `17`) as two batched
+FP8 GEMMs over all local experts (every expert on every row, the routing
+weight of a pair that is not routed is 0) instead of
+`torch.ops.hpu.mixture_of_experts`; longer and shorter steps keep the vendor op
+(below the minimum the vendor op reads only the experts the rows hit). On one
+card the vendor op costs several times what reading the local experts once
+costs at 32 to 512 rows (`tools/flash_next/kernel_probes/probe_moe_layers.py`,
+`probe_moe_dense.py`). `0` (or any other value) keeps the vendor op. The two
+forms agree to FP8 rounding (the dense form quantizes the intermediate per
+expert and row). On the real model (TP8, MTP k = 3, job 00177) the first form of
+this path, without the minimum and with an fp32 weighted sum, was slower than
+the vendor op; keep it off until a later A/B shows otherwise.
 
 `VLLM_HPU_MOE_GLUE_MERGE_GATE_UP` (integer, default `0`) applies only with
 `VLLM_HPU_MOE_GLUE=1`. `1` appends the shared expert's gate_up rows of this
@@ -565,7 +772,7 @@ prepared-model entrypoint and disabled in the generic entrypoint.
 | `VLLM_HPU_GDN_PADDED_DIRECT_STATE` | Opts partially filled decode buckets into the direct-state path. Requires FlashInfer GDN and direct state to be enabled, a contiguous active-slot prefix, and every padding slot to be free. Paused requests retain their slots and are never used as padding. Prefix caching and multi-token decode retain the general path. | `false` |
 | `VLLM_HPU_CGUID_DYNAMIC_QUANT` | Uses Gaudi's fused scale-calculation CGUID for decode-sized per-token dynamic FP8 quantization. Large prefill matrices retain the existing reduction path to preserve its numerical behavior. When unset, this follows `VLLM_HPU_FLASHINFER_GDN`. | `false` (`true` with FlashInfer GDN) |
 | `VLLM_HPU_CGUID_DYNAMIC_QUANT_MAX_ROWS` | Maximum flattened row count eligible for CGUID dynamic quantization. Keep this below the smallest prefill token bucket; increasing it can change prefill graph fusion. | `32` |
-| `VLLM_HPU_FUSED_GREEDY_LOGITS` | Fuses hidden-state selection, the LM-head projection, FP32 conversion, and argmax into one compiled decode region for plain greedy requests. Requests using logprobs, penalties, token masks, logit processors, structured output, or speculative decoding retain the general sampler path. | `false` |
+| `VLLM_HPU_FUSED_GREEDY_LOGITS` | Fuses hidden-state selection, the LM-head projection, FP32 conversion, and argmax into one compiled decode region for plain greedy requests. A request with `min_tokens` (up to 8 stop ids) decodes there too: until it has `min_tokens` output tokens its stop ids get `-inf` before the argmax through a fixed-shape mask. Requests using logprobs, penalties, token masks, other logit processors, structured output, or speculative decoding retain the general sampler path. | `false` |
 | `FLASHINFER_GAUDI_BACKEND` | Selects `auto`, `native`, `public`, `bridge`, or `pytorch`. Strict policies (`native/public/bridge`) require the entire operation to be native. The SiLU candidate supports `native/public`; GDN strict calls reject the remaining torch prologue/reference graph. Native availability does not imply performance qualification. | `auto` |
 | `FLASHINFER_GAUDI_STATE_DTYPE` | Selects the requested recurrent-state precision. `fp32` is the production default; `bf16` remains experimental until model-quality validation succeeds. | `fp32` |
 | `FLASHINFER_GAUDI_NATIVE_LIBRARY` | Optional path-list of native host-extension libraries to load. Packaged libraries are discovered automatically. | unset |
@@ -584,11 +791,18 @@ prepared-model entrypoint and disabled in the generic entrypoint.
 | `VLLM_HPU_TRITON_SILU_BLOCK_SIZE` | Power-of-two row chunk used to distribute each fused SiLU-and-mul row across Gaudi2 TPC engines; accepted range is 128–1024. | `128` |
 | `VLLM_HPU_TRITON_GDN_VALUE_TILE` | Value rows owned by each experimental Qwen3.5 packed GDN decode program; accepted values are 16, 32, 64, and 128. | `16` |
 | `VLLM_HPU_PLE_HOST_NGRAM_IDS` | Flash-Next only: where the PLE n-gram ids are computed. `0` computes them inside every graph (token packing, `searchsorted`, the EOS shift scan, the int32 hash). `1` computes the same ids on the host when a batch is built and passes them to the model as the int32 input `ple_ngram_ids`, which removes those ops from every prompt and decode graph (speculative verification steps included). A batch whose token ids are not all on the host (async scheduling, merged prefill) keeps the in-graph path and logs the reason once. Not yet checked on a card. | `0` |
+| `VLLM_HPU_DECODE_CUT_INTERVAL` | The `mark_step()` that `modify_model_layers` hooks after every `VLLM_CONFIG_HIDDEN_LAYERS`-th decoder layer, in decode and speculative verification forwards (attention metadata with `is_prompt=False`). `0` keeps the hooks as they are for every forward. `N >= 1` cuts a decode forward after every `N`-th layer only; a value above the layer count (`1000`) captures each decode graph with no per-layer cut, so a Flash-Next decode step loses 48 recipe boundaries (it is still split at each collective). Prompt forwards keep `VLLM_CONFIG_HIDDEN_LAYERS`. The hook runs only while a graph is captured or a step runs outside graphs. See `docs/design/flash-next/native-replay.md`. Not yet checked on a card. | `0` |
+| `VLLM_HPU_GRAPH_ASYNC_REPLAY` | Lazy mode: how the model's HPU graph (`wrap_in_hpu_graph`) replays. `0` keeps the bridge's default `asynchronous=False`: the calling thread issues every captured recipe and collective before the forward returns. `1` passes `asynchronous=True`: the forward returns once the replay is queued, so the logits and sampler ops are issued meanwhile. See `docs/design/flash-next/native-replay.md`. Not yet checked on a card. | `0` |
+| `VLLM_HPU_WORKER_CPU_PIN` | Where the HPU worker processes run on the host. `0` leaves their threads to the kernel, which moves them over every CPU the server may use. `1`: right after `torch.hpu.set_device` every thread of a worker is moved to one equal share of the CPUs the server process may use (`os.sched_getaffinity`, so a container CPU set is respected): the sorted CPUs are cut into one share per visible module and a worker takes the share at its module's position in `HABANA_VISIBLE_MODULES` (`HLS_MODULE_ID`; without those two variables, the share at its rank). Threads it starts later inherit the share. A CPU set laid out by module (the card farm gives each module the CPUs next to it) thereby keeps every worker next to its card. `2`: as `1`, and once the model is loaded and warmed up the thread that runs the model has the share's first CPU for itself and the worker's other threads the rest (a daemon thread moves threads started later off that CPU). `3`: nothing is pinned while the model loads and warms up (a pin there slows the server start); after warmup the thread that runs the model gets a CPU of the worker's share whose host hyperthread sibling (`VLLM_HPU_WORKER_CPU_SIBLINGS`) is kept free too, the worker's other threads keep to the rest of the share and the parent process's threads (the engine core) keep off both CPUs; for VMs that hide the host's hyperthreads. One log line per worker names its CPUs. Nothing a worker computes changes. Default `0`. `docs/design/flash-next/native-replay.md`. |
+| `VLLM_HPU_WORKER_CPU_SIBLINGS` | With `VLLM_HPU_WORKER_CPU_PIN=3`: which CPUs share a host core. `xor1` (default): CPUs 2k and 2k+1 (the rented Gaudi node; its VM reports one thread per core). `none`: no sibling known. `docs/design/flash-next/native-replay.md` section 7.12. |
 | `VLLM_HPU_VOCAB_PARALLEL_LOGITS` | Tensor-parallel models with a vocabulary-sharded LM head: consumers that need only the arg max do not all-gather the logits (`docs/design/flash-next/collectives.md`). `1`: plain greedy decode requests (the same gate as `VLLM_HPU_FUSED_GREEDY_LOGITS`, which this value also opens), the greedy verification of a Flash-Next MTP step and the MTP drafts take the largest logit of each rank's own vocabulary shard (lowest id on ties) and gather `[rows, 2]` fp32 per rank instead of `[rows, vocab]` (497 KB per row for Flash-Next). Requests with sampling, logprobs, `min_tokens`, penalties, logit bias, token masks or structured output keep the gathered logits. `2`: as `1`, and `vocab_parallel.top_k(model, hidden_states, k)`, the call of a sampler stage that draws from candidates (`VLLM_HPU_CANDIDATE_SAMPLING`), does not gather the logits either: each rank sends its `k` largest logits with their ids (`[rows, 2k]` fp32 per rank) and the top `k` of those is returned, the same values as `topk` over the gathered logits. Every token a top-k of at most `k` keeps is among them unless more than `k` such tokens lie in one rank's shard. Any other value is `0`. Not yet run on a card. | `0` |
 | `VLLM_HPU_REPLICATED_EMBEDDING` | Flash-Next only, read when the model is built: `1` gives every rank the whole token embedding (about 1.1 GiB more per card at TP8), so the all-reduce after the vocabulary-sharded lookup is gone from every target step and every MTP draft step. A model that ties its LM head to the embedding keeps the sharded table. Not yet run on a card. | `0` |
 | `VLLM_HPU_PLE_TABLE_RIDER` | Flash-Next only: `1` looks the PLE n-gram table rows up before the token embedding and sums both over the ranks in one all-reduce (the table rows as extra columns), so the table's own all-reduce is gone from every target step; the result is the same bit for bit. Needs the vocabulary-sharded embedding: with `VLLM_HPU_REPLICATED_EMBEDDING=1` nothing changes. Not yet run on a card. | `0` |
 | `VLLM_HPU_ALL_REDUCE_AS_GATHER_ROWS` | `N > 0`: an HPU tensor-parallel all-reduce whose input has at most `N` rows (first dimension) runs as an all-gather of every rank's partial and a local fp32 sum, the same bits on every rank; larger ones stay all-reduces (`docs/design/flash-next/collectives.md`, C4 without the fused kernel). The gather moves 7 times the payload at 8 ranks; it can pay only where one gather phase costs less than an all-reduce. `0` never. Not yet run on a card. | `0` |
 | `VLLM_HPU_MTP_REPLICATED_FC` | Flash-Next MTP only, read when the draft is built: `1` builds the draft's two hidden-by-hidden entry linears (`fc_embedding`, `fc_hidden`) unsharded, which removes their two all-gathers from every draft step (a 2560 x 2560 bf16 matrix each: about 11 MiB more per card each). Not yet run on a card. | `0` |
+| `VLLM_HPU_FLASH_NEXT_ASYNC_SCHED` | Flash-Next only: vLLM's async scheduling (the engine schedules step N+1 while step N runs; the worker prepares and issues step N+1 before step N's sampled tokens reach the host, so the host's per-step work hides behind the device). `0` keeps it off for Flash-Next, as before. `1` keeps vLLM's decision (on unless `--no-async-scheduling`) when there is no speculative config; with one it stays off. `2` is `1` and also keeps it with the Flash-Next MTP draft: the runner keeps its synchronous speculative step (one host read of the verification result), the drafts stay on the device for the next step (no read-back of the drafts, no wait for the draft passes) and the scheduler's optimistic `num_computed_tokens` is corrected with the accepted counts. The runner then carries the PLE n-gram context of the decode rows on the device (the host-built context lacks the previous step's token), keeps a placeholder per in-flight token in each request's output tokens (settled before penalties or bad words read them), and the async scheduler ends prompt chunks on the recurrent block grid as the synchronous engine does (prefix-cache hits of the recurrent state). `VLLM_HPU_PLE_HOST_NGRAM_IDS=1` has no effect under it (the ids need the device's tokens). A seeded request whose prompt spans several chunks samples a different (still valid) stream than without async scheduling. Design and card results: `docs/design/flash-next/async-sched.md`. `3` is `2` for the engine (async scheduling with the MTP draft), and the runner issues a chained verification step (`VLLM_HPU_MTP_DRAFT_CHAIN=1`) before the previous step's tokens reach the host: its tokens are copied on a side stream and read by the worker's output thread, and the runner's books (the batch's token rows and counts, the requests' output tokens, the recurrent lattice's accepted counts) follow one step late; a step whose batch changes (a request new, resumed or finished), or one with logprobs, penalties, bad words, `min_tokens` or structured output, waits for every pending book and keeps the synchronous order. `3` needs `VLLM_HPU_MTP_DRAFT_CHAIN=1`, `VLLM_HPU_FLASH_NEXT_SPEC_DEVICE_INPUTS=2`, `VLLM_HPU_FLASH_NEXT_DECODE_METADATA=1` and prefix caching off (its align-mode commits are the next stage); otherwise it acts as `2` and logs why. | `0` |
+| `VLLM_HPU_FLASH_NEXT_SPEC_DEVICE_INPUTS` | Flash-Next MTP only (async-sched stage 2, M1): the inputs of a verification step that depend on the previous verification's acceptance, made on the device from that step's own device inputs and its acceptance (mtp-draft-graph's chain output `_mtp_chain_out` with `VLLM_HPU_MTP_DRAFT_CHAIN=1`, else a stand-in from the host's read): the input ids (the bonus token and the drafts), the positions, the KV slot mapping (a gather from the one-row-per-request block table), the GDN lattice's `num_accepted_tokens` and the PLE n-gram context. Only a verification step whose decode rows are the previous step's (same requests, order, padded batch and k) is made so; any other keeps the host's inputs. `0` (default) makes nothing. `1` makes them and compares them with the host-made ones every step (a host read; a mismatch is logged as a warning, a summary line every 16 steps). `2` gives the model the device-made ones (host n-gram ids are then refused). Needs `VLLM_HPU_FLASH_NEXT_DECODE_METADATA=1`; with M-RoPE positions or the dense decode metadata the host's inputs stay (logged once). A server started at `1` or `2` reads the value again every step (so `VLLM_HPU_RUNTIME_SWITCH_FILE` can switch it among `0`, `1` and `2`; host n-gram ids stay refused for the server's life if it started at `2`). The next stage issues a step before the previous one's tokens reach the host. | `0` |
+| `VLLM_HPU_FLASH_NEXT_SPEC_DEVICE_ALIGN` | Flash-Next MTP with prefix caching only (async-sched stage 2, M3): a verification step's align mode made on the device from its true context (the step's device positions) and the previous step's acceptance: the running block `cdiv(ctx + 1 + k, block) - 1`, the pre-step copy of the running recurrent state into it (conv and ssm, whole rows), the recurrent groups' load and store lattices and load counts; after the step the boundary commits of the accepted tokens that complete a block and the self commits (next load count 1), all on the device, the host's books following (now, or with mode 3's asynchronous copy). The same rules as `recurrent_lattice` and `recurrent_commit`, for a recurrent block larger than `1 + k`. `0` (default) keeps them on the host. `1` makes them and compares them with the host's every step (a host read). `2` uses them; then `VLLM_HPU_FLASH_NEXT_ASYNC_SCHED=3` serves with prefix caching on. Needs `VLLM_HPU_FLASH_NEXT_SPEC_DEVICE_INPUTS`. | `0` |
 
 The Gaudi2 backend routes supported contiguous BF16 residual RMSNorm calls with
 hidden sizes up to 8192 to one Triton-generated TPC kernel. It returns both the

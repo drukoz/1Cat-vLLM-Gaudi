@@ -86,6 +86,14 @@ WARM_PASS_REQUEST_TIMEOUT_S = 3600.0
 WARM_WORKLOAD_FILE = "warm-workload.json"
 WARM_REQUESTS_FILE = "warm-requests.jsonl"
 WARM_PASS_FILE = "warm-pass.json"
+# --anatomy: the step-anatomy probe against each variant's first server, after its first token, with the step timer
+# on (tools/flash_next/anatomy). Every level is warmed at the measured length, so no measured round compiles.
+ANATOMY_PROBE = "tools/flash_next/anatomy/anatomy_probe.py"
+ANATOMY_SUMMARY = "tools/flash_next/anatomy/summarize_timing.py"
+ANATOMY_PHASES = "warm:1,8,32:128;1:1,8,32:128;3:1,32:64"
+ANATOMY_TIMEOUT_S = 2400.0
+ANATOMY_IDLE_S = 3.0  # seconds between the probe's rounds: the timer writes a round's steps after 2 idle s
+ANATOMY_STATUS_FILE = "anatomy.json"
 MONITOR_TERM_WAIT_S = 15.0
 CARD_FREE_WAIT_S = 20.0
 STUB_STAGGER_S = 0.0
@@ -428,6 +436,22 @@ def gdn_summary_lines(run_dir, variant_ids) -> list:
     return lines
 
 
+def anatomy_env(vdir: Path) -> dict:
+    """--anatomy: the step timer (mode 1) of a variant's servers, its records in <variant>/timing."""
+    return {"VLLM_HPU_STEP_TIMING": "1", "VLLM_HPU_STEP_TIMING_DIR": str(vdir / "timing"),
+            "VLLM_HPU_STEP_TIMING_EVERY": "4000"}
+
+
+def anatomy_commands(port: int, served_name: str, vdir: Path) -> tuple:
+    """The probe and the summary commands of the --anatomy stage."""
+    root = repo_root()
+    probe = [sys.executable, str(root / ANATOMY_PROBE), "--port", str(port), "--model", served_name,
+             "--timing-dir", str(vdir / "timing"), "--phases", ANATOMY_PHASES, "--idle", str(ANATOMY_IDLE_S),
+             "--out", str(vdir / "anatomy_probe.json")]
+    summary = [sys.executable, str(root / ANATOMY_SUMMARY), str(vdir), "--json", str(vdir / "anatomy_summary.json")]
+    return probe, summary
+
+
 class Runner:
 
     def __init__(self, args, variants: list):
@@ -470,6 +494,10 @@ class Runner:
         self.gdn_reason = None
         # The fused hyper-connection kernels: the operator's request (--hc-fused), the card test's result
         # in G1b (None before G1b ran), and who took the kernels out of this run's servers ("tiny").
+        # The fused QSA decode path (--qsa-fused): VLLM_HPU_QSA_FUSED=2 when its kernels' card test passed, else
+        # 1 (the torch data flow, no kernels); without the request 0. Sharded by request whenever it is on.
+        self.qsa_fused_requested = bool(getattr(args, "qsa_fused", False))
+        self.qsa_fused_status = None
         self.hc_fused_requested = bool(args.hc_fused)
         self.hc_fused_status = None
         self.hc_fused_reason = None
@@ -482,6 +510,7 @@ class Runner:
         self.gdn_fused_disabled_by = None  # "tiny" when the tiny gate only passed on the PyTorch GDN path
         self.skip_warmup = not args.full_warmup
         self.warm_pass = not args.no_warm_pass
+        self.anatomy = bool(getattr(args, "anatomy", False))
         self.server_timeout_s = float(args.server_timeout)
         self.request_timeout_s = (COHERENCE_REQUEST_TIMEOUT_SKIP_WARMUP_S if self.skip_warmup else
                                   gates.HTTP_TIMEOUT_S)
@@ -712,6 +741,14 @@ class Runner:
                 }
             hc_fused = self.check_hc_fused(phase_dir, details)
             moe_glue = self.check_moe_glue(phase_dir, details)
+            if self.qsa_fused_requested:
+                qsa = self.kernel_card_test(gates.qsa_fused, phase_dir, details, None)
+                qsa["requested"] = True
+                details["qsa_fused"] = qsa
+                self.qsa_fused_status = qsa.get("status")
+                print("  QSA fused kernels: card test %s%s -> servers get %s" % (
+                    self.qsa_fused_status, " (%s)" % qsa.get("reason") if qsa.get("reason") else "",
+                    self.qsa_fused_env()), flush=True)
         # The hyper-connection kernels' card test and the MoE glue kernels' are recorded next to G1b's own
         # result; `status`, the GDN mode and the GDN flags above are final and nothing below changes them.
         hc_fused["requested"] = self.hc_fused_requested
@@ -726,6 +763,8 @@ class Runner:
             details["env"] = dict(details.get("env") or {})
             details["env"][gates.HC_FUSED_ENV] = "1" if self.hc_fused_on() else "0"
             details["env"][gates.MOE_GLUE_ENV] = "1" if self.moe_glue_on() else "0"
+            if self.qsa_fused_requested:
+                details["env"].update(self.qsa_fused_env())
         self.gdn_env = dict(details.get("env") or {})
         self.gdn_mode = details.get("mode")
         self.gdn_reason = details.get("reason")
@@ -759,6 +798,14 @@ class Runner:
                                   combined_db_off=combined_db_off))
         except Exception as exc:  # noqa: BLE001 - recorded only
             return {"status": gates.HC_NOT_RUN, "reason": "%s: %s" % (type(exc).__name__, exc), "hpu_op": None}
+
+    def qsa_fused_env(self) -> dict:
+        """The QSA flags of this run's servers: 2 + shard when asked and the card test passed, 1 + shard when asked
+        and it did not (the torch data flow needs no kernel), 0 without the request."""
+        if not self.qsa_fused_requested:
+            return {gates.QSA_FUSED_ENV: "0", gates.QSA_SHARD_ENV: "0"}
+        mode = "2" if self.qsa_fused_status == gates.HC_PASSED else "1"
+        return {gates.QSA_FUSED_ENV: mode, gates.QSA_SHARD_ENV: "1"}
 
     def hc_fused_on(self) -> bool:
         """True when this run's servers get VLLM_HPU_HC_FUSED=1: the operator asked (--hc-fused), the card
@@ -968,6 +1015,8 @@ class Runner:
         failures = []
         eff, note = self.effective_variant(variant)
         eff["env"] = self.variant_server_env(eff["env"])
+        if self.anatomy:
+            eff["env"].update(anatomy_env(vdir))
         self.recipe_cache_notes[vid] = self.recipe_cache_note
         servers = variant["servers"]
         urls = ["http://127.0.0.1:%d" % int(s["port"]) for s in servers]
@@ -1024,6 +1073,8 @@ class Runner:
                     failure = self.run_first_token(vid, urls, vdir)
                     if failure is not None:
                         failures.append(failure)
+                if not failures and self.anatomy:
+                    self.run_anatomy(vid, servers[0], vdir)  # diagnostic: never fails the variant
                 if not failures:
                     w = self.ensure_workload(urls[0])
                 if not failures and self.warm_pass:
@@ -1079,6 +1130,29 @@ class Runner:
             return True
         finally:
             self.teardown_variant(procs)
+
+    def run_anatomy(self, vid: str, server: dict, vdir: Path) -> dict:
+        """--anatomy: the step-anatomy probe against this server, then its budget tables. Writes anatomy.json
+        (commands, exit codes, seconds), anatomy_probe.json and anatomy_summary.md; never fails the variant."""
+        t0 = time.time()
+        probe_cmd, summary_cmd = anatomy_commands(int(server["port"]), self.served_name, vdir)
+        record = {"probe_command": probe_cmd, "summary_command": summary_cmd, "phases": ANATOMY_PHASES}
+        for key, cmd, out_name in (("probe", probe_cmd, "anatomy_probe.log"),
+                                   ("summary", summary_cmd, "anatomy_summary.md")):
+            try:
+                with open(vdir / out_name, "w", encoding="utf-8") as out:
+                    proc = subprocess.run(cmd, cwd=str(repo_root()), stdout=out, stderr=subprocess.STDOUT,
+                                          timeout=ANATOMY_TIMEOUT_S, check=False)
+                record[key + "_exit"] = proc.returncode
+            except (OSError, subprocess.TimeoutExpired) as exc:
+                record[key + "_exit"] = None
+                record[key + "_error"] = "%s: %s" % (type(exc).__name__, exc)
+        record["seconds"] = round(time.time() - t0, 1)
+        write_json(vdir / ANATOMY_STATUS_FILE, record)
+        print("variant %s: anatomy probe exit %s, summary exit %s, %.0f s (%s)" %
+              (vid, record.get("probe_exit"), record.get("summary_exit"), record["seconds"],
+               vdir / "anatomy_summary.md"), flush=True)
+        return record
 
     def effective_variant(self, variant) -> tuple:
         eff = dict(variant)
@@ -1368,6 +1442,7 @@ class Runner:
         manifest["gdn_core_decode_reason"] = self.gdn_reason
         manifest["skip_warmup"] = self.skip_warmup
         manifest["warm_pass"] = self.warm_pass
+        manifest["anatomy"] = self.anatomy
         manifest["server_timeout_s"] = self.server_timeout_s
         manifest["load_read_timeout_s"] = self.load_read_timeout_s
         manifest["warm_request_timeout_s"] = self.warm_request_timeout_s
@@ -1451,6 +1526,8 @@ class Runner:
         env = server_env(variant_env, self.gdn_env)
         env[gates.HC_FUSED_ENV] = "1" if self.hc_fused_on() else "0"
         env[gates.MOE_GLUE_ENV] = "1" if self.moe_glue_on() else "0"
+        if self.qsa_fused_requested:  # without the switch the plugin default (0) holds
+            env.update(self.qsa_fused_env())
         if self.skip_warmup:
             env["VLLM_SKIP_WARMUP"] = "true"
         combined = self.combined_db_active()
@@ -1530,10 +1607,18 @@ def _parse_args(argv):
                         help="ask for the fused hyper-connection kernels: the servers get VLLM_HPU_HC_FUSED=1 "
                         "when the kernels' card test in G1b passed (default: off, every server gets "
                         "VLLM_HPU_HC_FUSED=0); a tiny gate that fails with them runs once more without")
+    parser.add_argument("--qsa-fused", action="store_true",
+                        help="ask for the fused QSA decode path: the servers get VLLM_HPU_QSA_FUSED=2 and "
+                        "VLLM_HPU_QSA_INDEXER_SHARD=1 when the QSA kernels' card test in G1b passed, else "
+                        "VLLM_HPU_QSA_FUSED=1 (the torch data flow) (default: off, VLLM_HPU_QSA_FUSED=0)")
     parser.add_argument("--moe-glue", action="store_true",
                         help="ask for the MoE glue kernels: the servers get VLLM_HPU_MOE_GLUE=1 when the "
                         "kernels' card test in G1b passed (default: off, every server gets "
                         "VLLM_HPU_MOE_GLUE=0); a tiny gate that fails with them runs once more without")
+    parser.add_argument("--anatomy", action="store_true",
+                        help="after each variant's first token, run the step-anatomy probe against its first "
+                        "server with the step timer on (VLLM_HPU_STEP_TIMING=1): host spans, dispatched ops and "
+                        "device waits at 1, 8 and 32 streams, in <variant>/anatomy_summary.md (about 6 minutes)")
     parser.add_argument("--recipe-cache", metavar="DIR", default=None,
                         help="folder for the HPU recipe cache; a server gets it only when it runs without the "
                         "fused GDN kernel, or when the combined kernel database is installed, G1b passed "
