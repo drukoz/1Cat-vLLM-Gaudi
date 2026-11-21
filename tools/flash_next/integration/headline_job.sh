@@ -17,6 +17,11 @@
 #   mtp<K>-graph  server 2 with VLLM_HPU_MTP_DRAFT_GRAPH=1 (the k draft passes of a decode step in one HPU graph,
 #           track mtp-draft-graph); the plain mtp<K> arm runs with VLLM_HPU_MTP_DRAFT_GRAPH=0 unless the job sets it.
 #           The tiny arm takes HEADLINE_TINY_DRAFT_GRAPH (default: the job's VLLM_HPU_MTP_DRAFT_GRAPH, else 0).
+#   mtp<K>-switch  ONE MTP server, VLLM_HPU_MTP_DRAFT_GRAPH switched per round through its runtime switch file
+#           (VLLM_HPU_RUNTIME_SWITCH_FILE=$OUT/<arm>/switches): per level a warm round per arm, then the
+#           measured rounds off, on, off, on (decode_scaling.py --switch-arm): an A/B without the
+#           server-to-server spread. Rows of scaling.json carry "arm" (off / on); the MTP timer's records of
+#           the one-graph drafts have the kind verify+graph.
 #   nospec-noshard, nospec-noprefix, nospec-noprefix-nocut  the low-stream bisect: A's env with
 #           VLLM_HPU_QSA_INDEXER_SHARD=0; A's env without VLLM_HPU_PREFIX_ALIGN_SPLIT and VLLM_HPU_PREFIX_KEEP_PROMPT_END
 #           (then also VLLM_HPU_DECODE_CUT_INTERVAL=0); greedy 8 and 1 streams only.
@@ -227,11 +232,26 @@ while [ "$i_arm" -lt "${#ARMS[@]}" ]; do
                 --warm-tokens "$WARM" --repeat-top 2 --no-mintok-check --probe-arg --no-sampled-check \
                 --probe-arg "--rounds=$ROUNDS"
             ;;
-        mtp[1-9] | mtp[1-9]-32 | mtp[1-9]-noshard | mtp[1-9]-async | mtp[1-9]-graph)
+        mtp[1-9] | mtp[1-9]-32 | mtp[1-9]-noshard | mtp[1-9]-async | mtp[1-9]-graph | mtp[1-9]-switch)
             k="${arm:3:1}"
             # mtp<K>-graph: the k draft passes of a decode step in one HPU graph (VLLM_HPU_MTP_DRAFT_GRAPH=1)
             draft_graph="${VLLM_HPU_MTP_DRAFT_GRAPH:-0}"
             case "$arm" in *-graph) draft_graph=1 ;; esac
+            # mtp<K>-switch: the flag per round on one server (the server starts with it off)
+            switch_env=()
+            switch_args=()
+            case "$arm" in
+                *-switch)
+                    draft_graph=0
+                    mkdir -p "$OUT/$arm"
+                    rm -f "$OUT/$arm/switches" "$OUT/$arm/switches.new"
+                    switch_env=(VLLM_HPU_RUNTIME_SWITCH_FILE="$OUT/$arm/switches")
+                    switch_args=(--probe-arg "--switch-file=$OUT/$arm/switches"
+                        --probe-arg "--switch-arm=off=VLLM_HPU_MTP_DRAFT_GRAPH=0"
+                        --probe-arg "--switch-arm=on=VLLM_HPU_MTP_DRAFT_GRAPH=1"
+                        --probe-arg "--server-log=$OUT/$arm/server0.log")
+                    ;;
+            esac
             # mtp<K>-async: VLLM_HPU_FLASH_NEXT_ASYNC_SCHED=2 (async scheduling with MTP) and the MTP timer at
             # HEADLINE_ASYNC_MTP_TIMING (default 2, the coordinator's; async-sched advises 0: the timer's device wait
             # at the draft's end hides the overlap).
@@ -253,14 +273,14 @@ while [ "$i_arm" -lt "${#ARMS[@]}" ]; do
                 sampled_args=(--probe-arg "--sampled-levels=${HEADLINE_MTP_SAMPLED_LEVELS:-32}")
                 sampled_verify="${VLLM_HPU_SPEC_SAMPLED_VERIFY:-1}"
             fi
-            env ${async_env[@]+"${async_env[@]}"} \
+            env ${async_env[@]+"${async_env[@]}"} ${switch_env[@]+"${switch_env[@]}"} \
             VLLM_HPU_QSA_INDEXER_SHARD="$shard" VLLM_HPU_SPEC_SAMPLED_VERIFY="$sampled_verify" \
             VLLM_HPU_GDN_CORE_VERIFY="${VLLM_HPU_GDN_CORE_VERIFY:-1}" VLLM_HPU_MTP_TIMING="$timing" \
                 VLLM_HPU_MTP_DRAFT_LOOP="${VLLM_HPU_MTP_DRAFT_LOOP:-1}" VLLM_HPU_MTP_CHUNK_KV="${VLLM_HPU_MTP_CHUNK_KV:-1}" \
                 VLLM_HPU_MTP_DRAFT_GRAPH="$draft_graph" \
                 bash "$HERE/serve_probe.sh" --out "$OUT/$arm" --mtp "$k" --levels "$levels" --tokens "$TOKENS" \
                 --warm-tokens "$WARM" --repeat-top 1 --no-mintok-check "${sampled_args[@]}" \
-                --probe-arg "--rounds=$ROUNDS" ${HEADLINE_MTP_CTX:+--ctx "$HEADLINE_MTP_CTX"} $(barrier_args "$arm") $(guard_args)
+                ${switch_args[@]+"${switch_args[@]}"} --probe-arg "--rounds=$ROUNDS" ${HEADLINE_MTP_CTX:+--ctx "$HEADLINE_MTP_CTX"} $(barrier_args "$arm") $(guard_args)
             ;;
         *)
             echo "headline_job: unknown arm $arm (nospec, mtp3, mtp3-32)"

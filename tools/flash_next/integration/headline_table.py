@@ -34,7 +34,8 @@ def rows_of(arm: str, data: dict) -> list:
         for r in data.get(kind) or []:
             mode = {"levels": "greedy", "sampled": "sampled"}.get(kind) or "greedy, ~%s-token prompts" % (
                 r.get("prompt_tokens_p50") or r.get("ctx_tokens"))
-            row = {"arm": arm, "mode": mode, "streams": r.get("streams"),
+            # an A/B on one server (decode_scaling.py --switch-arm): the round's arm after the folder's
+            row = {"arm": arm + ("/" + r["arm"] if r.get("arm") else ""), "mode": mode, "streams": r.get("streams"),
                    "rep": r.get("rep", 0), "ok": r.get("ok"), "errors": r.get("errors")}
             if r.get("ok"):
                 steady = r.get("steady_ms_per_token_p50")
