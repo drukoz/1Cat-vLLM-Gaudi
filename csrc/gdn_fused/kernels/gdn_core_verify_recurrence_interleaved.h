@@ -58,6 +58,15 @@ static inline void gdn_core_verify_recurrence_head(
             }
             const float64 vo_0 = verify_vo[2 * t];
             const float64 vo_1 = verify_vo[2 * t + 1];
+#ifdef GDN_VERIFY_LEAN_BROADCAST
+            // The row's element of v in every lane by one broadcast instead of the sum of a masked vector
+            // (VLLM_HPU_GDN_VERIFY_VARIANT 2 and 3). The sum adds +0.0 lanes to the element, which turns -0.0 into
+            // +0.0 and keeps every other value: so does "+ 0.0f", so the bits are the sum's.
+            const float64 v_value_a0 = v_broadcast_element_f32(vo_0, row_a0) + 0.0f;
+            const float64 v_value_b0 = v_broadcast_element_f32(vo_1, row_a0) + 0.0f;
+            const float64 v_value_a1 = v_broadcast_element_f32(vo_0, row_a1) + 0.0f;
+            const float64 v_value_b1 = v_broadcast_element_f32(vo_1, row_a1) + 0.0f;
+#else
             float64 v_value_a0 = v_f32_mov_vb(vo_0, 0, zero, mask0);
             float64 v_value_b0 = v_f32_mov_vb(vo_1, 0, zero, mask0);
             float64 v_value_a1 = v_f32_mov_vb(vo_0, 0, zero, mask1);
@@ -70,6 +79,7 @@ static inline void gdn_core_verify_recurrence_head(
             v_value_b0 = v_f32_shuffle_b(v_value_b0, broadcast_lane_zero, 0, v_value_b0);
             v_value_a1 = v_f32_shuffle_b(v_value_a1, broadcast_lane_zero, 0, v_value_a1);
             v_value_b1 = v_f32_shuffle_b(v_value_b1, broadcast_lane_zero, 0, v_value_b1);
+#endif
             state_lo_a0 = state_lo_a0 * decay;
             state_hi_a0 = state_hi_a0 * decay;
             state_lo_b0 = state_lo_b0 * decay;
@@ -126,10 +136,19 @@ static inline void gdn_core_verify_recurrence_head(
             out_b0 = v_f32_reduce_add(out_b0);
             out_a1 = v_f32_reduce_add(out_a1);
             out_b1 = v_f32_reduce_add(out_b1);
+#ifdef GDN_VERIFY_LEAN_BROADCAST
+            // Lane 0 of every lane group holds the sum after the reduction (the projection above is broadcast the
+            // same way): one shuffle instead of a broadcast of element 0, the same value in every lane.
+            out_a0 = v_f32_shuffle_b(out_a0, broadcast_lane_zero, 0, out_a0);
+            out_b0 = v_f32_shuffle_b(out_b0, broadcast_lane_zero, 0, out_b0);
+            out_a1 = v_f32_shuffle_b(out_a1, broadcast_lane_zero, 0, out_a1);
+            out_b1 = v_f32_shuffle_b(out_b1, broadcast_lane_zero, 0, out_b1);
+#else
             out_a0 = v_broadcast_element_f32(out_a0, 0);
             out_b0 = v_broadcast_element_f32(out_b0, 0);
             out_a1 = v_broadcast_element_f32(out_a1, 0);
             out_b1 = v_broadcast_element_f32(out_b1, 0);
+#endif
             float64 merged_0 = vo_0;
             merged_0 = v_f32_mov_vb(out_a0, 0, merged_0, mask0);
             merged_0 = v_f32_mov_vb(out_a1, 0, merged_0, mask1);

@@ -27,6 +27,13 @@
 
 #include "deepseek_v41_simulation_descriptor.hpp"
 #include "gdn_core_verify_gaudi2.hpp"
+#include "gdn_kernel_variant.hpp"
+
+// The request-major variant builds of the interleaved verify kernel, when this host links them (weak).
+extern unsigned char _binary_gdn_core_verify_interleaved_rmajor_gaudi2_o_start __attribute__((weak));
+extern unsigned char _binary_gdn_core_verify_interleaved_rmajor_gaudi2_o_end __attribute__((weak));
+extern unsigned char _binary_gdn_core_verify_interleaved_rmajor_lean_gaudi2_o_start __attribute__((weak));
+extern unsigned char _binary_gdn_core_verify_interleaved_rmajor_lean_gaudi2_o_end __attribute__((weak));
 
 namespace {
 
@@ -216,17 +223,29 @@ int main(int argc, char** argv)
         return 3;
     }
 
-    if (g.indexSpaceRank != 2 || g.indexSpaceGeometry[0] != H || g.indexSpaceGeometry[1] != B) {
+    // {key heads, requests}; the request-major variants (VLLM_HPU_GDN_VERIFY_VARIANT 1 or 3 with the interleave
+    // variable, their ELF linked into this host) have {requests, key heads} (docs/design/flash-next/hc-kernels.md).
+    const int variant = GdnKernelInterleaveRequested() ? GdnVerifyVariantRequested() : 0;
+    const bool requestMajor =
+        (variant == 1 && GdnElfLinked(&_binary_gdn_core_verify_interleaved_rmajor_gaudi2_o_start,
+                                      &_binary_gdn_core_verify_interleaved_rmajor_gaudi2_o_end)) ||
+        (variant == 3 && GdnElfLinked(&_binary_gdn_core_verify_interleaved_rmajor_lean_gaudi2_o_start,
+                                      &_binary_gdn_core_verify_interleaved_rmajor_lean_gaudi2_o_end));
+    const uint64_t wantFirst = requestMajor ? B : H;
+    const uint64_t wantSecond = requestMajor ? H : B;
+    if (g.indexSpaceRank != 2 || g.indexSpaceGeometry[0] != wantFirst || g.indexSpaceGeometry[1] != wantSecond) {
         std::fprintf(
             stderr,
-            "verify_sim_host: glue index space is rank %u {%llu, %llu}, expected 2 {%u, %u}\n",
+            "verify_sim_host: glue index space is rank %u {%llu, %llu}, expected 2 {%llu, %llu}\n",
             static_cast<unsigned>(g.indexSpaceRank),
             static_cast<unsigned long long>(g.indexSpaceGeometry[0]),
             static_cast<unsigned long long>(g.indexSpaceGeometry[1]),
-            static_cast<unsigned>(H),
-            static_cast<unsigned>(B));
+            static_cast<unsigned long long>(wantFirst),
+            static_cast<unsigned long long>(wantSecond));
         return 4;
     }
+    std::printf("index space: {%llu, %llu}\n", static_cast<unsigned long long>(g.indexSpaceGeometry[0]),
+                static_cast<unsigned long long>(g.indexSpaceGeometry[1]));
 
     std::vector<TensorDesc2> descriptors;
     for (int input = 0; input < kInputCount; ++input) {

@@ -64,17 +64,22 @@ extern "C" tpc_lib_api::GlueCodeReturn GetKernelGuids(
 {
     using namespace tpc_lib_api;
     if (!count) return GLUE_FAILED;
-    // The six hyper-connection GUIDs, then the MoE glue GUIDs that were built (0 to 4).
+    // The six hyper-connection GUIDs, then the MoE glue GUIDs that were built (0 to 4), then the interleaved
+    // hyper-connection GUIDs that were built (0 to 2).
     const uint32_t capacity = *count;
-    const uint32_t total = kHcFusedGuidCount + moe_glue::KernelCount();
+    const uint32_t moeCount = moe_glue::KernelCount();
+    const uint32_t total = kHcFusedGuidCount + moeCount + hc_fused::IlKernelCount();
     *count = device == DEVICE_ID_GAUDI2 ? total : 0;
     if (!*count || !guids || !capacity) return GLUE_SUCCESS;
     const uint32_t filled = capacity < total ? capacity : total;
     std::memset(guids, 0, filled * sizeof(*guids));
     const hc_fused::KernelInfo* kernels = hc_fused::Kernels();
     const moe_glue::KernelInfo* moeKernels = moe_glue::Kernels();
+    const hc_fused::KernelInfo* ilKernels = hc_fused::IlKernels();
     for (uint32_t index = 0; index < filled; ++index) {
-        const char* guid = index < kHcFusedGuidCount ? kernels[index].guid : moeKernels[index - kHcFusedGuidCount].guid;
+        const char* guid = index < kHcFusedGuidCount                ? kernels[index].guid
+                           : index < kHcFusedGuidCount + moeCount ? moeKernels[index - kHcFusedGuidCount].guid
+                                                                  : ilKernels[index - kHcFusedGuidCount - moeCount].guid;
         std::strncpy(guids[index].name, guid, MAX_NODE_NAME - 1);
     }
     return GLUE_SUCCESS;

@@ -72,6 +72,22 @@ VERIFY_KERNEL_OBJECT = "gdn_core_verify_gaudi2.o"
 INTERLEAVED_DECODE_SOURCE = REPO_ROOT / "csrc" / "gdn_fused" / "kernels" / "gdn_core_decode_interleaved_gaudi2.c"
 INTERLEAVED_VERIFY_SOURCE = REPO_ROOT / "csrc" / "gdn_fused" / "kernels" / "gdn_core_verify_interleaved_gaudi2.c"
 INTERLEAVE_ENV = "VLLM_HPU_GDN_KERNEL_INTERLEAVE"
+# The variant builds of the interleaved verify kernel (VLLM_HPU_GDN_VERIFY_VARIANT with the variable above;
+# docs/design/flash-next/hc-kernels.md, "GDN verify"): 1 request-major index space {requests, key heads}, 2 lean
+# broadcasts in the recurrence, 3 both. Each must give the interleaved kernel's bytes.
+VARIANT_VERIFY_SOURCES = {
+    1: REPO_ROOT / "csrc" / "gdn_fused" / "kernels" / "gdn_core_verify_interleaved_rmajor_gaudi2.c",
+    2: REPO_ROOT / "csrc" / "gdn_fused" / "kernels" / "gdn_core_verify_interleaved_lean_gaudi2.c",
+    3: REPO_ROOT / "csrc" / "gdn_fused" / "kernels" / "gdn_core_verify_interleaved_rmajor_lean_gaudi2.c",
+}
+VARIANT_ENV = "VLLM_HPU_GDN_VERIFY_VARIANT"
+# Variants 4 and 5 use the interleaved and the lean ELF with today's index space and the graph compiler's
+# preferred split of the key-head dimension (glue only; the simulator runs the whole index space on one TPC).
+VARIANTS = (1, 2, 3, 4, 5)
+REQUEST_MAJOR_VARIANTS = (1, 3)
+LEAN_VARIANTS = (2, 3, 5)
+# Instructions of the lean variants over the interleaved kernel, at most (measured 2026-11-21: 0.887 to 0.925).
+LEAN_VERIFY_RATIO = 0.94
 # Instructions of the interleaved kernel over today's, at most (measured 2026-11-20, tpc-clang 2.7.33: decode
 # 0.344 on every case, verify 0.369 to 0.378).
 INTERLEAVED_DECODE_RATIO = 0.40
@@ -232,14 +248,15 @@ def interleaved_sim_binary(tmp_path_factory: pytest.TempPathFactory) -> Path:
 
 @pytest.fixture(scope="module")
 def interleaved_verify_sim_binary(tmp_path_factory: pytest.TempPathFactory) -> Path:
-    """verify_sim_host linked with today's verify ELF and the interleaved one."""
+    """verify_sim_host linked with today's verify ELF, the interleaved one and its three variant builds."""
     build = tmp_path_factory.mktemp("gdn_core_verify_interleaved_sim")
+    variants = [_embed(build, source) for source in VARIANT_VERIFY_SOURCES.values()]
     for source in (VERIFY_KERNEL_SOURCE, INTERLEAVED_VERIFY_SOURCE):
         _embed(build, source)
     extra = build / "gdn_core_verify_interleaved_gaudi2_embedded.o"
     _run([
         "g++", "-std=c++17", "-O2", "-Wall", VERIFY_HOST_SOURCE, VERIFY_GLUE_SOURCE,
-        build / "gdn_core_verify_gaudi2_embedded.o", extra, f"-I{REPO_ROOT / 'csrc' / 'gdn_fused'}",
+        build / "gdn_core_verify_gaudi2_embedded.o", extra, *variants, f"-I{REPO_ROOT / 'csrc' / 'gdn_fused'}",
         f"-I{REPO_ROOT / 'csrc' / 'gdn_fused' / 'host'}", f"-I{REPO_ROOT / 'tools'}", f"-I{TOOLS_INCLUDE}",
         f"-I{DRIVER_INCLUDE}", "-L/usr/lib/habanatools", "-Wl,-rpath,/usr/lib/habanatools", "-ltpc_tests_core_ext",
         "-o", build / "verify_sim_host"
@@ -295,6 +312,63 @@ def test_interleaved_verify_kernel_is_bit_identical_and_shorter(interleaved_veri
     print(f"{case.name}: instructions today {today}, interleaved {interleaved} ({interleaved / today:.3f})")
     assert compare_verify(case, inputs, read_verify_outputs(case, case_dir / "interleaved")) == []
     assert interleaved <= INTERLEAVED_VERIFY_RATIO * today
+
+
+def _run_verify(binary: Path, case, inputs, run_dir: Path, env_values: dict) -> tuple[int, str, dict]:
+    """(instructions, the index-space line, output bytes by file) of one verify run with the given variables."""
+    write_verify_inputs(case, inputs, run_dir)
+    env = {key: value for key, value in os.environ.items() if key not in (INTERLEAVE_ENV, VARIANT_ENV)}
+    env.update(env_values)
+    proc = subprocess.run([str(binary), str(run_dir)], capture_output=True, text=True, timeout=3600, env=env)
+    assert proc.returncode == 0, f"rc={proc.returncode}\nstdout:\n{proc.stdout}\nstderr:\n{proc.stderr}"
+    count = int(re.search(r"instructions executed: (\d+)", proc.stdout).group(1))
+    geometry = re.search(r"index space: \{([^}]*)\}", proc.stdout).group(1)
+    files = ("out.bin", "conv_state.out.bin", "ssm_state.out.bin")
+    return count, geometry, {name: (run_dir / name).read_bytes() for name in files}
+
+
+@pytest.mark.parametrize("variant", VARIANTS)
+@pytest.mark.parametrize("case", VERIFY_CASES, ids=[case.name for case in VERIFY_CASES])
+def test_verify_variant_is_bit_identical_to_the_interleaved_kernel(interleaved_verify_sim_binary: Path, case,
+                                                                   variant: int, tmp_path: Path) -> None:
+    """VLLM_HPU_GDN_VERIFY_VARIANT 1 (request-major index space), 2 (lean broadcasts), 3 (both), 4 (preferred split
+    of the key heads), 5 (4 with the lean ELF): every output and state byte is the interleaved kernel's; 1 and 4 run
+    the same instructions, 2, 3 and 5 fewer."""
+    binary = interleaved_verify_sim_binary / "verify_sim_host"
+    inputs = make_verify_inputs(case)
+    base = _run_verify(binary, case, inputs, tmp_path / "interleaved", {INTERLEAVE_ENV: "1"})
+    got = _run_verify(binary, case, inputs, tmp_path / f"variant{variant}", {
+        INTERLEAVE_ENV: "1",
+        VARIANT_ENV: str(variant)
+    })
+    print(f"{case.name} variant {variant}: index space {base[1]} -> {got[1]}, instructions {base[0]} -> {got[0]} "
+          f"({got[0] / base[0]:.3f})")
+    first, second = (int(v) for v in base[1].split(","))
+    want = [second, first] if variant in REQUEST_MAJOR_VARIANTS else [first, second]
+    assert [int(v) for v in got[1].split(",")] == want
+    for name in base[2]:
+        assert base[2][name] == got[2][name], f"{name}: variant {variant}'s bytes differ"
+    if variant in LEAN_VARIANTS:
+        assert got[0] <= LEAN_VERIFY_RATIO * base[0]
+    else:
+        assert abs(got[0] - base[0]) <= 0.02 * base[0]
+
+
+def test_a_variant_needs_the_interleave_variable_and_an_exact_value(interleaved_verify_sim_binary: Path,
+                                                                    tmp_path: Path) -> None:
+    """The glue takes a variant only with the interleave variable at "1" and the variant at exactly "1" to "5"."""
+    binary = interleaved_verify_sim_binary / "verify_sim_host"
+    case = VERIFY_CASES[0]
+    inputs = make_verify_inputs(case)
+    runs = {}
+    for label, values in (("none", {}), ("variant_only", {VARIANT_ENV: "3"}),
+                          ("interleaved", {INTERLEAVE_ENV: "1"}), ("variant_6", {INTERLEAVE_ENV: "1", VARIANT_ENV: "6"}),
+                          ("variant_x", {INTERLEAVE_ENV: "1", VARIANT_ENV: "1 "}),
+                          ("variant_3", {INTERLEAVE_ENV: "1", VARIANT_ENV: "3"})):
+        runs[label] = _run_verify(binary, case, inputs, tmp_path / label, values)
+    assert runs["none"][0] == runs["variant_only"][0] and runs["none"][1] == runs["variant_only"][1]
+    assert runs["interleaved"][0] == runs["variant_6"][0] == runs["variant_x"][0]
+    assert runs["variant_3"][0] < runs["interleaved"][0] and runs["variant_3"][1] != runs["interleaved"][1]
 
 
 def test_without_the_variable_a_host_with_both_elfs_runs_todays_kernel(interleaved_sim_binary: Path,

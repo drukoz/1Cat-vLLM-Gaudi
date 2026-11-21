@@ -25,6 +25,14 @@ extern unsigned char _binary_hc_fused_combine_gaudi2_o_start;
 extern unsigned char _binary_hc_fused_combine_gaudi2_o_end;
 extern unsigned char _binary_hc_fused_combine_norm_gaudi2_o_start;
 extern unsigned char _binary_hc_fused_combine_norm_gaudi2_o_end;
+#ifdef HC_FUSED_HAS_HC_FUSED_GATE_MIX_IL
+extern unsigned char _binary_hc_fused_gate_mix_il_gaudi2_o_start;
+extern unsigned char _binary_hc_fused_gate_mix_il_gaudi2_o_end;
+#endif
+#ifdef HC_FUSED_HAS_HC_FUSED_COMBINE_NORM_IL
+extern unsigned char _binary_hc_fused_combine_norm_il_gaudi2_o_start;
+extern unsigned char _binary_hc_fused_combine_norm_il_gaudi2_o_end;
+#endif
 
 namespace hc_fused {
 namespace {
@@ -43,6 +51,19 @@ const KernelInfo kKernels[kHcFusedGuidCount] = {
     {Kind::Combine, kHcFusedCombineGuid, 3, 1},
     {Kind::CombineNorm, kHcFusedCombineNormGuid, 4, 2},
 };
+
+// The interleaved kernels that were built, in the order of hc_fused_params.h. One element more than the
+// kernels, so that the array is never empty.
+const KernelInfo kIlKernels[] = {
+#ifdef HC_FUSED_HAS_HC_FUSED_GATE_MIX_IL
+    {Kind::GateMixIl, kHcFusedGateMixIlGuid, 2, 1},
+#endif
+#ifdef HC_FUSED_HAS_HC_FUSED_COMBINE_NORM_IL
+    {Kind::CombineNormIl, kHcFusedCombineNormIlGuid, 4, 2},
+#endif
+    {Kind::GateMixIl, nullptr, 0, 0},
+};
+constexpr unsigned kIlKernelCount = sizeof(kIlKernels) / sizeof(kIlKernels[0]) - 1;
 
 struct Elf {
     unsigned char* start;
@@ -64,6 +85,19 @@ Elf KernelElf(Kind kind)
             return {&_binary_hc_fused_combine_gaudi2_o_start, &_binary_hc_fused_combine_gaudi2_o_end};
         case Kind::CombineNorm:
             return {&_binary_hc_fused_combine_norm_gaudi2_o_start, &_binary_hc_fused_combine_norm_gaudi2_o_end};
+        case Kind::GateMixIl:
+#ifdef HC_FUSED_HAS_HC_FUSED_GATE_MIX_IL
+            return {&_binary_hc_fused_gate_mix_il_gaudi2_o_start, &_binary_hc_fused_gate_mix_il_gaudi2_o_end};
+#else
+            return {nullptr, nullptr};
+#endif
+        case Kind::CombineNormIl:
+#ifdef HC_FUSED_HAS_HC_FUSED_COMBINE_NORM_IL
+            return {&_binary_hc_fused_combine_norm_il_gaudi2_o_start,
+                    &_binary_hc_fused_combine_norm_il_gaudi2_o_end};
+#else
+            return {nullptr, nullptr};
+#endif
     }
     return {nullptr, nullptr};
 }
@@ -150,6 +184,7 @@ GlueCodeReturn Resolve(const KernelInfo& kernel, const TensorGeometry* const* in
             SetOutput(r, 1, streams);
             return GLUE_SUCCESS;
         case Kind::GateMix:
+        case Kind::GateMixIl:
             r.width = in[0]->maxSizes[0];
             if (!SplitStreams(r.width, scalar.hc_count, r.hidden) || !IsMatrixOf(*in[1], r.width, r.tokens)) {
                 return GLUE_INCOMPATIBLE_INPUT_SIZE;
@@ -158,13 +193,14 @@ GlueCodeReturn Resolve(const KernelInfo& kernel, const TensorGeometry* const* in
             return GLUE_SUCCESS;
         case Kind::Combine:
         case Kind::CombineNorm:
+        case Kind::CombineNormIl:
             r.width = in[0]->maxSizes[0];
             if (!SplitStreams(r.width, scalar.hc_count, r.hidden) || !IsMatrixOf(*in[1], r.hidden, r.tokens) ||
                 !IsMatrixOf(*in[2], streams, r.tokens)) {
                 return GLUE_INCOMPATIBLE_INPUT_SIZE;
             }
             SetOutput(r, 0, r.width);
-            if (kernel.kind == Kind::CombineNorm) {
+            if (kernel.kind != Kind::Combine) {
                 if (!ResolveWeight(*in[3], r)) return GLUE_INCOMPATIBLE_INPUT_SIZE;
                 SetOutput(r, 1, r.width);
             }
@@ -173,7 +209,7 @@ GlueCodeReturn Resolve(const KernelInfo& kernel, const TensorGeometry* const* in
     return GLUE_NODE_NOT_FOUND;
 }
 
-bool ReadsEps(Kind kind) { return kind == Kind::Norm || kind == Kind::CombineNorm; }
+bool ReadsEps(Kind kind) { return kind == Kind::Norm || kind == Kind::CombineNorm || kind == Kind::CombineNormIl; }
 
 void MapDimension(TensorAccessPattern& pattern, unsigned tensorDim, unsigned indexDim, uint64_t a, uint64_t startB,
                   uint64_t endB)
@@ -201,11 +237,18 @@ void MapWeight(TensorAccessPattern& pattern, const Resolved& r)
 
 const KernelInfo* Kernels() { return kKernels; }
 
+const KernelInfo* IlKernels() { return kIlKernels; }
+
+unsigned IlKernelCount() { return kIlKernelCount; }
+
 const KernelInfo* FindKernel(const char* name)
 {
     if (!name) return nullptr;
     for (const KernelInfo& kernel : kKernels) {
         if (!std::strncmp(name, kernel.guid, MAX_NODE_NAME)) return &kernel;
+    }
+    for (unsigned index = 0; index < kIlKernelCount; ++index) {
+        if (!std::strncmp(name, kIlKernels[index].guid, MAX_NODE_NAME)) return &kIlKernels[index];
     }
     return nullptr;
 }
@@ -291,6 +334,7 @@ GlueCodeReturn Instantiate(const KernelInfo& kernel, HabanaKernelParams* params,
             }
             break;
         case Kind::GateMix:
+        case Kind::GateMixIl:
             // Point (chunk, token) writes 128 output columns and reads that chunk of every stream. The
             // chunks of one point are hidden columns apart in xn and gate, which one linear range cannot
             // describe, so both are declared as the token's whole row.
@@ -316,6 +360,20 @@ GlueCodeReturn Instantiate(const KernelInfo& kernel, HabanaKernelParams* params,
                 MapWeight(inputPattern[3], r);
                 MapMatrix(outputPattern[1], 1, r.hidden, r.hidden);
             }
+            break;
+        case Kind::CombineNormIl:
+            // Point (0, token) owns the token's whole row of residual and of the outputs, its hc_count injection
+            // logits and its block output row, and reads the whole norm weight: the kernel runs the streams of a
+            // token side by side.
+            instance->indexSpaceRank = 2;
+            instance->indexSpaceGeometry[0] = 1;
+            instance->indexSpaceGeometry[1] = r.tokens;
+            MapMatrix(inputPattern[0], 1, 0, r.width);
+            MapMatrix(inputPattern[1], 1, 0, r.hidden);
+            MapMatrix(inputPattern[2], 1, 0, streams);
+            MapDimension(inputPattern[3], 0, 0, 0, 0, (r.sharedWeight ? r.hidden : r.width) - 1);
+            MapMatrix(outputPattern[0], 1, 0, r.width);
+            MapMatrix(outputPattern[1], 1, 0, r.width);
             break;
     }
 

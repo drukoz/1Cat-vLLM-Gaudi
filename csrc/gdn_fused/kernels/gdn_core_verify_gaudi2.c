@@ -186,6 +186,19 @@ static inline void conv_verify_block(tensor conv_state, tensor mixed_qkv, tensor
     }
 }
 
+// Which index-space dimension holds the request and which the key head. Today's layout is {key heads, requests};
+// the request-major build (GDN_VERIFY_REQUEST_MAJOR, kernels/gdn_core_verify_interleaved_rmajor_gaudi2.c,
+// VLLM_HPU_GDN_VERIFY_VARIANT 1 and 3) has {requests, key heads}. A point does the same work in either layout, so
+// every output and state bit is the same; only the graph compiler's split of the points over the TPCs changes
+// (docs/design/flash-next/hc-kernels.md, "GDN verify").
+#ifdef GDN_VERIFY_REQUEST_MAJOR
+#define GDN_VERIFY_REQUEST_DIM 0
+#define GDN_VERIFY_KEY_HEAD_DIM 1
+#else
+#define GDN_VERIFY_REQUEST_DIM 1
+#define GDN_VERIFY_KEY_HEAD_DIM 0
+#endif
+
 void main(tensor conv_state, tensor ssm_state, tensor mixed_qkv, tensor z, tensor a, tensor b,
           tensor A_log, tensor dt_bias, tensor conv_weight_t, tensor norm_weight,
           tensor row_indices, tensor ssm_store_indices, tensor output,
@@ -208,7 +221,8 @@ void main(tensor conv_state, tensor ssm_state, tensor mixed_qkv, tensor z, tenso
     const int key_offset = key_heads * head_dim;
     const int value_offset = 2 * key_offset;
 
-    for (int request = index_start[1]; request < index_end[1]; ++request) {
+    for (int request = index_start[GDN_VERIFY_REQUEST_DIM]; request < index_end[GDN_VERIFY_REQUEST_DIM];
+         ++request) {
         int5 field_coords = {0, request, 0, 0, 0};
         const int conv_load = s_i32_ld_g(gen_addr(field_coords, row_indices));
         field_coords[0] = 1;
@@ -228,7 +242,8 @@ void main(tensor conv_state, tensor ssm_state, tensor mixed_qkv, tensor z, tenso
                           offset >= 0 && offset <= conv_rows - 3 && query_len >= 1;
         const int n = query_len < nodes ? query_len : nodes;
 
-        for (int key_head = index_start[0]; key_head < index_end[0]; ++key_head) {
+        for (int key_head = index_start[GDN_VERIFY_KEY_HEAD_DIM]; key_head < index_end[GDN_VERIFY_KEY_HEAD_DIM];
+             ++key_head) {
             if (!real) {
                 // Padding row: zeros for every node of every owned value head, no state touched.
                 for (int t = 0; t < nodes; ++t) {

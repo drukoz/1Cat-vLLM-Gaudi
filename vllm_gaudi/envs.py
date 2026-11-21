@@ -551,6 +551,7 @@ if TYPE_CHECKING:
     # 2 also one record per step (mtp_step_record_r*.jsonl)
     VLLM_HPU_MTP_CHUNK_KV: int = 0  # 1 the MTP draft also runs over prefill chunks that complete no prompt
     VLLM_HPU_GDN_KERNEL_INTERLEAVE: int = 0  # 0 today's GDN decode/verify kernels, 1 four value rows per iteration
+    VLLM_HPU_GDN_VERIFY_VARIANT: int = 0  # with the interleave flag: 1 request-major, 2 lean, 3 both, 4/5 split hint
     VLLM_HPU_GDN_GLUE_CACHE: int = 0  # 0 per-step glue of the fused GDN ops (default), 1 constants and indices cached
     VLLM_HPU_PLE_HOST_NGRAM_IDS: int = 0  # 0 PLE n-gram ids computed in the graph (default), 1 on the host
     VLLM_HPU_HC_FUSED: int = 0  # 0 torch hyper-connections (default), 1 the fused hyper-connection kernels
@@ -560,6 +561,7 @@ if TYPE_CHECKING:
     VLLM_HPU_FLASH_NEXT_SPEC_DEVICE_INPUTS: int = 0  # 0 host-made (default), 1 device-made + check, 2 device-made
     VLLM_HPU_FLASH_NEXT_SPEC_DEVICE_ALIGN: int = 0  # prefix-cache align mode: 0 host (default), 1 + device check, 2 device
     VLLM_HPU_HC_FUSED_COPY_MODE: int = 0  # copies before a fused HC op: 0 all, 1 not its own outputs, 2 block output
+    VLLM_HPU_HC_FUSED_IL: int = 0  # with VLLM_HPU_HC_FUSED=1: 0 shipped kernels, 1 interleaved gate_mix + combine_norm
     VLLM_HPU_MOE_DENSE: int = 0  # 0 vendor MoE op (default), 1 dense batched FP8 experts up to MAX_TOKENS rows
     VLLM_HPU_MOE_DENSE_MAX_TOKENS: int = 512  # with VLLM_HPU_MOE_DENSE=1: the most tokens a step runs dense
     VLLM_HPU_MOE_DENSE_MIN_TOKENS: int = 17  # with VLLM_HPU_MOE_DENSE=1: the fewest tokens a step runs dense
@@ -2035,6 +2037,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_HPU_GDN_KERNEL_INTERLEAVE":
     lambda: int(os.environ.get("VLLM_HPU_GDN_KERNEL_INTERLEAVE", "0")),
 
+    # With VLLM_HPU_GDN_KERNEL_INTERLEAVE=1 only, read by the GDN kernel library's glue (getenv) when the graph
+    # compiler instantiates the core-verify GUID: which build of the interleaved verify kernel serves it
+    # (docs/design/flash-next/hc-kernels.md, "GDN verify"). 0 (default) the interleaved kernel; 1 its request-major
+    # index space {requests, key heads} instead of {key heads, requests} (the same points: the graph compiler can
+    # spread them over more TPC engines); 2 lean broadcasts in the recurrence (11 % fewer instructions in the
+    # simulator); 3 both; 4 today's index space with the graph compiler asked to split the key heads into partitions
+    # of one (preferredSplitDim); 5 as 4 with the lean build. Every variant's outputs and states are the interleaved
+    # kernel's bit for bit. Any other value is 0. A library built without a variant serves the interleaved kernel.
+    # Not yet run on a card.
+    "VLLM_HPU_GDN_VERIFY_VARIANT":
+    lambda: int(os.environ.get("VLLM_HPU_GDN_VERIFY_VARIANT", "0")),
+
     # The glue of the fused GDN decode and verify ops (idea I25). 0 (default) = every layer, every step, copies
     # the transposed conv weight, casts dt_bias to fp32, selects its cache group's state indices, clones them
     # to int32 and makes an output buffer the fused op replaces. 1 = the conv weight and dt_bias come from
@@ -2181,6 +2195,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # value is 0. Read once per layer at construction. Not yet run on a card.
     "VLLM_HPU_HC_FUSED_COPY_MODE":
     lambda: int(os.environ.get("VLLM_HPU_HC_FUSED_COPY_MODE", "0")),
+
+    # With VLLM_HPU_HC_FUSED=1 only: which TPC kernels run the two hyper-connection ops that cost the most at many
+    # rows (docs/design/flash-next/hc-kernels.md). 0 (default) = the shipped hc_gate_mix and hc_combine_norm;
+    # 1 = their interleaved versions hc_gate_mix_il and hc_combine_norm_il (the same inputs and outputs:
+    # residual_out bit for bit, the gated mix and the norm inside the HC contract of
+    # tests/unit_tests/hc_fused/hc_case.py). Any other value is 0. Read once per layer at construction. A layer
+    # whose interleaved ops are not served (an older extension, or a kernel library built without them) logs one
+    # line ("HC fused interleaved kernels ... is off for <layer>", a rental-gate HC fallback) and keeps the shipped
+    # fused ops. Not yet run on a card.
+    "VLLM_HPU_HC_FUSED_IL":
+    lambda: int(os.environ.get("VLLM_HPU_HC_FUSED_IL", "0")),
 
     # FP8 per-channel routed experts (VllmMixtureOfExpertsOpFP8PerChannel) only. 1 = a step of at most
     # VLLM_HPU_MOE_DENSE_MAX_TOKENS tokens runs every local expert on every row as two batched FP8 GEMMs over the

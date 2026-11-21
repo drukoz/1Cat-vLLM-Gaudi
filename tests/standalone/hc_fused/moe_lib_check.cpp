@@ -150,7 +150,10 @@ void CheckGuids()
     uint32_t filled = count;
     Expect(g_guids(DEVICE_ID_GAUDI2, &filled, guids.data()), GLUE_SUCCESS, "guids/fill");
     const char* const ours[] = {kMoeGlueRouteGuid, kMoeGlueSiluMulGuid, kMoeGlueCombineGuid, kMoeGlueRowQuantGuid};
-    Report(count == kHcFusedGuidCount + kMoeGlueGuidCount, "guids/count", "count " + std::to_string(count));
+    // The interleaved hyper-connection GUIDs (0 to 2, after the MoE ones) do not move the MoE GUIDs.
+    Report(count >= kHcFusedGuidCount + kMoeGlueGuidCount &&
+               count <= kHcFusedGuidCount + kMoeGlueGuidCount + kHcFusedIlGuidCount,
+           "guids/count", "count " + std::to_string(count));
     for (unsigned index = 0; index < kMoeGlueGuidCount && kHcFusedGuidCount + index < guids.size(); ++index) {
         Report(!std::strcmp(guids[kHcFusedGuidCount + index].name, ours[index]),
                std::string("guids/after_the_hyper_connection_six/") + ours[index]);

@@ -31,6 +31,7 @@ _HC_FUSED_ERRORS: list[str] = []  # the fused hyper-connection loader's own erro
 _MOE_GLUE_LOADED: bool | None = None  # None = not attempted (the flag VLLM_HPU_MOE_GLUE is not 1)
 _MOE_GLUE_ERRORS: list[str] = []  # the MoE glue loader's own errors (the library's are the hyper-connection loader's)
 _MOE_GLUE_MISSING: tuple[str, ...] = ()  # the MoE glue ops whose kernel the library does not serve
+_HC_FUSED_IL_MISSING: tuple[str, ...] | None = None  # None = not asked yet (hc_fused_il_missing_kernels)
 _COMBINED_DB_ACTIVE: str | None = None  # the combined kernel database this process activated (its path)
 
 RECIPE_CACHE_ENV = "PT_HPU_RECIPE_CACHE_CONFIG"
@@ -503,6 +504,45 @@ def _load_moe_glue_locked() -> bool:
     return True
 
 
+# The interleaved hyper-connection ops (flashinfer_gaudi.hc_fused.IL_OP_NAMES) and their GUIDs
+# (csrc/hc_fused/hc_fused_params.h): each kernel is optional when the library is built.
+HC_FUSED_IL_GUIDS = {
+    "hc_gate_mix_il": "hc_fused_gate_mix_il_bf16_gaudi2",
+    "hc_combine_norm_il": "hc_fused_combine_norm_il_bf16_gaudi2",
+}
+_HC_FUSED_IL_LOCK = threading.Lock()
+
+
+def hc_fused_il_missing_kernels() -> tuple[str, ...]:
+    """The interleaved hyper-connection ops whose TPC kernel the kernel library does not serve; asked once.
+
+    Every op when the fused hyper-connection library is not loaded (``load_hc_fused_extension`` returned False or
+    was never called) or cannot be asked; otherwise the ops whose GUID ``GetKernelGuids`` does not list (a kernel
+    that does not compile is left out when the library is built, csrc/hc_fused/CMakeLists.txt). It never raises;
+    why a kernel is missing goes to the loader's error list (``load_errors`` of the status functions below).
+    """
+    global _HC_FUSED_IL_MISSING
+    if _HC_FUSED_IL_MISSING is not None:
+        return _HC_FUSED_IL_MISSING
+    with _HC_FUSED_IL_LOCK:
+        if _HC_FUSED_IL_MISSING is not None:
+            return _HC_FUSED_IL_MISSING
+        missing = tuple(HC_FUSED_IL_GUIDS)
+        if _HC_FUSED_LOADED:
+            package_lib = Path(__file__).resolve().parent / "lib"
+            kernel_db = os.environ.get(HC_FUSED_KERNEL_LIBRARY_ENV, "") or str(package_lib / HC_FUSED_KERNEL_DB)
+            try:
+                served = kernel_library_guids(kernel_db)
+                missing = tuple(name for name, guid in HC_FUSED_IL_GUIDS.items() if guid not in served)
+                if missing:
+                    _LOAD_ERRORS.append(f"{kernel_db} has no kernel for {', '.join(missing)}: a kernel that does "
+                                        f"not compile is left out when the library is built")
+            except Exception as exc:  # noqa: BLE001 - a library that cannot be asked serves nothing
+                _LOAD_ERRORS.append(f"{kernel_db}: cannot list its kernels ({_exception_text(exc)})")
+        _HC_FUSED_IL_MISSING = missing
+        return missing
+
+
 _MOE_GLUE_LOCK = threading.Lock()
 
 
@@ -661,6 +701,8 @@ def kernel_database_status() -> dict[str, object]:
     }
     if _MOE_GLUE_LOADED is not None:
         status["moe_glue_loaded"] = _MOE_GLUE_LOADED
+    if _HC_FUSED_IL_MISSING is not None:
+        status["hc_fused_il_missing"] = list(_HC_FUSED_IL_MISSING)
     return status
 
 

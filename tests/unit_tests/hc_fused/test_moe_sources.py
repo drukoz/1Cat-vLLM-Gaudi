@@ -98,7 +98,8 @@ def test_cmake_builds_every_kernel_optionally_and_without_a_memory_override():
     lines = (CSRC / "CMakeLists.txt").read_text().splitlines()
     code = "\n".join(line for line in lines if not line.lstrip().startswith("#"))
     assert not re.search(r"-+(vlm|slm|spill-vlm)\b", code)
-    assert code.count("-Wall -Werror -O2 -march=gaudi2") == 3  # the six kernels, the MoE probe, the MoE build
+    # the six kernels, the MoE probe and build, the interleaved kernels' probe and build
+    assert code.count("-Wall -Werror -O2 -march=gaudi2") == 5
     assert tuple(re.search(r"set\(MOE_GLUE_KERNELS(.*?)\)", code, re.S).group(1).split()) == MOE_KERNELS
     assert MOE_KERNELS == tuple(KERNEL_FILE[kind] for kind in KINDS)
     assert "option(HC_FUSED_MOE_GLUE " in code and "execute_process(" in code and "continue()" in code
@@ -130,6 +131,7 @@ def test_op_file_registers_each_schema_with_its_guid():
 
 def test_entry_points_serve_both_families():
     text = (CSRC / "host" / "entry_points.cpp").read_text()
-    assert "kHcFusedGuidCount + moe_glue::KernelCount()" in text
+    assert "const uint32_t moeCount = moe_glue::KernelCount();" in text
+    assert "kHcFusedGuidCount + moeCount + hc_fused::IlKernelCount()" in text
     assert text.count("moe_glue::FindKernel(") >= 4  # instantiate, shape inference (two names), data layouts
     assert "moe_glue::KernelForShapes(params)" in text

@@ -33,6 +33,7 @@ pytestmark = pytest.mark.skipif(bool(_MISSING), reason="Gaudi2 TPC simulator SDK
 GUID_HOST_SOURCE = sim_build.REPO_ROOT / "tests" / "standalone" / "gdn_core_decode" / "guid_list_host.cpp"
 HC_GUIDS = [hc_case.GUIDS[kind] for kind in hc_case.KINDS]
 MOE_GUIDS = [moe_case.GUIDS[kind] for kind in moe_case.KINDS]
+IL_GUIDS = list(sim_build.IL_GUIDS)  # the interleaved hyper-connection kernels, listed after the MoE glue GUIDs
 GLUE_NODE_NOT_FOUND = 1
 MEMORY_OVERRIDE = re.compile(r"-+(vlm|slm|spill-vlm)(=.*)?")
 
@@ -118,7 +119,7 @@ def _kernel_compiles(build_output: str) -> dict[str, list[str]]:
         words = line.split()
         if not words or Path(words[0]).name not in ("tpc-clang", "tpc-clang-wrapper"):
             continue
-        for kernel in sim_build.KERNELS + sim_build.MOE_KERNELS:
+        for kernel in sim_build.KERNELS + sim_build.MOE_KERNELS + sim_build.IL_KERNELS:
             if any(word.endswith(f"/kernels/{kernel}.c") for word in words):
                 compiles[kernel] = words[1:]
     return compiles
@@ -133,7 +134,7 @@ def guid_host(tmp_path_factory: pytest.TempPathFactory) -> Path:
 
 def _served(guid_host: Path, build_dir: Path) -> tuple[list[str], dict[str, int]]:
     """(the GUIDs the built library lists, GUID -> InstantiateTpcKernel return code with no tensors)."""
-    out = _run([guid_host, build_dir / sim_build.LIBRARY, *HC_GUIDS, *MOE_GUIDS]).stdout
+    out = _run([guid_host, build_dir / sim_build.LIBRARY, *HC_GUIDS, *MOE_GUIDS, *IL_GUIDS]).stdout
     guids = [line.split()[1] for line in out.splitlines() if line.startswith("guid ")]
     codes = {line.split()[1]: int(line.split()[2]) for line in out.splitlines() if line.startswith("instantiate ")}
     return guids, codes
@@ -150,7 +151,7 @@ def test_build_compiles_every_kernel_with_the_default_flags(default_build) -> No
     """No -vlm, -slm or -spill-vlm on any kernel of the library, and one flag list for all ten."""
     _, _, built = default_build
     compiles = _kernel_compiles(built)
-    assert sorted(compiles) == sorted(sim_build.KERNELS + sim_build.MOE_KERNELS), built[-3000:]
+    assert sorted(compiles) == sorted(sim_build.KERNELS + sim_build.MOE_KERNELS + sim_build.IL_KERNELS), built[-3000:]
     for kernel, arguments in compiles.items():
         assert not [a for a in arguments if MEMORY_OVERRIDE.fullmatch(a)], (kernel, arguments)
         flags = [a for a in arguments if not a.startswith("-I") and not a.endswith((".c", ".o")) and
@@ -162,7 +163,7 @@ def test_build_serves_the_ten_guids(default_build, guid_host: Path) -> None:
     build_dir, configure, _ = default_build
     assert "MoE glue kernels in the library: [" + ";".join(sim_build.MOE_KERNELS) + "]" in configure
     guids, codes = _served(guid_host, build_dir)
-    assert guids == HC_GUIDS + MOE_GUIDS
+    assert guids == HC_GUIDS + MOE_GUIDS + IL_GUIDS
     assert all(code != GLUE_NODE_NOT_FOUND for code in codes.values()), codes
 
 
@@ -189,7 +190,7 @@ def test_the_python_loader_reads_the_guid_list_of_the_real_library(default_build
     """
     _native, moe_glue = _package_module("_native"), _package_module("moe_glue")
     build_dir, _, _ = default_build
-    assert _native.kernel_library_guids(build_dir / sim_build.LIBRARY) == tuple(HC_GUIDS + MOE_GUIDS)
+    assert _native.kernel_library_guids(build_dir / sim_build.LIBRARY) == tuple(HC_GUIDS + MOE_GUIDS + IL_GUIDS)
     assert [moe_glue.GUIDS[name] for name in moe_glue.OP_NAMES] == MOE_GUIDS
     assert _native.MOE_GLUE_OPS == moe_glue.OP_NAMES
     broken = tmp_path / sim_build.LIBRARY
@@ -203,7 +204,7 @@ def test_the_python_loader_names_a_kernel_the_library_was_built_without(tmp_path
     build_dir = tmp_path / "build"
     _cmake_build(build_dir, "-DHC_FUSED_MOE_GLUE=OFF")
     served = _native.kernel_library_guids(build_dir / sim_build.LIBRARY)
-    assert served == tuple(HC_GUIDS)
+    assert served == tuple(HC_GUIDS + IL_GUIDS)
     assert [name for name in moe_glue.OP_NAMES if moe_glue.GUIDS[name] not in served] == list(moe_glue.OP_NAMES)
 
 
@@ -225,9 +226,9 @@ def test_a_moe_kernel_that_does_not_compile_costs_only_its_own_guid(tmp_path: Pa
     assert "vector local memory exceeded (test)" in warning
     kept = [kernel for kernel in sim_build.MOE_KERNELS if kernel != "moe_glue_route_gaudi2"]
     assert "MoE glue kernels in the library: [" + ";".join(kept) + "]" in configure
-    assert sorted(_kernel_compiles(built)) == sorted(sim_build.KERNELS + tuple(kept))
+    assert sorted(_kernel_compiles(built)) == sorted(sim_build.KERNELS + tuple(kept) + sim_build.IL_KERNELS)
     guids, codes = _served(guid_host, build_dir)
-    assert guids == HC_GUIDS + MOE_GUIDS[1:]
+    assert guids == HC_GUIDS + MOE_GUIDS[1:] + IL_GUIDS
     assert codes[moe_case.GUIDS["route"]] == GLUE_NODE_NOT_FOUND
     assert all(codes[guid] != GLUE_NODE_NOT_FOUND for guid in HC_GUIDS + MOE_GUIDS[1:]), codes
 
@@ -236,8 +237,37 @@ def test_the_switch_leaves_every_moe_kernel_out(tmp_path: Path, guid_host: Path)
     build_dir = tmp_path / "build"
     configure, built = _cmake_build(build_dir, "-DHC_FUSED_MOE_GLUE=OFF")
     assert "MoE glue kernels in the library: []" in configure
-    assert sorted(_kernel_compiles(built)) == sorted(sim_build.KERNELS)
+    assert sorted(_kernel_compiles(built)) == sorted(sim_build.KERNELS + sim_build.IL_KERNELS)
     guids, codes = _served(guid_host, build_dir)
-    assert guids == HC_GUIDS
+    assert guids == HC_GUIDS + IL_GUIDS
     assert all(codes[guid] == GLUE_NODE_NOT_FOUND for guid in MOE_GUIDS), codes
-    assert all(codes[guid] != GLUE_NODE_NOT_FOUND for guid in HC_GUIDS), codes
+    assert all(codes[guid] != GLUE_NODE_NOT_FOUND for guid in HC_GUIDS + IL_GUIDS), codes
+
+
+def test_the_interleaved_switch_and_a_failing_interleaved_kernel_cost_only_their_own_guids(tmp_path: Path,
+                                                                                         guid_host: Path) -> None:
+    """-DHC_FUSED_IL=OFF leaves both interleaved kernels out; an interleaved kernel that does not compile costs only
+    its own GUID (docs/design/flash-next/hc-kernels.md). The shipped kernels and the MoE glue kernels stay."""
+    configure, built = _cmake_build(tmp_path / "off", "-DHC_FUSED_IL=OFF")
+    assert "interleaved kernels in the library: []" in configure
+    assert sorted(_kernel_compiles(built)) == sorted(sim_build.KERNELS + sim_build.MOE_KERNELS)
+    guids, codes = _served(guid_host, tmp_path / "off")
+    assert guids == HC_GUIDS + MOE_GUIDS
+    assert all(codes[guid] == GLUE_NODE_NOT_FOUND for guid in IL_GUIDS), codes
+
+    import shutil
+    real = shutil.which("tpc-clang")
+    wrapper = tmp_path / "tpc-clang-wrapper"
+    wrapper.write_text("#!/bin/sh\n"
+                       'case "$*" in *hc_fused_gate_mix_il_gaudi2.c*) echo "hc_fused_gate_mix_il_gaudi2.c:1:1: error: '
+                       'too many vector spills (test)" >&2; exit 1;; esac\n'
+                       f'exec "{real}" "$@"\n')
+    wrapper.chmod(wrapper.stat().st_mode | stat.S_IXUSR)
+    configure, built = _cmake_build(tmp_path / "one", f"-DTPC_COMPILER={wrapper}")
+    warning = " ".join(configure.split())
+    assert "hc_fused_gate_mix_il_gaudi2.c does not compile with the default TPC flags" in warning
+    assert "interleaved kernels in the library: [hc_fused_combine_norm_il_gaudi2]" in configure
+    guids, codes = _served(guid_host, tmp_path / "one")
+    assert guids == HC_GUIDS + MOE_GUIDS + IL_GUIDS[1:]
+    assert codes[IL_GUIDS[0]] == GLUE_NODE_NOT_FOUND
+    assert all(codes[guid] != GLUE_NODE_NOT_FOUND for guid in HC_GUIDS + MOE_GUIDS + IL_GUIDS[1:]), codes
