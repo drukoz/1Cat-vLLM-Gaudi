@@ -10,7 +10,7 @@ repository is under `/Volumes/Storage/Claude/gaudi-work/reports/spec-lookup/` (`
 
 ## Handoff (if this agent stops)
 
-State at **2026-11-21 01:10 UTC** (fourth agent, Opus 5.5). Branch head: the commit that holds this text, pushed.
+State at **2026-11-21 01:15 UTC** (fourth agent, Opus 5.5). Branch head: the commit that holds this text, pushed.
 It contains the program head `5c1e8219` (PR #15 kernel-fixes, merged as `f4dad13a`), mtp-card-ready through
 `f1aa2292` and every commit of this track. **The node was extended (BRIEF 00:50 UTC): it ends about 00:00 UTC on
 2026-11-22**; everything on it is lost then. Merges are allowed again (one gate at a time).
@@ -72,7 +72,11 @@ entry). Run `bin/gate <worktree> --tools` when the merge is due (step 2 below); 
    sampler tests, `reports/spec-lookup/logs/m10_sampled_on_tp8_build.log`) and fails on this branch alone like
    mtp-card-ready's own sampled test did before their `0d1be6fc` (`logs/m9_test_lookup_engine_sampled.log`): it
    needs that commit, which comes with their pull request.
-3. **Rows at 32 streams** (section 7): an n-gram step is as wide as its longest draft, an empty draft is the
+3. **Card check of `VLLM_HPU_FLASH_NEXT_NGRAM_PLAIN_STEPS=1`** (`be141e1a`, default 0, CPU-proven: a step in which
+   no request drafts runs as a plain decode step instead of a 2-row placeholder verification; at one stream on
+   TP4 the placeholder row cost about 8 ms, 00133). It is not in the TP8 build `e85a3292`; the next n-gram job
+   should carry it (merge `be141e1a` into a new job build) with a `prose:1` and a `mix:32` round, where it acts.
+4. **Rows at 32 streams** (section 7): an n-gram step is as wide as its longest draft, an empty draft is the
    2-row placeholder, so 32 streams carry `32 (1 + k)` rows as soon as one stream drafts. Two code steps would
    fix the economics of a mixed load: per-request (ragged) verification rows (rows `sum(1 + d_i)`, not
    `32 (1 + max d_i)`), and no placeholder row for a request without a draft. Both need the runner's decode
@@ -82,7 +86,7 @@ entry). Run `bin/gate <worktree> --tools` when the merge is due (step 2 below); 
    uses the warmed `batch x (1 + k)` buckets instead of compiling the narrower widths on first use (section 2);
    it costs `k - 1` padding rows per request on steps whose longest draft is short (no effect at 32 editing
    streams, which run at full width anyway).
-4. Depth beyond 5 with the fused verification op needs a 9-node lattice (`GDN_CORE_VERIFY_MAX_NODES = 6`);
+5. Depth beyond 5 with the fused verification op needs a 9-node lattice (`GDN_CORE_VERIFY_MAX_NODES = 6`);
    k = 8 runs the torch recurrence today (rehearsed on the tiny model, 00087).
 
 **Done and verified on CPU** (earlier agents; tests on the tree of each named commit)
@@ -119,6 +123,11 @@ Not yet rerun on the merged head: the CPU engine tests (`test_lookup_engine.py` 
 | `e121d61b` | merge of mtp-card-ready `f1aa2292` |
 | `aa51e8b9`, `f0e2b5dd`, `074fb2b6` | the hybrid's counters through the `vllm` logger; `lookup_tiny.py` with the fused GDN verification op; the rehearsal oracle through the engine on CPU |
 | `49eb18cb` | merge of the program head `938dada4` (PR #14 collectives) |
+| `32f54e44`, `ab513444` | `lookup_probe.py` round kinds `mix` and the first prompt per round (no prompt twice), `lookup_arms.sh` |
+| `f4dad13a` | merge of the program head `5c1e8219` (PR #15 kernel-fixes) |
+| `2dd6bc75` | sampled verification: a lookup padding draft (-1) is never accepted (mtp-card-ready's function) |
+| `e6d8b4d6` | the sampled-request engine test of both lookup paths (needs mtp-card-ready's `0d1be6fc`) |
+| `be141e1a` | `VLLM_HPU_FLASH_NEXT_NGRAM_PLAIN_STEPS`: plain decode steps when no request drafts |
 
 ## 2. n-gram lookup with prefix caching
 
