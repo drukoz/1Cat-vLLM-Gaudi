@@ -159,9 +159,16 @@ What it saves (INFERRED from 00128's MTP timer, TP8): `final_wait` (about 6 ms a
 (about 2 ms) per step, and the next step's input preparation overlaps the draft passes on the device: about 8 ms of
 a 106 ms MTP step at 32 streams (8 %), 5 to 6 ms of 66 ms at 1 stream. What stays: the host read of the
 verification result inside the step and the drafter's host work after it (the device idles for the parse, the
-books and the first draft pass's issue, about 4 to 5 ms). Stage 2 would move the accepted counts to the device
-(lattice offsets, positions, slot mapping of the next verification, align commits): 2 to 4 days, only if stage 1's
-card number shows the remaining in-step gap is worth it.
+books and the first draft pass's issue, about 2 to 4 ms). Stage 2 would move the accepted counts to the device
+(lattice offsets, positions, slot mapping of the next verification, align commits, the drafter's inputs): 2 to 4
+days. Assessment (INFERRED): at 32 streams an MTP step is device-bound (verification about 85 ms of device work on
+TP8 against about 55 ms of host work), so once stage 1 lets the host run ahead, stage 2 can only remove the
+in-step gap at the verification-to-draft boundary, 2 to 4 ms of about 100 ms; at 1 stream the step is host-bound
+and stage 2 changes nothing the host must do. Not recommended unless 00176 shows a larger gap.
+
+For the integration build (02:45 UTC): take commit `fb5cefca` (merges cleanly into integration `8df22e1e`), not the
+branch head (which merges the program head with PR 16, carried there as qsa-fused). Flags `=1` / `=2`; with `=2`
+also `VLLM_HPU_MTP_TIMING=0`; engine-step's `01d66e31` keeps candidate sampling under async scheduling.
 
 CPU evidence (engine-step's harness on this branch; n-gram as the vehicle because the harness loads no drafter
 model, with oracle drafts returned as a tensor the way the MTP drafter returns them, one wrong draft every few
