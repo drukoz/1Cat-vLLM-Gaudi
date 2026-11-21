@@ -14,6 +14,8 @@
 #           --no-sampled-check (sampled verification is off in this build: a sampled request gets HTTP 400);
 #           acceptance per draft position per level from /metrics (SPEC lines).
 #   mtp3-32 server 2 with the 32-stream level only (a short hold).
+#   nospec-pin  the no-speculation server with VLLM_HPU_WORKER_CPU_PIN=1 (HEADLINE_PIN_MODE) and
+#           PT_HPU_DISABLE_HPUGRAPH_REPLAY_HASHCHECK=1 (native-replay's host levers): greedy 1 and 32 streams.
 #   tiny    the tiny model at TP8 with the job's flags (farm_tiny.py --gdn hc; --spec K with HEADLINE_TINY_SPEC=K):
 #           tokens against the CPU reference. A failure ends the job (exit 7) unless HEADLINE_TINY_ABORT=0.
 #   mtp3-noshard  server 2 with VLLM_HPU_QSA_INDEXER_SHARD=0 (isolates the request-sharded indexer, never run in a
@@ -171,6 +173,14 @@ while [ "$i_arm" -lt "${#ARMS[@]}" ]; do
             bash "$HERE/serve_probe.sh" --out "$OUT/nospec" --levels "$LEVELS" --tokens "$TOKENS" \
                 --warm-tokens "$WARM" --repeat-top 2 --no-mintok-check --probe-arg "--sampled-levels=$LEVELS" \
                 --probe-arg --interleave-sampled --probe-arg "--rounds=$ROUNDS"
+            ;;
+        nospec-pin)
+            # B: native-replay's two host levers on A's env (never run at TP8 before): greedy 1 and 32 streams only;
+            # its 1-stream text is compared with A's.
+            VLLM_HPU_WORKER_CPU_PIN="${HEADLINE_PIN_MODE:-1}" PT_HPU_DISABLE_HPUGRAPH_REPLAY_HASHCHECK=1 \
+                bash "$HERE/serve_probe.sh" --out "$OUT/$arm" --levels "${HEADLINE_PIN_LEVELS:-1,32}" --tokens "$TOKENS" \
+                --warm-tokens "$WARM" --repeat-top 2 --no-mintok-check --probe-arg --no-sampled-check \
+                --probe-arg "--rounds=$ROUNDS"
             ;;
         mtp[1-9] | mtp[1-9]-32 | mtp[1-9]-noshard)
             k="${arm:3:1}"
