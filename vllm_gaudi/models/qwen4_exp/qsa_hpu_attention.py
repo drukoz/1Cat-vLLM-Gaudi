@@ -95,9 +95,46 @@ def decode_selected_slots(selected: torch.Tensor, block_table: torch.Tensor, blo
     return block_id * block_size + (pos % block_size)
 
 
+def _gather(cache: torch.Tensor, flat: torch.Tensor, dequant=None) -> torch.Tensor:
+    """The cache rows at ``flat`` (one ``index_select``), dequantized when the cache holds FP8 values."""
+    rows = cache.index_select(0, flat)
+    return rows if dequant is None else dequant(rows)
+
+
+def bf16_attention_math(impl, modules=None) -> bool:
+    """Put the backend's attention math of one layer back to bf16 when ``fp8_inc`` switched it to FP8.
+
+    With ``--kv-cache-dtype fp8_inc`` the fork's ``HPUAttentionImpl`` stores K/V as E4M3 (``VLLMFP8KVCache``:
+    quantize on write, dequantize on fetch) and also computes its attention with FP8 matmuls and an FP8 fused
+    SDPA. A QSA layer under ``VLLM_HPU_QSA_KV_FP8`` keeps the storage and gets the bf16 math back, so only the
+    K/V values are rounded. ``modules`` provides ``Matmul``, ``B2BMatmul``, ``ModuleFusedSDPA`` and ``fsdpa``
+    (default: ``vllm_gaudi.extension``; the CPU tests pass stand-ins). Returns whether anything was replaced.
+    """
+    if not getattr(impl, "enable_fp8_attn", False):
+        return False
+    if modules is None:
+        import vllm_gaudi.extension.kernels as kernels
+        from vllm_gaudi.extension import utils as ext_utils
+
+        class modules:  # noqa: N801  (a namespace)
+            Matmul = ext_utils.Matmul
+            B2BMatmul = ext_utils.B2BMatmul
+            ModuleFusedSDPA = ext_utils.ModuleFusedSDPA
+            fsdpa = staticmethod(kernels.fsdpa)
+
+    impl.matmul_qk = modules.Matmul()
+    impl.matmul_av = modules.Matmul()
+    impl.batch2block_matmul = modules.B2BMatmul()
+    impl.block2batch_matmul = modules.B2BMatmul()
+    fused = modules.fsdpa()
+    impl.fused_scaled_dot_product_attention = None if fused is None else modules.ModuleFusedSDPA(fused)
+    impl.enable_fp8_attn = False
+    return True
+
+
 def sparse_decode_attention(query: torch.Tensor, key_cache: torch.Tensor, value_cache: torch.Tensor,
                             slots: torch.Tensor, valid: torch.Tensor, num_heads: int, num_kv_heads: int,
-                            head_dim: int, scale: float) -> torch.Tensor:
+                            head_dim: int, scale: float, k_dequant=None, v_dequant=None) -> torch.Tensor:
     """Gathered-K/V masked SDPA over the selected decode positions.
 
     ``query`` is ``[bs, H * D]``, ``key_cache`` / ``value_cache`` are
@@ -106,12 +143,13 @@ def sparse_decode_attention(query: torch.Tensor, key_cache: torch.Tensor, value_
     ``index_select`` (the HPU-compilable form), broadcast KV heads to query
     heads for GQA, score ``q @ k^T * scale`` with ``-inf`` on invalid columns,
     softmax in fp32 cast back to the query dtype, and take the weighted sum of
-    the gathered values.
+    the gathered values. ``k_dequant`` / ``v_dequant`` (``VLLM_HPU_QSA_KV_FP8``) turn the gathered rows of an
+    FP8 cache into the query's dtype right after the gather.
     """
     bs, width = slots.shape
     flat = slots.reshape(-1)
-    k = key_cache.index_select(0, flat).view(bs, width, num_kv_heads, head_dim)
-    v = value_cache.index_select(0, flat).view(bs, width, num_kv_heads, head_dim)
+    k = _gather(key_cache, flat, k_dequant).view(bs, width, num_kv_heads, head_dim)
+    v = _gather(value_cache, flat, v_dequant).view(bs, width, num_kv_heads, head_dim)
     repeat = num_heads // num_kv_heads
     if repeat > 1:
         k = k.repeat_interleave(repeat, dim=2)
@@ -134,7 +172,7 @@ GROUPED_MIN_ROWS = 8
 
 def sparse_decode_attention_grouped(query: torch.Tensor, key_cache: torch.Tensor, value_cache: torch.Tensor,
                                     slots: torch.Tensor, valid: torch.Tensor, num_heads: int, num_kv_heads: int,
-                                    head_dim: int, scale: float) -> torch.Tensor:
+                                    head_dim: int, scale: float, k_dequant=None, v_dequant=None) -> torch.Tensor:
     """``sparse_decode_attention`` with the query heads of each KV head in the GEMM's ``M`` dimension.
 
     Same inputs and result. The gathered ``[bs, W, KV, D]`` rows are not repeated for the
@@ -147,8 +185,8 @@ def sparse_decode_attention_grouped(query: torch.Tensor, key_cache: torch.Tensor
     bs, width = slots.shape
     groups = num_heads // num_kv_heads
     flat = slots.reshape(-1)
-    k = key_cache.index_select(0, flat).view(bs, width, num_kv_heads, head_dim)
-    v = value_cache.index_select(0, flat).view(bs, width, num_kv_heads, head_dim)
+    k = _gather(key_cache, flat, k_dequant).view(bs, width, num_kv_heads, head_dim)
+    v = _gather(value_cache, flat, v_dequant).view(bs, width, num_kv_heads, head_dim)
     if num_kv_heads == 1:
         k, v = k.view(bs, 1, width, head_dim), v.view(bs, 1, width, head_dim)
     else:
@@ -185,6 +223,14 @@ class HpuQsaSparseAttention(torch.nn.Module):
         # VLLM_HPU_QSA_FUSED >= 1: the grouped decode attention (no K/V repeat); read once.
         from vllm_gaudi.models.qwen4_exp.qsa_fused_path import QsaFusedMode, qsa_fused_mode
         self.grouped_decode = qsa_fused_mode() is not QsaFusedMode.OFF
+        # VLLM_HPU_QSA_KV_FP8 with --kv-cache-dtype fp8_inc (the layer refuses fp8_inc without the flag): E4M3
+        # K/V storage through the backend's caches, bf16 attention math, the decode gather dequantized.
+        self.kv_fp8 = getattr(impl, "kv_cache_dtype", None) == "fp8_inc"
+        self.k_dequant = self.v_dequant = None
+        if self.kv_fp8:
+            bf16_attention_math(impl)
+            self.k_dequant = getattr(impl.k_cache, "dequant_output", None) or (lambda t: t.to(torch.bfloat16))
+            self.v_dequant = getattr(impl.v_cache, "dequant_output", None) or (lambda t: t.to(torch.bfloat16))
 
     def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, selected: torch.Tensor,
                 positions: torch.Tensor, md) -> torch.Tensor:
@@ -256,7 +302,7 @@ class HpuQsaSparseAttention(torch.nn.Module):
             attend = (sparse_decode_attention_grouped if int(q.shape[0]) >= GROUPED_MIN_ROWS else
                       sparse_decode_attention)
             out = attend(q, key_cache, value_cache, selected.slots, selected.valid != 0, num_heads, num_kv_heads,
-                         head_dim, impl.scale)
+                         head_dim, impl.scale, k_dequant=self.k_dequant, v_dequant=self.v_dequant)
             return out.reshape(q.shape[0], num_heads * head_dim)
         slots = decode_selected_slots(selected, md.block_table, int(md.block_size))
         # A row with no selected position (a padding row of the batch under M-RoPE: position -1)
@@ -265,12 +311,14 @@ class HpuQsaSparseAttention(torch.nn.Module):
         valid = (selected >= 0) | rows_without_selection(selected)
         attend = (sparse_decode_attention_grouped if self.grouped_decode and int(q.shape[0]) >= GROUPED_MIN_ROWS else
                   sparse_decode_attention)
-        out = attend(q, key_cache, value_cache, slots, valid, num_heads, num_kv_heads, head_dim, impl.scale)
+        out = attend(q, key_cache, value_cache, slots, valid, num_heads, num_kv_heads, head_dim, impl.scale,
+                     k_dequant=self.k_dequant, v_dequant=self.v_dequant)
         return out.reshape(q.shape[0], num_heads * head_dim)
 
 
 __all__ = [
     "HpuQsaSparseAttention",
+    "bf16_attention_math",
     "decode_selected_slots",
     "prefill_selection_bias",
     "rows_without_selection",
