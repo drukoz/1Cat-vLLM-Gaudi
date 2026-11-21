@@ -10,7 +10,7 @@ repository is under `/Volumes/Storage/Claude/gaudi-work/reports/spec-lookup/` (`
 
 ## Handoff (if this agent stops)
 
-State at **2026-11-21 01:05 UTC** (fourth agent, Opus 5.5). Branch head: the commit that holds this text, pushed.
+State at **2026-11-21 01:10 UTC** (fourth agent, Opus 5.5). Branch head: the commit that holds this text, pushed.
 It contains the program head `5c1e8219` (PR #15 kernel-fixes, merged as `f4dad13a`), mtp-card-ready through
 `f1aa2292` and every commit of this track. **The node was extended (BRIEF 00:50 UTC): it ends about 00:00 UTC on
 2026-11-22**; everything on it is lost then. Merges are allowed again (one gate at a time).
@@ -66,8 +66,12 @@ entry). Run `bin/gate <worktree> --tools` when the merge is due (step 2 below); 
    00133 at 1 stream until the conv-commit crash, which `5c770d96` fixes), the hybrid (tiny 00107 torch and 00114
    fused verification). All flags of this track default off (`VLLM_HPU_FLASH_NEXT_SPEC_LOOKUP`,
    `..._LOOKUP_MIN_NGRAM`, `..._LOOKUP_MAX_NGRAM`, `..._LOOKUP_ORACLE`); n-gram itself is chosen by
-   `--speculative-config`. A sampled-request engine test of both lookup paths (`test_lookup_engine.py -k sampled`)
-   was running at 01:05 UTC (`reports/spec-lookup/logs/m9_test_lookup_engine_sampled.log`).
+   `--speculative-config`. **Sampled requests with lookup drafts** (agents sample): `test_lookup_engine.py -k sampled`
+   (the n-gram server and the hybrid, temperature 0.7, `VLLM_HPU_SPEC_SAMPLED_VERIFY=1`: every stream to its
+   length, no -1 token, ragged widths) passes on the TP8 build tree (`e85a3292` + this branch: 15 passed with the
+   sampler tests, `reports/spec-lookup/logs/m10_sampled_on_tp8_build.log`) and fails on this branch alone like
+   mtp-card-ready's own sampled test did before their `0d1be6fc` (`logs/m9_test_lookup_engine_sampled.log`): it
+   needs that commit, which comes with their pull request.
 3. **Rows at 32 streams** (section 7): an n-gram step is as wide as its longest draft, an empty draft is the
    2-row placeholder, so 32 streams carry `32 (1 + k)` rows as soon as one stream drafts. Two code steps would
    fix the economics of a mixed load: per-request (ragged) verification rows (rows `sum(1 + d_i)`, not
