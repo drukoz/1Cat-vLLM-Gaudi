@@ -537,6 +537,7 @@ while [ "$i_arm" -lt "${#ARMS[@]}" ]; do
             irlog=0
             bad_word=""
             needs_m3=0
+            needs_async3=0
             words="${arm:4}"
             words="${words#-}"
             arm_words=()
@@ -546,7 +547,8 @@ while [ "$i_arm" -lt "${#ARMS[@]}" ]; do
                     async) async_env=(VLLM_HPU_FLASH_NEXT_ASYNC_SCHED=2); timing="${HEADLINE_ASYNC_MTP_TIMING:-2}" ;;
                     # async-sched job branch: async3 = stage 2's mode 3 (a chained step issued before the previous
                     # one's tokens reach the host; needs the chain, SPEC_DEVICE_INPUTS=2, I01 and nopc)
-                    async3) async_env=(VLLM_HPU_FLASH_NEXT_ASYNC_SCHED=3); timing="${HEADLINE_ASYNC_MTP_TIMING:-2}" ;;
+                    async3) async_env=(VLLM_HPU_FLASH_NEXT_ASYNC_SCHED=3); timing="${HEADLINE_ASYNC_MTP_TIMING:-2}"
+                        needs_async3=1 ;;
                     # async-sched job branch: nopc = prefix caching off (after serve_probe.sh's --enable-prefix-caching)
                     nopc) serve_extra+=(--no-enable-prefix-caching) ;;
                     # async-sched job branch: m3a = stage 2's M3 in use (VLLM_HPU_FLASH_NEXT_SPEC_DEVICE_ALIGN=2; the
@@ -584,6 +586,10 @@ while [ "$i_arm" -lt "${#ARMS[@]}" ]; do
             fi
             if [ "$needs_m3" = 1 ] && [ "${m3_align_ok:-1}" != 1 ]; then
                 echo "headline_job: arm $arm left out: a tiny-m3pc gate failed (async-sched's M3)"
+                continue
+            fi
+            if [ "$needs_async3" = 1 ] && [ "${m3_ok:-1}" != 1 ]; then
+                echo "headline_job: arm $arm left out: the tiny-m3 gate failed (async-sched's M2, mode 3)"
                 continue
             fi
             ARM_DIR="${OUT:?}/${arm:?}"
