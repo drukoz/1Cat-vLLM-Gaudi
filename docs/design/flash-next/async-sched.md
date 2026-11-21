@@ -6,7 +6,7 @@ results are under `/Volumes/Storage/Claude/gaudi-work/reports/async-sched/card/`
 
 ## Handoff (if this agent stops)
 
-Updated 2026-11-21 06:30 UTC.
+Updated 2026-11-21 06:50 UTC.
 
 - **On the branch** (pushed): `8f4816f8` engine-step's `engine_harness.py`, unchanged; `7a818007` mode 1 of
   `VLLM_HPU_FLASH_NEXT_ASYNC_SCHED` (no speculation: the PLE context carry, the output-token ledger, the async
@@ -28,28 +28,36 @@ Updated 2026-11-21 06:30 UTC.
 - **Card 00186** (the coordinator's integration build 4, `reports/integration/card/00186-real8-build4/`): mode 2
   greedy is the best MTP server (33.7 ms/token at 32 streams); at 1 and 8 streams mode 1 (greedy and sampled) and
   mode 2 sampled are 15 to 21 ms per step slower than synchronous (section 2.5).
-- **Card jobs 00196 and 00197** (all, 40 min each), job branch `feat/flash-next-gaudi-async-sched-int3` at
-  `5ccf0604` (integration `8cdc5999` + `d3fb1b11` as `aeff141f` + job arms; never merge it), build 4's env
+- **Card jobs 00202 and 00203** (all, 40 min each, right after collectives' 00189; they replaced 00196 and 00197
+  in their places), job branch `feat/flash-next-gaudi-async-sched-int3` at `f2a5ff0b` (integration `8cdc5999` +
+  `d3fb1b11` as `aeff141f` + job arms + the placement switch; never merge it), build 4's env
   (`VLLM_HPU_PREFIX_ALIGN_SPLIT=1 VLLM_HPU_PREFIX_KEEP_PROMPT_END=1 VLLM_MOE_CHUNK=64,8192
   VLLM_MOE_TOKEN_BOUNDARY=512,1000000 PT_HPU_SYNCHRONOUS_ACC_QUEUE_FLUSHING=1`), `HEADLINE_LEVELS=8,1`, the step
   timer `VLLM_HPU_STEP_TIMING=1` (`VLLM_HPU_STEP_TIMING_EVERY=50`, records in `<arm>/timing/`):
-  - 00196 `real8-async-m1b` (took 00195's place): `tiny-async nospec-async nospec nospec-async-census` (`-census`:
-    the step timer in mode 2, host synchronisation points with their source lines). Waiter log
-    `reports/async-sched/logs/farm_real8_async_m1b.out`.
-  - 00197 `real8-async-m2s`: `mtp2-async mtp2 mtp2-async-census`, MTP k = 2, `HEADLINE_MTP_SAMPLED=1
+  - 00202 `real8-async-m1c`: `tiny-async nospec-async nospec nospec-async-census` (`-census`: the step timer in
+    mode 2, host synchronisation points with their source lines). Waiter log
+    `reports/async-sched/logs/farm_real8_async_m1c.out`.
+  - 00203 `real8-async-m2t`: `mtp2-async mtp2 mtp2-async-census`, MTP k = 2, `HEADLINE_MTP_SAMPLED=1
     HEADLINE_MTP_SAMPLED_LEVELS=8,1 VLLM_HPU_SPEC_SAMPLED_VERIFY=2 VLLM_HPU_MTP_TIMING=0 HEADLINE_ASYNC_MTP_TIMING=0
-    HEADLINE_MTP_FALLBACK=0`. Waiter log `reports/async-sched/logs/farm_real8_async_m2s.out`.
-  - If the session is gone: `bin/farm fetch async-sched 00196 00196-real8-async-m1b` (same for 00197). Read
-    `python3 -I reports/async-sched/tools/ab_table.py <dir> --pairs nospec-async:nospec` (00196) and
-    `--pairs mtp2-async:mtp2` (00197); `tiny-async/summary.json` (both modes must pass); the timer records of each
+    HEADLINE_MTP_FALLBACK=0`. Waiter log `reports/async-sched/logs/farm_real8_async_m2t.out`.
+  - Placement switch (the coordinator's request, 06:40 UTC): `~/farm/async-sched/results/switches/place` on the node
+    (`/results/switches/place` in the job), read once at each job's start, now `off`. `on` runs every server arm
+    with `VLLM_HPU_WORKER_CPU_PIN=1` under collectives' `place_wrap.sh` with native-replay's `place.sh` (rule a^1;
+    copies in `~/farm/async-sched/results/bench`, md5 5f7ca629 and 7e54f2de; local copy of `place.sh` in
+    `reports/async-sched/bench/`), the placement's output in each arm's `placement.log`; the job log says
+    `placement ON` or `placement off`. Turn it on only on the coordinator's word after 00189's verdict:
+    `bin/node-ssh 'echo on > ~/farm/async-sched/results/switches/place'` (before 00202 starts).
+  - If the session is gone: `bin/farm fetch async-sched 00202 00202-real8-async-m1c` (same for 00203). Read
+    `python3 -I reports/async-sched/tools/ab_table.py <dir> --pairs nospec-async:nospec` (00202) and
+    `--pairs mtp2-async:mtp2` (00203); `tiny-async/summary.json` (both modes must pass); the timer records of each
     arm with `python3 -I reports/async-sched/tools/timer_spans.py <dir> [--sites]` (spans `wait`, `async_wait`,
     `gap`, `rpc_gap`, the engine's `update_from_output`; `--sites`: the census with source lines; `t` is epoch
     seconds and `raw` in each record has every step, so greedy and sampled rounds can be told apart by time).
-  - 00179 cancelled (00186 answered it); 00195 replaced by 00196.
+  - 00179 cancelled (00186 answered it); 00195 replaced by 00196, 00196 by 00202, 00197 by 00203.
 - The 1-token prompt left out of `test_engine_async_spec.py`'s staggered schedule: a defect of the speculative
   prompt path, fixed by spec-lookup in `005e1ff9` (its own pull request, not on the program branch at `2e9f9196`).
   When it is there: merge it here and put prompt 0 back into `_serve_staggered` (3, 1, 2, 0).
-- **Next**: the pull request on a green gate. 00196 and 00197 to the coordinator and the integration track: does
+- **Next**: the pull request on a green gate. 00202 and 00203 to the coordinator and the integration track: does
   mode 1 with `d3fb1b11` close the 1- and 8-stream gap, and where does mode 2 lose time on sampled requests.
   Integration build 5 should take `d3fb1b11` (the flag's env-table place: after `VLLM_HPU_MOE_GLUE_MERGE_GATE_UP`
   here, before `VLLM_HPU_HC_FUSED` in their `bcaa3ed6`; both pass the order tests).
@@ -265,5 +273,7 @@ after `_with_host_ngram_ids`; after `AsyncHPUModelRunnerOutput(...)`; the top of
 | 00179 `real8-async-mtp2b` | TP8, integration `d00c0a9a` + modes 1 and 2: tiny gate (no speculation and MTP k = 2), mtp2-async, mtp2, async, nospec at 32 and 1 streams, greedy and sampled | cancelled (05:45 UTC): 00186 answered it |
 | 00186 `real8-build4` (integration) | the coordinator's build 4 with modes 1 and 2: mtp2-async, nospec-async, mtp2, nospec at 32, 8 and 1 streams, greedy and sampled | done; section 2.5 |
 | 00195 `real8-async-m1` | mode 1 with `d3fb1b11`: nospec-async, nospec, nospec-devids, nospec-async-spin at 8 and 1 streams, step timer | replaced by 00196 (06:21 UTC) |
-| 00196 `real8-async-m1b` | TP8, int3 `5ccf0604`: tiny-async, nospec-async, nospec, nospec-async-census at 8 and 1 streams, greedy and sampled, step timer | queued |
-| 00197 `real8-async-m2s` | TP8, int3 `5ccf0604`: mtp2-async, mtp2, mtp2-async-census (MTP k = 2, sampled verification 2, MTP timers 0) at 8 and 1 streams, greedy and sampled, step timer | queued |
+| 00196 `real8-async-m1b` | TP8, int3 `5ccf0604`: tiny-async, nospec-async, nospec, nospec-async-census at 8 and 1 streams, greedy and sampled, step timer | replaced by 00202 (06:44 UTC) |
+| 00197 `real8-async-m2s` | TP8, int3 `5ccf0604`: mtp2-async, mtp2, mtp2-async-census (MTP k = 2, sampled verification 2, MTP timers 0) at 8 and 1 streams, greedy and sampled, step timer | replaced by 00203 (06:47 UTC) |
+| 00202 `real8-async-m1c` | as 00196 from int3 `f2a5ff0b` (the placement switch, read at the start) | queued after 00189 |
+| 00203 `real8-async-m2t` | as 00197 from int3 `f2a5ff0b` | queued after 00202 |
