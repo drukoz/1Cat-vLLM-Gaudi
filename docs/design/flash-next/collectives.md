@@ -426,10 +426,15 @@ Next, in order (section 7's table):
    `sudo -n docker rmi farm-collectives-int:d00c0a9a3e18` on the node when done), the headline's no-speculation
    env (headline_job.sh's build flags + 00178's prefix flags) + `PT_HPU_SYNCHRONOUS_ACC_QUEUE_FLUSHING=1`, build 3's
    own probe pair staged at `~/farm/collectives/results/bench/intprobe/` (levels 32, 8, 1; 128 tokens; two rounds
-   per level; greedy and sampled interleaved). Arms tiny-stock, tiny-lean, then real-stock and real-lean. Submit
-   when native-replay names the fixed build:
-   `printf 'exec bash ~/farm/collectives/bridge/bridge_headline_job.sh <lean id> farm-collectives-int:d00c0a9a3e18 0a66722b7a55\n' | bin/farm submit collectives real8-bridge-headline all 45m`,
-   then send the id to the coordinator and native-replay.
+   per level; greedy and sampled interleaved). Arms tiny-stock, tiny-lean, then real-stock and real-lean.
+   **Submitted as job 00180 `real8-bridge-headline` at 03:25 UTC** with native-replay's `lean2-81b9b47e3599` (the
+   `run_prep` fix: the kept launcher's tensors are released right after each prepared launch); id sent to the
+   coordinator and native-replay. This agent's waiter fetches `00180-real8-bridge-headline-{tiny-stock,tiny-lean,
+   real-stock,real-lean}/` and the verdicts. To read: the steady ms per step at 32, 8, 1 (greedy and sampled) of
+   both real arms from their `scaling.json` (or the `MEAS`/`SAMPLED` lines of `arm.log`), and
+   `python3 -I reports/collectives/probes/replay_timing_table.py <real-lean folder>`: `run_prep` should be back
+   near 2 us; if `unattributed` (total minus the phase sum; 4.3 us for lean in 00174) rises by about 12 us instead,
+   the frees only moved (native-replay).
 2. Pull request: the gate runs on the snapshot worktree `reports/collectives/gate-snap-04f690be` (program head
    merged at 90fdeec3; log `reports/collectives/logs/gate_04f690be.log`; my tool tests 10 pass on it). When green:
    push the snapshot commit to its own branch, open the pull request from it, merge (owner's rule 03:07 UTC).
