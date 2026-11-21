@@ -82,6 +82,17 @@ def test_moe_layers_probe_runs_every_arm(tmp_path, timing):
     assert len(result["verdicts"]) == 4 and len([k for k in result if k.startswith("local")]) == 9
 
 
+def test_moe_dense_probe_matches_the_vendor_stand_in_and_times_every_form(tmp_path):
+    proc, out = _run([PROBES / "probe_moe_dense.py", "--out", tmp_path / "md", "--layers", "1", "--iters", "1",
+                      "--rows", "32", "--locals", "8"], tmp_path)
+    assert proc.returncode == 0, out[-3000:]
+    forms = [line for line in out.splitlines() if line.startswith("PROBE moe-dense local") and " form " in line]
+    assert len(forms) == 3 and not any("ERROR" in line for line in forms), forms
+    parity = [line for line in out.splitlines() if " parity dense vs vendor: " in line]
+    assert len(parity) == 1 and float(parity[0].split("relative ")[1].split()[0]) < 0.05, parity
+    assert "VERDICT moe-dense: local8_rows32:" in out
+
+
 def test_view_probe_selftest(tmp_path):
     proc, out = _run([PROBES / "probe_view_inputs.py", "--selftest"], tmp_path)
     assert proc.returncode == 0, out[-3000:]
