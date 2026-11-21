@@ -44,6 +44,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 MAX_DENSE = 512
 DROP_LINE = "captured HPU graphs dropped: model"
 STACKED_LINE = "keep their stacked experts"
+USED_LINE = "runs the dense MoE form"
 ACC_MODULES = ("argparse", "textwrap", "difflib", "heapq", "fractions", "statistics", "string", "bisect", "functools",
                "calendar", "shlex", "json.decoder", "csv", "fnmatch")
 
@@ -409,6 +410,12 @@ def main() -> int:
             warm = run_round(args, n, args.warm_tokens, args.prompt_sets[0])
             print("warm  %-4s N=%-3d ok=%d err=%d wall=%.1fs" % (setting, n, warm["ok"], warm["errors"], warm["wall_s"]),
                   flush=True)
+            if setting != "off" and n == args.levels[0] and count_lines(log_path, USED_LINE) < 1:
+                # The weights can be kept at load and still be lost later (jobs 00177 and 00190): no verdict then.
+                print("moe_rt: FAIL: setting %s: no %r line in %s after a warm round" % (setting, USED_LINE, log_path),
+                      flush=True)
+                save()
+                return 9
             for rep in range(args.rounds):
                 for prompt_set in args.prompt_sets:
                     m = run_round(args, n, args.tokens, prompt_set)

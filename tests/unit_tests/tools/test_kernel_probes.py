@@ -27,6 +27,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 ROOT = Path(__file__).resolve().parents[3]
 PROBES = ROOT / "tools" / "flash_next" / "kernel_probes"
 
@@ -185,6 +187,9 @@ def _fake_moe_rt_server(tmp_path, drop_lines=True):
                     for rank in range(8):
                         handle.write("(Worker_TP%d_EP%d pid=1) INFO Runtime switches: flags read inside the forward "
                                      "changed; captured HPU graphs dropped: model, drafter\n" % (rank, rank))
+                    if state["low"] <= 512:
+                        handle.write("(Worker_TP0_EP0 pid=1) WARNING VLLM_HPU_MOE_DENSE=1: a step of 4 tokens runs the "
+                                     "dense MoE form\n")
 
     def ids_of(text):
         return [1] + [sum(map(ord, word)) % 50000 + 2 for word in text.split()]
