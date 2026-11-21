@@ -235,3 +235,45 @@ def test_the_draft_runs_over_every_chunk_of_a_chunked_prompt(engine_runs):
     assert max(call["last_position"] for call in fills) >= 2048  # the 2600-token prompt's chunks before its last
     assert_same_streams(engine_runs["base"], on)
     assert_same_streams(engine_runs["base"], off)
+
+
+def test_requests_after_a_block_committed_during_speculative_decode(engine_runs):
+    """Card job 00133 (spec-lookup, TP4, n-gram k = 5, fused verify op, prefix caching): the first request's decode
+    completed a recurrent block (667 + 384 tokens across the 896-token block) and ran; the next request died in the
+    verify op, its conv pool without data (``ValidateSyncInputTensors tensor_data is empty``). The align-mode copies
+    of that block (the boundary commit after sampling, the pre-step copy before the forward) wrote the conv window
+    through a slice of the GDN conv pool (``recurrent_commit.commit_conv``), which the lazy bridge turns into
+    ``hpu::slice_insert``. On the CPU engine the recurrent block is 256 tokens:
+
+    * turn 1: a 240-token prompt and 48 tokens: the decode crosses 256, so its block is committed;
+    * turn 2: the same prompt: its decode completes a block whose hash is already cached;
+    * turn 3: the agent's next turn, turn 1's prompt and answer and 30 more tokens: a prefix-cache hit on the
+      committed block.
+
+    MTP k = 3 with prefix caching gives the tokens of the engine without speculation, the copies ran, and none of
+    them wrote through a slice of a pool (``--slice-write-probe``).
+    """
+    longest = max((p["prompt_ids"] for p in engine_runs["base"]["prompts"]), key=len)
+    first, extra = longest[:240], longest[1000:1030]
+    out = engine_runs["dir"]
+    one = out / "turn1_prompts.json"
+    one.write_text(json.dumps({"prompts": [{"prompt_ids": first}]}), encoding="utf-8")
+    answer = hpu_cpu_engine.run(engine_runs["ckpt"], out / "turn1_k0.json", "--prompts", str(one), "--max-tokens",
+                                "48")["prompts"][0]["generated_ids"]
+    turns = out / "turns_prompts.json"
+    turns.write_text(json.dumps({"prompts": [{"prompt_ids": first}, {"prompt_ids": first},
+                                             {"prompt_ids": first + answer + extra}]}), encoding="utf-8")
+    options = ("--prompts", str(turns), "--max-tokens", "48")
+    base = hpu_cpu_engine.run(engine_runs["ckpt"], out / "turns_k0.json", *options, "--logprobs", "2")
+    spec = hpu_cpu_engine.run(engine_runs["ckpt"], out / "turns_k3.json", *options, "--k", str(K),
+                              "--slice-write-probe")
+    probe = spec["slice_write_probe"]
+    assert probe["pools"] > 0 and probe["conv_pairs"] > 0 and probe["ssm_pairs"] > 0, probe
+    assert probe["violations"] == []
+    assert [len(p["prompt_ids"]) for p in spec["prompts"]] == [240, 240, 240 + 48 + 30]
+    for base_prompt, spec_prompt in zip(base["prompts"], spec["prompts"]):
+        first_difference(base_prompt, spec_prompt["generated_ids"])
+    # Turn 3's prefix-cache hit is the engine's, speculative or not. On this build it is 0 with or without MTP
+    # (prompt chunks end at the engine's block, not the recurrent block: prefill's VLLM_HPU_PREFIX_ALIGN_SPLIT,
+    # BRIEF 23:46); with that fix it is the committed block.
+    assert [p["num_cached_tokens"] for p in spec["prompts"]] == [p["num_cached_tokens"] for p in base["prompts"]]
