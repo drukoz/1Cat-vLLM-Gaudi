@@ -10,7 +10,7 @@ repository is under `/Volumes/Storage/Claude/gaudi-work/reports/spec-lookup/` (`
 
 ## Handoff (if this agent stops)
 
-State at **2026-11-21 03:35 UTC** (fourth agent, Opus 5.5). Branch head: the commit that holds this text, pushed.
+State at **2026-11-21 08:10 UTC** (fourth agent, Opus 5.5). Branch head: the commit that holds this text, pushed.
 It contains the program head `a16ebdde` (PR #16 qsa-dataflow, PR #17 this track's padded one-token fix; merged as
 `ace177c2`), mtp-card-ready through `f1aa2292` and every commit of this track. **The node was extended (BRIEF 00:50 UTC): it ends about 00:00 UTC on
 2026-11-22**; everything on it is lost then. Merges are allowed again (one gate at a time).
@@ -23,25 +23,30 @@ It contains the program head `a16ebdde` (PR #16 qsa-dataflow, PR #17 this track'
 | 00086, 00087, 00107, 00114 | tiny-model rehearsals (n-gram k = 3 and 8, vLLM's search, the hybrid with the torch and the fused GDN verification) | ended ok; section 7.1 |
 | 00095 `real4-nospec-edit-prose` | real model, no speculation, TP4 + EP4: the reference and the token ids for the replay | ended ok; sections 7.2 to 7.4 |
 | 00133 `real4-ngram5-edit3` | real model, n-gram k = 5, TP4: 85 tok/s for one editing agent, then the conv-commit crash on the second request (fused and torch verification alike) | ended rc 5 at 00:44 UTC; section 7.5 |
-| **00157 `real8-lookup-nospec-hybrid3-pf`** (all, 45 min; replaced 00153 / 00154) | TP8 on the integration build 2 + this branch + mtp-card-ready's conv-commit fix `5c770d96` (build `e85a3292`, branch `feat/flash-next-gaudi-spec-lookup-tp8`, pushed); build 2's flags with the prefix flags; arms `nospec` and `hybrid3` (`lookup_arms.sh`), rounds edit:1, edit:32, mix:32 and a repeat of edit:1 (the 00133 case at TP8) | **waiting**: placed by the coordinator behind the 8-card integration jobs (`farm status` at 03:09 UTC: starts by 08:44 UTC at the latest); local waiter `card/submit-real8-lookup-nospec-hybrid3-pf.log` |
-| **00159 `real8-lookup-ngram5-pf`** (all, 35 min; replaced 00155) | the same build and rounds, arm `ngram5` | **waiting**, after 00157 (starts by 10:14 UTC at the latest); local waiter `card/submit-real8-lookup-ngram5-pf.log` |
+| 00157 `real8-lookup-nospec-hybrid3-pf`, 00159 `real8-lookup-ngram5-pf` | TP8 on build `e85a3292` (integration build 2): never ran. 00157 was replaced by 00208, 00159 cancelled (coordinator 06:50 / 07:02 UTC) | replaced |
+| **00208 `real8-lookup-b4-fold`** (all, 60 min, in 00157's place) | TP8 + EP8 on integration build 4 + this branch: build branch `feat/flash-next-gaudi-spec-lookup-b4`, commit `c9740515` (build 4 `30f4e37e` + `e2d673ef`), image `farm-spec-lookup:c9740515fddd`; build 4's synchronous env. Arms (`lookup_arms.sh`): `tiny-off` (the tiny TP8 gate of the lookup-off reference), `hybrid3` (MTP k = 3 + lookup, modes 1 and 0 per round), `ngram5-nospec` (n-gram k = 5 and, per round, the same round with the requests' lookup off: plain decode steps, the no-speculation reference on the same server). Rounds edit:1, edit:32, mix:32 and the repeat of edit:1 | **waiting**; local waiter `card/submit-real8-lookup-b4-fold.log` (command: `card/submit_b4_fold.sh`) |
 
-The exact submit commands are in section 7.6. Both jobs run the build `e85a3292`: to resubmit, check out
-`feat/flash-next-gaudi-spec-lookup-tp8` in this worktree first (the farm runs the worktree's HEAD), submit with
-`--replaces <id>`, wait for the `farm: job` line, then check out `feat/flash-next-gaudi-spec-lookup` again.
+To resubmit: check out `feat/flash-next-gaudi-spec-lookup-b4` in this worktree (the farm runs the worktree's
+HEAD), run `bash reports/spec-lookup/card/submit_b4_fold.sh` with `--replaces 00208` in place of `--replaces 00157`,
+wait for the `farm: job` line, then check out `feat/flash-next-gaudi-spec-lookup` again. Section 7.6 has the
+design and what to read.
 
-When they end:
+When it ends:
 ```bash
 cd /Volumes/Storage/Claude/gaudi-work/wt/spec-lookup
-C=/Volumes/Storage/Claude/gaudi-work/reports/spec-lookup/card
-python3 tools/flash_next/lookup_summary.py $C/00157-real8-lookup-nospec-hybrid3-pf/nospec \
-    $C/00157-real8-lookup-nospec-hybrid3-pf/hybrid3 $C/00159-real8-lookup-ngram5-pf/ngram5
-grep -h -E "MEAS|TEXT|fallback|DONE|lookup_arms" $C/00157-*/*/probe.log $C/00159-*/*/probe.log $C/00157-*.log $C/00159-*.log
+C=/Volumes/Storage/Claude/gaudi-work/reports/spec-lookup/card/00208-real8-lookup-b4-fold
+grep -h -E "lookup tiny|lookup_arms" $C.log          # the gate's lines (tiny-off/lookup_tiny.json), arms, placement
+python3 tools/flash_next/lookup_summary.py $C/hybrid3 $C/ngram5-nospec   # + $C/nospec $C/ngram5 after a fallback
+grep -h -E "MEAS|TEXT|fallback|DONE" $C/*/probe.log
 ```
-and report to the coordinator (SendMessage `main`) and in section 7.6: per arm and round tokens per step, ms per
-step, ms per token and tok/s per stream against `nospec`; the hybrid's mode 1 against mode 0 (lookup's gain over
+and report to the coordinator (SendMessage `main`) and in section 7.6: first the tiny gate (`lookup tiny
+[ngram5-off/off]`: PASSED with no verification step and the baseline's decode rows, and how many streams are
+identical), then per arm and round tokens per step, ms per step, ms per token and tok/s per stream against the
+reference (the n-gram server's lookup-off rounds, arm "no speculation (n-gram server, lookup off)"; after a failed
+gate the `nospec` server); the hybrid's mode 1 against mode 0 (lookup's gain over
 MTP alone); the mix round's halves (`by_kind` in probe.json: edit and prose streams in one batch); `c` at 32
-streams = (ngram5 edit:32 ms per step - nospec edit:32 ms per step) / 160 and at 1 stream / 5; and whether the
+streams = (ngram5 edit:32 ms per step - the reference's edit:32 ms per step) / 160 and at 1 stream / 5 (both
+from the one n-gram server); and whether the
 repeat round (the last edit:1, a second request on prompt 100 past the 512-token block) ran and equals the first
 edit:1 stream token for token (TEXT lines; at TP8 a difference points at the commit path, coordinator 00:57 UTC).
 
@@ -69,7 +74,9 @@ entry). Run `bin/gate <worktree> --tools` when the merge is due (step 2 below); 
 
 **Pending, in order**
 
-1. 00157 and 00159's numbers (above).
+1. 00208's numbers (above; section 7.6): the tiny gate first, then the hybrid's mode 1 against mode 0 and n-gram
+   against its own lookup-off rounds. If 00208 must be resubmitted before it starts (a CPU failure on `c9740515`:
+   `reports/spec-lookup/logs/b4_cpu/test_lookup_engine_c9740515.log`, `summary.txt`), use `--replaces 00208`.
 2. **Merge after mtp-card-ready's own pull request** (merges are allowed again, BRIEF 00:50 UTC; one gate at a time).
    This branch contains mtp-card-ready through `f1aa2292`; on its merged head `test_engine_mtp.py` fails one test
    alone (`test_sampled_requests_through_the_speculative_engine`, "output with shape [1, 248320] doesn't match the
@@ -93,8 +100,9 @@ entry). Run `bin/gate <worktree> --tools` when the merge is due (step 2 below); 
    needs that commit, which comes with their pull request.
 3. **Card check of `VLLM_HPU_FLASH_NEXT_NGRAM_PLAIN_STEPS=1`** (`be141e1a`, default 0, CPU-proven: a step in which
    no request drafts runs as a plain decode step instead of a 2-row placeholder verification; at one stream on
-   TP4 the placeholder row cost about 8 ms, 00133). It is not in the TP8 build `e85a3292`; the next n-gram job
-   should carry it (merge `be141e1a` into a new job build) with a `prose:1` and a `mix:32` round, where it acts.
+   TP4 the placeholder row cost about 8 ms, 00133). 00208's `ngram5-nospec` arm runs with it on (its lookup-off
+   rounds need it, and its edit:1 n-gram rounds use it on steps without a match); the tiny gate checks the plain
+   steps with the step timer.
 4. **Rows at 32 streams** (section 7): an n-gram step is as wide as its longest draft, an empty draft is the
    2-row placeholder, so 32 streams carry `32 (1 + k)` rows as soon as one stream drafts. Two code steps would
    fix the economics of a mixed load: per-request (ragged) verification rows (rows `sum(1 + d_i)`, not
@@ -451,7 +459,40 @@ first, then (the job's own fallback) the torch verification; rounds as 00095. ME
   would give 8.53, at k = 3 3.92.
 - 32 streams: not measured (the server was gone). Prompts repeat no more in this track's probes (`ab513444`).
 
-### 7.6 n-gram and the hybrid at TP8 on the integration build (jobs 00157, 00159): pending
+### 7.6 n-gram and the hybrid at TP8 on integration build 4 (job 00208): pending
+
+Replaces 00157 and 00159 (below, never run). Coordinator 06:50 UTC: build 4's code and env; 07:02 UTC: TP8 (a TP4 run
+would understate lookup's gain at 32 streams, the cost of a verification row being 2 to 3 times higher there),
+two server starts, the no-speculation reference as rounds of the n-gram server itself. Build `c9740515` =
+integration build 4 (`30f4e37e`, plugin `bcaa3ed6`: builds 1-3, program head `a16ebdde` with PR #17,
+engine-step-mtp-record `2b90707f`, async-sched `fb5cefca`, ...) + this branch at `e2d673ef` (`039c7d11` merged
+`74d3292f` first: `envs.py` and `env_variables.md` both sides kept, `hpu_flash_next_mtp.py` a comment). The env:
+build 4's synchronous flags (00186's `--env` and the headline kit's build flags: QSA fused + request-sharded
+indexer, GDN interleave + glue cache, HC copy mode 2, cut interval 1000, candidate sampling, reserved graph memory
+0.4, the prefix flags, the MoE chunk 64,8192 above 512 tokens, synchronous queue flushing,
+`SPEC_SAMPLED_VERIFY=2`, `MTP_TIMING=2`), the fused GDN verification (`GDN_CORE_VERIFY=1`); no async scheduling
+(the hybrid merges its drafts on the host). Submit command: `reports/spec-lookup/card/submit_b4_fold.sh`.
+
+- `tiny-off`: `lookup_tiny.py --configs ngram5-off` at TP8: the baseline tiny server and an n-gram k = 5 server with
+  plain steps, both with the step timer (`VLLM_HPU_STEP_TIMING=1`, one record per step). Pass `off` (every
+  request `spec_lookup` 0): no draft verified (the counters), no `verify` step (the timer's kinds), each request
+  count's decode input rows equal to the baseline's, streams lossless (how many identical in its line); pass
+  `ngram5`: oracle drafts accepted. If the gate fails, `ngram5-nospec` runs as `nospec` and `ngram5` (two servers).
+- `hybrid3`: as before, modes 1 (the rounds' prompts) and 0 (prompts + 300).
+- `ngram5-nospec`: per round, n-gram on prompts + 300 (the hybrid's mode 0 prompts), then the same round with the
+  lookup off on the round's own prompts (the hybrid's mode 1 prompts: the lossless reference of the hybrid).
+- The probe warms once per (kind, streams, mode) now (plain and verification graphs differ at one batch size).
+- Placement: `/results/switches/place` in the container is `~/farm/spec-lookup/results/switches/place`, a HARD
+  LINK to async-sched's switch (`echo on > ~/farm/async-sched/results/switches/place` turns both on; a switch
+  written by replacing the file would not reach this job: then write this track's file too); the two scripts are
+  hard links as well (`~/farm/spec-lookup/results/bench/`). Read once at the job's start; never for the tiny gate.
+
+CPU on the merged tree (`reports/spec-lookup/logs/b4_cpu/`): see the commit messages of `e2d673ef` and `14a79fd5`
+and the summary files. The lookup-off engine test (`test_lookup_engine.py::test_drafts_off_requests_*`): plain
+1-row steps, the drafter never called; streams lossless but not bit-identical to the engine without speculation
+(6 of 9 identical, 3 at near-ties, two of them exact ties).
+
+The jobs it replaces, for the record:
 
 Build `e85a3292` (branch `feat/flash-next-gaudi-spec-lookup-tp8`, pushed): the integration build 2's code
 (`a9814f72`), this branch (`ab513444`) and mtp-card-ready's `5c770d96`. Submitted from that build (00157 replaced
