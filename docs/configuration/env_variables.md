@@ -159,6 +159,13 @@ as `argmax`); with `VLLM_HPU_VOCAB_PARALLEL_LOGITS` `1` or `2` each rank's arg m
 instead of the logits. The final hyper-connection mix, the LM head and the arg max are then one graph segment, and
 the runner verifies the drafts from those tokens (`greedy_rejection_sample_from_tokens`). Any other value is `0`.
 
+`VLLM_HPU_LOG_UNMATCHED_GRAPH_INPUTS` (integer, default `0`): `1` logs which inputs of a replayed HPU graph the
+graph wrapper copies before each replay. The wrapper binds an input directly only when it is the captured graph's own
+input value; any other input (a view or slice made outside the graph) is copied with a lazy device-to-device copy that
+runs as its own recipe, one launch per replay. The log line (`HPU graph replay copies N unmatched input tensor(s)`)
+names every copied tensor by its path in the forward's arguments, with shape, dtype, contiguity and storage offset,
+the 1st, 100th and 1000th time the same set comes back. Nothing else changes.
+
 `VLLM_HPU_RUNTIME_SWITCH_FILE` (a path, default unset) is an operator's tool for an A/B on one server.
 When set, every worker looks at that file before each step (one `stat`) and, when the file changed, takes
 the flags it lists, one `NAME=VALUE` per line. Only flags the runner reads at every step can be switched:
