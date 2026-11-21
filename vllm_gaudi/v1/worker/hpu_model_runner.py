@@ -64,7 +64,7 @@ from vllm_gaudi.v1.spec_decode.flash_next_mtp_steps import is_flash_next_mtp
 from vllm_gaudi.distributed import vocab_parallel
 from vllm_gaudi.platform import is_flash_next_model
 from vllm_gaudi.v1.worker.flash_next_async_spec import (ChainOut, VerifyInputAdvance, VerifyInputs,
-                                                        refresh_stand_in_drafts, stand_in_chain)
+                                                        stand_in_chain, use_scheduled_drafts)
 from vllm_gaudi.v1.worker.flash_next_async import (AsyncOutputLedger, PleContextCarry, SpecDraftHandoff,
                                                    needs_output_token_values)
 
@@ -4784,7 +4784,8 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
     _spec_draft_handoff: Optional[SpecDraftHandoff] = None
 
     def _advance_verify_inputs(self, num_decodes, padded, num_tokens, block_table_cpu_tensor, block_size, sparse_md,
-                               token_ids, positions, slot_mapping, num_accepted, scheduler_output):
+                               token_ids, positions, slot_mapping, num_accepted, scheduler_output,
+                               block_table_device=None):
         """VLLM_HPU_FLASH_NEXT_SPEC_DEVICE_INPUTS (stage 2, M1): this verification step's inputs from the previous
         verification's on the device. Returns (made or None, served, ids, positions, slots, accepted counts): the
         host's tensors, or with =2 the device-made ones; ``served`` False when this step cannot be advanced at all."""
@@ -4804,18 +4805,23 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             self._verify_advance.reset()
             return None, False, token_ids, positions, slot_mapping, num_accepted
         chain = self._verify_advance.pending_chain(self._verify_step)
-        if chain is not None and chain.stand_in:
-            # Without mtp-draft-graph's chain: the drafts this step verifies, as the scheduler has them (a synchronous
-            # engine); under async scheduling the scheduler has placeholders and the device drafts stay.
-            refresh_stand_in_drafts(chain, self.input_batch.req_ids, scheduler_output.scheduled_spec_decode_tokens)
+        if chain is not None:
+            # The drafts this step verifies, as the scheduler has them when it has them (a synchronous engine); under
+            # async scheduling the scheduler has placeholders and the device drafts stay.
+            use_scheduled_drafts(chain, self.input_batch.req_ids, scheduler_output.scheduled_spec_decode_tokens)
         with_context = model_requires_raw_input_tokens(self.model)
         eos_token_id = self._ple_eos_and_ngram()[0] if with_context else 0
-        table_cpu = torch.zeros((padded, block_table_cpu_tensor.shape[1]), dtype=torch.int32)
-        rows = min(num_decodes, padded, block_table_cpu_tensor.shape[0])
-        table_cpu[:rows] = block_table_cpu_tensor[:rows].to(torch.int32)
+        if block_table_device is not None and block_table_device.shape[0] == padded * num_tokens:
+            # The sparse decode metadata's table, already on the device: request r's row at r * (1 + k).
+            table, stride = block_table_device, num_tokens
+        else:
+            table_cpu = torch.zeros((padded, block_table_cpu_tensor.shape[1]), dtype=torch.int32)
+            rows = min(num_decodes, padded, block_table_cpu_tensor.shape[0])
+            table_cpu[:rows] = block_table_cpu_tensor[:rows].to(torch.int32)
+            table, stride = async_h2d_copy(table_cpu, device=self.device), 1
         made = self._verify_advance.advance(self._verify_step, self.input_batch.req_ids, num_decodes, padded,
-                                            num_tokens - 1, async_h2d_copy(table_cpu, device=self.device), block_size,
-                                            self._PAD_BLOCK_ID * block_size, eos_token_id, with_context)
+                                            num_tokens - 1, table, block_size, self._PAD_BLOCK_ID * block_size,
+                                            eos_token_id, with_context, table_row_stride=stride)
         if made is None:
             return None, True, token_ids, positions, slot_mapping, num_accepted
         made.slot_mapping = made.slot_mapping.to(slot_mapping.dtype)
@@ -5761,7 +5767,7 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                                                                 block_table_cpu_tensor, decode_block_size, sparse_md,
                                                                 token_ids_device, positions_device,
                                                                 slot_mapping_device, num_accepted_tokens,
-                                                                scheduler_output)
+                                                                scheduler_output, block_table_device)
         # call prepare_spec_decode_inputs to get the logits indices and
         if scheduler_output is not None:
             logits_indices, spec_decode_metadata = self._prepare_spec_decode_inputs(scheduler_output, logits_indices,

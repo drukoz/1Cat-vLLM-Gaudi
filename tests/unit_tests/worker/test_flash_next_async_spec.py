@@ -11,7 +11,7 @@ import pytest
 import torch
 
 from vllm_gaudi.v1.worker.flash_next_async_spec import (ChainOut, VerifyInputAdvance, VerifyInputs,
-                                                        refresh_stand_in_drafts, stand_in_chain)
+                                                        use_scheduled_drafts, stand_in_chain)
 from vllm_gaudi.v1.worker.flash_next_decode_metadata import fill_pad_slots
 from vllm_gaudi.v1.worker.flash_next_inputs import build_ple_inputs
 from vllm_gaudi.v1.worker.recurrent_spec import accepted_counts
@@ -83,9 +83,10 @@ def _assert_equal(made, host):
         assert torch.equal(getattr(made, name).to(torch.int64), getattr(host, name).to(torch.int64)), name
 
 
+@pytest.mark.parametrize("repeated", [False, True], ids=["table", "repeated_table"])
 @pytest.mark.parametrize("seed", range(6))
 @pytest.mark.parametrize("k", [1, 2, 3])
-def test_device_made_inputs_equal_the_host_made_ones_step_after_step(seed, k):
+def test_device_made_inputs_equal_the_host_made_ones_step_after_step(seed, k, repeated):
     rng = random.Random(seed * 10 + k)
     num_reqs = rng.randrange(1, 6)
     padded = num_reqs + rng.randrange(0, 3)
@@ -97,7 +98,14 @@ def test_device_made_inputs_equal_the_host_made_ones_step_after_step(seed, k):
         chain, _, _ = books.verify(padded)
         advance.set_chain(step, chain)
         step += 1
-        made = advance.advance(step, books.req_ids, num_reqs, padded, k, books.table, BS, PAD_BLOCK * BS, EOS, True)
+        if repeated:  # the sparse decode metadata's table: each request's row over its 1 + k rows, pad rows after
+            table = torch.full((padded * (1 + k), books.table.shape[1]), PAD_BLOCK, dtype=torch.int32)
+            table[:num_reqs * (1 + k)] = books.table.repeat_interleave(1 + k, dim=0)
+            made = advance.advance(step, books.req_ids, num_reqs, padded, k, table, BS, PAD_BLOCK * BS, EOS, True,
+                                   table_row_stride=1 + k)
+        else:
+            made = advance.advance(step, books.req_ids, num_reqs, padded, k, books.table, BS, PAD_BLOCK * BS, EOS,
+                                   True)
         host = books.host_inputs(padded)
         assert made is not None
         _assert_equal(made, host)
@@ -141,7 +149,12 @@ def test_the_stand_in_takes_the_host_read_and_the_scheduled_drafts():
     assert out.stand_in and out.num_decodes == 2
     assert out.accepted.tolist() == [2, 0, 0, 0]
     assert out.next_ids.tolist() == [[9, 11, 12], [8, 21, 22], [0, 0, 0], [0, 0, 0]]
-    assert refresh_stand_in_drafts(out, ["a", "b"], {"a": [41, 42], "b": [51, 52]})
+    assert use_scheduled_drafts(out, ["a", "b"], {"a": [41, 42], "b": [51, 52]})
     assert out.next_ids[:2].tolist() == [[9, 41, 42], [8, 51, 52]]
-    assert not refresh_stand_in_drafts(out, ["a", "b"], {"a": [-1, -1], "b": [51, 52]})  # async placeholders
+    assert not use_scheduled_drafts(out, ["a", "b"], {"a": [-1, -1], "b": [51, 52]})  # async placeholders
     assert out.next_ids[:2].tolist() == [[9, 41, 42], [8, 51, 52]]
+    theirs = ChainOut(accepted=out.accepted, next_ids=out.next_ids.clone(), num_decodes=2, k=2)
+    original = theirs.next_ids
+    assert use_scheduled_drafts(theirs, ["a", "b"], {"a": [61, 62], "b": [71, 72]})
+    assert theirs.next_ids[:2].tolist() == [[9, 61, 62], [8, 71, 72]]
+    assert original[:2].tolist() == [[9, 41, 42], [8, 51, 52]]  # the chain's own tensor is not written

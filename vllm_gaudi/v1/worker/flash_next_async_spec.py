@@ -46,13 +46,16 @@ class ChainOut:
     stand_in: bool = False  # made from the host's read (stand_in_chain), not by the chain
 
 
-def refresh_stand_in_drafts(chain: ChainOut, req_ids: Sequence[str], scheduled_spec_tokens: dict) -> bool:
-    """A stand-in's drafts from the drafts the scheduler scheduled for the next step (what a synchronous engine
-    verifies, e.g. the engine rehearsal's oracle drafts). False, and nothing changed, when a row has none or has the
-    async scheduler's -1 placeholders (then the device drafts stay)."""
+def use_scheduled_drafts(chain: ChainOut, req_ids: Sequence[str], scheduled_spec_tokens: dict) -> bool:
+    """The draft columns of ``next_ids`` from the drafts the scheduler scheduled for this step, when it has them: a
+    synchronous engine verifies those (the same values as the drafter's, or e.g. the engine rehearsal's oracle
+    drafts). False, and nothing changed, when a row has none or has the async scheduler's -1 placeholders: then the
+    device drafts stay (the asynchronous engine). The chain's own tensor is not written: a copy is."""
     rows = [scheduled_spec_tokens.get(req_id) for req_id in req_ids[:chain.num_decodes]]
     if not rows or any(r is None or len(r) != chain.k or min(r) < 0 for r in rows):
         return False
+    if not chain.stand_in:
+        chain.next_ids = chain.next_ids.clone()
     chain.next_ids[:chain.num_decodes, 1:] = torch.tensor(rows, dtype=torch.int32).to(chain.next_ids.device)
     return True
 
@@ -132,9 +135,11 @@ class VerifyInputAdvance:
 
     def advance(self, step: int, req_ids: Sequence[str], num_decodes: int, padded: int, k: int,
                 block_table: torch.Tensor, block_size: int, pad_slot_base: int, eos_token_id: int,
-                with_context: bool) -> Optional[VerifyInputs]:
+                with_context: bool, table_row_stride: int = 1) -> Optional[VerifyInputs]:
         """Step ``step``'s inputs from step ``step - 1``'s, or None when this step does not continue that one.
-        ``block_table`` is the ``[>= padded, W]`` int32 per-request kernel block table on the device."""
+        ``block_table`` is the int32 kernel block table on the device whose row ``r * table_row_stride`` is request
+        ``r``'s (the sparse decode metadata's table repeats each request's row over its ``1 + k`` verification rows:
+        stride ``1 + k``)."""
         self.stats.verify_steps += 1
         rec, chain = self._recorded, self._chain
         if rec is None or chain is None or rec.step != step - 1 or self._chain_step != step - 1:
@@ -155,9 +160,10 @@ class VerifyInputAdvance:
         base = prev.positions.reshape(padded, width)[:, 0].to(torch.int32) + accepted + 1  # [B]
         positions = torch.where(real[:, None], base[:, None] + cols[None, :], torch.zeros_like(base)[:, None])
 
-        table = block_table[:padded].to(torch.int32)
+        table = block_table.to(torch.int32)
         table_width = table.shape[1]
-        flat_index = rows[:, None] * table_width + torch.div(positions, block_size, rounding_mode="floor")
+        flat_index = (rows * table_row_stride)[:, None] * table_width + torch.div(positions, block_size,
+                                                                                  rounding_mode="floor")
         # padded rows read entry 0 (their slots are the pad block's below; the table may have fewer rows)
         flat_index = torch.where(real[:, None], flat_index, torch.zeros_like(flat_index))
         blocks = table.reshape(-1).index_select(0, flat_index.reshape(-1)).reshape(padded, width)
