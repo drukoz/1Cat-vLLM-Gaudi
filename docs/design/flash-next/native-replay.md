@@ -471,6 +471,33 @@ PCI devices, two NUMA nodes 0-75 and 76-151), so the farm's module-to-CPU table 
 to one slice still keeps its threads and its memory together. Build step 7 (`VLLM_HPU_WORKER_CPU_PIN`) and job 00122
 test it on the real model.
 
+### 7.9 The worker CPU pin and the hash switch at TP8 (integration track's job 00156, arm B against arm A)
+
+MEASURED (integration's report; `~/farm/integration/results/00156-real8-build2b/{nospec,nospec-pin}/`; the CPU watcher
+`reports/native-replay/card/cpuwatch-00156/`): TP8 + EP8, integration build 2, greedy, steady ms per step (round 1 /
+round 2): 1 stream B (`VLLM_HPU_WORKER_CPU_PIN=1 PT_HPU_DISABLE_HPUGRAPH_REPLAY_HASHCHECK=1`) 41.15 / 41.06 against A
+(neither) 43.95 / 33.01; 32 streams B 68.45 / 69.01 against A 53.74 / 62.63. Server healthy after 811 s (B) against 477 s
+(A), the weights at about 6 s against 2 s per shard. All 8 pin lines (rank r: share r of 8, CPUs 19r to 19r+17, 35
+threads moved), no fallback line; B's 1-stream text equals A's. **No gain, worse at 32 streams and at load: both flags
+stay off.**
+
+The watcher (MEASURED): unpinned, each worker's main thread uses 82-94 % of a CPU at 1 stream and 67-77 % at 32 streams
+and drifts over both NUMA halves; pinned, it stays in its slice at 83-97 % and 83-86 %, with the worker's AccThreadPool
+thread spinning at 100 % on a neighbouring CPU of the same slice. At 32 streams the pinned main thread therefore spent
+about 0.85 x 69 = 59 ms of CPU per step against about 0.70 x 58 = 41 ms unpinned (INFERRED): it runs about 45 % slower,
+it does not wait more. Reading (INFERRED): the VM's vCPUs are host hyperthreads (lscpu hides it: "1 thread per core"),
+and packing a worker's busy threads into 18 neighbouring vCPUs puts the main thread next to (or on the sibling of) a
+spinner. A different pin cannot avoid that without the host's sibling map. The slower weight loading under the pin is
+not explained (more loader threads than the slice's 18 CPUs, or NUMA).
+
+The spinner (VERIFIED in the bridge source at 5176b1b2, `pytorch_helpers/habana_helpers/thread_pool/acc_thread_pool.cpp`):
+`CreateAccThreadPool()` (line 35) picks `AccThreadPool` by default (`PT_HPU_ACC_THREAD_VERSION=0`), whose `main_loop`
+(line 158) is `while (task_count_ == 0 && !stop_) {}`, a busy-wait without pause: one CPU per worker, forever, also in
+accumulation mode 0 (51 % of all samples of the 1-card profile, section 7.5). Stock switches remove it:
+`PT_HPU_SYNCHRONOUS_ACC_QUEUE_FLUSHING=1` (`AccNoThread`, no thread) or `PT_HPU_ACC_THREAD_VERSION=1` (a blocking-queue
+pool that sleeps when idle). On one card (00067, "accsync") the first gave right values and no change, as expected
+on an otherwise idle host.
+
 ## 8. Build steps
 
 | Step | What | Proof off the card | Card | State |
@@ -643,6 +670,9 @@ all-reduces already split every layer).
 
 ### Pending, in order
 
+0. **Item 3a (proposed to the coordinator, 01:20 UTC): `PT_HPU_SYNCHRONOUS_ACC_QUEUE_FLUSHING=1`** (no AccThreadPool
+   spinner; section 7.9) as one arm at TP8, unpinned, 1 and 32 streams, after a tiny token-parity check; if the 1-stream
+   step and the per-rank spread drop, retry a pin on top. No bridge build needed.
 1. 00134 as above; write its numbers into a section 7.9 and sections 0 and 5; tell the coordinator.
 2. The coordinator's bridge build (23:43 UTC): the UNPATCHED bridge at `5176b1b2` (head of `v1.24.1`, the node's
    version) builds in container `nr-bridge-build` from `farm-base:latest` on the node, `--cpuset-cpus 18,37,56,75`, nice
