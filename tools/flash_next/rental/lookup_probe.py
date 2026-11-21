@@ -36,9 +36,11 @@ round, ``prompts`` by the prompt's hash), exact and without a tokenizer.
 
 Usage:
   lookup_probe.py --port P --out OUT.json --label L --rounds edit:32:384:0,edit:32:384:1,prose:32:256:-
-      round = KIND:STREAMS:TOKENS:MODE (MODE '-' sends no vllm_xargs). Before the first round of each
-      (KIND, STREAMS) a warm round runs: as long as the round for edit and prose, 48 tokens for editl and editf
-      (--warm-tokens N sets one length for all, 0 skips it).
+      round = KIND:STREAMS:TOKENS:MODE[:FIRST] (MODE '-' sends no vllm_xargs; stream i gets prompt FIRST + i
+      of its kind, default 0: two rounds of one server should not share a prompt, see WARM_FIRST). Before the first
+      round of each (KIND, STREAMS) a warm round runs on other prompts of the kind (FIRST + 1000 + i): as long as
+      the round for edit, prose and mix, 48 tokens for editl and editf (--warm-tokens N sets one length for all,
+      0 skips it).
   lookup_probe.py --compare A.json B.json ...   compare the texts of several probe files
   lookup_probe.py --list-prompts                the prompts' files and character counts
 Standard library only (Python 3.10).
@@ -89,6 +91,7 @@ LARGE_FILES = [
 KINDS = ("edit", "editl", "editf", "prose", "mix")
 FULL_WARM = ("edit", "prose", "mix")  # kinds whose warm round is as long as the round (the others: SHORT_WARM tokens)
 SHORT_WARM = 48
+WARM_FIRST = 1000  # a warm round's prompts: FIRST + WARM_FIRST + i (never a measured round's prompt)
 TREE = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 
@@ -120,21 +123,26 @@ def prompt_for(kind: str, i: int, files: list[tuple[str, str]]) -> str:
     raise ValueError(f"unknown prompt kind {kind!r} (one of {', '.join(KINDS)})")
 
 
-def parse_rounds(text: str) -> list[tuple[str, int, int, int | None]]:
-    """``KIND:STREAMS:TOKENS:MODE,...`` as ``[(kind, streams, tokens, mode or None)]``. ValueError on a bad round."""
+def parse_rounds(text: str) -> list[tuple[str, int, int, int | None, int]]:
+    """``KIND:STREAMS:TOKENS:MODE[:FIRST],...`` as ``[(kind, streams, tokens, mode or None, first)]``: stream ``i``
+    of the round gets prompt ``FIRST + i`` of its kind (default 0). ValueError on a bad round."""
     rounds = []
     for spec in text.split(","):
         parts = spec.strip().split(":")
-        if len(parts) != 4:
-            raise ValueError(f"a round is KIND:STREAMS:TOKENS:MODE, got {spec!r}")
-        kind, n, ntok, mode = parts
+        if len(parts) == 4:
+            parts.append("0")
+        if len(parts) != 5:
+            raise ValueError(f"a round is KIND:STREAMS:TOKENS:MODE[:FIRST], got {spec!r}")
+        kind, n, ntok, mode, first = parts
+        if not first.isdigit():
+            raise ValueError(f"FIRST is a prompt index, at least 0, in {spec!r}")
         if kind not in KINDS:
             raise ValueError(f"unknown prompt kind {kind!r} in {spec!r} (one of {', '.join(KINDS)})")
         if not (n.isdigit() and ntok.isdigit() and int(n) >= 1 and int(ntok) >= 2):
             raise ValueError(f"STREAMS is at least 1 and TOKENS at least 2 in {spec!r}")
         if mode != "-" and mode not in ("0", "1", "2"):
             raise ValueError(f"MODE is -, 0, 1 or 2 in {spec!r}")
-        rounds.append((kind, int(n), int(ntok), None if mode == "-" else int(mode)))
+        rounds.append((kind, int(n), int(ntok), None if mode == "-" else int(mode), int(first)))
     return rounds
 
 
@@ -294,8 +302,8 @@ def summarize_round(kind: str, n: int, ntok: int, mode: int | None, out: list, w
     return res
 
 
-def run_round(args, kind: str, n: int, ntok: int, mode: int | None, files: dict) -> dict:
-    prompts = [prompt_for(kind, i, files.get(kind, [])) for i in range(n)]
+def run_round(args, kind: str, n: int, ntok: int, mode: int | None, files: dict, first: int = 0) -> dict:
+    prompts = [prompt_for(kind, first + i, files.get(kind, [])) for i in range(n)]
     before = read_counters(args.host, args.port)
     out = [None] * n
     barrier = threading.Barrier(n)
@@ -356,10 +364,16 @@ def compare_texts(runs: list[dict]) -> list[str]:
                 continue
             same = total = 0
             shortest = None
+            # pair the streams by prompt (rounds with another FIRST hold other prompts), else by stream index
+            ref_by_sha = dict(zip(ref.get("prompt_sha") or [], ref["texts"]))
             for i, text in enumerate(r["texts"]):
-                if text is None or i >= len(ref["texts"]) or ref["texts"][i] is None:
+                shas = r.get("prompt_sha") or []
+                if ref_by_sha and i < len(shas):
+                    want = ref_by_sha.get(shas[i])
+                else:
+                    want = ref["texts"][i] if i < len(ref["texts"]) else None
+                if text is None or want is None:
                     continue
-                want = ref["texts"][i]
                 limit = min(len(want), len(text))  # rounds may differ in length: compare the common part
                 common = next((j for j in range(limit) if want[j] != text[j]), limit)
                 total += 1
@@ -421,13 +435,16 @@ def main(argv: list[str] | None = None) -> int:
         os.replace(args.out + ".tmp", args.out)
 
     failed = 0
-    for kind, n, ntok, mode in rounds:
+    for kind, n, ntok, mode, first in rounds:
         if args.warm_tokens != 0 and (kind, n) not in warmed:
             if args.warm_tokens >= 0:
                 warm_tokens = args.warm_tokens
             else:
                 warm_tokens = ntok if kind in FULL_WARM else min(ntok, SHORT_WARM)
-            w = run_round(args, kind, n, warm_tokens, mode, files)
+            # the warm round's prompts are other prompts of the kind (WARM_FIRST on): a later request on the same
+            # prompt would decode through recurrent blocks the warm request has cached, which no measured round
+            # needs (and which crashed the real model's speculative servers in job 00133)
+            w = run_round(args, kind, n, warm_tokens, mode, files, first + WARM_FIRST)
             warmed.add((kind, n))
             print(round_line(args.label, "warm", w), flush=True)
             results["prompts"].update(w.pop("prompt_token_ids", {}))
@@ -442,7 +459,8 @@ def main(argv: list[str] | None = None) -> int:
                 failed += 1
                 save()
                 continue
-        m = run_round(args, kind, n, ntok, mode, files)
+        m = run_round(args, kind, n, ntok, mode, files, first)
+        m["first"] = first
         results["prompts"].update(m.pop("prompt_token_ids", {}))
         results["rounds"].append(m)
         save()
