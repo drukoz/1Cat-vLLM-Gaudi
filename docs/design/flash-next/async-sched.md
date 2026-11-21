@@ -22,13 +22,14 @@ Updated 2026-11-21 02:30 UTC.
   `reports/async-sched/logs/gate_fd010f8c.out`); if it is green: `gh pr create --base feat/flash-next-gaudi`
   (title "Flash-Next under async scheduling: VLLM_HPU_FLASH_NEXT_ASYNC_SCHED (default 0), modes 1 and 2"),
   `gh pr merge --merge`.
-- **Card job 00175** `real8-async-mtp` (all, 60 min hold; replaced 00171 in its place, expected start about 04:45
-  UTC). Job branch `feat/flash-next-gaudi-async-sched-int2` (`a0273b7c` = integration `d00c0a9a` + `fb5cefca` +
-  job arms; never merge it): `headline_job.sh tiny-async mtp3-async mtp3 async nospec`, env `HEADLINE_LEVELS=32,1
-  VLLM_HPU_MTP_TIMING=0 HEADLINE_MTP_SAMPLED=1 HEADLINE_MTP_FALLBACK=0`. A background `bin/farm job` (log
-  `reports/async-sched/logs/farm_real8_async_mtp.out`) fetches into `reports/async-sched/card/00175-real8-async-mtp/`;
-  if the session is gone: `bin/farm fetch async-sched 00175 00175-real8-async-mtp`. Read `headline.md` (mtp3-async
-  against mtp3, async against nospec, at 32 and 1 streams, greedy and sampled), `tiny-async/summary.json` (both
+- **Card job 00176** `real8-async-mtp2` (all, 60 min hold; replaced 00171 then 00175 in their place, expected start
+  about 04:45 UTC). Job branch `feat/flash-next-gaudi-async-sched-int2` (`a0273b7c` = integration `d00c0a9a` +
+  `fb5cefca` + job arms; never merge it): `headline_job.sh tiny-async mtp2-async mtp2 async nospec`, env
+  `HEADLINE_LEVELS=32,1 VLLM_HPU_MTP_TIMING=0 HEADLINE_MTP_SAMPLED=1 HEADLINE_MTP_FALLBACK=0 HEADLINE_TINY_SPEC=2`
+  (k = 2 as integration build 2's 00156). A background `bin/farm job` (log
+  `reports/async-sched/logs/farm_real8_async_mtp2.out`) fetches into `reports/async-sched/card/00176-real8-async-mtp2/`;
+  if the session is gone: `bin/farm fetch async-sched 00176 00176-real8-async-mtp2`. Read `headline.md` (mtp2-async
+  against mtp2, async against nospec, at 32 and 1 streams, greedy and sampled), `tiny-async/summary.json` (both
   modes must pass), and grep each arm's `server0.log` for `Async scheduling on for Flash-Next` (the mode took),
   `Traceback`, `PT_DEVMEM`. The old job branch `feat/flash-next-gaudi-async-sched-int` (00171) is superseded.
 - **Next**: card result to the coordinator and the integration track (flags: mode 1 = `VLLM_HPU_FLASH_NEXT_ASYNC_SCHED=1`,
@@ -182,4 +183,5 @@ after `_with_host_ngram_ids`; after `AsyncHPUModelRunnerOutput(...)`; the top of
 | Job | What | State |
 |---|---|---|
 | 00171 `real8-async-ab` | TP8, integration build + mode 1: tiny gate, async / nospec / nospec-devids at 32 and 1 streams | replaced by 00175 (02:20 UTC) |
-| 00175 `real8-async-mtp` | TP8, integration `d00c0a9a` + modes 1 and 2: tiny gate (no speculation and MTP k = 3), mtp3-async, mtp3, async, nospec at 32 and 1 streams, greedy and sampled | queued, about 04:45 UTC |
+| 00175 `real8-async-mtp` | as 00176 with k = 3 | replaced by 00176 (02:35 UTC) |
+| 00176 `real8-async-mtp2` | TP8, integration `d00c0a9a` + modes 1 and 2: tiny gate (no speculation and MTP k = 2), mtp2-async, mtp2, async, nospec at 32 and 1 streams, greedy and sampled | queued, about 04:45 UTC |
