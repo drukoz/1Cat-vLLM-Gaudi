@@ -107,6 +107,17 @@ SERVE=(vllm serve "$MODEL" --served-model-name fn --host 127.0.0.1 --port "$PORT
     --enable-expert-parallel --max-model-len 131072 --max-num-seqs 32 --enable-prefix-caching
     --language-model-only --trust-remote-code --gpu-memory-utilization 0.92 --max-num-batched-tokens 8192
     --long-prefill-token-threshold 2048 --enable-prompt-tokens-details)
+# QSA_AB_SERVE_EXTRA: more vllm serve words, comma-separated, one word per argument (--kv-cache-dtype=fp8_inc).
+if [ -n "${QSA_AB_SERVE_EXTRA:-}" ]; then
+    IFS=, read -r -a SERVE_EXTRA <<<"$QSA_AB_SERVE_EXTRA"
+    SERVE+=("${SERVE_EXTRA[@]}")
+fi
+# QSA_AB_MTP=K (K > 0): MTP speculative decoding with K draft tokens.
+case "${QSA_AB_MTP:-0}" in
+    '' | 0) ;;
+    *[!0-9]*) echo "QSA_AB_MTP must be a number of draft tokens, got '$QSA_AB_MTP'" >&2 ;;
+    *) SERVE+=(--speculative-config "{\"method\": \"mtp\", \"num_speculative_tokens\": $QSA_AB_MTP}") ;;
+esac
 {
     "$PY" -c "import vllm, vllm_gaudi; print('vllm', vllm.__version__); print('vllm_gaudi', vllm_gaudi.__file__)" 2>&1
     echo "image: $(cat /farm-image 2>/dev/null)"
@@ -205,6 +216,8 @@ serve_and_probe() {
         grep -nE "Error|Traceback|error:" "$log" | tail -n 20 | cut -c1-400
     fi
     grep -E "generation throughput" "$log" | tail -n 4 | cut -c1-300
+    grep -E "GPU KV cache size|reserved for usable KV cache|Recurrent state pool: .* slots x" "$log" | head -n 4 \
+        | cut -c1-300
     say "fallback/off lines in the server log: $(grep -ciE "fallback|is off for|has no HPU kernel|kernels are not loaded" "$log")"
     grep -hE "is off for|kernels are not loaded|Traceback" "$log" | sort | uniq -c | head -n 6 | cut -c1-300
     say "decode configurations compiled at run time: $(grep -o "Configuration: ('decode'[^)]*)" "$log" | sort -u | wc -l)," \
