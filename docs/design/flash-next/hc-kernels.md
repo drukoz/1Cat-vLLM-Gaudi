@@ -4,7 +4,7 @@ Design note, report and handoff of the `hc-kernels` track (branch `feat/flash-ne
 `/Volumes/Storage/Claude/gaudi-work/wt/hc-kernels`). The harness refuses report files for this agent, so this note is
 the report. Labels: MEASURED (card), VERIFIED (simulator or CPU test named), INFERRED (arithmetic or reading).
 
-## 0. Handoff (if this agent stops) — updated 09:30 UTC 2026-11-21
+## 0. Handoff (if this agent stops) — updated 09:40 UTC 2026-11-21
 
 - **Goal 1:** the two hyper-connection TPC kernels (`hc_fused_gate_mix`, `hc_fused_combine_norm`) at 128
   verification rows (32 streams, MTP k = 3) from about 7 ms per step to about 2 ms. **Goal 2:** the GDN verify kernel
@@ -15,13 +15,15 @@ the report. Labels: MEASURED (card), VERIFIED (simulator or CPU test named), INF
   shipped kernels; the 8-card arm goes into build 6).
 - **On the branch, pushed:** HC `3c2ffd72`, `6f5b9300`, `0183f133`, `6c62cc56` (interleaved kernels, ops, flag
   `VLLM_HPU_HC_FUSED_IL`, tests, bench); GDN `8ed20160` (variants 1-3 of `VLLM_HPU_GDN_VERIFY_VARIANT`). Next commit
-  (09:30, after its simulator run): variants 4/5, chained benches, traces, `kernel_engines.py`.
+  (09:30, after its simulator run): variants 4/5, chained benches, traces, `kernel_engines.py`: pushed as `b9ff6384`
+  (simulator: variants 1-5 byte-identical, 71 passed).
 - **Card (coordinator 09:33 UTC: split in two):** job A = `tools/flash_next/hc_kernels/card_hc_quick.sh` (HC op card
   test, the TP1 tiny gate with `VLLM_HPU_HC_FUSED_IL=1`, the HC bench at 4/32/96/128 rows, traces at 128 rows), hold 12
   min, replaces 00227 (its place: right after build 5, beside engine-step's 2-card job); job B =
   `tools/flash_next/hc_kernels/card_gdn_verify.sh` (GDN verify variants 0-5: op test, chained bench, bits, traces),
-  placed by the coordinator about 15:00-16:00 UTC beside step-anatomy's 4-card trace. Ids: see the latest
-  `reports/hc-kernels/logs/farm_*.out`. When a job ends: `bin/farm fetch hc-kernels <id> <id>-<name>` if its waiter
+  placed by the coordinator about 15:00-16:00 UTC beside step-anatomy's 4-card trace. **Job A = 00231 `hc-quick`,
+  job B = 00232 `gdn-variants`** (both image `b9ff6384`, queued 09:39 UTC; waiters' logs
+  `reports/hc-kernels/logs/farm_hc-quick.out`, `farm_gdn-variants.out`). When a job ends: `bin/farm fetch hc-kernels <id> <id>-<name>` if its waiter
   is gone; read `pytest_il.log`, `tiny.log`, `bench.log` (VERDICT), `gdn_bench_variant*.log` (us per call and
   "bit-identical" lines); traces with `python3 tools/flash_next/hc_kernels/kernel_engines.py <trace> <kernel name>`;
   send kernel-fixes the GDN result. The TP1 tiny gate stands in for a TP8 one (coordinator, 09:33).
@@ -185,8 +187,10 @@ interleave variable; each an optional ELF of the library, weak symbols):
   so the documented split hint is the cleaner form.
 - 5, as 4 with the lean ELF.
 
-VERIFIED (simulator, `tests/standalone/gdn_core_decode/test_simulation.py -k variant`: 43 passed, 09:22 UTC): out,
-conv state and SSM state byte-identical to the interleaved kernel on all 14 verify cases for each of variants 1, 2, 3;
+VERIFIED (simulator, `tests/standalone/gdn_core_decode/test_simulation.py -k variant`: 43 passed at 09:22 UTC for
+variants 1-3, 71 passed at 09:35 UTC for variants 1-5): out, conv state and SSM state byte-identical to the interleaved
+kernel on all 14 verify cases for each variant (4 and 5 keep today's index space; their split hint is for the graph
+compiler only);
 variant 1 swaps the index space and runs the same instruction count; variants 2 and 3 run 0.887 to 0.925 of the
 instructions; the glue takes a variant only with the interleave variable at "1" and the value exactly "1", "2" or
 "3". The library builds with the three optional ELFs (`test_kernel_build.py` 7 passed); CPU:
