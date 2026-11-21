@@ -369,6 +369,8 @@ def runner_facts(runner) -> dict:
             "candidate_verify_steps": int(getattr(runner, "_candidate_verify_steps", 0)),
             # VLLM_HPU_MTP_DRAFT_GRAPH=1: decode drafts whose k passes ran in one HPU graph (MtpDraftLoop)
             "draft_graph_calls": int(getattr(getattr(runner, "drafter", None), "draft_graph_calls", 0)),
+            # VLLM_HPU_MTP_DRAFT_CHAIN=1: decode drafts chained behind their verification (MtpDraftChain)
+            "draft_chain_calls": int(getattr(getattr(runner, "drafter", None), "draft_chain_calls", 0)),
             # VLLM_HPU_FLASH_NEXT_DECODE_METADATA=1 in force (decided at the first decode step; None: never decided)
             "sparse_decode_md": getattr(runner, "_sparse_decode_md", None),
             "attention_group": runner._get_attention_group_id_for_hybrid(),
