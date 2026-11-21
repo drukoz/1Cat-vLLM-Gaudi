@@ -326,7 +326,7 @@ placed() {
     local dir="$1"
     shift
     restore_cpus
-    if [ "$PLACE_ON" = 1 ]; then
+    if [ "$PLACE_ON" = 1 ] && [ "${ARM_NOPLACE:-0}" != 1 ]; then
         mkdir -p "$dir"
         PLACE_ARGS="--log $dir/server0.log" PLACE_LOG="$dir/placement.log" bash "$PLACE_WRAP" "$PLACE_SCRIPT" -- "$@"
     else
@@ -576,6 +576,7 @@ while [ "$i_arm" -lt "${#ARMS[@]}" ]; do
             needs_m3=0
             needs_async3=0
             needs_b6=()
+            ARM_NOPLACE=0
             words="${arm:4}"
             words="${words#-}"
             arm_words=()
@@ -604,6 +605,9 @@ while [ "$i_arm" -lt "${#ARMS[@]}" ]; do
                     inline) arm_env+=(PT_HPU_DISABLE_ASYNC_COLLECTIVE=1) ;;
                     fp8kv) fp8kv=1; arm_env+=(VLLM_HPU_QSA_KV_FP8=1); serve_extra+=(--kv-cache-dtype fp8_inc) ;;
                     pin3) arm_env+=(VLLM_HPU_WORKER_CPU_PIN=3) ;;
+                    # build 6: this server without place_wrap.sh / place.sh even when the switch says "place" (pin
+                    # mode 3 against the placement)
+                    noplace) ARM_NOPLACE=1 ;;
                     # build 6: one flag each (a server start; each needs its tiny gate, if run, to have passed)
                     il) arm_env+=(VLLM_HPU_HC_FUSED_IL=1); needs_b6+=(il) ;;
                     shift) arm_env+=(VLLM_HPU_QSA_SLOT_SHIFT=1); needs_b6+=(shift) ;;
