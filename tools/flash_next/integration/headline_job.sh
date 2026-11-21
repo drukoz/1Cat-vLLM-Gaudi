@@ -608,6 +608,8 @@ while [ "$i_arm" -lt "${#ARMS[@]}" ]; do
                     # build 6: this server without place_wrap.sh / place.sh even when the switch says "place" (pin
                     # mode 3 against the placement)
                     noplace) ARM_NOPLACE=1 ;;
+                    # build 6b: kernel-fixes' dense MoE gate / up as one 2-D FP8 GEMM (bit-identical, 34e2bb24)
+                    flat) arm_env+=(VLLM_HPU_MOE_DENSE_FLAT_GATE_UP=1) ;;
                     # build 6: prefill's prompt-graph serve flags on this server, from HEADLINE_PG_ENV ("K=V;K=V", e.g.
                     # VLLM_HPU_PROMPT_GRAPH_MAX_TOKENS with its bound and its graph reserve; set by the job or its late
                     # file); an arm word pg without HEADLINE_PG_ENV is an error
