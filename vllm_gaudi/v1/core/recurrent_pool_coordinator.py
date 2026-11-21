@@ -82,9 +82,23 @@ def keep_decode_end_requested(environ=None) -> bool:
     return value == 1
 
 
-def keep_last_decode_boundary(manager) -> bool:
+ENV_BOUNDARY_COMMITS = "VLLM_HPU_RECURRENT_BOUNDARY_COMMITS"
+
+
+def boundary_commits_known(environ=None) -> bool | None:
+    """Whether the HPU runner commits the state at every block boundary its decode steps complete, as the
+    platform hook wrote it (``platform._configure_recurrent_state``: ``1`` when a speculative config with drafted
+    tokens runs on the recurrent state pool, the runner's ``recurrent_spec_enabled`` with prefix caching); None
+    when nothing was written (a coordinator built without the hook)."""
+    value = (os.environ if environ is None else environ).get(ENV_BOUNDARY_COMMITS)
+    if value is None or value.strip() == "":
+        return None
+    return value.strip() == "1"
+
+
+def keep_last_decode_boundary(manager, boundary_commits: bool | None = None) -> bool:
     """Make a recurrent group's sparse retention keep the state at the last block boundary a request reached
-    while decoding.
+    while decoding (two of them for a group with speculative blocks).
 
     Why. Under sparse retention a request leaves one recurrent state behind, at its prompt's replay boundary
     (``keep_block_aligned_prompt_end``). The states its decode steps complete at later block boundaries are
@@ -101,17 +115,28 @@ def keep_last_decode_boundary(manager) -> bool:
     block the pool has handed to another request since is left alone). Cost: one more retained state per
     recurrent group for a request whose output crossed a block boundary.
 
-    Not with speculative decoding: a step of ``1 + k`` scheduled tokens that straddles a block boundary keeps
+    Speculative decoding. Upstream, a step of ``1 + k`` scheduled tokens that straddles a block boundary keeps
     its running state in the block of its LAST scheduled token (``recurrent_lattice.align_running_block``), so
-    the earlier block's slot stays at the position before that step, which is not the boundary. A group with
-    speculative blocks is left as it is (returns False).
+    the earlier block's slot stays at the position before that step. The HPU runner does not leave it there: at
+    sample time of the same step it copies the state after the block's last accepted token into the completed
+    block's slot (``HPUModelRunner._commit_recurrent_boundaries``, ``recurrent_commit.boundary_commits``,
+    whenever ``recurrent_spec_enabled`` and prefix caching), so the boundary state exists. A group with
+    speculative blocks is therefore kept only when ``boundary_commits`` is True (the platform hook says the
+    runner commits, ``boundary_commits_known``); otherwise, or when that is unknown, it is left as it is
+    (returns False). Such a group keeps the last TWO decode boundaries: upstream's EAGLE / MTP rule drops the
+    last matched block of every hit (``drop_eagle_block``: the drafting head's hidden states are recomputed), so
+    the next turn's hit needs the state one block before the last decode boundary. Cost: one more retained state
+    per recurrent group for a request whose output crossed two block boundaries.
     """
-    if int(getattr(manager.kv_cache_spec, "num_speculative_blocks", 0) or 0) > 0:
+    speculative = int(getattr(manager.kv_cache_spec, "num_speculative_blocks", 0) or 0) > 0
+    if speculative and boundary_commits is not True:
         return False
+    keep = 2 if speculative else 1
     base_cache_blocks = manager.cache_blocks
     base_mask = manager.reachable_block_mask
     base_pop = manager.pop_blocks_for_free
-    kept: dict[str, tuple[KVCacheBlock, object]] = {}  # request id -> (its decode-boundary block, the hash given)
+    # request id -> its kept decode-boundary blocks with the hash each was given, oldest first
+    kept: dict[str, list[tuple[KVCacheBlock, object]]] = {}
     call: dict = {}
 
     def reachable_block_mask(*args, **kwargs):
@@ -139,10 +164,13 @@ def keep_last_decode_boundary(manager) -> bool:
         block = blocks[marked] if marked < len(blocks) else None
         if block is None or block.is_null or block.block_hash is None:
             return
-        previous = kept.get(request.request_id)
-        if previous is not None and previous[0] is not block and previous[0].block_hash == previous[1]:
-            manager.block_pool._maybe_evict_cached_block(previous[0])
-        kept[request.request_id] = (block, block.block_hash)
+        entries = [entry for entry in kept.get(request.request_id, []) if entry[0] is not block]
+        entries.append((block, block.block_hash))
+        while len(entries) > keep:
+            oldest, given = entries.pop(0)
+            if oldest.block_hash == given:
+                manager.block_pool._maybe_evict_cached_block(oldest)
+        kept[request.request_id] = entries
 
     def pop_blocks_for_free(request_id):
         kept.pop(request_id, None)
@@ -343,16 +371,18 @@ class HpuRecurrentPoolCoordinator(HybridKVCacheCoordinator):
         )
         keep_prompt_end = keep_prompt_end_requested()
         keep_decode_end = keep_decode_end_requested()
+        boundary_commits = boundary_commits_known()
         for gid, manager in enumerate(self.single_type_managers):
             manager.block_pool = self._pool_for_group(gid)
             manager._null_block = manager.block_pool.null_block
             if gid in self.recurrent_group_ids:
                 if keep_prompt_end:
                     keep_block_aligned_prompt_end(manager)
-                if keep_decode_end and not keep_last_decode_boundary(manager):
-                    logger.warning("%s=1 is ignored for recurrent group %d: it has speculative blocks, and a "
-                                   "speculative step that straddles a block boundary leaves no state at it",
-                                   ENV_KEEP_DECODE_END, gid)
+                if keep_decode_end and not keep_last_decode_boundary(manager, boundary_commits):
+                    logger.warning("%s=1 is ignored for recurrent group %d: it has speculative blocks and the "
+                                   "runner is not known to commit the state at a block boundary a speculative "
+                                   "step straddles (%s=%s)", ENV_KEEP_DECODE_END, gid, ENV_BOUNDARY_COMMITS,
+                                   os.environ.get(ENV_BOUNDARY_COMMITS, "unset"))
 
     def _pool_for_group(self, group_id: int) -> BlockPool:
         return self.recurrent_pool if group_id in self.recurrent_group_ids else self.block_pool

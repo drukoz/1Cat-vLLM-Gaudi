@@ -247,10 +247,15 @@ unaligned). With `1` the state its decode steps completed at the last block
 boundary is kept too (one per request and recurrent group: an earlier one
 leaves the prefix cache when a later one is cached), and the next turn starts
 there. Dense retention (`--prefix-cache-retention-interval` at the block size)
-gives the same hit but keeps every chunk-end state of every prompt. Ignored,
-with a warning, when speculative decoding is on: a speculative step that
-straddles a block boundary leaves no state exactly at it. Default `0`. See
-`keep_last_decode_boundary` in
+gives the same hit but keeps every chunk-end state of every prompt. With
+speculative decoding (MTP, n-gram) the runner commits the state at every block
+boundary a speculative step completes (`HPUModelRunner._commit_recurrent_boundaries`;
+the platform hook records it in `VLLM_HPU_RECURRENT_BOUNDARY_COMMITS`, which is
+not a setting), and the last TWO decode boundaries are kept per request and
+recurrent group, because the EAGLE / MTP rule drops the last matched block of a
+hit: the next turn then starts one block before the last decode boundary. When
+the runner is not known to commit (no record), a group with speculative blocks
+is left as it is, with a warning. Default `0`. See `keep_last_decode_boundary` in
 `vllm_gaudi/v1/core/recurrent_pool_coordinator.py`.
 
 `VLLM_HPU_PREFIX_ALIGN_SPLIT=1` makes prompt chunks end at the recurrent
