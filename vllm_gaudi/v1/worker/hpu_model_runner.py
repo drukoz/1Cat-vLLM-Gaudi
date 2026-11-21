@@ -4790,6 +4790,9 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         verification's on the device. Returns (made or None, served, ids, positions, slots, accepted counts): the
         host's tensors, or with =2 the device-made ones; ``served`` False when this step cannot be advanced at all."""
         mode = int(gaudi_envs.VLLM_HPU_FLASH_NEXT_SPEC_DEVICE_INPUTS)
+        if mode not in (1, 2):  # switched off while serving (VLLM_HPU_RUNTIME_SWITCH_FILE)
+            self._verify_advance.reset()
+            return None, False, token_ids, positions, slot_mapping, num_accepted
         reason = None
         if not sparse_md:
             reason = "the dense decode metadata (it needs VLLM_HPU_FLASH_NEXT_DECODE_METADATA=1)"
@@ -4857,7 +4860,8 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         (``_mtp_chain_out``) when the step chained, else a stand-in from the host's read and the device drafts."""
         advance = self._verify_advance
         recorded = advance._recorded
-        if recorded is None or recorded.step != self._verify_step or num_decodes == 0:
+        if (recorded is None or recorded.step != self._verify_step or num_decodes == 0
+                or int(gaudi_envs.VLLM_HPU_FLASH_NEXT_SPEC_DEVICE_INPUTS) not in (1, 2)):
             advance.set_chain(self._verify_step, None)
             return
         chain = getattr(self, "_mtp_chain_out", None)
