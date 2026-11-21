@@ -14,12 +14,28 @@
 # The probe is the build's own pair at PROBE_DIR (e.g. /results/bench/intprobe4): levels 32, 8, 1, 128 tokens, two
 # rounds per level, greedy and sampled interleaved. Exit code 0 when every arm that ran passed; verdicts in
 # ~/farm/<track>/results/<job>-<name>-verdicts.txt; the spinner decision in <job>-<name>-spinner.txt.
+# Settings (job environment; ~/farm/collectives/bridge/late/<job id>.env with KEY=VALUE lines wins, read at the start):
+#   BRIDGE_REBUILD_KV / REBUILD_KV  the rebuild arm's env, ';'-separated (default PT_HPU_HPUGRAPH_REPLAY_TIMING=0;
+#                                   with REBUILD = a lean build: PT_HPU_HPUGRAPH_PREPARED_REPLAY=0 and timers, our build
+#                                   on the stock path); REBUILD overrides the third argument
+#   BRIDGE_PIN_KV / PIN_KV          a fifth real arm, real-pin: LEAN, flag 1, timing 5000, plus this env (';'-separated,
+#                                   e.g. VLLM_HPU_WORKER_CPU_PIN=1), last
 set -u
 IMG="${1:?image}"
 P="${2:?probe dir inside the container, e.g. /results/bench/intprobe4}"
 RB="${3:?REBUILD build id}"
 L="${4:?LEAN build id}"
 S="${5:-$(basename "$(readlink "$HOME/farm/${CARDQ_TRACK:?}/current")")}"
+RB_KV="${BRIDGE_REBUILD_KV:-PT_HPU_HPUGRAPH_REPLAY_TIMING=0}"
+PIN_KV="${BRIDGE_PIN_KV:-}"
+LATE="$HOME/farm/collectives/bridge/late/${CARDQ_JOB:-none}.env"
+if [ -s "$LATE" ]; then
+    while IFS='=' read -r k v; do
+        case "$v" in *[!A-Za-z0-9._,\;=-]*) echo "bridge_vendor: ignored a bad value in $LATE: $k"; continue ;; esac
+        case "$k" in REBUILD) [ -n "$v" ] && RB="$v" ;; REBUILD_KV) RB_KV="$v" ;; PIN_KV) PIN_KV="$v" ;; esac
+    done <"$LATE"
+    echo "bridge_vendor: late-bound settings from $LATE"
+fi
 J="$HOME/farm/collectives/bridge/ab_bridge_job.sh"
 R="$HOME/farm/${CARDQ_TRACK:?}/results"
 PREFIX="${CARDQ_JOB:?}-${CARDQ_NAME:?}"
@@ -36,10 +52,10 @@ case " ${BRIDGE_ENV:-} " in *" PT_HPU_SYNCHRONOUS_ACC_QUEUE_FLUSHING="*)
     echo "bridge_vendor: BRIDGE_ENV must not set PT_HPU_SYNCHRONOUS_ACC_QUEUE_FLUSHING (the job decides it)"; exit 2 ;;
 esac
 PROBE="bash $P/serve_probe.sh --levels 32,8,1 --tokens 128 --warm-tokens 48 --repeat-top 2 --no-mintok-check --probe-arg --sampled-levels=32,8,1 --probe-arg --interleave-sampled --probe-arg --rounds=2"
-echo "bridge_vendor: image $IMG, rebuild $RB, lean $L, env ${BRIDGE_ENV:-none}"
+echo "bridge_vendor: image $IMG, rebuild $RB ($RB_KV), lean $L, pin arm ${PIN_KV:-none}, env ${BRIDGE_ENV:-none}"
 
 bash "$J" --sha "$S" --image "$IMG" "${ENV[@]}" --cmd 'python /farm/farm_tiny.py --gdn hc' \
-    "tiny-stock:-" "tiny-rebuild:$RB" "tiny-lean:$L:PT_HPU_HPUGRAPH_PREPARED_REPLAY=1,PT_HPU_HPUGRAPH_REPLAY_TIMING=2000"
+    "tiny-stock:-" "tiny-rebuild:$RB:$RB_KV" "tiny-lean:$L:PT_HPU_HPUGRAPH_PREPARED_REPLAY=1,PT_HPU_HPUGRAPH_REPLAY_TIMING=2000"
 grep -q '^tiny-stock ok' "$V" || { echo "bridge_vendor: the reference tiny arm failed: no real arm"; cat "$V"; exit 3; }
 
 bash "$J" --sha "$S" --image "$IMG" "${ENV[@]}" --cmd "$PROBE" \
@@ -71,14 +87,17 @@ PY
 )" 2>"$R/$PREFIX-spinner.txt"
 cat "$R/$PREFIX-spinner.txt"
 case "$SPIN" in
-    off) SPINKV=",PT_HPU_SYNCHRONOUS_ACC_QUEUE_FLUSHING=1" ;;
+    off) SPINKV=";PT_HPU_SYNCHRONOUS_ACC_QUEUE_FLUSHING=1" ;;
     *) SPIN="on"; SPINKV="" ;;
 esac
 echo "bridge_vendor: spinner $SPIN for the rebuild and lean arms" | tee -a "$R/$PREFIX-spinner.txt"
 
 MORE=()
-grep -q '^tiny-rebuild ok' "$V" && MORE+=("real-rebuild:$RB:PT_HPU_HPUGRAPH_REPLAY_TIMING=0$SPINKV")
-grep -q '^tiny-lean ok' "$V" && MORE+=("real-lean:$L:PT_HPU_HPUGRAPH_PREPARED_REPLAY=1,PT_HPU_HPUGRAPH_REPLAY_TIMING=5000$SPINKV")
+grep -q '^tiny-rebuild ok' "$V" && MORE+=("real-rebuild:$RB:$RB_KV$SPINKV")
+if grep -q '^tiny-lean ok' "$V"; then
+    MORE+=("real-lean:$L:PT_HPU_HPUGRAPH_PREPARED_REPLAY=1;PT_HPU_HPUGRAPH_REPLAY_TIMING=5000$SPINKV")
+    [ -z "$PIN_KV" ] || MORE+=("real-pin:$L:PT_HPU_HPUGRAPH_PREPARED_REPLAY=1;PT_HPU_HPUGRAPH_REPLAY_TIMING=5000;$PIN_KV$SPINKV")
+fi
 [ ${#MORE[@]} -eq 0 ] || bash "$J" --sha "$S" --image "$IMG" "${ENV[@]}" --cmd "$PROBE" "${MORE[@]}"
 echo "bridge_vendor: verdicts:"
 cat "$V"

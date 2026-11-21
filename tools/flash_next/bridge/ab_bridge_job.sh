@@ -7,7 +7,8 @@
 # job), probed by the farm's serve_probe.sh + decode_scaling.py. Deployed to ~/farm/collectives/bridge/.
 #
 #   ab_bridge_job.sh [--sha SHA12] [--image IMG] [--env KEY=VALUE]... [--cmd 'COMMAND WORDS'] [--stop-on-fail] ARM...
-#     ARM = name:BUILD[:KEY=VALUE[,KEY=VALUE...]]; --stop-on-fail: no further arm after one that failed;
+#     ARM = name:BUILD[:KEY=VALUE[,KEY=VALUE...]] (';' instead of ',' when a value holds a comma);
+#     --stop-on-fail: no further arm after one that failed;
 #     --image: every arm in that image (farm_job.sh --image: another track's build, the bundle stays this track's;
 #     the plugin is installed in an image, so its servers run the image's code); --env: for every arm, before
 #     the arm's own KEY=VALUE pairs; --ref-arm NAME: tiny arms are compared with arm NAME of an earlier call in
@@ -74,7 +75,9 @@ for arm in "$@"; do
     has_reserved=0
     case " ${COMMON_ENV[*]-} " in *" VLLM_GRAPH_RESERVED_MEM="*) has_reserved=1 ;; esac
     if [ -n "$kvs" ]; then
-        IFS=',' read -r -a pairs <<<"$kvs"
+        sep=','
+        case "$kvs" in *';'*) sep=';' ;; esac  # ';' separates the pairs when a value holds a comma
+        IFS="$sep" read -r -a pairs <<<"$kvs"
         for kv in "${pairs[@]}"; do
             envs+=(--env "$kv")
             case "$kv" in VLLM_GRAPH_RESERVED_MEM=*) has_reserved=1 ;; esac
