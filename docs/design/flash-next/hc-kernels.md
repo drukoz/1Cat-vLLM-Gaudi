@@ -18,11 +18,17 @@ the report. Labels: MEASURED (card), VERIFIED (simulator or CPU test named), INF
   traces, split card scripts), `aaf256ea` (merge of the program branch at `e5188341`); then the fold build
   (variants 6/7: `gdn_core_verify_recurrence_fold.h`, `GDN_VERIFY_BATCHED_GATES`), simulator 0.609-0.630 of the
   interleaved kernel's instructions, every verify case byte-identical.
-- **PR step 1 (HC + GDN variants 1-5):** gate green on `aaf256ea` (113 files, 10:25 UTC); the program branch moved
-  (PRs #24, #25), so `d07b2155` = `aaf256ea` + `4f070c75` was pushed as `feat/flash-next-gaudi-hc-kernels-pr1` and is
-  gated from `reports/hc-kernels/gate-pr1` (log `reports/hc-kernels/logs/gate_pr1.log`); when green: `gh pr create
-  --base feat/flash-next-gaudi --head feat/flash-next-gaudi-hc-kernels-pr1` (body `reports/hc-kernels/pr/
-  pr_body_step1.md`), `gh pr merge --merge`, PR number to the coordinator. The fold build goes in a later PR.
+- **PR:** the gate on `aaf256ea` was green (10:25 UTC) but the program branch moved twice; the pr1 gate was
+  stopped. Now: the whole branch (HC + GDN variants 1-7) merged with the program head `4d66755e` = `a1f36d80`,
+  CPU tests green on it (39 files, 5 card-only skips), gate `bin/gate reports/hc-kernels/gate-a1f36d80 --tools`
+  waiting for a slot (log `reports/hc-kernels/logs/gate_a1f36d80.log`). When green: push `a1f36d80` as
+  `feat/flash-next-gaudi-hc-kernels-pr2`, `gh pr create --base feat/flash-next-gaudi --head
+  feat/flash-next-gaudi-hc-kernels-pr2` with body `reports/hc-kernels/pr/pr_body_merge1.md` (add a line that PR #28,
+  merged since, touches only `hpu_model_runner.py`), `gh pr merge --merge`, PR number to the coordinator.
+- **Build 6a (00249, coordinator 12:25 UTC)** runs HC IL and the GDN verify variant late-bound: default 6, switched by
+  integration's `make_run6.sh a --gv 7` or `--no-gv` on 00239's verdict. So 00239's verdict goes to the coordinator
+  the moment its first benches land: op test 6 green and every bit line (incl. chain) "bit-identical" -> 6, or 7 if
+  7's us per call at batch 32 is lower; op test red or any DIFFERS -> `--no-gv` (and kernel-fixes' ACC check).
 - **Card:** job A = **00231** `hc-quick` (image `b9ff6384`, hold 12 min, after build 5 on card 6:
   `tools/flash_next/hc_kernels/card_hc_quick.sh`: HC op card test, the TP1 tiny gate with `VLLM_HPU_HC_FUSED_IL=1`
   (stands in for TP8, coordinator 09:33), the HC bench at 4/32/96/128 rows, traces at 128 rows). Job B =
@@ -36,8 +42,9 @@ the report. Labels: MEASURED (card), VERIFIED (simulator or CPU test named), INF
   `reports/hc-kernels/logs/farm_gdn-variants*.out` (00232 was the image without the fold build).
   When a job ends: `bin/farm fetch hc-kernels <id> <id>-<name>` if its waiter is gone; read `pytest_il.log`,
   `tiny.log`, `bench.log` (VERDICT), `gdn_bench_variant*.log` (us per call and "bit-identical" lines),
-  `gdn_optest_variant6.log`; traces with `python3 tools/flash_next/hc_kernels/kernel_engines.py <trace> <kernel>`;
-  send kernel-fixes the GDN result.
+  `gdn_optest_variant6.log`; `python3 reports/hc-kernels/tools/gdn_job_summary.py <results dir> --traces` prints
+  the op tests, us per call per variant and batch, every bit line and the traced engines; send kernel-fixes the GDN
+  result.
 - **Job A 00231 ended 12:01 UTC, green** (section 5): op card test 41 passed, TP1 tiny gate PASSED, device time
   per call at 128 rows gate_mix 40.5 -> 15.2 us, combine_norm 29.8 -> 10.0 us (about -4.7 ms per 128-row step).
 - **Next:** build-6 arm for the coordinator: `VLLM_HPU_HC_FUSED_IL=1` (with `VLLM_HPU_HC_FUSED=1`), card-proven; and
