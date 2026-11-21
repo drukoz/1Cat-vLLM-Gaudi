@@ -8,6 +8,103 @@ file), VERIFIED (CPU test or code line), INFERRED.
 
 ## Handoff (if this agent stopped)
 
+Last update: 2026-11-21 09:35 UTC (`date -u`), first agent of the track (Opus 5.5), started 04:35 UTC. The notes
+after the next horizontal rule are history (06:50 UTC and before).
+
+**Where things are (09:35 UTC).**
+- **PR #23 merged** into `feat/flash-next-gaudi` as merge commit `e5188341`, from the gated head `d44ca56d` (gate: 74
+  files, 0 red). It contains:
+  - the one-graph draft (`VLLM_HPU_MTP_DRAFT_GRAPH`, card-verified in 00194);
+  - the chained draft (`VLLM_HPU_MTP_DRAFT_CHAIN`, stage A `73e9fbf8`, stage B `c0bef8d8`, runtime switch
+    `214cdcf4`; CPU-verified, not yet on a card).
+
+  All flags are default 0.
+- Feature branch `feat/flash-next-gaudi-mtp-draft-graph`, after PR #23:
+  - `a7508d00`: `_mtp_chain_step` and `_mtp_chain_out` reset at the top of `sample_tokens`. Before, a step
+    without decodes kept the last chained step's values: its timer records were labelled `+chain`, and async
+    scheduling's mode 3 would have read a stale chain. Red-then-green engine check.
+  - An engine test of the chain switched at run time.
+  - This handoff.
+
+  Next PR after its own gate.
+- The gate of `436855e7` had one red file, `test_gdn_core_decode_batch.py::test_padded_batch_matches_off[negative]`
+  ("RECURRENCE pad=-1: conv slot 5 differs from OFF"). It passed alone on the program head `adbcff30` and on this
+  branch, and it was green in the gate of `d44ca56d`. INFERRED: intermittent, and not this branch's code.
+- **Card job 00228 `real8-chain-b5`** (all, 100 min; replaced 00212; the coordinator places it right after build
+  5's 00222, about 13:00 UTC).
+  - Branch and image: `feat/flash-next-gaudi-mtp-draft-graph-b5` at `ea1715fa`, image
+    `farm-mtp-draft-graph:ea1715fa06e8`. It is build 5 (`integration/card-build-20261120b` at `eb21ac75`) plus:
+    - the chain (`f3d82f32`, `357f220c`, `2a07e787`, `6a7a87ce`);
+    - engine-step's `844a37f2` (`VLLM_HPU_VERIFY_LOGITS_IN_GRAPH`) and `ca52fa33` (`VLLM_HPU_LOG_UNMATCHED_GRAPH_INPUTS`);
+    - `64656082`: the verify graph's ids handed to the chain whole, VLG runtime-switchable;
+    - async-sched's M1 (`249647f7`, `c1906d33`, `70d41eb9`), with `0cc01f43` putting its flag in SWITCHABLE;
+    - the harness (`7fe2bea8`, `ea1715fa`).
+  - Submit script and log: `reports/mtp-draft-graph/card/submit-chain-b5.log`.
+  - Env: build 5's serve-candidate env as 00222 runs it, every server async (`ASYNC_SCHED=2`, MTP timer 0), levels
+    32 and 1, 2 rounds.
+  - Arms:
+    1. `tiny`;
+    2. `mtp2-async-cuts-switch` and `mtp2-async-switch`: `graph-md-all` (off, on, md, on-md, all). The
+       REPLICATED_FC + REPLICATED_EMBEDDING levers and the KV capacity with and without (server logs).
+    3. `tiny-chain`, `tiny-chain-vlg`, `tiny-chain-vp`: the chain's gates.
+    4. `mtp2-async-cuts-chainsw`: on-md, chain-md, vlg, chain-vlg, all, chain-all on one server.
+    5. `tiny-m1` and `mtp2-async-cuts-m1sw`: async-sched's M1, 0 against 2, with the chain on.
+  - Placement: async-sched's switch, through the hard link `~/farm/mtp-draft-graph/results/switches/place`.
+  - Arms can be changed late with `~/farm/mtp-draft-graph/results/late/run-chain.sh`.
+  - async-sched builds its M2 job on `ea1715fa`.
+- **What to read when 00228 ends** (`bin/farm fetch mtp-draft-graph 00228 00228-real8-chain-b5` if no waiter
+  copied it):
+  - `headline.md`;
+  - per arm folder, `tools/ab_summary.py <arm folder>` (rounds per arm, means, text identity);
+  - the tiny gates' lines in the job log: the chain's stage, `HPU graph replay copies ...` (the chain graph's
+    copied inputs), M1's `=1: ... 0 with differences`;
+  - the servers' `GPU KV cache size` (cuts against plain: the token capacity with and without
+    REPLICATED_EMBEDDING);
+  - the chain arms against their twins at 32 and 1 stream: chain-md vs on-md, chain-vlg vs vlg, chain-all vs all;
+  - m1on vs m1off.
+
+**The chained draft (`VLLM_HPU_MTP_DRAFT_CHAIN=1`, the coordinator's item (b), 08:10 UTC).**
+
+Today the runner reads the verification's result on the host (`parse_output`), then builds the draft's inputs and
+issues the draft. So the draft's host issue (8 to 15 ms per step at 32 streams on TP8) sits between two device
+phases.
+
+With the chain, right after the rejection sampler and before any host read, the drafter issues `MtpDraftChain`
+(one HPU graph, `flash_next_mtp_steps.py`):
+- `chain_draft_rows`: each request's committed rows, last row, accepted count and bonus token from the device
+  result (`HpuEagleProposer.prepare_inputs` on the device);
+- the pass-0 inputs gathered from the target's rows;
+- `draft_step_slots`: the later passes' block tables and slots from the device positions (engine-step's I01 builder
+  on the device);
+- then `MtpDraftLoop`'s passes. The ids are int32 from fp32 id tables (`first_max_ids`, card rule 9).
+
+Stage B: when the verification's per-row greedy ids are on the device (VP, or engine-step's VLG), the greedy
+rejection (`greedy_rejection_sample_from_tokens`) runs inside the chain's graph too.
+
+The host then reads the result and keeps its books as before (`HPUModelRunner._mtp_chain_settle`). It takes the
+drafts from `_mtp_chain_out`: `MtpChainOut` with accepted, next_ids, sampled, last_row, num_decodes, k and drafts,
+the interface agreed with async-sched.
+
+Refused (today's path, each reason logged once): a prefill in the step, a sampled request, structured output, the
+draft-rank log, no `VLLM_HPU_MTP_DRAFT_GRAPH=1`, I01 not in force. The runner logs once which stage ran. Timer kind
+`+chain`.
+- CPU (VERIFIED): `test_mtp_draft_chain.py` 10 passed. In the engine rehearsal, every variant's drafts and streams
+  equal the per-pass drafter's:
+  - k = 1, 2, 3, every prompt at once, and stage B with VP;
+  - on the job branch also: stage B on the verify graph's ids, and the six chain arms switched at run time in one
+    run;
+  - M1 switched 2 → 0 → 2 with the chain.
+- INFERRED gain at 32 streams: about 12 ms per step. The draft's host issue overlaps the verification's device
+  time, and the host read now also waits for the draft's device time (2.6 ms at 32 streams).
+- Split of item (c) with engine-step (their message, 08:55 UTC):
+  - engine-step takes the logits region into the captured verify forward (`VLLM_HPU_VERIFY_LOGITS_IN_GRAPH`, their
+    `844a37f2`), plus the front (embedding, PLE cast) and the final-mix cut;
+  - this track takes the greedy rejection into the chain (stage B, done).
+
+---
+
+### Earlier handoff (06:50 UTC)
+
 Last update: 2026-11-21 06:50 UTC (`date -u`), first agent of the track (Opus 5.5), started 04:35 UTC.
 
 **Goal (coordinator, 04:45 UTC).** Run the k draft passes of an MTP decode draft in ONE HPU graph behind a default-off
