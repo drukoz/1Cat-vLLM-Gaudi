@@ -350,15 +350,19 @@ kernels pass the Gaudi2 instruction simulator and have not run on a card; see
 per-channel FP8 MoE (`VllmMixtureOfExpertsOpFP8PerChannel`, Flash-Next's experts
 with `VLLM_HPU_FORCE_CHANNEL_FP8`). `1` keeps the layer's stacked FP8 experts
 when its weights are prepared and runs a step of at most
-`VLLM_HPU_MOE_DENSE_MAX_TOKENS` tokens (integer, default `512`) as two batched
+`VLLM_HPU_MOE_DENSE_MAX_TOKENS` tokens (integer, default `512`) and at least
+`VLLM_HPU_MOE_DENSE_MIN_TOKENS` tokens (integer, default `17`) as two batched
 FP8 GEMMs over all local experts (every expert on every row, the routing
 weight of a pair that is not routed is 0) instead of
-`torch.ops.hpu.mixture_of_experts`; longer steps keep the vendor op. On one
+`torch.ops.hpu.mixture_of_experts`; longer and shorter steps keep the vendor op
+(below the minimum the vendor op reads only the experts the rows hit). On one
 card the vendor op costs several times what reading the local experts once
 costs at 32 to 512 rows (`tools/flash_next/kernel_probes/probe_moe_layers.py`,
 `probe_moe_dense.py`). `0` (or any other value) keeps the vendor op. The two
 forms agree to FP8 rounding (the dense form quantizes the intermediate per
-expert and row). Not yet run on a card.
+expert and row). On the real model (TP8, MTP k = 3, job 00177) the first form of
+this path, without the minimum and with an fp32 weighted sum, was slower than
+the vendor op; keep it off until a later A/B shows otherwise.
 
 `VLLM_HPU_MOE_GLUE_MERGE_GATE_UP` (integer, default `0`) applies only with
 `VLLM_HPU_MOE_GLUE=1`. `1` appends the shared expert's gate_up rows of this
