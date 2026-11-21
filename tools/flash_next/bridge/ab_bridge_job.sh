@@ -19,7 +19,10 @@
 # (for example 'python /farm/farm_tiny.py --gdn hc': the tiny model at TP = the job's cards; its arms are then
 # compared prompt by prompt, and the job fails unless every arm passed with the same tokens). Results: ~/farm/<track>/results/<job>-<name>-<arm>/ (scaling.json,
 # server0.log, probe.log, versions.txt, summary.json, bridge.json), and one summary line per arm and level here.
-# Exit code 0 when every arm's server answered and its probe ended well.
+# Exit code 0 when every arm's server answered and its probe ended well. Every call also appends one line per arm,
+# "<arm> ok" or "<arm> fail <reason>", to ~/farm/<track>/results/<job>-<name>-verdicts.txt (a tiny arm is ok when
+# its smoke passed with the tokens of the call's first tiny arm; a server arm when it ended with exit code 0 and
+# left a scaling.json), so that a job script can run a later arm only where an earlier one passed.
 set -u
 F="$HOME/farm"
 TRACK="${CARDQ_TRACK:?not inside a job of the card queue}"
@@ -44,6 +47,8 @@ RESERVED="$([ "$NCARDS" -ge 8 ] && echo 0.4 || echo 0.5)"
 WRAP='exec python3 "$FARM_OUT/bridge/with_bridge.py" "$FARM_OUT/bridge" -- "$@"'
 now() { date -u +%T; }
 rc_all=0
+RCS="$F/$TRACK/results/$JOB-$NAME-arms.rc"
+VERDICTS="$F/$TRACK/results/$JOB-$NAME-verdicts.txt"
 echo "ab_bridge: job $JOB, commit $SHA, cards ${CARDQ_CARDS:-?}, arms: $* [$(now)]"
 for arm in "$@"; do
     name="${arm%%:*}"
@@ -93,6 +98,7 @@ for arm in "$@"; do
     grep -E "^BRIDGE |serve_probe: (SERVER-|PROBE-RC|DONE|fallback)|^MEAS|^SAMPLED|^TEXT|tiny smoke|decode_ms" "$out/arm.log" \
         | cut -c1-220 | head -40
     echo "ab_bridge: arm $name ended rc $rc [$(now)]"
+    printf '%s %s\n' "$name" "$rc" >>"$RCS"
     [ "$rc" -eq 0 ] || rc_all=$rc
     sleep "${CARD_RELEASE_S:-15}"  # the cards are not free the moment the server's processes end
     if [ "$rc" -ne 0 ] && [ "$STOP_ON_FAIL" -eq 1 ]; then
@@ -102,13 +108,23 @@ for arm in "$@"; do
 done
 # one line per arm and level: the steady ms per token (median gap between chunks) of the measured rounds; with
 # --cmd and the tiny smoke: each arm's result and its tokens against the first arm's, prompt by prompt
-python3 - "$F/$TRACK/results" "$JOB-$NAME" "$@" <<'PY' || rc_all=$?
+python3 - "$F/$TRACK/results" "$JOB-$NAME" "$RCS" "$VERDICTS" "$@" <<'PY' || rc_all=$?
 import json, sys, os, glob
-root, prefix, arms = sys.argv[1], sys.argv[2], sys.argv[3:]
+root, prefix, rcs_path, verdicts_path, arms = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5:]
 tiny, first, bad = {}, None, False
+rcs = {}
+if os.path.exists(rcs_path):
+    for line in open(rcs_path):
+        if line.strip():
+            k, v = line.split()[:2]
+            rcs[k] = v
+verdicts = []
 for arm in arms:
     name = arm.split(":")[0]
     folder = os.path.join(root, "%s-%s" % (prefix, name))
+    if name not in rcs:
+        verdicts.append("%s fail not run" % name)
+        continue
     details = sorted(glob.glob(os.path.join(folder, "*", "details.json")))
     if os.path.exists(os.path.join(folder, "summary.json")) and details:
         s = json.load(open(os.path.join(folder, "summary.json")))
@@ -122,6 +138,7 @@ for arm in arms:
             "%s: %s" % (m, " ".join("%s:%s/%s%s" % (i, v[0], v[1], "~" if v[3] else "") for i, v in sorted(r.items())))
             for m, r in modes.items())))
         bad = bad or not s.get("passed")
+        same = True
         if first is None:
             first = (name, modes)
         else:
@@ -129,18 +146,34 @@ for arm in arms:
             print("ab_bridge: %-8s tokens %s the %s arm's, prompt by prompt" % (
                 name, "EQUAL to" if same else "DIFFER from", first[0]))
             bad = bad or not same
+        if not s.get("passed"):
+            verdicts.append("%s fail smoke rc %s" % (name, rcs.get(name)))
+        elif not same:
+            verdicts.append("%s fail tokens differ from %s" % (name, first[0]))
+        else:
+            verdicts.append("%s ok" % name)
         continue
+    if rcs.get(name) != "0":
+        verdicts.append("%s fail rc %s" % (name, rcs.get(name)))
     try:
         d = json.load(open(os.path.join(folder, "scaling.json")))
     except Exception as exc:
         print("ab_bridge: %-8s no scaling.json (%s)" % (name, exc))
+        if rcs.get(name) == "0":
+            verdicts.append("%s fail no scaling.json" % name)
         continue
+    if rcs.get(name) == "0":
+        verdicts.append("%s ok" % name)
     for lv in d.get("levels", []):
         print("ab_bridge: %-8s N=%-3s rep %s: steady ms/token p50 %s x tokens/chunk %s, ms/token p50 %s, "
               "total tok/s %s, ok %s err %s" % (
                   name, lv.get("streams"), lv.get("rep"), lv.get("steady_ms_per_token_p50"),
                   lv.get("tokens_per_chunk_p50"), lv.get("ms_per_token_p50"), lv.get("aggregate_tok_s"),
                   lv.get("ok"), lv.get("errors")))
+with open(verdicts_path, "a") as f:
+    for v in verdicts:
+        f.write(v + "\n")
+        print("ab_bridge: VERDICT " + v)
 sys.exit(3 if bad else 0)
 PY
 echo "ab_bridge: DONE rc $rc_all [$(now)]"
