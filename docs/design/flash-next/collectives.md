@@ -297,6 +297,48 @@ Every job runs the committed tree in the farm's per-commit image (`CARD.md`); sc
 A probe that sends `min_tokens` measures none of this: a request with `min_tokens` is kept out of the greedy region
 (`_can_fuse_plain_greedy_sampling`, `hpu_model_runner.py`), so the logits are gathered and sampled as before.
 
+## 7. Our own build of the PyTorch bridge in farm jobs (deployment; from 2026-11-21 00:40 UTC)
+
+Why (coordinator, 00:40 UTC): about 150 of every 188 us of host time per graph launch is the PyTorch bridge's
+own work (step-anatomy, RESULTS.md "Integration card build"); native-replay writes a bridge-only "prepared replay"
+patch against gaudi-pytorch-bridge v1.24.1 (5176b1b2, the node's exact version, `habana-torch-plugin 1.24.1.482`
+in the image). This track deploys native-replay's builds into farm jobs and qualifies them on the card.
+
+Interface (agreed with native-replay, 00:45 UTC):
+- **Builds** (native-replay, no card): `~/farm/native-replay/bridge-build/out/<build-id>/` on the node with
+  `wheels/*.whl`, `manifest.json` (`build_id`, `bridge_commit`, `patch_sha256`, `built_at`, `wheels` {file:
+  sha256}, optional `files` {file: [sha256, destination]}, `env_flag`) and `build.log`; a copy under
+  `~/farm/native-replay/results/bridge-builds/<build-id>/`. Ids: `stock-5176b1b2` (unpatched),
+  `lean-<12 hex of the patch's sha256>` (patched).
+- **Switch:** `bin/farm job|tiny|serve ... --bridge <build-id>` (this track's change to `bin/farm`, 2026-11-21;
+  the diff is `tools/flash_next/bridge/farm-bridge-option.diff` against card-farm's `farm.sh` at a2fd0cf8: a
+  `farm install` from wt/card-farm would undo it). The job script copies the build into the job's own results
+  folder when the job starts (the container's `$FARM_OUT/bridge`) and wraps the job's command with
+  `tools/flash_next/bridge/with_bridge.py` (deployed to `~/farm/collectives/bridge/with_bridge.py`): every
+  wheel's sha256 against the manifest, `pip install --no-deps --force-reinstall --no-index`, then a fresh process
+  imports the bridge, runs one HPU op and must map only the wheels' `.so` files (md5 from `/proc/self/maps`,
+  also for a bridge library loaded from outside the package, e.g. through `LD_LIBRARY_PATH`); `bridge.json` in
+  the results, one `BRIDGE <build-id> ok: ...` line in the log; exit 7 (cannot install) or 8 (does not load, or
+  not what was installed); the compiled-recipe cache moves to `$FARM_RECIPE_CACHE/bridge-<build-id>`. No image
+  per combination; the install costs seconds of the job's hold. CPU test:
+  `tests/unit_tests/tools/test_with_bridge.py` (a fake bridge in a scratch venv; 5 cases).
+- **Flag:** `PT_HPU_HPUGRAPH_PREPARED_REPLAY` (0 = stock replay, the default), read by the bridge itself; set it
+  with `--env` (a stock bridge ignores it).
+- The image's bridge (VERIFIED on the node, 00:50 UTC): `/usr/local/lib/python3.10/dist-packages/habana_frameworks/
+  torch/lib/` holds `libhabana_pytorch{,2}_plugin.so`, `libhabana_pytorch_backend.so` and their `.upstream.so`
+  twins; `python` and `python3` are both `/usr/bin/python3.10`; `/usr/lib/habanalabs` (on `LD_LIBRARY_PATH` and
+  `PYTHONPATH`) holds no bridge library in the image (the build container's build system links its own there).
+
+Qualification, in order (each decides the next):
+
+| Step | Job | Decides |
+|---|---|---|
+| a1 | the tiny model at TP1, `--gdn hc`: stock (plain `farm tiny`) and `--bridge stock-5176b1b2`, two 1-card jobs side by side | the deployment path: the rebuilt, unpatched bridge loads (BRIDGE ok, md5s) and gives the tokens of the stock bridge |
+| a2 | the same with `--bridge stock-5176b1b2` at TP8 (all) | the same through HCCL at 8 ranks |
+| a3 | `--bridge lean-<x>`, tiny at TP1 and TP8, `PT_HPU_HPUGRAPH_PREPARED_REPLAY=0` and `=1` | the patch keeps the tokens with the flag off and on |
+| b | native-replay's `bench_replay.py` at TP8 (`replay`, `replay_seg`), lean build, flag 0 against 1 | the host cost per launch the patch removes |
+| c | the real model at TP8, 1 and 32 streams (`serve_probe.sh` + `decode_scaling.py`): stock bridge, lean flag 0, lean flag 1 | the step time; texts equal at 1 stream |
+
 ## Handoff (if this agent stops)
 
 State at 23:35 UTC on 2026-11-20 (fourth agent of this track, from 23:15 UTC, Opus 5.5). Branch
