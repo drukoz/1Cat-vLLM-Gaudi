@@ -4,7 +4,7 @@ Design note, report and handoff of the `hc-kernels` track (branch `feat/flash-ne
 `/Volumes/Storage/Claude/gaudi-work/wt/hc-kernels`). The harness refuses report files for this agent, so this note is
 the report. Labels: MEASURED (card), VERIFIED (simulator or CPU test named), INFERRED (arithmetic or reading).
 
-## 0. Handoff (if this agent stops) — updated 10:50 UTC 2026-11-21
+## 0. Handoff (if this agent stops) — updated 12:01 UTC 2026-11-21
 
 - **Goal 1:** the two hyper-connection TPC kernels (`hc_fused_gate_mix`, `hc_fused_combine_norm`) at 128
   verification rows (32 streams, MTP k = 3) from about 7 ms per step to about 2 ms. **Goal 2:** the GDN verify kernel
@@ -38,8 +38,10 @@ the report. Labels: MEASURED (card), VERIFIED (simulator or CPU test named), INF
   `tiny.log`, `bench.log` (VERDICT), `gdn_bench_variant*.log` (us per call and "bit-identical" lines),
   `gdn_optest_variant6.log`; traces with `python3 tools/flash_next/hc_kernels/kernel_engines.py <trace> <kernel>`;
   send kernel-fixes the GDN result.
-- **Next:** build-6 arm for the coordinator: `VLLM_HPU_HC_FUSED_IL=1` (with `VLLM_HPU_HC_FUSED=1`) once job A is
-  green, and `VLLM_HPU_GDN_VERIFY_VARIANT=6` or `7` (with `VLLM_HPU_GDN_KERNEL_INTERLEAVE=1`) once job B is.
+- **Job A 00231 ended 12:01 UTC, green** (section 5): op card test 41 passed, TP1 tiny gate PASSED, device time
+  per call at 128 rows gate_mix 40.5 -> 15.2 us, combine_norm 29.8 -> 10.0 us (about -4.7 ms per 128-row step).
+- **Next:** build-6 arm for the coordinator: `VLLM_HPU_HC_FUSED_IL=1` (with `VLLM_HPU_HC_FUSED=1`), card-proven; and
+  `VLLM_HPU_GDN_VERIFY_VARIANT=6` or `7` (with `VLLM_HPU_GDN_KERNEL_INTERLEAVE=1`) once job B (00239) is green.
 - Tools: `tools/flash_next/hc_kernels/sim_cost.py` (simulator instructions per index-space point, oracle check,
   bit-equality against another build), `tools/flash_next/hc_kernels/bench_hc.py` and `bench_gdn_verify.py` (1-card
   chained replay benches), `tools/flash_next/hc_kernels/kernel_engines.py` (per-engine time of a kernel in a
@@ -150,11 +152,35 @@ stream per point: 1,073 per (stream, token).
   and the shipped op on the card, a hyper-connection chain at 4/32/96/128 rows against the shipped chain, the ops in
   an HPU graph replayed).
 
-## 5. Card plan
+## 5. Card results (job 00231 `hc-quick`, image `b9ff6384`, card 6, 11:57-12:01 UTC, exit 0, 211 s)
 
-1. 1-card job (`any:1`, about 10 minutes): `bash tools/flash_next/hc_kernels/card_1card.sh`.
-2. Tiny TP8 token gate with `VLLM_HPU_HC_FUSED=1 VLLM_HPU_HC_FUSED_IL=1` (tokens equal the CPU reference).
-3. Build-6 arm: build 5's flags plus `VLLM_HPU_HC_FUSED_IL=1`; read the 32-stream MTP step and the device trace.
+MEASURED, `reports/hc-kernels/card/00231-hc-quick/`:
+- `tests/unit_tests/hc_fused/test_hpu_op_il.py`: **41 passed** (the interleaved ops against the oracle and the shipped
+  ops on the card).
+- Tiny-model token gate at TP1 with `VLLM_HPU_HC_FUSED=1 VLLM_HPU_HC_FUSED_IL=1 VLLM_HPU_HC_FUSED_COPY_MODE=2`
+  (`--gdn hc`): **PASSED**, tokens match the reference, no fallback line (neither "HC fused ... is off" nor the
+  interleaved one), decode 4.1 ms/token on the tiny model. Stands in for TP8 (coordinator, 09:33); build 6's own TP8
+  tiny gates cover TP8.
+- Parity on the card (`bench_hc.py`, against the shipped ops): gate_mix bit-equal 99.993 % (32, 96 rows) to
+  99.995 % (128 rows); combine_norm 100 % / 99.9997 % to 100 %; oracle ok at 4, 32, 96, 128 rows.
+- Device time per call at 128 rows (profiler traces, `kernel_engines.py`, 72 executions each):
+
+  | kernel | shipped | interleaved | engines | ratio | simulator said |
+  |---|---|---|---|---|---|
+  | gate_mix | 40.5 us | 15.2 us | 24 / 24 | 2.66x | 2.70x |
+  | combine_norm | 29.8 us | 10.0 us | 22 / 22 | 2.98x | 3.52x |
+
+  The shipped numbers equal 00205's real-model trace (41.1 and 30.1 us). combine_norm_il's engines are unevenly
+  loaded (per-engine busy 3.2 to 9.8 us: 128 one-token points over 22 engines), which is where its ratio falls
+  short of the simulator's; an even split would give about 8.3 us (INFERRED).
+- Per step at 128 rows (INFERRED from the MEASURED device times x 00205's 106 gate_mix and 101 combine_norm calls):
+  7.30 ms -> 2.62 ms, **about -4.7 ms per 128-row step**.
+- Wall-clock per hyper-connection (chained replay slope, gate_mix + combine_norm + the chain add, one card):
+  29.6 -> 26.5 us at 4 rows, 44.6 -> 32.0 at 32, 77.4 -> 45.0 at 96, 98.7 -> 54.1 at 128. The per-op wall slopes of
+  this bench are noisy at 6 iterations (one is negative); the traces above are the numbers to use.
+
+Build-6 arm: build 5's flags plus `VLLM_HPU_HC_FUSED_IL=1` (it needs `VLLM_HPU_HC_FUSED=1`); read the 32-stream MTP
+step and the device trace.
 
 ## 6. GDN verify kernel (`gdn_fused_core_verify`, Goal 2)
 
