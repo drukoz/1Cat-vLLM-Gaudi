@@ -552,6 +552,7 @@ if TYPE_CHECKING:
     VLLM_HPU_GDN_KERNEL_INTERLEAVE: int = 0  # 0 today's GDN decode/verify kernels, 1 four value rows per iteration
     VLLM_HPU_GDN_GLUE_CACHE: int = 0  # 0 per-step glue of the fused GDN ops (default), 1 constants and indices cached
     VLLM_HPU_FLASH_NEXT_ASYNC_SCHED: int = 0  # 0 Flash-Next without async scheduling (default), 1 with it, 2 also MTP
+    VLLM_HPU_FLASH_NEXT_SPEC_DEVICE_INPUTS: int = 0  # 0 host-made (default), 1 device-made + check, 2 device-made
     VLLM_HPU_PLE_HOST_NGRAM_IDS: int = 0  # 0 PLE n-gram ids computed in the graph (default), 1 on the host
     VLLM_HPU_HC_FUSED: int = 0  # 0 torch hyper-connections (default), 1 the fused hyper-connection kernels
     VLLM_HPU_MOE_GLUE: int = 0  # 0 torch MoE glue (default), 1 the fused MoE glue kernels
@@ -2118,6 +2119,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Any other value is 0. See docs/design/flash-next/async-sched.md.
     "VLLM_HPU_FLASH_NEXT_ASYNC_SCHED":
     lambda: int(os.environ.get("VLLM_HPU_FLASH_NEXT_ASYNC_SCHED", "0")),
+    # Flash-Next MTP (async-sched stage 2, M1): a verification step's inputs that depend on the previous step's
+    # acceptance (ids, positions, KV slots, GDN accepted counts, PLE context) made on the device. 1 also compares them
+    # with the host-made ones every step (a host read), 2 uses them. Needs VLLM_HPU_FLASH_NEXT_DECODE_METADATA=1.
+    "VLLM_HPU_FLASH_NEXT_SPEC_DEVICE_INPUTS":
+    lambda: int(os.environ.get("VLLM_HPU_FLASH_NEXT_SPEC_DEVICE_INPUTS", "0")),
 
     # Flash-Next hyper-connections through the fused TPC kernels (flashinfer_gaudi.hc_fused: hc_norm,
     # hc_silu, hc_silu_split, hc_gate_mix, hc_combine, hc_combine_norm). 0 (default) = the torch path,
