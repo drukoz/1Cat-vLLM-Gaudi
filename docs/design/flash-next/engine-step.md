@@ -494,6 +494,9 @@ median wall ms per engine step over 60 steps, flags as noted.
   also on the steps where nothing changes (no block boundary, no newly full block). A decode fast path would have
   to reproduce Mamba align mode's per-step partial-tail caching (`MambaManager.cache_blocks` re-marks the prompt
   tail in `cached_blocks_this_step`); not done.
-- The card's `prepare` is about 2 ms at 32 rows (step-anatomy 00013) against 0.32 ms here: the 11 small
-  host-to-device copies per step are the suspect. Job 00173 (`h2d_copies_bench.py`, one card) times them one by one
-  against one packed copy.
+- The card's `prepare` is about 2 ms at 32 rows (step-anatomy 00013) against 0.32 ms here. **Job 00173**
+  (`h2d_copies_bench.py`, one card, MEASURED, host us per step, median of 200): the eleven small copies of a
+  32-row step one by one cost 473 us to issue (about 43 us each) plus 790 us at the `mark_step` (with the bench's
+  consumer ops); one packed int32 copy with device slices costs 409 + 638 us (with clones of the slices 650 + 573);
+  at 1 row 345 + 571 against 362 + 587. So packing saves about 0.2 ms per step at 32 rows and nothing at 1 row: the
+  host-side packing and the slice ops eat most of what one copy saves. Not built (about 0.3 % of a step).
