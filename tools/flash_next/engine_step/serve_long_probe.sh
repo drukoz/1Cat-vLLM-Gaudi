@@ -31,6 +31,25 @@ rm -f "$VLLM_HPU_RUNTIME_SWITCH_FILE"
     echo "image: $(cat /farm-image 2>/dev/null)"; echo "cards: ${FARM_CARDS:-?} (modules ${FARM_MODULES:-?}), port $PORT, tp $TP"
     env | grep -E '^(VLLM_|PT_HPU|HABANA_VISIBLE|FARM_)' | sort
 } > versions.txt
+# May a process of this container take SCHED_FIFO (coordinator, 07:25 UTC: the launch thread at real-time
+# priority)? A throwaway python process asks for it and gives it back at once; nothing else changes, no sudo.
+python3 - > sched_fifo.txt 2>&1 <<'PY'
+import os
+import resource
+status = open("/proc/self/status").read().split("\n")
+capeff = next((line.split()[1] for line in status if line.startswith("CapEff:")), None)
+print("CapEff", capeff, "CAP_SYS_NICE", None if capeff is None else bool((int(capeff, 16) >> 23) & 1))
+print("RLIMIT_RTPRIO", resource.getrlimit(resource.RLIMIT_RTPRIO))
+try:
+    before = os.sched_getscheduler(0)
+    os.sched_setscheduler(0, os.SCHED_FIFO, os.sched_param(1))
+    during = os.sched_getscheduler(0)
+    os.sched_setscheduler(0, before, os.sched_param(0))
+    print("SCHED_FIFO permitted: policy %d -> %d -> %d (given back)" % (before, during, os.sched_getscheduler(0)))
+except OSError as error:
+    print("SCHED_FIFO not permitted:", error)
+PY
+echo "SCHED: $(tr '\n' ' ' < sched_fifo.txt)"
 # SERVE_SPEC_K=K: the server drafts K tokens with MTP (--speculative-config method mtp).
 SPEC_ARGS=()
 if [ -n "${SERVE_SPEC_K:-}" ]; then
@@ -81,7 +100,7 @@ wait "$CHILD"
 RC=$?
 echo "PROBE-RC $RC"
 echo "runtime switches logged by the workers: $(grep -c "Runtime switches from" server0.log)"
-grep -h "Runtime switch file\|sparse-QSA decode metadata\|is off for this server\|Candidate sampling" server0.log | sed 's/^.*\] //' | sort | uniq -c | head -12
+grep -h "Runtime switch file\|sparse-QSA decode metadata\|is off for this server\|Candidate sampling\|Worker GC freeze" server0.log | sed 's/^.*\] //' | sort | uniq -c | head -16
 echo "decode configurations compiled at run time: $(grep -o "Configuration: ('decode'[^)]*)" server0.log | sort -u | wc -l)"
 grep -o "Configuration: ('decode'[^)]*)" server0.log | sort | uniq -c | head -40
 grep -ciE "fallback|is off for|has no HPU kernel" server0.log | xargs echo "fallback/off lines:"

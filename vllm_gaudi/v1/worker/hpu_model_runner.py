@@ -38,6 +38,7 @@ from vllm_gaudi.extension.debug import init_debug_logger
 from vllm_gaudi.v1.core.recurrent_state_pool import pool_pad_block_id, pool_slots_from_env, pool_tensor_slots
 from vllm_gaudi.v1.worker.hpu_dp_utils import set_hpu_dp_metadata
 from vllm_gaudi.v1.worker.gdn_state_layout import has_contiguous_dflash_checkpoints
+from vllm_gaudi.v1.worker.gc_control import GcControl
 from vllm_gaudi.v1.worker.flash_next_inputs import (build_block_table, build_ple_inputs, decode_block_table_width,
                                                     dummy_ple_inputs,
                                                     model_requires_block_table, model_requires_raw_input_tokens)
@@ -6633,6 +6634,29 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         self.defragmenter.update_state(new | cached, scheduler_output.finished_req_ids)
         self.defragmenter.defragment()
 
+    _gc_control = None
+
+    def _gc_step_begin(self) -> None:
+        """VLLM_HPU_WORKER_GC_FREEZE (gc_control.py): this step's collector mode, and the step marked busy until
+        sample_tokens returns, so the idle collector runs only between steps."""
+        control = self._gc_control
+        if control is None:
+            if not gaudi_envs.VLLM_HPU_WORKER_GC_FREEZE:
+                return
+            control = self._gc_control = GcControl(log=logger.info)
+            sample = self.sample_tokens
+
+            def sample_tokens(*args, **kwargs):
+                try:
+                    return sample(*args, **kwargs)
+                finally:
+                    control.step_end()
+
+            self.sample_tokens = sample_tokens
+        control.apply(gaudi_envs.VLLM_HPU_WORKER_GC_FREEZE)
+        if control.mode:
+            control.step_begin()
+
     @torch.inference_mode()
     def _poll_runtime_switches(self) -> None:
         """VLLM_HPU_RUNTIME_SWITCH_FILE: take the per-step flags the operator changed since the last step
@@ -6669,6 +6693,8 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                 return EMPTY_MODEL_RUNNER_OUTPUT
             # For D case, wait until kv finish load here
             return self.kv_connector_no_forward(scheduler_output, self.vllm_config)
+        if not warmup_mode:
+            self._gc_step_begin()
 
         if self.is_pooling_model:
             # 1. padding input_ids and positions 2. fill attn_metadata

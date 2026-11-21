@@ -60,7 +60,7 @@ FLAGS = ("VLLM_HPU_FLASH_NEXT_DECODE_METADATA", "VLLM_HPU_FUSED_GREEDY_LOGITS", 
          "VLLM_HPU_VOCAB_PARALLEL_LOGITS")
 ARMS = {name: dict(zip(FLAGS, values)) for name, values in (
     ("base", (0, 0, 0, 0)), ("both", (1, 1, 0, 0)), ("i01", (1, 0, 0, 0)), ("i05", (0, 1, 0, 0)),
-    ("cand", (0, 0, 1, 0)), ("candvp", (0, 0, 1, 2)), ("cand2", (0, 0, 2, 0)), ("cand2vp", (0, 0, 2, 2)))}
+    ("cand", (0, 0, 1, 0)), ("candvp", (0, 0, 1, 2)), ("cand2", (0, 0, 2, 0)), ("cand2vp", (0, 0, 2, 2)), ("gc", (0, 0, 0, 0)))}
 
 
 def _load_spec_probe():
@@ -77,6 +77,7 @@ def _load_spec_probe():
 
 
 SPEC_PROBE = _load_spec_probe()
+GC_FLAG = "VLLM_HPU_WORKER_GC_FREEZE"
 SWITCH_LINE = "Runtime switches from"
 REFUSAL_LINE = "is off for this server"
 
@@ -136,6 +137,7 @@ def run_round(args, label, prompts, ntok, min_tokens=False, sampling=None):
                                                          barrier, args.timeout, min_tokens, sampling), daemon=True)
                for i in range(n)]
     t_start = time.perf_counter()
+    wall_start = time.time()
     for t in threads:
         t.start()
     for t in threads:
@@ -167,7 +169,8 @@ def run_round(args, label, prompts, ntok, min_tokens=False, sampling=None):
                     "first": r["times"][0], "last": r["times"][-1],
                     "gaps_ms": [round(1000.0 * g, 2) for g in gaps]})
     res = {"label": label, "streams": n, "tokens": ntok, "min_tokens": bool(min_tokens), "ok": len(per),
-           "errors": errors, "untimed": untimed, "wall_s": wall, "texts": texts}
+           "errors": errors, "untimed": untimed, "wall_s": wall, "texts": texts,
+           "t_start": round(wall_start, 3), "t_end": round(wall_start + wall, 3)}
     if per:
         res["steady_ms_p50"] = statistics.median(p["steady_ms"] for p in per)
         res["step_ms_p50"] = statistics.median(p["step_ms"] for p in per)
@@ -267,7 +270,9 @@ class Probe:
         """Replace the switch file with the arm's flags (a rename) while no request runs."""
         if arm == self.arm:
             return
-        flags = ARMS[arm]
+        flags = dict(ARMS[arm])
+        if getattr(self.args, "gc_arms", False):  # only then: a server without the flag refuses the whole file
+            flags[GC_FLAG] = 1 if arm == "gc" else 0
         if self.args.switch_file:
             time.sleep(self.args.settle)  # the last round's requests are done on every worker
             before = log_count(self.args.server_log, SWITCH_LINE)
@@ -419,7 +424,7 @@ def summary(probe):
     for res in probe.results["rounds"]:
         if res.get("tag") != "" or res.get("steady_ms_p50") is None or res.get("min_tokens"):
             continue
-        if res["kind"] not in ("short", "long", "sampled", "sampled1"):
+        if res["kind"] not in ("short", "long", "sampled", "sampled1", "gc32", "gc1"):
             continue
         rows.setdefault((res["kind"], res["arm"]), []).append(res)
     print("\nSUMMARY steady ms per token (median gap between chunks), measured rounds only")
@@ -494,6 +499,9 @@ def main():
                     "with the speculative counters per round (e.g. cand,cand2,cand2vp: VLLM_HPU_CANDIDATE_SAMPLING=1, "
                     "which leaves speculative steps to VLLM_HPU_SPEC_SAMPLED_VERIFY's path, 2, the candidate region, "
                     "and 2 with VLLM_HPU_VOCAB_PARALLEL_LOGITS=2)")
+    ap.add_argument("--gc-arms", action="store_true", help="after the other rounds: greedy rounds at N streams and "
+                    "1 stream with VLLM_HPU_WORKER_GC_FREEZE off (base) and on (gc), in turn and twice; every arm's "
+                    "switch file then carries the flag (the server must know it)")
     ap.add_argument("--logprobs-check", action="store_true", help="last: a request with logprobs=5 and one with "
                     "prompt_logprobs=2, the ids checked, then /health (a server that dies there loses nothing)")
     args = ap.parse_args()
@@ -650,6 +658,12 @@ def main():
         if mintok.get("steady_ms_p50") is not None and last.get("steady_ms_p50") is not None:
             print("MINTOK %s arm %s: %.2f ms per token with min_tokens, %.2f without" % (
                 kind, main_arm, mintok["steady_ms_p50"], last["steady_ms_p50"]), flush=True)
+    if args.gc_arms:
+        # The worker's collector frozen (gc) against as is (base), greedy, N streams and 1 stream, in turn, twice.
+        for first in (True, False):
+            for arm in ("base", "gc"):
+                measure("gc32", arm, short_prompts, warm=24 if first else None)
+                measure("gc1", arm, [one_prompt], warm=24 if first else None)
     probe.set_arm("base")
     summary(probe)
     if not args.no_sampled and not spec_arms:

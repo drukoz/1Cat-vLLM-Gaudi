@@ -110,11 +110,20 @@ before vLLM's sampler (`vllm_gaudi/v1/sample/request_params.py`): the stop ids o
 probability at its temperature get `-inf`. One difference from vLLM: a request with logprobs gets them after its
 own bias and masks (vLLM's raw logprobs come before them). Any other value is `0`. CPU-checked; not yet on a card.
 
+`VLLM_HPU_WORKER_GC_FREEZE` (integer, default `0`) sets a worker's Python garbage collector while steps run. Every
+collective of a TP step is a barrier across the ranks, so one rank's generation-2 collection stalls all of them. `1`:
+at the first step the heap is collected once and frozen (`gc.freeze()`), automatic generation-2 collections are off
+while steps run, and a daemon thread runs a full collection when no step has run for 0.5 s; generations 0 and 1
+collect as before. It can be switched at run time (`VLLM_HPU_RUNTIME_SWITCH_FILE`); back at `0` the heap is unfrozen
+and the thresholds restored. With `VLLM_HPU_MTP_TIMING=2` each step's record has the collector's pauses
+(`gc_ms`, `gc_gen2`). Any other value is `0`.
+
 `VLLM_HPU_RUNTIME_SWITCH_FILE` (a path, default unset) is an operator's tool for an A/B on one server.
 When set, every worker looks at that file before each step (one `stat`) and, when the file changed, takes
 the flags it lists, one `NAME=VALUE` per line. Only flags the runner reads at every step can be switched:
-`VLLM_HPU_FLASH_NEXT_DECODE_METADATA`, `VLLM_HPU_FUSED_GREEDY_LOGITS`, `VLLM_HPU_CANDIDATE_SAMPLING` and
-`VLLM_HPU_VOCAB_PARALLEL_LOGITS` (read at every call of the logits region, which runs after the replayed graph);
+`VLLM_HPU_FLASH_NEXT_DECODE_METADATA`, `VLLM_HPU_FUSED_GREEDY_LOGITS`, `VLLM_HPU_CANDIDATE_SAMPLING`,
+`VLLM_HPU_VOCAB_PARALLEL_LOGITS` (read at every call of the logits region, which runs after the replayed graph) and
+`VLLM_HPU_WORKER_GC_FREEZE`;
 any other name is reported and the file is ignored. Replace the file with a rename while no request runs, so every worker sees the change
 at the same step. `tools/flash_next/engine_step/long_context_probe.py` measures two arms of one server
 this way.

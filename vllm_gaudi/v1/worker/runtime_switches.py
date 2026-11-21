@@ -20,7 +20,8 @@ from typing import Optional
 # VLLM_HPU_VOCAB_PARALLEL_LOGITS is read at every call of the logits region (distributed/vocab_parallel.mode()),
 # which runs as lazy ops after the replayed decode graph: switching it changes the region's graph, not a captured one.
 SWITCHABLE = ("VLLM_HPU_FLASH_NEXT_DECODE_METADATA", "VLLM_HPU_FUSED_GREEDY_LOGITS", "VLLM_HPU_CANDIDATE_SAMPLING",
-              "VLLM_HPU_VOCAB_PARALLEL_LOGITS")
+              "VLLM_HPU_VOCAB_PARALLEL_LOGITS",
+              "VLLM_HPU_WORKER_GC_FREEZE")
 
 
 def parse_switches(text: str) -> dict[str, str]:

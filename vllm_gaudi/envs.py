@@ -536,6 +536,7 @@ if TYPE_CHECKING:
     VLLM_HPU_QSA_FUSED: int = 0  # QsaFusedMode: 0 torch (default), 1 torch data flow, 2 TPC kernels, 3 + top-k kernels
     VLLM_HPU_QSA_INDEXER_SHARD: int = 0  # QsaShardMode: 0 replicated (default), 1 by request (int32), 2 by request (fp32)
     VLLM_HPU_QSA_TABLE_WIDTH: int = 0  # decode block-table columns: 0 the engine's longest context (default), 1 the batch's
+    VLLM_HPU_WORKER_GC_FREEZE: int = 0  # 0 Python's collector as is (default), 1 frozen heap, generation 2 only when idle
     VLLM_HPU_GDN_CORE_DECODE: int = 1  # GdnCoreDecodeMode: 1 fused (default), 0 off, 2 recurrence
     VLLM_HPU_GDN_CORE_DECODE_DEBUG: int = 0  # GdnCoreDecodeDebug: 0 off, 1 check slot indices every step (host sync)
     VLLM_HPU_GDN_CORE_VERIFY: int = 0  # GdnCoreVerifyMode: 0 off (default), 1 fused verification steps
@@ -1957,6 +1958,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # pad block and are masked. One decode graph per (bucket, width) met. Any other value is 0.
     "VLLM_HPU_QSA_TABLE_WIDTH":
     lambda: int(os.environ.get("VLLM_HPU_QSA_TABLE_WIDTH", "0")),
+
+    # A worker's Python garbage collector while steps run (v1/worker/gc_control.py). 0 (default) = as is. 1 = at
+    # the first step the heap is collected once and frozen (gc.freeze), automatic generation-2 collections are off
+    # while steps run, and a daemon thread collects when no step has run for 0.5 s: every collective of a TP step
+    # is a barrier across the ranks, so one rank's generation-2 pause stalls all of them. Switchable at run time
+    # (VLLM_HPU_RUNTIME_SWITCH_FILE); back at 0 the heap is unfrozen and the thresholds restored. Any other value is 0.
+    "VLLM_HPU_WORKER_GC_FREEZE":
+    lambda: 1 if os.environ.get("VLLM_HPU_WORKER_GC_FREEZE", "0").strip() == "1" else 0,
 
     # Flash-Next GDN decode through the fused core op (flashinfer_gaudi.gdn_core_decode).
     # 1 (default) = fused, 0 = off (the torch path), 2 = recurrence only (a bisect tool).
