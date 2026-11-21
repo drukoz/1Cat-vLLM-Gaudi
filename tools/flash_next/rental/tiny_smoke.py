@@ -58,6 +58,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -431,6 +432,27 @@ def report_mode(entry: dict) -> None:
     print("    log: %s" % entry["log"], flush=True)
 
 
+def run_argmax_check(out: Path) -> dict:
+    """``argmax_precision_check.py --report-only`` on the card before any server (its lines into ``out``): the fused
+    precision of an arg max in the LM head's lazy graph is card-only behaviour the CPU reference cannot show."""
+    import importlib.util
+    if importlib.util.find_spec("habana_frameworks") is None:  # no card here (the CPU tests): nothing to check
+        return {"skipped": "no card"}
+    script = Path(__file__).with_name("argmax_precision_check.py")
+    log = out / "argmax_check.log"
+    try:
+        done = subprocess.run([sys.executable, str(script), "--report-only"], capture_output=True, text=True,
+                              timeout=600)
+        text = done.stdout + done.stderr
+    except Exception as error:  # noqa: BLE001 - the check never stops the smoke
+        text = "ARGMAX-CHECK not run: %r\n" % (error, )
+    log.write_text(text, encoding="utf-8")
+    lines = [line for line in text.splitlines() if line.startswith("ARGMAX-CHECK")]
+    for line in lines:
+        print("tiny smoke: " + line, flush=True)
+    return {"lines": lines, "log": str(log)}
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="python -m tools.flash_next.rental.tiny_smoke",
                                      description="Serve the tiny Flash-Next checkpoint and compare it with its "
@@ -460,6 +482,9 @@ def main(argv: list[str] | None = None) -> int:
                         "the tokens are compared with the reference and with the mode's own tokens, the "
                         "acceptance is printed; rungs: the fused verification op, then the torch "
                         "verification, then no speculation (default 0: no speculative mode)")
+    parser.add_argument("--no-argmax-check", action="store_true",
+                        help="skip argmax_precision_check.py (by default it runs once on the card before the "
+                        "servers, report only: every in-graph arg max against the gathered path's)")
     args = parser.parse_args(argv)
     modes = [m for m in args.gdn.split(",") if m]
     if not modes or any(m not in GDN_MODES for m in modes):
@@ -484,6 +509,8 @@ def main(argv: list[str] | None = None) -> int:
     recipe_cache = orchestrator.keyed_recipe_cache_dir(args.recipe_cache, orchestrator.bundle_commit())
     summary: dict = {"passed": False, "reason": None, "checkpoint": str(ckpt), "modes": []}
     summary["reason"] = build_checkpoint(ckpt)
+    if summary["reason"] is None and not args.no_argmax_check:
+        summary["argmax_check"] = run_argmax_check(out)
     if summary["reason"] is None:
         common = dict(skip_warmup=not args.full_warmup, extra_env=extra_env, recipe_cache=recipe_cache,
                       recipe_cache_mb=args.recipe_cache_mb, combined_db=combined_db)
