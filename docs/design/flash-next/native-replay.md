@@ -539,7 +539,13 @@ on CPUs 19r to 19r+17, its own module's slice; the engine and API server unpinne
 B) and the hash switch's caveats (set at server start; never on a card here, no token parity yet, so arm B's
 1-stream text against A decides; it removes only the spec construction per launch; arm B combines two levers). It
 was asked to send back per arm the steady ms per step at 1 and 32 streams, the text, the pin lines and the
-watcher's per-rank main-thread share during the measured 1-stream round: write them into section 7.9.
+watcher's per-rank main-thread share during the measured 1-stream round: write them into section 7.9. It runs arm B
+in job 00142 (TP8, image 2de56804 with 9b0e7655; arm folders `tiny`, `nospec` = A, `nospec-pin` = B, `mtp2` = C under
+`~/farm/integration/results/00142-real8-build2/`, fetched to `reports/integration/card/00142-real8-build2/`), without a
+watcher inside its job. With its agreement (00:35 UTC: read-only, /proc and `docker ps` only, CPU 151, writing only
+under this track's folder) this track runs `late/watch_job.sh 00142 ~/farm/integration/results/00142-real8-build2 nospec
+nospec-pin` on the node (started 00:36:22 UTC, pids 817765 and 817768; it ends by itself after B's workers exit):
+results in `~/farm/native-replay/results/cpuwatch-00142/<arm>/cpus_series.txt|.jsonl`, log `watch_job.log`.
 
 ### The card job in the queue: 00134 `real4-cut-pin-hash-ab` (probably not run tonight)
 
