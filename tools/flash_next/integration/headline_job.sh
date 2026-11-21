@@ -39,6 +39,19 @@
 #           job stops), HEADLINE_SW_ARMS / HEADLINE_SW_LEVELS / HEADLINE_SW_ROUNDS, HEADLINE_CAPTURE_LEVELS,
 #           HEADLINE_KVLP_LENGTHS / HEADLINE_KVLP_REF, HEADLINE_LONG_CTX / HEADLINE_LONG_STREAMS / HEADLINE_LONG_REPEAT,
 #           HEADLINE_INTERLEAVE_SAMPLED=1 (each level's SAMPLED rounds right after its greedy ones).
+#   mtp-draft-graph's job on build 5 (coordinator, 09:05 UTC): server word cuts (VLLM_HPU_MTP_REPLICATED_FC=1 and
+#           VLLM_HPU_REPLICATED_EMBEDDING=1: the whole token table on every rank), probe word chainsw (the whole probe
+#           as an A/B of the chained draft, VLLM_HPU_MTP_DRAFT_CHAIN, on the draft graph and I01: on-md / chain-md
+#           (stage A), vlg / chain-vlg (VLLM_HPU_VERIFY_LOGITS_IN_GRAPH=1, stage B on the verify graph's ids), all /
+#           chain-all (VLLM_HPU_VOCAB_PARALLEL_LOGITS=1, stage B on its ids)), HEADLINE_SWITCH_SET=graph-md-all (the
+#           four graph-md arms and "all": draft graph, I01 and VP), the tiny gates tiny-chain, tiny-chain-vlg and
+#           tiny-chain-vp (the chain's stages with the draft graph and I01; a failure drops that stage's arms of
+#           chainsw, the job goes on; VLLM_HPU_LOG_UNMATCHED_GRAPH_INPUTS=1 logs the chain graph's copied inputs),
+#           the tiny knobs HEADLINE_TINY_REPLICATED_EMBEDDING / _DRAFT_CHAIN / _VOCAB_PARALLEL / _VERIFY_LOGITS_IN_GRAPH,
+#           and HEADLINE_PLACE_SWITCH (async-sched's placement switch, read with async-sched's case statement).
+#           async-sched's M1 (VLLM_HPU_FLASH_NEXT_SPEC_DEVICE_INPUTS, the verification inputs made on the device) rides
+#           along: tiny-m1 (its tiny gate at 1 with the chain, stage A) and the probe word m1sw (the server starts at 2,
+#           the whole probe as an A/B of 0 against 2 with the chain on; skipped when tiny-m1 or tiny-chain failed).
 #   nospec-noshard, nospec-noprefix, nospec-noprefix-nocut  the low-stream bisect: A's env with
 #           VLLM_HPU_QSA_INDEXER_SHARD=0; A's env without VLLM_HPU_PREFIX_ALIGN_SPLIT and VLLM_HPU_PREFIX_KEEP_PROMPT_END
 #           (then also VLLM_HPU_DECODE_CUT_INTERVAL=0); greedy 8 and 1 streams only.
@@ -127,6 +140,23 @@ done
 #   0..3   VLLM_HPU_WORKER_CPU_PIN=<digit>
 #   anything else or no file: no placement. A VLLM_HPU_WORKER_CPU_PIN the job sets itself (--env) wins over the file.
 PIN_SWITCH="${HEADLINE_PIN_SWITCH:-/results/switches/pin}"
+# HEADLINE_PLACE_SWITCH (mtp-draft-graph's job, coordinator 09:05 UTC): async-sched's switch file instead, read with
+# async-sched's case statement: "on" or a rule ("a^1", "a+N/2") = the placement with VLLM_HPU_WORKER_CPU_PIN=1, "place"
+# = the placement alone (rule a^1, no pin flag), "off", anything else or no file = no placement. The word is handed to
+# the block below as this kit's "place" or "off" (the same scripts: late/place, else this kit's place/ copies).
+PLACE_EXTRA_PIN=0
+if [ -n "${HEADLINE_PLACE_SWITCH:-}" ]; then
+    as_word="$(head -c 64 "$HEADLINE_PLACE_SWITCH" 2>/dev/null | awk 'NR == 1 { print $1 }')"
+    echo "headline_job: async-sched's placement switch $HEADLINE_PLACE_SWITCH says '${as_word:-nothing (no file)}'"
+    case "$as_word" in
+        on) as_word=place; PLACE_SIBLING_RULE="${PLACE_SIBLING_RULE:-a^1}"; PLACE_EXTRA_PIN=1 ;;
+        place) PLACE_SIBLING_RULE="${PLACE_SIBLING_RULE:-a^1}" ;;
+        "a^1" | "a+N/2") PLACE_SIBLING_RULE="$as_word"; as_word=place; PLACE_EXTRA_PIN=1 ;;
+        *) as_word=off ;;
+    esac
+    PIN_SWITCH="$(mktemp)"
+    echo "$as_word" >"$PIN_SWITCH"
+fi
 pin_word="$(head -c 64 "$PIN_SWITCH" 2>/dev/null | awk 'NR == 1 { print $1 }')"
 PLACE_ON=0
 if [ -n "${VLLM_HPU_WORKER_CPU_PIN+x}" ]; then
@@ -161,6 +191,11 @@ else
         echo "headline_job: placement switch $PIN_SWITCH says '${pin_word:-nothing (no file)}':" \
             "VLLM_HPU_WORKER_CPU_PIN=${VLLM_HPU_WORKER_CPU_PIN:-unset (no pin)}, no place.sh"
     fi
+fi
+
+if [ "$PLACE_ON" = 1 ] && [ "$PLACE_EXTRA_PIN" = 1 ] && [ -z "${VLLM_HPU_WORKER_CPU_PIN+x}" ]; then
+    export VLLM_HPU_WORKER_CPU_PIN=1
+    echo "headline_job: async-sched's switch: the placement with VLLM_HPU_WORKER_CPU_PIN=1"
 fi
 
 if [ $# -eq 0 ]; then set -- nospec mtp3; fi
@@ -326,19 +361,128 @@ while [ "$i_arm" -lt "${#ARMS[@]}" ]; do
     first=0
     echo "=== headline_job: arm $arm start $(date -u +%T)"
     case "$arm" in
-        tiny)
+        tiny | tiny-chain | tiny-chain-vlg | tiny-chain-vp | tiny-m1 | tiny-m3 | tiny-m3pc1 | tiny-m3pc2 | tiny-il | \
+            tiny-shift | tiny-gv | tiny-pi)
             spec=()
             case "${HEADLINE_TINY_SPEC:-0}" in [1-9]) spec=(--spec "$HEADLINE_TINY_SPEC") ;; esac
+            tiny_graph="${HEADLINE_TINY_DRAFT_GRAPH:-${VLLM_HPU_MTP_DRAFT_GRAPH:-0}}"
+            tiny_md="${HEADLINE_TINY_DECODE_METADATA:-${VLLM_HPU_FLASH_NEXT_DECODE_METADATA:-0}}"
+            tiny_chain="${HEADLINE_TINY_DRAFT_CHAIN:-${VLLM_HPU_MTP_DRAFT_CHAIN:-0}}"
+            tiny_vp="${HEADLINE_TINY_VOCAB_PARALLEL:-${VLLM_HPU_VOCAB_PARALLEL_LOGITS:-0}}"
+            tiny_vlg="${HEADLINE_TINY_VERIFY_LOGITS_IN_GRAPH:-${VLLM_HPU_VERIFY_LOGITS_IN_GRAPH:-0}}"
+            tiny_log="${VLLM_HPU_LOG_UNMATCHED_GRAPH_INPUTS:-0}"
+            tiny_m1="${VLLM_HPU_FLASH_NEXT_SPEC_DEVICE_INPUTS:-0}"
+            tiny_async="${VLLM_HPU_FLASH_NEXT_ASYNC_SCHED:-0}"
+            tiny_nopc="${FARM_SERVE_NO_PREFIX_CACHING:-0}"
+            tiny_align="${VLLM_HPU_FLASH_NEXT_SPEC_DEVICE_ALIGN:-0}"
+            # the chain's gates: the chained draft (stage A; -vlg and -vp: stage B) on the draft graph and I01, with
+            # the chain graph's copied inputs logged (a tiny gate is never a measured arm)
+            case "$arm" in
+                tiny-chain) tiny_graph=1; tiny_md=1; tiny_chain=1; tiny_vp=0; tiny_vlg=0; tiny_log=1 ;;
+                tiny-chain-vlg) tiny_graph=1; tiny_md=1; tiny_chain=1; tiny_vp=0; tiny_vlg=1; tiny_log=1 ;;
+                tiny-chain-vp) tiny_graph=1; tiny_md=1; tiny_chain=1; tiny_vp=1; tiny_vlg=0; tiny_log=1 ;;
+                # async-sched's M1 gate: the device-made inputs made and checked against the host's every step
+                tiny-m1) tiny_graph=1; tiny_md=1; tiny_chain=1; tiny_vp=0; tiny_vlg=0; tiny_m1=1 ;;
+                # async-sched's M2 gate: mode 3 (a chained step issued before the previous one's tokens reach the
+                # host) with the device-made inputs, prefix caching off (rental/serve.py's opt-out)
+                tiny-m3) tiny_graph=1; tiny_md=1; tiny_chain=1; tiny_vp=0; tiny_vlg=0; tiny_m1=2; tiny_async=3
+                    tiny_nopc=1 ;;
+                # async-sched's M3 gates, prefix caching on: the align mode on the device checked against the host's
+                # (mode 2, =1), then used by mode 3 (=2)
+                tiny-m3pc1) tiny_graph=1; tiny_md=1; tiny_chain=1; tiny_vp=0; tiny_vlg=0; tiny_m1=2; tiny_async=2
+                    tiny_nopc=0; tiny_align=1 ;;
+                tiny-m3pc2) tiny_graph=1; tiny_md=1; tiny_chain=1; tiny_vp=0; tiny_vlg=0; tiny_m1=2; tiny_async=3
+                    tiny_nopc=0; tiny_align=2 ;;
+            esac
+            # build 6's gates: one new flag each on the job's flags (a failure drops the arms with that word)
+            tiny_b6=()
+            case "$arm" in
+                tiny-il) tiny_b6=(VLLM_HPU_HC_FUSED_IL=1) ;;
+                tiny-shift) tiny_b6=(VLLM_HPU_QSA_SLOT_SHIFT=1) ;;
+                tiny-gv) tiny_b6=(VLLM_HPU_GDN_VERIFY_VARIANT="${HEADLINE_TINY_GV:-6}") ;;
+                tiny-pi) tiny_b6=(VLLM_HPU_PERSISTENT_INPUTS=1) ;;
+            esac
             # the MTP server's own flags too (they act only on the speculative mode)
             tiny_sv="${VLLM_HPU_SPEC_SAMPLED_VERIFY:-0}"
             if [ "${HEADLINE_MTP_SAMPLED:-0}" = 1 ]; then tiny_sv="${VLLM_HPU_SPEC_SAMPLED_VERIFY:-1}"; fi
-            VLLM_HPU_MTP_DRAFT_LOOP="${VLLM_HPU_MTP_DRAFT_LOOP:-1}" VLLM_HPU_MTP_CHUNK_KV="${VLLM_HPU_MTP_CHUNK_KV:-1}" \
+            env ${tiny_b6[@]+"${tiny_b6[@]}"} \
+                VLLM_HPU_MTP_DRAFT_LOOP="${VLLM_HPU_MTP_DRAFT_LOOP:-1}" VLLM_HPU_MTP_CHUNK_KV="${VLLM_HPU_MTP_CHUNK_KV:-1}" \
                 VLLM_HPU_SPEC_SAMPLED_VERIFY="$tiny_sv" \
-                VLLM_HPU_MTP_DRAFT_GRAPH="${HEADLINE_TINY_DRAFT_GRAPH:-${VLLM_HPU_MTP_DRAFT_GRAPH:-0}}" \
+                VLLM_HPU_MTP_DRAFT_GRAPH="$tiny_graph" \
                 VLLM_HPU_MTP_REPLICATED_FC="${HEADLINE_TINY_MTP_REPLICATED_FC:-${VLLM_HPU_MTP_REPLICATED_FC:-0}}" \
-                VLLM_HPU_FLASH_NEXT_DECODE_METADATA="${HEADLINE_TINY_DECODE_METADATA:-${VLLM_HPU_FLASH_NEXT_DECODE_METADATA:-0}}" \
-                "$PYTHON" /farm/farm_tiny.py --gdn hc ${spec[@]+"${spec[@]}"} --out "$OUT/tiny"
+                VLLM_HPU_REPLICATED_EMBEDDING="${HEADLINE_TINY_REPLICATED_EMBEDDING:-${VLLM_HPU_REPLICATED_EMBEDDING:-0}}" \
+                VLLM_HPU_FLASH_NEXT_DECODE_METADATA="$tiny_md" VLLM_HPU_MTP_DRAFT_CHAIN="$tiny_chain" \
+                VLLM_HPU_VOCAB_PARALLEL_LOGITS="$tiny_vp" VLLM_HPU_VERIFY_LOGITS_IN_GRAPH="$tiny_vlg" \
+                VLLM_HPU_LOG_UNMATCHED_GRAPH_INPUTS="$tiny_log" VLLM_HPU_FLASH_NEXT_SPEC_DEVICE_INPUTS="$tiny_m1" \
+                VLLM_HPU_FLASH_NEXT_ASYNC_SCHED="$tiny_async" FARM_SERVE_NO_PREFIX_CACHING="$tiny_nopc" \
+                VLLM_HPU_FLASH_NEXT_SPEC_DEVICE_ALIGN="$tiny_align" \
+                "$PYTHON" /farm/farm_tiny.py --gdn hc ${spec[@]+"${spec[@]}"} --out "$OUT/$arm"
             rc=$?
+            if [ "$arm" != tiny ]; then
+                # a chain gate: a failure drops that stage's chain arms, the job goes on
+                if [ "$rc" -ne 0 ]; then
+                    echo "headline_job: $arm failed (rc $rc): its chain arms are left out"
+                    case "$arm" in
+                        tiny-chain) chain_a_ok=0 ;;
+                        tiny-chain-vlg) chain_vlg_ok=0 ;;
+                        tiny-chain-vp) chain_vp_ok=0 ;;
+                        tiny-m1) m1_ok=0 ;;
+                        tiny-m3) m3_ok=0 ;;
+                        tiny-m3pc1 | tiny-m3pc2) m3_align_ok=0 ;;
+                        tiny-il) il_ok=0 ;;
+                        tiny-shift) shift_ok=0 ;;
+                        tiny-gv) gv_ok=0 ;;
+                        tiny-pi) pi_ok=0 ;;
+                    esac
+                fi
+                if [ "$arm" = tiny-m3 ] && [ "$rc" -eq 0 ]; then
+                    # M2's own check: steps were issued before the previous step's tokens reached the host
+                    last="$(grep -rhoE "VLLM_HPU_FLASH_NEXT_ASYNC_SCHED=3: [0-9]+ steps issued.*" "$OUT/$arm" 2>/dev/null | tail -n 1)"
+                    echo "headline_job: tiny-m3: ${last:-no mode-3 summary line}"
+                    if [ -z "$last" ] || grep -rqE "ASYNC_SCHED=3 acts as 2|device-made inputs differ" "$OUT/$arm" 2>/dev/null; then
+                        echo "headline_job: tiny-m3: mode 3 did not serve the tiny gate"
+                        m3_ok=0
+                    fi
+                fi
+                if [ "$arm" = tiny-m3pc1 ] && [ "$rc" -eq 0 ]; then
+                    last="$(grep -rhoE "VLLM_HPU_FLASH_NEXT_SPEC_DEVICE_ALIGN=1: [0-9]+ verification steps made.*" "$OUT/$arm" 2>/dev/null | tail -n 1)"
+                    echo "headline_job: tiny-m3pc1: ${last:-no M3 summary line}"
+                    if [ -z "$last" ] || ! printf '%s' "$last" | grep -q " 0 with differences" ||
+                        grep -rqE "align mode differs|device-made inputs differ" "$OUT/$arm" 2>/dev/null; then
+                        echo "headline_job: tiny-m3pc1: M3's check did not pass: the m3a arms are left out"
+                        m3_align_ok=0
+                    fi
+                fi
+                if [ "$arm" = tiny-m3pc2 ] && [ "$rc" -eq 0 ]; then
+                    last="$(grep -rhoE "VLLM_HPU_FLASH_NEXT_ASYNC_SCHED=3: [0-9]+ steps issued.*" "$OUT/$arm" 2>/dev/null | tail -n 1)"
+                    echo "headline_job: tiny-m3pc2: ${last:-no mode-3 summary line}"
+                    if [ -z "$last" ] || grep -rqE "ASYNC_SCHED=3 acts as 2|align mode differs" "$OUT/$arm" 2>/dev/null; then
+                        echo "headline_job: tiny-m3pc2: mode 3 with M3 did not serve the tiny gate: the m3a arms are left out"
+                        m3_align_ok=0
+                    fi
+                fi
+                if [ "$arm" = tiny-m1 ] && [ "$rc" -eq 0 ]; then
+                    # M1's own check: every advanced step checked, no difference (async-sched)
+                    last="$(grep -rhoE "VLLM_HPU_FLASH_NEXT_SPEC_DEVICE_INPUTS=1: [0-9]+ verification steps.*" "$OUT/$arm" 2>/dev/null | tail -n 1)"
+                    echo "headline_job: tiny-m1: ${last:-no M1 summary line}"
+                    if [ -z "$last" ] || ! printf '%s' "$last" | grep -q " 0 with differences" ||
+                        grep -rqE "device-made inputs differ|keeps the host's inputs" "$OUT/$arm" 2>/dev/null; then
+                        echo "headline_job: tiny-m1: M1's check did not pass: the m1sw arm is left out"
+                        m1_ok=0
+                    fi
+                fi
+                # whether the chain served the tiny's decode steps (the runner logs its stage once), what it copied
+                grep -rhoE "chained behind its verification, stage [AB]|keeps the draft after the host read: .*|HPU graph replay copies .*" \
+                    "$OUT/$arm" 2>/dev/null | cut -c1-400 | sort | uniq -c | head -20
+                want_stage=B
+                case "$arm" in tiny-chain | tiny-m1 | tiny-m3 | tiny-m3pc1 | tiny-m3pc2) want_stage=A ;; esac
+                case "$arm" in tiny-il | tiny-shift | tiny-gv | tiny-pi) want_stage="" ;; esac
+                if [ -n "$want_stage" ] && [ "$rc" -eq 0 ] && ! grep -rqE "chained behind its verification, stage $want_stage" "$OUT/$arm" 2>/dev/null; then
+                    echo "headline_job: WARNING: $arm passed but no step was chained in stage $want_stage (the gate did not test it)"
+                fi
+                echo "=== headline_job: arm $arm rc=$rc end $(date -u +%T)"
+                continue
+            fi
             if [ "$rc" -ne 0 ] && [ "${HEADLINE_TINY_ABORT:-1}" = 1 ]; then
                 echo "headline_job: the tiny gate failed (rc $rc): no real-model server with these flags"
                 exit 7
@@ -424,10 +568,14 @@ while [ "$i_arm" -lt "${#ARMS[@]}" ]; do
             post_args=()
             post_words=()
             whole_switch=0
+            switch_set="${HEADLINE_SWITCH_SET:-graph}"
             greedy_only=0
             fp8kv=0
             irlog=0
             bad_word=""
+            needs_m3=0
+            needs_async3=0
+            needs_b6=()
             words="${arm:4}"
             words="${words#-}"
             arm_words=()
@@ -435,15 +583,39 @@ while [ "$i_arm" -lt "${#ARMS[@]}" ]; do
             for w in ${arm_words[@]+"${arm_words[@]}"}; do
                 case "$w" in
                     async) async_env=(VLLM_HPU_FLASH_NEXT_ASYNC_SCHED=2); timing="${HEADLINE_ASYNC_MTP_TIMING:-2}" ;;
+                    # async-sched job branch: async3 = stage 2's mode 3 (a chained step issued before the previous
+                    # one's tokens reach the host; needs the chain, SPEC_DEVICE_INPUTS=2, I01 and nopc)
+                    async3) async_env=(VLLM_HPU_FLASH_NEXT_ASYNC_SCHED=3); timing="${HEADLINE_ASYNC_MTP_TIMING:-2}"
+                        needs_async3=1 ;;
+                    # async-sched job branch: nopc = prefix caching off (after serve_probe.sh's --enable-prefix-caching)
+                    nopc) serve_extra+=(--no-enable-prefix-caching) ;;
+                    # async-sched job branch: m3a = stage 2's M3 in use (VLLM_HPU_FLASH_NEXT_SPEC_DEVICE_ALIGN=2; the
+                    # arm is left out when a tiny-m3pc gate failed); turns = commit_turns_probe.py after the probe
+                    m3a) arm_env+=(VLLM_HPU_FLASH_NEXT_SPEC_DEVICE_ALIGN=2); needs_m3=1 ;;
                     graph) draft_graph=1 ;;
                     rfc) replicated_fc=1 ;;
                     noshard) shard=0; greedy_only=1 ;;
                     32) levels=32 ;;
                     switch) whole_switch=1 ;;
+                    chainsw) whole_switch=1; switch_set=chain ;;
+                    m1sw) whole_switch=1; switch_set=m1; arm_env+=(VLLM_HPU_FLASH_NEXT_SPEC_DEVICE_INPUTS=2) ;;
+                    cuts) replicated_fc=1; arm_env+=(VLLM_HPU_REPLICATED_EMBEDDING=1) ;;
                     spin) unset_env+=(-u PT_HPU_SYNCHRONOUS_ACC_QUEUE_FLUSHING) ;;
                     inline) arm_env+=(PT_HPU_DISABLE_ASYNC_COLLECTIVE=1) ;;
                     fp8kv) fp8kv=1; arm_env+=(VLLM_HPU_QSA_KV_FP8=1); serve_extra+=(--kv-cache-dtype fp8_inc) ;;
                     pin3) arm_env+=(VLLM_HPU_WORKER_CPU_PIN=3) ;;
+                    # build 6: one flag each (a server start; each needs its tiny gate, if run, to have passed)
+                    il) arm_env+=(VLLM_HPU_HC_FUSED_IL=1); needs_b6+=(il) ;;
+                    shift) arm_env+=(VLLM_HPU_QSA_SLOT_SHIFT=1); needs_b6+=(shift) ;;
+                    gv[0-9]) arm_env+=(VLLM_HPU_GDN_VERIFY_VARIANT="${w#gv}"); needs_b6+=(gv) ;;
+                    pi) arm_env+=(VLLM_HPU_PERSISTENT_INPUTS=1); needs_b6+=(pi) ;;
+                    # build 6: the chain at the server's start (stage A on the draft graph and I01; with vlg stage B on
+                    # the verify graph's ids), I01 alone, the verify graph's LM head alone, M1 at start
+                    chainon) draft_graph=1; arm_env+=(VLLM_HPU_MTP_DRAFT_CHAIN=1 VLLM_HPU_FLASH_NEXT_DECODE_METADATA=1)
+                        needs_b6+=(chain) ;;
+                    vlg) arm_env+=(VLLM_HPU_VERIFY_LOGITS_IN_GRAPH=1) ;;
+                    md) arm_env+=(VLLM_HPU_FLASH_NEXT_DECODE_METADATA=1) ;;
+                    m1on) arm_env+=(VLLM_HPU_FLASH_NEXT_SPEC_DEVICE_INPUTS=2) ;;
                     ss0) arm_env+=(PT_HPU_ENABLE_STAGE_SUBMISSION=0) ;;
                     irlog) irlog=1; arm_env+=(LOG_LEVEL_PT_IRGRAPH=1 LOG_LEVEL_PT_LAZY=1) ;;
                     lv[0-9]*)
@@ -453,13 +625,35 @@ while [ "$i_arm" -lt "${#ARMS[@]}" ]; do
                         ;;
                     hpulog) arm_env+=(HPU_GRAPH_INPUT_LOG=1 "PYTHONPATH=$HERE/hpulog${PYTHONPATH:+:$PYTHONPATH}") ;;
                     greedy) greedy_only=1 ;;
-                    sw | dg32 | cap | kvlp | kvlpfb | long) post_words+=("$w") ;;
+                    sw | dg32 | cap | kvlp | kvlpfb | kvlpc | kvlpfloor | long | turns) post_words+=("$w") ;;
                     *) bad_word="$w" ;;
                 esac
             done
             if [ -n "$bad_word" ]; then
                 echo "headline_job: arm $arm: unknown word '$bad_word' (see the comment of the MTP arms)"
                 failed=$((failed + 1))
+                continue
+            fi
+            if [ "$needs_m3" = 1 ] && [ "${m3_align_ok:-1}" != 1 ]; then
+                echo "headline_job: arm $arm left out: a tiny-m3pc gate failed (async-sched's M3)"
+                continue
+            fi
+            if [ "$needs_async3" = 1 ] && [ "${m3_ok:-1}" != 1 ]; then
+                echo "headline_job: arm $arm left out: the tiny-m3 gate failed (async-sched's M2, mode 3)"
+                continue
+            fi
+            b6_skip=""
+            for g in ${needs_b6[@]+"${needs_b6[@]}"}; do
+                case "$g" in
+                    il) [ "${il_ok:-1}" = 1 ] || b6_skip="tiny-il" ;;
+                    shift) [ "${shift_ok:-1}" = 1 ] || b6_skip="tiny-shift" ;;
+                    gv) [ "${gv_ok:-1}" = 1 ] || b6_skip="tiny-gv" ;;
+                    pi) [ "${pi_ok:-1}" = 1 ] || b6_skip="tiny-pi" ;;
+                    chain) [ "${chain_a_ok:-1}" = 1 ] || b6_skip="tiny-chain" ;;
+                esac
+            done
+            if [ -n "$b6_skip" ]; then
+                echo "headline_job: arm $arm left out: its gate $b6_skip failed"
                 continue
             fi
             ARM_DIR="${OUT:?}/${arm:?}"
@@ -477,7 +671,47 @@ while [ "$i_arm" -lt "${#ARMS[@]}" ]; do
                 switch_args=(--probe-arg "--switch-file=$ARM_DIR/switches" --probe-arg "--server-log=$ARM_DIR/server0.log")
                 # HEADLINE_SWITCH_SET: graph (default) = off / on; graph-md = the 2 x 2 with engine-step's
                 # VLLM_HPU_FLASH_NEXT_DECODE_METADATA (the sparse-QSA decode metadata, also switchable)
-                case "${HEADLINE_SWITCH_SET:-graph}" in
+                case "$switch_set" in
+                    chain)
+                        # the chained draft on the draft graph and I01, behind each of the three verifications it can
+                        # follow; a stage whose tiny gate failed is left out (with its non-chained twin for VLG)
+                        g="VLLM_HPU_MTP_DRAFT_GRAPH=1;VLLM_HPU_FLASH_NEXT_DECODE_METADATA=1"
+                        switch_args+=(--probe-arg "--switch-arm=on-md=$g;VLLM_HPU_VOCAB_PARALLEL_LOGITS=0;VLLM_HPU_VERIFY_LOGITS_IN_GRAPH=0;VLLM_HPU_MTP_DRAFT_CHAIN=0")
+                        if [ "${chain_a_ok:-1}" = 1 ]; then
+                            switch_args+=(--probe-arg "--switch-arm=chain-md=$g;VLLM_HPU_VOCAB_PARALLEL_LOGITS=0;VLLM_HPU_VERIFY_LOGITS_IN_GRAPH=0;VLLM_HPU_MTP_DRAFT_CHAIN=1")
+                        fi
+                        if [ "${chain_vlg_ok:-1}" = 1 ]; then
+                            switch_args+=(--probe-arg "--switch-arm=vlg=$g;VLLM_HPU_VOCAB_PARALLEL_LOGITS=0;VLLM_HPU_VERIFY_LOGITS_IN_GRAPH=1;VLLM_HPU_MTP_DRAFT_CHAIN=0"
+                                --probe-arg "--switch-arm=chain-vlg=$g;VLLM_HPU_VOCAB_PARALLEL_LOGITS=0;VLLM_HPU_VERIFY_LOGITS_IN_GRAPH=1;VLLM_HPU_MTP_DRAFT_CHAIN=1")
+                        fi
+                        switch_args+=(--probe-arg "--switch-arm=all=$g;VLLM_HPU_VOCAB_PARALLEL_LOGITS=1;VLLM_HPU_VERIFY_LOGITS_IN_GRAPH=0;VLLM_HPU_MTP_DRAFT_CHAIN=0")
+                        if [ "${chain_vp_ok:-1}" = 1 ]; then
+                            switch_args+=(--probe-arg "--switch-arm=chain-all=$g;VLLM_HPU_VOCAB_PARALLEL_LOGITS=1;VLLM_HPU_VERIFY_LOGITS_IN_GRAPH=0;VLLM_HPU_MTP_DRAFT_CHAIN=1")
+                        fi
+                        if [ "${chain_a_ok:-1}" != 1 ] && [ "${chain_vlg_ok:-1}" != 1 ] && [ "${chain_vp_ok:-1}" != 1 ]; then
+                            echo "headline_job: arm $arm: every chain stage failed its tiny gate, the arm is skipped"
+                            failed=$((failed + 1))
+                            continue
+                        fi
+                        ;;
+                    m1)
+                        # async-sched's M1 off (0) against on (2), with the chain on (stage A, the pair CPU-proven)
+                        if [ "${m1_ok:-1}" != 1 ] || [ "${chain_a_ok:-1}" != 1 ]; then
+                            echo "headline_job: arm $arm: tiny-m1 or tiny-chain failed, the arm is skipped"
+                            failed=$((failed + 1))
+                            continue
+                        fi
+                        g="VLLM_HPU_MTP_DRAFT_GRAPH=1;VLLM_HPU_FLASH_NEXT_DECODE_METADATA=1;VLLM_HPU_VOCAB_PARALLEL_LOGITS=0;VLLM_HPU_VERIFY_LOGITS_IN_GRAPH=0;VLLM_HPU_MTP_DRAFT_CHAIN=1"
+                        switch_args+=(--probe-arg "--switch-arm=m1off=$g;VLLM_HPU_FLASH_NEXT_SPEC_DEVICE_INPUTS=0"
+                            --probe-arg "--switch-arm=m1on=$g;VLLM_HPU_FLASH_NEXT_SPEC_DEVICE_INPUTS=2")
+                        ;;
+                    graph-md-all)
+                        switch_args+=(--probe-arg "--switch-arm=off=VLLM_HPU_MTP_DRAFT_GRAPH=0;VLLM_HPU_FLASH_NEXT_DECODE_METADATA=0;VLLM_HPU_VOCAB_PARALLEL_LOGITS=0"
+                            --probe-arg "--switch-arm=on=VLLM_HPU_MTP_DRAFT_GRAPH=1;VLLM_HPU_FLASH_NEXT_DECODE_METADATA=0;VLLM_HPU_VOCAB_PARALLEL_LOGITS=0"
+                            --probe-arg "--switch-arm=md=VLLM_HPU_MTP_DRAFT_GRAPH=0;VLLM_HPU_FLASH_NEXT_DECODE_METADATA=1;VLLM_HPU_VOCAB_PARALLEL_LOGITS=0"
+                            --probe-arg "--switch-arm=on-md=VLLM_HPU_MTP_DRAFT_GRAPH=1;VLLM_HPU_FLASH_NEXT_DECODE_METADATA=1;VLLM_HPU_VOCAB_PARALLEL_LOGITS=0"
+                            --probe-arg "--switch-arm=all=VLLM_HPU_MTP_DRAFT_GRAPH=1;VLLM_HPU_FLASH_NEXT_DECODE_METADATA=1;VLLM_HPU_VOCAB_PARALLEL_LOGITS=1")
+                        ;;
                     graph-md)
                         switch_args+=(--probe-arg "--switch-arm=off=VLLM_HPU_MTP_DRAFT_GRAPH=0;VLLM_HPU_FLASH_NEXT_DECODE_METADATA=0"
                             --probe-arg "--switch-arm=on=VLLM_HPU_MTP_DRAFT_GRAPH=1;VLLM_HPU_FLASH_NEXT_DECODE_METADATA=0"
@@ -492,7 +726,7 @@ while [ "$i_arm" -lt "${#ARMS[@]}" ]; do
             fi
             # The post steps (serve_probe.sh --post-cmd), in the order sw, cap, kvlp / kvlpfb, long. Each command is
             # one bash -c string; serve_probe.sh runs it in the arm's folder with SERVE_PORT set.
-            for w in sw dg32 cap kvlp kvlpfb long; do
+            for w in sw dg32 cap kvlp kvlpfb kvlpfloor kvlpc long turns; do
                 [[ " ${post_words[*]:-} " == *" $w "* ]] || continue
                 case "$w" in
                     sw | dg32)
@@ -524,10 +758,35 @@ while [ "$i_arm" -lt "${#ARMS[@]}" ]; do
                             --measured-timeout 600 --out "$ARM_DIR/trace_probe.json")
                         post_args+=(--post-cmd "$(printf '%q ' "${cap_cmd[@]}") --port \"\$SERVE_PORT\" 2>&1 | tee trace_probe.log; rc=\${PIPESTATUS[0]}; ls -la trace 2>/dev/null | tail -n 12; du -sh trace 2>/dev/null; exit \$rc")
                         ;;
-                    kvlp | kvlpfb)
+                    turns)
+                        # async-sched job branch: requests across the recurrent block, new batch shapes after the
+                        # commits, the same prompts again (exact tokens), the agent's next turn on the committed blocks
+                        turns_cmd=("$PYTHON" "$TREE/tools/flash_next/rental/commit_turns_probe.py" --model fn
+                            --block "${HEADLINE_TURNS_BLOCK:-896}" --out "$ARM_DIR/turns.json")
+                        post_args+=(--post-cmd "$(printf '%q ' "${turns_cmd[@]}") --port \"\$SERVE_PORT\" 2>&1 | tee turns.log; exit \${PIPESTATUS[0]}")
+                        ;;
+                    kvlp | kvlpfb | kvlpfloor | kvlpc)
+                        # kvlpfloor (build 6): a second bf16 server's raw run against the job's first good bf16 file,
+                        # the cross-server floor of the FP8 comparison; kvlpc: the probe's --chat mode (the prompt in
+                        # the chat template, so the 24 tokens answer the needle), bf16c against nothing, fp8c against
+                        # the job's bf16c file (chat and raw prompts differ: never compared with each other)
                         label=bf16
                         ref_args=()
-                        if [ "$fp8kv" = 1 ]; then
+                        chat_args=()
+                        if [ "$w" = kvlpc ]; then
+                            chat_args=(--chat)
+                            label=bf16c
+                            if [ "$fp8kv" = 1 ]; then
+                                label=fp8c
+                                ref="$(ls -1 "$OUT"/*/kvlp_bf16c.json 2>/dev/null | head -n 1)"
+                                if [ -n "$ref" ]; then ref_args=(--reference "$ref"); fi
+                            fi
+                        elif [ "$w" = kvlpfloor ]; then
+                            label=bf16floor
+                            ref="${HEADLINE_KVLP_REF:-$(good_kvlp_ref)}"
+                            if [ -n "$ref" ]; then ref_args=(--reference "$ref"); fi
+                            echo "headline_job: arm $arm: kvlpfloor reference ${ref:-none (no good kvlp_bf16.json in the job)}"
+                        elif [ "$fp8kv" = 1 ]; then
                             label=fp8
                             ref="${HEADLINE_KVLP_REF:-$(good_kvlp_ref)}"
                             if [ -n "$ref" ]; then ref_args=(--reference "$ref"); fi
@@ -539,7 +798,7 @@ while [ "$i_arm" -lt "${#ARMS[@]}" ]; do
                         kvlp_cmd=("$PYTHON" "$TREE/tools/flash_next/rental/kv_logprob_probe.py" --model fn --docs "$TREE"
                             --label "$label" --lengths "${HEADLINE_KVLP_LENGTHS:-16000,64000,120000}"
                             --timeout "${HEADLINE_KVLP_TIMEOUT:-1200}" --out "$ARM_DIR/kvlp_$label.json"
-                            ${ref_args[@]+"${ref_args[@]}"})
+                            ${ref_args[@]+"${ref_args[@]}"} ${chat_args[@]+"${chat_args[@]}"})
                         post_args+=(--post-cmd "$(printf '%q ' "${kvlp_cmd[@]}") --port \"\$SERVE_PORT\" 2>&1 | tee kvlp_$label.log; exit \${PIPESTATUS[0]}")
                         ;;
                     long)
