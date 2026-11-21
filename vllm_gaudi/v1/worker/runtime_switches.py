@@ -22,6 +22,8 @@ from typing import Optional
 # VLLM_HPU_MTP_DRAFT_GRAPH is read at every decode draft (HpuFlashNextMtpProposer._draft_graph_enabled): 1 runs the
 # k draft passes in the one-graph loop (built at its first draft), 0 the per-pass graphs; both keep their graphs.
 # VLLM_HPU_MTP_DRAFT_CHAIN is decided before every verification (HPUModelRunner._mtp_chain_decision).
+# VLLM_HPU_FLASH_NEXT_SPEC_DEVICE_INPUTS (async-sched's stage 2, M1) is read at every verification step by a server
+# started at 1 or 2 (the device-made inputs' object exists only then); 0 turns it off while serving.
 # The MoE dense range (VLLM_HPU_MOE_DENSE_MIN_TOKENS / _MAX_TOKENS, extension/ops.py) is read inside the model's
 # forward, so a captured HPU graph keeps the path it was captured with: when the file names one of these
 # (GRAPH_SWITCHABLE), the runner drops the captured graphs of the model and of the drafter and the next steps capture
@@ -29,7 +31,8 @@ from typing import Optional
 # the maximum is the vendor op at every size.
 GRAPH_SWITCHABLE = ("VLLM_HPU_MOE_DENSE_MIN_TOKENS", "VLLM_HPU_MOE_DENSE_MAX_TOKENS")
 SWITCHABLE = ("VLLM_HPU_FLASH_NEXT_DECODE_METADATA", "VLLM_HPU_FUSED_GREEDY_LOGITS", "VLLM_HPU_CANDIDATE_SAMPLING",
-              "VLLM_HPU_VOCAB_PARALLEL_LOGITS", "VLLM_HPU_MTP_DRAFT_GRAPH", "VLLM_HPU_MTP_DRAFT_CHAIN") + GRAPH_SWITCHABLE
+              "VLLM_HPU_VOCAB_PARALLEL_LOGITS", "VLLM_HPU_MTP_DRAFT_GRAPH", "VLLM_HPU_MTP_DRAFT_CHAIN",
+              "VLLM_HPU_FLASH_NEXT_SPEC_DEVICE_INPUTS") + GRAPH_SWITCHABLE
 
 
 def parse_switches(text: str) -> dict[str, str]:

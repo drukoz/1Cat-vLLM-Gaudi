@@ -37,6 +37,7 @@ def test_switch_file_format():
     assert set(SWITCHABLE) == {"VLLM_HPU_FLASH_NEXT_DECODE_METADATA", "VLLM_HPU_FUSED_GREEDY_LOGITS",
                                "VLLM_HPU_CANDIDATE_SAMPLING", "VLLM_HPU_VOCAB_PARALLEL_LOGITS",
                                "VLLM_HPU_MTP_DRAFT_GRAPH", "VLLM_HPU_MTP_DRAFT_CHAIN",
+                               "VLLM_HPU_FLASH_NEXT_SPEC_DEVICE_INPUTS",
                                "VLLM_HPU_MOE_DENSE_MIN_TOKENS", "VLLM_HPU_MOE_DENSE_MAX_TOKENS"}
     assert set(GRAPH_SWITCHABLE) == {"VLLM_HPU_MOE_DENSE_MIN_TOKENS", "VLLM_HPU_MOE_DENSE_MAX_TOKENS"}
     assert parse_switches("VLLM_HPU_MOE_DENSE_MIN_TOKENS=1\nVLLM_HPU_MOE_DENSE_MAX_TOKENS=512\n") == {
