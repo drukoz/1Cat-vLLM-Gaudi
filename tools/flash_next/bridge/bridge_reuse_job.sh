@@ -37,7 +37,9 @@
 # under another batch: real-ref's own count is the noise floor), and how many of real-ref-alt's churn texts equal
 # real-ref's (two servers, all flags off: the floor of the hard rule).
 # REF_PAIR=1 (BRIDGE_REF_PAIR) adds real-ref-alt: real-ref with the other accumulation-thread setting (two servers that
-# differ only in the spinner; its texts_1 must equal real-ref's); LEAN4=0 (BRIDGE_LEAN4) leaves real-lean4 out.
+# differ only in the spinner; its texts_1 must equal real-ref's); LEAN4=0 (BRIDGE_LEAN4) leaves real-lean4 out;
+# VERIFY_KV (BRIDGE_VERIFY_KV, ';'-separated) is extra env of real-lean5-verify alone, the arm that is not timed (e.g.
+# PT_HPU_HPUGRAPH_STATIC_PLAN_MISS_LOG=200 with native-replay's lean6m wheel: one line per missing launcher).
 # Verdicts: ~/farm/<track>/results/<job>-<name>-verdicts.txt; exit code 0 when all passed and no arm was skipped.
 set -u
 IMG="${1:?image}"
@@ -51,12 +53,13 @@ ARMSET="${BRIDGE_ARMSET:-lean4}"
 L5="${BRIDGE_LEAN5:-}"
 REF_PAIR="${BRIDGE_REF_PAIR:-0}"
 WITH_LEAN4="${BRIDGE_LEAN4:-1}"
+VERIFY_KV="${BRIDGE_VERIFY_KV:-}"
 LATE="$HOME/farm/collectives/bridge/late/${CARDQ_JOB:-none}.env"
 if [ -s "$LATE" ]; then
     while IFS='=' read -r k v; do
         case "$v" in *[!A-Za-z0-9._,\;=/-]*) echo "bridge_reuse: ignored a bad value in $LATE: $k"; continue ;; esac
         case "$k" in SPIN) SPIN="$v" ;; PIN_KV) PIN_KV="$v" ;; PLACE) PLACE="$v" ;; ARMSET) ARMSET="$v" ;;
-            LEAN5) L5="$v" ;; REF_PAIR) REF_PAIR="$v" ;; LEAN4) WITH_LEAN4="$v" ;; esac
+            LEAN5) L5="$v" ;; REF_PAIR) REF_PAIR="$v" ;; LEAN4) WITH_LEAN4="$v" ;; VERIFY_KV) VERIFY_KV="$v" ;; esac
     done <"$LATE"
     echo "bridge_reuse: late-bound settings from $LATE"
 fi
@@ -76,7 +79,7 @@ done
 SPINKV=""
 [ "$SPIN" = off ] && SPINKV=";PT_HPU_SYNCHRONOUS_ACC_QUEUE_FLUSHING=1"
 F1="PT_HPU_HPUGRAPH_PREPARED_REPLAY=1"
-echo "bridge_reuse: image $IMG, arm set $ARMSET, lean4 $L, lean5 ${L5:-none}, spinner $SPIN, pin ${PIN_KV:-none}, placement ${PLACE:-none}, ref pair $REF_PAIR, lean4 arm $WITH_LEAN4"
+echo "bridge_reuse: image $IMG, arm set $ARMSET, lean4 $L, lean5 ${L5:-none}, spinner $SPIN, pin ${PIN_KV:-none}, placement ${PLACE:-none}, ref pair $REF_PAIR, lean4 arm $WITH_LEAN4, verify arm extra ${VERIFY_KV:-none}"
 PROBE="bash $P/serve_probe.sh --levels 32,8,1 --tokens 128 --warm-tokens 48 --repeat-top 2 --no-mintok-check --probe-arg --sampled-levels=32,8,1 --probe-arg --interleave-sampled --probe-arg --rounds=2"
 CMD="$PROBE"
 [ -z "$PLACE" ] || CMD="bash /results/bench/place_wrap.sh $PLACE -- $PROBE"
@@ -213,7 +216,7 @@ if [ "$ARMSET" = lean5 ]; then
     REAL=("real-ref:$L5:$CH;$T5$LEANKV")
     if grep -q '^tiny-lean5-verify ok' "$V"; then
         REAL+=("real-lean5:$L5:$F1;PT_HPU_HPUGRAPH_PREPARED_REUSE=1;PT_HPU_HPUGRAPH_STATIC_PLAN=1;PT_HPU_DISABLE_ASYNC_COLLECTIVE=1;$CH;$T5$LEANKV")
-        REAL+=("real-lean5-verify:$L5:$F1;PT_HPU_HPUGRAPH_PREPARED_REUSE=2;PT_HPU_HPUGRAPH_STATIC_PLAN=2;PT_HPU_HPUGRAPH_STATIC_PLAN_BUMP_EVERY=5000;PT_HPU_DISABLE_ASYNC_COLLECTIVE=1;$CH;$T5$LEANKV")
+        REAL+=("real-lean5-verify:$L5:$F1;PT_HPU_HPUGRAPH_PREPARED_REUSE=2;PT_HPU_HPUGRAPH_STATIC_PLAN=2;PT_HPU_HPUGRAPH_STATIC_PLAN_BUMP_EVERY=5000;PT_HPU_DISABLE_ASYNC_COLLECTIVE=1;$CH;$T5$LEANKV${VERIFY_KV:+;$VERIFY_KV}")
     fi
     if [ "$REF_PAIR" = 1 ]; then  # real-ref with the other spinner setting, everything else the same
         if [ "$SPIN" = off ]; then ALTKV="${PIN_KV:+;$PIN_KV}"; else ALTKV="${PIN_KV:+;$PIN_KV};PT_HPU_SYNCHRONOUS_ACC_QUEUE_FLUSHING=1"; fi
