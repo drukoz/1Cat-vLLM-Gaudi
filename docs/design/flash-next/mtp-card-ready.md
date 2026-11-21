@@ -6,7 +6,7 @@ This file is the track's report. The harness of the track's agents does not writ
 
 ## Handoff (if this agent stops)
 
-Last update: 2026-11-21 00:26 UTC (fourth agent of the track, Opus 5.5, started 23:15 UTC). Coordinator's rule
+Last update: 2026-11-21 00:41 UTC (fourth agent of the track, Opus 5.5, started 23:15 UTC). Coordinator's rule
 for tonight (BRIEF 23:21): card evidence first, no pull request before 04:00 UTC; push the branch after each green
 step and tell the coordinator the commit and the flags (the integration track builds from this branch).
 
@@ -21,7 +21,15 @@ streams on TP4 k = 1 is the best k** (00126 arm k1: 55.2 ms per token greedy, 65
 without speculation and 61.9 / 82.4 at k = 3); at 1 and 8 streams k = 3. On TP8 (Ft grows about 0.24 ms per row)
 k = 2 to 4 are all about 40-41 ms per token at 32 streams by arithmetic.
 
-**Branch** (pushed: `origin/feat/flash-next-gaudi-mtp-card-ready` = `fb4f4d50` and this handoff):
+**Owner's directive (BRIEF 00:28): 8 cards first.** Every TP4 job waits behind the TP8 jobs and probably will
+not run tonight. Sampled MTP at TP8 runs in the integration track's build 2 (MTP k = 2, sampled rounds last with
+`VLLM_HPU_SPEC_SAMPLED_VERIFY=2`; its build 4681ee37 has this branch up to 6f5004f6, which contains `=2`; the
+optional log line is `409c83e5`).
+
+**Branch** (pushed: `origin/feat/flash-next-gaudi-mtp-card-ready` = `409c83e5` and this handoff):
+- `409c83e5` one log line at the first candidate step (`VLLM_HPU_SPEC_SAMPLED_VERIFY=2: sampled verification over
+  the top 64 candidates of every row (first step: N requests, k = K)`); a refused step logs once per reason.
+- `b66e1131` candidate_verify_bench.py: id checks by value (bf16 ties made 00135's set check fail).
 - `fb4f4d50` spec_scaling.py: the long prompts of the warm and the measured round start with different text (no
   round reads another's prefix cache: a TP4 prefix-cache hit can read another position's GDN state, BRIEF 23:46).
 - `1f2dc38e` I07 fast path: `VLLM_HPU_SPEC_SAMPLED_VERIFY=2`, sampled verification over the top-64 candidates of
@@ -59,7 +67,17 @@ k = 2 to 4 are all about 40-41 ms per token at 32 streams by arithmetic.
   `python tools/flash_next/candidate_verify_bench.py --device hpu --requests 1,8,32 --out "$FARM_OUT/bench.json"`:
   the exact sampled verification (`=1`) against the candidate path (`=2`) per call on one card, the candidate ids
   against the CPU's topk, valid tokens, first-draft acceptance of both, greedy = arg max.
-- **00136 `real4-qsa-mtp3-cand-ctx`** (any:4, 30 min, `fb4f4d50`, bump asked after 00135): 00126's flags with
+- **00135 ended 00:23 UTC (ok, 22 s)**: candidate path 3.7 / 6.0 / 13.3 ms per call against 5.4 / 11.9 / 27.6 ms on
+  the exact path at 1 / 8 / 32 requests (k = 3, one card); tokens valid, k-th value equal to the CPU's, first-draft
+  acceptance of both paths within 1.5 sigma of the CPU's exact expectation (0.097 at 32 requests). Its id-set and
+  greedy checks failed on bf16 ties only (88-100 % of rows tie at the 64th value); fixed in `b66e1131`.
+- **00139 `cand-verify-bench2`** (any:1, 10 min, `b66e1131`): the same bench with the id checks by value (every
+  candidate id holds its value in the CPU's logits). Queued 00:35 UTC; runs only if a card is idle.
+- **00138 `real4-qsa-cand-k3-k1`** (any:4, 45 min, `fb4f4d50`, replaced 00136 at 00:26 UTC, keeps its bump): 00126's
+  flags with `VLLM_HPU_SPEC_SAMPLED_VERIFY=2`, `mtp_arms.sh 'cand3|3||--levels 32 --tokens 256 --repeat-top 1
+  --sampled-levels 1,32 --ctx 8:16000' 'cand1|1||--levels 32 --tokens 256 --repeat-top 1 --sampled-levels 1,32'`.
+  Waits behind the TP8 jobs; THE PLAN FOR THE NEXT RENTAL if it does not run.
+- (cancelled) **00136 `real4-qsa-mtp3-cand-ctx`** (any:4, 30 min, `fb4f4d50`, bump asked after 00135): 00126's flags with
   `VLLM_HPU_SPEC_SAMPLED_VERIFY=2`, `mtp_arms.sh 'cand|3||--levels 32 --tokens 256 --repeat-top 1 --sampled-levels
   1,32 --ctx 8:16000'` (greedy 32 in the same server, sampled 1 and 32 over candidates, 8 x 16K-token prompts with
   CHUNK_KV). If 00135 shows the candidate path wrong on the card: `--replaces 00136` with `=1`.
