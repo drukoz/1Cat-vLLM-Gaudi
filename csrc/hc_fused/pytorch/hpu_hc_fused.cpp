@@ -34,10 +34,12 @@ constexpr int64_t kMaxStreams = 64;
 //   moe_silu_mul(Tensor gate_up, int first_column=0) -> Tensor
 //   moe_combine(Tensor shared, Tensor gates, Tensor routed, int gate_column) -> Tensor
 //   moe_row_quant(Tensor x, float fp8_max) -> (Tensor, Tensor)                fp8 values, fp32 scale
+//   moe_act_quant(Tensor gate_up, int experts, float fp8_max) -> (Tensor, Tensor)  fp8 [T, E*I], fp32 [T, E]
 constexpr auto kMoeRouteSchema = "flashinfer_gaudi::moe_route";
 constexpr auto kMoeSiluMulSchema = "flashinfer_gaudi::moe_silu_mul";
 constexpr auto kMoeCombineSchema = "flashinfer_gaudi::moe_combine";
 constexpr auto kMoeRowQuantSchema = "flashinfer_gaudi::moe_row_quant";
+constexpr auto kMoeActQuantSchema = "flashinfer_gaudi::moe_act_quant";
 
 // A [tokens, columns] activation: 2-D, bf16, contiguous, not empty.
 void check_matrix(const at::Tensor& tensor, const char* name) {
@@ -267,6 +269,20 @@ void validate_moe_row_quant(const at::Tensor& x, double fp8_max) {
                 " (the Gaudi2 fp8 range), got ", fp8_max);
 }
 
+// act_quant: the flat gate / up GEMM output [tokens, experts * 2 * width] of the dense routed experts.
+void validate_moe_act_quant(const at::Tensor& gate_up, int64_t experts, double fp8_max) {
+    check_matrix(gate_up, "gate_up");
+    TORCH_CHECK(experts >= 1 && experts <= kMoeGlueMaxExperts, "MoE act_quant experts must be in [1, ",
+                kMoeGlueMaxExperts, "], got ", experts);
+    TORCH_CHECK(gate_up.size(1) % (2 * experts) == 0, "MoE act_quant gate_up must have experts * 2 * width columns, got ",
+                gate_up.size(1), " for ", experts, " experts");
+    const int64_t width = gate_up.size(1) / (2 * experts);
+    TORCH_CHECK(width % kVectorLanes == 0, "MoE act_quant width must be a multiple of ", kVectorLanes, " (one TPC vector), got ",
+                width);
+    TORCH_CHECK(static_cast<float>(fp8_max) == kMoeGlueFp8Max, "MoE glue fp8_max must be ", kMoeGlueFp8Max,
+                " (the Gaudi2 fp8 range), got ", fp8_max);
+}
+
 std::shared_ptr<void> moe_node_params(size_t& size, int64_t experts, int64_t top_k, int64_t gate_column,
                                       double fp8_max) {
     size = sizeof(MoeGlueParams);
@@ -333,6 +349,24 @@ const bool moe_row_quant_registered = [] {
         },
         [](const at::Stack& stack, size_t& size) -> std::shared_ptr<void> {
             return moe_node_params(size, 0, 0, 0, stack.at(1).toDouble());
+        });
+    return true;
+}();
+
+const bool moe_act_quant_registered = [] {
+    habana::custom_op::registerUserCustomOp(
+        kMoeActQuantSchema, kMoeGlueActQuantGuid,
+        [](const at::Stack& stack) {
+            const auto& gate_up = stack.at(0).toTensor();
+            const int64_t experts = stack.at(1).toInt();
+            validate_moe_act_quant(gate_up, experts, stack.at(2).toDouble());
+            const int64_t width = gate_up.size(1) / (2 * experts);
+            return habana::PartialOutputMetaDataVector{
+                habana::PartialOutputMetaData{at::ScalarType::Float8_e4m3fn, {gate_up.size(0), experts * width}},
+                habana::PartialOutputMetaData{at::kFloat, {gate_up.size(0), experts}}};
+        },
+        [](const at::Stack& stack, size_t& size) -> std::shared_ptr<void> {
+            return moe_node_params(size, stack.at(1).toInt(), 0, 0, stack.at(2).toDouble());
         });
     return true;
 }();
@@ -415,6 +449,12 @@ std::tuple<at::Tensor, at::Tensor> run_moe_row_quant(const at::Tensor& x, double
     const auto outputs = execute(kMoeRowQuantSchema, x, {x, fp8_max}, 2);
     return std::make_tuple(outputs.at(0), outputs.at(1));
 }
+std::tuple<at::Tensor, at::Tensor> run_moe_act_quant(const at::Tensor& gate_up, int64_t experts, double fp8_max) {
+    validate_moe_act_quant(gate_up, experts, fp8_max);
+    TORCH_CHECK(moe_act_quant_registered);
+    const auto outputs = execute(kMoeActQuantSchema, gate_up, {gate_up, experts, fp8_max}, 2);
+    return std::make_tuple(outputs.at(0), outputs.at(1));
+}
 }  // namespace
 
 TORCH_LIBRARY_IMPL(flashinfer_gaudi, HPU, m) {
@@ -422,6 +462,7 @@ TORCH_LIBRARY_IMPL(flashinfer_gaudi, HPU, m) {
     m.impl("moe_silu_mul", run_moe_silu_mul);
     m.impl("moe_combine", run_moe_combine);
     m.impl("moe_row_quant", run_moe_row_quant);
+    m.impl("moe_act_quant", run_moe_act_quant);
     m.impl("hc_norm", run_norm);
     m.impl("hc_silu", run_silu);
     m.impl("hc_silu_split", run_silu_split);

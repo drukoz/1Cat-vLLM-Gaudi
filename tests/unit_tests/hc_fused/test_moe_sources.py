@@ -22,10 +22,11 @@ GUID_CONSTANT = {
     "silu_mul": "kMoeGlueSiluMulGuid",
     "combine": "kMoeGlueCombineGuid",
     "row_quant": "kMoeGlueRowQuantGuid",
+    "act_quant": "kMoeGlueActQuantGuid",
 }
 BUILD_DEFINE = {kind: f"HC_FUSED_HAS_MOE_GLUE_{kind.upper()}" for kind in KINDS}
 SCALAR_TAIL = "int experts, int top_k, int gate_column, float inv_fp8_max)"
-TENSORS = {"route": (1, 2), "silu_mul": (1, 1), "combine": (3, 1), "row_quant": (1, 2)}
+TENSORS = {"route": (1, 2), "silu_mul": (1, 1), "combine": (3, 1), "row_quant": (1, 2), "act_quant": (1, 2)}
 
 
 def _code(path: Path) -> str:

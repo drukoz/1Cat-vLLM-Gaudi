@@ -17,17 +17,19 @@ from __future__ import annotations
 
 import torch
 
-from flashinfer_gaudi.moe_glue import (GUIDS, NAMESPACE, OP_NAMES, SCHEMAS, moe_combine,  # noqa: F401
-                                       moe_glue_available, moe_glue_missing_ops, moe_route, moe_row_quant,
-                                       moe_silu_mul)
-from tests.unit_tests.hc_fused.moe_reference import (moe_combine_reference, moe_route_reference,
-                                                     moe_row_quant_cpu_reference, moe_silu_mul_reference)
+from flashinfer_gaudi.moe_glue import (GUIDS, NAMESPACE, OP_NAMES, SCHEMAS, moe_act_quant,  # noqa: F401
+                                       moe_combine, moe_glue_available, moe_glue_missing_ops, moe_route,
+                                       moe_row_quant, moe_silu_mul)
+from tests.unit_tests.hc_fused.moe_reference import (moe_act_quant_cpu_reference, moe_combine_reference,
+                                                     moe_route_reference, moe_row_quant_cpu_reference,
+                                                     moe_silu_mul_reference)
 
 CPU_KERNELS = {
     "moe_route": moe_route_reference,
     "moe_silu_mul": moe_silu_mul_reference,
     "moe_combine": moe_combine_reference,
     "moe_row_quant": moe_row_quant_cpu_reference,
+    "moe_act_quant": moe_act_quant_cpu_reference,
 }
 
 

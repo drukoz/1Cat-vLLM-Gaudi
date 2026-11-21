@@ -26,7 +26,7 @@ EXTENSION = "hc_fused_ops.cpython-310-x86_64-linux-gnu.so"
 HC_GUIDS = ("hc_fused_norm_bf16_gaudi2", "hc_fused_silu_bf16_gaudi2", "hc_fused_silu_split_bf16_gaudi2",
             "hc_fused_gate_mix_bf16_gaudi2", "hc_fused_combine_bf16_gaudi2", "hc_fused_combine_norm_bf16_gaudi2")
 MOE_GUIDS = ("moe_glue_route_bf16_gaudi2", "moe_glue_silu_mul_bf16_gaudi2", "moe_glue_combine_bf16_gaudi2",
-             "moe_glue_row_quant_bf16_gaudi2")
+             "moe_glue_row_quant_bf16_gaudi2", "moe_glue_act_quant_bf16_gaudi2")
 STATUS_KEYS = {"state", "gc_kernel_path", "combined_active", "combined_kernel_db", "gdn_fused_loaded",
                "hc_fused_loaded", "load_errors"}
 
@@ -147,7 +147,7 @@ def test_missing_files_are_named(monkeypatch, tmp_path, events):
     assert errors == _native.hc_fused_extension_errors()  # the library's own errors, not copies with other text
     assert events == [] and asked == []
     assert _native.kernel_database_status()["moe_glue_loaded"] is False
-    assert _native.moe_glue_missing_kernels() == ("moe_route", "moe_silu_mul", "moe_combine", "moe_row_quant")
+    assert _native.moe_glue_missing_kernels() == ("moe_route", "moe_silu_mul", "moe_combine", "moe_row_quant", "moe_act_quant")
 
 
 def test_a_kernel_the_library_was_built_without_is_named(monkeypatch, package, events):
@@ -167,7 +167,7 @@ def test_a_library_that_cannot_be_asked_serves_nothing(monkeypatch, package, eve
     _serve(monkeypatch, OSError("invalid ELF header"))
 
     assert _native.load_moe_glue_extension() is False
-    assert _native.moe_glue_missing_kernels() == ("moe_route", "moe_silu_mul", "moe_combine", "moe_row_quant")
+    assert _native.moe_glue_missing_kernels() == ("moe_route", "moe_silu_mul", "moe_combine", "moe_row_quant", "moe_act_quant")
     (error, ) = _native.moe_glue_extension_errors()
     assert "OSError: invalid ELF header" in error
     assert _native.hc_fused_extension_loaded() is True  # the hyper-connection ops are not affected

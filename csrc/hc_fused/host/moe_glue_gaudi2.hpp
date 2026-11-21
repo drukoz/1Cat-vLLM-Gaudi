@@ -8,7 +8,7 @@
 // entry_points.cpp look a GUID up here after the hyper-connection table.
 namespace moe_glue {
 
-enum class Kind { Route, SiluMul, Combine, RowQuant };
+enum class Kind { Route, SiluMul, Combine, RowQuant, ActQuant };
 
 struct KernelInfo {
     Kind kind;
@@ -17,7 +17,7 @@ struct KernelInfo {
     unsigned outputs;
 };
 
-// The kernels in the library, in GetKernelGuids order, and how many there are (0 to 4).
+// The kernels in the library, in GetKernelGuids order, and how many there are (0 to 5).
 const KernelInfo* Kernels();
 unsigned KernelCount();
 
@@ -36,7 +36,7 @@ tpc_lib_api::GlueCodeReturn InferShapes(
     tpc_lib_api::ShapeInferenceOutput* output);
 
 // The kernel a shape-inference call without a GUID name is for, from the tensor counts and the
-// node parameters (top_k > 0 tells route from row_quant), or nullptr.
+// node parameters (top_k > 0: route; else experts > 0: act_quant; else row_quant), or nullptr.
 const KernelInfo* KernelForShapes(const tpc_lib_api::ShapeInferenceParams* params);
 
 }  // namespace moe_glue

@@ -27,12 +27,15 @@ from __future__ import annotations
 import torch
 
 NAMESPACE = "flashinfer_gaudi"
-OP_NAMES = ("moe_route", "moe_silu_mul", "moe_combine", "moe_row_quant")
+OP_NAMES = ("moe_route", "moe_silu_mul", "moe_combine", "moe_row_quant", "moe_act_quant")
 SCHEMAS = {
     "moe_route": "moe_route(Tensor gates, int experts, int top_k) -> (Tensor, Tensor)",
     "moe_silu_mul": "moe_silu_mul(Tensor gate_up, int first_column=0) -> Tensor",
     "moe_combine": "moe_combine(Tensor shared, Tensor gates, Tensor routed, int gate_column) -> Tensor",
     "moe_row_quant": "moe_row_quant(Tensor x, float fp8_max) -> (Tensor, Tensor)",
+    # The dense routed experts' fused activation + quantization (vllm_gaudi/extension/ops.py moe_dense_fp8,
+    # VLLM_HPU_MOE_DENSE_ACT_QUANT=1).
+    "moe_act_quant": "moe_act_quant(Tensor gate_up, int experts, float fp8_max) -> (Tensor, Tensor)",
 }
 # The kernel of each op in libhc_fused_gaudi2.so (csrc/hc_fused/hc_fused_params.h).  Each kernel is optional
 # at build time, so the loader asks the library which of them it serves.
@@ -41,6 +44,7 @@ GUIDS = {
     "moe_silu_mul": "moe_glue_silu_mul_bf16_gaudi2",
     "moe_combine": "moe_glue_combine_bf16_gaudi2",
     "moe_row_quant": "moe_glue_row_quant_bf16_gaudi2",
+    "moe_act_quant": "moe_glue_act_quant_bf16_gaudi2",
 }
 
 # What the HPU kernels accept, as the op's validation callback (csrc/hc_fused/pytorch/hpu_hc_fused.cpp) and the
@@ -79,6 +83,13 @@ def _moe_row_quant_fake(x, fp8_max):
             x.new_empty(tuple(x.shape[:-1]) + (1, ), dtype=torch.float32))
 
 
+@torch.library.register_fake(f"{NAMESPACE}::moe_act_quant", lib=_LIBRARY)
+def _moe_act_quant_fake(gate_up, experts, fp8_max):
+    width = gate_up.shape[-1] // (2 * experts)
+    return (gate_up.new_empty((gate_up.shape[0], experts * width), dtype=torch.float8_e4m3fn),
+            gate_up.new_empty((gate_up.shape[0], experts), dtype=torch.float32))
+
+
 def moe_route(gates: torch.Tensor, experts: int, top_k: int) -> tuple[torch.Tensor, torch.Tensor]:
     """Softmax over ``gates[:, :experts]``, the ``top_k`` experts and their renormalized weights.
 
@@ -106,6 +117,21 @@ def moe_combine(shared: torch.Tensor, gates: torch.Tensor, routed: torch.Tensor,
 def moe_row_quant(x: torch.Tensor, fp8_max: float) -> tuple[torch.Tensor, torch.Tensor]:
     """Per-row dynamic FP8 quantization: ``(x_fp8 float8_e4m3fn [T, H], scale float32 [T, 1])``."""
     return torch.ops.flashinfer_gaudi.moe_row_quant(x, float(fp8_max))
+
+
+def moe_act_quant(gate_up: torch.Tensor, experts: int, fp8_max: float) -> tuple[torch.Tensor, torch.Tensor]:
+    """The dense routed experts' activation and per-(token, expert) FP8 quantization of the flat gate / up GEMM
+    output ``[T, E * 2 * I]`` (expert e's gate columns, then its up columns): ``(mid fp8 [T, E * I], scale float32
+    [T, E])`` with ``mid = bf16(silu(gate) * up)`` quantized as ``moe_row_quant`` does per (token, expert)."""
+    return torch.ops.flashinfer_gaudi.moe_act_quant(gate_up, int(experts), float(fp8_max))
+
+
+def moe_act_quant_available(device: torch.device | str) -> bool:
+    """True when moe_act_quant has a kernel for the device's type."""
+    device_type = device.type if isinstance(device, torch.device) else torch.device(device).type
+    dispatch_key = _DISPATCH_KEYS_BY_DEVICE_TYPE.get(device_type)
+    return dispatch_key is not None and torch._C._dispatch_has_kernel_for_dispatch_key(
+        f"{NAMESPACE}::moe_act_quant", dispatch_key)
 
 
 _DISPATCH_KEYS_BY_DEVICE_TYPE = {"cpu": "CPU", "hpu": "HPU"}

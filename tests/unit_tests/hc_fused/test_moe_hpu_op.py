@@ -94,6 +94,14 @@ def _row_quant(x, fp8_max):
     return moe_ops.moe_row_quant(x, fp8_max)
 
 
+def _act_quant(gate_up, experts, fp8_max):
+    """The dense experts' activation + quantization op.  In a dry run the stand-in is the kernel's oracle, not the
+    op's CPU kernel (whose scale is CPU torch's division)."""
+    if DRY_RUN:
+        return moe_reference.moe_act_quant_reference(gate_up, experts, fp8_max)
+    return moe_ops.moe_act_quant(gate_up, experts, fp8_max)
+
+
 def _dynamic_quant_on_the_card(plugin_ops, x):
     """The plugin's dynamic_quant.  A dry run has no card: the same function with the card's scalar division."""
     if DRY_RUN:
@@ -103,7 +111,8 @@ def _dynamic_quant_on_the_card(plugin_ops, x):
 
 
 def _run(case, device_inputs):
-    op = {"route": _route, "row_quant": _row_quant}.get(case.kind) or getattr(moe_ops, OP_NAME[case.kind])
+    op = {"route": _route, "row_quant": _row_quant, "act_quant": _act_quant}.get(case.kind) or getattr(
+        moe_ops, OP_NAME[case.kind])
     out = op(*[device_inputs[name] for name in INPUT_ORDER[case.kind]], *scalars(case))
     out = out if isinstance(out, tuple) else (out, )
     assert len(out) == len(OUTPUT_ORDER[case.kind])

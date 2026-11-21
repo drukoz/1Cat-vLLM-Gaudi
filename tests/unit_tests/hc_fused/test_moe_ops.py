@@ -54,6 +54,9 @@ def _torch_path_on_cpu(case, inputs):
     if case.kind == "row_quant":
         return dict(zip(OUTPUT_ORDER[case.kind], moe_reference.moe_row_quant_cpu_reference(inputs["x"],
                                                                                            *scalars(case))))
+    if case.kind == "act_quant":
+        return dict(zip(OUTPUT_ORDER[case.kind], moe_reference.moe_act_quant_cpu_reference(inputs["gate_up"],
+                                                                                           *scalars(case))))
     return expected(case, inputs)
 
 

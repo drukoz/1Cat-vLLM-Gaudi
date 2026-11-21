@@ -47,7 +47,9 @@ inline constexpr const char* kMoeGlueRouteGuid = "moe_glue_route_bf16_gaudi2";
 inline constexpr const char* kMoeGlueSiluMulGuid = "moe_glue_silu_mul_bf16_gaudi2";
 inline constexpr const char* kMoeGlueCombineGuid = "moe_glue_combine_bf16_gaudi2";
 inline constexpr const char* kMoeGlueRowQuantGuid = "moe_glue_row_quant_bf16_gaudi2";
-inline constexpr unsigned kMoeGlueGuidCount = 4;
+// The dense routed experts' activation + per-(token, expert) quantization (VLLM_HPU_MOE_DENSE_ACT_QUANT).
+inline constexpr const char* kMoeGlueActQuantGuid = "moe_glue_act_quant_bf16_gaudi2";
+inline constexpr unsigned kMoeGlueGuidCount = 5;
 
 // Gates of the MoE kernels. top_k: one 64-lane int32 vector holds the ids of a row. experts: the
 // routing kernel tracks expert ids in int16 lanes. fp8_max: the largest value of Gaudi2's 1-4-3

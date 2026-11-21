@@ -182,3 +182,31 @@ def moe_combine_reference(shared: torch.Tensor, gates: torch.Tensor, routed: tor
                           gate_column: int) -> torch.Tensor:
     """``moe_combine``: ``sigmoid(gates[:, gate_column]) * shared + routed``, ``[T, H]``."""
     return moe_combine_torch(shared, gates[:, gate_column:gate_column + 1], routed)
+
+
+def moe_act_quant_reference(gate_up: torch.Tensor, experts: int,
+                            fp8_max: float = GAUDI2_FP8_MAX) -> tuple[torch.Tensor, torch.Tensor]:
+    """``moe_act_quant``: ``[T, E * 2 * I] -> (mid float8_e4m3fn [T, E * I], scale float32 [T, E])``, the oracle.
+
+    The dense routed experts' torch path (vllm_gaudi/extension/ops.py moe_dense_fp8 with the flat gate / up GEMM):
+    ``act = (F.silu(gate.float()) * up.float()).to(bf16)`` per expert, one rounding, then ``moe_row_quant`` of
+    every (token, expert) row of act as a Gaudi2 card computes it.
+    """
+    rows = gate_up.shape[0]
+    width = gate_up.shape[1] // (2 * experts)
+    blocks = gate_up.reshape(rows, experts, 2 * width).float()
+    act = (torch.nn.functional.silu(blocks[..., :width]) * blocks[..., width:]).to(torch.bfloat16)
+    mid, scale = moe_row_quant_reference(act.reshape(rows * experts, width), fp8_max)
+    return mid.reshape(rows, experts * width), scale.reshape(rows, experts)
+
+
+def moe_act_quant_cpu_reference(gate_up: torch.Tensor, experts: int,
+                                fp8_max: float = GAUDI2_FP8_MAX) -> tuple[torch.Tensor, torch.Tensor]:
+    """``moe_act_quant`` where the quantization is CPU torch's (``moe_row_quant_cpu_reference``): the op's CPU
+    stand-in. Not what a kernel returns: no kernel runs on a CPU."""
+    rows = gate_up.shape[0]
+    width = gate_up.shape[1] // (2 * experts)
+    blocks = gate_up.reshape(rows, experts, 2 * width).float()
+    act = (torch.nn.functional.silu(blocks[..., :width]) * blocks[..., width:]).to(torch.bfloat16)
+    mid, scale = moe_row_quant_cpu_reference(act.reshape(rows * experts, width), fp8_max)
+    return mid.reshape(rows, experts * width), scale.reshape(rows, experts)

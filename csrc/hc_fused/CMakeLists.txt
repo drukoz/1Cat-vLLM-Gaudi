@@ -65,7 +65,8 @@ set(MOE_GLUE_KERNELS
     moe_glue_route_gaudi2
     moe_glue_silu_mul_gaudi2
     moe_glue_combine_gaudi2
-    moe_glue_row_quant_gaudi2)
+    moe_glue_row_quant_gaudi2
+    moe_glue_act_quant_gaudi2)
 set(MOE_GLUE_KERNEL_HEADERS
     "${CMAKE_CURRENT_SOURCE_DIR}/kernels/hc_fused_common.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/kernels/moe_glue_common.h")

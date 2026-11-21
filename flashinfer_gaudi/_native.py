@@ -470,7 +470,7 @@ def moe_glue_missing_kernels() -> tuple[str, ...]:
     return _MOE_GLUE_MISSING
 
 
-MOE_GLUE_OPS = ("moe_route", "moe_silu_mul", "moe_combine", "moe_row_quant")  # flashinfer_gaudi.moe_glue.OP_NAMES
+MOE_GLUE_OPS = ("moe_route", "moe_silu_mul", "moe_combine", "moe_row_quant", "moe_act_quant")  # flashinfer_gaudi.moe_glue.OP_NAMES
 
 
 def _load_moe_glue_locked() -> bool:

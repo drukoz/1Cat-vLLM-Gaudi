@@ -7,7 +7,9 @@
 // columns of gates and <= 32767, outputs int32 ids and bf16 weights; silu_mul: a first column
 // (gate_column) inside the input and an even number of columns from it; combine and row_quant: a
 // hidden size divisible by one 128-lane vector; combine: a gate column inside gates; row_quant:
-// fp8_max exactly 240, outputs fp8 (1-4-3) and fp32.
+// fp8_max exactly 240, outputs fp8 (1-4-3) and fp32; act_quant: experts >= 1 segments of 2 * width
+// columns with width divisible by one 128-lane vector, top_k 0, fp8_max exactly 240, outputs fp8
+// {experts * width, tokens} and fp32 {experts, tokens}.
 // Anything else is rejected here with a GlueCodeReturn; no kernel runs on a shape it cannot handle.
 
 #include <cstdint>
@@ -30,6 +32,10 @@ extern unsigned char _binary_moe_glue_combine_gaudi2_o_end;
 #ifdef HC_FUSED_HAS_MOE_GLUE_ROW_QUANT
 extern unsigned char _binary_moe_glue_row_quant_gaudi2_o_start;
 extern unsigned char _binary_moe_glue_row_quant_gaudi2_o_end;
+#endif
+#ifdef HC_FUSED_HAS_MOE_GLUE_ACT_QUANT
+extern unsigned char _binary_moe_glue_act_quant_gaudi2_o_start;
+extern unsigned char _binary_moe_glue_act_quant_gaudi2_o_end;
 #endif
 
 namespace moe_glue {
@@ -54,6 +60,9 @@ const KernelInfo kKernels[] = {
 #endif
 #ifdef HC_FUSED_HAS_MOE_GLUE_ROW_QUANT
     {Kind::RowQuant, kMoeGlueRowQuantGuid, 1, 2},
+#endif
+#ifdef HC_FUSED_HAS_MOE_GLUE_ACT_QUANT
+    {Kind::ActQuant, kMoeGlueActQuantGuid, 1, 2},
 #endif
     {Kind::Route, nullptr, 0, 0},
 };
@@ -82,6 +91,10 @@ Elf KernelElf(Kind kind)
 #ifdef HC_FUSED_HAS_MOE_GLUE_ROW_QUANT
         case Kind::RowQuant:
             return {&_binary_moe_glue_row_quant_gaudi2_o_start, &_binary_moe_glue_row_quant_gaudi2_o_end};
+#endif
+#ifdef HC_FUSED_HAS_MOE_GLUE_ACT_QUANT
+        case Kind::ActQuant:
+            return {&_binary_moe_glue_act_quant_gaudi2_o_start, &_binary_moe_glue_act_quant_gaudi2_o_end};
 #endif
         default:
             break;
@@ -156,6 +169,22 @@ GlueCodeReturn Resolve(const KernelInfo& kernel, const TensorGeometry* const* in
             r.outputType[0] = DATA_F8_143;
             r.outputType[1] = DATA_F32;
             return GLUE_SUCCESS;
+        case Kind::ActQuant: {
+            // experts segments of 2 * width columns (gate, then up), width a multiple of one 128-lane vector.
+            if (scalar.experts < 1 || scalar.experts > kMoeGlueMaxExperts || scalar.top_k != 0 ||
+                !(scalar.fp8_max == kMoeGlueFp8Max)) {
+                return GLUE_KERNEL_INVALID_SCALAR_ARGUMENT;
+            }
+            const uint64_t experts = static_cast<uint64_t>(scalar.experts);
+            if (columns % (2 * experts) != 0) return GLUE_INCOMPATIBLE_INPUT_SIZE;
+            const uint64_t width = columns / (2 * experts);
+            if (width == 0 || width % kHcFusedVectorLanes != 0) return GLUE_INCOMPATIBLE_INPUT_SIZE;
+            r.outputColumns[0] = experts * width;
+            r.outputColumns[1] = experts;
+            r.outputType[0] = DATA_F8_143;
+            r.outputType[1] = DATA_F32;
+            return GLUE_SUCCESS;
+        }
     }
     return GLUE_NODE_NOT_FOUND;
 }
@@ -211,9 +240,11 @@ const KernelInfo* KernelForShapes(const ShapeInferenceParams* params)
     for (unsigned index = 0; index < kKernelCount; ++index) {
         const KernelInfo& kernel = kKernels[index];
         if (kernel.inputs != params->inputTensorsNr || kernel.outputs != params->outputTensorsNr) continue;
-        // route and row_quant both have one input and two outputs: only route has a top_k.
+        // route, row_quant and act_quant all have one input and two outputs: only route has a top_k, and of the
+        // other two only act_quant has experts.
         if (kernel.kind == Kind::Route && scalar.top_k < 1) continue;
-        if (kernel.kind == Kind::RowQuant && scalar.top_k >= 1) continue;
+        if (kernel.kind == Kind::RowQuant && (scalar.top_k >= 1 || scalar.experts >= 1)) continue;
+        if (kernel.kind == Kind::ActQuant && (scalar.top_k >= 1 || scalar.experts < 1)) continue;
         return &kernel;
     }
     return nullptr;
@@ -298,7 +329,9 @@ GlueCodeReturn Instantiate(const KernelInfo& kernel, HabanaKernelParams* params,
     // the reciprocal rounded to bf16, not as a quotient. The kernel has to return the card's scale: with
     // the unrounded reciprocal its scale was CPU torch's, one bf16 step below the card's in two rows of
     // three (first card run, 2026-11-20; tests/unit_tests/hc_fused/hpu_arithmetic.py).
-    args.inv_fp8_max = kernel.kind == Kind::RowQuant ? RoundToBf16(1.0f / scalar.fp8_max) : 0.0f;
+    args.inv_fp8_max = kernel.kind == Kind::RowQuant || kernel.kind == Kind::ActQuant
+                           ? RoundToBf16(1.0f / scalar.fp8_max)
+                           : 0.0f;
     instance->kernel.paramsNr = sizeof(MoeGlueKernelArgs) / sizeof(uint32_t);
     std::memcpy(instance->kernel.scalarParams, &args, sizeof(args));
 

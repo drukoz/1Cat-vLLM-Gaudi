@@ -19,18 +19,20 @@ import torch
 import torch.nn.functional as F
 
 from tests.unit_tests.hc_fused.hc_case import bf16_steps
-from tests.unit_tests.hc_fused.moe_reference import (GAUDI2_FP8_MAX, moe_combine_reference, moe_route_reference,
+from tests.unit_tests.hc_fused.moe_reference import (GAUDI2_FP8_MAX, cast_to_fp8_reference, moe_act_quant_reference,
+                                                     moe_combine_reference, moe_route_reference,
                                                      moe_row_quant_reference, moe_silu_mul_reference)
 
 BF16 = torch.bfloat16
 F8 = torch.float8_e4m3fn
-KINDS = ("route", "silu_mul", "combine", "row_quant")
+KINDS = ("route", "silu_mul", "combine", "row_quant", "act_quant")
 # Kernel GUIDs; the same strings are in csrc/hc_fused/hc_fused_params.h (test_moe_sources.py checks it).
 GUIDS = {
     "route": "moe_glue_route_bf16_gaudi2",
     "silu_mul": "moe_glue_silu_mul_bf16_gaudi2",
     "combine": "moe_glue_combine_bf16_gaudi2",
     "row_quant": "moe_glue_row_quant_bf16_gaudi2",
+    "act_quant": "moe_glue_act_quant_bf16_gaudi2",
 }
 # The op of each kind: torch.ops.flashinfer_gaudi.<name> (schemas in flashinfer_gaudi/moe_glue.py).
 OP_NAME = {kind: f"moe_{kind}" for kind in KINDS}
@@ -39,12 +41,14 @@ INPUT_ORDER = {
     "silu_mul": ("gate_up", ),
     "combine": ("shared", "gates", "routed"),
     "row_quant": ("x", ),
+    "act_quant": ("gate_up", ),
 }
 OUTPUT_ORDER = {
     "route": ("ids", "weights"),
     "silu_mul": ("act", ),
     "combine": ("out", ),
     "row_quant": ("x_fp8", "scale"),
+    "act_quant": ("x_fp8", "scale"),
 }
 OUTPUT_DTYPE = {"ids": torch.int32, "weights": BF16, "act": BF16, "out": BF16, "x_fp8": F8, "scale": torch.float32}
 VECTOR = 128  # bf16 lanes of one TPC vector; combine and row_quant need hidden % VECTOR == 0
@@ -78,7 +82,8 @@ class MoeCase:
     experts: int = 512  # route, combine: E, the router columns of gates
     top_k: int = 10  # route: K
     columns: int = 513  # route, combine: C, the columns of gates (E, or E + 1 with the shared-gate logit)
-    hidden: int = 2560  # combine, row_quant: H.  silu_mul: D, the output width (the input has 2 * D columns)
+    hidden: int = 2560  # combine, row_quant: H.  silu_mul: D, the output width (the input has 2 * D columns).
+    #                     act_quant: I, one expert's width (the input has experts * 2 * I columns)
     first_column: int = 0  # silu_mul: the column the gate_up block starts at (the input has first_column + 2 * D)
     flavor: str = "random"
     seed: int = 0
@@ -161,15 +166,35 @@ SIM_CASES = (
     _c("row_quant_real_stress", "row_quant", 16, flavor="stress", seed=68),
     _c("row_quant_real_edge", "row_quant", 8, flavor="edge", seed=69),
     _c("row_quant_every_amax", "row_quant", 32639, hidden=128, flavor="every_amax", seed=70),
+    # ---- moe_act_quant: the dense routed experts' activation + per-(token, expert) FP8 ------------------
+    _c("act_quant_tiny_r1", "act_quant", 1, experts=1, hidden=128, seed=81),
+    _c("act_quant_tiny_r3", "act_quant", 3, experts=2, hidden=128, seed=82),
+    _c("act_quant_e4_r2", "act_quant", 2, experts=4, hidden=640, seed=87),
+    _c("act_quant_e4_r16", "act_quant", 16, experts=4, hidden=640, seed=83),
+    _c("act_quant_e4_r32", "act_quant", 32, experts=4, hidden=640, seed=88),
+    _c("act_quant_prefill_r2048", "act_quant", 2048, experts=2, hidden=128, seed=89),
+    _c("act_quant_real_r1", "act_quant", 1, experts=64, hidden=640, seed=84),
+    _c("act_quant_e64_r4", "act_quant", 4, experts=64, hidden=640, seed=85),
+    _c("act_quant_real_stress", "act_quant", 4, experts=8, hidden=640, flavor="stress", seed=86),
 )
 # The verification step of 32 streams, per kernel: simulator and card.
+def _real(kind: str) -> dict:
+    """The real model's geometry of a kind at TP8 (the shared expert's 80 columns, 64 local experts of 640)."""
+    if kind == "silu_mul":
+        return dict(hidden=80)
+    if kind == "act_quant":
+        return dict(hidden=640, experts=64)
+    return dict(hidden=2560)
+
+
 SIM_CASES += tuple(
-    _c(f"{kind}_real_r{rows}", kind, rows, hidden=80 if kind == "silu_mul" else 2560, seed=200 + 10 * i + j)
-    for i, kind in enumerate(KINDS) for j, rows in enumerate(VERIFY_ROWS))
+    _c(f"{kind}_real_r{rows}", kind, rows, seed=200 + 10 * i + j, **_real(kind))
+    for i, kind in enumerate(KINDS) for j, rows in enumerate(VERIFY_ROWS) if kind != "act_quant" or rows == 128)
 # HPU only: every decode batch bucket and the largest prefill, per kernel.
 HPU_CASES = SIM_CASES + tuple(
-    _c(f"{kind}_real_r{rows}", kind, rows, hidden=80 if kind == "silu_mul" else 2560, seed=100 + 10 * i + j)
-    for i, kind in enumerate(KINDS) for j, rows in enumerate((4, 8, 12, 20, 8192)))
+    _c(f"{kind}_real_r{rows}", kind, rows, seed=100 + 10 * i + j, **_real(kind))
+    for i, kind in enumerate(KINDS) for j, rows in enumerate((4, 8, 12, 20, 8192))
+    if kind != "act_quant" or rows <= 512)
 
 
 def case_by_name(name: str) -> MoeCase:
@@ -295,6 +320,14 @@ def make_inputs(case: MoeCase) -> dict[str, torch.Tensor]:
             return {"shared": torch.ones(T, H, dtype=BF16), "gates": gates, "routed": torch.zeros(T, H, dtype=BF16)}
         return {"shared": shared.to(BF16), "gates": gates.to(BF16), "routed": routed.to(BF16)}
 
+    if case.kind == "act_quant":
+        # The bf16 gate / up GEMM output: gates and ups of a few units, rows of different sizes.
+        gate_up = torch.randn(T, case.experts * 2 * H, generator=g) * 2.0 * torch.exp(torch.randn(T, 1, generator=g))
+        if case.flavor == "stress":
+            gate_up = _stress_values(g, (T, case.experts * 2 * H)).clamp(-1e4, 1e4)
+            gate_up[:, :2 * H] = 0.0  # a zero expert: its scale is the epsilon alone
+        return {"gate_up": gate_up.to(BF16)}
+
     # row_quant
     x = _hidden(g, T, H)
     if case.flavor == "stress":
@@ -341,6 +374,7 @@ def scalars(case: MoeCase) -> tuple:
         "silu_mul": (case.first_column, ),
         "combine": (gate_column(case), ),
         "row_quant": (GAUDI2_FP8_MAX, ),
+        "act_quant": (case.experts, GAUDI2_FP8_MAX),
     }[case.kind]
 
 
@@ -352,6 +386,8 @@ def kernel_params(case: MoeCase) -> tuple[int, int, int, float]:
         return 0, 0, gate_column(case), 0.0
     if case.kind == "row_quant":
         return 0, 0, 0, GAUDI2_FP8_MAX
+    if case.kind == "act_quant":
+        return case.experts, 0, 0, GAUDI2_FP8_MAX
     return 0, 0, case.first_column, 0.0  # silu_mul: the first column of its gate_up block
 
 
@@ -363,6 +399,7 @@ def expected(case: MoeCase, inputs: dict[str, torch.Tensor]) -> dict[str, torch.
         "silu_mul": moe_silu_mul_reference,
         "combine": moe_combine_reference,
         "row_quant": moe_row_quant_reference,
+        "act_quant": moe_act_quant_reference,
     }[case.kind]
     out = reference(*args, *scalars(case))
     if not isinstance(out, tuple):
@@ -377,6 +414,7 @@ def input_shapes(case: MoeCase) -> dict[str, tuple[int, ...]]:
         "silu_mul": {"gate_up": (T, case.first_column + 2 * H)},
         "combine": {"shared": (T, H), "gates": (T, C), "routed": (T, H)},
         "row_quant": {"x": (T, H)},
+        "act_quant": {"gate_up": (T, case.experts * 2 * H)},
     }[case.kind]
 
 
@@ -387,6 +425,7 @@ def output_shapes(case: MoeCase) -> dict[str, tuple[int, ...]]:
         "silu_mul": {"act": (T, H)},
         "combine": {"out": (T, H)},
         "row_quant": {"x_fp8": (T, H), "scale": (T, 1)},
+        "act_quant": {"x_fp8": (T, case.experts * H), "scale": (T, case.experts)},
     }[case.kind]
 
 
@@ -582,6 +621,9 @@ def compare(case: MoeCase, inputs: dict[str, torch.Tensor], got: dict[str, torch
         passes, flushed = _combine_passes(case, inputs, got["out"])
         return _bf16_messages(case, "out", got["out"], exp["out"], passes, flushed)
 
+    if case.kind == "act_quant":
+        return _act_quant_messages(case, inputs, got, exp)
+
     # row_quant: both outputs are exact
     if not torch.equal(got["scale"], exp["scale"]):
         bad = int((got["scale"] != exp["scale"]).sum())
@@ -591,6 +633,41 @@ def compare(case: MoeCase, inputs: dict[str, torch.Tensor], got: dict[str, torch
         bad = have != want
         msgs.append(f"{case.name}: x_fp8: {int(bad.sum())} of {want.numel()} elements differ "
                     f"(max abs err {float((have - want).abs()[bad].max()):.3e})")
+    return msgs
+
+
+def _act_quant_messages(case: MoeCase, inputs: dict[str, torch.Tensor], got: dict[str, torch.Tensor],
+                        exp: dict[str, torch.Tensor]) -> list[str]:
+    """act_quant: the oracle's bits, or those of an activation one bf16 step away (the kernel's sigmoid is
+    1 / (1 + exp(-x)) on the TPC, which can differ from torch's in the last fp32 bit; see silu_mul).
+
+    A (token, expert) scale passes when it is the oracle's or the scale of the activations one bf16 step below or
+    above (a row maximum one step away); an fp8 value passes when it is the cast, with the kernel's own scale, of the
+    activation or of one of its two bf16 neighbours. At most max(1, 1 %) of the fp8 values may differ from the
+    oracle at all.
+    """
+    T, E, I = case.rows, case.experts, case.hidden
+    blocks = inputs["gate_up"].reshape(T, E, 2 * I).float()
+    act = (F.silu(blocks[..., :I]) * blocks[..., I:]).to(BF16).reshape(T * E, I)
+    below, above = bf16_neighbours(act)
+    scale_have = got["scale"].reshape(T * E, 1)
+    scales = [moe_row_quant_reference(x)[1] for x in (act, below, above)]
+    scale_ok = (scale_have == scales[0]) | (scale_have == scales[1]) | (scale_have == scales[2])
+    msgs = []
+    if not bool(scale_ok.all()):
+        msgs.append(f"{case.name}: scale: {int((~scale_ok).sum())} of {T * E} (token, expert) rows are neither the "
+                    f"oracle's nor one row-maximum step away")
+    inverse = (1.0 / scale_have).to(BF16).float()  # the kernel's bf16 reciprocal of its own scale
+    have = got["x_fp8"].reshape(T * E, I).float()
+    candidates = [cast_to_fp8_reference(x.float(), inverse)[0].float() for x in (act, below, above)]
+    allowed = (have == candidates[0]) | (have == candidates[1]) | (have == candidates[2])
+    if not bool(allowed.all()):
+        msgs.append(f"{case.name}: x_fp8: {int((~allowed).sum())} of {have.numel()} elements are not the cast of the "
+                    f"activation or of a bf16 neighbour")
+    differ = int((have != exp["x_fp8"].reshape(T * E, I).float()).sum())
+    if differ > _inexact_limit(have.numel()):
+        msgs.append(f"{case.name}: x_fp8: {differ} of {have.numel()} elements differ from the oracle "
+                    f"(more than {_inexact_limit(have.numel())})")
     return msgs
 
 
