@@ -203,7 +203,7 @@ def rows_of(runs: list[dict]) -> list[dict]:
         ref = base.get((r["kind"], r["streams"]))
         r["speedup_vs_no_speculation"] = (ref["steady_ms_per_token"] / r["steady_ms_per_token"]
                                           if ref and not r["failed"] and r.get("steady_ms_per_token") else None)
-    order = {"edit": 0, "editf": 1, "editl": 2, "prose": 3}
+    order = {"edit": 0, "editf": 1, "editl": 2, "prose": 3, "mix": 4}
     rows.sort(key=lambda r: (order.get(r["kind"], 9), -(r["streams"] or 0), r["arm"] != "no speculation", r["arm"]))
     return rows
 

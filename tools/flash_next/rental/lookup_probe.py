@@ -20,6 +20,9 @@ commit, decode the same contexts and their texts can be compared token for token
   editf  the edit prompts again, answered to the model's own end (no ignore_eos; TOKENS is only the cap): whole
          answers, for replaying lookup drafters over what the model really wrote (tools/flash_next/lookup_replay.py).
   prose  a story request with a distinct opening per stream (nothing to copy).
+  mix    half and half in one round: stream 2j gets edit prompt j, stream 2j + 1 prose prompt j (the same prompts
+         as streams j of an edit and a prose round), every stream TOKENS long: a mixed agent load in one batch,
+         with tokens per chunk and ms per token per half (``by_kind``).
 
 A round may carry a per-request lookup mode for a server with VLLM_HPU_FLASH_NEXT_SPEC_LOOKUP (vllm_xargs
 {"spec_lookup": m}: 0 MTP drafts, 1 hybrid, 2 lookup only).
@@ -83,8 +86,8 @@ LARGE_FILES = [
     "vllm_gaudi/models/llama4.py",
     "vllm_gaudi/utils.py",
 ]
-KINDS = ("edit", "editl", "editf", "prose")
-FULL_WARM = ("edit", "prose")  # kinds whose warm round is as long as the round (the others: SHORT_WARM tokens)
+KINDS = ("edit", "editl", "editf", "prose", "mix")
+FULL_WARM = ("edit", "prose", "mix")  # kinds whose warm round is as long as the round (the others: SHORT_WARM tokens)
 SHORT_WARM = 48
 TREE = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
@@ -109,6 +112,8 @@ def prompt_for(kind: str, i: int, files: list[tuple[str, str]]) -> str:
         body = text if text.endswith("\n") else text + "\n"
         template = TEMPLATES[(i // len(files)) % len(TEMPLATES)]
         return "Request %d. %s\n\nFile: %s\n\n```python\n%s```\n" % (i, template, rel, body)
+    if kind == "mix":
+        return prompt_for("edit", i // 2, files) if i % 2 == 0 else prompt_for("prose", i // 2, files)
     if kind == "prose":
         return ("Stream %d. Write a long, detailed story about a %s named %s who finds a %s. Do not use lists. Begin."
                 % (i, WORDS[i % len(WORDS)], WORDS[(i * 7 + 3) % len(WORDS)].title(), WORDS[(i * 3 + 5) % len(WORDS)]))
@@ -227,10 +232,16 @@ def one_stream(args, body: dict, out: list, idx: int, barrier: threading.Barrier
     out[idx] = rec
 
 
+def stream_kinds(kind: str, n: int) -> list[str]:
+    """The prompt kind of each of the ``n`` streams of a round of ``kind`` (``mix``: edit, prose, edit, ...)."""
+    return [("edit" if i % 2 == 0 else "prose") if kind == "mix" else kind for i in range(n)]
+
+
 def summarize_round(kind: str, n: int, ntok: int, mode: int | None, out: list, wall: float, spec: dict | None) -> dict:
     """The record of one round from its streams' raw records and the counters' summary."""
     per, errors, sizes = [], 0, []
-    for r in out:
+    kinds = stream_kinds(kind, len(out))
+    for i, r in enumerate(out):
         if not r or r["err"] or r["status"] != 200 or len(r["times"]) < 2:
             errors += 1
             continue
@@ -246,7 +257,8 @@ def summarize_round(kind: str, n: int, ntok: int, mode: int | None, out: list, w
                     "cached_tokens": (usage.get("prompt_tokens_details") or {}).get("cached_tokens"),
                     "chunks": len(r["times"]), "gap_ms_p50": statistics.median(gaps),
                     "gap_ms_p90": gaps[min(len(gaps) - 1, int(0.9 * len(gaps)))], "gap_ms_max": gaps[-1],
-                    "tokens_per_chunk": comp / len(r["times"]), "first": r["times"][0], "last": r["times"][-1]})
+                    "tokens_per_chunk": comp / len(r["times"]), "first": r["times"][0], "last": r["times"][-1],
+                    "kind": kinds[i]})
     res = {"kind": kind, "streams": n, "tokens": ntok, "mode": mode, "ok": len(per), "errors": errors,
            "wall_s": wall, "spec": spec,
            "texts": ["".join(r["text"]) if r else None for r in out],
@@ -270,6 +282,11 @@ def summarize_round(kind: str, n: int, ntok: int, mode: int | None, out: list, w
         res["all_decoding_window_s"] = max(0.0, min(p["last"] for p in per) - max(p["first"] for p in per))
         if sizes:
             res["step_sizes"] = {str(s): sizes.count(s) for s in sorted(set(sizes))}
+        if kind == "mix":  # per half: what the edit streams and the prose streams of the one batch got
+            res["by_kind"] = {k: {"streams": len(ps), "tokens_per_chunk_p50": statistics.median(p["tokens_per_chunk"]
+                                                                                             for p in ps),
+                                  "ms_per_token_p50": statistics.median(p["ms_per_token"] for p in ps)}
+                              for k in ("edit", "prose") for ps in [[p for p in per if p["kind"] == k]] if ps}
         al = (spec or {}).get("acceptance_length")
         # steady figures: the median gap between chunks is one engine step; a step commits `al` tokens per request
         res["ms_per_step"] = res["gap_ms_p50"]
@@ -309,14 +326,16 @@ def round_line(label: str, tag: str, m: dict) -> str:
     al = s.get("acceptance_length")
     rates = ",".join("%.2f" % r for r in s.get("position_rates") or [] if r is not None)
     prompt = m.get("prompt_tokens") or [0, 0, 0]
+    halves = "".join("  %s: tok/chunk %.2f, ms/token %.2f" % (k, v["tokens_per_chunk_p50"], v["ms_per_token_p50"])
+                     for k, v in sorted((m.get("by_kind") or {}).items()))
     return ("%s %s %-5s N=%-3d mode=%s ok=%d err=%d  tokens/step=%s (pos %s)  ms/step=%.1f (p90 %.1f max %.0f)  "
             "ms/token steady=%.2f span p50=%.2f max=%.2f  agg=%.1f tok/s  tok/chunk=%.2f  ttft p50=%.2fs  "
-            "prompt %d..%d cached p50 %s  wall=%.1fs" % (
+            "prompt %d..%d cached p50 %s  wall=%.1fs%s" % (
                 label, tag, m["kind"], m["streams"], m["mode"], m["ok"], m["errors"], ("%.2f" % al) if al else "-",
                 rates or "-", m["ms_per_step"], m["gap_ms_p90"], m["gap_ms_max"], m["steady_ms_per_token"],
                 m["ms_per_token_p50"], m["ms_per_token_max"], m.get("aggregate_tok_s") or 0.0,
                 m["tokens_per_chunk_p50"], m["ttft_p50_s"], prompt[0], prompt[2], m.get("cached_tokens_p50"),
-                m["wall_s"]))
+                m["wall_s"], halves))
 
 
 def compare_texts(runs: list[dict]) -> list[str]:
@@ -376,7 +395,7 @@ def main(argv: list[str] | None = None) -> int:
         print("\n".join(compare_texts(runs)))
         return 0
     files = {"edit": load_files(args.tree, SMALL_FILES), "editl": load_files(args.tree, LARGE_FILES)}
-    files["editf"] = files["edit"]
+    files["editf"] = files["mix"] = files["edit"]
     if args.list_prompts:
         for kind in KINDS:
             for i in range(len(files.get(kind) or [0])):

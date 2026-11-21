@@ -9,7 +9,7 @@
 #
 #   bash tools/flash_next/rental/lookup_serve.sh --label L --rounds ROUNDS [options] [-- EXTRA_VLLM_SERVE_ARGS...]
 #     --label L           names the run in the log and in probe.json
-#     --rounds ROUNDS     lookup_probe.py rounds: KIND:STREAMS:TOKENS:MODE,... (KIND edit, editl or prose;
+#     --rounds ROUNDS     lookup_probe.py rounds: KIND:STREAMS:TOKENS:MODE,... (KIND edit, editl, editf, prose or mix;
 #                         MODE -, or the request's spec_lookup mode 0 MTP, 1 hybrid, 2 lookup only)
 #     --mtp K             MTP speculative decoding with K tokens
 #     --ngram K           n-gram prompt lookup with K tokens (--ngram-min N, default 3; --ngram-max N, default 8)
