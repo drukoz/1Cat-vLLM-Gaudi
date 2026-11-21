@@ -676,6 +676,24 @@ sibling (19r xor 1), so mode 2 needs the sibling kept free (a fix for the flag, 
 
 ## Handoff (if this agent stops)
 
+**06:40 UTC: lean4 built** (`lean4-44fe39c26127`, `patches/lean4.patch`, published 06:28:34, VERIFIED in the wheel; the
+coordinator approved it at 06:25 with a harder qualification). Output-buffer reuse behind
+`PT_HPU_HPUGRAPH_PREPARED_REUSE` (only with `PT_HPU_HPUGRAPH_PREPARED_REPLAY=1`): the bridge allocates every launch's new
+outputs twice over (patch_alloc 14.4 us: `create_empty_tensor` gives a handle; syn_lock 9.9 us: `lock_addresses` backs
+each new handle with device memory under the pool mutex, after a third allocator walk; VERIFIED in
+`backend/synapse_helpers/device_memory.cpp`), about 24 of 144 us per launch. lean4 keeps each prepared launcher's
+outputs of the last two launches (recipe output order, at most `PT_HPU_HPUGRAPH_PREPARED_REUSE_MAX_KB`, default 4096)
+and reuses the set of two launches ago through the bridge's allocated-outputs path when the launcher holds the only
+reference to every tensor and storage (two back, because the graph's lazy outputs keep the last set until they are
+rebound after the next launch; safe in this mode because every device user holds a reference until its work is done:
+the recipe's and the collective's resource holders; stream allocator off, post_record 0). `=2`: also a NaN fill
+(`synMemsetD16/D32Async` on the launch stream) of every reused floating-point buffer right before the launch. Counters
+`reuse_try`, `reuse_hit`, `reuse_poison` per launch in the timer line. Qualification (coordinator): tiny TP8 tokens with
+=2 and =1; real model, `tools/flash_next/replay/text_check.py` (6 prompts x 600 greedy tokens at 1 stream must equal
+the REUSE=0 arm; 32 streams coherent; on the node `~/farm/native-replay/late/text_check.py`, md5 1d8cb0c9...), hit rate
+and sub-timers per rank. Arms sent to the collectives track for the bridge job after 00189 (tiny-lean4-nan, tiny-lean4,
+real-ref = lean4 REUSE=0, real-lean4-nan, real-lean4; place.sh in the real arms if 00189 shows the pin pays).
+
 **06:20 UTC: pull request #21 merged** into `feat/flash-next-gaudi` (merge commit 42d70a7e; gate on 63693b83: 100 files,
 2 red = the two rental tests that also fail on the program head's own snapshot; everything of this branch up to
 f0c36b39 is on the program branch). 00193 found the sibling rule a^1 (section 7.12); `place.sh` (rule a^1) is staged
