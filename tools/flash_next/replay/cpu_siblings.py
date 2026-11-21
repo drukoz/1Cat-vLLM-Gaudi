@@ -70,21 +70,24 @@ int main(int argc, char** argv) {
   while (now() < start) {
   }
   volatile uint64_t sink = 0;
-  uint64_t x = 88172645463325252ULL ^ (uint64_t)cpu;
+  /* four independent chains: enough parallel work to fill a core's ports, so that a sibling hyperthread running
+     the same loop takes a large share (one dependent chain left most of the core free: 00193 saw only 7-9 %) */
+  uint64_t x0 = 88172645463325252ULL ^ (uint64_t)cpu, x1 = x0 * 3 + 1, x2 = x0 * 5 + 7, x3 = x0 * 7 + 11;
   uint64_t iters = 0;
   double end = start + seconds;
   double t = now();
   while (t < end) {
     for (int i = 0; i < 4096; ++i) {
-      x ^= x << 13;
-      x ^= x >> 7;
-      x ^= x << 17;
-      x += (x >> 3) * 0x9E3779B97F4A7C15ULL;
+      x0 ^= x0 << 13; x1 ^= x1 << 13; x2 ^= x2 << 13; x3 ^= x3 << 13;
+      x0 ^= x0 >> 7;  x1 ^= x1 >> 7;  x2 ^= x2 >> 7;  x3 ^= x3 >> 7;
+      x0 ^= x0 << 17; x1 ^= x1 << 17; x2 ^= x2 << 17; x3 ^= x3 << 17;
+      x0 += (x0 >> 3) * 0x9E3779B97F4A7C15ULL; x1 += (x1 >> 3) * 0x9E3779B97F4A7C15ULL;
+      x2 += (x2 >> 3) * 0x9E3779B97F4A7C15ULL; x3 += (x3 >> 3) * 0x9E3779B97F4A7C15ULL;
     }
     iters += 4096;
     t = now();
   }
-  sink = x;
+  sink = x0 ^ x1 ^ x2 ^ x3;
   (void)sink;
   printf("%.1f\n", iters / (t - start));
   return 0;
@@ -153,12 +156,34 @@ def infer_rule(pair_results: list[dict], threshold: float) -> tuple[str | None, 
     return (full[0] if len(full) == 1 else None), explained
 
 
+def infer_rule_relative(pair_results: list[dict], floor: float = 0.04, factor: float = 3.0) -> tuple[str | None, dict]:
+    """The rule whose weakest pair (the smaller side's slowdown) stands above every other pair: at least ``floor``
+    and ``factor`` times the 95th percentile of the pairs that are not this rule's pairs (a pair tested under two
+    rules, say a+1 = a^1, counts for both). Returns (rule or None, per rule its weakest pair)."""
+    weakest: dict[str, float] = {}
+    pairs_of: dict[str, set] = {}
+    for r in pair_results:
+        m = min(r["slow_a"], r["slow_b"])
+        weakest[r["rule"]] = min(weakest.get(r["rule"], 1.0), m)
+        pairs_of.setdefault(r["rule"], set()).add(frozenset((r["a"], r["b"])))
+    best = None
+    for rule, w in sorted(weakest.items(), key=lambda kv: -kv[1]):
+        others = sorted(min(r["slow_a"], r["slow_b"]) for r in pair_results
+                        if frozenset((r["a"], r["b"])) not in pairs_of[rule])
+        p95 = others[int(0.95 * (len(others) - 1))] if others else 0.0
+        if w >= max(floor, factor * p95):
+            best = rule
+        break
+    return best, {k: round(v, 3) for k, v in weakest.items()}
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--out", default=os.environ.get("FARM_OUT", "."))
     ap.add_argument("--seconds", type=float, default=0.3, help="length of one measurement")
     ap.add_argument("--sample", type=int, default=12, help="vCPUs whose candidate partners are tested")
-    ap.add_argument("--threshold", type=float, default=0.2, help="slowdown that marks a sibling pair")
+    ap.add_argument("--threshold", type=float, default=None,
+                    help="slowdown that marks a sibling pair (default: relative to the other pairs, see infer_rule_relative)")
     ap.add_argument("--scan", type=int, default=3, help="vCPUs paired with every other vCPU when no rule fits")
     args = ap.parse_args()
 
@@ -204,7 +229,13 @@ def main() -> int:
             if b in cpus and b != a:
                 hyp.append(pair(a, b, name))
     report["hypotheses"] = hyp
-    rule_name, explained = infer_rule(hyp, args.threshold)
+    if args.threshold is None:
+        rule_name, explained = infer_rule_relative(hyp)
+        weakest = explained.get(rule_name, 0.0) if rule_name else 0.0
+        args.threshold = max(0.04, 0.5 * weakest)  # for the verify and scan steps
+        report["threshold"] = args.threshold
+    else:
+        rule_name, explained = infer_rule(hyp, args.threshold)
     report["rule"] = rule_name
     report["explained"] = explained
     print("cpu_siblings: %d vCPUs in the job (machine %d); sample %s" % (len(cpus), n_machine, sample))

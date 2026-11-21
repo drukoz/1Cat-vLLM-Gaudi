@@ -47,3 +47,18 @@ def test_infer_rule_none_when_one_side_only():
     # a slowdown on one side only (a noisy neighbour) is not a sibling pair
     res = [_r("a^1", 0, 1, 0.5, 0.01)]
     assert sib.infer_rule(res, 0.2)[0] is None
+
+
+def test_infer_rule_relative_on_job_00193():
+    # 00193: one dependent chain per loop; a^1 pairs 0.07-0.09, everything else 0.00-0.01 (a+1 = a^1 for even a)
+    res = [_r("a+N/2", 0, 76, 0.01, 0.0), _r("a+N/2", 12, 88, 0.018, 0.003), _r("a^1", 0, 1, 0.083, 0.085),
+           _r("a^1", 12, 13, 0.103, 0.088), _r("a^1", 25, 24, 0.101, 0.086), _r("a+1", 0, 1, 0.083, 0.084),
+           _r("a+1", 25, 26, 0.068, 0.013), _r("a-1", 12, 11, 0.003, 0.0), _r("a-1", 25, 24, 0.13, 0.118)]
+    rule, weakest = sib.infer_rule_relative(res)
+    assert rule == "a^1"
+    assert weakest["a^1"] == 0.083
+
+
+def test_infer_rule_relative_none_when_flat():
+    res = [_r("a+N/2", 0, 76, 0.01, 0.0), _r("a^1", 0, 1, 0.02, 0.01), _r("a+1", 0, 1, 0.02, 0.01)]
+    assert sib.infer_rule_relative(res)[0] is None
