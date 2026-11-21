@@ -689,6 +689,15 @@ step while the host works.
   hits, repeats; card rules 10 / 11: the copy_ might have ordered the in-place cache writes), then a real-model A/B.
   Rank skew in build 5 (per-step records, placement on): `replay_first_ms` p50 6.2-6.5 ms on all 8 workers at 96 rows;
   the placement removed 00205's skew.
+- **The nine step-level cuts under the chain and VLG (MEASURED, mtp-draft-graph's 00230 `tiny-chain-vlg`, TP8 tiny,
+  k = 2, `window.py` on one rank, 44 steady steps):** a chained step is the verify replay and the chain graph's replay
+  with nothing pending, one 3-op launch before the verify (`cast add index`, the PLE input path: gone with
+  `PLE_HOST_NGRAM_IDS=1` in 00235), and one `bindings-synchronize_device` (a `torch.hpu.synchronize()`, asked
+  mtp-draft-graph where). Of 00223's nine, (3) the post-verify logits flush, (4) the sampler launch, (5)-(8) the
+  draft prep launches and per-pass replays and (6) the draft positions' read are gone; the two host reads fold into
+  the one sync. mtp-draft-graph's card numbers (same server): chain-vlg -6.0 % at 32 streams, -9.7 % at 1 stream; VLG
+  alone -0.6 ms at 32 streams, flat at 1 stream. `runner._verify_ids_raw` (`bd2e731b`, kvargs branch) lets the chain
+  take the verify ids unviewed (its fifth copied input).
 - **`VLLM_HPU_VOCAB_PARALLEL_LOGITS` was not exact on the card (coordinator 12:55 UTC, from mtp-draft-graph's 00230;
   MEASURED):** the card's `argmax` takes the lowest index on ties (00252), so the tie rule is the same everywhere.
   `linear -> .to(fp32) -> argmax` in one lazy graph is fused (the GEMM hands out its fp32 accumulator: 00254 / 00255
