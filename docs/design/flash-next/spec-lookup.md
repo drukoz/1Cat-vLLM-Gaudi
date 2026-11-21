@@ -45,6 +45,9 @@ streams = (ngram5 edit:32 ms per step - nospec edit:32 ms per step) / 160 and at
 repeat round (the last edit:1, a second request on prompt 100 past the 512-token block) ran and equals the first
 edit:1 stream token for token (TEXT lines; at TP8 a difference points at the commit path, coordinator 00:57 UTC).
 
+**The gate.** The third agent's waiting gate was stopped at 23:41 UTC (BRIEF 23:21, since withdrawn by the 00:50
+entry). Run `bin/gate <worktree> --tools` when the merge is due (step 2 below); it waits for the lock.
+
 **Pending, in order**
 
 1. 00157 and 00159's numbers (above).
@@ -409,21 +412,35 @@ first, then (the job's own fallback) the torch verification; rounds as 00095. ME
   copy, prefix caching with speculation only), wrote the pool through a slice; the fix writes whole rows with
   `index_copy_`. 00095 (no speculation) ran the same request sequence without a crash. MTP had never completed a
   block during decode on a card (prompts and outputs under one block).
+- **The replay is exact on the card**: replaying 00095's greedy answer to the same prompt (edit prompt 0, 384
+  tokens) through vLLM's search at k = 5 gives 5.82 tokens per step (rates 0.97 0.97 0.97 0.95 0.95); the server
+  measured 5.87 and 5.88 (VERIFIED, `lookup_replay.replay` on `00095 .../probe.json`). At k = 8 the same stream
+  would give 8.53, at k = 3 3.92.
 - 32 streams: not measured (the server was gone). Prompts repeat no more in this track's probes (`ab513444`).
 
-### 7.6 n-gram and the hybrid at TP8 on the integration build (jobs 00154, 00155): pending
+### 7.6 n-gram and the hybrid at TP8 on the integration build (jobs 00157, 00159): pending
 
 Build `e85a3292` (branch `feat/flash-next-gaudi-spec-lookup-tp8`, pushed): the integration build 2's code
-(`a9814f72`), this branch (`ab513444`) and mtp-card-ready's `5c770d96`; build 2's flags (`VLLM_HPU_QSA_FUSED=1
-VLLM_HPU_QSA_INDEXER_SHARD=1 VLLM_HPU_GDN_KERNEL_INTERLEAVE=1 VLLM_HPU_GDN_GLUE_CACHE=1 VLLM_HPU_HC_FUSED_COPY_MODE=2
-VLLM_HPU_DECODE_CUT_INTERVAL=1000 VLLM_HPU_CANDIDATE_SAMPLING=1 VLLM_GRAPH_RESERVED_MEM=0.4`) and
-`VLLM_HPU_GDN_CORE_VERIFY=1`; `tools/flash_next/rental/lookup_arms.sh` with the rounds `edit:1:384:-:100,
-edit:32:384:-:0, mix:32:384:-:400, edit:1:384:-:100` (the last repeats prompt 100: a second request decoding past
-the 512-token block the first one cached, the 00133 case at TP8; no prefix flags, as in build 2). 00154: arms
-`nospec`, `hybrid3` (MTP k = 3 + lookup; every round in mode 1 and, on prompts + 300, in mode 0 = MTP alone);
-00155: arm `ngram5`. CPU on that tree: `test_align_commit_slice_writes.py` 10, `test_lookup_oracle_engine.py` 2,
-`test_engine_mtp.py` 15 passed.
-
+(`a9814f72`), this branch (`ab513444`) and mtp-card-ready's `5c770d96`. Submitted from that build (00157 replaced
+00153 and 00154, 00159 replaced 00155):
+```bash
+F=/Volumes/Storage/Claude/gaudi-work/bin/farm
+E="--env VLLM_HPU_QSA_FUSED=1 --env VLLM_HPU_QSA_INDEXER_SHARD=1 --env VLLM_HPU_GDN_KERNEL_INTERLEAVE=1
+   --env VLLM_HPU_GDN_GLUE_CACHE=1 --env VLLM_HPU_HC_FUSED_COPY_MODE=2 --env VLLM_HPU_DECODE_CUT_INTERVAL=1000
+   --env VLLM_HPU_CANDIDATE_SAMPLING=1 --env VLLM_GRAPH_RESERVED_MEM=0.4 --env VLLM_HPU_GDN_CORE_VERIFY=1
+   --env VLLM_HPU_PREFIX_ALIGN_SPLIT=1 --env VLLM_HPU_PREFIX_KEEP_PROMPT_END=1"
+R=edit:1:384:-:100,edit:32:384:-:0,mix:32:384:-:400,edit:1:384:-:100
+$F job spec-lookup real8-lookup-nospec-hybrid3-pf all 45m $E -- bash -c \
+    "LOOKUP_ARMS_ROUNDS=$R bash tools/flash_next/rental/lookup_arms.sh nospec hybrid3"
+$F job spec-lookup real8-lookup-ngram5-pf all 35m $E -- bash -c \
+    "LOOKUP_ARMS_ROUNDS=$R bash tools/flash_next/rental/lookup_arms.sh ngram5"
+```
+The last round repeats prompt 100: a second request decoding past the 512-token block the first one cached (the
+00133 case at TP8; at TP8 a stale prefix state cannot occur, coordinator 00:57 UTC, so a text difference there
+points at the commit path). `hybrid3` runs every round in mode 1 (hybrid) and, on prompts + 300, in mode 0 (MTP
+alone). CPU on that tree: `test_align_commit_slice_writes.py` 10, `test_lookup_oracle_engine.py` 2,
+`test_engine_mtp.py` 15 passed (`test_lookup_probe.py`'s editl prompt-size guard fails there: a large file of the
+integration tree grew; editl is not used by these jobs).
 
 ## 8. Notes for other tracks
 
