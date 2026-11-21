@@ -6,8 +6,11 @@
 # (CARDQ_* set); each arm is one container started by ~/farm/farm_job.sh (cards, CPUs, ports, labels as for every
 # job), probed by the farm's serve_probe.sh + decode_scaling.py. Deployed to ~/farm/collectives/bridge/.
 #
-#   ab_bridge_job.sh [--sha SHA12] [--cmd 'COMMAND WORDS'] [--stop-on-fail] ARM...
-#     ARM = name:BUILD[:KEY=VALUE[,KEY=VALUE...]]; --stop-on-fail: no further arm after one that failed
+#   ab_bridge_job.sh [--sha SHA12] [--image IMG] [--env KEY=VALUE]... [--cmd 'COMMAND WORDS'] [--stop-on-fail] ARM...
+#     ARM = name:BUILD[:KEY=VALUE[,KEY=VALUE...]]; --stop-on-fail: no further arm after one that failed;
+#     --image: every arm in that image (farm_job.sh --image: another track's build, the bundle stays this track's;
+#     the plugin is installed in an image, so its servers run the image's code); --env: for every arm, before
+#     the arm's own KEY=VALUE pairs
 #     BUILD "-" = the image's bridge; otherwise a build id of ~/farm/native-replay/bridge-build/out/, installed by
 #     with_bridge.py at the container's start (exit 7 or 8 and the arm fails if it is not what loads).
 #   e.g. stock:-  lean0:lean-0123456789ab:PT_HPU_HPUGRAPH_PREPARED_REPLAY=0
@@ -31,9 +34,13 @@ NAME="${CARDQ_NAME:-bridge-ab}"
 SHA=""
 CMD=""
 STOP_ON_FAIL=0
+IMAGE_ARGS=()
+COMMON_ENV=()
 while [ $# -gt 0 ]; do
     case "$1" in
         --sha) SHA="$2"; shift 2 ;;
+        --image) IMAGE_ARGS=(--image "$2"); shift 2 ;;
+        --env) COMMON_ENV+=(--env "$2"); shift 2 ;;
         --cmd) CMD="$2"; shift 2 ;;
         --stop-on-fail) STOP_ON_FAIL=1; shift ;;
         *) break ;;
@@ -49,7 +56,7 @@ now() { date -u +%T; }
 rc_all=0
 RCS="$F/$TRACK/results/$JOB-$NAME-arms.rc"
 VERDICTS="$F/$TRACK/results/$JOB-$NAME-verdicts.txt"
-echo "ab_bridge: job $JOB, commit $SHA, cards ${CARDQ_CARDS:-?}, arms: $* [$(now)]"
+echo "ab_bridge: job $JOB, commit $SHA${IMAGE_ARGS[1]:+, image ${IMAGE_ARGS[1]}}, cards ${CARDQ_CARDS:-?}, env ${COMMON_ENV[*]-none}, arms: $* [$(now)]"
 for arm in "$@"; do
     name="${arm%%:*}"
     rest="${arm#*:}"
@@ -60,8 +67,9 @@ for arm in "$@"; do
     run="$JOB-$NAME-$name"
     out="$F/$TRACK/results/$run"
     mkdir -p "$out"
-    envs=()
+    envs=(${COMMON_ENV[@]+"${COMMON_ENV[@]}"})
     has_reserved=0
+    case " ${COMMON_ENV[*]-} " in *" VLLM_GRAPH_RESERVED_MEM="*) has_reserved=1 ;; esac
     if [ -n "$kvs" ]; then
         IFS=',' read -r -a pairs <<<"$kvs"
         for kv in "${pairs[@]}"; do
@@ -87,12 +95,12 @@ for arm in "$@"; do
     echo "ab_bridge: arm $name: bridge $label, env ${kvs:-none} [$(now)]"
     if [ -n "$CMD" ]; then
         # shellcheck disable=SC2086  # CMD is a list of words
-        bash "$F/farm_job.sh" --sha "$SHA" --run-id "$run" --suffix "$name" ${envs[@]+"${envs[@]}"} -- \
-            ${wrap[@]+"${wrap[@]}"} $CMD >"$out/arm.log" 2>&1
+        bash "$F/farm_job.sh" --sha "$SHA" ${IMAGE_ARGS[@]+"${IMAGE_ARGS[@]}"} --run-id "$run" --suffix "$name" \
+            ${envs[@]+"${envs[@]}"} -- ${wrap[@]+"${wrap[@]}"} $CMD >"$out/arm.log" 2>&1
     else
         # shellcheck disable=SC2086  # PROBE_OPTS is a list of options
-        bash "$F/farm_job.sh" --sha "$SHA" --run-id "$run" --suffix "$name" ${envs[@]+"${envs[@]}"} -- \
-            ${wrap[@]+"${wrap[@]}"} bash /farm/serve_probe.sh $PROBE_OPTS >"$out/arm.log" 2>&1
+        bash "$F/farm_job.sh" --sha "$SHA" ${IMAGE_ARGS[@]+"${IMAGE_ARGS[@]}"} --run-id "$run" --suffix "$name" \
+            ${envs[@]+"${envs[@]}"} -- ${wrap[@]+"${wrap[@]}"} bash /farm/serve_probe.sh $PROBE_OPTS >"$out/arm.log" 2>&1
     fi
     rc=$?
     grep -E "^BRIDGE |serve_probe: (SERVER-|PROBE-RC|DONE|fallback)|^MEAS|^SAMPLED|^TEXT|tiny smoke|decode_ms" "$out/arm.log" \
