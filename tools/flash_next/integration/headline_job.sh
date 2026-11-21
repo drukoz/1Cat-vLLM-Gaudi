@@ -118,7 +118,8 @@ done
 #          own with its hyperthread sibling kept free, re-applied every 2 s; NO VLLM_HPU_WORKER_CPU_PIN, so the load
 #          and warm-up keep every CPU (00189: the pin flag doubled the time to the first throughput line). The
 #          placement's output: <arm>/placement.log. The scripts: /results/late/place/{place_wrap.sh,place.sh} when
-#          both exist (late-bound), else this kit's place/ copies (place_wrap.sh md5 5f7ca629, place.sh 7e54f2de);
+#          both exist (late-bound), else this kit's place/ copies (place_wrap.sh md5 363bcf9d = collectives' b9aac4db,
+#          which stops waiting when its server ended before health; place.sh 7e54f2de);
 #          HEADLINE_PLACE_WRAP / HEADLINE_PLACE_SCRIPT override. The tiny gate is not placed.
 #   pin3   (or "on") every server of the job, the tiny gate too, with VLLM_HPU_WORKER_CPU_PIN=3
 #          (native-replay's pin with the model thread's sibling kept free; restricts the load to the worker's share)

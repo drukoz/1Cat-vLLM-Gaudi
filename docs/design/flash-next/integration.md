@@ -9,7 +9,7 @@ Labels: MEASURED (card, with its file), VERIFIED (CPU test or code line), INFERR
 
 ## Handoff (if this agent stops)
 
-**Build 5 (fifth agent of the track, Opus 5.5, started 08:04 UTC on 2026-11-21; updated 08:55 UTC).**
+**Build 5 (fifth agent of the track, Opus 5.5, started 08:04 UTC on 2026-11-21; updated 08:50 UTC).**
 
 - **Tree.** Base = build 4 (`8cdc5999`) with the program head `adbcff30` (PRs #18 to #22) merged in, so the tree is the
   program head plus what build 4 carried that the head lacks (qsa-fused's branch, mtp-card-ready + the per-step record,
@@ -32,8 +32,9 @@ Labels: MEASURED (card, with its file), VERIFIED (CPU test or code line), INFERR
   00177 and 00190). Late switches read at the job's start: `~/farm/integration/results/switches/pin` ("place" =
   every real-model server under collectives' place_wrap.sh + native-replay's place.sh once healthy, rule a^1, NO pin
   flag (00189: the pin flag doubled the load to 14.9 min); "pin3" = `VLLM_HPU_WORKER_CPU_PIN=3` everywhere; no file =
-  nothing; the scripts are the kit's `place/` copies, md5 5f7ca629 / 7e54f2de, or `~/farm/integration/results/late/place/`
-  when both exist there) and `.../switches/ss0` ("on" = the stage-submission arms run and the inline arm does not;
+  nothing; the scripts are `~/farm/integration/results/late/place/` when both exist there (uploaded 08:49 UTC:
+  place_wrap.sh 363bcf9d = collectives' b9aac4db, place.sh 7e54f2de), else the kit's `place/` copies; the job log
+  prints the md5s it used) and `.../switches/ss0` ("on" = the stage-submission arms run and the inline arm does not;
   the coordinator keeps it off: 00209 showed stage submission does not cause the MoE cuts).
   Dry runs against a fake server on the Mac: `scratchpad/integration/dry-*` (all arms, post steps, the dense stop,
   the switches).
