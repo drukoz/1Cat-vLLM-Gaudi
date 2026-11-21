@@ -699,6 +699,14 @@ every other process of the container off the reserved vCPUs; mode 3 only the eng
 
 ## Handoff (if this agent stops)
 
+**10:01 UTC (date -u).** 00219 read (section 7.13: place-only, nothing pinned before warmup, is the fastest: 1 stream
+24.0 / 23.6 ms, load 7.7 min). lean5's qualification is now job **00234** `real8-bridge-reuse3` (collectives, 120 min,
+starts by 16:25 UTC at the latest) on build 5's image (`farm-integration:eb21ac75a7c8`, dense MoE from 1 token: about
+100 launches per 1-stream step instead of 148, kernel-fixes' 00213), lean6m on every lean arm, MISS_LOG=200 in
+real-lean5-verify, place-only placement. The next pull request (mode 3, the CPU tools, the bridge patches, design
+7.10-7.13) waits for its gate on `ac63f272` (the branch merged with program head adbcff30, #22; my 7 test files pass
+on it; body `reports/native-replay/probes/pr_body_3.txt`).
+
 **09:02 UTC (date -u).** 00189 read (section 7.13): pin + `place.sh` removes the slow ranks, 1 stream -10 to -14 ms,
 8 streams -22 ms; the pin during load costs about 7 min of server start, so mode 3 now places only after warmup
 (0e055831). Build `lean6m-43fdd6850644` (published 09:01:25): lean6h2 plus `PT_HPU_HPUGRAPH_STATIC_PLAN_MISS_LOG=N`
