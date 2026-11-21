@@ -534,6 +534,7 @@ if TYPE_CHECKING:
     VLLM_HPU_QSA_TABLE_WIDTH: int = 0  # decode block-table columns: 0 the engine's longest context (default), 1 the batch's
     VLLM_HPU_QSA_KV_FP8: int = 0  # 1: the QSA layers accept --kv-cache-dtype fp8_inc (FP8 K/V storage, bf16 attention)
     VLLM_HPU_QSA_SLOT_SHIFT: int = 0  # decode slot mapping: 0 // and % (default), 1 shift and mask, 2 through float32
+    VLLM_HPU_QSA_TOPK_FORM: int = 0  # mode-1 decode top-k: 0 topk sorted (default), 1 unsorted, 2 two stages, 3 threshold
     VLLM_HPU_GDN_CORE_DECODE: int = 1  # GdnCoreDecodeMode: 1 fused (default), 0 off, 2 recurrence
     VLLM_HPU_GDN_CORE_DECODE_DEBUG: int = 0  # GdnCoreDecodeDebug: 0 off, 1 check slot indices every step (host sync)
     VLLM_HPU_GDN_CORE_VERIFY: int = 0  # GdnCoreVerifyMode: 0 off (default), 1 fused verification steps
@@ -1932,6 +1933,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # every form (a power-of-two block size; another size keeps form 0). Any other value is 0.
     "VLLM_HPU_QSA_SLOT_SHIFT":
     lambda: int(os.environ.get("VLLM_HPU_QSA_SLOT_SHIFT", "0")),
+    # How the mode-1 sparse QSA decode (VLLM_HPU_QSA_FUSED=1) finds each row's top 512 of 32,768 block scores
+    # (qsa_sparse_ops.topk_by_form): 0 (default) torch.topk of the whole row, a bitonic sort on the card (2.98 ms
+    # per 128-row step, step-anatomy, build 4); 1 torch.topk unsorted; 2 two stages (the top 512 of each 4,096
+    # columns, then of those 4,096 candidates); 3 a threshold pick (a binary search of the 512th value on the
+    # scores' int32 bit patterns, 31 counting passes, a cumsum compaction). Forms 1 to 3 order their set by value
+    # as form 0 does, so all return the same ids when the scores are distinct; with ties (zero scores, when every
+    # index head's product is negative) the tied blocks may differ (topk's tie order is its own). Any other value is 0.
+    "VLLM_HPU_QSA_TOPK_FORM":
+    lambda: int(os.environ.get("VLLM_HPU_QSA_TOPK_FORM", "0")),
 
     # Flash-Next GDN decode through the fused core op (flashinfer_gaudi.gdn_core_decode).
     # 1 (default) = fused, 0 = off (the torch path), 2 = recurrence only (a bisect tool).

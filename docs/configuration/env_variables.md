@@ -112,6 +112,14 @@ build 4). `1`: shift and mask. `2`: through float32 (`floor(pos * 2**-s)`, exact
 Every form gives the same slots; forms 1 and 2 need a power-of-two block size (another size
 keeps form 0).
 
+`VLLM_HPU_QSA_TOPK_FORM` chooses how the mode-1 sparse QSA decode (`VLLM_HPU_QSA_FUSED=1`)
+finds each row's top 512 of 32,768 block scores. `0` (default): `torch.topk` of the whole row
+(a bitonic sort on the card). `1`: `torch.topk` unsorted. `2`: two stages (the top 512 of each
+4,096 columns, then of those candidates). `3`: a threshold pick (a binary search of the 512th
+value on the scores' int32 bit patterns, then a cumsum compaction). Forms 1 to 3 order their set
+by value as form 0 does, so every form returns the same block ids when the scores are distinct;
+with ties (zero scores, when every index head's product is negative) the tied blocks may differ.
+
 `VLLM_HPU_GDN_CORE_DECODE` selects the GDN decode core path as an integer.
 `1` (default) is fused: every non-speculative decode step runs through the
 fused core op `torch.ops.flashinfer_gaudi.gdn_core_decode` (conv, gates,

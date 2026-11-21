@@ -197,7 +197,7 @@ def select_blocks_request_major(q: torch.Tensor, positions: torch.Tensor, block_
             positions32 = shared(("positions32", T), lambda: positions.to(torch.int32, copy=True))
             return topk_kernels(scores, positions32, ratio, topk)
         visible = shared(("visible", T, ratio), lambda: visible_blocks(positions, ratio))
-        return select_blocks(scores, visible, topk)
+        return select_blocks(scores, visible, topk, form=int(envs.VLLM_HPU_QSA_TOPK_FORM))
 
     def my_share():
         mine = torch.arange(rank * per, (rank + 1) * per, dtype=torch.int32, device=positions.device)
@@ -210,7 +210,7 @@ def select_blocks_request_major(q: torch.Tensor, positions: torch.Tensor, block_
     if use_topk_kernels:
         local = topk_kernels(scores, owned(pos32_mine), ratio, topk)
     else:
-        local = select_blocks(scores, visible_mine, topk)  # [per * T_cols, topk]
+        local = select_blocks(scores, visible_mine, topk, form=int(envs.VLLM_HPU_QSA_TOPK_FORM))  # [per * T_cols, topk]
     if shard is QsaShardMode.BY_REQUEST_FP32:
         gathered = all_gather_rows(local.to(torch.float32)).to(torch.int32)
     else:

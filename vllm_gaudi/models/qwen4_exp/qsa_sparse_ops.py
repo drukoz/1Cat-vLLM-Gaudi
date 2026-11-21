@@ -115,7 +115,70 @@ def topk_ids_int32(idx: torch.Tensor, n: int) -> torch.Tensor:
     return cols.index_select(0, idx.reshape(-1)).view(idx.shape)
 
 
-def select_blocks(scores: torch.Tensor, visible: torch.Tensor, block_topk: int) -> torch.Tensor:
+# Columns per first-stage chunk of the two-stage top-k (select_blocks form 2).
+TOPK_CHUNK = 4096
+
+
+def threshold_pick(masked: torch.Tensor, k: int) -> torch.Tensor:
+    """int64 ``[T, k]``: the columns of the ``k`` largest of ``masked`` (non-negative scores, -inf masked), in
+    ascending column order, -1 where a row has fewer than ``k`` unmasked columns; no sort of the row.
+
+    The ``k``-th largest value is found by a binary search on the scores' int32 bit patterns (for non-negative
+    floats the bit pattern orders as the value; a masked column counts as -1, a zero of either sign as 0): 31
+    passes of a count. The columns above it are taken, then the first columns equal to it up to ``k`` (the lowest
+    columns among ties), and compacted with a cumsum and a scatter.
+    """
+    rows, n = masked.shape
+    bits = masked.contiguous().view(torch.int32)
+    bits = torch.where(masked > 0, bits, torch.where(masked == 0, torch.zeros_like(bits), torch.full_like(bits, -1)))
+    lo = torch.zeros(rows, 1, dtype=torch.int32, device=masked.device)
+    hi = torch.full((rows, 1), 0x7F800000, dtype=torch.int32, device=masked.device)
+    for _ in range(31):
+        mid = lo + ((hi - lo + 1) >> 1)
+        ge = (bits >= mid).to(torch.int32).sum(dim=1, keepdim=True) >= k
+        lo = torch.where(ge, mid, lo)
+        hi = torch.where(ge, hi, mid - 1)
+    greater = bits > lo
+    equal = bits == lo
+    need = k - greater.to(torch.int32).sum(dim=1, keepdim=True)
+    take = greater | (equal & (torch.cumsum(equal.to(torch.int32), dim=1) <= need))
+    slot = torch.cumsum(take.to(torch.int32), dim=1) - 1
+    slot = torch.where(take, slot, torch.full_like(slot, k))
+    cols = torch.arange(n, dtype=torch.long, device=masked.device).expand(rows, n)
+    out = torch.full((rows, k + 1), -1, dtype=torch.long, device=masked.device)
+    return out.scatter(1, slot.to(torch.long), cols)[:, :k]
+
+
+def topk_by_form(masked: torch.Tensor, k: int, form: int = 0) -> tuple[torch.Tensor, torch.Tensor]:
+    """``(values, ids)`` of the ``k`` largest of ``masked`` ``[T, N]``, in ``topk(sorted=True)``'s order.
+
+    ``form`` (``VLLM_HPU_QSA_TOPK_FORM``): 0 ``torch.topk`` of the whole row (today); 1 ``torch.topk`` unsorted;
+    2 two stages (the top ``k`` of each ``TOPK_CHUNK`` columns, then of those candidates); 3 ``threshold_pick``.
+    Forms 1 to 3 find the same set when the scores are distinct, then order it by value, descending (one
+    ``topk`` of ``k`` values), so they return what form 0 returns. Among equal scores (zero scores, when every
+    index head's product is negative) each form keeps its own tie order: the tied blocks may differ. A form that does not fit the shape (2:
+    ``N`` not a multiple of ``TOPK_CHUNK`` or fewer than two chunks) is form 0.
+    """
+    t, n = masked.shape
+    if form == 1:
+        idx = torch.topk(masked, k, dim=-1, sorted=False)[1]
+    elif form == 2 and n % TOPK_CHUNK == 0 and n // TOPK_CHUNK >= 2 and TOPK_CHUNK >= k:
+        c = n // TOPK_CHUNK
+        v, i = torch.topk(masked.view(t, c, TOPK_CHUNK), k, dim=-1, sorted=False)
+        base = (torch.arange(c, device=masked.device) * TOPK_CHUNK).view(1, c, 1)
+        cand_v, cand_i = v.reshape(t, c * k), (i + base).reshape(t, c * k)
+        idx = cand_i.gather(1, torch.topk(cand_v, k, dim=-1, sorted=False)[1])
+    elif form == 3:
+        idx = threshold_pick(masked, k)
+        # a row with fewer than k unmasked columns: its -1 entries point at the last column, masked (-inf) there
+        idx = torch.where(idx >= 0, idx, torch.full_like(idx, n - 1))
+    else:
+        return torch.topk(masked, k, dim=-1)
+    vals, order = torch.topk(masked.gather(1, idx), k, dim=-1)
+    return vals, idx.gather(1, order)
+
+
+def select_blocks(scores: torch.Tensor, visible: torch.Tensor, block_topk: int, form: int = 0) -> torch.Tensor:
     """Top-k blocks: ``scores`` ``[T, N]`` fp32, ``visible`` ``[T]`` int64 ->
     int32 ``[T, block_topk]`` block indices, -1 padded.
 
@@ -123,13 +186,14 @@ def select_blocks(scores: torch.Tensor, visible: torch.Tensor, block_topk: int) 
     and ``topk(k, dim=-1)``; entries whose value is -inf become -1, and the
     width is padded to ``block_topk`` with -1. The set per row equals HF's
     ``topk(min(block_topk, nc))``. The ids become int32 through ``topk_ids_int32``,
-    never through a cast (card rule 9).
+    never through a cast (card rule 9). ``form``: how the top-k is found (``topk_by_form``); every form returns
+    the same ids in the same order when no two scores at the cut are equal.
     """
     t, n = scores.shape
     k = min(block_topk, n)
     cols = torch.arange(n, device=scores.device)
     masked = scores.masked_fill(cols[None, :] >= visible[:, None], float("-inf"))
-    vals, idx = torch.topk(masked, k, dim=-1)
+    vals, idx = topk_by_form(masked, k, form)
     picked = topk_ids_int32(idx, n).masked_fill(vals == float("-inf"), -1)
     if k < block_topk:
         pad = torch.full((t, block_topk - k), -1, dtype=torch.int32, device=scores.device)
