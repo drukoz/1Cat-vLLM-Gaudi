@@ -376,12 +376,20 @@ Next, in order (section 7's table):
 1. Read 00160 (above; bumped to the head of the queue at 00:59 UTC, starts by 02:00 UTC at the latest) and send
    the verdict to the coordinator and native-replay (on exit 8: name the file it reports; native-replay's build
    has no `.upstream` variants).
-1b. native-replay's next build `timers-c281d8b53d08` (phase timers; `PT_HPU_HPUGRAPH_REPLAY_TIMING=N` prints one
-   `HPUGRAPH_REPLAY_TIMING` line per N replayed launches per thread; about 02:15 UTC): one all-card job, 30 min,
-   submitted the moment `out/timers-c281d8b53d08/manifest.json` exists:
-   `printf '%s\n' "bash ~/farm/collectives/bridge/ab_bridge_job.sh --sha 0a66722b7a55 --cmd 'python /farm/farm_tiny.py --gdn hc' tiny:timers-c281d8b53d08:PT_HPU_HPUGRAPH_REPLAY_TIMING=2000 && exec bash ~/farm/collectives/bridge/ab_bridge_job.sh --sha 0a66722b7a55 real:timers-c281d8b53d08:PT_HPU_HPUGRAPH_REPLAY_TIMING=5000" | bin/farm submit collectives real8-bridge-timers all 30m`;
-   (no `exec` before the first call: it would end the script before the real arm); the timing lines are in
-   `<id>-real8-bridge-timers-tiny/hc/server0.log` and `<id>-real8-bridge-timers-real/server0.log`.
+1b. native-replay's next builds: `timers-c281d8b53d08` (phase timers: `PT_HPU_HPUGRAPH_REPLAY_TIMING=N` prints one
+   `HPUGRAPH_REPLAY_TIMING` line per N replayed launches per thread; about 01:45 UTC) and, about 10 minutes later,
+   `lean-e1dbb4942fb8` (the timers plus the first prepared-replay step behind `PT_HPU_HPUGRAPH_PREPARED_REPLAY=1`:
+   captured segments keep their launcher and recipe from the first replay; patch
+   `tools/flash_next/bridge/patches/lean1.patch` on native-replay's branch, d9a1f8f1). A background task of this
+   agent (`scratchpad/collectives/auto_submit_timers.sh`, started 01:10 UTC) submits, once 00160 ended with exit 0
+   and the timers build exists, either the four-arm job `real8-bridge-timers-lean` (all, 50 min; when the lean build
+   lands within 25 minutes of the timers build) or the timers job alone `real8-bridge-timers` (all, 30 min). The
+   four-arm job script:
+   `bash ~/farm/collectives/bridge/ab_bridge_job.sh --sha 0a66722b7a55 --stop-on-fail --cmd 'python /farm/farm_tiny.py --gdn hc' tiny-timers:timers-c281d8b53d08:PT_HPU_HPUGRAPH_REPLAY_TIMING=2000 tiny-lean:lean-e1dbb4942fb8:PT_HPU_HPUGRAPH_REPLAY_TIMING=2000,PT_HPU_HPUGRAPH_PREPARED_REPLAY=1 && exec bash ~/farm/collectives/bridge/ab_bridge_job.sh --sha 0a66722b7a55 --stop-on-fail real-timers:timers-c281d8b53d08:PT_HPU_HPUGRAPH_REPLAY_TIMING=5000 real-lean:lean-e1dbb4942fb8:PT_HPU_HPUGRAPH_REPLAY_TIMING=5000,PT_HPU_HPUGRAPH_PREPARED_REPLAY=1`
+   (no `exec` before the first call: it would end the script before the real arms). If the agent is gone and
+   nothing was submitted, submit that text with `bin/farm submit collectives real8-bridge-timers-lean all 50m`
+   (script on standard input). The timing lines: `<id>-<name>-<arm>/server0.log` (real arms) and
+   `<id>-<name>-<arm>/hc/server0.log` (tiny arms); native-replay parses them.
 2. (Replaced by 00160: the 1-card pair a1 and the single TP8 arm a2.)
 3. a3 and b with the lean build (flag 0 and 1); c with `ab_bridge_job.sh` through `bin/farm submit`:
    `printf 'exec bash ~/farm/collectives/bridge/ab_bridge_job.sh --sha 0a66722b7a55 stock:- lean0:<id>:PT_HPU_HPUGRAPH_PREPARED_REPLAY=0 lean1:<id>:PT_HPU_HPUGRAPH_PREPARED_REPLAY=1\n' | bin/farm submit collectives real8-bridge-ab all 45m`,
