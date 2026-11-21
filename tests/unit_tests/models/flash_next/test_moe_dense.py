@@ -138,7 +138,9 @@ def test_weights_are_kept_only_with_the_flag(monkeypatch):
     # the layer's stacked tensors themselves (no copy of the experts)
     assert w13.data_ptr() == layer.w13_weight.data_ptr() and w2.data_ptr() == layer.w2_weight.data_ptr()
     assert torch.equal(s13, dense[2].float()) and torch.equal(s2, dense[3].float())
-    op._apply(lambda t: t)  # a device move leaves the references behind: the vendor op serves again
+    op._apply(lambda t: t)  # model.to("hpu") on tensors already there (the runner does it after loading): kept
+    assert op.dense_weights is not None and op.dense_weights[0].data_ptr() == layer.w13_weight.data_ptr()
+    op._apply(lambda t: t.clone())  # a real move would copy the stacked experts: dropped, the vendor op serves
     assert op.dense_weights is None
 
 
