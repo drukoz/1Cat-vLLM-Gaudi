@@ -6,7 +6,7 @@ results are under `/Volumes/Storage/Claude/gaudi-work/reports/async-sched/card/`
 
 ## Handoff (if this agent stops)
 
-Updated 2026-11-21 12:06 UTC.
+Updated 2026-11-21 12:09 UTC.
 
 - **Card results so far** (placement on, MTP timers 0, compare arms within a job only):
   - 00220, mode 1 with `d3fb1b11` (MEASURED). ms/token sync → async: 1 stream greedy 27.9 → 29.4, sampled
@@ -19,7 +19,9 @@ Updated 2026-11-21 12:06 UTC.
     ms/step sync → mode 2: 8 streams greedy 61.9/61.9 → 62.2/65.3, sampled 67.5/67.1 → 67.5/69.5; 1 stream greedy
     53.4/53.7 → 55.0/57.6, sampled 57.9/56.9 → 53.3/56.2. Mode 2 is even with sync per step. At 1 stream greedy it
     gets 2.00 tokens/step against 2.42: its text leaves sync's after 13 equal tokens (sync opens a `<think>` block
-    the drafter predicts well), INFERRED content, not a defect. Spans: mode 2 hides the engine gap (sync 2.2-4.6 ms
+    the drafter predicts well), INFERRED content, not a defect: greedy texts move with the batch's numerics even
+    within the sync arm (8 streams, stream 0: round 1 "He had seen ships", round 2 "found a rope"), and mode 2's
+    1-stream text is sync's 8-stream round-1 text. Spans: mode 2 hides the engine gap (sync 2.2-4.6 ms
     → 0.26) but the host's forward + wait (blocked on the device) grows by as much (1 row: sync 38-40 ms, mode 2
     41-44). INFERRED: the per-step pageable H2D copies (about 20 per step) wait behind the step in flight.
     engine-step's `VLLM_HPU_PERSISTENT_INPUTS` (pinned host buffers, non-blocking copies, two alternating slots under
