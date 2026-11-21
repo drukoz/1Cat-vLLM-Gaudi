@@ -256,14 +256,11 @@ def test_requests_after_a_block_committed_during_speculative_decode(engine_runs)
     longest = max((p["prompt_ids"] for p in engine_runs["base"]["prompts"]), key=len)
     first, extra = longest[:240], longest[1000:1030]
     out = engine_runs["dir"]
-    one = out / "turn1_prompts.json"
-    one.write_text(json.dumps({"prompts": [{"prompt_ids": first}]}), encoding="utf-8")
-    answer = hpu_cpu_engine.run(engine_runs["ckpt"], out / "turn1_k0.json", "--prompts", str(one), "--max-tokens",
-                                "48")["prompts"][0]["generated_ids"]
     turns = out / "turns_prompts.json"
-    turns.write_text(json.dumps({"prompts": [{"prompt_ids": first}, {"prompt_ids": first},
-                                             {"prompt_ids": first + answer + extra}]}), encoding="utf-8")
-    options = ("--prompts", str(turns), "--max-tokens", "48")
+    turns.write_text(json.dumps({"prompts": [{"prompt_ids": first}, {"prompt_ids": first}]}), encoding="utf-8")
+    # --next-turn: turn 3 is built from this engine's own turn-1 answer (greedy MTP and the engine without
+    # speculation may part at a near tie, so a prompt built from the other engine's answer would share no block)
+    options = ("--prompts", str(turns), "--max-tokens", "48", "--next-turn", json.dumps(extra))
     base = hpu_cpu_engine.run(engine_runs["ckpt"], out / "turns_k0.json", *options, "--logprobs", "2")
     spec = hpu_cpu_engine.run(engine_runs["ckpt"], out / "turns_k3.json", *options, "--k", str(K),
                               "--slice-write-probe")
@@ -271,9 +268,36 @@ def test_requests_after_a_block_committed_during_speculative_decode(engine_runs)
     assert probe["pools"] > 0 and probe["conv_pairs"] > 0 and probe["ssm_pairs"] > 0, probe
     assert probe["violations"] == []
     assert [len(p["prompt_ids"]) for p in spec["prompts"]] == [240, 240, 240 + 48 + 30]
-    for base_prompt, spec_prompt in zip(base["prompts"], spec["prompts"]):
+    for base_prompt, spec_prompt in zip(base["prompts"][:2], spec["prompts"][:2]):
         first_difference(base_prompt, spec_prompt["generated_ids"])
-    # Turn 3's prefix-cache hit is the engine's, speculative or not. On this build it is 0 with or without MTP
-    # (prompt chunks end at the engine's block, not the recurrent block: prefill's VLLM_HPU_PREFIX_ALIGN_SPLIT,
-    # BRIEF 23:46); with that fix it is the committed block.
-    assert [p["num_cached_tokens"] for p in spec["prompts"]] == [p["num_cached_tokens"] for p in base["prompts"]]
+    # the same prompt again on the same engine: the same tokens
+    assert spec["prompts"][1]["generated_ids"] == spec["prompts"][0]["generated_ids"]
+    # Turn 3's prefix-cache hit: 0 on this build with or without MTP (prompt chunks end at the engine's block, not
+    # the recurrent block: prefill's VLLM_HPU_PREFIX_ALIGN_SPLIT, BRIEF 23:46)
+    assert spec["prompts"][2]["num_cached_tokens"] == base["prompts"][2]["num_cached_tokens"]
+
+
+def test_per_step_timing_records_through_the_runner(engine_runs, tmp_path):
+    """``VLLM_HPU_MTP_TIMING=2`` through the runner (``mtp_step_timer.py``): one record per speculative step, with its
+    rows and, per decode request, the tokens it committed in the step (the oracle's forced count plus one) and in its
+    previous step."""
+    path = tmp_path / "timing.oracle.json"
+    path.write_text(json.dumps({"streams": engine_runs["base"]["prompts"], "accept": [2, 0, 3, 1]}), encoding="utf-8")
+    hpu_cpu_engine.run(engine_runs["ckpt"], tmp_path / "timing.json", "--k", str(K), "--oracle", str(path),
+                       env={"VLLM_HPU_MTP_TIMING": "2"}, cwd=tmp_path)
+    files = list(tmp_path.glob("mtp_step_record_r*.jsonl"))
+    assert len(files) == 1, files
+    records = [json.loads(line) for line in files[0].read_text(encoding="utf-8").splitlines()]
+    verify = [r for r in records if r["kind"] == "verify"]
+    assert verify and max(r["rows"] for r in verify) == 1 + K
+    assert all(r["rows"] <= r["requests"] * (1 + K) and r["verify_ms"] > 0 and r["draft_ms"] > 0 for r in verify)
+    seen = set()
+    for r in verify:
+        seen |= set(r["committed"])
+    assert seen <= {str(n) for n in range(1, K + 2)} and {"1", str(K + 1)} <= seen  # accept 0 and accept k ran
+    chained = 0
+    for before, after in zip(verify, verify[1:]):  # one request at a time: its steps follow each other
+        if after["prev_committed"] != {"none": 1}:
+            assert after["prev_committed"] == before["committed"], (before, after)
+            chained += 1
+    assert chained >= len(verify) // 2

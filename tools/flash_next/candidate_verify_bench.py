@@ -103,14 +103,18 @@ def bench(batch: int, k: int, device, iters: int, seed: int = 0) -> dict:
     out_cand, t_cand = _time(candidates, device, iters)
     record = {"requests": batch, "k": k, "rows": rows, "exact": t_exact, "candidates": t_cand}
 
-    # checks on the device
+    # checks on the device. bf16 logits tie often (88 to 100 % of rows at the 64th value, job 00135), so the id
+    # checks are by value: every candidate id holds its candidate's value in the CPU's logits, and the tokens
+    # strictly above the k-th value are the CPU's (ties at the k-th value may be cut differently).
     values, ids = cv.candidates(logits, cv.CANDIDATES)
-    ids_cpu = ids.cpu()
+    ids_cpu, values_cpu = ids.cpu(), values.cpu()
     top_cpu = torch.topk(logits_cpu.float(), cv.CANDIDATES, dim=-1)
-    same = sum(set(ids_cpu[r].tolist()) == set(top_cpu.indices[r].tolist()) for r in range(rows))
-    kth_equal = torch.equal(values.cpu()[:, -1], top_cpu.values[:, -1])
-    record["ids_rows_equal_to_cpu_topk"] = "%d/%d" % (same, rows)
-    record["kth_value_equal"] = bool(kth_equal)
+    held = logits_cpu.float().gather(1, ids_cpu.long().clamp(0, VOCAB - 1))
+    above = sum(set(ids_cpu[r][values_cpu[r] > values_cpu[r, -1]].tolist())
+                == set(top_cpu.indices[r][top_cpu.values[r] > top_cpu.values[r, -1]].tolist()) for r in range(rows))
+    record["ids_hold_their_values"] = bool(torch.equal(held, values_cpu))
+    record["ids_above_kth_equal_cpu"] = "%d/%d" % (above, rows)
+    record["kth_value_equal"] = bool(torch.equal(values_cpu[:, -1], top_cpu.values[:, -1]))
     for name, out in (("exact", out_exact), ("candidates", out_cand)):
         tokens = out.cpu()
         valid = ((tokens == -1) | ((tokens >= 0) & (tokens < VOCAB))).all().item()
@@ -126,7 +130,9 @@ def bench(batch: int, k: int, device, iters: int, seed: int = 0) -> dict:
     # greedy (top_k 1) over candidates returns the arg max
     greedy_inputs = cv.host_inputs([0.0] * batch, [-1] * batch, [1.0] * batch, k, noise).to(device)
     greedy = cv.candidate_rejection_sample(logits, target, bonus, draft, cumulative, greedy_inputs, -1).cpu()
-    record["greedy_first_token_is_argmax"] = bool(torch.equal(greedy[:, 0], argmax.view(batch, k)[:, 0]))
+    first_rows = logits_cpu.float().index_select(0, target_cpu.view(batch, k)[:, 0])
+    greedy_logit = first_rows.gather(1, greedy[:, :1].long().clamp(0, VOCAB - 1)).view(-1)
+    record["greedy_first_token_holds_the_max"] = bool(torch.equal(greedy_logit, first_rows.max(dim=-1).values))
     return record
 
 

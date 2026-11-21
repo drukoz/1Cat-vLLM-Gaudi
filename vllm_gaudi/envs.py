@@ -543,7 +543,8 @@ if TYPE_CHECKING:
     VLLM_HPU_SPEC_SAMPLED_VERIFY: int = 0  # 0 greedy requests only (default), 1 also sampled, 2 sampled over candidates
     VLLM_HPU_MTP_DRAFT_LOOP: int = 0  # 0 draft positions read back from the device (default), 1 host books
     VLLM_HPU_MTP_DRAFT_IDS: int = 0  # 0 draft ids by argmax, int64 narrowed in the graph (default), 1 int32 ids
-    VLLM_HPU_MTP_TIMING: int = 0  # 0 off (default), 1 time the verification part and the draft of every step
+    VLLM_HPU_MTP_TIMING: int = 0  # 0 off (default), 1 time the verification part and the draft of every step,
+    # 2 also one record per step (mtp_step_record_r*.jsonl)
     VLLM_HPU_MTP_CHUNK_KV: int = 0  # 1 the MTP draft also runs over prefill chunks that complete no prompt
     VLLM_HPU_GDN_KERNEL_INTERLEAVE: int = 0  # 0 today's GDN decode/verify kernels, 1 four value rows per iteration
     VLLM_HPU_GDN_GLUE_CACHE: int = 0  # 0 per-step glue of the fused GDN ops (default), 1 constants and indices cached
@@ -2052,7 +2053,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # What a speculative step is made of. 1 = the runner times every step of a speculative server: the verification
     # part (to the drafter call) and the draft, with the proposer's laps per draft pass and one device wait after
     # the draft (vllm_gaudi/v1/spec_decode/mtp_step_timer.py): a log line and a JSON line per 25 steps of a row
-    # count (mtp_step_timing_r<rank>_<pid>.jsonl in the working directory). 0 (default) = no timer exists.
+    # count (mtp_step_timing_r<rank>_<pid>.jsonl in the working directory). 2 = as 1, and one JSON line per step
+    # (mtp_step_record_r<rank>_<pid>.jsonl): its verify and draft ms with the tokens each decode request committed
+    # in this step and in its previous one. 0 (default) = no timer exists.
     "VLLM_HPU_MTP_TIMING":
     lambda: int(os.environ.get("VLLM_HPU_MTP_TIMING", "0")),
 

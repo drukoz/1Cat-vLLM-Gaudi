@@ -6,18 +6,91 @@ This file is the track's report. The harness of the track's agents does not writ
 
 ## Handoff (if this agent stops)
 
-Last update: 2026-11-20 23:56 UTC (fourth agent of the track, Opus 5.5, started 23:15 UTC). Coordinator's rule
-for tonight (BRIEF 23:21): card evidence first, no pull request before 04:00 UTC; push the branch after each green
-step and tell the coordinator the commit and the flags (the integration track builds from this branch).
+Last update: 2026-11-21 01:48 UTC by `date -u` (fourth agent of the track, Opus 5.5, 23:15 UTC to 01:50 UTC; it ended its run here). **The node runs until
+about 00:00 UTC on 2026-11-22 (BRIEF 00:50); merges allowed again.** Coordinator's plan for this track (00:42 UTC):
+(1) the verify-op crash of 00133, cause and fix, CPU first, then its card check (00162, mine); (2) the pull request
+of the card-proven MTP fixes (gate, merge); (3) with engine-step (agent a8a87f4c2008bde9c): sampled MTP verification
+through its candidate region; (4) the k choice at TP8 from integration's build 2 (00142) and MTP acceptance at long
+prompts. Take the time from `date -u` (coordinator stamps and my own estimates have run 10 to 50 minutes late).
 
-**State.** MTP k = 3 works on the real model at TP8 and TP4 and pays at 1 stream (TP4: 23.5 ms per token against
-39.8, 1.69 times), about even at 8 streams, and LOSES at 32 streams on today's torch QSA path (133.7 against 108.1).
-The timer (job 00104) says why: the verification part Ft grows with its rows (47 / 109 / 303 ms at 4 / 32 / 128
-rows) while a draft pass Fd is small (4.4 / 6.0 / 10.7 ms). Acceptance holds at 32 streams (0.72 / 0.51 / 0.36
-per position). The open questions are what the QSA data-flow change and the kernel-fixes flags do to Ft at 128
-rows, whether k = 1 beats k = 3 at 32 streams, and what sampled verification (I07) costs: jobs 00126 / 00127.
+**State.** With the QSA data flow and the kernel-fixes flags, MTP k = 3 pays at 1 and 8 streams and breaks even at
+32 on TP4 (00126 / 00127: 25.5 / 34.0 / 61.9 ms per token against 29.8 / 43.2 / 63.7; a 128-row verification costs
+Ft 131 ms, it was 303 on the torch QSA path); on TP8 (integration 00128) 40.7 against 51.1 ms per token at 32 streams,
+acceptance 0.743 / 0.535 / 0.396. **At 32 streams on TP4 k = 1 is the best k** (55.2 ms per token greedy, 65.8
+sampled, against 63.7 / 76.2 without speculation); on TP8 (Ft grows about 0.24 ms per row) k = 2 to 4 are all about
+40-41 ms per token at 32 streams by arithmetic (integration's 00142 measures k = 2). The draft loop is sound.
+**Sampled verification (I07) works on the card** (`=1`, 00126) but adds about 26 ms per step at k = 3; `=2`
+(candidates) halves the rejection maths on one card (00135 / 00139, ids verified by value) and waits for a real-model
+run (00138, TP4, queued behind the TP8 jobs; integration's build 2 has it). engine-step built the end state
+(`VLLM_HPU_CANDIDATE_SAMPLING=2`, sampling every verification row in its region, then the greedy rejection; CPU-green
+at d5ad5e67) and runs its own TP4 job on a test branch with this branch merged (engine-step-mtp-card at c7669410).
 
-**Branch** (pushed: `origin/feat/flash-next-gaudi-mtp-card-ready` = `fb4f4d50` and this handoff):
+**00133 crash: cause and fix `5c770d96`, card check 00162.** The request after one whose decode completed a recurrent
+block died with `ValidateSyncInputTensors tensor_data is empty` at `gdn_core_verify`'s first input (the GDN conv
+pool), in a graph captured after the block commit. The align-mode copies (`recurrent_commit.commit_conv`, boundary
+commit and pre-step copy) wrote the conv window through a slice of the pool (`hpu::slice_insert`); `commit_ssm`
+(whole rows, `index_copy_`) was fine and its pool was not the failing input (INFERRED from code and log; BRIEF rule
+11 now). Fix: new whole rows from `index_select` copies, one `index_copy_` on the pool. CPU:
+`test_align_commit_slice_writes.py` 10 passed (8 failed before), `test_mtp_align_continuity.py` 76 passed, the
+3-turn CPU engine test (decode across the block, the same prompt again, the next turn) tokens equal to k = 0, copies
+ran, no slice write (`hpu_cpu_engine --slice-write-probe`).
+- **00170 `real4-commit-turns-check2`** (replaced 00162 at 01:47 UTC, keeps its place; any:4, 50 min; card build
+  `3026297f` = this branch at `05d2db66` + `origin/feat/flash-next-gaudi-prefill` with prefill's reviewed
+  `92e65144` (the decode-end keep for MTP), pushed as `feat/flash-next-gaudi-mtp-card-ready-cardbuild`; one conflict
+  in qsa.py, both sides kept; 93 CPU tests passed on it): 00126's flags + `VLLM_HPU_PREFIX_ALIGN_SPLIT=1
+  VLLM_HPU_PREFIX_KEEP_PROMPT_END=1 VLLM_HPU_PREFIX_KEEP_DECODE_END=1`, arms k = 3 (fused verify, timer, draft loop,
+  chunk KV) and k = 0, probe `tools/flash_next/rental/commit_turns_probe.py --block 896 --decode 1100`
+  (`MTP_PROBE_SCRIPT`, output `<arm>/turns.json`): one stream across 896 and 1,792, then 2 / 3 / 5 / 8 streams (new
+  graph captures), the first prompt again (must equal round 1 exactly), 8 long prompts crossing at once and again
+  (equal per stream), the next turn (k = 3 should hit 896, one block before the last decode boundary; k = 0
+  1,792). Read: `COMPARE` / `ROUND` lines of `probe.log` per arm, `turns.json`, `server0.log` (no `tensor_data is
+  empty`), acceptance per position before and after the crossings. Placed by the coordinator after the MoE A/B 00161, beside prefill's 00150 / 00151: expected start about 04:00 to
+  04:30 UTC.
+- CPU finding (prefill's flags, scratch tree `reports/mtp-card-ready/scratch-prefill`,
+  `reports/mtp-card-ready/cpu4/turns_prefix/summary.json`): with the flags on, the next turn hits 256 tokens at
+  k = 0 but 0 at k = 3. Prefill's `keep_last_decode_boundary` refuses speculative configs (the straddling step's state
+  lands in its last token's block upstream; our align-mode boundary commit writes the exact boundary state, so it
+  could be lifted for the HPU MTP path), and upstream's EAGLE / MTP rule drops the last matched block of every hit.
+  Asked the coordinator who takes it.
+
+**Answer reuse with MTP (agreed with prefill, agent a9a36e0116ed6cb7d; coordinator 01:05 UTC: mine).** With
+prefill's flags on, MTP's next turn reused nothing of the previous answer (CPU engine, `--next-turn` on the engine's
+own answer: cached 512 without speculation, 0 with MTP k = 3): prefill's `keep_last_decode_boundary` refused
+speculative groups, and upstream's EAGLE / MTP rule drops the last matched block of every hit. Fix, for prefill to
+review and cherry-pick: **`ac7153b7` on `feat/flash-next-gaudi-mtp-card-ready-prefix-spec`** (based on prefill's
+`4a77ec46`): the platform hook records `recurrent_spec_enabled` in `VLLM_HPU_RECURRENT_BOUNDARY_COMMITS`
+(internal), a speculative group is kept only then, with its last two decode boundaries; harness
+(`flash_next_sched_harness.Settings.speculative_blocks / eagle_drop / boundary_commits`) at engine block 128 with
+ALIGN_SPLIT: the next turn hits 24,576 (one block before 25,088), no violation; 114 prefill-area tests passed. CPU
+engine with the change: MTP's next turn 256 cached (`reports/mtp-card-ready/cpu4/turns3.log`, driver
+`reports/mtp-card-ready/turns_prefix_check3.py`).
+
+**engine-step's candidate region for MTP** (`VLLM_HPU_CANDIDATE_SAMPLING=2`, with `VLLM_HPU_SPEC_SAMPLED_VERIFY` 1 or
+2 for admission and fallback): CPU-green at d5ad5e67; its TP4 job runs from its test branch engine-step-mtp-card
+(c7669410 = d5ad5e67 + this branch's 05d2db66); compare with 00126 (=1) and 00138 (=2).
+
+**Pull request.** Gate queued at 00:58 UTC on a snapshot of `558277d2` (the program head `5c1e8219`, PR #15, merged
+in; contains `5c770d96`): `bin/gate reports/mtp-card-ready/gate-558277d2 --tools`, output
+`reports/mtp-card-ready/gate/gate-558277d2.txt`; it waits in the lock behind about seven gates. PR body draft:
+`reports/mtp-card-ready/pr/pr2_body.md`. The branch carries the qsa-fused merge (`697bffed`): merge qsa-fused's pull
+request first, or say in the PR that it carries it. Known tools/rental reds that are not this branch's: the signal
+and git tests (`test_sh_run_rental`, `test_sh_tiny_smoke` signal cases, `test_rental_scripts::test_make_rental_bundle`
+outside a git checkout).
+
+**Branch** (pushed: `origin/feat/flash-next-gaudi-mtp-card-ready` = `61db722d` and this handoff):
+- `61db722d` `hpu_cpu_engine.py --next-turn` (the agent's next turn on the engine's own answer); the block-commit
+  engine test uses it and checks that the same prompt twice gives the same tokens after a commit.
+- `44a8ad02` + `950608fc`: spec-lookup's fix of the exact sampled path for -1 (lookup padding) drafts,
+  cherry-picked (`2dd6bc75`), and a test that the candidate path never accepts a -1 draft (it needs no change).
+- `05d2db66` `commit_turns_probe.py` (the block-commit card check) and `MTP_PROBE_SCRIPT` in `mtp_real_card.sh`.
+- `558277d2` merge of the program head `5c1e8219` (PR #15 kernel-fixes), clean.
+- `5c770d96` the 00133 fix (above) with its tests; `hpu_cpu_engine.py --slice-write-probe` and `num_cached_tokens`.
+- 00139 (ended 00:38 UTC, ok): the bench with id checks by value passes on the card at 1 / 8 / 32
+  requests (every candidate id holds its value, greedy holds the max); candidate path 3.3 / 10.3 / 19.1 ms against
+  5.0 / 18.5 / 33.3 ms exact (a busier node than 00135).
+- `409c83e5` one log line at the first candidate step (`VLLM_HPU_SPEC_SAMPLED_VERIFY=2: sampled verification over
+  the top 64 candidates of every row (first step: N requests, k = K)`); a refused step logs once per reason.
+- `b66e1131` candidate_verify_bench.py: id checks by value (bf16 ties made 00135's set check fail).
 - `fb4f4d50` spec_scaling.py: the long prompts of the warm and the measured round start with different text (no
   round reads another's prefix cache: a TP4 prefix-cache hit can read another position's GDN state, BRIEF 23:46).
 - `1f2dc38e` I07 fast path: `VLLM_HPU_SPEC_SAMPLED_VERIFY=2`, sampled verification over the top-64 candidates of
@@ -55,7 +128,17 @@ rows, whether k = 1 beats k = 3 at 32 streams, and what sampled verification (I0
   `python tools/flash_next/candidate_verify_bench.py --device hpu --requests 1,8,32 --out "$FARM_OUT/bench.json"`:
   the exact sampled verification (`=1`) against the candidate path (`=2`) per call on one card, the candidate ids
   against the CPU's topk, valid tokens, first-draft acceptance of both, greedy = arg max.
-- **00136 `real4-qsa-mtp3-cand-ctx`** (any:4, 30 min, `fb4f4d50`, bump asked after 00135): 00126's flags with
+- **00135 ended 00:23 UTC (ok, 22 s)**: candidate path 3.7 / 6.0 / 13.3 ms per call against 5.4 / 11.9 / 27.6 ms on
+  the exact path at 1 / 8 / 32 requests (k = 3, one card); tokens valid, k-th value equal to the CPU's, first-draft
+  acceptance of both paths within 1.5 sigma of the CPU's exact expectation (0.097 at 32 requests). Its id-set and
+  greedy checks failed on bf16 ties only (88-100 % of rows tie at the 64th value); fixed in `b66e1131`.
+- **00139 `cand-verify-bench2`** (any:1, 10 min, `b66e1131`): the same bench with the id checks by value (every
+  candidate id holds its value in the CPU's logits). Queued 00:35 UTC; runs only if a card is idle.
+- **00138 `real4-qsa-cand-k3-k1`** (any:4, 45 min, `fb4f4d50`, replaced 00136 at 00:26 UTC, keeps its bump): 00126's
+  flags with `VLLM_HPU_SPEC_SAMPLED_VERIFY=2`, `mtp_arms.sh 'cand3|3||--levels 32 --tokens 256 --repeat-top 1
+  --sampled-levels 1,32 --ctx 8:16000' 'cand1|1||--levels 32 --tokens 256 --repeat-top 1 --sampled-levels 1,32'`.
+  Waits behind the TP8 jobs; THE PLAN FOR THE NEXT RENTAL if it does not run.
+- (cancelled) **00136 `real4-qsa-mtp3-cand-ctx`** (any:4, 30 min, `fb4f4d50`, bump asked after 00135): 00126's flags with
   `VLLM_HPU_SPEC_SAMPLED_VERIFY=2`, `mtp_arms.sh 'cand|3||--levels 32 --tokens 256 --repeat-top 1 --sampled-levels
   1,32 --ctx 8:16000'` (greedy 32 in the same server, sampled 1 and 32 over candidates, 8 x 16K-token prompts with
   CHUNK_KV). If 00135 shows the candidate path wrong on the card: `--replaces 00136` with `=1`.
@@ -68,19 +151,30 @@ rows, whether k = 1 beats k = 3 at 32 streams, and what sampled verification (I0
   streams greedy and sampled, k = 3 against k = 1 against the reference, Ft / Fd at 128 rows, which verification
   rung ran (the fused one, `VLLM_HPU_GDN_CORE_VERIFY=1`).
 
-**Pending, in order**
-1. Read 00126 / 00127 when they end (they start after the integration track's 00128, by 00:19 UTC at the latest);
-   numbers to the coordinator (per arm and level: ms per step, tokens per step, ms per token, tok/s per stream,
-   Ft / Fd, acceptance per position, hl-smi peak; k = 1 against k = 3 at 32 streams) and into "Card results".
-2. I07 fast path on the card: the 1-card bench job (`cand-verify-bench`, below), then a real-model arm with
-   `VLLM_HPU_SPEC_SAMPLED_VERIFY=2` (sampled rounds at 1 and 32 streams) against 00126's `=1` sampled rounds:
-   `mtp_arms.sh 'cand|K||--levels 32 --tokens 256 --repeat-top 1 --sampled-levels 1,32'` with 00126's flags,
-   `VLLM_HPU_SPEC_SAMPLED_VERIFY=2` and K the best k at 32 streams.
-3. k from arithmetic (`tools/flash_next/mtp_k_choice.py`): E(k) = 1 + r1 + ... + rk with the unconditional
-   per-position rates; cost Ft(rows(k)) + k Fd. k = 4 / 5 only where Fd stays small against Ft (1 stream).
-4. Pull request after 04:00 UTC: gate (`bin/gate <worktree> --tools`) on a snapshot, PR to
-   `feat/flash-next-gaudi` (the merges of qsa-fused and kernel-fixes are then on the program branch or not: if
-   not, the PR carries them, say so).
+**Pending, in order (for whoever takes the track next)**
+1. 00170 (the 00133 fix's card check with prefill's flags, above): read it when it ends (`bin/farm fetch
+   mtp-card-ready 00170 00170-real4-commit-turns-check2` if no waiter copied it), report `COMPARE` lines, the
+   next-turn cached tokens at k = 3 (896 expected) and k = 0, acceptance before and after the crossings, any
+   `tensor_data is empty` in `server0.log`.
+2. 00138 was CANCELLED at 01:36 UTC (coordinator: covered at TP8 by integration's build 2 arm C, k = 2 with `=2`, and
+   engine-step's 00164, sampled MTP in its region). Read those for the sampled MTP numbers.
+3. The pull request: when `reports/mtp-card-ready/gate/gate-558277d2.txt` ends (the gate on a snapshot of
+   `558277d2`), judge its reds (the known tools/rental signal and git reds are not this branch's; anything in
+   flash_next or the sampler is), then merge `origin/feat/flash-next-gaudi` again, push, `gh pr create --base
+   feat/flash-next-gaudi` with `reports/mtp-card-ready/pr/pr2_body.md` (update its numbers: 00126 / 00127 / 00135 /
+   00139, the 00133 fix), `gh pr merge --merge`. The branch carries the qsa-fused merge (`697bffed`): if qsa-fused's
+   pull request has not landed first, say so in the body.
+4. DONE 01:47 UTC, k at TP8 (sent to the coordinator): integration's 00156 (build 2b, k = 2) 40.1 / 45.7 ms per
+   token at 32 streams greedy (2.29 tokens per step, acceptance 0.755 / 0.537) against 00128's k = 3 40.7: a tie,
+   as the arithmetic said (Ft grows 0.24 ms per row at TP8); k = 2 is the cheaper choice. Caveat: 00156's 1-stream
+   k = 2 (41.8 against 33.0 without speculation) is slower than 00128's k = 3 (24.3): compare k = 2 and k = 3 in one
+   build before fixing k for latency. Sampled (=2) at 32 streams: 46.7 / 53.1 against 58.9 / 52.7 without
+   speculation. **MTP acceptance at long prompts (first measurement, 00156, 8 x about 14.8K tokens, CHUNK_KV on):
+   2.43 tokens per step, 0.796 / 0.629**, higher than at short prompts.
+5. Leftover scratch trees (safe to delete once 00170 has run): `reports/mtp-card-ready/scratch-prefill`,
+   `scratch-merge2` (the card build's merges; a stash holds the SCRATCH_* probe patches), `snap-0d1be6fc`,
+   `snap-cand`, `prefix-spec` (prefill's reviewed commit, now `92e65144` on their branch). Keep `gate-558277d2`
+   until its gate has run.
 
 **Results of the jobs the third agent left (read 23:20 UTC)** are in "Card results" (00099, 00104, 00105).
 The fused verify rung's mismatch on the tiny model at TP2 (00105, 700-token prompt, token 4) is a near tie: the
@@ -197,6 +291,26 @@ short-prompt numbers.
 6. Merge proven steps per the protocol: merge `origin/feat/flash-next-gaudi` into the branch (one conflict, in
    `hpu_flash_next_mtp.py`), `bin/gate <worktree> --tools`, PR to `feat/flash-next-gaudi`.
 
+## I07, sampled verification: what is built and where it should end
+
+- `VLLM_HPU_SPEC_SAMPLED_VERIFY=1` (exact, `hpu_rejection_sampler.sampled_rejection_sample`): card-proven in 00126 (TP4,
+  coherent sampled texts, acceptance length 2.62 at 1 stream, 2.23 at 32), but about 26 ms per step at k = 3 (13 at
+  k = 1), mostly upstream's RejectionSampler / Sampler pass: the one-card cost of the rejection maths is 5.4 ms at 4
+  rows and 27.6 ms at 128 rows (00135).
+- `=2` (`hpu_candidate_verify.py`): the same distribution over the top-64 candidates after the logits all-gather,
+  13.3 ms at 128 rows on one card (00135); skips upstream's sampler pass. Real-model run pending (00138, integration
+  build 2).
+- **End state (proposed to engine-step, 00:47 UTC):** for arg-max drafts (MTP), speculative sampling equals "sample
+  every verification row and the bonus row from the target distribution, each with its own noise, then the greedy
+  rejection on the sampled tokens". Proof: with q one-hot at d, speculative sampling accepts with p(d) and on a
+  rejection draws from p without d; a draw y ~ p accepted when y = d gives P(accept) = p(d) and
+  P(y = x | y != d) = p(x) / (1 - p(d)); rows are independent. So engine-step's sampled region
+  (`VLLM_HPU_CANDIDATE_SAMPLING=1`, candidates inside the compiled LM-head region, vocabulary-parallel in its candvp
+  form) can serve a verification step: expand the request parameters to rows (row r is request r // (1 + k) in the
+  HPU's padded layout), one noise row per row, return the per-row tokens as `fused_sampled_token_ids`; the runner's
+  spec branch already hands them to `greedy_rejection_sample_from_tokens` (PR 13). Sampled verification would then
+  cost about what greedy verification costs. Card check needed: the first-draft acceptance against p(d).
+
 ## Card results
 
 | Job | What | Result |
@@ -211,6 +325,11 @@ short-prompt numbers.
 | 00099 `real4-nospec-ref` | TP4 + EP4, no speculation, `9d013a36`, modules 0-3, greedy, 256 tokens, torch QSA path | steady ms per step 39.8 (1 stream), 53.7 (8), 108.1 / 108.1 (32, two rounds) |
 | 00104 `real4-mtp3-timed` | TP4 + EP4, k = 3, fused verify rung (`VLLM_HPU_GDN_CORE_VERIFY=1`), timer, `317c33c5`, modules 4-7, greedy, 256 tokens | ms per token 23.5 / 49.0 / 133.7 (1 / 8 / 32 streams), tokens per step 2.56 / 2.57 / 2.53, step 60 / 126 / 338 ms. Timer (means of 25 steps, 4 ranks within 1 ms): Ft 47.0-48.4 / 109.2-109.5 / 302.5-303.4 ms at 4 / 32 / 128 rows (415-438 in the first 32-stream rounds, compiles); draft 12.8-13.5 / 17.8 / 32.1-32.5 ms, so Fd 4.3-4.5 / 5.9-6.0 / 10.7-10.8 ms per pass. Acceptance per position (server windows): 0.75 / 0.55 / 0.38 at 8 streams (1,959 drafted), 0.72 / 0.51 / 0.36 at 32 (16,134 drafted), 0.64 / 0.39 / 0.23 at 1 stream (windows with warm rounds). Texts coherent; the 1-stream text leaves the reference's after 4 words (a near tie under 4 rows). Pauses up to 24.6 s in the first 32-stream round (compiles) |
 | 00105 `tiny2-mtp-arms` | tiny model TP2, k = 3, image `317c33c5`; arm base, arm `VLLM_HPU_MTP_DRAFT_LOOP=1` + `VLLM_HPU_MTP_CHUNK_KV=1` | both arms PASS on the torch-verification rung (tokens equal the non-speculative server, 1 to 2,600-token prompts; 0 of 270 drafts accepted, random weights), 20.0 and 16.2 ms per token; the fused verify rung missed the 700-token prompt at token 4 in both arms (a near tie, see the handoff). First card run of DRAFT_LOOP and CHUNK_KV: no error |
+| 00127 `real4-qsa-ref-nospec` | TP4 + EP4, no speculation, `13d7393a`, QSA data flow (`VLLM_HPU_QSA_FUSED=1 VLLM_HPU_QSA_INDEXER_SHARD=1`) + kernel-fixes flags (`VLLM_HPU_GDN_KERNEL_INTERLEAVE=1 VLLM_HPU_GDN_GLUE_CACHE=1 VLLM_HPU_HC_FUSED_COPY_MODE=2`), `VLLM_GRAPH_RESERVED_MEM=0.5`, 256 tokens | greedy ms per step 29.8 (1 stream), 43.2 (8), 64.5 / 63.7 (32); sampled (server default sampling) 38.7 (1), 76.2 (32); hl-smi peak 70.7 GiB per card; texts coherent |
+| 00126 arm `k3` | the same build and flags with k = 3, fused verify rung (`VLLM_HPU_GDN_CORE_VERIFY=1`), `VLLM_HPU_MTP_DRAFT_LOOP=1`, `VLLM_HPU_MTP_CHUNK_KV=1`, `VLLM_HPU_SPEC_SAMPLED_VERIFY=1`, timer | greedy: 65.3 / 88.3 / 157.9 and 157.6 ms per step at 1 / 8 / 32 streams, 2.56 / 2.60 / 2.53 and 2.55 tokens per step, **25.5 / 34.0 / 62.3 and 61.9 ms per token (1.17 / 1.27 / 1.03 times the reference)**, acceptance 0.74 / 0.47 / 0.38, 0.73 / 0.52 / 0.39, 0.73 / 0.50 / 0.35. Timer: Ft 47-52 / 65 / 130-132 ms at 4 / 32 / 128 rows, Fd 4.4 / 5.7 / 6.9-8.5 ms (pass-0 wait gone with the draft loop). **Sampled (I07, exact path, first card run): works**, 91.0 ms per step at 1 stream (2.59 tokens per step, 35.2 ms per token, acceptance 0.73 / 0.53 / 0.36), 184.3 at 32 streams (2.24, 82.4 ms per token, 0.64 / 0.38 / 0.22): the exact path adds about 26 ms per step at 4 and at 128 rows; texts coherent |
+| 00126 arm `k1` | the same with k = 1 | 1 stream: 50.1 ms per step, 1.75 tokens per step, 28.6 ms per token, acceptance 0.76; **32 streams greedy: 95.7 ms per step, 1.74 tokens per step, 55.2 ms per token (1.15 times the reference's 63.7; k = 3: 61.9)**, acceptance 0.75; 32 streams sampled (`=1`): 109.1 ms per step, 1.66, **65.8 ms per token (reference 76.2, k = 3: 82.4)**, acceptance 0.66. Timer: Ft 42-47 / 84-86 (sampled 98-100) ms at 2 / 64 rows, Fd 4.8-5.9 / 5.2-7.6 ms. KV cache 868,867 tokens (k = 3: 657,714). hl-smi peak 73.7 GiB per card (MTP), 70.7 without |
+| 00135 `cand-verify-bench` | one card, `1f2dc38e`, sampled verification per call (k = 3, the real vocabulary, temperature 1 / top_k 20 / top_p 0.95, lazy mode, mark_step + sync) | exact path (`=1`) 5.4 / 11.9 / 27.6 ms, candidate path (`=2`) 3.7 / 6.0 / 13.3 ms at 1 / 8 / 32 requests; tokens valid, k-th candidate value equal to the CPU's, first-draft acceptance of both within 1.5 sigma of the CPU's exact expectation (0.097 at 32 requests: card 0.080 exact, 0.114 candidates); the id-set and greedy checks failed on bf16 ties only |
+| 00139 `cand-verify-bench2` | the same with the id checks by value (`b66e1131`) | every candidate id holds its value in the CPU's logits, tokens above the k-th value equal the CPU's (4/4, 32/32, 128/128), greedy holds the max: **ids VERIFIED on the card**; 3.3 / 10.3 / 19.1 ms against 5.0 / 18.5 / 33.3 ms (a busier node) |
 
 ## How the jobs of this track run (late-bound)
 

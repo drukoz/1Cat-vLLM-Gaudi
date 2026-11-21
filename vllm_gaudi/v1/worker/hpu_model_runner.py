@@ -6956,9 +6956,11 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                 logger.info("VLLM_HPU_SPEC_SAMPLED_VERIFY=2: a step with %s takes the exact sampled verification",
                             reason)
             return None
+        max_draft = int(spec_decode_metadata.target_logits_indices.shape[0]) // batch
         if self._candidate_noise is None:
             self._candidate_noise = torch.Generator().manual_seed(candidate_verify.NOISE_SEED)
-        max_draft = int(spec_decode_metadata.target_logits_indices.shape[0]) // batch
+            logger.info("VLLM_HPU_SPEC_SAMPLED_VERIFY=2: sampled verification over the top %d candidates of every row "
+                        "(first step: %d requests, k = %d)", candidate_verify.CANDIDATES, batch, max_draft)
         inputs = candidate_verify.host_inputs(temperatures, top_ks, top_ps, max_draft, self._candidate_noise)
         self._candidate_verify_steps += 1
         return candidate_verify.candidate_rejection_sample(logits_device, spec_decode_metadata.target_logits_indices,
@@ -7589,6 +7591,9 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                     step_timer.lap("post")
                 mtp_step_timer = None if warmup_mode else self._mtp_step_timer
                 if mtp_step_timer is not None:
+                    if mtp_step_timer.per_step:  # VLLM_HPU_MTP_TIMING=2: what each decode request committed
+                        mtp_step_timer.step_tokens(self.input_batch.req_ids[:num_decodes],
+                                                   [len(t) for t in postprocessed_sampled_token_ids[:num_decodes]])
                     mtp_step_timer.draft_start(
                         "prefill" if num_decodes == 0 else ("verify" if num_prefills == 0 else "mixed"),
                         scheduler_output.total_num_scheduled_tokens, num_decodes + num_prefills,

@@ -551,6 +551,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--top-p", type=float, default=1.0, help="top_p of a sampled run")
     parser.add_argument("--seed", type=int, default=None, help="per-request seed of a sampled run")
     parser.add_argument("--logprobs", type=int, default=None, help="record the top-N logprobs of every generated token")
+    parser.add_argument("--next-turn", default=None, metavar="IDS_JSON",
+                        help="after the prompts, one more request: the first prompt, its generated tokens and these "
+                        "token ids (a JSON list): the agent's next turn on this engine's own answer")
     parser.add_argument("--slice-write-probe", action="store_true",
                         help="record writes through a slice of the recurrent pools the align-mode copies write")
     parser.add_argument("--op-audit", action="store_true",
@@ -602,6 +605,11 @@ def main(argv: list[str] | None = None) -> int:
                     stream["top_logprobs"] = [{str(t): float(lp.logprob) for t, lp in step.items()}
                                               for step in (output.outputs[0].logprobs or [])]
                 streams.append(stream)
+        if args.next_turn and streams:
+            turn = streams[0]["prompt_ids"] + streams[0]["generated_ids"] + list(json.loads(args.next_turn))
+            output = llm.generate([{"prompt_token_ids": turn}], params, use_tqdm=False)[0]
+            streams.append({"prompt_ids": turn, "generated_ids": list(output.outputs[0].token_ids),
+                            "num_cached_tokens": getattr(output, "num_cached_tokens", None), "next_turn": True})
     record = {"k": args.k,
               "prefix_caching": not args.no_prefix_caching,
               "concurrent": bool(args.concurrent),
@@ -618,9 +626,11 @@ def main(argv: list[str] | None = None) -> int:
     return 0
 
 
-def run(ckpt: Path, out: Path, *options: str, env: dict | None = None, timeout_s: float = 1800.0) -> dict:
+def run(ckpt: Path, out: Path, *options: str, env: dict | None = None, timeout_s: float = 1800.0,
+        cwd: Path | None = None) -> dict:
     """Run one rehearsal in a process of its own and return its record. ``options`` are CLI options of
-    :func:`main`; ``env`` is added to the engine's environment (plugin flags). A run that fails raises
+    :func:`main`; ``env`` is added to the engine's environment (plugin flags); ``cwd`` is the engine's working
+    directory (default the repository root), where files a server writes there land. A run that fails raises
     ``RuntimeError`` with the end of its output."""
     run_env = dict(os.environ)
     run_env.update(ENGINE_ENV)
@@ -630,7 +640,7 @@ def run(ckpt: Path, out: Path, *options: str, env: dict | None = None, timeout_s
     command = [sys.executable, "-m", "tests.unit_tests.hpu_cpu_engine", "--ckpt", str(ckpt), "--out", str(out), *options]
     log = Path(str(out) + ".log")
     with open(log, "wb") as stream:
-        done = subprocess.run(command, cwd=REPO_ROOT, env=run_env, stdout=stream, stderr=subprocess.STDOUT,
+        done = subprocess.run(command, cwd=cwd or REPO_ROOT, env=run_env, stdout=stream, stderr=subprocess.STDOUT,
                               timeout=timeout_s, check=False)
     if done.returncode != 0 or not Path(out).is_file():
         tail = log.read_text(encoding="utf-8", errors="replace")[-6000:]

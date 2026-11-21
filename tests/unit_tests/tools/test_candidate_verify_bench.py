@@ -11,6 +11,6 @@ def test_the_bench_times_both_paths_and_its_checks_hold_on_the_cpu(tmp_path):
     record = json.loads(out.read_text())[0]
     assert record["requests"] == 2 and record["rows"] == 8
     assert record["exact"]["p50_ms"] > 0 and record["candidates"]["p50_ms"] > 0
-    assert record["ids_rows_equal_to_cpu_topk"] == "8/8" and record["kth_value_equal"]
+    assert record["ids_hold_their_values"] and record["ids_above_kth_equal_cpu"] == "8/8" and record["kth_value_equal"]
     assert record["exact_tokens_valid"] and record["candidates_tokens_valid"]
-    assert record["greedy_first_token_is_argmax"]
+    assert record["greedy_first_token_holds_the_max"]

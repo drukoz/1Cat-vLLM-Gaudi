@@ -114,8 +114,12 @@ echo "mtp_real_card: SERVER-HEALTHY after $(($(date -u +%s) - STARTED)) s"
 grep -E "Maximum concurrency|Recurrent state pool: [0-9]+ slots x|GPU KV cache size|Free device memory" server0.log |
     sed 's/^.*\] //' | sort -u | tail -n 6 | cut -c1-300
 
+# MTP_PROBE_SCRIPT: the probe (default spec_scaling.py; commit_turns_probe.py for the block-commit check), its
+# output file MTP_PROBE_OUT (default scaling.json).
+PROBE_SCRIPT="${MTP_PROBE_SCRIPT:-spec_scaling.py}"
+PROBE_OUT="${MTP_PROBE_OUT:-scaling.json}"
 probe() {
-    "$PYTHON" "$HERE/spec_scaling.py" --port "$PORT" --model fn --out "$OUT/scaling.json" "$@" 2>&1 | tee probe.log
+    "$PYTHON" "$HERE/$PROBE_SCRIPT" --port "$PORT" --model fn --out "$OUT/$PROBE_OUT" "$@" 2>&1 | tee probe.log
     return "${PIPESTATUS[0]}"
 }
 probe "$@" &
