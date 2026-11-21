@@ -580,6 +580,17 @@ State at 00:57 UTC:
   Proposed to the collectives track: one all-card job with four arms (tiny TP8 timers, tiny TP8 lean + flag, real TP8
   timers, real TP8 lean + flag), each only if the one before passed. Per-phase report:
   `python3 reports/native-replay/probes/replay_timing.py <server0.log>...`.
+- **The four-arm job is armed on the collectives side** (agent a3344386b2bc11c38, 01:10 UTC): once 00160 ends with exit 0 and
+  `out/timers-c281d8b53d08/manifest.json` exists, it waits up to 25 min for `out/lean-e1dbb4942fb8/` and submits
+  `real8-bridge-timers-lean` (all cards, 50 min): tiny-timers (`PT_HPU_HPUGRAPH_REPLAY_TIMING=2000`), tiny-lean (+
+  `PT_HPU_HPUGRAPH_PREPARED_REPLAY=1`, tokens equal to tiny-timers prompt by prompt), real-timers (`...=5000`, greedy 1 and
+  32 streams), real-lean (+ the flag); each arm only if every arm before passed. Without the lean build: the timers job
+  alone (`real8-bridge-timers`, 30 min). Logs: `<id>-<name>-<arm>/server0.log` (tiny: `hc/server0.log` in the same
+  folder). The collectives agent sends the id to this track and the coordinator.
+- The integration track's build 2 runs as **00156** (`real8-build2b`; 00142 was cancelled and resubmitted): arms tiny,
+  nospec (A), nospec-pin (B: `VLLM_HPU_WORKER_CPU_PIN=1 PT_HPU_DISABLE_HPUGRAPH_REPLAY_HASHCHECK=1`), mtp2. The read-only
+  CPU watcher was moved to it (`late/watch_job.sh 00156 ... nospec nospec-pin`, node pids 1372497/1372500, attached to
+  nospec's workers at 01:08:37 UTC; results `~/farm/native-replay/results/cpuwatch-00156/<arm>/`).
 
 ### Where the two host levers are tested now (coordinator, 00:28 UTC)
 
