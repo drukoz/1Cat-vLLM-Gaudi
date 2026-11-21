@@ -97,7 +97,9 @@ def test_single_prefill_state_save_uses_the_only_real_slot():
     assert torch.count_nonzero(state_pool[3:]) == 0
 
 
-def test_batched_prefill_state_save_ignores_padding_indices():
+def test_batched_prefill_state_save_sends_padding_indices_to_the_padding_row():
+    # Several rows: one fixed-shape index_copy_ (no nonzero inside the captured forward); the -1 padding row
+    # writes the pool's last row, the padding row of every runner layout, and no request's slot.
     output = torch.tensor([7.0])
     final_state = torch.stack((torch.ones(2, 3, 4), torch.full((2, 3, 4), 2.0), torch.full((2, 3, 4), 3.0)))
     state_pool = torch.zeros(5, 2, 3, 4)
@@ -107,9 +109,9 @@ def test_batched_prefill_state_save_ignores_padding_indices():
     assert returned is output
     torch.testing.assert_close(state_pool[1], final_state[0])
     torch.testing.assert_close(state_pool[3], final_state[2])
+    torch.testing.assert_close(state_pool[4], final_state[1])
     assert torch.count_nonzero(state_pool[0]) == 0
     assert torch.count_nonzero(state_pool[2]) == 0
-    assert torch.count_nonzero(state_pool[4]) == 0
 
 
 def test_build_hpu_qwen3_layer_groups_preserves_order_and_tail():

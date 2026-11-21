@@ -582,6 +582,7 @@ if TYPE_CHECKING:
     VLLM_HPU_PREFILL_PACING_SLICE_TOKENS: int = 2048  # prompt tokens of one step while streams decode, 0 no cap
     VLLM_HPU_SCHED_KNOBS_FILE: str = ""  # JSON file of scheduler knobs re-read at run time (experiments)
     VLLM_HPU_PROMPT_GRAPH_MAX_TOKENS: int = 0  # 0 upstream; >0 prompt forwards up to this size replay HPU graphs
+    VLLM_HPU_PREFILL_BATCH: int = 0  # 0 one prompt chunk per forward; N >= 2 up to N equal-shape chunks per forward
     VLLM_HPU_QSA_PREFILL_INDEXER_SPLIT: int = 0  # 0 every rank scores all prompt rows; 1 rows split over TP ranks
     VLLM_HPU_PREFIX_KEEP_PROMPT_END: int = 0  # 0 upstream's sparse retention; 1 also a prompt end on a block boundary
     VLLM_HPU_PREFIX_KEEP_DECODE_END: int = 0  # 0 upstream's sparse retention; 1 also the last boundary reached in decode
@@ -2302,6 +2303,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # tokens instead, so long-context prompt chunks replay graphs too. Decode is unchanged.
     "VLLM_HPU_PROMPT_GRAPH_MAX_TOKENS":
     lambda: int(os.environ.get("VLLM_HPU_PROMPT_GRAPH_MAX_TOKENS", "0")),
+    # Batched prefill across requests (Flash-Next, vllm_gaudi/v1/worker/prefill_batch.py). 0 (default): every prompt
+    # chunk of a hybrid model is its own forward. N >= 2: up to N prompt chunks of one step that have the same
+    # padded shape (query and context bucket), the same logits class and no shared block written in the step run
+    # as one forward of [rows, query bucket] (rows a prompt bs bucket); one-row forwards are unchanged.
+    "VLLM_HPU_PREFILL_BATCH":
+    lambda: int(os.environ.get("VLLM_HPU_PREFILL_BATCH", "0")),
 
     # QSA prompt indexer (HpuQsaIndexer.select, prompt branch). 0 (default): every TP rank scores every query row
     # of a prompt chunk against all block keys (the projection and the compressed key cache are replicated, so
