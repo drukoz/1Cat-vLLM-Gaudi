@@ -60,6 +60,13 @@ T0="$(date -u +%s)"
 HOLD_S="${HEADLINE_HOLD_S:-2400}"
 FALLBACK="${HEADLINE_MTP_FALLBACK:-1}"
 
+# The farm preset first (serve_probe.sh sets the same for its servers; the tiny gate needs it here).
+for kv in PT_HPU_LAZY_MODE=1 PT_HPU_LAZY_ACC_PAR_MODE=0 VLLM_HPU_FLASH_NEXT_QSA_MODE=1 \
+    VLLM_HPU_RECURRENT_STATE_POOL=1 VLLM_HPU_GDN_CORE_DECODE=1 VLLM_HPU_HC_FUSED=1 \
+    VLLM_HPU_PLE_HOST_NGRAM_IDS=1 VLLM_HPU_COLLECTIVE_MARK_STEP=0 VLLM_SKIP_WARMUP=true; do
+    key="${kv%%=*}"
+    if [ -z "${!key+x}" ]; then export "$kv"; fi
+done
 for kv in VLLM_HPU_QSA_FUSED=1 VLLM_HPU_QSA_INDEXER_SHARD=1 \
     VLLM_HPU_GDN_KERNEL_INTERLEAVE=1 VLLM_HPU_GDN_GLUE_CACHE=1 VLLM_HPU_HC_FUSED_COPY_MODE=2 \
     VLLM_HPU_DECODE_CUT_INTERVAL=1000 VLLM_HPU_CANDIDATE_SAMPLING=1 VLLM_GRAPH_RESERVED_MEM=0.4; do
@@ -143,7 +150,12 @@ while [ "$i_arm" -lt "${#ARMS[@]}" ]; do
         tiny)
             spec=()
             if [ "${HEADLINE_TINY_SPEC:-0}" = 1 ]; then spec=(--spec 3); fi
-            "$PYTHON" /farm/farm_tiny.py --gdn hc ${spec[@]+"${spec[@]}"} --out "$OUT/tiny"
+            # the MTP server's own flags too (they act only on the speculative mode)
+            tiny_sv="${VLLM_HPU_SPEC_SAMPLED_VERIFY:-0}"
+            if [ "${HEADLINE_MTP_SAMPLED:-0}" = 1 ]; then tiny_sv="${VLLM_HPU_SPEC_SAMPLED_VERIFY:-1}"; fi
+            VLLM_HPU_MTP_DRAFT_LOOP="${VLLM_HPU_MTP_DRAFT_LOOP:-1}" VLLM_HPU_MTP_CHUNK_KV="${VLLM_HPU_MTP_CHUNK_KV:-1}" \
+                VLLM_HPU_SPEC_SAMPLED_VERIFY="$tiny_sv" \
+                "$PYTHON" /farm/farm_tiny.py --gdn hc ${spec[@]+"${spec[@]}"} --out "$OUT/tiny"
             rc=$?
             if [ "$rc" -ne 0 ] && [ "${HEADLINE_TINY_ABORT:-1}" = 1 ]; then
                 echo "headline_job: the tiny gate failed (rc $rc): no real-model server with these flags"
