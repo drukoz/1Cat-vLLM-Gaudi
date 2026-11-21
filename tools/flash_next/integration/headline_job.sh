@@ -194,11 +194,28 @@ while [ "$i_arm" -lt "${#ARMS[@]}" ]; do
             echo "=== headline_job: arm tiny rc=$rc end $(date -u +%T)"
             continue
             ;;
-        nospec | nospec-async)
+        tiny-async)
+            # async-sched job branch: the tiny gate with VLLM_HPU_FLASH_NEXT_ASYNC_SCHED=2: tokens against the CPU
+            # reference without speculation (async scheduling) and with MTP k = HEADLINE_TINY_SPEC (default 2).
+            VLLM_HPU_FLASH_NEXT_ASYNC_SCHED=2 VLLM_HPU_MTP_DRAFT_LOOP="${VLLM_HPU_MTP_DRAFT_LOOP:-1}" \
+                VLLM_HPU_MTP_CHUNK_KV="${VLLM_HPU_MTP_CHUNK_KV:-1}" \
+                "$PYTHON" /farm/farm_tiny.py --gdn hc --spec "${HEADLINE_TINY_SPEC:-2}" --out "$OUT/tiny-async"
+            rc=$?
+            if [ "$rc" -ne 0 ] && [ "${HEADLINE_TINY_ABORT:-1}" = 1 ]; then
+                echo "headline_job: the tiny gate under async scheduling failed (rc $rc): no real-model server"
+                exit 7
+            fi
+            echo "=== headline_job: arm tiny-async rc=$rc end $(date -u +%T)"
+            continue
+            ;;
+        nospec | nospec-async | nospec-async-census)
             # Levels in HEADLINE_LEVELS order (default 32,8,1: the 32-stream numbers first); each level's sampled
             # rounds right after its greedy rounds. nospec-async: VLLM_HPU_FLASH_NEXT_ASYNC_SCHED=1 (async-sched).
+            # nospec-async-census (async-sched job branch): the same server with the step timer in mode 2, the
+            # census of host synchronisation points with their source lines.
             async_env=()
-            if [ "$arm" = nospec-async ]; then async_env=(VLLM_HPU_FLASH_NEXT_ASYNC_SCHED=1); fi
+            case "$arm" in nospec-async*) async_env=(VLLM_HPU_FLASH_NEXT_ASYNC_SCHED=1) ;; esac
+            case "$arm" in *-census) async_env+=(VLLM_HPU_STEP_TIMING=2) ;; esac
             env ${async_env[@]+"${async_env[@]}"} \
                 bash "$HERE/serve_probe.sh" --out "$OUT/$arm" --levels "$LEVELS" --tokens "$TOKENS" \
                 --warm-tokens "$WARM" --repeat-top 2 --no-mintok-check --probe-arg "--sampled-levels=$LEVELS" \
@@ -244,17 +261,21 @@ while [ "$i_arm" -lt "${#ARMS[@]}" ]; do
                 --warm-tokens "$WARM" --repeat-top 2 --no-mintok-check --probe-arg --no-sampled-check \
                 --probe-arg "--rounds=$ROUNDS"
             ;;
-        mtp[1-9] | mtp[1-9]-32 | mtp[1-9]-noshard | mtp[1-9]-async)
+        mtp[1-9] | mtp[1-9]-32 | mtp[1-9]-noshard | mtp[1-9]-async | mtp[1-9]-async-census)
             k="${arm:3:1}"
             # mtp<K>-async: VLLM_HPU_FLASH_NEXT_ASYNC_SCHED=2 (async scheduling with MTP) and the MTP timer at
             # HEADLINE_ASYNC_MTP_TIMING (default 2, the coordinator's; async-sched advises 0: the timer's device wait
-            # at the draft's end hides the overlap).
+            # at the draft's end hides the overlap). mtp<K>-async-census (async-sched job branch): the same server
+            # with the step timer in mode 2 (host synchronisation points with their source lines).
             timing="${VLLM_HPU_MTP_TIMING:-1}"
             async_env=()
-            if [ "${arm%-async}" != "$arm" ]; then
-                async_env=(VLLM_HPU_FLASH_NEXT_ASYNC_SCHED=2)
-                timing="${HEADLINE_ASYNC_MTP_TIMING:-2}"
-            fi
+            case "$arm" in
+                *-async | *-async-census)
+                    async_env=(VLLM_HPU_FLASH_NEXT_ASYNC_SCHED=2)
+                    timing="${HEADLINE_ASYNC_MTP_TIMING:-2}"
+                    ;;
+            esac
+            case "$arm" in *-census) async_env+=(VLLM_HPU_STEP_TIMING=2) ;; esac
             levels="$LEVELS"
             case "$arm" in *-32) levels=32 ;; esac
             shard="$VLLM_HPU_QSA_INDEXER_SHARD"
