@@ -204,6 +204,25 @@ TP8 against about 55 ms of host work), so once stage 1 lets the host run ahead, 
 in-step gap at the verification-to-draft boundary, 2 to 4 ms of about 100 ms; at 1 stream the step is host-bound
 and stage 2 changes nothing the host must do. Not recommended unless 00176 shows a larger gap.
 
+**Revised 08:15 UTC: stage 2 is worth up to about 30 ms per step at 32 streams, not 2 to 4.** Step-anatomy split
+the dense build's synchronous MTP k = 3 step at 32 streams (84.9 ms; the coordinator's message): prepare 6.2,
+forward issue 27.2, wait for the device 31.3, draft 14.6, sample and post 2.6, gap 2.8; the device is busy 54.1 ms
+and idle 30.8 ms while the host works serially. The assumption above (a device-bound step) was wrong. From the code
+(int3, `hpu_model_runner.py`; 00203's census checks it on the card): mode 2 overlaps the step boundary (the engine
+schedules during the step) and the draft read-back (no `take_draft_token_ids`, so nothing waits for the draft
+passes), so step N+1's prepare and the start of its forward issue overlap step N's draft passes on the device,
+about 6 ms (00186: 77.2 against 83.4 ms per step at 32 streams, greedy). Everything else waits for the host's
+read of the verification result (`parse_output`, :7440): the accepted counts per request (:7455), the align
+commits (:7461), the drafter's inputs (`propose_draft_token_ids`, :7664, takes the host token lists), and every
+input of step N+1. Overlapping the rest takes, in order: (1) the draft chained behind the verification on the
+device (mtp-draft-graph's task), so verification and draft are issued back to back without the read; (2) stage 2,
+step N+1's inputs from step N's accepted counts on the device (positions, sequence and context lengths, KV slot
+mapping and block-table offsets, the recurrent lattice offsets and align commits, the PLE context of the k + 1
+verification rows, input ids), as upstream's GPU runner does for async speculation, 2 to 4 days; (3) mode 1's
+asynchronous output for the verification result, so no read of a step's tokens stays on the main thread. Fully
+overlapped, a step becomes max(device about 54 ms, host issue about 50 ms); below that the host issue itself must
+shrink (engine-step's batched input upload, native-replay's graph replay for the 27 ms forward issue).
+
 For the integration build (02:45 UTC): take commit `fb5cefca` (merges cleanly into integration `8df22e1e`), not the
 branch head (which merges the program head with PR 16, carried there as qsa-fused). Flags `=1` / `=2`; with `=2`
 also `VLLM_HPU_MTP_TIMING=0`; engine-step's `01d66e31` keeps candidate sampling under async scheduling.
