@@ -4,7 +4,7 @@ Design note, report and handoff of the `hc-kernels` track (branch `feat/flash-ne
 `/Volumes/Storage/Claude/gaudi-work/wt/hc-kernels`). The harness refuses report files for this agent, so this note is
 the report. Labels: MEASURED (card), VERIFIED (simulator or CPU test named), INFERRED (arithmetic or reading).
 
-## 0. Handoff (if this agent stops) — updated 12:01 UTC 2026-11-21
+## 0. Handoff (if this agent stops) — updated 13:12 UTC 2026-11-21
 
 - **Goal 1:** the two hyper-connection TPC kernels (`hc_fused_gate_mix`, `hc_fused_combine_norm`) at 128
   verification rows (32 streams, MTP k = 3) from about 7 ms per step to about 2 ms. **Goal 2:** the GDN verify kernel
@@ -25,10 +25,9 @@ the report. Labels: MEASURED (card), VERIFIED (simulator or CPU test named), INF
   `feat/flash-next-gaudi-hc-kernels-pr2`, `gh pr create --base feat/flash-next-gaudi --head
   feat/flash-next-gaudi-hc-kernels-pr2` with body `reports/hc-kernels/pr/pr_body_merge1.md` (add a line that PR #28,
   merged since, touches only `hpu_model_runner.py`), `gh pr merge --merge`, PR number to the coordinator.
-- **Build 6a (00249, coordinator 12:25 UTC)** runs HC IL and the GDN verify variant late-bound: default 6, switched by
-  integration's `make_run6.sh a --gv 7` or `--no-gv` on 00239's verdict. So 00239's verdict goes to the coordinator
-  the moment its first benches land: op test 6 green and every bit line (incl. chain) "bit-identical" -> 6, or 7 if
-  7's us per call at batch 32 is lower; op test red or any DIFFERS -> `--no-gv` (and kernel-fixes' ACC check).
+- **Build 6a (00249, coordinator 12:25 UTC)** runs HC IL and the GDN verify variant late-bound. **00239 ended green
+  at 13:09 UTC; verdict `--gv 7` sent 13:05 UTC** (section 6, "Card results"): variant 7 bit-identical on the card,
+  125.5 us device time per call at 128 rows against 259.3 (22 engines instead of 16).
 - **Card:** job A = **00231** `hc-quick` (image `b9ff6384`, hold 12 min, after build 5 on card 6:
   `tools/flash_next/hc_kernels/card_hc_quick.sh`: HC op card test, the TP1 tiny gate with `VLLM_HPU_HC_FUSED_IL=1`
   (stands in for TP8, coordinator 09:33), the HC bench at 4/32/96/128 rows, traces at 128 rows). Job B =
@@ -300,8 +299,44 @@ engines, kernel-fixes' point 3), the slope of two K, and the bits of variants 1 
 card; then profiler traces (`HABANA_PROFILE=profile_api_light`) of variants 0, 1, 4 at batch 1 and 32 for the engines
 per call (`tools/flash_next/hc_kernels/kernel_engines.py`).
 
-If the card shows that neither variant 1 nor variant 4 moves the call off 16 engines at 128 rows, the next layout to
-try is a flat index space of key heads x requests (64 points at 128 rows): `tpc_kernel_lib_interface.h` declares the
+**Card results, job 00239** (`gdn-fold-variants2`, image `d096366d`, card 4, from 13:00:55 UTC; MEASURED,
+`reports/hc-kernels/card/00239-gdn-fold-variants2/`):
+- Op card test (`test_hpu_verify_op.py`) with variant 6: **19 passed**.
+- Bits on the card against variant 0, for every variant 1, 4, 6, 7 at batch 1, 8 and 32: out, conv state and SSM
+  state after one call (whole pools) and the digest of every set's pools and outputs after the whole chained
+  recurrence of replays: **all bit-identical**, no DIFFERS line (kernel-fixes' condition 1).
+- us per call, T = 4, TP8 geometry, chained replay slope:
+
+  | variant | batch 1 | batch 8 | batch 32 (128 rows) | ratio at 32 |
+  |---|---|---|---|---|
+  | 0 interleaved | 83.7 | 90.8 | 297.4 | 1 |
+  | 1 request-major | 85.5 | 93.7 | 276.5 | 0.93 |
+  | 4 key-head split hint | 82.8 | 86.8 | 214.3 | 0.72 |
+  | 6 fold | 58.9 | 62.6 | 186.5 | 0.63 |
+  | 7 fold + split hint | 57.6 | 58.2 | 145.5 | 0.49 |
+
+  The fold's ratio is the simulator's (0.61 to 0.63); the split hint's 0.72 is the 4 -> 3 points per engine of the
+  model above (0.75). The lean variants: 2 254.2, 3 257.3, 5 195.6 us at batch 32, all bit-identical too. Op card
+  test with variant 3 at the end: 19 passed. Job ended 13:09:35 UTC, exit 0, 520 s.
+- Device time per call (profiler traces, `kernel_engines.py`, 36 executions each = the model's 36 GDN layers):
+
+  | variant | batch 1: wall, engines | batch 32: wall, engines, per-engine busy | sum of 36 calls at 32 |
+  |---|---|---|---|
+  | 0 | 64.8 us, 2 | 259.3 us, 16, 256.6-259.2 | 9.33 ms |
+  | 1 | 64.8 us, 2 | 259.0 us, 16 | 9.33 ms |
+  | 4 | 64.8 us, 2 | 195.8 us, **22**, 128.0-195.6 | 7.05 ms |
+  | 6 | **40.8 us**, 2 | 165.1 us, 16 | 5.94 ms |
+  | 7 | **40.8 us**, 2 | **125.5 us**, **22**, 80.8-125.4 | **4.52 ms** |
+
+  Variant 0 at batch 32 is 00205's real-model 262 us. The request-major swap (1) does not change the compiler's
+  split (still 16 engines, 4 points each); the `preferredSplitDim` hint (4, 7) does: 22 engines, at most 3 points
+  each. How it scales with rows (Goal 2's question), MEASURED: 4 rows = 2 points on 2 engines = one point's time
+  (64.8 us today, 40.8 with the fold); 128 rows = 64 points: 4 per engine on 16 (259 us) or 3 per engine on 22 with
+  the hint (196 us; 125.5 with the fold). Verdict sent to the coordinator 13:05 UTC: build 6a with
+  `VLLM_HPU_GDN_VERIFY_VARIANT=7` (`make_run6.sh a --gv 7`): -4.8 ms of GDN verify device time per 128-row step
+  (9.33 -> 4.52 ms over the 36 calls; MEASURED on the bench, the model's step INFERRED to follow).
+
+Not needed now that variant 4's hint moved the call to 22 engines: the fallback had been a flat index space of key heads x requests (64 points at 128 rows): `tpc_kernel_lib_interface.h` declares the
 mapping coefficients `a`, `start_b`, `end_b` as floats, so the request dimension of the token-row tensors can follow
 the flat index with `a = 1 / key heads`, and the dimensions that follow the key head (its channels and value heads)
 are declared `allRequired`; with `preferredSplitDim = 1` (the header's encoding: dimension index + 1, so 1 = dim 0,
