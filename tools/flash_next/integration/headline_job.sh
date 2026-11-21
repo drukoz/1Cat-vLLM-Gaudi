@@ -22,6 +22,8 @@
 #           measured rounds off, on, off, on (decode_scaling.py --switch-arm): an A/B without the
 #           server-to-server spread. Rows of scaling.json carry "arm" (off / on); the MTP timer's records of
 #           the one-graph drafts have the kind verify+graph.
+#   mtp<K>-async-switch  the same A/B on the mtp<K>-async server (VLLM_HPU_FLASH_NEXT_ASYNC_SCHED=2, the MTP timer
+#           at HEADLINE_ASYNC_MTP_TIMING: set 0 for this A/B, the timer's device wait hides async's overlap).
 #   nospec-noshard, nospec-noprefix, nospec-noprefix-nocut  the low-stream bisect: A's env with
 #           VLLM_HPU_QSA_INDEXER_SHARD=0; A's env without VLLM_HPU_PREFIX_ALIGN_SPLIT and VLLM_HPU_PREFIX_KEEP_PROMPT_END
 #           (then also VLLM_HPU_DECODE_CUT_INTERVAL=0); greedy 8 and 1 streams only.
@@ -232,7 +234,8 @@ while [ "$i_arm" -lt "${#ARMS[@]}" ]; do
                 --warm-tokens "$WARM" --repeat-top 2 --no-mintok-check --probe-arg --no-sampled-check \
                 --probe-arg "--rounds=$ROUNDS"
             ;;
-        mtp[1-9] | mtp[1-9]-32 | mtp[1-9]-noshard | mtp[1-9]-async | mtp[1-9]-graph | mtp[1-9]-switch)
+        mtp[1-9] | mtp[1-9]-32 | mtp[1-9]-noshard | mtp[1-9]-async | mtp[1-9]-graph | mtp[1-9]-switch | \
+            mtp[1-9]-async-switch)
             k="${arm:3:1}"
             # mtp<K>-graph: the k draft passes of a decode step in one HPU graph (VLLM_HPU_MTP_DRAFT_GRAPH=1)
             draft_graph="${VLLM_HPU_MTP_DRAFT_GRAPH:-0}"
@@ -257,7 +260,8 @@ while [ "$i_arm" -lt "${#ARMS[@]}" ]; do
             # at the draft's end hides the overlap).
             timing="${VLLM_HPU_MTP_TIMING:-1}"
             async_env=()
-            if [ "${arm%-async}" != "$arm" ]; then
+            # (mtp<K>-async-switch: the async server of mtp<K>-async with the draft-graph flag switched per round)
+            if [ "${arm%-async}" != "$arm" ] || [ "${arm%-async-switch}" != "$arm" ]; then
                 async_env=(VLLM_HPU_FLASH_NEXT_ASYNC_SCHED=2)
                 timing="${HEADLINE_ASYNC_MTP_TIMING:-2}"
             fi
