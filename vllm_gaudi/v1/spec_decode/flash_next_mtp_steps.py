@@ -378,6 +378,7 @@ class MtpChainDrafts(NamedTuple):
     last_row: torch.Tensor  # [B] the last committed verification row, flattened [B * S]
     next_ids: torch.Tensor  # [B, 1 + k] the bonus token, then the next step's k drafts
     drafts: torch.Tensor  # [B, k] the next step's drafts
+    sampled: torch.Tensor | None = None  # [B, S] the greedy verification's result when the chain computed it
 
 
 @dataclasses.dataclass
@@ -423,11 +424,24 @@ class MtpDraftChain(torch.nn.Module):
         self.pad_block_id = int(pad_block_id)
         self.pad_slot_id = int(pad_slot_id)
 
-    def forward(self, sampled: torch.Tensor, cu_num_draft_tokens: torch.Tensor, real: torch.Tensor,
+    def forward(self, sampled: torch.Tensor | None, cu_num_draft_tokens: torch.Tensor, real: torch.Tensor,
                 verify_positions: torch.Tensor, verify_hidden: tuple, attn_metadata, table_full: torch.Tensor,
-                mode_key: tuple = ()) -> MtpChainDrafts:
+                mode_key: tuple = (), verify_ids: torch.Tensor | None = None,
+                draft_token_ids: torch.Tensor | None = None, target_logits_indices: torch.Tensor | None = None,
+                bonus_logits_indices: torch.Tensor | None = None) -> MtpChainDrafts:
+        """``sampled`` the verification's result (stage A), or ``None`` with ``verify_ids`` (the target's greedy id
+        of every verification row, ``[rows]`` or ``[rows, 1]``, as the verify graph returns them) and the step's
+        draft tokens and logits indices (stage B): then the greedy rejection
+        (``greedy_rejection_sample_from_tokens``) runs here too and its result is returned as ``sampled``."""
         loop = self.__dict__["_loop"]
         k = loop.num_speculative_tokens
+        computed = None
+        if verify_ids is not None:
+            from vllm_gaudi.v1.sample.hpu_greedy_verify import greedy_rejection_sample_from_tokens
+
+            sampled = computed = greedy_rejection_sample_from_tokens(verify_ids.reshape(-1), draft_token_ids,
+                                                                     target_logits_indices, bonus_logits_indices,
+                                                                     cu_num_draft_tokens)
         picked, last_row, accepted, bonus = chain_draft_rows(sampled, cu_num_draft_tokens)
         rows = picked.to(torch.int64)
         target_token_ids = torch.index_select(sampled.reshape(-1, 1), 0, rows)
@@ -451,7 +465,7 @@ class MtpDraftChain(torch.nn.Module):
         drafts = MtpDraftLoop.forward(loop, target_token_ids, target_positions, target_hidden_states,
                                       last_token_indices, attn_metadata, step_metadata).to(torch.int32)
         next_ids = torch.cat((bonus.view(-1, 1), drafts), dim=1)
-        return MtpChainDrafts(accepted, last_row, next_ids, drafts)
+        return MtpChainDrafts(accepted, last_row, next_ids, drafts, computed)
 
 
 def draft_argmax(logits: torch.Tensor) -> torch.Tensor:

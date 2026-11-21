@@ -245,6 +245,22 @@ and the draft-rank log (`VLLM_FLASH_NEXT_DRAFT_RANK_LOG=1`) keep the per-pass pa
 With `VLLM_HPU_MTP_TIMING=1` the draft's laps are `graph_positions`, `graph_meta`
 (the metadata of the later passes) and `graph` (the replay's issue).
 
+`VLLM_HPU_MTP_DRAFT_CHAIN` chains the Flash-Next MTP draft behind the verification, as
+an integer. `0` (default): the runner reads the verification's result on the host,
+then builds the draft's inputs and issues it. `1`: right after the rejection sampler,
+before any host read, the drafter computes on the device each request's committed
+rows, the draft's inputs and the later passes' block tables and slots, and issues the
+draft in one HPU graph (`MtpDraftChain`); the host then reads the result and keeps its
+books as before. When the verification's per-row greedy ids are on the device (the
+vocabulary-parallel path, or `VLLM_HPU_VERIFY_LOGITS_IN_GRAPH=1`), the greedy rejection
+runs inside the chain's graph too. Needs `VLLM_HPU_MTP_DRAFT_GRAPH=1` and the sparse
+decode metadata (`VLLM_HPU_FLASH_NEXT_DECODE_METADATA=1` in force); a step with a
+prefill, a sampled request (greedy only so far), structured output or the draft-rank
+log keeps today's path (each reason logged once). Switchable at run time
+(`VLLM_HPU_RUNTIME_SWITCH_FILE`). The chained step's device outputs stay in
+`HPUModelRunner._mtp_chain_out` (accepted counts, the next step's ids, the result)
+for async scheduling.
+
 `VLLM_HPU_MTP_TIMING` times the steps of a Flash-Next MTP server, as an integer. `0`
 (default): no timer. `1`: per step the verification part (to the drafter call) and the
 draft, with a lap per draft pass and one device wait after the draft; every 25 steps of
@@ -355,19 +371,32 @@ leaves the choice open. With `0` nothing is loaded, registered or logged. The
 kernels pass the Gaudi2 instruction simulator and have not run on a card; see
 `docs/design/flash-next/hc-fused.md` ("MoE glue kernels").
 
+`VLLM_MOE_CHUNK` and `VLLM_MOE_TOKEN_BOUNDARY` (lists of integers of equal
+length, default empty) pass `chunk_size` and `total_experts` to
+`torch.ops.hpu.mixture_of_experts`: a step of at most `VLLM_MOE_TOKEN_BOUNDARY[i]`
+tokens (the first that fits) gets `VLLM_MOE_CHUNK[i]`, a longer one the last
+value. A value of `0` keeps the op's own default for that range (no
+arguments). On Flash-Next at TP8 (MTP k = 3, 32 streams) `chunk_size` 64 made
+the step about 12 ms shorter (job 00161); `VLLM_MOE_CHUNK=0,64,8192
+VLLM_MOE_TOKEN_BOUNDARY=16,512,1000000` applies it from 17 to 512 tokens only.
+
 `VLLM_HPU_MOE_DENSE` (integer, default `0`) applies to the routed experts of a
 per-channel FP8 MoE (`VllmMixtureOfExpertsOpFP8PerChannel`, Flash-Next's experts
 with `VLLM_HPU_FORCE_CHANNEL_FP8`). `1` keeps the layer's stacked FP8 experts
 when its weights are prepared and runs a step of at most
-`VLLM_HPU_MOE_DENSE_MAX_TOKENS` tokens (integer, default `512`) as two batched
+`VLLM_HPU_MOE_DENSE_MAX_TOKENS` tokens (integer, default `512`) and at least
+`VLLM_HPU_MOE_DENSE_MIN_TOKENS` tokens (integer, default `17`) as two batched
 FP8 GEMMs over all local experts (every expert on every row, the routing
 weight of a pair that is not routed is 0) instead of
-`torch.ops.hpu.mixture_of_experts`; longer steps keep the vendor op. On one
+`torch.ops.hpu.mixture_of_experts`; longer and shorter steps keep the vendor op
+(below the minimum the vendor op reads only the experts the rows hit). On one
 card the vendor op costs several times what reading the local experts once
 costs at 32 to 512 rows (`tools/flash_next/kernel_probes/probe_moe_layers.py`,
 `probe_moe_dense.py`). `0` (or any other value) keeps the vendor op. The two
 forms agree to FP8 rounding (the dense form quantizes the intermediate per
-expert and row). Not yet run on a card.
+expert and row). On the real model (TP8, MTP k = 3, job 00177) the first form of
+this path, without the minimum and with an fp32 weighted sum, was slower than
+the vendor op; keep it off until a later A/B shows otherwise.
 
 `VLLM_HPU_MOE_GLUE_MERGE_GATE_UP` (integer, default `0`) applies only with
 `VLLM_HPU_MOE_GLUE=1`. `1` appends the shared expert's gate_up rows of this

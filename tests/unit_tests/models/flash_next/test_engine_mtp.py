@@ -295,6 +295,21 @@ def test_the_chained_draft_with_several_requests_at_once(engine_runs):
     assert not [c for c in chain["draft_calls"] if c.get("decode")]
 
 
+def test_the_chain_runs_the_greedy_rejection_in_its_graph(engine_runs):
+    # Stage B: with the verification's per-row greedy ids on the device (VLLM_HPU_VOCAB_PARALLEL_LOGITS=1 here; the
+    # verify graph's own ids with engine-step's VLLM_HPU_VERIFY_LOGITS_IN_GRAPH=1), the chained draft's graph runs
+    # the greedy rejection too. Drafts and streams equal the per-pass drafter's with the same flags.
+    accept = [2, 0, 3, 1]
+    vp = {"VLLM_HPU_VOCAB_PARALLEL_LOGITS": "1"}
+    per_pass = _oracle_run(engine_runs, accept, env={**CHAIN_BASE, **vp}, tag="_loop_md_vp")
+    chain = _oracle_run(engine_runs, accept, env={**CHAIN, **vp}, tag="_chain_vp")
+    assert [e["drafter"] for e in chain["oracle"]] == [e["drafter"] for e in per_pass["oracle"]]
+    assert [p["generated_ids"] for p in chain["prompts"]] == [p["generated_ids"] for p in per_pass["prompts"]]
+    assert chain["runner"]["draft_chain_calls"] > 0
+    assert not [c for c in chain["draft_calls"] if c.get("decode")]
+    _check_oracle(engine_runs, chain, accept, K)
+
+
 def test_a_sampled_request_keeps_the_draft_after_the_host_read(engine_runs):
     # The chain is greedy only so far: a step with a sampled request keeps today's path (logged once), and its
     # stream gets its tokens.

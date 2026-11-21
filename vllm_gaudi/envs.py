@@ -558,6 +558,7 @@ if TYPE_CHECKING:
     VLLM_HPU_HC_FUSED_COPY_MODE: int = 0  # copies before a fused HC op: 0 all, 1 not its own outputs, 2 block output
     VLLM_HPU_MOE_DENSE: int = 0  # 0 vendor MoE op (default), 1 dense batched FP8 experts up to MAX_TOKENS rows
     VLLM_HPU_MOE_DENSE_MAX_TOKENS: int = 512  # with VLLM_HPU_MOE_DENSE=1: the most tokens a step runs dense
+    VLLM_HPU_MOE_DENSE_MIN_TOKENS: int = 17  # with VLLM_HPU_MOE_DENSE=1: the fewest tokens a step runs dense
     VLLM_HPU_COLLECTIVE_MARK_STEP: int = 1  # 1 (default) mark_step() before every HPU collective, 0 none
     VLLM_HPU_STEP_TIMING: int = 0  # StepTimingMode: 0 off (default), 1 spans, 2 sync counters, 3 device waits
     VLLM_HPU_STEP_TIMING_COMPONENTS: int = 0  # 0 (default) none, 1 mode 3 also waits around every model component
@@ -1918,8 +1919,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # An operator's A/B on one server (v1/worker/runtime_switches.py). Unset (default): nothing. A path: every
     # worker looks at that file before each step and, when it changed, takes the flags it lists (NAME=VALUE lines).
     # Only flags the runner reads at every step can be switched: VLLM_HPU_FLASH_NEXT_DECODE_METADATA,
-    # VLLM_HPU_FUSED_GREEDY_LOGITS, VLLM_HPU_CANDIDATE_SAMPLING, VLLM_HPU_VOCAB_PARALLEL_LOGITS and
-    # VLLM_HPU_MTP_DRAFT_GRAPH. Replace the file with a rename while no request runs.
+    # VLLM_HPU_FUSED_GREEDY_LOGITS, VLLM_HPU_CANDIDATE_SAMPLING, VLLM_HPU_VOCAB_PARALLEL_LOGITS,
+    # VLLM_HPU_MTP_DRAFT_GRAPH and VLLM_HPU_MTP_DRAFT_CHAIN. Replace the file with a rename while no request runs.
     "VLLM_HPU_RUNTIME_SWITCH_FILE":
     lambda: os.environ.get("VLLM_HPU_RUNTIME_SWITCH_FILE", "").strip(),
 
@@ -2154,6 +2155,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     lambda: int(os.environ.get("VLLM_HPU_MOE_DENSE", "0")),
     "VLLM_HPU_MOE_DENSE_MAX_TOKENS":
     lambda: int(os.environ.get("VLLM_HPU_MOE_DENSE_MAX_TOKENS", "512")),
+    # With VLLM_HPU_MOE_DENSE=1: steps with fewer tokens keep the vendor op, which reads only the experts the rows
+    # hit (the dense form reads every local expert: job 00177 lost at 1 stream).
+    "VLLM_HPU_MOE_DENSE_MIN_TOKENS":
+    lambda: int(os.environ.get("VLLM_HPU_MOE_DENSE_MIN_TOKENS", "17")),
 
     # The htorch.core.mark_step() that HpuCommunicator issues before every all-reduce and all-gather
     # (a workaround for a Habana bridge bug with PT_HPU_ENABLE_LAZY_COLLECTIVES). 1 (default) keeps it.
