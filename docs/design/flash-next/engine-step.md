@@ -11,7 +11,7 @@ This track's harness refuses report files outside the repository, so the handoff
 
 ## Handoff (if this agent stops)
 
-Last update: **2026-11-21 04:46 UTC** (fourth agent, Opus 5.5; the node was extended to about 00:00 UTC on
+Last update: **2026-11-21 07:03 UTC** (fourth agent, Opus 5.5; the node was extended to about 00:00 UTC on
 2026-11-22). Branch `feat/flash-next-gaudi-engine-step`, head after `bcef8aa5` (merged into the program branch as PR #20;
 code of this track up to `01d66e31`), pushed. A second branch of this track,
 **`feat/flash-next-gaudi-engine-step-mtp-record`** (`2b90707f`, worktree `reports/engine-step/trees/mtp-record`):
@@ -42,7 +42,7 @@ question answered on the CPU (section 14).
    own PR as soon as its gate is green and the change is card-proven or default-off, then tell the coordinator the
    number. Next PR: gate the branch (`bin/gate <snapshot>`, no `--tools`: the rental tool tests fail on this Mac for
    every track), merge the program head first.
-2. Read 00164, 00166 and 00169 when they land (table below); section 9 and the coordinator.
+2. Read 00206 and 00169 when they land (table below); section 9 and the coordinator.
 3. Build 4 runs the `mtp-record` branch with `VLLM_HPU_MTP_TIMING=2`: read `mtp_step_record_r*.jsonl` (verify ms of
    the steps whose `prev_committed` is `{"1": n}` against the others).
 
@@ -55,8 +55,8 @@ question answered on the CPU (section 14).
 | 00158 `real4-mtp3-cand2-sampled` | | cancelled | - |
 | 00167 `tiny-request-params` (1 card, `9a3ed1d1`) | `tiny_checks.py --arms params` | ended 01:46 UTC, exit 0 | done: section 9 (`PARAMS ok`) |
 | 00173 `h2d-copies-1card` (1 card, `01d66e31`) | `h2d_copies_bench.py` at 32 and 1 rows | ended 02:02 UTC, exit 0 | done: section 13 |
-| **00164** `real8-mtp2-cand2-sampled` (all, 40m, `3ed03d13` = integration build 2 + `d5ad5e67`) | `headline_job.sh mtp2` with `HEADLINE_MTP_SAMPLED=1 HEADLINE_MTP_SAMPLED_LEVELS=32,1 VLLM_HPU_SPEC_SAMPLED_VERIFY=2 VLLM_HPU_CANDIDATE_SAMPLING=2` | queued (8-card sequence) | step time and acceptance per draft position, sampled at 32 and 1 streams, against build 2's arm C; the `Candidate sampling` lines must say the region drew; no rejection-sampler error |
-| **00166** `real8-candvp-short2` (all, 35m) | `serve_long_probe.sh --arms both --no-long --candvp --logprobs-check` at TP8 | queued | `SUMMARY`, `TASK`, `LOGPROBS`, the `Candidate sampling` lines: does `candvp` hold at TP8 |
+| 00164 `real8-mtp2-cand2-sampled`, 00166 `real8-candvp-short2` | (TP8 jobs) | folded into 00206 at 07:03 UTC (00164 replaced, 00166 cancelled) | - |
+| **00206** `real8-mtp2-candsw` (all, TP8 + EP8, 30m, `455fadd7` = build 4 `30f4e37e` + the probe's `--spec-arms`; on this branch as `6d5b8eef`) | one MTP k = 2 server with build 4's mtp2 env (00186's `versions.txt`): `serve_long_probe.sh --arms both --no-long --spec-arms cand,cand2,cand2vp --logprobs-check` (`SERVE_SPEC_K=2`) | queued at 00164's place | greedy base / both (I01 acts under MTP; I05 is refused on speculative steps); sampled at 32 and 1 streams: cand (=1: mtp-card-ready's `VLLM_HPU_SPEC_SAMPLED_VERIFY=2` path, the baseline) / cand2 (the candidate region for the verification rows) / cand2vp (the region with `VLLM_HPU_VOCAB_PARALLEL_LOGITS=2`): step ms, tokens per chunk, acceptance per position (SPEC lines); the `Candidate sampling` lines must say the region drew; seeded twice; logprobs under MTP |
 | **00169** `real8-i01-long120k` (all, 50m) | I01 at 32 x 120K over a shared prefix with prefill's prefix flags, and an MTP k = 2 part (`probe.log`, `mtp2/probe.log`) | queued | `prepare_inputs` and step time base against I01 at a long context |
 
 ### Pending subtasks after those steps, in order
