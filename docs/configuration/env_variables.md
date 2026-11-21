@@ -59,6 +59,66 @@ selection, added in M2): `HpuQsaIndexer.select` picks the attended
 positions per query and attention runs only over them. Sparse prefill needs a
 4-aligned context. MTP verification steps (M3) score their draft rows on the sparse path too.
 
+`VLLM_HPU_FLASH_NEXT_DECODE_METADATA` (integer, default `0`) applies only with sparse QSA
+(`VLLM_HPU_FLASH_NEXT_QSA_MODE=1`). A sparse-QSA decode or verification step reads only the
+per-request `block_table` and the `slot_mapping` of the attention metadata. `0` still builds the
+dense paged-attention buffers of every decode step (`block_list`, `block_groups`, `block_usage`,
+and in the graph the `block_mapping` one-hot and `attn_bias`), as for any model. `1` does not build
+them: the block table is one row per request (numpy, repeated over its verification rows), block
+ids are not resolved (the defragmenter is off for this model), the decode bucket depends on the
+batch size only (one decode graph per batch size instead of one per block bucket), and the MTP
+drafter's per-step metadata follows the same rules. A runner that cannot use it (another model,
+dense QSA, the defragmenter on, a draft method other than MTP or n-gram) logs the reason once and
+keeps the dense buffers. CPU-checked (bit-identical tokens and logits on the whole serving loop,
+decode and k = 3 verification); not yet checked on a card.
+
+`VLLM_HPU_CANDIDATE_SAMPLING` (integer, default `0`) selects how a sampled decode step draws its tokens
+(requests with a temperature above zero; a request without a temperature gets the checkpoint's default
+sampling, temperature 1.0, top_k 20, top_p 0.95). `0` is vLLM's sampler: on every step a full sort of
+`[rows, vocabulary]`, a scatter back and exponential noise over the vocabulary. `1` samples over
+candidates (`vllm_gaudi/v1/sample/candidate_sampling.py`): the 64 largest logits of every row are taken in
+the LM-head region, and temperature, top-k, top-p and the draw run on `[rows, 64]` with noise made on the
+host (one small copy to the device, a seeded request's row from its own generator); there is no sampler
+graph, and rows x 4 bytes of token ids come back (int32 ids read out of an fp32 id table: top-k indices are
+never cast or read back as data on the card). With `VLLM_HPU_VOCAB_PARALLEL_LOGITS=2` each rank takes the
+top 64 of its vocabulary shard and the ranks gather `[rows, 128]` fp32 instead of the logits. It is vLLM's distribution whenever `0 < top_k <= 64`
+(a tie group at the k-th value that reaches past 64 candidates is cut there); the random stream differs,
+so a seeded request is reproducible but not equal to its output with `0`. A step with a request outside
+the conditions (`top_k` unset or above 64, `min_p`, penalties, `logit_bias`, `allowed_token_ids`,
+`bad_words`, logprobs, a custom logits processor, speculative decoding unless `2`, structured output) keeps
+vLLM's sampler; an all-greedy step is not affected. The server logs one INFO line
+(`Candidate sampling (VLLM_HPU_CANDIDATE_SAMPLING=1): a sampled decode step drew in the logits region ...`)
+the first time a sampled step takes the region, and one (`... took vLLM's sampler instead: <reason>`) the
+first time a sampled step falls back; a change of the runtime switch file logs them again. `2` is `1`, and the
+decode steps of a speculative server with deterministic drafts (MTP's arg max, n-gram) sample in the region too:
+every verification row and the bonus row of a request draws from the target distribution with its own noise, and
+the drafts are verified against those draws (`hpu_greedy_verify.greedy_rejection_sample_from_tokens`): accepted
+while a row's draw equals the draft, else the first unequal draw, else the bonus draw. For drafts that are one-hot
+that is speculative sampling exactly (acceptance p(draft), a rejected row follows p without the draft,
+renormalized), at about the cost of a greedy verification step. It needs `VLLM_HPU_SPEC_SAMPLED_VERIFY` at `1` or
+`2` (mtp-card-ready), which admits sampled requests to a speculative server and serves the steps the region refuses
+(a request with fewer drafts, `min_tokens`, logprobs, ...); without it `2` acts as `1`. CPU-checked
+against vLLM's `apply_top_k_top_p_pytorch`; on the card (TP4, 32 sampled streams) 4.9 ms less per step
+than vLLM's sampler (engine-step job 00110).
+
+`VLLM_HPU_SAMPLER_REQUEST_PARAMS` (integer, default `0`) makes a request's `min_tokens`, `logit_bias` and
+`min_p` take effect on the general sampler path. With `0` they are ignored on HPU: vLLM applies them through logits
+processors whose per-row state the HPU input batch never feeds (and the HPU samples prefills and decodes in calls
+whose rows are not the batch's rows). With `1` the runner applies each row's own request's values to the logits
+before vLLM's sampler (`vllm_gaudi/v1/sample/request_params.py`): the stop ids of a request below its
+`min_tokens` get `-inf`, each `logit_bias` entry is added, and tokens below `min_p` times the row's largest
+probability at its temperature get `-inf`. One difference from vLLM: a request with logprobs gets them after its
+own bias and masks (vLLM's raw logprobs come before them). Any other value is `0`. CPU-checked; not yet on a card.
+
+`VLLM_HPU_RUNTIME_SWITCH_FILE` (a path, default unset) is an operator's tool for an A/B on one server.
+When set, every worker looks at that file before each step (one `stat`) and, when the file changed, takes
+the flags it lists, one `NAME=VALUE` per line. Only flags the runner reads at every step can be switched:
+`VLLM_HPU_FLASH_NEXT_DECODE_METADATA`, `VLLM_HPU_FUSED_GREEDY_LOGITS`, `VLLM_HPU_CANDIDATE_SAMPLING` and
+`VLLM_HPU_VOCAB_PARALLEL_LOGITS` (read at every call of the logits region, which runs after the replayed graph);
+any other name is reported and the file is ignored. Replace the file with a rename while no request runs, so every worker sees the change
+at the same step. `tools/flash_next/engine_step/long_context_probe.py` measures two arms of one server
+this way.
+
 `VLLM_HPU_QSA_FUSED` selects the sparse QSA decode path (with
 `VLLM_HPU_FLASH_NEXT_QSA_MODE=1`) as an integer. `0` (default) keeps the torch path.
 `1` is the restructured torch data flow: the indexer gathers each request's
@@ -559,7 +619,7 @@ prepared-model entrypoint and disabled in the generic entrypoint.
 | `VLLM_HPU_GDN_PADDED_DIRECT_STATE` | Opts partially filled decode buckets into the direct-state path. Requires FlashInfer GDN and direct state to be enabled, a contiguous active-slot prefix, and every padding slot to be free. Paused requests retain their slots and are never used as padding. Prefix caching and multi-token decode retain the general path. | `false` |
 | `VLLM_HPU_CGUID_DYNAMIC_QUANT` | Uses Gaudi's fused scale-calculation CGUID for decode-sized per-token dynamic FP8 quantization. Large prefill matrices retain the existing reduction path to preserve its numerical behavior. When unset, this follows `VLLM_HPU_FLASHINFER_GDN`. | `false` (`true` with FlashInfer GDN) |
 | `VLLM_HPU_CGUID_DYNAMIC_QUANT_MAX_ROWS` | Maximum flattened row count eligible for CGUID dynamic quantization. Keep this below the smallest prefill token bucket; increasing it can change prefill graph fusion. | `32` |
-| `VLLM_HPU_FUSED_GREEDY_LOGITS` | Fuses hidden-state selection, the LM-head projection, FP32 conversion, and argmax into one compiled decode region for plain greedy requests. Requests using logprobs, penalties, token masks, logit processors, structured output, or speculative decoding retain the general sampler path. | `false` |
+| `VLLM_HPU_FUSED_GREEDY_LOGITS` | Fuses hidden-state selection, the LM-head projection, FP32 conversion, and argmax into one compiled decode region for plain greedy requests. A request with `min_tokens` (up to 8 stop ids) decodes there too: until it has `min_tokens` output tokens its stop ids get `-inf` before the argmax through a fixed-shape mask. Requests using logprobs, penalties, token masks, other logit processors, structured output, or speculative decoding retain the general sampler path. | `false` |
 | `FLASHINFER_GAUDI_BACKEND` | Selects `auto`, `native`, `public`, `bridge`, or `pytorch`. Strict policies (`native/public/bridge`) require the entire operation to be native. The SiLU candidate supports `native/public`; GDN strict calls reject the remaining torch prologue/reference graph. Native availability does not imply performance qualification. | `auto` |
 | `FLASHINFER_GAUDI_STATE_DTYPE` | Selects the requested recurrent-state precision. `fp32` is the production default; `bf16` remains experimental until model-quality validation succeeds. | `fp32` |
 | `FLASHINFER_GAUDI_NATIVE_LIBRARY` | Optional path-list of native host-extension libraries to load. Packaged libraries are discovered automatically. | unset |

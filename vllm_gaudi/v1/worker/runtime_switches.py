@@ -1,0 +1,68 @@
+# SPDX-License-Identifier: Apache-2.0
+"""Flags a running server rereads from a file (``VLLM_HPU_RUNTIME_SWITCH_FILE``): an A/B on one server.
+
+A real-model server takes about ten minutes to start, and two servers on two halves of a node differ by more
+than a host-side fast path saves. With ``VLLM_HPU_RUNTIME_SWITCH_FILE=<path>`` every worker looks at ``<path>``
+before each step (one ``os.stat``) and, when the file changed, takes the flags it lists. So one server measures
+a path off and on in turn, on the same cards.
+
+Only flags the runner reads at every step can be switched (``SWITCHABLE``); every other flag is read when the
+model is built and needs a new server. The file holds one ``NAME=VALUE`` per line (``#`` starts a comment).
+Replace it with a rename while no request runs: every worker then sees the change at the same step, the first
+one of the next request. A file that cannot be read or names another flag is reported once and changes nothing.
+
+This module imports nothing of the plugin (the runner cannot be imported on a machine without an HPU).
+"""
+
+import os
+from typing import Optional
+
+# VLLM_HPU_VOCAB_PARALLEL_LOGITS is read at every call of the logits region (distributed/vocab_parallel.mode()),
+# which runs as lazy ops after the replayed decode graph: switching it changes the region's graph, not a captured one.
+SWITCHABLE = ("VLLM_HPU_FLASH_NEXT_DECODE_METADATA", "VLLM_HPU_FUSED_GREEDY_LOGITS", "VLLM_HPU_CANDIDATE_SAMPLING",
+              "VLLM_HPU_VOCAB_PARALLEL_LOGITS")
+
+
+def parse_switches(text: str) -> dict[str, str]:
+    """``{name: value}`` of a switch file's text. Raises ``ValueError`` for a line that is not ``NAME=VALUE`` or
+    names a flag outside ``SWITCHABLE``."""
+    values: dict[str, str] = {}
+    for number, line in enumerate(text.splitlines(), 1):
+        line = line.split("#", 1)[0].strip()
+        if not line:
+            continue
+        name, separator, value = line.partition("=")
+        name, value = name.strip(), value.strip()
+        if not separator or not value:
+            raise ValueError(f"line {number}: expected NAME=VALUE, got {line!r}")
+        if name not in SWITCHABLE:
+            raise ValueError(f"line {number}: {name} cannot be switched at run time (only {', '.join(SWITCHABLE)})")
+        values[name] = value
+    return values
+
+
+class RuntimeSwitchFile:
+    """The switch file of one worker: ``poll()`` returns the flags when the file changed since the last call."""
+
+    def __init__(self, path: str):
+        self.path = path
+        self._stamp: Optional[tuple[int, int, int]] = None
+
+    def poll(self) -> Optional[dict[str, str]]:
+        """The file's flags if it changed since the last call (or exists for the first time), else ``None``.
+
+        A missing file is "no change". Raises ``OSError`` or ``ValueError`` for a file that cannot be read or
+        parsed; that file is not read again until it changes."""
+        try:
+            status = os.stat(self.path)
+        except OSError:
+            return None
+        stamp = (status.st_mtime_ns, status.st_size, status.st_ino)
+        if stamp == self._stamp:
+            return None
+        self._stamp = stamp
+        with open(self.path, encoding="utf-8") as handle:
+            return parse_switches(handle.read())
+
+
+__all__ = ["SWITCHABLE", "RuntimeSwitchFile", "parse_switches"]
