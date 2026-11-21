@@ -73,6 +73,12 @@ class QsaMode(enum.IntEnum):
     SPARSE = 1
 
 
+def qsa_kv_cache_dtype_allowed(cache_dtype: str, kv_fp8: int) -> bool:
+    """Whether a QSA layer serves this main KV cache dtype: bf16 (``auto``, ``bfloat16``) always, and the backend's
+    FP8 storage ``fp8_inc`` with ``VLLM_HPU_QSA_KV_FP8=1`` (E4M3 K/V, bf16 attention math; qsa_hpu_attention)."""
+    return cache_dtype in ("auto", "bfloat16") or (cache_dtype == "fp8_inc" and int(kv_fp8) == 1)
+
+
 def platform_is_hpu() -> bool:
     """True when vLLM's current platform is the Gaudi (HPU) platform.
 
@@ -549,8 +555,9 @@ class HpuQwen4ExpQSAAttention(Qwen4ExpQSAAttention):
             raise ValueError("Qwen4Exp QSA requires a paged KV cache")
         if model_config.dtype != torch.bfloat16:
             raise NotImplementedError("Qwen4Exp QSA currently requires BF16")
-        if cache_config.cache_dtype not in ("auto", "bfloat16"):
-            raise NotImplementedError("Qwen4Exp QSA requires a BF16 main KV cache")
+        if not qsa_kv_cache_dtype_allowed(cache_config.cache_dtype, envs.VLLM_HPU_QSA_KV_FP8):
+            raise NotImplementedError("Qwen4Exp QSA requires a BF16 main KV cache, or with VLLM_HPU_QSA_KV_FP8=1 "
+                                      f"--kv-cache-dtype fp8_inc; got {cache_config.cache_dtype!r}")
         if getattr(quant_config, "kv_cache_scheme", None) is not None:
             raise NotImplementedError("Qwen4Exp QSA does not support KV quantization")
         parallel_config = vllm_config.parallel_config
@@ -704,6 +711,7 @@ class HpuQwen4ExpQSAAttention(Qwen4ExpQSAAttention):
 
 
 __all__ = [
+    "qsa_kv_cache_dtype_allowed",
     "HpuQsaIndexer",
     "HpuQsaIndexerWeights",
     "HpuQwen4ExpQSAAttention",
