@@ -13,13 +13,14 @@ the runner read that history and are made right here:
   Rows that did not decode in the previous step (a first decode after the prompt, a request back in the batch)
   keep the host's context, which is complete for them.
 * :class:`AsyncOutputLedger`: ``CachedRequestState.output_token_ids`` gets one placeholder (-1) per sampled token
-  at the end of a step, as vLLM's GPU runner does, so its length is right at once (min_tokens), and the placeholder
-  is replaced by the token when that step's host copy is complete: two steps later at the latest (no wait in
-  practice), or before a sampler pass that reads the values (penalties, bad words).
+  at the end of a step, as vLLM's GPU runner does, so its length is right at once (min_tokens). The values are
+  filled in only before a sampler pass that reads them (penalties, bad words), from the steps' host copies.
 
-Everything here works on device tensors that already exist and on host lists; it adds no host read of the device
-except the ledger's event wait, which never blocks on the step in flight unless a sampler pass needs the values.
-Imports only ``torch``, so it is unit-testable without an HPU.
+Nothing here waits for the device in a steady decode step: on the HPU bridge an event wait
+(``HPUEvent::synchronize``) also flushes every pending host event, that is every device-to-host copy in flight,
+so a wait for an old step's copy is a wait for the step in flight (card: an event wait at the start of every step
+made a 1-stream step about 20 ms slower, integration build 4, job 00186). Imports only ``torch``, so it is
+unit-testable without an HPU.
 """
 
 from __future__ import annotations
@@ -127,20 +128,23 @@ class _Pending:
 
 
 class AsyncOutputLedger:
-    """One placeholder per sampled token in each request's ``output_token_ids``, settled from the step's host copy.
+    """One placeholder per sampled token in each request's ``output_token_ids``, settled from the steps' host copies.
 
-    The runner calls :meth:`record` at the end of every async step (after it made the step's host copy),
-    :meth:`settle` with ``keep=1`` at the start of the next step (every step but the one in flight: those copies
-    are complete, so the wait returns at once), and :meth:`settle` with ``keep=0`` before a sampler pass that reads
-    the token values. A placeholder is replaced only while its list is still the request's and still holds -1 at
-    that index, so a request whose list was replaced (resumed with the scheduler's tokens) or that was freed in
-    between is left alone.
+    The runner calls :meth:`record` at the end of every async step (after it made the step's host copy) and, before
+    a sampler pass that reads the token values (penalties, bad words), :meth:`settle` and then :meth:`neutralize`
+    on the batch's lists. Nothing else waits: the placeholders give every reader of the length (min_tokens) the
+    right number at once. The records of the last ``max_pending`` steps are kept; an older placeholder can only
+    belong to a request that needed no values all that time, and :meth:`neutralize` turns it into the penalty pad
+    before a pass that reads values. A placeholder is replaced only while its list is still the request's and still
+    holds -1 at that index, so a request whose list was replaced (resumed with the scheduler's tokens) or that was
+    freed in between is left alone.
     """
 
     PLACEHOLDER = -1
+    MAX_PENDING = 64
 
-    def __init__(self) -> None:
-        self._pending: collections.deque[_Pending] = collections.deque()
+    def __init__(self, max_pending: int = MAX_PENDING) -> None:
+        self._pending: collections.deque[_Pending] = collections.deque(maxlen=max_pending)
 
     def __len__(self) -> int:
         return len(self._pending)
@@ -164,7 +168,8 @@ class AsyncOutputLedger:
             self._pending.append(_Pending(requests, sampled_cpu, event, entries))
 
     def settle(self, keep: int = 0) -> int:
-        """Replace the placeholders of every recorded step but the ``keep`` newest; returns how many were set."""
+        """Replace the placeholders of every recorded step but the ``keep`` newest; returns how many were set.
+        Waits for the device (each record's copy event), so only before a pass that reads the values."""
         settled = 0
         while len(self._pending) > keep:
             pending = self._pending.popleft()
@@ -181,6 +186,18 @@ class AsyncOutputLedger:
 
     def clear(self) -> None:
         self._pending.clear()
+
+    @classmethod
+    def neutralize(cls, lists: Sequence[list[int]], pad: int) -> int:
+        """Replace the placeholders left in ``lists`` (beyond the kept window) by ``pad``, the value the penalty
+        and bad-word code treats as no token; returns how many were replaced."""
+        replaced = 0
+        for out in lists:
+            for index, value in enumerate(out):
+                if value == cls.PLACEHOLDER:
+                    out[index] = pad
+                    replaced += 1
+        return replaced
 
 
 def _row_tokens(sampled_cpu) -> list[int]:

@@ -3840,8 +3840,12 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                           request_ids: Union[None, list[str]] = None,
                           pad_to: Optional[int] = None,
                           logits_reqs=None) -> SamplingMetadata:
-        if self._async_ledger is not None and len(self._async_ledger) and needs_output_token_values(self.input_batch):
-            self._async_ledger.settle()  # async scheduling: the values of the step in flight (penalties, bad words)
+        if self._async_ledger is not None and needs_output_token_values(self.input_batch):
+            # Async scheduling, a pass that reads output token values (penalties, bad words): the recorded steps'
+            # tokens, then the penalty pad for any older placeholder (a request that needed no values till now).
+            self._async_ledger.settle()
+            self._async_ledger.neutralize([self.requests[r].output_token_ids for r in self.input_batch.req_ids
+                                           if r is not None and r in self.requests], self.input_batch.vocab_size)
         # Create the sampling metadata.
         req_id_output_token_ids_lst = \
             self._generate_req_id_output_token_ids_lst(request_ids, \
@@ -4764,8 +4768,9 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
 
     def _flash_next_async_begin_step(self, scheduler_output=None) -> None:
         """Under async scheduling, once per engine step before its batches are built: the last step's decode
-        contexts become this step's, and every placeholder but the step in flight gets its token. With speculation
-        (the runner's step stays synchronous): the true num_computed_tokens of the last step's verification rows."""
+        contexts become this step's (no wait for the device: see flash_next_async.AsyncOutputLedger). With
+        speculation (the runner's step stays synchronous): the true num_computed_tokens of the last step's
+        verification rows."""
         if self._spec_draft_handoff is not None:
             self._spec_draft_handoff.begin_step()
             if scheduler_output is not None:
@@ -4779,7 +4784,6 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                 self._ple_carry, self._async_ledger = PleContextCarry(), AsyncOutputLedger()
         if self._ple_carry is not None:
             self._ple_carry.begin_step()
-            self._async_ledger.settle(keep=1)
 
     def _form_prefill_batch(self, contents):
         if len(contents.req_ids) == 0:
