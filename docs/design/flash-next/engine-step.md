@@ -28,9 +28,11 @@ job queued: **`VLLM_HPU_CANDIDATE_SAMPLING=2`** (`d5ad5e67`): with deterministic
 verification row and the bonus row draws in the candidate region with its own noise and the drafts are verified
 against those draws (`greedy_rejection_sample_from_tokens`), which is speculative sampling exactly for one-hot
 drafts (design and interface agreed with mtp-card-ready; it needs their `VLLM_HPU_SPEC_SAMPLED_VERIFY` at 1 or 2).
-Its 8-card check is 00164 (integration build 2 + `d5ad5e67`, MTP k = 2, sampled 32 and 1 streams). Pull request:
-the gate runs on `reports/engine-step/merge-wt` at `d5ad5e67` (waiting for the lock since 00:40 UTC), then PR and
-merge.
+Its 8-card check is 00164 (integration build 2 + `d5ad5e67`, MTP k = 2, sampled 32 and 1 streams).
+CPU-proven, not yet on a card: **`VLLM_HPU_SAMPLER_REQUEST_PARAMS=1`** (`299856cd`): a request's `min_tokens`,
+`logit_bias` and `min_p` take effect on the general sampler path (they were ignored on HPU), applied per row from
+each row's own request before vLLM's sampler. Pull request: the gate runs on `reports/engine-step/merge-wt` at
+`299856cd` (waiting for the lock since 00:40 UTC), then PR and merge.
 
 ### If you take over, in this order
 
@@ -96,8 +98,11 @@ merge.
    stable.
 4. The brief's later items, none started: device tensors kept in place, async scheduling with speculation (the PLE
    layer needs the sampled tokens on the device), the worker round trip. CPU pinning belongs to native-replay.
-5. **Functional fix, after the speed work**: the general sampler path on HPU ignores `min_tokens`, `logit_bias` and
-   `min_p` (section 3); `test_general_sampler_path_tracks_no_min_tokens_request` pins it.
+5. **Done on the CPU at `299856cd`** (`VLLM_HPU_SAMPLER_REQUEST_PARAMS=1`, default 0): the general sampler path's
+   ignored `min_tokens`, `logit_bias` and `min_p`. A card check is a 1-card tiny job (a `logit_bias` of +100 must
+   make a greedy request write only that token; a stop token before `min_tokens` must not appear; `min_p` must not
+   crash), not yet submitted: a new sync prunes the oldest bundle, and 00146 waits on `e9032e68` (replace 00146
+   onto the new commit in the same go).
 6. For mtp-card-ready (not this track's file): `hpu_flash_next_mtp.py` reads `logits.topk(DRAFT_RANK_TOP).indices`
    back as data for its draft-rank statistics (off by default); under the card rule those ids may be wrong.
    kernel-fixes' 00123 widened the rule: any `.to(int32)` of ids from `topk`, `sort` or `max(dim).indices` read on
