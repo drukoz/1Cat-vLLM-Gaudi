@@ -32,7 +32,10 @@ tiny-chain-vlg, tiny-m3pc1, tiny-m3pc2; A6 with the switch A/B off / chain stage
 mode 3 with kvlpfloor; "all" (mode 3, chain stage B, il, shift, gv6, pi, pg, pf, cap); FP8 at 32 streams with kvlpc.
 Late-bound through `make_run6.sh b` (ARMS=...): mode 3 out if 00240 fails (the floor moves to a mode-2 chain server),
 the GDN variant, the scaled FP8 arm (00241), engine-step's KV_CACHES_IN_GRAPH_ARGS. VOCAB_PARALLEL_LOGITS and the
-replicated FC / embedding stay off (coordinator, 12:55); its stacked arm carries prefill's prompt-graph flags (kit word `pg`,
+replicated FC / embedding stay off (coordinator, 12:55). **Late files written 13:05 UTC (GDN verify variant 7 from
+00239: 297 -> 146 us per call at 128 rows, bit-identical):** `late/run6a.sh` (md5 a3f18372: HEADLINE_TINY_GV=7, arm
+mtp2-async-gv7) and `late/run6b.sh` (md5 2f8e0ad1: the stacked arm with gv7). 6b has no gates for il / shift / gv /
+pi (6a runs them first): if one fails in 6a, rewrite run6b.sh without that word before 6b starts; its stacked arm carries prefill's prompt-graph flags (kit word `pg`,
 `HEADLINE_PG_ENV="VLLM_HPU_PROMPT_GRAPH_MAX_TOKENS=64000;VLLM_GRAPH_RESERVED_MEM=0.4"`; check line "Prompt forwards up to
 64000 tokens ... replay HPU graphs") and, like A6, the post step `pf` (a 64K-token prompt, so the step timer records
 2,048-token prompt chunks: build 5 had 1.64 to 1.97 s per chunk op by op). CPU: the async loop test with `VLLM_HPU_PERSISTENT_INPUTS=1` 7 passed. Build 5's record
