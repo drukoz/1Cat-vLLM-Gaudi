@@ -368,19 +368,26 @@ class HpuFlashNextMtpProposer(HpuEagleProposer):
         return self._draft_chain
 
     def propose_chain(self, sampled_token_ids, cu_num_draft_tokens, real, verify_positions, verify_hidden,
-                      common_attn_metadata, table_full, model_runner):
+                      common_attn_metadata, table_full, model_runner, verify_ids=None, spec_decode_metadata=None):
         """The chained draft (VLLM_HPU_MTP_DRAFT_CHAIN=1): ``MtpDraftChain`` on the verification's device result.
 
         ``sampled_token_ids`` the rejection sampler's ``[B, 1 + k]``; ``cu_num_draft_tokens`` the step's cumulative
         draft counts; ``real`` bool ``[B]`` (the rows of real requests); ``verify_positions`` and ``verify_hidden``
         (a tuple of the target's multi-stream outputs) of the verification rows; ``common_attn_metadata`` the
         verification's metadata (pass 0's); ``table_full`` int32 ``[B, max_blocks]`` the requests' attention block
-        table. Returns ``MtpChainDrafts`` on the device; nothing is read back."""
+        table. Stage B: ``sampled_token_ids`` None, ``verify_ids`` the verification's per-row greedy ids and
+        ``spec_decode_metadata`` the step's: the greedy rejection runs inside the chain's graph (its result is the
+        returned ``sampled``). Returns ``MtpChainDrafts`` on the device; nothing is read back."""
         self.last_draft_top_ids = None
         self.host_base_positions = None
+        extra = {}
+        if verify_ids is not None:
+            extra = dict(verify_ids=verify_ids, draft_token_ids=spec_decode_metadata.draft_token_ids,
+                         target_logits_indices=spec_decode_metadata.target_logits_indices,
+                         bonus_logits_indices=spec_decode_metadata.bonus_logits_indices)
         out = self._draft_chain_module(model_runner)(sampled_token_ids, cu_num_draft_tokens, real, verify_positions,
                                                      tuple(verify_hidden), common_attn_metadata, table_full,
-                                                     self._draft_mode_key())
+                                                     self._draft_mode_key(), **extra)
         self.draft_chain_calls += 1
         return out
 
