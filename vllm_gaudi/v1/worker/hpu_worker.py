@@ -1313,12 +1313,16 @@ class HPUWorker(WorkerBase):
             torch.hpu.reset_peak_memory_stats()
             self._native_peak_scope = "since_last_ready_including_request_warmup"
 
-        # VLLM_HPU_WORKER_CPU_PIN=2: the thread that runs the model (this one) gets a CPU of its own (no-op otherwise).
+        # VLLM_HPU_WORKER_CPU_PIN=2: the thread that runs the model (this one) gets a CPU of its own; =3: a CPU whose
+        # host sibling is kept free too (no-op otherwise).
         from vllm_gaudi import envs as gaudi_envs
-        from vllm_gaudi.v1.worker.hpu_worker_cpus import give_calling_thread_its_own_cpu
+        from vllm_gaudi.v1.worker.hpu_worker_cpus import (give_calling_thread_its_own_core,
+                                                          give_calling_thread_its_own_cpu)
 
         try:
             give_calling_thread_its_own_cpu(getattr(self, "_cpu_share", []), gaudi_envs.VLLM_HPU_WORKER_CPU_PIN, logger)
+            give_calling_thread_its_own_core(getattr(self, "_cpu_share", []), gaudi_envs.VLLM_HPU_WORKER_CPU_PIN, logger,
+                                             rule=gaudi_envs.VLLM_HPU_WORKER_CPU_SIBLINGS)
         except Exception as exc:  # noqa: BLE001 - placement is an optimisation: never stop a worker for it
             logger.warning("VLLM_HPU_WORKER_CPU_PIN=%d: the calling thread keeps its share: %s",
                            gaudi_envs.VLLM_HPU_WORKER_CPU_PIN, exc)
