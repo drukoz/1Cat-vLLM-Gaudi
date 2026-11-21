@@ -7454,6 +7454,10 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                     if int(gaudi_envs.VLLM_HPU_MTP_DRAFT_GRAPH) == 1:
                         # the one-graph drafts in records of their own (the flag can be switched at run time)
                         timer_kind += "+graph"
+                    if (int(gaudi_envs.VLLM_HPU_FLASH_NEXT_DECODE_METADATA) == 1
+                            and self.flash_next_sparse_decode_metadata()):
+                        # the sparse decode metadata in force (also switchable): records of their own too
+                        timer_kind += "+md"
                     mtp_step_timer.draft_start(timer_kind, scheduler_output.total_num_scheduled_tokens,
                                                num_decodes + num_prefills,
                                                self.speculative_config.num_speculative_tokens)
