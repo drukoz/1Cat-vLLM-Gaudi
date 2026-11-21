@@ -1,0 +1,639 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
+#
+# headline_job.sh: the integration card build's headline numbers in ONE all-card farm job (TP8 + EP8):
+#
+#   farm job integration NAME all 40m [--env K=V]... -- bash tools/flash_next/integration/headline_job.sh [ARM...]
+#
+# ARMs run one after the other in the order given (default: nospec mtp3):
+#   nospec  server 1: the farm preset + the build's flags below, no speculation. Probe: 1, 8 and 32 streams
+#           greedy (a warm round before every measured round, two measured rounds at 32), then a SAMPLED round
+#           (no temperature in the request: the checkpoint's default sampling) at 1, 8 and 32 streams.
+#   mtp3    server 2: the same + MTP k = 3 (--speculative-config method mtp, VLLM_HPU_GDN_CORE_VERIFY=1,
+#           VLLM_HPU_MTP_TIMING=1). Probe: 32, 8 and 1 streams greedy (32 first: the number that decides),
+#           --no-sampled-check (sampled verification is off in this build: a sampled request gets HTTP 400);
+#           acceptance per draft position per level from /metrics (SPEC lines).
+#   mtp3-32 server 2 with the 32-stream level only (a short hold).
+#   mtp<K>-graph  server 2 with VLLM_HPU_MTP_DRAFT_GRAPH=1 (the k draft passes of a decode step in one HPU graph,
+#           track mtp-draft-graph); the plain mtp<K> arm runs with VLLM_HPU_MTP_DRAFT_GRAPH=0 unless the job sets it.
+#           The tiny arm takes HEADLINE_TINY_DRAFT_GRAPH (default: the job's VLLM_HPU_MTP_DRAFT_GRAPH, else 0).
+#   mtp<K>-switch  ONE MTP server, VLLM_HPU_MTP_DRAFT_GRAPH switched per round through its runtime switch file
+#           (VLLM_HPU_RUNTIME_SWITCH_FILE=$OUT/<arm>/switches): per level a warm round per arm, then the
+#           measured rounds off, on, off, on (decode_scaling.py --switch-arm): an A/B without the
+#           server-to-server spread. Rows of scaling.json carry "arm" (off / on); the MTP timer's records of
+#           the one-graph drafts have the kind verify+graph.
+#           HEADLINE_SWITCH_SET=graph-md: four arms, the 2 x 2 of VLLM_HPU_MTP_DRAFT_GRAPH and
+#           VLLM_HPU_FLASH_NEXT_DECODE_METADATA (off, on, md, on-md).
+#   mtp<K>-rfc, mtp<K>-rfc-switch  the MTP server of mtp<K> / mtp<K>-switch built with VLLM_HPU_MTP_REPLICATED_FC=1 (the
+#           draft's two fc linears unsharded: two all-gathers fewer per draft pass); other MTP arms take the job's
+#           value, else 0. The tiny arm takes HEADLINE_TINY_MTP_REPLICATED_FC and HEADLINE_TINY_DECODE_METADATA
+#           (VLLM_HPU_FLASH_NEXT_DECODE_METADATA) the same way as HEADLINE_TINY_DRAFT_GRAPH.
+#   mtp<K>-async-switch  the same A/B on the mtp<K>-async server (VLLM_HPU_FLASH_NEXT_ASYNC_SCHED=2, the MTP timer
+#           at HEADLINE_ASYNC_MTP_TIMING: set 0 for this A/B, the timer's device wait hides async's overlap).
+#   mtp<K>-WORD-WORD...  (build 5) any MTP arm is mtp<K> and words in any order: server words async, graph, rfc,
+#           noshard, spin, inline, fp8kv, pin3, hpulog; probe words 32, greedy, switch; and the steps after the probe
+#           on the same server sw, dg32, cap, kvlp, kvlpfb, long (the comment of the MTP arms below says what each
+#           does). E.g. build 5's arms: tiny mtp2-async-sw-cap-kvlp mtp2-async-spin mtp3-async mtp2-kvlpfb
+#           mtp2-async-inline-greedy mtp2-async-fp8kv-hpulog-32-greedy-dg32-kvlp-long. Knobs: HEADLINE_TRACE_ENV=1 (every MTP server with
+#           step-anatomy's capture setup), HEADLINE_REQUIRE_DENSE=1 (the dense MoE form must run: else exit 8, the
+#           job stops), HEADLINE_SW_ARMS / HEADLINE_SW_LEVELS / HEADLINE_SW_ROUNDS, HEADLINE_CAPTURE_LEVELS,
+#           HEADLINE_KVLP_LENGTHS / HEADLINE_KVLP_REF, HEADLINE_LONG_CTX / HEADLINE_LONG_STREAMS / HEADLINE_LONG_REPEAT,
+#           HEADLINE_INTERLEAVE_SAMPLED=1 (each level's SAMPLED rounds right after its greedy ones).
+#   nospec-noshard, nospec-noprefix, nospec-noprefix-nocut  the low-stream bisect: A's env with
+#           VLLM_HPU_QSA_INDEXER_SHARD=0; A's env without VLLM_HPU_PREFIX_ALIGN_SPLIT and VLLM_HPU_PREFIX_KEEP_PROMPT_END
+#           (then also VLLM_HPU_DECODE_CUT_INTERVAL=0); greedy 8 and 1 streams only.
+#   nospec-async, mtp<K>-async  the same servers with async scheduling (VLLM_HPU_FLASH_NEXT_ASYNC_SCHED=1 / 2;
+#           the MTP timer at HEADLINE_ASYNC_MTP_TIMING, default 2).
+#   nospec-pin  the no-speculation server with VLLM_HPU_WORKER_CPU_PIN=1 (HEADLINE_PIN_MODE) and
+#           PT_HPU_DISABLE_HPUGRAPH_REPLAY_HASHCHECK=1 (native-replay's host levers): greedy 1 and 32 streams.
+#   tiny    the tiny model at TP8 with the job's flags (farm_tiny.py --gdn hc; --spec K with HEADLINE_TINY_SPEC=K):
+#           tokens against the CPU reference. A failure ends the job (exit 7) unless HEADLINE_TINY_ABORT=0.
+#   mtp3-noshard  server 2 with VLLM_HPU_QSA_INDEXER_SHARD=0 (isolates the request-sharded indexer, never run in a
+#           served speculative step before this build). Run by itself after mtp3 when mtp3 ended with the server
+#           dead (3) or the probe failed (5) and HEADLINE_HOLD_S (default 2400, the job's hold) leaves 900 s or more;
+#           HEADLINE_MTP_FALLBACK=0 turns that off.
+# Between two servers: the leftover vLLM workers of THIS container are killed (the container has its own
+# process namespace) and the script waits until no worker is left, then 8 s more for the cards (CARD.md).
+#
+# The build's flags (each only when the job did not set it with --env; serve_probe.sh adds the preset
+# PT_HPU_LAZY_MODE=1 PT_HPU_LAZY_ACC_PAR_MODE=0 VLLM_HPU_FLASH_NEXT_QSA_MODE=1 VLLM_HPU_RECURRENT_STATE_POOL=1
+# VLLM_HPU_GDN_CORE_DECODE=1 VLLM_HPU_HC_FUSED=1 VLLM_HPU_PLE_HOST_NGRAM_IDS=1 VLLM_HPU_COLLECTIVE_MARK_STEP=0
+# VLLM_SKIP_WARMUP=true):
+#   qsa-fused     VLLM_HPU_QSA_FUSED=1 VLLM_HPU_QSA_INDEXER_SHARD=1 (torch data flow, request-sharded indexer)
+#   kernel-fixes  VLLM_HPU_GDN_KERNEL_INTERLEAVE=1 VLLM_HPU_GDN_GLUE_CACHE=1 VLLM_HPU_HC_FUSED_COPY_MODE=2
+#   native-replay VLLM_HPU_DECODE_CUT_INTERVAL=1000 (decode graphs without the per-layer cuts)
+#   engine-step   VLLM_HPU_CANDIDATE_SAMPLING=1 (sampled requests draw from the 64 largest logits; greedy rows and
+#                 speculation keep their paths)
+#   memory        VLLM_GRAPH_RESERVED_MEM=0.4 (graphs made at run time need room: warmup is skipped)
+#   MTP server    VLLM_HPU_GDN_CORE_VERIFY=1 VLLM_HPU_MTP_DRAFT_LOOP=1 VLLM_HPU_MTP_CHUNK_KV=1 VLLM_HPU_MTP_TIMING=1
+# Never set here: VLLM_HPU_GRAPH_ASYNC_REPLAY (never faster), HCCL_PRIM_* (HCCL_PRIM_COLLECTIVE_MASK=2 kills
+# every rank), VLLM_HPU_MOE_GLUE (no gain), VLLM_HPU_QSA_FUSED=2/3 and VLLM_HPU_QSA_TABLE_WIDTH (not card-proven).
+# The card memory of every card is logged every 15 s to $FARM_OUT/hlsmi_mem.log.
+#
+# Environment knobs: HEADLINE_TOKENS (measured tokens per stream, default 128), HEADLINE_WARM_TOKENS (default 48),
+# HEADLINE_ROUNDS (measured rounds per level, greedy and sampled, after the warm round; default 2; 0 = one per level
+# and two at the top level, as in job 00128), HEADLINE_LEVELS (default 32,8,1: the 32-stream numbers first),
+# HEADLINE_MTP_SAMPLED=1 (the MTP server with VLLM_HPU_SPEC_SAMPLED_VERIFY=1 and a SAMPLED 32-stream level last;
+# HEADLINE_MTP_SAMPLED_LEVELS), HEADLINE_MTP_CTX=N:TOKENS (one greedy round of N streams with long prompts on
+# the MTP server, at the very end: a long-prompt crash (spec-lookup 00133) must not cost the sampled rounds),
+# HEADLINE_TINY_SPEC=K (the tiny gate with --spec K). MTP arms are mtp<K>
+# (k = K drafted tokens), mtp<K>-32 (32 streams only) and mtp<K>-noshard.
+# Results: $FARM_OUT/<arm>/ (versions.txt, server0.log, scaling.json, probe.log, summary.json) and
+# $FARM_OUT/headline.md + headline.json (headline_table.py), written after every arm.
+# Exit code: the number of arms whose serve_probe.sh did not end with 0.
+
+set -u
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+TREE="$(cd "$HERE/../../.." && pwd)"
+PYTHON="${FARM_PYTHON:-python3}"
+OUT="${FARM_OUT:-/results/headline}"
+TOKENS="${HEADLINE_TOKENS:-128}"
+WARM="${HEADLINE_WARM_TOKENS:-48}"
+ROUNDS="${HEADLINE_ROUNDS:-2}"
+LEVELS="${HEADLINE_LEVELS:-32,8,1}"
+T0="$(date -u +%s)"
+HOLD_S="${HEADLINE_HOLD_S:-2400}"
+FALLBACK="${HEADLINE_MTP_FALLBACK:-1}"
+
+# The farm preset first (serve_probe.sh sets the same for its servers; the tiny gate needs it here).
+for kv in PT_HPU_LAZY_MODE=1 PT_HPU_LAZY_ACC_PAR_MODE=0 VLLM_HPU_FLASH_NEXT_QSA_MODE=1 \
+    VLLM_HPU_RECURRENT_STATE_POOL=1 VLLM_HPU_GDN_CORE_DECODE=1 VLLM_HPU_HC_FUSED=1 \
+    VLLM_HPU_PLE_HOST_NGRAM_IDS=1 VLLM_HPU_COLLECTIVE_MARK_STEP=0 VLLM_SKIP_WARMUP=true; do
+    key="${kv%%=*}"
+    if [ -z "${!key+x}" ]; then export "$kv"; fi
+done
+for kv in VLLM_HPU_QSA_FUSED=1 VLLM_HPU_QSA_INDEXER_SHARD=1 \
+    VLLM_HPU_GDN_KERNEL_INTERLEAVE=1 VLLM_HPU_GDN_GLUE_CACHE=1 VLLM_HPU_HC_FUSED_COPY_MODE=2 \
+    VLLM_HPU_DECODE_CUT_INTERVAL=1000 VLLM_HPU_CANDIDATE_SAMPLING=1 VLLM_GRAPH_RESERVED_MEM=0.4; do
+    key="${kv%%=*}"
+    if [ -z "${!key+x}" ]; then export "$kv"; fi
+done
+
+# The worker placement, switched late (coordinator, 2026-11-21 08:28 and 08:49 UTC): the first word of
+# HEADLINE_PIN_SWITCH (default /results/switches/pin = ~/farm/integration/results/switches/pin on the node), read once
+# here at the job's start:
+#   place  every real-model server runs under collectives' place_wrap.sh with native-replay's place.sh (rule a^1 of
+#          job 00193; PLACE_SIBLING_RULE): once the server is healthy, each worker's main thread gets a vCPU of its
+#          own with its hyperthread sibling kept free, re-applied every 2 s; NO VLLM_HPU_WORKER_CPU_PIN, so the load
+#          and warm-up keep every CPU (00189: the pin flag doubled the time to the first throughput line). The
+#          placement's output: <arm>/placement.log. The scripts: /results/late/place/{place_wrap.sh,place.sh} when
+#          both exist (late-bound), else this kit's place/ copies (place_wrap.sh md5 7b159d11 = collectives' 98213f8c,
+#          which also widens its mask to the cgroup cpuset; place.sh 816292de = native-replay 3a733c26, which moves
+#          only the server's own process tree);
+#          HEADLINE_PLACE_WRAP / HEADLINE_PLACE_SCRIPT override. The tiny gate is not placed.
+#   pin3   (or "on") every server of the job, the tiny gate too, with VLLM_HPU_WORKER_CPU_PIN=3
+#          (native-replay's pin with the model thread's sibling kept free; restricts the load to the worker's share)
+#   0..3   VLLM_HPU_WORKER_CPU_PIN=<digit>
+#   anything else or no file: no placement. A VLLM_HPU_WORKER_CPU_PIN the job sets itself (--env) wins over the file.
+PIN_SWITCH="${HEADLINE_PIN_SWITCH:-/results/switches/pin}"
+pin_word="$(head -c 64 "$PIN_SWITCH" 2>/dev/null | awk 'NR == 1 { print $1 }')"
+PLACE_ON=0
+if [ -n "${VLLM_HPU_WORKER_CPU_PIN+x}" ]; then
+    echo "headline_job: placement from the job's env: VLLM_HPU_WORKER_CPU_PIN=$VLLM_HPU_WORKER_CPU_PIN" \
+        "(the switch $PIN_SWITCH is not read)"
+else
+    case "$pin_word" in
+        place) PLACE_ON=1 ;;
+        on | pin3) export VLLM_HPU_WORKER_CPU_PIN=3 ;;
+        [0-3]) export VLLM_HPU_WORKER_CPU_PIN="$pin_word" ;;
+    esac
+    if [ "$PLACE_ON" = 1 ]; then
+        PLACE_WRAP="${HEADLINE_PLACE_WRAP:-}"
+        PLACE_SCRIPT="${HEADLINE_PLACE_SCRIPT:-}"
+        if [ -z "$PLACE_WRAP" ] && [ -z "$PLACE_SCRIPT" ] && [ -r /results/late/place/place_wrap.sh ] &&
+            [ -r /results/late/place/place.sh ]; then
+            PLACE_WRAP=/results/late/place/place_wrap.sh
+            PLACE_SCRIPT=/results/late/place/place.sh
+        fi
+        PLACE_WRAP="${PLACE_WRAP:-$HERE/place/place_wrap.sh}"
+        PLACE_SCRIPT="${PLACE_SCRIPT:-$HERE/place/place.sh}"
+        export PLACE_SIBLING_RULE="${PLACE_SIBLING_RULE:-a^1}"
+        if [ -r "$PLACE_WRAP" ] && [ -r "$PLACE_SCRIPT" ]; then
+            echo "headline_job: placement switch $PIN_SWITCH says 'place': every real-model server under" \
+                "$PLACE_WRAP $PLACE_SCRIPT (rule $PLACE_SIBLING_RULE, no VLLM_HPU_WORKER_CPU_PIN; md5" \
+                "$(md5sum "$PLACE_WRAP" "$PLACE_SCRIPT" 2>/dev/null | awk '{ printf "%s %s ", $2, substr($1, 1, 8) }'))"
+        else
+            echo "headline_job: placement switch says 'place' but $PLACE_WRAP or $PLACE_SCRIPT is missing: NO placement"
+            PLACE_ON=0
+        fi
+    else
+        echo "headline_job: placement switch $PIN_SWITCH says '${pin_word:-nothing (no file)}':" \
+            "VLLM_HPU_WORKER_CPU_PIN=${VLLM_HPU_WORKER_CPU_PIN:-unset (no pin)}, no place.sh"
+    fi
+fi
+
+if [ $# -eq 0 ]; then set -- nospec mtp3; fi
+# Optional arms, switched late: an arm written if-NAME:ARM runs only when the first word of HEADLINE_SWITCH_DIR/NAME
+# (default /results/switches/NAME = ~/farm/<track>/results/switches/NAME on the node) is "on", one written
+# ifnot-NAME:ARM only when it is not; each file is read once, here at the job's start (coordinator, build 5: the
+# stage-submission arms in place of the inline-collective arm).
+SWITCH_DIR="${HEADLINE_SWITCH_DIR:-/results/switches}"
+kept_arms=()
+for a in "$@"; do
+    case "$a" in
+        if-*:* | ifnot-*:*)
+            opt_kind="${a%%-*}"
+            opt_name="${a%%:*}"
+            opt_name="${opt_name#*-}"
+            opt_word="$(head -c 64 "$SWITCH_DIR/$opt_name" 2>/dev/null | awk 'NR == 1 { print $1 }')"
+            if { [ "$opt_kind" = if ] && [ "$opt_word" = on ]; } || { [ "$opt_kind" = ifnot ] && [ "$opt_word" != on ]; }; then
+                kept_arms+=("${a#*:}")
+                echo "headline_job: optional arm ${a#*:} runs ($a; $SWITCH_DIR/$opt_name says '${opt_word:-nothing (no file)}')"
+            else
+                echo "headline_job: optional arm ${a#*:} skipped ($a; $SWITCH_DIR/$opt_name says '${opt_word:-nothing (no file)}')"
+            fi
+            ;;
+        *) kept_arms+=("$a") ;;
+    esac
+done
+set -- ${kept_arms[@]+"${kept_arms[@]}"}
+mkdir -p "$OUT"
+
+# The card memory every 15 s (coordinator 23:50 UTC: graphs made at run time can run out of device memory).
+MEMLOG_PID=""
+if command -v hl-smi >/dev/null 2>&1; then
+    (
+        while :; do
+            echo "$(date -u +%T) $(hl-smi -Q index,memory.used,memory.total -f csv,noheader 2>&1 | tr '\n' ';')"
+            sleep 15
+        done
+    ) >>"$OUT/hlsmi_mem.log" 2>&1 &
+    MEMLOG_PID=$!
+fi
+stop_memlog() { if [ -n "$MEMLOG_PID" ]; then kill "$MEMLOG_PID" 2>/dev/null; MEMLOG_PID=""; fi; }
+trap 'stop_memlog' EXIT
+echo "headline_job: arms $*; tokens $TOKENS (warm $WARM); out $OUT; $(date -u +%T)"
+env | grep -E '^(VLLM_|PT_HPU|HABANA_VISIBLE|FARM_)' | sort | sed 's/^/headline_job: env /'
+
+# workers_left: how many vLLM processes are left in this container (their titles start with VLLM::, the API
+# server's command line names vllm serve).
+workers_left() {
+    local n=0 pid cmd
+    for pid in $(ls /proc 2>/dev/null | grep -E '^[0-9]+$'); do
+        [ "$pid" = "$$" ] && continue
+        cmd="$(tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null)" || continue
+        case "$cmd" in
+            VLLM::* | *"vllm serve"* | *"bin/vllm serve"*) n=$((n + 1)) ;;
+        esac
+    done
+    echo "$n"
+}
+
+# clear_cards: after a server stop. Kills only processes of this container (own PID namespace).
+clear_cards() {
+    local i left
+    left="$(workers_left)"
+    echo "headline_job: after the server stop: $left vLLM processes left in this container"
+    if [ "$left" -gt 0 ]; then
+        pkill -9 -f "VLLM::" 2>/dev/null
+        pkill -9 -f "vllm serve" 2>/dev/null
+    fi
+    for ((i = 0; i < 60; i++)); do
+        [ "$(workers_left)" -eq 0 ] && break
+        sleep 1
+    done
+    echo "headline_job: $(workers_left) left after ${i} s; waiting 8 s for the cards"
+    sleep 8
+    # The card memory of a stopped server is released some seconds after its processes are gone (00128: 65 GB per
+    # card 10 s after the stop, 0.8 GB 25 s after): wait until every card holds less than 4 GB, at most 120 s.
+    if command -v hl-smi >/dev/null 2>&1; then
+        for ((i = 0; i < 120; i += 3)); do
+            used="$(hl-smi -Q index,memory.used -f csv,noheader 2>/dev/null |
+                awk -F', *' '{ gsub(/[^0-9]/, "", $2); if ($2 + 0 > m) m = $2 + 0 } END { print m + 0 }')"
+            [ "${used:-0}" -lt 4096 ] && break
+            sleep 3
+        done
+        hl-smi -Q index,memory.used -f csv,noheader 2>/dev/null | tr '\n' ';' | sed 's/^/headline_job: card memory: /'
+        echo " (after ${i} s more)"
+    fi
+}
+
+# HEADLINE_HEALTH_TIMEOUT (seconds a server may take to become healthy, default 2400) and HEADLINE_PROBE_TIMEOUT
+# (seconds per probe request, default 1800): an arm whose server hangs gives up sooner and the next arm runs.
+guard_args() {
+    echo "--health-timeout ${HEADLINE_HEALTH_TIMEOUT:-2400} --probe-arg --timeout=${HEADLINE_PROBE_TIMEOUT:-1800}"
+}
+
+# HEADLINE_BARRIER_DIR: align every probe round with the other servers of the job (layout_2xtp4.sh):
+# HEADLINE_BARRIER_N servers, this one named HEADLINE_BARRIER_NAME.
+barrier_args() {
+    if [ -n "${HEADLINE_BARRIER_DIR:-}" ]; then
+        echo "--probe-arg --barrier-dir=$HEADLINE_BARRIER_DIR --probe-arg --barrier-n=${HEADLINE_BARRIER_N:-2}" \
+            "--probe-arg --barrier-name=${HEADLINE_BARRIER_NAME:-probe} --probe-arg --barrier-tag=$1"
+    fi
+}
+
+# The job's CPUs, read once here before any server: native-replay's place.sh moves EVERY process of the container off
+# the vCPUs it reserves (each worker's main thread and its sibling: 16 at TP8), this script included, so every later
+# server inherited 16 CPUs fewer (job 00222: 144, 128, 112, 96, 80, 64 CPUs over its six servers, 16 to 6 helper CPUs
+# per rank). restore_cpus gives this shell its whole set back before each server starts (a no-op where the platform
+# has no sched_getaffinity, e.g. a Mac dry run).
+JOB_CPUS="$("$PYTHON" -c 'import os; print(",".join(map(str, sorted(os.sched_getaffinity(0)))))' 2>/dev/null)"
+restore_cpus() {
+    [ -n "$JOB_CPUS" ] || return 0
+    "$PYTHON" - "$$" "$JOB_CPUS" <<'PY4' || echo "headline_job: could not give this shell its CPUs back"
+import os
+import sys
+pid, cpus = int(sys.argv[1]), {int(c) for c in sys.argv[2].split(",")}
+before = os.sched_getaffinity(pid)
+if before != cpus:
+    os.sched_setaffinity(pid, cpus)
+    print("headline_job: this shell's CPUs %d -> %d (given back after the last placement)" % (len(before), len(cpus)))
+PY4
+}
+
+# placed DIR COMMAND...: one real-model server (COMMAND, a serve_probe.sh run whose out folder is DIR), under the
+# placement when the pin switch said "place" (above): place_wrap.sh runs COMMAND and, once the server answers /health
+# on the job's port, place.sh with the server's log; its output goes to DIR/placement.log. Every server starts with
+# the job's whole CPU set (restore_cpus).
+placed() {
+    local dir="$1"
+    shift
+    restore_cpus
+    if [ "$PLACE_ON" = 1 ]; then
+        mkdir -p "$dir"
+        PLACE_ARGS="--log $dir/server0.log" PLACE_LOG="$dir/placement.log" bash "$PLACE_WRAP" "$PLACE_SCRIPT" -- "$@"
+    else
+        "$@"
+    fi
+}
+
+# good_kvlp_ref: the job's first kvlp_bf16.json in which every length ran without an error (the kvlp post step of
+# an fp8kv arm compares against it); prints nothing when there is none.
+good_kvlp_ref() {
+    "$PYTHON" - "$OUT" <<'PY3'
+import glob, json, os, sys
+for path in sorted(glob.glob(os.path.join(sys.argv[1], "*", "kvlp_bf16.json")), key=os.path.getmtime):
+    try:
+        lengths = json.load(open(path)).get("lengths") or {}
+    except (OSError, ValueError):
+        continue
+    if lengths and all("error" not in r and r.get("mean_teacher_logprob") is not None for r in lengths.values()):
+        print(path)
+        break
+PY3
+}
+
+failed=0
+first=1
+ARMS=("$@")
+i_arm=0
+while [ "$i_arm" -lt "${#ARMS[@]}" ]; do
+    arm="${ARMS[$i_arm]}"
+    i_arm=$((i_arm + 1))
+    if [ "$first" -eq 0 ]; then clear_cards; fi
+    first=0
+    echo "=== headline_job: arm $arm start $(date -u +%T)"
+    case "$arm" in
+        tiny)
+            spec=()
+            case "${HEADLINE_TINY_SPEC:-0}" in [1-9]) spec=(--spec "$HEADLINE_TINY_SPEC") ;; esac
+            # the MTP server's own flags too (they act only on the speculative mode)
+            tiny_sv="${VLLM_HPU_SPEC_SAMPLED_VERIFY:-0}"
+            if [ "${HEADLINE_MTP_SAMPLED:-0}" = 1 ]; then tiny_sv="${VLLM_HPU_SPEC_SAMPLED_VERIFY:-1}"; fi
+            VLLM_HPU_MTP_DRAFT_LOOP="${VLLM_HPU_MTP_DRAFT_LOOP:-1}" VLLM_HPU_MTP_CHUNK_KV="${VLLM_HPU_MTP_CHUNK_KV:-1}" \
+                VLLM_HPU_SPEC_SAMPLED_VERIFY="$tiny_sv" \
+                VLLM_HPU_MTP_DRAFT_GRAPH="${HEADLINE_TINY_DRAFT_GRAPH:-${VLLM_HPU_MTP_DRAFT_GRAPH:-0}}" \
+                VLLM_HPU_MTP_REPLICATED_FC="${HEADLINE_TINY_MTP_REPLICATED_FC:-${VLLM_HPU_MTP_REPLICATED_FC:-0}}" \
+                VLLM_HPU_FLASH_NEXT_DECODE_METADATA="${HEADLINE_TINY_DECODE_METADATA:-${VLLM_HPU_FLASH_NEXT_DECODE_METADATA:-0}}" \
+                "$PYTHON" /farm/farm_tiny.py --gdn hc ${spec[@]+"${spec[@]}"} --out "$OUT/tiny"
+            rc=$?
+            if [ "$rc" -ne 0 ] && [ "${HEADLINE_TINY_ABORT:-1}" = 1 ]; then
+                echo "headline_job: the tiny gate failed (rc $rc): no real-model server with these flags"
+                exit 7
+            fi
+            echo "=== headline_job: arm tiny rc=$rc end $(date -u +%T)"
+            continue
+            ;;
+        nospec | nospec-async)
+            # Levels in HEADLINE_LEVELS order (default 32,8,1: the 32-stream numbers first); each level's sampled
+            # rounds right after its greedy rounds. nospec-async: VLLM_HPU_FLASH_NEXT_ASYNC_SCHED=1 (async-sched).
+            async_env=()
+            if [ "$arm" = nospec-async ]; then async_env=(VLLM_HPU_FLASH_NEXT_ASYNC_SCHED=1); fi
+            placed "$OUT/$arm" env ${async_env[@]+"${async_env[@]}"} \
+                bash "$HERE/serve_probe.sh" --out "$OUT/$arm" --levels "$LEVELS" --tokens "$TOKENS" \
+                --warm-tokens "$WARM" --repeat-top 2 --no-mintok-check --probe-arg "--sampled-levels=$LEVELS" \
+                --probe-arg --interleave-sampled --probe-arg "--rounds=$ROUNDS" $(barrier_args "$arm") $(guard_args)
+            ;;
+        nospec-noshard | nospec-noprefix | nospec-noprefix-nocut)
+            # The low-stream bisect (coordinator, build 3): A's env without the QSA request shard; A's env without the
+            # prefix flags, then also without the decode cut interval; greedy only, HEADLINE_BISECT_LEVELS (default
+            # 8,1), HEADLINE_BISECT_TOKENS (default 96).
+            change=()
+            case "$arm" in
+                nospec-noshard) change=(VLLM_HPU_QSA_INDEXER_SHARD=0) ;;
+                nospec-noprefix) change=(VLLM_HPU_PREFIX_ALIGN_SPLIT=0 VLLM_HPU_PREFIX_KEEP_PROMPT_END=0) ;;
+                nospec-noprefix-nocut)
+                    change=(VLLM_HPU_PREFIX_ALIGN_SPLIT=0 VLLM_HPU_PREFIX_KEEP_PROMPT_END=0 VLLM_HPU_DECODE_CUT_INTERVAL=0) ;;
+            esac
+            placed "$OUT/$arm" env "${change[@]}" \
+                bash "$HERE/serve_probe.sh" --out "$OUT/$arm" --levels "${HEADLINE_BISECT_LEVELS:-8,1}" \
+                --tokens "${HEADLINE_BISECT_TOKENS:-96}" --warm-tokens "$WARM" --repeat-top 2 --no-mintok-check \
+                --probe-arg --no-sampled-check --probe-arg "--rounds=$ROUNDS"
+            ;;
+        nospec-pin)
+            # B: native-replay's two host levers on A's env (never run at TP8 before): greedy 1 and 32 streams only;
+            # its 1-stream text is compared with A's.
+            VLLM_HPU_WORKER_CPU_PIN="${HEADLINE_PIN_MODE:-1}" PT_HPU_DISABLE_HPUGRAPH_REPLAY_HASHCHECK=1 \
+                bash "$HERE/serve_probe.sh" --out "$OUT/$arm" --levels "${HEADLINE_PIN_LEVELS:-1,32}" --tokens "$TOKENS" \
+                --warm-tokens "$WARM" --repeat-top 2 --no-mintok-check --probe-arg --no-sampled-check \
+                --probe-arg "--rounds=$ROUNDS"
+            ;;
+        mtp[1-9] | mtp[1-9]-*)
+            k="${arm:3:1}"
+            # The words after mtp<K>, separated by "-", each one change of the server or of its probe (any order):
+            #   server: async (VLLM_HPU_FLASH_NEXT_ASYNC_SCHED=2, the MTP timer at HEADLINE_ASYNC_MTP_TIMING), graph
+            #     (VLLM_HPU_MTP_DRAFT_GRAPH=1), rfc (VLLM_HPU_MTP_REPLICATED_FC=1), noshard (VLLM_HPU_QSA_INDEXER_SHARD=0,
+            #     greedy only), spin (the bridge's spinner ON: PT_HPU_SYNCHRONOUS_ACC_QUEUE_FLUSHING removed from the
+            #     server's environment), inline (PT_HPU_DISABLE_ASYNC_COLLECTIVE=1: collectives issued inline), fp8kv
+            #     (VLLM_HPU_QSA_KV_FP8=1 and --kv-cache-dtype fp8_inc), pin3 (VLLM_HPU_WORKER_CPU_PIN=3), hpulog
+            #     (engine-step's copy_to logger: HPU_GRAPH_INPUT_LOG=1 and hpulog/ first on PYTHONPATH; it walks the
+            #     forward's inputs at every replay: never on an arm whose speed is compared), ss0
+            #     (PT_HPU_ENABLE_STAGE_SUBMISSION=0: the bridge's stage submission off), irlog (LOG_LEVEL_PT_IRGRAPH=1
+            #     LOG_LEVEL_PT_LAZY=1 into <arm>/habana_logs: a chatty bridge log, never on a measured arm)
+            #   probe: 32 (the 32-stream level only), lv<N>_<N>... (these levels, e.g. lv32_1), greedy (no SAMPLED
+            #     rounds), switch (the whole probe as an A/B of
+            #     the draft graph through the runtime switch file, HEADLINE_SWITCH_SET)
+            #   after the probe, on the same server (serve_probe.sh --post-cmd), in this order: sw (an A/B through the
+            #     runtime switch file: HEADLINE_SW_ARMS at HEADLINE_SW_LEVELS, HEADLINE_SW_ROUNDS rounds each, greedy,
+            #     into scaling_sw.json; afterwards the file holds the first arm's values again), dg32 (the same with
+            #     the draft graph off / on at 32 streams, one round each: scaling_dg32.json), cap (step-anatomy's
+            #     device trace: anatomy_probe.py --trace HEADLINE_CAPTURE_LEVELS), kvlp (qsa-fused's teacher-forced
+            #     prompt-logprob probe: kvlp_bf16.json, or with fp8kv kvlp_fp8.json compared with the job's first good
+            #     kvlp_bf16.json), kvlpfb (kvlp only when the job has no good kvlp_bf16.json yet), long (qsa-fused's
+            #     long rounds: the needle at HEADLINE_LONG_CTX tokens, then HEADLINE_LONG_STREAMS streams on its cached
+            #     prefix, long.json)
+            # HEADLINE_TRACE_ENV=1: every MTP server starts with step-anatomy's capture setup (the torch profiler by
+            # --profiler-config into <arm>/trace, HABANA_PROFILE=profile_api_light, the step timer VLLM_HPU_STEP_TIMING=1
+            # into <arm>/timing); only an arm with cap captures. HEADLINE_REQUIRE_DENSE=1 (with VLLM_HPU_MOE_DENSE=1):
+            # the server log must say at load that the MoE layers keep their stacked experts and, after the first
+            # warm round, that a step ran the dense form; else the arm ends with 8 and the job stops (all its arms
+            # depend on it).
+            draft_graph="${VLLM_HPU_MTP_DRAFT_GRAPH:-0}"
+            replicated_fc="${VLLM_HPU_MTP_REPLICATED_FC:-0}"
+            shard="$VLLM_HPU_QSA_INDEXER_SHARD"
+            timing="${VLLM_HPU_MTP_TIMING:-1}"
+            levels="$LEVELS"
+            async_env=()
+            arm_env=()
+            unset_env=()
+            serve_extra=()
+            switch_env=()
+            switch_args=()
+            post_args=()
+            post_words=()
+            whole_switch=0
+            greedy_only=0
+            fp8kv=0
+            irlog=0
+            bad_word=""
+            words="${arm:4}"
+            words="${words#-}"
+            arm_words=()
+            if [ -n "$words" ]; then IFS=- read -r -a arm_words <<<"$words"; fi
+            for w in ${arm_words[@]+"${arm_words[@]}"}; do
+                case "$w" in
+                    async) async_env=(VLLM_HPU_FLASH_NEXT_ASYNC_SCHED=2); timing="${HEADLINE_ASYNC_MTP_TIMING:-2}" ;;
+                    graph) draft_graph=1 ;;
+                    rfc) replicated_fc=1 ;;
+                    noshard) shard=0; greedy_only=1 ;;
+                    32) levels=32 ;;
+                    switch) whole_switch=1 ;;
+                    spin) unset_env+=(-u PT_HPU_SYNCHRONOUS_ACC_QUEUE_FLUSHING) ;;
+                    inline) arm_env+=(PT_HPU_DISABLE_ASYNC_COLLECTIVE=1) ;;
+                    fp8kv) fp8kv=1; arm_env+=(VLLM_HPU_QSA_KV_FP8=1); serve_extra+=(--kv-cache-dtype fp8_inc) ;;
+                    pin3) arm_env+=(VLLM_HPU_WORKER_CPU_PIN=3) ;;
+                    ss0) arm_env+=(PT_HPU_ENABLE_STAGE_SUBMISSION=0) ;;
+                    irlog) irlog=1; arm_env+=(LOG_LEVEL_PT_IRGRAPH=1 LOG_LEVEL_PT_LAZY=1) ;;
+                    lv[0-9]*)
+                        levels="${w#lv}"
+                        levels="${levels//_/,}"
+                        case "$levels" in *[!0-9,]*) bad_word="$w" ;; esac
+                        ;;
+                    hpulog) arm_env+=(HPU_GRAPH_INPUT_LOG=1 "PYTHONPATH=$HERE/hpulog${PYTHONPATH:+:$PYTHONPATH}") ;;
+                    greedy) greedy_only=1 ;;
+                    sw | dg32 | cap | kvlp | kvlpfb | long) post_words+=("$w") ;;
+                    *) bad_word="$w" ;;
+                esac
+            done
+            if [ -n "$bad_word" ]; then
+                echo "headline_job: arm $arm: unknown word '$bad_word' (see the comment of the MTP arms)"
+                failed=$((failed + 1))
+                continue
+            fi
+            ARM_DIR="${OUT:?}/${arm:?}"
+            mkdir -p "$ARM_DIR"
+            # irlog: the bridge's debug log of this server in its own folder (the job's HABANA_LOGS stays quiet)
+            if [ "$irlog" = 1 ]; then arm_env+=(HABANA_LOGS="$ARM_DIR/habana_logs"); mkdir -p "$ARM_DIR/habana_logs"; fi
+            # The runtime switch file (the whole-probe switch arms and sw): a path at the server's start, absent then.
+            if [ "$whole_switch" = 1 ] || [[ " ${post_words[*]:-} " == *" sw "* ]] ||
+                [[ " ${post_words[*]:-} " == *" dg32 "* ]]; then
+                rm -f "$ARM_DIR/switches" "$ARM_DIR/switches.new"
+                switch_env=(VLLM_HPU_RUNTIME_SWITCH_FILE="$ARM_DIR/switches")
+            fi
+            if [ "$whole_switch" = 1 ]; then
+                draft_graph=0
+                switch_args=(--probe-arg "--switch-file=$ARM_DIR/switches" --probe-arg "--server-log=$ARM_DIR/server0.log")
+                # HEADLINE_SWITCH_SET: graph (default) = off / on; graph-md = the 2 x 2 with engine-step's
+                # VLLM_HPU_FLASH_NEXT_DECODE_METADATA (the sparse-QSA decode metadata, also switchable)
+                case "${HEADLINE_SWITCH_SET:-graph}" in
+                    graph-md)
+                        switch_args+=(--probe-arg "--switch-arm=off=VLLM_HPU_MTP_DRAFT_GRAPH=0;VLLM_HPU_FLASH_NEXT_DECODE_METADATA=0"
+                            --probe-arg "--switch-arm=on=VLLM_HPU_MTP_DRAFT_GRAPH=1;VLLM_HPU_FLASH_NEXT_DECODE_METADATA=0"
+                            --probe-arg "--switch-arm=md=VLLM_HPU_MTP_DRAFT_GRAPH=0;VLLM_HPU_FLASH_NEXT_DECODE_METADATA=1"
+                            --probe-arg "--switch-arm=on-md=VLLM_HPU_MTP_DRAFT_GRAPH=1;VLLM_HPU_FLASH_NEXT_DECODE_METADATA=1")
+                        ;;
+                    *)
+                        switch_args+=(--probe-arg "--switch-arm=off=VLLM_HPU_MTP_DRAFT_GRAPH=0"
+                            --probe-arg "--switch-arm=on=VLLM_HPU_MTP_DRAFT_GRAPH=1")
+                        ;;
+                esac
+            fi
+            # The post steps (serve_probe.sh --post-cmd), in the order sw, cap, kvlp / kvlpfb, long. Each command is
+            # one bash -c string; serve_probe.sh runs it in the arm's folder with SERVE_PORT set.
+            for w in sw dg32 cap kvlp kvlpfb long; do
+                [[ " ${post_words[*]:-} " == *" $w "* ]] || continue
+                case "$w" in
+                    sw | dg32)
+                        # sw: HEADLINE_SW_ARMS at HEADLINE_SW_LEVELS, HEADLINE_SW_ROUNDS rounds (scaling_sw.json);
+                        # dg32: the draft graph off / on at 32 streams, one round each (scaling_dg32.json: engine-step's
+                        # copy_to log of both forms, with hpulog)
+                        sw_levels="${HEADLINE_SW_LEVELS:-32,8,1}"
+                        sw_rounds="${HEADLINE_SW_ROUNDS:-2}"
+                        sw_spec="${HEADLINE_SW_ARMS:-off=VLLM_HPU_MTP_DRAFT_GRAPH=0,VLLM_HPU_FLASH_NEXT_DECODE_METADATA=0;dg=VLLM_HPU_MTP_DRAFT_GRAPH=1,VLLM_HPU_FLASH_NEXT_DECODE_METADATA=0;md=VLLM_HPU_MTP_DRAFT_GRAPH=0,VLLM_HPU_FLASH_NEXT_DECODE_METADATA=1}"
+                        if [ "$w" = dg32 ]; then
+                            sw_levels=32
+                            sw_rounds=1
+                            sw_spec="off=VLLM_HPU_MTP_DRAFT_GRAPH=0;dg=VLLM_HPU_MTP_DRAFT_GRAPH=1"
+                        fi
+                        sw_cmd=("$PYTHON" "$HERE/decode_scaling.py" --model fn --levels "$sw_levels" --tokens "$TOKENS"
+                            --warm-tokens "$WARM" --rounds "$sw_rounds" --no-sampled-check
+                            --switch-file "$ARM_DIR/switches" --server-log "$ARM_DIR/server0.log"
+                            --timeout "${HEADLINE_PROBE_TIMEOUT:-1800}" --out "$ARM_DIR/scaling_$w.json")
+                        # NAME=FLAG=V,FLAG=V;NAME=FLAG=V,... (the first arm's values are the server's start values)
+                        IFS=';' read -r -a sw_arms <<<"$sw_spec"
+                        for a in "${sw_arms[@]}"; do sw_cmd+=(--switch-arm "${a//,/;}"); done
+                        first="${sw_arms[0]#*=}"
+                        restore="$(printf '%s\n' "${first//,/ }" | tr ' ' '\n')"
+                        post_args+=(--post-cmd "$(printf '%q ' "${sw_cmd[@]}") --port \"\$SERVE_PORT\" 2>&1 | tee probe_$w.log; rc=\${PIPESTATUS[0]}; printf '%s\n' $(printf '%q' "$restore") > switches.new && mv switches.new switches; sleep 4; echo \"switches back to: \$(tr '\n' ' ' < switches)\"; exit \$rc")
+                        ;;
+                    cap)
+                        cap_cmd=("$PYTHON" "$TREE/tools/flash_next/anatomy/anatomy_probe.py" --model fn --phases ""
+                            --trace "${HEADLINE_CAPTURE_LEVELS:-32,1}" --trace-tokens 64 --trace-after 12 --trace-seconds 0.6
+                            --measured-timeout 600 --out "$ARM_DIR/trace_probe.json")
+                        post_args+=(--post-cmd "$(printf '%q ' "${cap_cmd[@]}") --port \"\$SERVE_PORT\" 2>&1 | tee trace_probe.log; rc=\${PIPESTATUS[0]}; ls -la trace 2>/dev/null | tail -n 12; du -sh trace 2>/dev/null; exit \$rc")
+                        ;;
+                    kvlp | kvlpfb)
+                        label=bf16
+                        ref_args=()
+                        if [ "$fp8kv" = 1 ]; then
+                            label=fp8
+                            ref="${HEADLINE_KVLP_REF:-$(good_kvlp_ref)}"
+                            if [ -n "$ref" ]; then ref_args=(--reference "$ref"); fi
+                            echo "headline_job: arm $arm: kvlp reference ${ref:-none (no good kvlp_bf16.json in the job)}"
+                        elif [ "$w" = kvlpfb ] && [ -n "$(good_kvlp_ref)" ]; then
+                            echo "headline_job: arm $arm: kvlpfb not needed, the job has a reference: $(good_kvlp_ref)"
+                            continue
+                        fi
+                        kvlp_cmd=("$PYTHON" "$TREE/tools/flash_next/rental/kv_logprob_probe.py" --model fn --docs "$TREE"
+                            --label "$label" --lengths "${HEADLINE_KVLP_LENGTHS:-16000,64000,120000}"
+                            --timeout "${HEADLINE_KVLP_TIMEOUT:-1200}" --out "$ARM_DIR/kvlp_$label.json"
+                            ${ref_args[@]+"${ref_args[@]}"})
+                        post_args+=(--post-cmd "$(printf '%q ' "${kvlp_cmd[@]}") --port \"\$SERVE_PORT\" 2>&1 | tee kvlp_$label.log; exit \${PIPESTATUS[0]}")
+                        ;;
+                    long)
+                        long_cmd=("$PYTHON" "$TREE/tools/flash_next/rental/qsa_ab_probe.py" --model fn --levels ""
+                            --ctx "${HEADLINE_LONG_CTX:-64000}" --long-streams "${HEADLINE_LONG_STREAMS:-32}"
+                            --long-repeat "${HEADLINE_LONG_REPEAT:-1}" --tokens "$TOKENS" --docs "$TREE/docs/design/flash-next"
+                            --timeout "${HEADLINE_LONG_TIMEOUT:-1500}" --out "$ARM_DIR/long.json")
+                        post_args+=(--post-cmd "$(printf '%q ' "${long_cmd[@]}") --port \"\$SERVE_PORT\" 2>&1 | tee long.log; exit \${PIPESTATUS[0]}")
+                        ;;
+                esac
+            done
+            # HEADLINE_TRACE_ENV=1: step-anatomy's capture setup at every MTP server's start (00205's recipe)
+            if [ "${HEADLINE_TRACE_ENV:-0}" = 1 ]; then
+                mkdir -p "$ARM_DIR/trace" "$ARM_DIR/timing"
+                arm_env+=(HABANA_PROFILE=profile_api_light VLLM_HPU_STEP_TIMING="${VLLM_HPU_STEP_TIMING:-1}"
+                    VLLM_HPU_STEP_TIMING_DIR="$ARM_DIR/timing")
+                serve_extra+=(--profiler-config "{\"profiler\": \"torch\", \"torch_profiler_dir\": \"$ARM_DIR/trace\", \"torch_profiler_with_stack\": false, \"torch_profiler_use_gzip\": true, \"torch_profiler_record_shapes\": false}")
+            fi
+            # HEADLINE_MTP_SAMPLED=1: the server also verifies sampled requests (VLLM_HPU_SPEC_SAMPLED_VERIFY=1, the
+            # exact path, unless the job sets it) and SAMPLED rounds follow each level of HEADLINE_MTP_SAMPLED_LEVELS
+            # (default 32) right after its greedy rounds.
+            sampled_args=(--probe-arg --no-sampled-check)
+            sampled_verify="${VLLM_HPU_SPEC_SAMPLED_VERIFY:-0}"
+            if [ "${HEADLINE_MTP_SAMPLED:-0}" = 1 ] && [ "$greedy_only" = 0 ]; then
+                s_levels="${HEADLINE_MTP_SAMPLED_LEVELS:-32}"
+                if [ "$levels" != "$LEVELS" ]; then s_levels="$levels"; fi
+                sampled_args=(--probe-arg "--sampled-levels=$s_levels")
+                if [ "${HEADLINE_INTERLEAVE_SAMPLED:-0}" = 1 ]; then sampled_args+=(--probe-arg --interleave-sampled); fi
+                sampled_verify="${VLLM_HPU_SPEC_SAMPLED_VERIFY:-1}"
+            fi
+            dense_args=()
+            if [ "${HEADLINE_REQUIRE_DENSE:-0}" = 1 ] && [ "${VLLM_HPU_MOE_DENSE:-0}" = 1 ]; then
+                dense_args=(--require-log "MOE_DENSE=1: the per-channel FP8 MoE layers keep their stacked experts"
+                    --forbid-log "MOE_DENSE=1: a device move after the weights were prepared"
+                    --probe-require-log "runs the dense MoE form")
+            fi
+            echo "headline_job: arm $arm: k $k, levels $levels, draft graph $draft_graph, ${async_env[*]:-sync}," \
+                "MTP timer $timing, env ${arm_env[*]:-} ${unset_env[*]:-}, serve args ${serve_extra[*]:-}," \
+                "after the probe: ${post_words[*]:-nothing}"
+            placed "$ARM_DIR" env ${unset_env[@]+"${unset_env[@]}"} ${async_env[@]+"${async_env[@]}"} \
+                ${switch_env[@]+"${switch_env[@]}"} ${arm_env[@]+"${arm_env[@]}"} \
+                VLLM_HPU_QSA_INDEXER_SHARD="$shard" VLLM_HPU_SPEC_SAMPLED_VERIFY="$sampled_verify" \
+                VLLM_HPU_GDN_CORE_VERIFY="${VLLM_HPU_GDN_CORE_VERIFY:-1}" VLLM_HPU_MTP_TIMING="$timing" \
+                VLLM_HPU_MTP_DRAFT_LOOP="${VLLM_HPU_MTP_DRAFT_LOOP:-1}" VLLM_HPU_MTP_CHUNK_KV="${VLLM_HPU_MTP_CHUNK_KV:-1}" \
+                VLLM_HPU_MTP_DRAFT_GRAPH="$draft_graph" VLLM_HPU_MTP_REPLICATED_FC="$replicated_fc" \
+                bash "$HERE/serve_probe.sh" --out "$ARM_DIR" --mtp "$k" --levels "$levels" --tokens "$TOKENS" \
+                --warm-tokens "$WARM" --repeat-top 1 --no-mintok-check "${sampled_args[@]}" \
+                ${switch_args[@]+"${switch_args[@]}"} ${dense_args[@]+"${dense_args[@]}"} \
+                ${post_args[@]+"${post_args[@]}"} --probe-arg "--rounds=$ROUNDS" \
+                ${HEADLINE_MTP_CTX:+--ctx "$HEADLINE_MTP_CTX"} $(barrier_args "$arm") $(guard_args) \
+                ${serve_extra[@]+-- "${serve_extra[@]}"}
+            ;;
+        *)
+            echo "headline_job: unknown arm $arm (nospec, mtp3, mtp3-32)"
+            failed=$((failed + 1))
+            continue
+            ;;
+    esac
+    rc=$?
+    # The probe ends with 0 even when rounds failed (it records them): a round with errors, or no measured round
+    # at all, makes the arm a probe failure (5).
+    if [ "$rc" -eq 0 ] && ! "$PYTHON" - "$OUT/$arm/scaling.json" <<'PY2'
+import json, sys
+try:
+    data = json.load(open(sys.argv[1]))
+except (OSError, ValueError):
+    sys.exit(1)
+rounds = data.get("levels") or []  # greedy rounds; a failed sampled round is reported, not a server failure
+sys.exit(0 if rounds and all(r.get("ok") and not r.get("errors") for r in rounds) else 1)
+PY2
+    then
+        echo "headline_job: arm $arm: a greedy round failed or none was measured (scaling.json): a probe failure"
+        rc=5
+    fi
+    echo "=== headline_job: arm $arm rc=$rc end $(date -u +%T)"
+    if [ "$rc" -ne 0 ]; then failed=$((failed + 1)); fi
+    "$PYTHON" "$HERE/headline_table.py" "$OUT" --md "$OUT/headline.md" --json "$OUT/headline.json" || true
+    if [ "$rc" -eq 8 ]; then
+        # a required server log line is missing (HEADLINE_REQUIRE_DENSE: the dense MoE form did not run): every
+        # later arm of the build depends on the same flag, so the job stops here instead of measuring a fallback
+        echo "headline_job: arm $arm ended with 8 (a required server log line is missing): the job stops"
+        clear_cards
+        exit 8
+    fi
+    left=$((HOLD_S - ($(date -u +%s) - T0)))
+    case "$arm" in mtp[1-9]) is_mtp=1 ;; *) is_mtp=0 ;; esac
+    if [ "$is_mtp" = 1 ] && [ "$FALLBACK" = 1 ] && { [ "$rc" -eq 3 ] || [ "$rc" -eq 5 ]; }; then
+        if [ "$left" -ge 900 ]; then
+            echo "headline_job: $arm ended with $rc: the same server with VLLM_HPU_QSA_INDEXER_SHARD=0 next ($left s left)"
+            ARMS+=("$arm-noshard")
+        else
+            echo "headline_job: $arm ended with $rc; only $left s left: no run without the request shard"
+        fi
+    fi
+done
+echo "headline_job: $failed of ${#ARMS[@]} arms failed; $(date -u +%T)"
+exit "$failed"
