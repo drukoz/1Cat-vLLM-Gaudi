@@ -38,7 +38,8 @@ from vllm_gaudi.extension.debug import init_debug_logger
 from vllm_gaudi.v1.core.recurrent_state_pool import pool_pad_block_id, pool_slots_from_env, pool_tensor_slots
 from vllm_gaudi.v1.worker.hpu_dp_utils import set_hpu_dp_metadata
 from vllm_gaudi.v1.worker.gdn_state_layout import has_contiguous_dflash_checkpoints
-from vllm_gaudi.v1.worker.flash_next_inputs import (build_block_table, build_ple_inputs, dummy_ple_inputs,
+from vllm_gaudi.v1.worker.flash_next_inputs import (build_block_table, build_ple_inputs, decode_block_table_width,
+                                                    dummy_ple_inputs,
                                                     model_requires_block_table, model_requires_raw_input_tokens)
 from vllm_gaudi.v1.worker.recurrent_commit import (apply_align_precopy, boundary_commits, commit_conv, commit_ssm,
                                                    self_commit_requests)
@@ -5122,8 +5123,12 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
 
         block_table_cpu = None
         if getattr(self, '_needs_block_table', False):
-            block_table_cpu = build_block_table(block_tables_list, padded_batch_size * num_tokens,
-                                                self._block_table_max_blocks, self._PAD_BLOCK_ID)
+            # VLLM_HPU_QSA_TABLE_WIDTH=1: as wide as the batch's longest request needs, not as the engine's
+            # longest context (the QSA indexer scores every column's keys).
+            table_width = decode_block_table_width(num_blocks, self._block_table_max_blocks,
+                                                   gaudi_envs.VLLM_HPU_QSA_TABLE_WIDTH)
+            block_table_cpu = build_block_table(block_tables_list, padded_batch_size * num_tokens, table_width,
+                                                self._PAD_BLOCK_ID)
 
         # CONTEXT_LENS [batch_size]
         block_list, block_groups, block_usage = \
