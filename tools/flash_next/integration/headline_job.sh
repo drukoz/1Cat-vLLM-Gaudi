@@ -171,6 +171,11 @@ while [ "$i_arm" -lt "${#ARMS[@]}" ]; do
     if [ "$first" -eq 0 ]; then clear_cards; fi
     first=0
     echo "=== headline_job: arm $arm start $(date -u +%T)"
+    # async-sched job branch: the step timer's records of each arm in its own folder.
+    if [ "${VLLM_HPU_STEP_TIMING:-0}" != 0 ]; then
+        export VLLM_HPU_STEP_TIMING_DIR="$OUT/$arm/timing"
+        mkdir -p "$VLLM_HPU_STEP_TIMING_DIR"
+    fi
     case "$arm" in
         tiny)
             spec=()
@@ -198,6 +203,14 @@ while [ "$i_arm" -lt "${#ARMS[@]}" ]; do
                 bash "$HERE/serve_probe.sh" --out "$OUT/$arm" --levels "$LEVELS" --tokens "$TOKENS" \
                 --warm-tokens "$WARM" --repeat-top 2 --no-mintok-check --probe-arg "--sampled-levels=$LEVELS" \
                 --probe-arg --interleave-sampled --probe-arg "--rounds=$ROUNDS" $(barrier_args "$arm") $(guard_args)
+            ;;
+        nospec-devids)
+            # async-sched job branch: the nospec server (no async scheduling) with the PLE n-gram ids in the graph
+            # (VLLM_HPU_PLE_HOST_NGRAM_IDS=0, what async scheduling must use): the ids' cost alone.
+            VLLM_HPU_PLE_HOST_NGRAM_IDS=0 \
+                bash "$HERE/serve_probe.sh" --out "$OUT/$arm" --levels "$LEVELS" --tokens "$TOKENS" \
+                --warm-tokens "$WARM" --repeat-top 2 --no-mintok-check --probe-arg --no-sampled-check \
+                --probe-arg "--rounds=$ROUNDS"
             ;;
         nospec-noshard | nospec-noprefix | nospec-noprefix-nocut)
             # The low-stream bisect (coordinator, build 3): A's env without the QSA request shard; A's env without the
