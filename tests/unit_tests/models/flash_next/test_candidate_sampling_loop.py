@@ -48,8 +48,8 @@ class _Steps:
         inputs = runner._candidate_sampling_inputs
         captured = {}
 
-        def recording_inputs(request_ids, rows):
-            result = inputs(request_ids, rows)
+        def recording_inputs(request_ids, rows, *args):
+            result = inputs(request_ids, rows, *args)
             greedy = all(runner.requests[r].sampling_params.sampling_type == SamplingType.GREEDY for r in request_ids)
             self.gate.append((greedy, result is None))
             return result

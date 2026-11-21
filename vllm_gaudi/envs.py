@@ -535,7 +535,8 @@ if TYPE_CHECKING:
     VLLM_HPU_QSA_TABLE_WIDTH: int = 0  # decode block-table columns: 0 the engine's longest context (default), 1 the batch's
     VLLM_HPU_FLASH_NEXT_DECODE_METADATA: int = 0  # 0 dense paged-attention buffers (default), 1 sparse-QSA only
     VLLM_HPU_RUNTIME_SWITCH_FILE: str = ""  # a file of per-step flags a running server rereads (an A/B on one server)
-    VLLM_HPU_CANDIDATE_SAMPLING: int = 0  # 0 vLLM's sampler over the vocabulary (default), 1 sampling over candidates
+    VLLM_HPU_CANDIDATE_SAMPLING: int = 0  # 0 vLLM's sampler (default), 1 sampling over candidates, 2 also speculative steps
+    VLLM_HPU_SAMPLER_REQUEST_PARAMS: int = 0  # 0 as before (ignored on HPU), 1 min_tokens/logit_bias/min_p per row
     VLLM_HPU_GDN_CORE_DECODE: int = 1  # GdnCoreDecodeMode: 1 fused (default), 0 off, 2 recurrence
     VLLM_HPU_GDN_CORE_DECODE_DEBUG: int = 0  # GdnCoreDecodeDebug: 0 off, 1 check slot indices every step (host sync)
     VLLM_HPU_GDN_CORE_VERIFY: int = 0  # GdnCoreVerifyMode: 0 off (default), 1 fused verification steps
@@ -1968,9 +1969,20 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # temperature, top-k, top-p and the draw run on [rows, 64] with noise made on the host; no sampler graph. A
     # step whose requests are outside its conditions (top_k unset or above 64, min_p, penalties, logit_bias,
     # logprobs, a custom logits processor, speculation, structured output) keeps vLLM's sampler. Same
-    # distribution as vLLM's; the random stream differs. Any other value is 0.
+    # distribution as vLLM's; the random stream differs. 2 = 1, and the decode steps of a speculative server with
+    # deterministic drafts (MTP, n-gram) sample every verification row and the bonus row in the region, then the
+    # runner verifies the drafts against those draws (greedy_rejection_sample_from_tokens): speculative sampling
+    # exactly for one-hot drafts. Needs mtp-card-ready's VLLM_HPU_SPEC_SAMPLED_VERIFY at 1 or 2, which admits
+    # sampled requests and serves the steps the region refuses; without it 2 acts as 1. Any other value is 0.
     "VLLM_HPU_CANDIDATE_SAMPLING":
     lambda: int(os.environ.get("VLLM_HPU_CANDIDATE_SAMPLING", "0")),
+
+    # min_tokens, logit_bias and min_p on the general sampler path (v1/sample/request_params.py). 0 (default) = as
+    # before: on HPU vLLM's processors for them never receive the batch's state, so all three are ignored. 1 = the
+    # runner applies each row's own request's min_tokens mask, logit_bias and min_p cut to the logits before vLLM's
+    # sampler (fixed shapes, host-made int64 indices). Any other value is 0.
+    "VLLM_HPU_SAMPLER_REQUEST_PARAMS":
+    lambda: int(os.environ.get("VLLM_HPU_SAMPLER_REQUEST_PARAMS", "0")),
 
     # Flash-Next GDN decode through the fused core op (flashinfer_gaudi.gdn_core_decode).
     # 1 (default) = fused, 0 = off (the torch path), 2 = recurrence only (a bisect tool).

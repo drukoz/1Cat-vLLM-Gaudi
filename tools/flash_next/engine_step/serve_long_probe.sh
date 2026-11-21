@@ -9,7 +9,7 @@
 # flag-on rounds in turn), counts the switches the workers logged and the decode graphs compiled at run time,
 # stops the server. Options go to the probe: --prefix TOKENS (default 120832), --streams N (default 32),
 # --tokens N (default 128), --arms LIST (default both,i01,i05), --budget SECONDS, --no-long, --candvp,
-# --logprobs-check. hl-smi's device memory goes to hlsmi.log every 15 s.
+# --logprobs-check. hl-smi's device memory goes to hlsmi.log every 15 s. SERVE_SPEC_K=K adds MTP with K drafts.
 set -u
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 OUT="${FARM_OUT:-/results/serve}"
@@ -31,11 +31,16 @@ rm -f "$VLLM_HPU_RUNTIME_SWITCH_FILE"
     echo "image: $(cat /farm-image 2>/dev/null)"; echo "cards: ${FARM_CARDS:-?} (modules ${FARM_MODULES:-?}), port $PORT, tp $TP"
     env | grep -E '^(VLLM_|PT_HPU|HABANA_VISIBLE|FARM_)' | sort
 } > versions.txt
+# SERVE_SPEC_K=K: the server drafts K tokens with MTP (--speculative-config method mtp).
+SPEC_ARGS=()
+if [ -n "${SERVE_SPEC_K:-}" ]; then
+    SPEC_ARGS=(--speculative-config "{\"method\": \"mtp\", \"num_speculative_tokens\": ${SERVE_SPEC_K}}")
+fi
 setsid vllm serve /models/Qwen3.8-Flash-Next-FP8 --served-model-name fn --host 127.0.0.1 --port "$PORT" \
     --tensor-parallel-size "$TP" --enable-expert-parallel --max-model-len 131072 --max-num-seqs 32 \
     --enable-prefix-caching --language-model-only --trust-remote-code --gpu-memory-utilization 0.92 \
     --max-num-batched-tokens 8192 --long-prefill-token-threshold 2048 --enable-prompt-tokens-details \
-    > server0.log 2>&1 &
+    ${SPEC_ARGS[@]+"${SPEC_ARGS[@]}"} > server0.log 2>&1 &
 SP=$!
 # Device memory every 15 s (coordinator, 23:50 UTC: graphs made at run time can exhaust it; PT_DEVMEM lines).
 HLSMI=""

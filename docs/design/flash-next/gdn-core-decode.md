@@ -604,6 +604,17 @@ variable, the bytes of every output file equal, the interleaved count at most 0.
 the variable at 1, and the time per call (`tools/flash_next/gdn_core_decode_bench.py`) with and without it; the
 simulator counts instruction words, not cycles.
 
+On the card (2026-11-20): the decode and verify op tests pass with the variable at 1 (job 00039, 26 passed); the real
+model at TP4 + EP4 with this variable, `VLLM_HPU_GDN_GLUE_CACHE=1` and `VLLM_HPU_HC_FUSED_COPY_MODE=2` against the
+preset on the same cards (00091): the decode step about 6 % shorter at 32 streams, about 3 % at 8 and at 1 stream,
+the 1-stream texts identical. The per-row cost is this kernel's: in the device trace of the served graph
+(step-anatomy 00113, TP4, without the variable) one call runs about 42 us per index point (the simulator's
+71.6K instruction words per point), 4 points on 4 TPCs at 1 row and 128 points on 16 TPCs at 32 rows (about 335 us
+per call, about 12 ms of a 107 ms step), while the projections and the glue around it stay flat in the rows. The
+bench's per-call times are not row costs: it calls the op 8 times on one pool in one graph, and the op's HPU
+registration declares only `out` (the bridge's CustomOp API has no in-place output), so those calls have no
+declared order and the compiler may overlap them (card rule 10; one call per pool and graph in serving).
+
 Tests (tpcsim container; `tests/standalone/gdn_core_decode/`):
 - `test_simulation.py`: all three kernels are compiled with one flag list; `test_vector_local_memory` asserts the
   compiler's count is at most 13312 bytes (3 KiB free; it was 4 KiB free before the kernel grew to 6 nodes) for

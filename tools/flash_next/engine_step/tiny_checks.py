@@ -16,7 +16,9 @@ and one with ``prompt_logprobs=2``:
   tiny model's logits are near-flat, its 4th and 5th may swap).
 
 Arms: ``i01`` = ``VLLM_HPU_FLASH_NEXT_DECODE_METADATA=1``, ``i05`` = ``VLLM_HPU_FUSED_GREEDY_LOGITS=1``,
-``base`` = neither. Job 00093 ran both flags at once: the 700-token prompt took another token at its 5th position
+``base`` = neither, ``params`` = ``VLLM_HPU_SAMPLER_REQUEST_PARAMS=1`` on the general sampler path, with
+``request_params_check`` (a ``logit_bias`` of +100 must win, a stop token before ``min_tokens`` must not appear,
+a ``min_p`` request must answer). Job 00093 ran both flags at once: the 700-token prompt took another token at its 5th position
 (a near tie of the tiny model resolved the other way by the in-graph greedy region, INFERRED from the same token
 stream in collectives' and mtp-card-ready's runs): one flag at a time says which flag carries it. The exit code is
 1 when a logprobs check failed, else 0 (the token comparison of each arm is reported, not judged here).
@@ -35,7 +37,10 @@ ARMS = {
     "i01": ["VLLM_HPU_FLASH_NEXT_DECODE_METADATA=1"],
     "i05": ["VLLM_HPU_FUSED_GREEDY_LOGITS=1"],
     "both": ["VLLM_HPU_FLASH_NEXT_DECODE_METADATA=1", "VLLM_HPU_FUSED_GREEDY_LOGITS=1"],
+    # min_tokens / logit_bias / min_p on the general sampler path (the fused greedy region off)
+    "params": ["VLLM_HPU_SAMPLER_REQUEST_PARAMS=1", "VLLM_HPU_FUSED_GREEDY_LOGITS=0"],
 }
+BIAS_TOKEN = 4242  # a token the tiny model never picks by itself
 ID_LIMIT = 1 << 24  # every id of the tiny model's vocabulary is below it; a garbled id is not
 CHECKS: list = []  # one record per arm, filled while its server is up
 
@@ -101,6 +106,53 @@ def logprobs_check(gates, base_url: str, reference_path) -> dict:
     return record
 
 
+def request_params_check(gates, base_url: str, reference_path) -> dict:
+    """VLLM_HPU_SAMPLER_REQUEST_PARAMS=1 on the general sampler path: a logit_bias of +100 makes a greedy request
+    write only that token; a stop token the model would emit before min_tokens is not emitted; a min_p request
+    answers; /health after."""
+    reference = json.loads(Path(reference_path).read_text(encoding="utf-8"))
+    prompts = sorted(reference["prompts"], key=lambda p: len(p["prompt_ids"]))
+    record = {"ok": True}
+
+    def post(payload):
+        return gates._post_json(base_url, "/v1/completions", dict({"model": "tiny", "return_token_ids": True},
+                                                                   **payload), 120.0)
+
+    short = next(p for p in prompts if len(p["prompt_ids"]) == 7)
+    try:
+        resp = post({"prompt": short["prompt_ids"], "max_tokens": 6, "temperature": 0,
+                     "logit_bias": {str(BIAS_TOKEN): 100.0}})
+        got = (resp.get("choices") or [{}])[0].get("token_ids") or []
+        record["logit_bias"] = {"tokens": got, "ok": got == [BIAS_TOKEN] * 6}
+    except Exception as e:  # noqa: BLE001
+        record["logit_bias"] = {"error": ("%s: %s" % (type(e).__name__, e))[:300], "ok": False}
+    longer = next(p for p in prompts if 30 <= len(p["prompt_ids"]) <= 700 and len(p["generated_ids"]) >= 8
+                  and p["generated_ids"][2] not in p["generated_ids"][:2])
+    stop = longer["generated_ids"][2]
+    try:
+        resp = post({"prompt": longer["prompt_ids"], "max_tokens": 6, "min_tokens": 6, "temperature": 0,
+                     "stop_token_ids": [stop]})
+        got = (resp.get("choices") or [{}])[0].get("token_ids") or []
+        record["min_tokens"] = {"tokens": got, "stop": stop, "ok": stop not in got and len(got) == 6}
+    except Exception as e:  # noqa: BLE001
+        record["min_tokens"] = {"error": ("%s: %s" % (type(e).__name__, e))[:300], "ok": False}
+    try:
+        resp = post({"prompt": short["prompt_ids"], "max_tokens": 8, "temperature": 1.0, "top_k": 20,
+                     "min_p": 0.5})
+        got = (resp.get("choices") or [{}])[0].get("token_ids") or []
+        record["min_p"] = {"tokens": got, "ok": len(got) == 8}
+    except Exception as e:  # noqa: BLE001
+        record["min_p"] = {"error": ("%s: %s" % (type(e).__name__, e))[:300], "ok": False}
+    try:
+        with urllib.request.urlopen(base_url + "/health", timeout=30) as resp:
+            record["health_after"] = resp.status
+    except Exception as e:  # noqa: BLE001
+        record["health_after"] = repr(e)[:200]
+    record["ok"] = all(record[k]["ok"] for k in ("logit_bias", "min_tokens", "min_p")) and \
+        record["health_after"] == 200
+    return record
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--arms", default="i01,i05")
@@ -114,9 +166,16 @@ def main() -> int:
 
     original = gates.tiny_compare
 
+    current = {"arm": None}
+
     def compare_then_logprobs(base_url, reference_path):
         status, details = original(base_url, reference_path)
         check = logprobs_check(gates, base_url, reference_path)
+        if current["arm"] == "params":
+            params = request_params_check(gates, base_url, reference_path)
+            check["request_params"] = params
+            check["ok"] = check["ok"] and params["ok"]
+            print("PARAMS %s: %s" % ("ok" if params["ok"] else "FAILED", json.dumps(params)), flush=True)
         CHECKS.append(check)
         details["logprobs_check"] = check
         return status, details
@@ -126,6 +185,7 @@ def main() -> int:
     for number, arm in enumerate([a for a in args.arms.split(",") if a]):
         if number:
             time.sleep(8)  # the last server's workers have let go of the card (CARD.md, two steps on one card)
+        current["arm"] = arm
         env = [w for kv in ARMS[arm] for w in ("--env", kv)]
         out = str(Path(args.out) / ("tiny-" + arm))
         print("== tiny model, arm %s: %s" % (arm, " ".join(ARMS[arm]) or "no engine-step flag"), flush=True)

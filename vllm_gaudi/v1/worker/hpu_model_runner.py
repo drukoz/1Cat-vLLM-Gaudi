@@ -49,7 +49,9 @@ from vllm_gaudi.v1.sample.fused_greedy import STOP_ID_WIDTH, mask_stop_tokens, m
 from vllm_gaudi.v1.sample.candidate_sampling import (CANDIDATES, candidate_parameters, candidate_refusal,
                                                      sample_candidates)
 from vllm_gaudi.v1.sample.candidate_sampling import PARAM_COLUMNS as CANDIDATE_PARAM_COLUMNS
+from vllm_gaudi.v1.sample.candidate_sampling import NOISE_SEED as CANDIDATE_NOISE_SEED
 from vllm_gaudi.v1.sample.topk_ids import topk_with_ids
+from vllm_gaudi.v1.sample.request_params import RowParams, apply_request_adjustments, request_adjustments
 from vllm_gaudi.v1.worker.runtime_switches import RuntimeSwitchFile
 from vllm_gaudi.v1.worker.recurrent_commit import (apply_align_precopy, boundary_commits, commit_conv, commit_ssm,
                                                    self_commit_requests)
@@ -1998,6 +2000,19 @@ def _hpu_graph_wrap_kwargs() -> dict:
         kwargs["asynchronous"] = True
         logger.info("VLLM_HPU_GRAPH_ASYNC_REPLAY=1: the model's HPU graph replays asynchronously")
     return kwargs
+
+
+def _prompt_hidden_states_per_request(hidden_states: torch.Tensor, token_ids: torch.Tensor) -> torch.Tensor:
+    """The prefill hidden states with one row per request of the prompt batch: ``[batch, seq, hidden]``.
+
+    ``token_ids`` is the prompt batch ``[batch, seq]``. A model that returns its hidden states flattened,
+    ``[batch * seq, hidden]`` (Flash-Next), is viewed by that shape: indexing the flat tensor by request took one
+    token's vector, and a request with prompt logprobs then ended the engine in the LM head (engine-step job 00130,
+    ``1x6 and 128x248320``). Any other shape is returned as it is.
+    """
+    if hidden_states.dim() == 2 and token_ids.dim() == 2 and hidden_states.shape[0] == token_ids.numel():
+        return hidden_states.view(token_ids.shape[0], token_ids.shape[1], hidden_states.shape[-1])
+    return hidden_states
 
 
 def _maybe_wrap_in_hpu_graph(*args, **kwargs):
@@ -6388,7 +6403,7 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             stops.append(params.all_stop_token_ids if below else None)
         return min_tokens_stop_ids(stops, rows)
 
-    def _candidate_sampling_inputs(self, request_ids: list[str], rows: int):
+    def _candidate_sampling_inputs(self, request_ids: list[str], rows: int, spec_decode_metadata=None):
         """VLLM_HPU_CANDIDATE_SAMPLING=1: this step's host tensors for the sampled region, or ``None`` when the
         step keeps the general sampler (the flag is off, a request is outside the conditions of
         ``candidate_sampling.candidate_refusal``, or every request is greedy).
@@ -6396,9 +6411,10 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         Returns ``(params, top_k_index, mixed, stops)``: the two tensors of ``candidate_parameters`` (the noise
         of a seeded request from its own host generator), whether the batch has greedy rows, and the
         min_tokens mask of ``fused_greedy.min_tokens_stop_ids`` (or ``None``)."""
-        if int(gaudi_envs.VLLM_HPU_CANDIDATE_SAMPLING) != 1:
+        flag = int(gaudi_envs.VLLM_HPU_CANDIDATE_SAMPLING)
+        if flag not in (1, 2):
             return None
-        inputs, reason = self._candidate_sampling_decision(request_ids, rows)
+        inputs, reason = self._candidate_sampling_decision(request_ids, rows, flag, spec_decode_metadata)
         self._log_candidate_path(inputs, reason, len(request_ids), rows)
         return inputs
 
@@ -6435,16 +6451,29 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                 "Candidate sampling (VLLM_HPU_CANDIDATE_SAMPLING=1): a sampled decode step took vLLM's sampler "
                 "instead: %s. Logged once.", reason)
 
-    def _candidate_sampling_decision(self, request_ids: list[str], rows: int):
+    def _candidate_sampling_decision(self, request_ids: list[str], rows: int, flag: int = 1,
+                                     spec_decode_metadata=None):
         """``(inputs, None)`` when the step samples over candidates; ``(None, reason)`` when a step with a sampled
-        request keeps vLLM's sampler; ``(None, None)`` for a step without a sampled request."""
+        request keeps vLLM's sampler; ``(None, None)`` for a step without a sampled request.
+
+        ``flag`` 2 also serves the decode steps of a speculative server with deterministic drafts (MTP's arg max,
+        n-gram): every verification row and the bonus row of a request draws from the target distribution with its
+        own noise, and the runner's speculative branch then takes ``greedy_rejection_sample_from_tokens`` on those
+        tokens. With a draft distribution that is one-hot at the draft d, that is speculative sampling exactly: a
+        draw y accepted when y = d is accepted with probability p(d), and a rejected draw follows p without d,
+        renormalized (``candidate_sampling.py``)."""
         sampled = [r for r in request_ids
                    if self.requests[r].sampling_params is not None
                    and self.requests[r].sampling_params.sampling_type != SamplingType.GREEDY]
         if not sampled:
             return None, None
+        rows_per_request = 1
         if self.speculative_config is not None:
-            return None, "a speculative config (the verification step samples in the rejection sampler)"
+            refusal = self._candidate_verification_refusal(flag, spec_decode_metadata, len(request_ids), rows)
+            if refusal is not None:
+                return None, refusal
+            if spec_decode_metadata is not None:
+                rows_per_request = 1 + int(self.speculative_config.num_speculative_tokens)
         if self.use_structured_output:
             return None, "structured output"
         if self.use_async_scheduling:
@@ -6458,7 +6487,7 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         generators = {}
         host_generators = self.__dict__.setdefault('_candidate_generators', {})
         mixed = False
-        for row, request_id in enumerate(request_ids):
+        for index, request_id in enumerate(request_ids):
             state = self.requests[request_id]
             params = state.sampling_params
             if params is None:
@@ -6481,24 +6510,60 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                                  stop_ids=len(params.all_stop_token_ids) if params.min_tokens else 0)
             if refusal is not None:
                 return None, f"request {request_id}: {refusal}"
-            mixed = mixed or greedy
-            temperatures.append(0.0 if greedy else params.temperature)
-            top_ks.append(params.top_k)
-            top_ps.append(params.top_p)
             below = params.min_tokens and len(state.output_token_ids) < params.min_tokens
-            stops.append(params.all_stop_token_ids if below else None)
+            if below and rows_per_request > 1:
+                return None, f"request {request_id}: min_tokens in a verification step (the mask has one row per request)"
+            mixed = mixed or greedy
+            # A request owns rows index * rows_per_request .. + rows_per_request - 1 (its verification rows and its
+            # bonus row in the runner's padded layout), each with the request's parameters and its own noise row.
+            temperatures.extend([0.0 if greedy else params.temperature] * rows_per_request)
+            top_ks.extend([params.top_k] * rows_per_request)
+            top_ps.extend([params.top_p] * rows_per_request)
+            stops.extend([params.all_stop_token_ids if below else None] * rows_per_request)
             if not greedy and params.seed is not None:
-                # A seeded request draws its noise from a host generator of its own, kept for its lifetime.
+                # A seeded request draws its noise from a host generator of its own, kept for its lifetime: its
+                # rows in row order, the same number of rows every step.
                 if request_id not in host_generators:
                     host_generators[request_id] = torch.Generator().manual_seed(params.seed)
-                generators[row] = host_generators[request_id]
+                for row in range(index * rows_per_request, (index + 1) * rows_per_request):
+                    generators[row] = host_generators[request_id]
         if all(temperature == 0.0 for temperature in temperatures):
             return None, None  # every request greedy after all: the greedy region or the general sampler
-        if len(host_generators) > len(generators):
-            for request_id in [r for r in host_generators if r not in self.requests]:
-                del host_generators[request_id]
-        params, top_k_index = candidate_parameters(temperatures, top_ks, top_ps, rows, generators=generators)
-        return (params, top_k_index, mixed, min_tokens_stop_ids(stops, rows)), None
+        for request_id in [r for r in host_generators if r not in self.requests]:
+            del host_generators[request_id]
+        if len(temperatures) > rows:
+            return None, f"{len(temperatures)} sampled rows for {rows} logits rows"
+        # The other rows draw from one host generator of this server, seeded alike on every TP rank and used by
+        # nothing else, so every rank draws the same tokens.
+        noise = self.__dict__.setdefault('_candidate_noise_generator',
+                                         torch.Generator().manual_seed(CANDIDATE_NOISE_SEED))
+        params, top_k_index = candidate_parameters(temperatures, top_ks, top_ps, rows, generator=noise,
+                                                   generators=generators)
+        stop_ids = min_tokens_stop_ids(stops, rows) if rows_per_request == 1 else None
+        return (params, top_k_index, mixed, stop_ids), None
+
+    def _candidate_verification_refusal(self, flag: int, spec_decode_metadata, requests: int,
+                                        rows: int) -> Optional[str]:
+        """``None`` when a decode step of this speculative server may sample in the candidate region, else why
+        not (VLLM_HPU_CANDIDATE_SAMPLING=2; agreed with mtp-card-ready, 2026-11-21)."""
+        if flag != 2:
+            return "a speculative config (VLLM_HPU_CANDIDATE_SAMPLING=2 serves its decode steps)"
+        method = getattr(self.speculative_config, 'method', None)
+        if method not in ("mtp", "ngram"):
+            return f"speculative method {method!r} (the region serves deterministic drafts only: mtp, ngram)"
+        # mtp-card-ready's flag admits sampled requests to a speculative server and serves every step this
+        # region refuses; without it such a step would reach the greedy-only rejection sampler.
+        if os.environ.get("VLLM_HPU_SPEC_SAMPLED_VERIFY", "0").strip() not in ("1", "2"):
+            return "VLLM_HPU_SPEC_SAMPLED_VERIFY is not 1 or 2 (it admits sampled requests to a speculative server)"
+        if spec_decode_metadata is None:
+            return None  # a decode step without drafts: one row per request
+        k = int(self.speculative_config.num_speculative_tokens)
+        drafts = list(spec_decode_metadata.num_draft_tokens)[:requests]
+        if len(drafts) < requests or any(int(n) != k for n in drafts):
+            return f"a request with fewer than {k} drafts in this step ({drafts})"
+        if rows < requests * (1 + k) or rows % (1 + k):
+            return f"{rows} logits rows for {requests} requests of {1 + k} rows"
+        return None
 
     def _run_sampling(self,
                       batch_changed: bool,
@@ -6509,6 +6574,8 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         step_timer = self.step_timer
         htorch.core.mark_step()
         sampling_metadata = self._prepare_sampling(batch_changed, request_ids, pad_to, logits_requests)
+        if int(gaudi_envs.VLLM_HPU_SAMPLER_REQUEST_PARAMS) == 1:
+            logits_device = self._apply_sampler_request_params(logits_device, request_ids, pad_to, logits_requests)
         sampler_output = self.sampler(logits=logits_device, sampling_metadata=sampling_metadata)
         if step_timer is not None:
             step_timer.lap("sample")
@@ -6517,6 +6584,34 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             step_timer.lap("launch_sample")
             step_timer.device_wait("device_sample")
         return sampler_output, sampling_metadata
+
+    def _apply_sampler_request_params(self, logits_device, request_ids, pad_to, logits_requests):
+        """VLLM_HPU_SAMPLER_REQUEST_PARAMS=1: each row's min_tokens, logit_bias and min_p, from its own request in
+        this call's row order (``v1/sample/request_params.py``): vLLM's processors for them never get the HPU
+        batch's state. The logits are returned unchanged when no row needs anything."""
+        rows = []
+        for req_id, output_token_ids in self._generate_req_id_output_token_ids_lst(request_ids, pad_to,
+                                                                                    logits_requests):
+            params = self.requests[req_id].sampling_params
+            if params is None:
+                rows.append(RowParams())
+                continue
+            greedy = params.sampling_type == SamplingType.GREEDY
+            rows.append(RowParams(min_tokens=params.min_tokens or 0,
+                                  num_output_tokens=len(output_token_ids),
+                                  stop_token_ids=tuple(params.all_stop_token_ids or ()),
+                                  logit_bias=params.logit_bias,
+                                  min_p=params.min_p or 0.0,
+                                  temperature=0.0 if greedy else float(params.temperature)))
+        rows = rows[:int(logits_device.shape[0])]
+        adjust = request_adjustments(rows)
+        if not adjust:
+            return logits_device
+        if not getattr(self, '_request_params_logged', False):
+            self._request_params_logged = True
+            logger.info("VLLM_HPU_SAMPLER_REQUEST_PARAMS=1: min_tokens, logit_bias and min_p applied per row on the "
+                        "general sampler path. Logged once.")
+        return apply_request_adjustments(logits_device, adjust.to(logits_device.device))
 
     def _pool(
         self,
@@ -7057,10 +7152,11 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                 non_flattened_hidden_states_prefills.append(non_flattened_hidden_states)
                 # Collect prefill hidden states for prompt logprobs.
                 # req_id is a list of request IDs in this prefill batch.
-                for i, rid in enumerate(req_id):
-                    if rid in self.input_batch.num_prompt_logprobs:
-                        prefill_hidden_states_for_logprobs[rid] = \
-                            non_flattened_hidden_states[i]
+                if any(rid in self.input_batch.num_prompt_logprobs for rid in req_id):
+                    per_request = _prompt_hidden_states_per_request(non_flattened_hidden_states, token_ids)
+                    for i, rid in enumerate(req_id):
+                        if rid in self.input_batch.num_prompt_logprobs:
+                            prefill_hidden_states_for_logprobs[rid] = per_request[i]
                 if self.use_aux_hidden_state_outputs:
                     aux_hidden_states_prefills.append(aux_hidden_states)
                 sample_hidden_states_prefills.append(sample_hidden_states)
@@ -7131,7 +7227,7 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                                                            int(decode_data.logits_indices.shape[0]))
                                if fuse_greedy_sampling else None)
             candidate_sampling = (None if fuse_greedy_sampling else self._candidate_sampling_inputs(
-                pd_info.decode_req_ids, int(decode_data.logits_indices.shape[0])))
+                pd_info.decode_req_ids, int(decode_data.logits_indices.shape[0]), decode_data.spec_decode_metadata))
             if step_timer is not None:
                 step_timer.lap("setup")
                 step_timer.bucket(decode_data.token_ids.size(0))
