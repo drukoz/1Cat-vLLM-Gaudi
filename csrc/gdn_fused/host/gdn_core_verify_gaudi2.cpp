@@ -19,6 +19,15 @@ extern unsigned char _binary_gdn_core_verify_gaudi2_o_end;
 // The interleaved build (VLLM_HPU_GDN_KERNEL_INTERLEAVE=1): weak, absent when it did not compile.
 extern unsigned char _binary_gdn_core_verify_interleaved_gaudi2_o_start __attribute__((weak));
 extern unsigned char _binary_gdn_core_verify_interleaved_gaudi2_o_end __attribute__((weak));
+// Its variant builds (VLLM_HPU_GDN_VERIFY_VARIANT 1, 2, 3, 6): weak, absent when they did not compile.
+extern unsigned char _binary_gdn_core_verify_interleaved_rmajor_gaudi2_o_start __attribute__((weak));
+extern unsigned char _binary_gdn_core_verify_interleaved_rmajor_gaudi2_o_end __attribute__((weak));
+extern unsigned char _binary_gdn_core_verify_interleaved_lean_gaudi2_o_start __attribute__((weak));
+extern unsigned char _binary_gdn_core_verify_interleaved_lean_gaudi2_o_end __attribute__((weak));
+extern unsigned char _binary_gdn_core_verify_interleaved_rmajor_lean_gaudi2_o_start __attribute__((weak));
+extern unsigned char _binary_gdn_core_verify_interleaved_rmajor_lean_gaudi2_o_end __attribute__((weak));
+extern unsigned char _binary_gdn_core_verify_interleaved_fold_gaudi2_o_start __attribute__((weak));
+extern unsigned char _binary_gdn_core_verify_interleaved_fold_gaudi2_o_end __attribute__((weak));
 
 namespace {
 
@@ -157,9 +166,40 @@ tpc_lib_api::GlueCodeReturn GdnCoreVerifyGaudi2::GetGcDefinitions(
         return tpc_lib_api::GLUE_INCOMPATIBLE_OUTPUT_SIZE;
     }
 
+    // The variant build of the interleaved kernel (VLLM_HPU_GDN_VERIFY_VARIANT, interleave variable at "1"), when it
+    // is linked in; otherwise the interleave variable's choice as before. Today's index space is
+    // {key heads, requests}; variants 1 and 3 take {requests, key heads}: every mapping to an index dimension below
+    // goes through keyHeadDim / requestDim.
+    // Variants 4 and 5 keep today's index space and ask the graph compiler for a split of the key-head dimension
+    // into partitions of one (preferredSplitDim, which needs every tensor dimension mapped to it allRequired).
+    // Variant 6 is the fold build with today's index space, 7 the fold build with the split of 4 and 5.
+    const int asked = GdnKernelInterleaveRequested() ? GdnVerifyVariantRequested() : 0;
+    const unsigned char* variantStart = nullptr;
+    const unsigned char* variantEnd = nullptr;
+    if (asked == 1) {
+        variantStart = &_binary_gdn_core_verify_interleaved_rmajor_gaudi2_o_start;
+        variantEnd = &_binary_gdn_core_verify_interleaved_rmajor_gaudi2_o_end;
+    } else if (asked == 2 || asked == 5) {
+        variantStart = &_binary_gdn_core_verify_interleaved_lean_gaudi2_o_start;
+        variantEnd = &_binary_gdn_core_verify_interleaved_lean_gaudi2_o_end;
+    } else if (asked == 3) {
+        variantStart = &_binary_gdn_core_verify_interleaved_rmajor_lean_gaudi2_o_start;
+        variantEnd = &_binary_gdn_core_verify_interleaved_rmajor_lean_gaudi2_o_end;
+    } else if (asked == 4) {
+        variantStart = &_binary_gdn_core_verify_interleaved_gaudi2_o_start;
+        variantEnd = &_binary_gdn_core_verify_interleaved_gaudi2_o_end;
+    } else if (asked == 6 || asked == 7) {
+        variantStart = &_binary_gdn_core_verify_interleaved_fold_gaudi2_o_start;
+        variantEnd = &_binary_gdn_core_verify_interleaved_fold_gaudi2_o_end;
+    }
+    const bool variant = asked != 0 && GdnElfLinked(variantStart, variantEnd);
+    const bool requestMajor = variant && (asked == 1 || asked == 3);
+    const bool splitKeyHeads = variant && (asked == 4 || asked == 5 || asked == 7);
+    const unsigned keyHeadDim = requestMajor ? 1 : 0;
+    const unsigned requestDim = requestMajor ? 0 : 1;
     instance->indexSpaceRank = 2;
-    instance->indexSpaceGeometry[0] = keyHeads;
-    instance->indexSpaceGeometry[1] = batchSize;
+    instance->indexSpaceGeometry[keyHeadDim] = keyHeads;
+    instance->indexSpaceGeometry[requestDim] = batchSize;
 
     for (unsigned input = 0; input < kInputCount; ++input) {
         std::memset(
@@ -184,19 +224,20 @@ tpc_lib_api::GlueCodeReturn GdnCoreVerifyGaudi2::GetGcDefinitions(
 
     auto& mixedQkvPattern = instance->inputTensorAccessPattern[2];
     MapDimension(mixedQkvPattern, 0, 0, 0, 0, static_cast<int>(channels - 1));
-    MapDimension(mixedQkvPattern, 1, 1, static_cast<int>(nodes), 0, static_cast<int>(nodes - 1));
+    MapDimension(mixedQkvPattern, 1, requestDim, static_cast<int>(nodes), 0, static_cast<int>(nodes - 1));
 
     auto& zPattern = instance->inputTensorAccessPattern[3];
-    MapDimension(zPattern, 0, 0, static_cast<int>(repetition * 128), 0, static_cast<int>(repetition * 128 - 1));
-    MapDimension(zPattern, 1, 1, static_cast<int>(nodes), 0, static_cast<int>(nodes - 1));
+    MapDimension(zPattern, 0, keyHeadDim, static_cast<int>(repetition * 128), 0,
+                 static_cast<int>(repetition * 128 - 1));
+    MapDimension(zPattern, 1, requestDim, static_cast<int>(nodes), 0, static_cast<int>(nodes - 1));
 
     auto& aPattern = instance->inputTensorAccessPattern[4];
-    MapDimension(aPattern, 0, 0, static_cast<int>(repetition), 0, static_cast<int>(repetition - 1));
-    MapDimension(aPattern, 1, 1, static_cast<int>(nodes), 0, static_cast<int>(nodes - 1));
+    MapDimension(aPattern, 0, keyHeadDim, static_cast<int>(repetition), 0, static_cast<int>(repetition - 1));
+    MapDimension(aPattern, 1, requestDim, static_cast<int>(nodes), 0, static_cast<int>(nodes - 1));
 
     auto& bPattern = instance->inputTensorAccessPattern[5];
-    MapDimension(bPattern, 0, 0, static_cast<int>(repetition), 0, static_cast<int>(repetition - 1));
-    MapDimension(bPattern, 1, 1, static_cast<int>(nodes), 0, static_cast<int>(nodes - 1));
+    MapDimension(bPattern, 0, keyHeadDim, static_cast<int>(repetition), 0, static_cast<int>(repetition - 1));
+    MapDimension(bPattern, 1, requestDim, static_cast<int>(nodes), 0, static_cast<int>(nodes - 1));
 
     auto& aLogPattern = instance->inputTensorAccessPattern[6];
     MapDimension(aLogPattern, 0, 0, 0, 0, static_cast<int>(valueHeads - 1));
@@ -213,22 +254,39 @@ tpc_lib_api::GlueCodeReturn GdnCoreVerifyGaudi2::GetGcDefinitions(
 
     auto& rowIndicesPattern = instance->inputTensorAccessPattern[10];
     MapDimension(rowIndicesPattern, 0, 0, 0, 0, 4);
-    MapDimension(rowIndicesPattern, 1, 1, 1, 0, 0);
+    MapDimension(rowIndicesPattern, 1, requestDim, 1, 0, 0);
 
     auto& ssmStoreIndicesPattern = instance->inputTensorAccessPattern[11];
     MapDimension(ssmStoreIndicesPattern, 0, 0, 0, 0, static_cast<int>(nodes - 1));
-    MapDimension(ssmStoreIndicesPattern, 1, 1, 1, 0, 0);
+    MapDimension(ssmStoreIndicesPattern, 1, requestDim, 1, 0, 0);
 
     MapDimension(outputPattern, 0, 0, 0, 0, 127);
-    MapDimension(outputPattern, 1, 0, static_cast<int>(repetition), 0, static_cast<int>(repetition - 1));
-    MapDimension(outputPattern, 2, 1, static_cast<int>(nodes), 0, static_cast<int>(nodes - 1));
+    MapDimension(outputPattern, 1, keyHeadDim, static_cast<int>(repetition), 0, static_cast<int>(repetition - 1));
+    MapDimension(outputPattern, 2, requestDim, static_cast<int>(nodes), 0, static_cast<int>(nodes - 1));
+
+    if (splitKeyHeads) {
+        // Index dimension 0 (the key heads) in partitions of one: every tensor dimension mapped to it is declared
+        // allRequired, as preferredSplitDim requires (tpc_kernel_lib_interface.h); the kernel itself reads only its
+        // own key head's columns, as before.
+        for (unsigned input = 0; input < kInputCount; ++input) {
+            for (auto& dim : instance->inputTensorAccessPattern[input].mapping) {
+                if (dim.indexSpaceDim == 0) dim.allRequired = true;
+            }
+        }
+        for (auto& dim : outputPattern.mapping) {
+            if (dim.indexSpaceDim == 0) dim.allRequired = true;
+        }
+        instance->preferredSplitDim = 1;  // 1 = index dimension 0
+    }
 
     instance->kernel.paramsNr = sizeof(GdnCoreVerifyParams) / sizeof(uint32_t);
     std::memcpy(instance->kernel.scalarParams, &scalar, sizeof(scalar));
 
-    const GdnKernelElf elf = GdnSelectKernelElf(&_binary_gdn_core_verify_gaudi2_o_start, &_binary_gdn_core_verify_gaudi2_o_end,
-                                                &_binary_gdn_core_verify_interleaved_gaudi2_o_start,
-                                                &_binary_gdn_core_verify_interleaved_gaudi2_o_end);
+    const GdnKernelElf elf =
+        variant ? GdnKernelElf{variantStart, static_cast<unsigned>(variantEnd - variantStart)}
+                : GdnSelectKernelElf(&_binary_gdn_core_verify_gaudi2_o_start, &_binary_gdn_core_verify_gaudi2_o_end,
+                                     &_binary_gdn_core_verify_interleaved_gaudi2_o_start,
+                                     &_binary_gdn_core_verify_interleaved_gaudi2_o_end);
     const unsigned isaSize = elf.size;
     const unsigned providedSize = instance->kernel.elfSize;
     instance->kernel.elfSize = isaSize;

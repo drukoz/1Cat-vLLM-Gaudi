@@ -7,7 +7,7 @@
 // entry_points.cpp look a GUID up here and call Instantiate / InferShapes.
 namespace hc_fused {
 
-enum class Kind { Norm, Silu, SiluSplit, GateMix, Combine, CombineNorm };
+enum class Kind { Norm, Silu, SiluSplit, GateMix, Combine, CombineNorm, GateMixIl, CombineNormIl };
 
 struct KernelInfo {
     Kind kind;
@@ -19,7 +19,13 @@ struct KernelInfo {
 // The six kernels, in GetKernelGuids order.
 const KernelInfo* Kernels();
 
-// The row whose GUID is `name`, or nullptr.
+// The interleaved kernels that were built into the library (CMakeLists.txt defines
+// HC_FUSED_HAS_HC_FUSED_GATE_MIX_IL / HC_FUSED_HAS_HC_FUSED_COMBINE_NORM_IL), in GetKernelGuids order after the
+// MoE glue GUIDs, and how many there are (0 to kHcFusedIlGuidCount).
+const KernelInfo* IlKernels();
+unsigned IlKernelCount();
+
+// The row whose GUID is `name` (one of the six or a built interleaved kernel), or nullptr.
 const KernelInfo* FindKernel(const char* name);
 
 // Validates the node, fills the index space, the access patterns, the scalar arguments and the

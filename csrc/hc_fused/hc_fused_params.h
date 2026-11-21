@@ -13,6 +13,13 @@ inline constexpr const char* kHcFusedGateMixGuid = "hc_fused_gate_mix_bf16_gaudi
 inline constexpr const char* kHcFusedCombineGuid = "hc_fused_combine_bf16_gaudi2";
 inline constexpr const char* kHcFusedCombineNormGuid = "hc_fused_combine_norm_bf16_gaudi2";
 inline constexpr unsigned kHcFusedGuidCount = 6;
+// The interleaved kernels (docs/design/flash-next/hc-kernels.md): hc_fused_gate_mix and hc_fused_combine_norm
+// with the same node parameters, inputs and outputs, written for many rows. Each one is optional at build time
+// (CMakeLists.txt), and GetKernelGuids lists the ones that were built after the MoE glue GUIDs, so the six
+// hyper-connection GUIDs and the MoE GUIDs keep their places.
+inline constexpr const char* kHcFusedGateMixIlGuid = "hc_fused_gate_mix_il_bf16_gaudi2";
+inline constexpr const char* kHcFusedCombineNormIlGuid = "hc_fused_combine_norm_il_bf16_gaudi2";
+inline constexpr unsigned kHcFusedIlGuidCount = 2;
 
 // One 128-lane bf16 vector. Every multi-stream kernel walks a stream in whole vectors, so the glue
 // rejects a hidden size that is not a multiple of it (2560 and the tiny model's 128 are).

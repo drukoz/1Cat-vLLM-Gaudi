@@ -23,6 +23,10 @@ KERNELS = ("hc_fused_norm_gaudi2", "hc_fused_silu_gaudi2", "hc_fused_silu_split_
 # The MoE glue kernels of the same library (each optional at build time, csrc/hc_fused/CMakeLists.txt).
 MOE_KERNELS = ("moe_glue_route_gaudi2", "moe_glue_silu_mul_gaudi2", "moe_glue_combine_gaudi2",
                "moe_glue_row_quant_gaudi2")
+# The interleaved hyper-connection kernels of the same library (each optional at build time,
+# docs/design/flash-next/hc-kernels.md), listed by GetKernelGuids after the MoE glue GUIDs.
+IL_KERNELS = ("hc_fused_gate_mix_il_gaudi2", "hc_fused_combine_norm_il_gaudi2")
+IL_GUIDS = ("hc_fused_gate_mix_il_bf16_gaudi2", "hc_fused_combine_norm_il_bf16_gaudi2")
 # The flags of the proven GDN decode kernel.  No -vlm: a kernel with lookup-table special functions has
 # 16 KiB of vector local memory, and the graph compiler may recompile the embedded bitcode without the flag.
 TPC_FLAGS = ("-Wall", "-Werror", "-O2", "-march=gaudi2")

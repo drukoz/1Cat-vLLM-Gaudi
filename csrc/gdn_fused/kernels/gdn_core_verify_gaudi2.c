@@ -186,6 +186,19 @@ static inline void conv_verify_block(tensor conv_state, tensor mixed_qkv, tensor
     }
 }
 
+// Which index-space dimension holds the request and which the key head. Today's layout is {key heads, requests};
+// the request-major build (GDN_VERIFY_REQUEST_MAJOR, kernels/gdn_core_verify_interleaved_rmajor_gaudi2.c,
+// VLLM_HPU_GDN_VERIFY_VARIANT 1 and 3) has {requests, key heads}. A point does the same work in either layout, so
+// every output and state bit is the same; only the graph compiler's split of the points over the TPCs changes
+// (docs/design/flash-next/hc-kernels.md, "GDN verify").
+#ifdef GDN_VERIFY_REQUEST_MAJOR
+#define GDN_VERIFY_REQUEST_DIM 0
+#define GDN_VERIFY_KEY_HEAD_DIM 1
+#else
+#define GDN_VERIFY_REQUEST_DIM 1
+#define GDN_VERIFY_KEY_HEAD_DIM 0
+#endif
+
 void main(tensor conv_state, tensor ssm_state, tensor mixed_qkv, tensor z, tensor a, tensor b,
           tensor A_log, tensor dt_bias, tensor conv_weight_t, tensor norm_weight,
           tensor row_indices, tensor ssm_store_indices, tensor output,
@@ -208,7 +221,8 @@ void main(tensor conv_state, tensor ssm_state, tensor mixed_qkv, tensor z, tenso
     const int key_offset = key_heads * head_dim;
     const int value_offset = 2 * key_offset;
 
-    for (int request = index_start[1]; request < index_end[1]; ++request) {
+    for (int request = index_start[GDN_VERIFY_REQUEST_DIM]; request < index_end[GDN_VERIFY_REQUEST_DIM];
+         ++request) {
         int5 field_coords = {0, request, 0, 0, 0};
         const int conv_load = s_i32_ld_g(gen_addr(field_coords, row_indices));
         field_coords[0] = 1;
@@ -228,7 +242,8 @@ void main(tensor conv_state, tensor ssm_state, tensor mixed_qkv, tensor z, tenso
                           offset >= 0 && offset <= conv_rows - 3 && query_len >= 1;
         const int n = query_len < nodes ? query_len : nodes;
 
-        for (int key_head = index_start[0]; key_head < index_end[0]; ++key_head) {
+        for (int key_head = index_start[GDN_VERIFY_KEY_HEAD_DIM]; key_head < index_end[GDN_VERIFY_KEY_HEAD_DIM];
+             ++key_head) {
             if (!real) {
                 // Padding row: zeros for every node of every owned value head, no state touched.
                 for (int t = 0; t < nodes; ++t) {
@@ -279,6 +294,39 @@ void main(tensor conv_state, tensor ssm_state, tensor mixed_qkv, tensor z, tenso
                                   request, nodes, n, conv_load, offset, conv_store, conv_rows);
 
                 // decay and beta of this value head: node t in lane t of every 16-lane dual group.
+#ifdef GDN_VERIFY_BATCHED_GATES
+                // The fold build (VLLM_HPU_GDN_VERIFY_VARIANT 6 and 7): the gate inputs of all nodes first, node t
+                // in lane t of every dual group, then the gate functions once for all nodes instead of once per
+                // node. Every function below works lane by lane, so lane t gets the bits the per-node loop gives
+                // it; the lanes of no node compute values nobody reads.
+                int5 head_coords = {value_head, 0, 0, 0, 0};
+                const float64 a_log = s_f32_ld_g(gen_addr(head_coords, A_log));
+                const float64 dt = s_f32_ld_g(gen_addr(head_coords, dt_bias));
+                float64 xg = 0.0f;
+                float64 b_input = 0.0f;
+                for (int t = 0; t < n; ++t) {
+                    int5 gate_coords = {value_head, request * nodes + t, 0, 0, 0};
+                    const bf16 a_bf16 = s_bf16_ld_g(gen_addr(gate_coords, a));
+                    const bf16 b_bf16 = s_bf16_ld_g(gen_addr(gate_coords, b));
+                    const bool64 node_lane = v_u32_cmp_eq_b(group_lanes, (uint64)t);
+                    xg = v_f32_mov_vb((float)a_bf16 + dt, 0, xg, node_lane, 0);
+                    b_input = v_f32_mov_vb((float64)(float)b_bf16, 0, b_input, node_lane, 0);
+                }
+                // Stock softplus: log1p(exp(x)) with the small-value branch,
+                // then the torch threshold that returns x for x > 20.
+                const float64 exponential = v_exp_cephes_f32(xg);
+                const float64 small = v_f32_mul_b(
+                    exponential,
+                    v_f32_mac_b(exponential, 0.5f, (float64)1.0f, SW_NEG));
+                const bool64 use_small = v_f32_cmp_less_b(exponential, 5.0e-3f);
+                const float64 regular = v_log_f32(1.0f + exponential);
+                float64 softplus = v_f32_mov_vb(
+                    small, 0, regular, use_small, 0);
+                const bool64 large = v_f32_cmp_grt_b(xg, 20.0f);
+                softplus = v_f32_mov_vb(xg, 0, softplus, large, 0);
+                const float64 decay_nodes = v_exp_cephes_f32(-v_exp_cephes_f32(a_log) * softplus);
+                const float64 beta_nodes = v_sigmoid_f32(b_input);
+#else
                 float64 decay_nodes = 0.0f;
                 float64 beta_nodes = 0.0f;
                 for (int t = 0; t < n; ++t) {
@@ -310,6 +358,7 @@ void main(tensor conv_state, tensor ssm_state, tensor mixed_qkv, tensor z, tenso
                     decay_nodes = v_f32_mov_vb(decay, 0, decay_nodes, node_lane, 0);
                     beta_nodes = v_f32_mov_vb(beta, 0, beta_nodes, node_lane, 0);
                 }
+#endif
 
                 gdn_core_verify_recurrence_head(ssm_state, ssm_load, value_head, n, decay_nodes, beta_nodes, lanes);
 

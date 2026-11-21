@@ -49,10 +49,11 @@ def test_every_entry_point_check_passes(check_lines: list[str]) -> None:
 
 
 def test_guid_list_is_the_six_kernels_in_order(check_lines: list[str]) -> None:
-    """The six hyper-connection GUIDs keep their places; the MoE glue GUIDs of the same library follow them."""
+    """The six hyper-connection GUIDs keep their places; the MoE glue GUIDs of the same library follow them, then
+    the interleaved hyper-connection GUIDs (docs/design/flash-next/hc-kernels.md)."""
     guids = [line.split(" ")[2] for line in check_lines if line.startswith("GUID ")]
     assert guids[:len(KINDS)] == [GUIDS[kind] for kind in KINDS]
-    assert guids[len(KINDS):] == [moe_case.GUIDS[kind] for kind in moe_case.KINDS]
+    assert guids[len(KINDS):] == [moe_case.GUIDS[kind] for kind in moe_case.KINDS] + list(sim_build.IL_GUIDS)
     assert all(len(guid) < 64 for guid in guids)
 
 
@@ -156,7 +157,8 @@ def test_build_script_accepts_the_library_and_refuses_a_broken_one(build: Path, 
     """``tools/build_flashinfer_gaudi.py`` checks the built library the way the combined database uses it."""
     from tools.build_flashinfer_gaudi import check_kernel_library
 
-    assert check_kernel_library(build / "lib" / sim_build.LIBRARY) == len(KINDS) + len(moe_case.KINDS)
+    assert check_kernel_library(build / "lib" / sim_build.LIBRARY) == (len(KINDS) + len(moe_case.KINDS) +
+                                                                     len(sim_build.IL_GUIDS))
     broken = tmp_path / sim_build.LIBRARY
     broken.write_text("not a shared object\n", encoding="utf-8")
     with pytest.raises(RuntimeError, match="does not load"):
