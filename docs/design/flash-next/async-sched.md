@@ -122,9 +122,12 @@ are active whenever async scheduling is on for a Flash-Next model (it is wrong w
 
 - Whether the side-stream copy of the sampled ids (`.to('cpu', non_blocking=True)` under
   `torch.hpu.stream(...)`) returns before the device finishes in lazy mode with HPU-graph replay. If it blocks,
-  the worker cannot run ahead: only the engine turn (0.6 to 2 ms) hides. vllm-gaudi's own CI runs granite with
-  async scheduling (`tests/full_tests/ci_e2e_discoverable_tests.sh:294`), so it at least works; its overlap on
-  this model is unmeasured.
+  the worker cannot run ahead: only the engine turn (0.6 to 2 ms) hides. The bridge source at the node's version
+  (v1.24.1 head, native-replay's checkout `reports/native-replay/bridge-src`) says it does not block: with
+  `PT_ENABLE_HABANA_STREAMASYNC` (default true, `scripts/env_flags.yaml:235`) `copy_data_to_host` enqueues the DMA
+  with a completion callback and returns; only a blocking copy spins until it is done
+  (`backend/helpers/tensor_utils.cpp:408-446`). VERIFIED in the source, not yet on a card; vllm-gaudi's CI runs
+  granite with async scheduling (`tests/full_tests/ci_e2e_discoverable_tests.sh:294`).
 - The per-step cost of the in-graph n-gram ids against the host ids (device time, about 0.5 to 1 ms INFERRED).
 - Steps with a prefill (an agent's new turn) synchronize (hybrid rule above): no overlap on those steps.
 
