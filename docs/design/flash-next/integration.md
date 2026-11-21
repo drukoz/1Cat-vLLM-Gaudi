@@ -9,16 +9,25 @@ Labels: MEASURED (card, with its file), VERIFIED (CPU test or code line), INFERR
 
 ## Handoff (if this agent stops)
 
-Updated 2026-11-20 23:40 UTC (fourth agent of the track, Opus 5.5, started 23:12 UTC).
+Updated 2026-11-21 00:05 UTC (fourth agent of the track, Opus 5.5, started 23:12 UTC).
 
-**Now:** job **00121** `tiny8-build` PASSED (23:36 UTC, below). Job **00128** `real8-headline` (commit `fbb685ac`)
-runs since 23:36:27 UTC (SIGTERM at 00:16:27 UTC). Both
-`farm job` commands wait in background shells of the agent's session and copy the results to
-`reports/integration/card/` when the jobs end. **Do not run `farm sync`, `farm job` or `farm serve` for this track
-while 00121 or 00128 waits**: the node keeps three images per track, a fourth build prunes the oldest (00121's).
-A first submit of the headline job (commit `5ec92ead`) failed at its image build: two syncs of this track ran at once,
-the later bundle folder `~/farm/integration/b/5ec92eadbe9b` vanished and was re-created empty and root-owned
-(reported to the coordinator as a queue problem; INFERRED cause: the first sync pruned it).
+**Now (00:05 UTC):** build 1 is measured (job **00128**, the headline table below; job **00121** tiny gate passed).
+**Build 2** is on the branch, not yet on a card: code `a39d1f48` (build 1 + engine-step `ddc6bbbf` with the
+candidate-path log line, native-replay `9b0e7655` with `VLLM_HPU_WORKER_CPU_PIN`, prefill `2abf636a` with
+`VLLM_HPU_PREFIX_ALIGN_SPLIT` / `VLLM_HPU_PREFIX_KEEP_PROMPT_END` / prompt graphs, mtp-card-ready `6f5004f6` with the
+sampled-verification fix and `VLLM_HPU_SPEC_SAMPLED_VERIFY=2`; every new flag off), job kit `4681ee37`. Its CPU run:
+`reports/integration/cpu/out-b6/summary.txt` (list `list_b6.txt`). Plan agreed with the coordinator (00:05 UTC): submit
+when the CPU run is green, the coordinator places it after mtp-card-ready's 00136 (about 02:30 to 03:20 UTC), hold at
+most 45 min (it must end by 03:25; harvest 03:30):
+`bin/farm job integration real8-build2 all 45m --env HEADLINE_TINY_SPEC=1 -- bash -c 'f=/results/late/run.sh; if
+[ -s "$f" ]; then echo "headline: late-bound $f:"; cat "$f"; exec bash "$f"; fi; exec bash
+tools/flash_next/integration/headline_job.sh tiny nospec mtp3'` = the tiny gate with `--spec 3`, then the no-spec
+server (32, 8, 1 streams, two greedy and two sampled rounds per level, 32 first), then MTP k = 3 (32, 8, 1, two rounds).
+Before it starts, write `~/farm/integration/results/late/run.sh` on the node (via `bin/node-scp`) only to switch on
+what other jobs proved: `VLLM_HPU_PREFIX_ALIGN_SPLIT=1 VLLM_HPU_PREFIX_KEEP_PROMPT_END=1` if prefill's 00080 confirms;
+native-replay's 00134 winners (`VLLM_HPU_WORKER_CPU_PIN`, ...); `HEADLINE_MTP_SAMPLED=1` (sampled MTP level last,
+`VLLM_HPU_SPEC_SAMPLED_VERIFY=1`) only if the coordinator confirms mtp-card-ready's 00126 sampled rounds are clean. Form:
+`export K=V ...; exec bash /bundle/plugin/tools/flash_next/integration/headline_job.sh tiny nospec mtp3`.
 
 **Build commit `fbb685ac`** (pushed; the headline job runs it). The plugin code is final since `b691faa8`; the later commits only add the
 job kit `tools/flash_next/integration/` and this file. What is in it (first-parent merges on top of the qsa-fused
@@ -84,6 +93,33 @@ shape [4, 248320]`) and `test_sh_run_sheet.py` (`tiny_smoke.sh --spec` is not na
 2. When (b) ends: the table (`headline.md`, also at the end of the job log), the texts, `hlsmi_mem.log`; send the table
    to the coordinator at once and write it below with the build commit and flags.
 
+### 00128 `real8-headline`, server 2 (MTP k = 3), 23:46:36-23:57:05 UTC (same build and flags)
+
+Plus `--speculative-config {"method": "mtp", "num_speculative_tokens": 3}` and `VLLM_HPU_GDN_CORE_VERIFY=1
+VLLM_HPU_MTP_DRAFT_LOOP=1 VLLM_HPU_MTP_CHUNK_KV=1 VLLM_HPU_MTP_TIMING=1`; greedy (`--no-sampled-check`: sampled
+verification is off in build 1); one measured round per level after a warm round. MEASURED
+(`reports/integration/card/00128-real8-headline/mtp3/`, `headline.md`):
+
+| streams | tokens per step | acceptance per position | ms per step | ms per token | tok/s per stream | no speculation, same build |
+|---|---|---|---|---|---|---|
+| 32 | 2.61 (acceptance length 2.68) | 0.74 / 0.54 / 0.40 | 106 | **40.7** | **24.6** | 51.1 ms (19.6 tok/s) |
+| 8 | 2.76 (2.80) | 0.77 / 0.60 / 0.43 | 81 | 29.3 | 34.1 | 58.7 ms |
+| 1 | 2.72 (2.78) | 0.83 / 0.57 / 0.39 | 66 | 24.3 | 41.1 | 43.6 ms |
+
+- **MTP pays at 32 streams with the QSA data flow** (1.26 times; at TP4 on the torch QSA path it lost: 134 against
+  108, coordinator's 00099/00104). Best per-stream number of the night: 24.6 tok/s at 32 streams (target 100).
+- The 32-stream round still compiled verification shapes (warm round 91 s; pauses up to 47 s in the measured round,
+  span 138 ms per token, aggregate 75 tok/s): the steady median gap is the reading, a second round confirms it
+  (build 2 runs two).
+- Split (`MTP step timing`, rank 0, mean of 25 steps, second record per shape): 128 rows verify 85.5 ms + draft
+  38.1 ms (pass0 4.0, pass1 19.3 (compile-inflated), pass2 6.8, final wait 6.0); 32 rows verify 62.3 + draft 18.1;
+  4 rows verify 54.4 + draft 14.6.
+- Acceptance equals 00104 (TP4) and 00021 (TP8, 1 stream): the request-sharded indexer and grouped attention in the
+  verification step do not hurt the drafts. Texts coherent at 32, 8 and 1. No fallback line.
+- Card memory (`hlsmi_mem.log`): about 65.5 GB per card used while serving, both servers (98 GB cards). After server
+  1 stopped, its memory was released about 20 s after its processes ended (the MTP server's load started 10 s after
+  the stop and was not hurt).
+
 ## Merge log (what the conflicts were)
 
 - `b38ffaa1` (first agent) mtp-card-ready into qsa-fused: one conflict in `hpu_flash_next_mtp.py` (vocabulary-parallel
@@ -97,6 +133,15 @@ shape [4, 248320]`) and `test_sh_run_sheet.py` (`tiny_smoke.sh --spec` is not na
 - `b691faa8` engine-step `f0fd0a2b`: `hpu_model_runner.py` (the decode block table is now built inside engine-step's
   dense-metadata branch, with qsa-fused's table width; the step timer's setup lap after engine-step's sampler
   inputs); `envs.py` and `env_variables.md`: both sides kept.
+
+- Build 2: `c02bfd25` engine-step `3757e7e0` (clean), `3a4aee22` native-replay `9b0e7655` (`env_variables.md`: rows of
+  both sides), `46b3ce5b` prefill `d072b775` (`qsa.py`: qsa-fused's decode-row helpers and prefill's split prompt-row
+  selection, both kept; `hpu_model_runner.py`: the runtime-switch poll and the prompt-graph knob, both kept),
+  `ff58bb6b` engine-step `ddc6bbbf` (clean), `4b602948` prefill `2abf636a` (clean, a test only), `312c9299`
+  mtp-card-ready `6f5004f6` (`envs.py`: the newer description of `VLLM_HPU_SPEC_SAMPLED_VERIFY`;
+  `hpu_flash_next_mtp.py`: a comment). `a39d1f48` adjusts two of prefill's tests to the merged tree (a stub of
+  engine-step's `_poll_runtime_switches`; the rule-9 cast guard skipped because qsa-fused's `select_blocks` no longer
+  casts): for prefill's own merge after engine-step and qsa-fused.
 
 ## Card results
 
