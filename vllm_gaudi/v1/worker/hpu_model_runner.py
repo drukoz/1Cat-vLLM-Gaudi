@@ -5801,12 +5801,11 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         logits_indices[:num_decodes] = query_start_loc_cpu[1:num_decodes + 1] - 1
 
         positions_device = async_h2d_copy(positions, dtype=position_dtype, device=self.device)
-        # VLLM_HPU_QSA_TABLE_WIDTH=1: as wide as the batch's longest request needs, not as the engine's longest
-        # context (the QSA indexer scores every column's keys); the same width with the sparse decode metadata.
-        table_width = decode_block_table_width(num_blocks, self._block_table_max_blocks,
-                                               gaudi_envs.VLLM_HPU_QSA_TABLE_WIDTH)
         if sparse_md:
-            # One row per request (the pages of its last scheduled token), repeated over its verification rows.
+            # One row per request (the pages of its last scheduled token), repeated over its verification rows, as
+            # wide as VLLM_HPU_QSA_TABLE_WIDTH says (the same width as the dense branch's table below).
+            table_width = decode_block_table_width(num_blocks, self._block_table_max_blocks,
+                                                   gaudi_envs.VLLM_HPU_QSA_TABLE_WIDTH)
             block_table_cpu = request_block_table(block_table_cpu_tensor, num_blocks, num_tokens,
                                                   padded_batch_size * num_tokens, table_width, self._PAD_BLOCK_ID)
             block_list = block_groups = block_usage = None
@@ -5815,6 +5814,10 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
 
             block_table_cpu = None
             if getattr(self, '_needs_block_table', False):
+                # VLLM_HPU_QSA_TABLE_WIDTH=1: as wide as the batch's longest request needs, not as the engine's longest
+                # context (the QSA indexer scores every column's keys).
+                table_width = decode_block_table_width(num_blocks, self._block_table_max_blocks,
+                                                       gaudi_envs.VLLM_HPU_QSA_TABLE_WIDTH)
                 block_table_cpu = build_block_table(block_tables_list, padded_batch_size * num_tokens, table_width,
                                                     self._PAD_BLOCK_ID)
 
