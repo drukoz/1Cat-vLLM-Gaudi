@@ -6,7 +6,7 @@ results are under `/Volumes/Storage/Claude/gaudi-work/reports/async-sched/card/`
 
 ## Handoff (if this agent stops)
 
-Updated 2026-11-21 11:22 UTC.
+Updated 2026-11-21 11:50 UTC.
 
 - **Card results so far** (placement on, MTP timers 0, compare arms within a job only):
   - 00220, mode 1 with `d3fb1b11` (MEASURED). ms/token sync → async: 1 stream greedy 27.9 → 29.4, sampled
@@ -31,14 +31,9 @@ Updated 2026-11-21 11:22 UTC.
     align mode's load count). `78478ead` merges the program head `4f070c75` (PRs #23 chain, #24, #25; conflicts only
     in `SWITCHABLE` and its test: the union); `915638c2` (= `35d9d4d4` of the job branches) makes mode 3 issue early
     after the chain's stage B too; `9d2ee2e3` tests it on the engine (`VLLM_HPU_VOCAB_PARALLEL_LOGITS=1`).
-  - **Gate of stage 2**: `bin/gate reports/async-sched/trees/gate-9d2ee2e3` (frozen copy of `9d2ee2e3`), started
-    about 10:58 UTC with a 6 h alarm (pids 18115 and 18118); it holds a slot and runs. Log
-    `reports/async-sched/logs/gate_9d2ee2e3.out`.
-    If green: `gh pr create --base feat/flash-next-gaudi --head feat/flash-next-gaudi-async-sched-s2` with the title
-    "Flash-Next MTP under async scheduling, stage 2 (default off): device-made verification inputs, early issue
-    (mode 3), device align mode" and the body `reports/async-sched/pr_body_s2.md` (fill in GATE_LINE), then
-    `gh pr merge --merge` (owner's rule: default-off and the gate green). If the program head moved, merge it in
-    and gate again.
+  - **Stage 2 is on the program head**: PR #27 merged as `4d66755e` (11:48 UTC). Gate on the frozen
+    `9d2ee2e3` (s2 + head `4f070c75`): 80 files, 0 red (`reports/async-sched/logs/gate_9d2ee2e3.out`); the worker
+    files, not in the gate's set, green on the same merge. Body: `reports/async-sched/pr_body_s2.md`.
   - engine-step's persistent-inputs branch merged the program head as `887266b1` (the device-context passthrough
     kept, as asked). s2 merges it with the `SWITCHABLE` union only (scratch branch `s2-pi` in `scratchpad/m1clone`).
     With `VLLM_HPU_PERSISTENT_INPUTS=1` (MEASURED on CPU, `reports/async-sched/logs/tests_s2_pi.log`): loop_async 7
@@ -46,11 +41,15 @@ Updated 2026-11-21 11:22 UTC.
     step's host-made inputs and the next step's uploads rewrite those buffers first (one buffer per input in a
     synchronous engine). engine-step also found that an input uploaded twice in a step shared a pair; they fixed it
     (a pair per upload of a step).
-  - `feat/flash-next-gaudi-async-sched-s3` (s2 + follow-ups, not gated yet): `59b54a77` no draft scatter when M1 made
-    the step's ids (two H2D copies and two device ops less per step); `a4f1e896` M1 keeps copies of host-made inputs
-    (the fix above); `3e98b623` its unit tests (`tests/unit_tests/worker/test_flash_next_async_spec_keep.py`, 3).
-    CPU runs: `reports/async-sched/logs/tests_s3.log` (without PI) and `tests_s3_pi.log` (s3 + `887266b1`, PI on).
-    After s2's PR: merge the program head into s3, gate, PR.
+  - `feat/flash-next-gaudi-async-sched-s3` (follow-ups): `59b54a77` no draft scatter when M1 made the step's ids
+    (two H2D copies and two device ops less per step); `a4f1e896` M1 keeps copies of host-made inputs (the fix
+    above); `3e98b623` its unit tests (`tests/unit_tests/worker/test_flash_next_async_spec_keep.py`, 3); `57339426`
+    merges the head `4d66755e`. CPU: without PI green (`reports/async-sched/logs/tests_s3.log`); with PI on s3 +
+    `887266b1`: M1 8, M3 3, early 4 (`tests_s3_pi.log`); on s3 + `8a5bc621` (engine-step's per-upload pairs):
+    `tests_s3_pi2.log`. **Gate**: `bin/gate reports/async-sched/trees/gate-57339426`, log
+    `reports/async-sched/logs/gate_57339426.out`; if green: `gh pr create --base feat/flash-next-gaudi --head
+    feat/flash-next-gaudi-async-sched-s3` (title "Stage 2 follow-ups: M1 keeps copies of host-made inputs (for
+    persistent inputs), no draft scatter under M1"), then `gh pr merge --merge` (default-off code paths).
 - **Card job 00240** `real8-async-m3d` (all, 85 min; replaced 00237, which replaced 00233 and 00229; starts after
   mtp-draft-graph's 00230, by 14:21 UTC at the latest).
   - Job branch `feat/flash-next-gaudi-async-sched-m3-b5` at `1a70d353` (never merge it; `1a70d353` makes a failed
@@ -79,7 +78,7 @@ Updated 2026-11-21 11:22 UTC.
   `place` (the coordinator sets it). `on` = `VLLM_HPU_WORKER_CPU_PIN=1` + `place_wrap.sh` + `place.sh` (rule a^1);
   `place` = the placement without the pin flag. Scripts in `~/farm/async-sched/results/bench` (md5 363bcf9d and
   7e54f2de); spec-lookup hard-links them.
-- **Next**: read 00240; s2's PR when its gate is green; then s3 (merge the head, gate, PR); the persistent-inputs
+- **Next**: read 00240; s3's PR when its gate is green; the persistent-inputs
   job (mode 2 and mode 3, PI off/on, prefix caching on, 32/8/1; needs PI on the program head and s3); sampled with
   mtp-draft-graph's D2 (they have no D2 yet: the chain refuses sampled requests).
 - The 1-token prompt note: spec-lookup's `005e1ff9` is not on the program branch yet. When it is, put prompt 0 back
