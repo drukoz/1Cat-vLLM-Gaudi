@@ -349,14 +349,44 @@ at token 0 for 1 and 100 tokens) and **the tokens are equal prompt by prompt, ne
 and check took under 3 minutes of the arm (stock arm 84 s, bridge arm 167 s). So a rebuilt bridge reaches the
 card through `--bridge` and is what runs. Results: `reports/collectives/card/00160-tiny8-bridge-check-{stock,build}/`.
 
-**Job 00174 `real8-bridge-phase`** (all, 65 min, queued 02:09 UTC behind integration's 00161): native-replay's
-`timers-c281d8b53d08` (phase timers) and `lean-e1dbb4942fb8` (prepared replay step 1), with the accsync pair
-(`PT_HPU_SYNCHRONOUS_ACC_QUEUE_FLUSHING=1`); `bridge_phase_job.sh`, arms tiny-timers, tiny-accsync, tiny-lean, then
-real-timers, real-accsync and real-lean where their tiny arm passed. Pending.
+**Job 00174 `real8-bridge-phase` (MEASURED, all 8 cards, 02:33-03:06 UTC, exit 0, all six arms ok):**
+native-replay's `timers-c281d8b53d08` (phase timers) and `lean-e1dbb4942fb8` (timers + prepared replay step 1),
+and the timers build with `PT_HPU_SYNCHRONOUS_ACC_QUEUE_FLUSHING=1` (no accumulation thread, so no spinning CPU per
+worker). Tiny model at TP8: the lean (flag 1) and accsync arms give the timers arm's tokens prompt by prompt. Real
+model at TP8, steady ms per step (1 stream: one round; 32 streams: two rounds), the 1-stream text identical in all
+three arms:
+
+| arm | 1 stream | 32 streams |
+|---|---|---|
+| timers (reference) | 38.2 | 84.2, 84.7 |
+| lean, `PT_HPU_HPUGRAPH_PREPARED_REPLAY=1` | 30.8 (-7.4) | 83.7, 83.6 (-0.8) |
+| accsync, `PT_HPU_SYNCHRONOUS_ACC_QUEUE_FLUSHING=1` | 34.6 (-3.6) | 82.4, 82.2 (-2.2) |
+
+Host time per graph launch from the `HPUGRAPH_REPLAY_TIMING` lines (median over every line after each pid's first;
+each line averages one thread's last 5,000 launches; us; `reports/collectives/probes/replay_timing_table.py`):
+
+| phase | timers | lean | accsync |
+|---|---|---|---|
+| total | 155.4 | 137.8 | 138.8 |
+| exec_setup | 6.78 | 1.52 | 5.83 |
+| launch_hashes, create_launcher, run_spec, run_lookup | 10.92 | 0.00 | 9.50 |
+| run_prep | 1.75 | 14.05 | 1.38 |
+| run_patching | 22.4 | 16.9 | 19.2 |
+| launcher_inputs | 29.7 | 33.3 | 29.6 |
+| syn_launch | 48.9 | 41.0 | 43.7 |
+| launcher_post | 14.6 | 13.0 | 12.8 |
+
+Readings (INFERRED from the tables): the prepared path engages (the hash, launcher, spec and lookup phases read 0)
+but adds 12 us in `run_prep`, so it saves 17.6 us per launch net; at one stream (host-bound) that is the largest
+step gain measured tonight, at 32 streams (device-bound) little. Without the accumulation thread almost every phase
+is 10 to 20 % cheaper (the spinner's CPU contention). The launch's host time is now mostly the Synapse launch (41 to
+49 us), input handling (about 30), patching (17 to 22) and post-launch work (13 to 15). Not yet run: lean and accsync
+together; accsync on the image's bridge (it is a stock setting). Results:
+`reports/collectives/card/00174-real8-bridge-phase-*/`.
 
 ## Handoff (if this agent stops)
 
-State at 00:55 UTC on 2026-11-21 (fourth agent of this track, Opus 5.5). **The node stays until about 00:00 UTC
+State at 03:10 UTC on 2026-11-21 (fourth agent of this track, Opus 5.5). **The node stays until about 00:00 UTC
 on 2026-11-22** (BRIEF 00:50 UTC). Branch `feat/flash-next-gaudi-collectives` (and `-dev`, the same head), worktree
 `/Volumes/Storage/Claude/gaudi-work/wt/collectives`; card results and logs in
 `/Volumes/Storage/Claude/gaudi-work/reports/collectives/` (`card/<id>-<name>/`, `logs/`, `probes/`). This section is
@@ -388,11 +418,9 @@ bench8-bridge all 30m` (each arm pairs the flag off and on in one bench run; sum
 `python3 reports/native-replay/probes/knob_table.py bench_r8.json`).
 
 Next, in order (section 7's table):
-1. 00160 PASSED (section 7), sent to the coordinator and native-replay at 02:10 UTC. Next: 00174 (section 7;
-   this agent's waiter fetches its six arms and `00174-real8-bridge-phase-verdicts.txt` into
-   `reports/collectives/card/`; else `bin/farm fetch collectives 00174 00174-real8-bridge-phase-<arm>...` and
-   `bin/node-scp :farm/collectives/results/00174-real8-bridge-phase-verdicts.txt <dir>/`). Its numbers go to
-   native-replay (it parses the `HPUGRAPH_REPLAY_TIMING` lines) and the coordinator.
+1. 00160 PASSED and 00174 ended ok (section 7); both sent to the coordinator and native-replay (03:10 UTC).
+   Next with native-replay: its `run_prep` fix, then lean + accsync together, and accsync on the image's bridge
+   (a stock setting, for the integration build); the bench step b if native-replay still wants it.
 1b. native-replay's next builds: `timers-c281d8b53d08` (phase timers: `PT_HPU_HPUGRAPH_REPLAY_TIMING=N` prints one
    `HPUGRAPH_REPLAY_TIMING` line per N replayed launches per thread; about 01:47 UTC) and, about 20 minutes later,
    `lean-e1dbb4942fb8` (the timers plus the first prepared-replay step behind `PT_HPU_HPUGRAPH_PREPARED_REPLAY=1`;
