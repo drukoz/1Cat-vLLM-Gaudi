@@ -225,3 +225,16 @@ Tests: `tests/unit_tests/worker/test_prefill_batch_rules.py` (rules), `tests/uni
 test_engine_prefill_batch.py` (the engine plan off / on, without and with MTP; state slots per chunk equal; the
 runtime switch at 0 and 2), `test_runtime_switches.py`, `tests/unit_tests/test_qwen3_next.py` (state save; its two
 gated-FP8 tests are red on the base `8ead88c7` too, not this track's).
+
+## Ops of a merged forward (VERIFIED by CPU dispatcher count, 13:25 UTC; device time INFERRED)
+
+`prefill_batch_engine.py --count-ops` counts the ops every model forward dispatches (on a card each one is a node of
+the forward's graph). Tiny model (4 layers: 3 GDN + 1 QSA), bursts of K equal turns (`reports/prefill-batch/tools/
+exp4.py`): a one-row prompt forward [1, 512] dispatches 2,592 ops; merged [2, 512] 2,676 (+84), [4, 512] 2,786
+(+194), [8, 512] 3,002 (+410, +16 %); [1, 256] 2,535, [8, 256] 2,945. About 52 ops per added row, all from the QSA
+indexer's per-row loop (`qsa.py`, `for b in range(rows)`): on the real model about 12 x 52 = 620 ops per added row
+against about 35,000 per forward (prefill's count at TP4), i.e. a merged forward of 8 rows has about 1.12 times the
+graph nodes of a one-row forward, not 8 times. If the 80 ms intercept of section 1 is mostly per-node device overhead
+(35,000 x 2.4 us = 84 ms, coord 00009's per-op cost), merging removes most of it per removed forward: the upper
+column of section 4. Byte- and FLOP-bound per-row work (context gathers, attention) is not counted here; the burst
+probe of 00267 measures the whole.

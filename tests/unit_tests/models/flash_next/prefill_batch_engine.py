@@ -71,12 +71,44 @@ def _record_prompt_forwards(runner, clock: dict) -> list[dict]:
     return records
 
 
+def _count_forward_ops(runner, clock: dict) -> list[dict]:
+    """``--count-ops``: the number of dispatched ops of every model forward (``_execute_model_generic``), with its
+    kind and rows: on a card each one is a node of the forward's graph (the CPU path traces what the card records)."""
+    import torch
+    from torch.utils._python_dispatch import TorchDispatchMode
+
+    class Count(TorchDispatchMode):
+
+        def __init__(self):
+            super().__init__()
+            self.n = 0
+
+        def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+            self.n += 1
+            return func(*args, **(kwargs or {}))
+
+    records: list[dict] = []
+    real = runner._execute_model_generic
+
+    def counting(token_ids, position_ids, attn_metadata, *args, **kwargs):
+        counter = Count()
+        with counter:
+            result = real(token_ids, position_ids, attn_metadata, *args, **kwargs)
+        records.append({"step": clock["step"], "is_prompt": bool(getattr(attn_metadata, "is_prompt", False)),
+                        "shape": list(token_ids.shape), "ops": counter.n})
+        return result
+
+    runner._execute_model_generic = counting
+    return records
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="python -m tests.unit_tests.models.flash_next.prefill_batch_engine")
     parser.add_argument("--ckpt", required=True)
     parser.add_argument("--plan", required=True)
     parser.add_argument("--out", required=True)
     parser.add_argument("--no-prefix-caching", action="store_true")
+    parser.add_argument("--count-ops", action="store_true", help="count the dispatched ops of every forward")
     args = parser.parse_args(argv)
     plan = json.loads(Path(args.plan).read_text(encoding="utf-8"))
 
@@ -103,6 +135,7 @@ def main(argv: list[str] | None = None) -> int:
     runner = hpu_cpu_engine.find_runner(llm)
     clock = {"step": 0}
     forwards = _record_prompt_forwards(runner, clock)
+    op_counts = _count_forward_ops(runner, clock) if args.count_ops else None
     engine = llm.llm_engine
 
     requests = {r["id"]: dict(r) for r in plan["requests"]}
@@ -167,6 +200,7 @@ def main(argv: list[str] | None = None) -> int:
         "index_events": guard.events(),
         "runner": hpu_cpu_engine.runner_facts(runner),
         "prefill_batch_rows": int(getattr(runner, "prefill_batch_rows", 0)),
+        "op_counts": op_counts,
     }
     Path(args.out).write_text(json.dumps(record), encoding="utf-8")
     return 0
