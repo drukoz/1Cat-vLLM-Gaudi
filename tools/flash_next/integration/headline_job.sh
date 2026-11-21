@@ -39,8 +39,10 @@
 # The card memory of every card is logged every 15 s to $FARM_OUT/hlsmi_mem.log.
 #
 # Environment knobs: HEADLINE_TOKENS (measured tokens per stream, default 128), HEADLINE_WARM_TOKENS (default 48),
-# HEADLINE_ROUNDS (measured rounds per level, greedy and sampled, after the warm round; default 0 = one per level
-# and two at the top level without speculation, as in job 00128).
+# HEADLINE_ROUNDS (measured rounds per level, greedy and sampled, after the warm round; default 2; 0 = one per level
+# and two at the top level, as in job 00128), HEADLINE_LEVELS (default 32,8,1: the 32-stream numbers first),
+# HEADLINE_MTP_SAMPLED=1 (the MTP server with VLLM_HPU_SPEC_SAMPLED_VERIFY=1 and a SAMPLED 32-stream level last;
+# HEADLINE_MTP_SAMPLED_LEVELS), HEADLINE_TINY_SPEC=1 (the tiny gate with --spec 3).
 # Results: $FARM_OUT/<arm>/ (versions.txt, server0.log, scaling.json, probe.log, summary.json) and
 # $FARM_OUT/headline.md + headline.json (headline_table.py), written after every arm.
 # Exit code: the number of arms whose serve_probe.sh did not end with 0.
@@ -52,7 +54,8 @@ PYTHON="${FARM_PYTHON:-python3}"
 OUT="${FARM_OUT:-/results/headline}"
 TOKENS="${HEADLINE_TOKENS:-128}"
 WARM="${HEADLINE_WARM_TOKENS:-48}"
-ROUNDS="${HEADLINE_ROUNDS:-0}"
+ROUNDS="${HEADLINE_ROUNDS:-2}"
+LEVELS="${HEADLINE_LEVELS:-32,8,1}"
 T0="$(date -u +%s)"
 HOLD_S="${HEADLINE_HOLD_S:-2400}"
 FALLBACK="${HEADLINE_MTP_FALLBACK:-1}"
@@ -150,19 +153,30 @@ while [ "$i_arm" -lt "${#ARMS[@]}" ]; do
             continue
             ;;
         nospec)
-            bash "$HERE/serve_probe.sh" --out "$OUT/nospec" --levels 1,8,32 --tokens "$TOKENS" --warm-tokens "$WARM" \
-                --repeat-top 2 --no-mintok-check --probe-arg --sampled-levels=1,8,32 --probe-arg "--rounds=$ROUNDS"
+            # Levels in HEADLINE_LEVELS order (default 32,8,1: the 32-stream numbers first); each level's sampled
+            # rounds right after its greedy rounds.
+            bash "$HERE/serve_probe.sh" --out "$OUT/nospec" --levels "$LEVELS" --tokens "$TOKENS" \
+                --warm-tokens "$WARM" --repeat-top 2 --no-mintok-check --probe-arg "--sampled-levels=$LEVELS" \
+                --probe-arg --interleave-sampled --probe-arg "--rounds=$ROUNDS"
             ;;
         mtp3 | mtp3-32 | mtp3-noshard)
-            levels=32,8,1
+            levels="$LEVELS"
             if [ "$arm" = mtp3-32 ]; then levels=32; fi
             shard="$VLLM_HPU_QSA_INDEXER_SHARD"
             if [ "$arm" = mtp3-noshard ]; then shard=0; fi
-            VLLM_HPU_QSA_INDEXER_SHARD="$shard" \
+            # HEADLINE_MTP_SAMPLED=1: the server also verifies sampled requests (VLLM_HPU_SPEC_SAMPLED_VERIFY=1, the
+            # exact path) and one SAMPLED level (32 streams) runs LAST, after every greedy level.
+            sampled_args=(--probe-arg --no-sampled-check)
+            sampled_verify="${VLLM_HPU_SPEC_SAMPLED_VERIFY:-0}"
+            if [ "${HEADLINE_MTP_SAMPLED:-0}" = 1 ] && [ "$arm" != mtp3-noshard ]; then
+                sampled_args=(--probe-arg "--sampled-levels=${HEADLINE_MTP_SAMPLED_LEVELS:-32}")
+                sampled_verify="${VLLM_HPU_SPEC_SAMPLED_VERIFY:-1}"
+            fi
+            VLLM_HPU_QSA_INDEXER_SHARD="$shard" VLLM_HPU_SPEC_SAMPLED_VERIFY="$sampled_verify" \
             VLLM_HPU_GDN_CORE_VERIFY="${VLLM_HPU_GDN_CORE_VERIFY:-1}" VLLM_HPU_MTP_TIMING="${VLLM_HPU_MTP_TIMING:-1}" \
                 VLLM_HPU_MTP_DRAFT_LOOP="${VLLM_HPU_MTP_DRAFT_LOOP:-1}" VLLM_HPU_MTP_CHUNK_KV="${VLLM_HPU_MTP_CHUNK_KV:-1}" \
                 bash "$HERE/serve_probe.sh" --out "$OUT/$arm" --mtp 3 --levels "$levels" --tokens "$TOKENS" \
-                --warm-tokens "$WARM" --repeat-top 1 --no-mintok-check --probe-arg --no-sampled-check \
+                --warm-tokens "$WARM" --repeat-top 1 --no-mintok-check "${sampled_args[@]}" \
                 --probe-arg "--rounds=$ROUNDS"
             ;;
         *)
@@ -180,11 +194,11 @@ try:
     data = json.load(open(sys.argv[1]))
 except (OSError, ValueError):
     sys.exit(1)
-rounds = (data.get("levels") or []) + (data.get("sampled") or [])
+rounds = data.get("levels") or []  # greedy rounds; a failed sampled round is reported, not a server failure
 sys.exit(0 if rounds and all(r.get("ok") and not r.get("errors") for r in rounds) else 1)
 PY2
     then
-        echo "headline_job: arm $arm: a round failed or none was measured (scaling.json): counted as a probe failure"
+        echo "headline_job: arm $arm: a greedy round failed or none was measured (scaling.json): a probe failure"
         rc=5
     fi
     echo "=== headline_job: arm $arm rc=$rc end $(date -u +%T)"
