@@ -170,3 +170,38 @@ def test_from_env_mode_two_records_every_step(monkeypatch, tmp_path):
     assert os.path.dirname(timer.step_path) == str(tmp_path)
     monkeypatch.setenv("VLLM_HPU_MTP_TIMING", "3")
     assert mtp_step_timer.from_env(device_type="cpu") is None
+
+
+def test_per_step_records_carry_the_replay_calls_laps_and_collector_pauses(tmp_path, monkeypatch):
+    """VLLM_HPU_MTP_TIMING=2 also records the wall clock, the target forward's replay calls (runner replay()), the
+    draft's laps, VLLM_HPU_WORKER_GC_FREEZE and the collector's pauses of the step."""
+
+    class Pauses:
+        def __init__(self):
+            self.ms, self.gen2, self.collections, self.resets = 0.0, 0, 0, 0
+
+        def reset(self):
+            self.resets += 1
+            self.ms, self.gen2, self.collections = 0.0, 0, 0
+
+    clock = Clock()
+    timer = MtpStepTimer(clock=clock, every=25, directory=str(tmp_path), per_step=True)
+    timer.gc_pauses = Pauses()
+    monkeypatch.setenv("VLLM_HPU_WORKER_GC_FREEZE", "1")
+    timer.replay(0.5)  # outside a step: ignored
+    timer.step_start()
+    timer.step_tokens(["a"], [2])
+    timer.replay(0.020)
+    timer.replay(0.004)
+    timer.gc_pauses.ms, timer.gc_pauses.gen2, timer.gc_pauses.collections = 7.5, 1, 3
+    clock.advance(40.0)
+    timer.draft_start("verify", 3, 1, 2)
+    clock.advance(3.0)
+    timer.lap("pass0")
+    clock.advance(5.0)
+    timer.draft_end()
+    line = json.loads(open(timer.step_path).read().splitlines()[0])
+    assert line["replay_ms"] == pytest.approx(24.0) and line["replays"] == 2
+    assert line["laps"]["pass0"] == pytest.approx(3.0) and line["laps"]["final_wait"] == pytest.approx(5.0)
+    assert line["gc_freeze"] == 1 and line["gc_ms"] == 7.5 and line["gc_gen2"] == 1 and line["gc_collections"] == 3
+    assert isinstance(line["t"], float) and timer.gc_pauses.resets == 1

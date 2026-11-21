@@ -30,8 +30,10 @@ its accepted drafts plus one) and ``prev_committed`` (the same request's count i
 ``none`` when it had none). A step whose ``prev_committed`` is ``{"1": n}`` follows a step that accepted no draft.
 Why (engine-step, 2026-11-21): in card job 00156 (k = 2) the 1-stream verification part ranged from 51 to 71 ms
 between rounds of one server, and its 25-step means tracked the share of steps whose first draft was rejected;
-the per-step record shows whether the steps after a full rejection are the slow ones. The record costs one
-``write`` of a line per step.
+the per-step record shows whether the steps after a full rejection are the slow ones. Each line also has ``t``
+(wall clock at the step's start), ``replay_ms`` (the target forward's replay calls, timed by the runner), the draft's
+laps, ``gc_freeze`` (``VLLM_HPU_WORKER_GC_FREEZE`` at the step) and the collector's pauses in the step (``gc_ms``,
+``gc_gen2``: generation-2 collections). The record costs one ``write`` of a line per step.
 """
 
 from __future__ import annotations
@@ -71,6 +73,10 @@ class MtpStepTimer:
         self._steps_recorded = 0
         self._committed: tuple[list, list] | None = None  # (requests, committed tokens) of the step being timed
         self._previous: dict = {}  # request -> tokens it committed in its last timed step
+        self._replay_s = 0.0  # the target forward's replay calls in the step (the runner's replay())
+        self._replays = 0
+        self._wall_start = None
+        self.gc_pauses = None  # a gc_control.GcPauses the runner installs: the collector's pauses per step
 
     # ---- the runner's calls ----
 
@@ -79,6 +85,17 @@ class MtpStepTimer:
         self._draft_start = None
         self._key = None
         self._committed = None
+        self._replay_s = 0.0
+        self._replays = 0
+        self._wall_start = time.time()
+        if self.gc_pauses is not None:
+            self.gc_pauses.reset()
+
+    def replay(self, seconds: float) -> None:
+        """The runner's target forward call took ``seconds`` (the HPU graph replay issued from the host)."""
+        if self._step_start is not None:
+            self._replay_s += float(seconds)
+            self._replays += 1
 
     def step_tokens(self, req_ids, counts) -> None:
         """Before ``draft_start``, with ``VLLM_HPU_MTP_TIMING=2``: the step's decode requests and how many tokens each
@@ -169,7 +186,15 @@ class MtpStepTimer:
         out = {"step": self._steps_recorded, "kind": kind, "rows": rows, "requests": requests, "k": k,
                "rank": self.rank, "verify_ms": round(1000.0 * spans[SPAN_VERIFY], 3),
                "draft_ms": round(1000.0 * spans[SPAN_DRAFT], 3), "committed": self._histogram(committed),
-               "prev_committed": self._histogram(previous)}
+               "prev_committed": self._histogram(previous),
+               "t": None if self._wall_start is None else round(self._wall_start, 3),
+               "replay_ms": round(1000.0 * self._replay_s, 3), "replays": self._replays,
+               "laps": {name: round(1000.0 * value, 3) for name, value in spans.items()
+                        if name not in (SPAN_VERIFY, SPAN_DRAFT)},
+               "gc_freeze": 1 if os.environ.get("VLLM_HPU_WORKER_GC_FREEZE", "0").strip() == "1" else 0}
+        if self.gc_pauses is not None:
+            out.update(gc_ms=round(self.gc_pauses.ms, 3), gc_gen2=self.gc_pauses.gen2,
+                       gc_collections=self.gc_pauses.collections)
         self._steps_recorded += 1
         try:
             if self._step_file is None:
