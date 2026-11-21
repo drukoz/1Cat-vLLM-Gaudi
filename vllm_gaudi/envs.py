@@ -549,6 +549,7 @@ if TYPE_CHECKING:
     VLLM_HPU_FLASH_NEXT_LOOKUP_MIN_NGRAM: int = 3  # hybrid lookup: shortest suffix n-gram matched
     VLLM_HPU_FLASH_NEXT_LOOKUP_MAX_NGRAM: int = 8  # hybrid lookup: longest suffix n-gram matched
     VLLM_HPU_FLASH_NEXT_LOOKUP_ORACLE: str = ""  # rehearsals only: a file of recorded streams answers the search
+    VLLM_HPU_FLASH_NEXT_NGRAM_PLAIN_STEPS: int = 0  # 0 an n-gram step always verifies, 1 plain when nobody drafts
     VLLM_HPU_VOCAB_PARALLEL_LOGITS: int = 0  # VocabParallelMode: 0 logits all-gather (default), 1 greedy, 2 candidates
     VLLM_HPU_REPLICATED_EMBEDDING: int = 0  # 0 vocabulary-sharded token embedding (default), 1 one full copy per rank
     VLLM_HPU_MTP_REPLICATED_FC: int = 0  # 0 the MTP fc linears shard and all-gather (default), 1 unsharded
@@ -2038,6 +2039,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Empty (default) = no oracle. Never set on a production server.
     "VLLM_HPU_FLASH_NEXT_LOOKUP_ORACLE":
     lambda: os.environ.get("VLLM_HPU_FLASH_NEXT_LOOKUP_ORACLE", ""),
+    # The n-gram method on Flash-Next: 0 (default) gives a request without a match the 1-token placeholder draft
+    # (-1, never accepted), so every decode step is a verification step at least 2 rows wide per request; 1 keeps
+    # the placeholder only when another request of the step drafts, and a step in which no request drafts runs as
+    # a plain decode step (1 row per request; the runner's plain-step path after a verification). Any other value
+    # is 0.
+    "VLLM_HPU_FLASH_NEXT_NGRAM_PLAIN_STEPS":
+    lambda: int(os.environ.get("VLLM_HPU_FLASH_NEXT_NGRAM_PLAIN_STEPS", "0")),
     # Collective cuts of a tensor-parallel Flash-Next step (docs/design/flash-next/collectives.md). All default 0.
     # VLLM_HPU_VOCAB_PARALLEL_LOGITS: 0 = every consumer gets the all-gathered logits; 1 = arg-max consumers
     # (plain greedy decode, MTP drafts, greedy MTP verification) reduce each rank's vocabulary shard first and

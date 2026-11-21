@@ -10384,6 +10384,10 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                              num_speculative_tokens) if sampled else []
                 for i, sampled in enumerate(sampled_token_ids)
             ]
+        if gaudi_envs.VLLM_HPU_FLASH_NEXT_NGRAM_PLAIN_STEPS == 1 and not any(len(d) for d in draft_token_ids):
+            # no request drafts: the next step runs as a plain decode step, not a 2-row verification of
+            # placeholders (the runner resets the recurrent checkpoint after a plain step)
+            return draft_token_ids
         # swipe draft_token_ids_native replacing [] to [-1]
         for i in range(len(draft_token_ids)):
             if len(draft_token_ids[i]) == 0:

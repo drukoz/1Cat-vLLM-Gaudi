@@ -260,6 +260,16 @@ the context length, every `N`-th context with a wrong last token), so drafts
 are accepted on the tiny model, which never repeats its context
 (`tools/flash_next/rental/lookup_tiny.py` runs it on a card). Never set it on a
 production server.
+
+`VLLM_HPU_FLASH_NEXT_NGRAM_PLAIN_STEPS` (integer, default `0`) applies to the
+`ngram` method on Flash-Next. `0` gives a request without an n-gram match the
+1-token placeholder draft (`-1`, never accepted), so every decode step is a
+verification step at least 2 rows wide per request. `1` keeps the placeholder
+only when another request of the step drafts; a step in which no request
+drafts runs as a plain decode step (1 row per request), which spares one row
+per request on fresh text (at one stream on TP4 an extra row cost about 8 ms,
+card job 00133). Any other value is `0`.
+
 `VLLM_HPU_MOE_GLUE_MERGE_GATE_UP` (integer, default `0`) applies only with
 `VLLM_HPU_MOE_GLUE=1`. `1` appends the shared expert's gate_up rows of this
 rank to the block's merged gate weight (built once at load, a second

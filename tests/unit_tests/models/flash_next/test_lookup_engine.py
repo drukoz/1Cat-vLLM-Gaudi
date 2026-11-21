@@ -148,6 +148,27 @@ def test_sampled_requests_with_lookup_drafts(sampled_run, tiny_checkpoint):
     assert len(widths) >= 2, widths
 
 
+@pytest.fixture(scope="module")
+def plain_run(tiny_checkpoint, tmp_path_factory) -> dict:
+    """The n-gram server with VLLM_HPU_FLASH_NEXT_NGRAM_PLAIN_STEPS=1: ragged oracle drafts whose schedule has steps
+    without any draft (single requests), which then run as plain decode steps between verification steps."""
+    plan = _plan(Path(tiny_checkpoint))
+    plan["configs"] = [{"name": "plain-pc", "speculative_config": NGRAM, "prefix_caching": True,
+                        "env": {"VLLM_HPU_FLASH_NEXT_NGRAM_PLAIN_STEPS": "1"},
+                        "oracle": {"schedule": SCHEDULE, "tamper_every": 4},
+                        "scenarios": ["solo-solo-7", "solo-solo-100", "near-256", "near-512", "batch", "turn-2"]}]
+    return _run_child(plan, tmp_path_factory.mktemp("lookup_engine_plain"))
+
+
+def test_plain_steps_when_no_request_drafts(plain_run):
+    config = plain_run["configs"]["plain-pc"]
+    assert "error" not in config, config.get("error")
+    widths = [w["width"] for w in config["widths"]]
+    # plain decode steps (1 row per request) between verification steps (2 to 1 + k rows), lossless
+    assert 1 in widths and max(widths) == K + 1, sorted(set(widths))
+    _compare(plain_run, "plain-pc")
+
+
 def _divergences(record: dict, config: str) -> tuple[int, list, list]:
     """``(matched, ties, breaks)`` of ``config`` against the baseline: per request the first token that differs is a
     tie when the speculative token is among the baseline's recorded best tokens there, at most ``TIE`` below the
