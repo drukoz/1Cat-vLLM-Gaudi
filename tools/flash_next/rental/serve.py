@@ -145,6 +145,8 @@ def build_command(variant: dict, server: dict, model: str, served_name: str) -> 
         "--enable-prompt-tokens-details",
     ]
     cmd += list(variant.get("serve_args") or [])
+    if os.environ.get("FARM_SERVE_NO_PREFIX_CACHING") == "1":  # async-sched job branch: the tiny gate of mode 3
+        cmd.append("--no-enable-prefix-caching")
 
     env = server_environment(variant.get("env") or {}, server["cards"])
     return cmd, env

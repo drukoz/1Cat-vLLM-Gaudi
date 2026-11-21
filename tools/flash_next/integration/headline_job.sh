@@ -339,7 +339,7 @@ while [ "$i_arm" -lt "${#ARMS[@]}" ]; do
     first=0
     echo "=== headline_job: arm $arm start $(date -u +%T)"
     case "$arm" in
-        tiny | tiny-chain | tiny-chain-vlg | tiny-chain-vp | tiny-m1)
+        tiny | tiny-chain | tiny-chain-vlg | tiny-chain-vp | tiny-m1 | tiny-m3)
             spec=()
             case "${HEADLINE_TINY_SPEC:-0}" in [1-9]) spec=(--spec "$HEADLINE_TINY_SPEC") ;; esac
             tiny_graph="${HEADLINE_TINY_DRAFT_GRAPH:-${VLLM_HPU_MTP_DRAFT_GRAPH:-0}}"
@@ -349,6 +349,8 @@ while [ "$i_arm" -lt "${#ARMS[@]}" ]; do
             tiny_vlg="${HEADLINE_TINY_VERIFY_LOGITS_IN_GRAPH:-${VLLM_HPU_VERIFY_LOGITS_IN_GRAPH:-0}}"
             tiny_log="${VLLM_HPU_LOG_UNMATCHED_GRAPH_INPUTS:-0}"
             tiny_m1="${VLLM_HPU_FLASH_NEXT_SPEC_DEVICE_INPUTS:-0}"
+            tiny_async="${VLLM_HPU_FLASH_NEXT_ASYNC_SCHED:-0}"
+            tiny_nopc="${FARM_SERVE_NO_PREFIX_CACHING:-0}"
             # the chain's gates: the chained draft (stage A; -vlg and -vp: stage B) on the draft graph and I01, with
             # the chain graph's copied inputs logged (a tiny gate is never a measured arm)
             case "$arm" in
@@ -357,6 +359,10 @@ while [ "$i_arm" -lt "${#ARMS[@]}" ]; do
                 tiny-chain-vp) tiny_graph=1; tiny_md=1; tiny_chain=1; tiny_vp=1; tiny_vlg=0; tiny_log=1 ;;
                 # async-sched's M1 gate: the device-made inputs made and checked against the host's every step
                 tiny-m1) tiny_graph=1; tiny_md=1; tiny_chain=1; tiny_vp=0; tiny_vlg=0; tiny_m1=1 ;;
+                # async-sched's M2 gate: mode 3 (a chained step issued before the previous one's tokens reach the
+                # host) with the device-made inputs, prefix caching off (rental/serve.py's opt-out)
+                tiny-m3) tiny_graph=1; tiny_md=1; tiny_chain=1; tiny_vp=0; tiny_vlg=0; tiny_m1=2; tiny_async=3
+                    tiny_nopc=1 ;;
             esac
             # the MTP server's own flags too (they act only on the speculative mode)
             tiny_sv="${VLLM_HPU_SPEC_SAMPLED_VERIFY:-0}"
@@ -369,6 +375,7 @@ while [ "$i_arm" -lt "${#ARMS[@]}" ]; do
                 VLLM_HPU_FLASH_NEXT_DECODE_METADATA="$tiny_md" VLLM_HPU_MTP_DRAFT_CHAIN="$tiny_chain" \
                 VLLM_HPU_VOCAB_PARALLEL_LOGITS="$tiny_vp" VLLM_HPU_VERIFY_LOGITS_IN_GRAPH="$tiny_vlg" \
                 VLLM_HPU_LOG_UNMATCHED_GRAPH_INPUTS="$tiny_log" VLLM_HPU_FLASH_NEXT_SPEC_DEVICE_INPUTS="$tiny_m1" \
+                VLLM_HPU_FLASH_NEXT_ASYNC_SCHED="$tiny_async" FARM_SERVE_NO_PREFIX_CACHING="$tiny_nopc" \
                 "$PYTHON" /farm/farm_tiny.py --gdn hc ${spec[@]+"${spec[@]}"} --out "$OUT/$arm"
             rc=$?
             if [ "$arm" != tiny ]; then
@@ -380,7 +387,17 @@ while [ "$i_arm" -lt "${#ARMS[@]}" ]; do
                         tiny-chain-vlg) chain_vlg_ok=0 ;;
                         tiny-chain-vp) chain_vp_ok=0 ;;
                         tiny-m1) m1_ok=0 ;;
+                        tiny-m3) m3_ok=0 ;;
                     esac
+                fi
+                if [ "$arm" = tiny-m3 ] && [ "$rc" -eq 0 ]; then
+                    # M2's own check: steps were issued before the previous step's tokens reached the host
+                    last="$(grep -rhoE "VLLM_HPU_FLASH_NEXT_ASYNC_SCHED=3: [0-9]+ steps issued.*" "$OUT/$arm" 2>/dev/null | tail -n 1)"
+                    echo "headline_job: tiny-m3: ${last:-no mode-3 summary line}"
+                    if [ -z "$last" ] || grep -rqE "ASYNC_SCHED=3 acts as 2|device-made inputs differ" "$OUT/$arm" 2>/dev/null; then
+                        echo "headline_job: tiny-m3: mode 3 did not serve the tiny gate"
+                        m3_ok=0
+                    fi
                 fi
                 if [ "$arm" = tiny-m1 ] && [ "$rc" -eq 0 ]; then
                     # M1's own check: every advanced step checked, no difference (async-sched)
@@ -396,7 +413,7 @@ while [ "$i_arm" -lt "${#ARMS[@]}" ]; do
                 grep -rhoE "chained behind its verification, stage [AB]|keeps the draft after the host read: .*|HPU graph replay copies .*" \
                     "$OUT/$arm" 2>/dev/null | cut -c1-400 | sort | uniq -c | head -20
                 want_stage=B
-                case "$arm" in tiny-chain | tiny-m1) want_stage=A ;; esac
+                case "$arm" in tiny-chain | tiny-m1 | tiny-m3) want_stage=A ;; esac
                 if [ "$rc" -eq 0 ] && ! grep -rqE "chained behind its verification, stage $want_stage" "$OUT/$arm" 2>/dev/null; then
                     echo "headline_job: WARNING: $arm passed but no step was chained in stage $want_stage (the gate did not test it)"
                 fi
@@ -500,6 +517,11 @@ while [ "$i_arm" -lt "${#ARMS[@]}" ]; do
             for w in ${arm_words[@]+"${arm_words[@]}"}; do
                 case "$w" in
                     async) async_env=(VLLM_HPU_FLASH_NEXT_ASYNC_SCHED=2); timing="${HEADLINE_ASYNC_MTP_TIMING:-2}" ;;
+                    # async-sched job branch: async3 = stage 2's mode 3 (a chained step issued before the previous
+                    # one's tokens reach the host; needs the chain, SPEC_DEVICE_INPUTS=2, I01 and nopc)
+                    async3) async_env=(VLLM_HPU_FLASH_NEXT_ASYNC_SCHED=3); timing="${HEADLINE_ASYNC_MTP_TIMING:-2}" ;;
+                    # async-sched job branch: nopc = prefix caching off (after serve_probe.sh's --enable-prefix-caching)
+                    nopc) serve_extra+=(--no-enable-prefix-caching) ;;
                     graph) draft_graph=1 ;;
                     rfc) replicated_fc=1 ;;
                     noshard) shard=0; greedy_only=1 ;;
