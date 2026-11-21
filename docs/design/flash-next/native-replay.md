@@ -676,6 +676,23 @@ sibling (19r xor 1), so mode 2 needs the sibling kept free (a fix for the flag, 
 
 ## Handoff (if this agent stops)
 
+**08:30 UTC (date -u).** Builds: `lean6-73203512bf62` (lean5 + `PT_HPU_HPUGRAPH_LEAN_COLLECTIVE`, deferred),
+`lean6h2-15f100baff2e` (lean6 + `PT_HPU_H2D_TIMING=N`: per thread every N host-to-device copies one line
+`HPU_H2D_TIMING ... host_us blocking wait_us pinned bytes multi transfers`; for engine-step's copy census; patches
+`lean6h.patch`, `lean6h2.patch`). Answers sent to engine-step (agent a8a87f4c2008bde9c), from the bridge source:
+(1) with `disable_tensor_cache=True` the wrapper binds a marked input directly only when its own lazy tensor is an input
+of a captured segment ("matched", `habana_lazy/lazy_executor.cpp` `saveInputsAndOutputs`); unmatched inputs are
+copied with a lazy `copy_` before every replay (graphs.py `copy_to`), flushed as their own recipe; replay checks sizes
+and the storage offset (`patch_exact`); views and slices passed in are likely unmatched; (2) any view handed to a custom
+op fails at launch (00043), not the offset or the strides; (3) the bridge uploads Python scalar operands of a lazy graph
+with one `copy_scalars_to_device` multi-transfer per flushed graph, and a random graph's seed on every replay; (4) a
+captured segment ends at every lazy flush: collectives, host reads (`.item()`, D2H), data-dependent ops (`nonzero`,
+`unique`, boolean-mask indexing), which also switch on **stage submission** (default on: then a flush after every
+`PT_HPU_MAX_COMPOUND_OP_SIZE_SS` = 10, 20, 40, ... top-level ops until a host mark_step), an H2D copy into a lazily
+computed tensor, CPU fallbacks, stream and event calls; the reasons are the `PT_IRGRAPH`/`PT_LAZY` debug messages
+"step marker due to ..." in `pytorch_log.txt`; first A/B for the small "embed" and "PLE cast" segments:
+`PT_HPU_MAX_COMPOUND_OP_SIZE_SS=1000000`.
+
 **08:08 UTC (date -u).** lean5's qualification is job **00210** `real8-bridge-reuse2` (collectives track, all cards, 120 min,
 after async-sched's 00202/00203; replaces 00198): tiny-stock, tiny-lean4-nan, tiny-lean5-verify; real-ref, real-lean5,
 real-lean5-verify, real-lean4 (fallback, last); text_check 1/32 (+ churn on the lean5 arms); plan_bad 0 and churn
