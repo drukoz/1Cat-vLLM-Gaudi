@@ -425,11 +425,14 @@ greedy ms per step at 32 + 8 + 1 (`<job>-<name>-spinner.txt`) for real-rebuild (
 our build on the stock path, the control 00181 lacked), real-lean (`lean3a-8f6f7faf88dc`, flag 1: lean3t + no GIL
 release for inputs whose event is done, no argument building for logs and traces that are off) and real-pin (the
 same + `VLLM_HPU_WORKER_CPU_PIN=1`; mode 2 would put the eight main threads on CPUs 19m, possibly four sibling pairs).
-If native-replay's sibling-map probe yields a placement script before 00189 starts: copy it to
-`~/farm/collectives/results/bench/place.sh` and write `PIN_PLACE=/results/bench/place.sh` into
-`~/farm/collectives/bridge/late/00189.env`; the pin arm then runs on its own through `place_wrap.sh` (the server and
-probe start at once; the script runs once the server answers `/health`; `placement.log` in the arm's results).
-Pending.
+Native-replay's sibling-map probe (its job 00193) found that vCPUs 2k and 2k+1 share a host core (all 12 tested
+a^1 pairs slow each other, no other pair does); its placement script `place.sh` (md5 7e54f2de, read in full: inline
+Python, it only sets thread affinities inside its own container) gives each worker's main thread one vCPU of its
+share with the sibling kept free, keeps every other thread off those, and re-applies every 2 s. Staged at 05:43 UTC as
+`~/farm/collectives/results/bench/place.sh` with `PIN_PLACE=/results/bench/place.sh` in
+`~/farm/collectives/bridge/late/00189.env`: the pin arm runs last, on its own, through `place_wrap.sh` (the server and
+probe start at once; the script runs once the server answers `/health`; `placement.log` in the arm's results), with
+`VLLM_HPU_WORKER_CPU_PIN=1` kept. Pending.
 
 ## Handoff (if this agent stops)
 
