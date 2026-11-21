@@ -37,6 +37,8 @@ def server(tmp_path):
         app.router.add_post("/tokenize", fake.tokenize)
         app.router.add_get("/metrics", fake.metrics)
         app.router.add_post("/v1/completions", fake.completions)
+        app.router.add_post("/start_profile", fake.profile)
+        app.router.add_post("/stop_profile", fake.profile)
         holder["runner"] = web.AppRunner(app, shutdown_timeout=0.5)
         await holder["runner"].setup()
         await web.SockSite(holder["runner"], sock).start()
@@ -518,3 +520,29 @@ def test_turn2_salted_resends_the_second_turn_without_prefix_hits(server, tmp_pa
     assert len(salted) == 1, list(cases)
     assert cases[salted[0]]["tokens_equal"] in (True, False)
     assert "cache_salt" in server.requests[-1]["fields"]
+
+
+def test_capture_plan_traces_one_cached_prompt_forward_and_a_window_of_a_cold_prompt(server, tmp_path,
+                                                                                         slow_prefill):
+    """step-anatomy's prompt-forward traces (00242): the prefix is primed and the shape compiled before the traced
+    request, the profile window brackets exactly that request, and the cold prompt's window opens while it is
+    still prefilling. No canary streams run (a traced step must not be mixed)."""
+    code, report, _ = run_tool(server, tmp_path, "--plan", "capture", "--canaries", "2", "--capture-cached", "4096",
+                               "--capture-new", "1024", "--capture-cold", "24000", "--capture-after", "1.0",
+                               "--capture-seconds", "0.3")
+    assert code == 0
+    cases = by_case(report)
+    assert list(cases) == ["capture prime 4097", "capture warm-up 4096+1024", "capture traced 4096+1024",
+                           "capture cold 24000"]
+    traced = cases["capture traced 4096+1024"]
+    assert traced["requests"][0]["cached_tokens"] == 4096 and traced["requests"][0]["uncached_tokens"] == 1024
+    assert all(row["canaries"] is None for row in report["cases"])
+    calls = server.profile_calls
+    assert [path for path, _ in calls] == ["/start_profile", "/stop_profile"] * 2
+    trace = traced["trace"]
+    assert trace["start_profile"]["status"] == 200 and trace["stop_profile"]["status"] == 200
+    t_send = traced["requests"][0]["t_send"]
+    assert trace["start_profile"]["at"] <= t_send and trace["stop_profile"]["at"] >= t_send
+    cold = cases["capture cold 24000"]["trace"]
+    assert cold["prompt_done_before_window"] is False  # 24,000 tokens at 8,000 per second: 3 s, window at 1 s
+    assert cold["start_profile"]["at"] < calls[3][1] and cold["window_s"] == 0.3

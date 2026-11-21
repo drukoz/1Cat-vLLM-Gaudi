@@ -77,7 +77,7 @@ KNOBS_SETTLE_S = 0.8  # the engine polls the knobs file every 0.25 s
 SYNTHETIC_ID_RANGE = (1000, 60000)  # ordinary vocabulary ids, far from the special tokens at the top
 RECORDED_TOKEN_IDS = 64  # output token ids kept per request row (--return-ids)
 
-PLANS = ("baseline", "ladder", "sweep", "pacing", "agents")
+PLANS = ("baseline", "ladder", "sweep", "pacing", "agents", "capture")
 DEFAULT_SETTINGS = "8192:2048,8192:8192,16384:4096,16384:16384,32768:8192,32768:32768,65536:16384,65536:0"
 DEFAULT_PACING = "100:0,50:2048,25:2048,25:512,10:2048"
 METRIC_NAMES = {
@@ -619,6 +619,61 @@ class Runner:
 
     # ----- the agent loop -----
 
+    async def _profile(self, action: str) -> dict:
+        """POST ``/start_profile`` or ``/stop_profile`` (the server needs ``--profiler-config``); the status and how
+        long the call took (``/stop_profile`` writes the traces and holds the server for minutes)."""
+        t0 = time.time()
+        try:
+            async with self._session.post(self.url.rstrip("/") + f"/{action}_profile", json={},
+                                          timeout=aiohttp.ClientTimeout(total=self.args.profile_timeout)) as resp:
+                body = (await resp.text())[:200]
+                status = resp.status
+        except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as error:
+            body, status = f"{type(error).__name__}: {error}"[:200], 0
+        out = {"status": status, "seconds": round(time.time() - t0, 3), "at": t0, "body": body}
+        print("CAPTURE %s_profile: status %s after %.1f s%s" % (action, status, out["seconds"],
+                                                              "" if status == 200 else f" ({body})"), flush=True)
+        return out
+
+    async def plan_capture(self) -> None:
+        """Device traces of prompt forwards for step-anatomy (the server starts with ``--profiler-config`` (torch)
+        and ``HABANA_PROFILE=profile_api_light``). No canary streams: a decoding stream makes the traced steps
+        mixed. The timings of the traced cases are not speed numbers.
+
+        ``--capture-cached C --capture-new N``: a cold prompt of C + 1 tokens (the cache keeps its first C tokens),
+        then C + N tokens (it compiles the shapes; not traced), then C + N other tokens inside ``/start_profile`` ..
+        ``/stop_profile`` with one output token: the window holds that prompt forward (one forward of N tokens at
+        context C when C and C + N are recurrent block boundaries). ``--capture-cold T``: a cold prompt of T tokens;
+        ``--capture-after`` seconds after it is sent a window of ``--capture-seconds`` (one or two chunks).
+        """
+        args = self.args
+        cached, new = args.capture_cached, args.capture_new
+        if cached > 0 and new > 0:
+            base = self.corpus.cold(cached + 1, f"capture-base-{cached}")
+            await self.run_case(f"capture prime {cached + 1}", [("prime", base)], canaries=False)
+            warm = base[:cached] + self.corpus.take(new, f"capture-warm-{cached}-{new}")
+            await self.run_case(f"capture warm-up {cached}+{new}", [("warm-up", warm)], canaries=False)
+            traced = base[:cached] + self.corpus.take(new, f"capture-traced-{cached}-{new}")
+            start = await self._profile("start")
+            result = await self.run_case(f"capture traced {cached}+{new}", [("traced", traced)], canaries=False)
+            stop = await self._profile("stop")
+            result["trace"] = {"start_profile": start, "stop_profile": stop, "window": "one prompt forward"}
+        if args.capture_cold > 0:
+            prompt = self.corpus.cold(args.capture_cold, f"capture-cold-{args.capture_cold}")
+            task = asyncio.ensure_future(self.run_case(f"capture cold {args.capture_cold}", [("cold", prompt)],
+                                                       canaries=False))
+            await asyncio.sleep(args.capture_after)
+            early = task.done()
+            if early:
+                print("CAPTURE the cold prompt ended before the window (%.1f s): the trace holds no chunk of it"
+                      % args.capture_after, flush=True)
+            start = await self._profile("start")
+            await asyncio.sleep(args.capture_seconds)
+            stop = await self._profile("stop")
+            result = await task
+            result["trace"] = {"start_profile": start, "stop_profile": stop, "after_s": args.capture_after,
+                               "window_s": args.capture_seconds, "prompt_done_before_window": early}
+
     async def plan_agents(self) -> None:
         """``--agents`` conversations in a closed loop (the module text), once per ``--agent-pacing`` pair."""
         a = self.args
@@ -932,6 +987,14 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     p.add_argument("--agent-pacing", type=_pairs, default=[],
                    help="agents: one loop per share_percent:slice_tokens pair (share 100 = pacing off); "
                    "empty = one loop at the server's settings")
+    p.add_argument("--capture-cached", type=int, default=32768,
+                   help="capture: cached prefix of the traced prompt forward (0 = no such capture)")
+    p.add_argument("--capture-new", type=int, default=1024, help="capture: new tokens of the traced prompt forward")
+    p.add_argument("--capture-cold", type=int, default=0,
+                   help="capture: a cold prompt of this many tokens traced in its middle (0 = none)")
+    p.add_argument("--capture-after", type=float, default=20.0, help="capture: seconds into the cold prompt")
+    p.add_argument("--capture-seconds", type=float, default=2.5, help="capture: the cold prompt's window")
+    p.add_argument("--profile-timeout", type=float, default=1800.0, help="capture: limit of one profile call")
     p.add_argument("--repeat", type=int, default=1,
                    help="cold passes per size; with 2 the first pass compiles the graphs and the second measures")
     p.add_argument("--canaries", type=int, default=2, help="streams already decoding during each case (0 = none)")

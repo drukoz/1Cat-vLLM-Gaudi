@@ -11,6 +11,7 @@ import argparse
 import asyncio
 import json
 import os
+import time
 
 from aiohttp import web
 
@@ -25,6 +26,7 @@ class FakeServer:
     def __init__(self, knobs_path=None) -> None:
         self.cached: set[tuple] = set()
         self.prefilling = 0
+        self.profile_calls: list[tuple[str, float]] = []
         self.knobs_path = knobs_path
         self.knobs_seen: list[dict] = []
         self.prompt_tokens = 0.0
@@ -54,6 +56,11 @@ class FakeServer:
     def _store(self, ids: list[int]) -> None:
         for end in range(BLOCK, len(ids) + 1, BLOCK):
             self.cached.add(tuple(ids[:end]))
+
+    async def profile(self, request: web.Request) -> web.Response:
+        """``/start_profile`` and ``/stop_profile``: recorded (path, time)."""
+        self.profile_calls.append((request.path, time.time()))
+        return web.Response(text="")
 
     async def tokenize(self, request: web.Request) -> web.Response:
         body = await request.json()
