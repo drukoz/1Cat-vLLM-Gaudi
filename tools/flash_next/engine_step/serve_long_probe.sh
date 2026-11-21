@@ -40,7 +40,7 @@ setsid vllm serve /models/Qwen3.8-Flash-Next-FP8 --served-model-name fn --host 1
     --tensor-parallel-size "$TP" --enable-expert-parallel --max-model-len 131072 --max-num-seqs 32 \
     --enable-prefix-caching --language-model-only --trust-remote-code --gpu-memory-utilization 0.92 \
     --max-num-batched-tokens 8192 --long-prefill-token-threshold 2048 --enable-prompt-tokens-details \
-    "${SPEC_ARGS[@]}" > server0.log 2>&1 &
+    ${SPEC_ARGS[@]+"${SPEC_ARGS[@]}"} > server0.log 2>&1 &
 SP=$!
 # Device memory every 15 s (coordinator, 23:50 UTC: graphs made at run time can exhaust it; PT_DEVMEM lines).
 HLSMI=""
