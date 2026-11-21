@@ -638,6 +638,26 @@ Readings:
    the same number of `isra` clones; the plugin likewise. A slower build is unlikely; job 00188 measures it (real-rebuild
    against the image's bridge).
 
+### 7.12 The host's hyperthread pairs: job 00193 (CPU only, all cards held)
+
+MEASURED (`tools/flash_next/replay/cpu_siblings.py` in job 00193, 281 s, the 144 CPUs of an all-card job; results
+`reports/native-replay/card/00193-cpu-sibs/cpu_siblings.json`): a pinned C loop per vCPU, alone and in pairs. The VM
+reports 152 sockets of one core each (lscpu: KVM, Icelake, 2 NUMA nodes 0-75 / 76-151, `numa_balancing=1`), but
+**vCPUs 2k and 2k+1 share a host core**: all 12 tested a^1 pairs (0-1, 12-13, 24-25, 38-39, 50-51, 62-63, 76-77, 88-89,
+100-101, 114-115, 126-127, 138-139) slow each other by 7-9 % on both sides; a+-76 pairs 0.00 (12 of 12); a+-1 only when
+it is a^1; a full scan of vCPUs 0, 12, 25 against all 143 others puts the a^1 partner at 0.07-0.10 and the rest at a
+median 0.000, 95th percentile 0.02, max 0.06. The small size is the loop's (one dependent chain leaves most of a core
+free; fixed to four chains in 61ad3d1+); two busy decode main threads lose far more (INFERRED from the 2x slow ranks of
+section 7.11, slow only at 1 and 8 streams, where the main threads are busy all the step). The tool's own verdict
+printed "rule: None" (its absolute threshold 0.2 was meant for a core-filling loop; now relative).
+
+Use: `tools/flash_next/replay/place_workers.py` with rule a^1 (`~/farm/native-replay/late/place.sh`, md5
+7e54f2de93590d2478bf5a94dbca7d75) runs in 00189's pin arm after health: each worker's main thread alone on one vCPU
+of its share, the sibling vCPU kept free, the worker's other threads on the rest of the share, every other process off
+the reserved vCPUs, re-applied every 2 s. Also a rule for every placement here: never put two busy threads on 2k and
+2k+1; `VLLM_HPU_WORKER_CPU_PIN=2` puts the main thread on its share's first CPU (19r) and lets other threads use its
+sibling (19r xor 1), so mode 2 needs the sibling kept free (a fix for the flag, after 00189 says it pays).
+
 ## 8. Build steps
 
 | Step | What | Proof off the card | Card | State |
