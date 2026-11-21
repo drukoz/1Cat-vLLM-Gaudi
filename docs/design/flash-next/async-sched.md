@@ -45,8 +45,12 @@ Updated 2026-11-21 06:50 UTC.
     with `VLLM_HPU_WORKER_CPU_PIN=1` under collectives' `place_wrap.sh` with native-replay's `place.sh` (rule a^1;
     copies in `~/farm/async-sched/results/bench`, md5 5f7ca629 and 7e54f2de; local copy of `place.sh` in
     `reports/async-sched/bench/`), the placement's output in each arm's `placement.log`; the job log says
-    `placement ON` or `placement off`. Turn it on only on the coordinator's word after 00189's verdict:
-    `bin/node-ssh 'echo on > ~/farm/async-sched/results/switches/place'` (before 00202 starts).
+    `placement ON` or `placement off`. The coordinator sets it itself (06:50 UTC) from collectives' verdict on
+    00189's pin arm (about 08:20 UTC: "on" if at 1 and 8 streams no rank is above 1.4x the rank median and the
+    steady step is not slower than without placement): `echo on > ~/farm/async-sched/results/switches/place`.
+    Queue order then: 00184, 00189, 00170 + 00150 (4 cards each, about 50 min), 00202, 00203.
+  - Waiters with fetch: `reports/async-sched/logs/wait_00202.out` and `wait_00203.out` (`bin/farm wait` then
+    `bin/farm fetch`); the submit logs' own waiters end at their 3 h alarm, before the jobs do.
   - If the session is gone: `bin/farm fetch async-sched 00202 00202-real8-async-m1c` (same for 00203). Read
     `python3 -I reports/async-sched/tools/ab_table.py <dir> --pairs nospec-async:nospec` (00202) and
     `--pairs mtp2-async:mtp2` (00203); `tiny-async/summary.json` (both modes must pass); the timer records of each
