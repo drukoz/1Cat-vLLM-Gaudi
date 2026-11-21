@@ -6,16 +6,18 @@ This file is the track's report. The harness of the track's agents does not writ
 
 ## Handoff (if this agent stops)
 
-Last update: 2026-11-20 23:56 UTC (fourth agent of the track, Opus 5.5, started 23:15 UTC). Coordinator's rule
+Last update: 2026-11-21 00:13 UTC (fourth agent of the track, Opus 5.5, started 23:15 UTC). Coordinator's rule
 for tonight (BRIEF 23:21): card evidence first, no pull request before 04:00 UTC; push the branch after each green
 step and tell the coordinator the commit and the flags (the integration track builds from this branch).
 
-**State.** MTP k = 3 works on the real model at TP8 and TP4 and pays at 1 stream (TP4: 23.5 ms per token against
-39.8, 1.69 times), about even at 8 streams, and LOSES at 32 streams on today's torch QSA path (133.7 against 108.1).
-The timer (job 00104) says why: the verification part Ft grows with its rows (47 / 109 / 303 ms at 4 / 32 / 128
-rows) while a draft pass Fd is small (4.4 / 6.0 / 10.7 ms). Acceptance holds at 32 streams (0.72 / 0.51 / 0.36
-per position). The open questions are what the QSA data-flow change and the kernel-fixes flags do to Ft at 128
-rows, whether k = 1 beats k = 3 at 32 streams, and what sampled verification (I07) costs: jobs 00126 / 00127.
+**State (00:13 UTC).** With the QSA data flow and the kernel-fixes flags, MTP k = 3 pays at 1 and 8 streams and
+breaks even at 32 on TP4 (00126 / 00127: 25.5 / 34.0 / 61.9 ms per token against 29.8 / 43.2 / 63.7; a 128-row
+verification costs Ft 131 ms, it was 303 on the torch QSA path); on TP8 (integration 00128) 40.7 against 51.1 ms per
+token at 32 streams. The draft loop is sound (acceptance 0.72 / 0.50 / 0.34 at 32 streams, as with it off).
+**Sampled verification (I07) works on the card** (exact path, `VLLM_HPU_SPEC_SAMPLED_VERIFY=1`: coherent texts,
+acceptance length 2.62 at 1 stream, 2.23 at 32) but adds about 26 ms per step, so sampled MTP loses at 32 streams on
+TP4 (82.4 against 76.2 ms per token); the candidate path (`=2`) targets that cost (jobs 00135, 00136). k = 1 at 32
+streams is 00126's second arm (predicted about 55 ms per token at TP4).
 
 **Branch** (pushed: `origin/feat/flash-next-gaudi-mtp-card-ready` = `fb4f4d50` and this handoff):
 - `fb4f4d50` spec_scaling.py: the long prompts of the warm and the measured round start with different text (no
@@ -211,6 +213,8 @@ short-prompt numbers.
 | 00099 `real4-nospec-ref` | TP4 + EP4, no speculation, `9d013a36`, modules 0-3, greedy, 256 tokens, torch QSA path | steady ms per step 39.8 (1 stream), 53.7 (8), 108.1 / 108.1 (32, two rounds) |
 | 00104 `real4-mtp3-timed` | TP4 + EP4, k = 3, fused verify rung (`VLLM_HPU_GDN_CORE_VERIFY=1`), timer, `317c33c5`, modules 4-7, greedy, 256 tokens | ms per token 23.5 / 49.0 / 133.7 (1 / 8 / 32 streams), tokens per step 2.56 / 2.57 / 2.53, step 60 / 126 / 338 ms. Timer (means of 25 steps, 4 ranks within 1 ms): Ft 47.0-48.4 / 109.2-109.5 / 302.5-303.4 ms at 4 / 32 / 128 rows (415-438 in the first 32-stream rounds, compiles); draft 12.8-13.5 / 17.8 / 32.1-32.5 ms, so Fd 4.3-4.5 / 5.9-6.0 / 10.7-10.8 ms per pass. Acceptance per position (server windows): 0.75 / 0.55 / 0.38 at 8 streams (1,959 drafted), 0.72 / 0.51 / 0.36 at 32 (16,134 drafted), 0.64 / 0.39 / 0.23 at 1 stream (windows with warm rounds). Texts coherent; the 1-stream text leaves the reference's after 4 words (a near tie under 4 rows). Pauses up to 24.6 s in the first 32-stream round (compiles) |
 | 00105 `tiny2-mtp-arms` | tiny model TP2, k = 3, image `317c33c5`; arm base, arm `VLLM_HPU_MTP_DRAFT_LOOP=1` + `VLLM_HPU_MTP_CHUNK_KV=1` | both arms PASS on the torch-verification rung (tokens equal the non-speculative server, 1 to 2,600-token prompts; 0 of 270 drafts accepted, random weights), 20.0 and 16.2 ms per token; the fused verify rung missed the 700-token prompt at token 4 in both arms (a near tie, see the handoff). First card run of DRAFT_LOOP and CHUNK_KV: no error |
+| 00127 `real4-qsa-ref-nospec` | TP4 + EP4, no speculation, `13d7393a`, QSA data flow (`VLLM_HPU_QSA_FUSED=1 VLLM_HPU_QSA_INDEXER_SHARD=1`) + kernel-fixes flags (`VLLM_HPU_GDN_KERNEL_INTERLEAVE=1 VLLM_HPU_GDN_GLUE_CACHE=1 VLLM_HPU_HC_FUSED_COPY_MODE=2`), `VLLM_GRAPH_RESERVED_MEM=0.5`, 256 tokens | greedy ms per step 29.8 (1 stream), 43.2 (8), 64.5 / 63.7 (32); sampled (server default sampling) 38.7 (1), 76.2 (32); hl-smi peak 70.7 GiB per card; texts coherent |
+| 00126 arm `k3` | the same build and flags with k = 3, fused verify rung (`VLLM_HPU_GDN_CORE_VERIFY=1`), `VLLM_HPU_MTP_DRAFT_LOOP=1`, `VLLM_HPU_MTP_CHUNK_KV=1`, `VLLM_HPU_SPEC_SAMPLED_VERIFY=1`, timer | greedy: 65.3 / 88.3 / 157.9 and 157.6 ms per step at 1 / 8 / 32 streams, 2.56 / 2.60 / 2.53 and 2.55 tokens per step, **25.5 / 34.0 / 62.3 and 61.9 ms per token (1.17 / 1.27 / 1.03 times the reference)**, acceptance 0.74 / 0.47 / 0.38, 0.73 / 0.52 / 0.39, 0.73 / 0.50 / 0.35. Timer: Ft 47-52 / 65 / 130-132 ms at 4 / 32 / 128 rows, Fd 4.4 / 5.7 / 6.9-8.5 ms (pass-0 wait gone with the draft loop). **Sampled (I07, exact path, first card run): works**, 91.0 ms per step at 1 stream (2.59 tokens per step, 35.2 ms per token, acceptance 0.73 / 0.53 / 0.36), 184.3 at 32 streams (2.24, 82.4 ms per token, 0.64 / 0.38 / 0.22): the exact path adds about 26 ms per step at 4 and at 128 rows; texts coherent |
 
 ## How the jobs of this track run (late-bound)
 
