@@ -247,7 +247,7 @@ def _config(async_scheduling, speculative=False):
                            speculative_config=SimpleNamespace(method="mtp") if speculative else None)
 
 
-@pytest.mark.parametrize("value", [None, "0", "3"])
+@pytest.mark.parametrize("value", [None, "0", "9"])
 def test_platform_default_turns_async_off(platform_module, monkeypatch, value):
     if value is not None:
         monkeypatch.setenv("VLLM_HPU_FLASH_NEXT_ASYNC_SCHED", value)
@@ -277,6 +277,16 @@ def _spec_config(async_scheduling, method="mtp"):
                            speculative_config=SimpleNamespace(method=method))
 
 
+def test_platform_mode_3_keeps_async_for_mtp_as_mode_2(platform_module, monkeypatch):
+    monkeypatch.setenv("VLLM_HPU_FLASH_NEXT_ASYNC_SCHED", "3")
+    config = _spec_config(False)
+    assert platform_module.resolve_flash_next_async_scheduling(config, requested=True) is True
+    assert config.scheduler_config.async_scheduling is True
+    monkeypatch.setenv("VLLM_HPU_FLASH_NEXT_ASYNC_SCHED", "3")
+    plain = _config(True)  # without speculation: as mode 1
+    assert platform_module.resolve_flash_next_async_scheduling(plain) is True
+
+
 def test_platform_mode_2_keeps_async_for_mtp(platform_module, monkeypatch):
     """vLLM kept async scheduling on for MTP (requested); the HPU hook had turned it off for the speculative
     config just before: mode 2 turns it back on."""
@@ -287,7 +297,7 @@ def test_platform_mode_2_keeps_async_for_mtp(platform_module, monkeypatch):
 
 
 @pytest.mark.parametrize("mode,requested,method", [("2", False, "mtp"), ("2", True, "ngram"), ("1", True, "mtp"),
-                                                   ("0", True, "mtp")])
+                                                   ("0", True, "mtp"), ("3", False, "mtp"), ("3", True, "ngram")])
 def test_platform_mode_2_only_for_requested_mtp(platform_module, monkeypatch, mode, requested, method):
     monkeypatch.setenv("VLLM_HPU_FLASH_NEXT_ASYNC_SCHED", mode)
     config = _spec_config(False, method=method)
