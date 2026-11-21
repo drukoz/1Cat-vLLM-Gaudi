@@ -6,7 +6,7 @@ results are under `/Volumes/Storage/Claude/gaudi-work/reports/async-sched/card/`
 
 ## Handoff (if this agent stops)
 
-Updated 2026-11-21 13:07 UTC.
+Updated 2026-11-21 13:29 UTC.
 
 - **Card results so far** (placement on, MTP timers 0, compare arms within a job only):
   - 00220, mode 1 with `d3fb1b11` (MEASURED). ms/token sync → async: 1 stream greedy 27.9 → 29.4, sampled
@@ -64,8 +64,14 @@ Updated 2026-11-21 13:07 UTC.
   mode 2, chain stage A, M1 switched at runtime): M1 costs ms/token 24.7 → 26.6 and 25.0 → 25.6 at 32 streams
   (+1.2, +4.9 %), 12.7 → 13.4 and 12.7 → 13.6 at 1 stream (+0.8); texts identical, acceptance unchanged; 87 % of
   verification steps advanced. In mode 2 M1 is overhead only: mode 3 has to win more than that.
-- **Card job 00256** `real8-async-m3e` (all, 85 min; replaced 00240, which replaced 00237, 00233 and 00229; starts by
-  13:43 UTC).
+- **Card job 00256** `real8-async-m3e` (all, 85 min; replaced 00240, which replaced 00237, 00233 and 00229; ran from
+  13:16 UTC). Its `tiny-m3` gate failed: the tiny server ran with prefix caching on (my opt-out was only in
+  `rental/serve.py`; the tiny server is `rental/main.py`'s `tiny_serve_command`), mode 3 logged "acts as 2", and
+  `1a70d353`'s rule left out every `async3` arm, the m3a arm too: no mode-3 numbers from it, only the card M3 gates
+  (`tiny-m3pc1`, `tiny-m3pc2`) and mode-2 baselines. **00269** `real8-async-m3f` (the same arms and env, branch
+  `e51a697f`: the tiny command honors `FARM_SERVE_NO_PREFIX_CACHING`; an m3a arm answers only to the tiny-m3pc gates)
+  was queued at 13:26 at the end of the queue; the coordinator was asked to bump it right after 00256. Waiter
+  `reports/async-sched/logs/wait_00269.out`. The rest of this entry describes both jobs.
   - Job branch `feat/flash-next-gaudi-async-sched-m3-b5` at `cd49d9f7` (never merge it; `1a70d353` makes a failed
     `tiny-m3` gate leave out the `async3` arms; `cd49d9f7` adds the word `m1off` and `59b54a77`, the scatter skip):
     the M2 job branch
