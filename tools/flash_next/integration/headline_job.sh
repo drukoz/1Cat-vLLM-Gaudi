@@ -608,6 +608,17 @@ while [ "$i_arm" -lt "${#ARMS[@]}" ]; do
                     # build 6: this server without place_wrap.sh / place.sh even when the switch says "place" (pin
                     # mode 3 against the placement)
                     noplace) ARM_NOPLACE=1 ;;
+                    # build 6: prefill's prompt-graph serve flags on this server, from HEADLINE_PG_ENV ("K=V;K=V", e.g.
+                    # VLLM_HPU_PROMPT_GRAPH_MAX_TOKENS with its bound and its graph reserve; set by the job or its late
+                    # file); an arm word pg without HEADLINE_PG_ENV is an error
+                    pg)
+                        if [ -z "${HEADLINE_PG_ENV:-}" ]; then
+                            bad_word="pg (HEADLINE_PG_ENV is empty)"
+                        else
+                            IFS=';' read -r -a pg_kv <<<"$HEADLINE_PG_ENV"
+                            for kv in "${pg_kv[@]}"; do [ -n "$kv" ] && arm_env+=("$kv"); done
+                        fi
+                        ;;
                     # build 6: one flag each (a server start; each needs its tiny gate, if run, to have passed)
                     il) arm_env+=(VLLM_HPU_HC_FUSED_IL=1); needs_b6+=(il) ;;
                     shift) arm_env+=(VLLM_HPU_QSA_SLOT_SHIFT=1); needs_b6+=(shift) ;;
