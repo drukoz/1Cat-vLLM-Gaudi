@@ -483,14 +483,23 @@ def hpu_causal_conv1d_fn(
         with torch.no_grad():
             update_mask = (actual_qlens > 0).view(-1, 1, 1)
             new_states_t = new_states.transpose(-1, -2)  # [B, state_len, dim]
-            existing_states = conv_states.index_select(0,
-                                                       safe_cache_idx_prefill)[:,
-                                                                               state_start:state_start + state_len, :]
-            conv_states[safe_cache_idx_prefill, state_start:state_start + state_len, :] = torch.where(
+            existing_rows = conv_states.index_select(0, safe_cache_idx_prefill)
+            existing_states = existing_rows[:, state_start:state_start + state_len, :]
+            updated_states = torch.where(
                 update_mask,
                 new_states_t,
                 existing_states,
             )
+            if conv_states.shape[1] > state_len:
+                # An expanded speculative state (state_start == 0): whole rows with one index_copy_. The slice
+                # assignment below is an in-place write through a slice view of the state tensor there
+                # (hpu::slice_insert), whose output an HPU graph cannot bind (card job 00021, the PLE state:
+                # "Neither storage attached to input tensor, not its view").
+                # index_copy_ takes an int64 index on CPU (index_select takes the int32 one the engine hands over).
+                conv_states.index_copy_(0, safe_cache_idx_prefill.to(torch.long),
+                                        torch.cat((updated_states, existing_rows[:, state_len:, :]), dim=1))
+            else:
+                conv_states[safe_cache_idx_prefill, state_start:state_start + state_len, :] = updated_states
 
     else:
         # Fallback: variable-length sequences — per-sequence loop
@@ -903,6 +912,13 @@ def hpu_causal_conv1d_fn_update(
     seq_out = _apply_activation(seq_out, activation)
 
     with torch.no_grad():
-        conv_states[safe_store_idx, state_start:state_start + state_len, :] = new_state.transpose(-1, -2)
+        if conv_states.shape[1] > state_len and not direct_state_layout:
+            # An expanded speculative state: whole rows with one index_copy_, no in-place write through a slice
+            # view of the state tensor (see hpu_causal_conv1d_fn).
+            store_rows = conv_states.index_select(0, safe_store_idx)
+            conv_states.index_copy_(0, safe_store_idx.to(torch.long),
+                                    torch.cat((new_state.transpose(-1, -2), store_rows[:, state_len:, :]), dim=1))
+        else:
+            conv_states[safe_store_idx, state_start:state_start + state_len, :] = new_state.transpose(-1, -2)
 
     return seq_out.to(original_dtype)
