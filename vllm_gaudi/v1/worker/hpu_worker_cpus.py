@@ -20,12 +20,13 @@ thread) the first CPU of the share for itself and moves the other threads to the
 thread starts after that inherits its single CPU (a compile pool on first use when the warmup was skipped), so a
 small daemon thread looks for such threads and moves them to the rest of the share too.
 
-Mode 3 is mode 2 for a host whose hyperthreads the VM hides: the rented node pairs vCPUs 2k and 2k+1 on one host
-core (design document, section 7.12), and two busy threads on such a pair slow each other down by up to 2x. The
-model thread gets one CPU of its share whose sibling (``VLLM_HPU_WORKER_CPU_SIBLINGS``: ``xor1`` = 2k with 2k+1,
-the default; ``none`` makes mode 3 mode 2 on the share's second CPU) is kept free: the worker's other threads keep
-to the rest of the share, the parent process's threads (the engine core) keep off both CPUs, and the daemon thread
-keeps later threads of both processes off them.
+Mode 3 is for a host whose hyperthreads the VM hides: the rented node pairs vCPUs 2k and 2k+1 on one host core
+(design document, section 7.12), and two busy threads on such a pair slow each other down by up to 2x. Nothing is
+pinned while the model loads, compiles and warms up (a pin there made the server start about 7 minutes slower in
+job 00189); once warmed up, the model thread gets one CPU of the worker's share whose sibling
+(``VLLM_HPU_WORKER_CPU_SIBLINGS``: ``xor1`` = 2k with 2k+1, the default; ``none``: only its own CPU) is kept free,
+the worker's other threads keep to the rest of the share, the parent process's threads (the engine core) keep off
+both CPUs, and the daemon thread keeps later threads of both processes off them.
 Nothing here changes what a worker computes.
 """
 
@@ -139,6 +140,17 @@ def pin_from_env(rank: int, world: int, mode: int, log=None, *, environ=None, **
     module, visible = environ.get("HLS_MODULE_ID"), environ.get("HABANA_VISIBLE_MODULES")
     index, count = share_position(rank, world, module, visible)
     label = "rank %d module %s: " % (rank, module if module not in (None, "") else "?")
+    if mode == PIN_SHARE_AND_OWN_CORE:
+        # mode 3: the share is only computed here; the worker keeps every CPU through load and warmup
+        getaffinity = os_functions.get("getaffinity") or getattr(os, "sched_getaffinity", None)
+        if getaffinity is None:
+            return []
+        allowed = sorted(getaffinity(0))
+        share = worker_cpu_share(allowed, index, count)
+        if log is not None:
+            log.info("VLLM_HPU_WORKER_CPU_PIN=3: %sshare %d of %d, CPUs %s, placed after warmup (nothing pinned "
+                     "before)", label, index, count, format_cpus(share) if share else "none")
+        return share
     return pin_worker(index, count, mode, log, label=label, **os_functions)
 
 

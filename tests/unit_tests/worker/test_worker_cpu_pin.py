@@ -298,3 +298,14 @@ def test_trim_threads_keeps_a_thread_that_has_no_other_cpu():
 
     moved = _cpus.trim_threads([20, 21], [1, 2], getaffinity=lambda t: aff[t], setaffinity=setaffinity)
     assert moved == 1 and aff == {1: {20}, 2: {22}}
+
+
+def test_mode_three_pins_nothing_at_init_and_returns_the_share():
+    calls = []
+    share = _cpus.pin_from_env(1, 8, _cpus.PIN_SHARE_AND_OWN_CORE, environ={"HLS_MODULE_ID": "1",
+                                                                            "HABANA_VISIBLE_MODULES": "0,1,2,3,4,5,6,7"},
+                               getaffinity=lambda pid: set(c for c in range(152) if c not in (18, 19, 56, 57, 94, 95,
+                                                                                               132, 133)),
+                               setaffinity=lambda *a: calls.append(a), thread_ids=lambda: [1, 2, 3])
+    assert share == list(range(20, 38))
+    assert calls == []

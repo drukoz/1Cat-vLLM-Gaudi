@@ -2075,8 +2075,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # them to the kernel. 1: after torch.hpu.set_device every thread of a worker keeps to one equal share of the
     # CPUs the server may use, the share at its module's position among HABANA_VISIBLE_MODULES (the rank's
     # without them); threads started later inherit it. 2: as 1, and after load and warmup the thread that runs
-    # the model has the share's first CPU for itself, the worker's other threads the rest. 3: as 2 on a CPU whose host
-    # hyperthread sibling (VLLM_HPU_WORKER_CPU_SIBLINGS) is kept free of the worker's and its parent's threads.
+    # the model has the share's first CPU for itself, the worker's other threads the rest. 3: nothing pinned during
+    # load and warmup; after warmup the model thread on a CPU of the share whose host hyperthread sibling
+    # (VLLM_HPU_WORKER_CPU_SIBLINGS) is kept free of the worker's and its parent's threads, the worker's other threads
+    # on the rest of the share.
     # docs/design/flash-next/native-replay.md.
     "VLLM_HPU_WORKER_CPU_PIN":
     lambda: int(os.environ.get("VLLM_HPU_WORKER_CPU_PIN", "0")),
