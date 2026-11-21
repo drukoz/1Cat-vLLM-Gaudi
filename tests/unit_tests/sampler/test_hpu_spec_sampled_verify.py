@@ -215,3 +215,36 @@ def test_the_upstream_module_runs_the_hpu_functions():
     assert rejection_sampler.rejection_sample is hrs.rejection_sample
     assert rejection_sampler.apply_sampling_constraints is hrs.apply_sampling_constraints
     assert rejection_sampler.expand_batch_to_tokens is hrs.expand_batch_to_tokens
+
+
+def test_a_lookup_padding_draft_is_never_accepted():
+    # Prompt lookup pads its drafts with -1 (the n-gram placeholder of a request without a match, the hybrid's
+    # padding of a lookup draft shorter than k) and the runner counts the padding as drafts. For a sampled
+    # request such a position must be rejected like any wrong draft, and the token drawn there must come from the
+    # whole target row: before the fix the -1 was clamped to token 0, accepted with p(0), and the bonus token was
+    # then drawn from a row whose context held the padding (spec-lookup, the sampled path of I07).
+    vocab, rows = 5, 20000
+    torch.manual_seed(7)
+    p1 = torch.softmax(torch.randn(vocab), dim=0)
+    p1[0] = p1.max() * 2  # token 0 likely: the old clamp accepted the padding with this probability
+    p1 = p1 / p1.sum()
+    logits = torch.full((rows * 3, vocab), -30.0)
+    logits[0::3, 2] = 10.0  # position 0: the real draft 2 has p ~ 1 and is accepted
+    logits[1::3] = p1.log()  # position 1: the first padding position
+    logits[2::3] = p1.log()
+    draft = torch.tensor([2, -1, -1], dtype=torch.int32).repeat(rows)
+    bonus = torch.full((rows, 1), vocab - 1, dtype=torch.int32)
+    n_draft, cumulative = _layout(rows, 3, [3] * rows)
+    out = hrs.sampled_rejection_sample(draft, n_draft, cumulative, logits, bonus,
+                                       _metadata(temperature=torch.ones(rows)))
+    assert (out[:, 0] == 2).all()
+    assert (out[:, 1] != PLACEHOLDER).all()  # a token is drawn at the first padding position...
+    assert (out[:, 2:] == PLACEHOLDER).all()  # ...and nothing follows it (no bonus after padding)
+    counts = torch.bincount(out[:, 1].long(), minlength=vocab).double()
+    stat, dof = _chi_square(counts, p1.double())  # ...from the whole row, token 0 included
+    assert stat < _chi_square_bound(dof), (stat, dof)
+    # greedy rows: the padding is never the arg max
+    md = _metadata(temperature=torch.full((rows, ), -1.0), all_random=False)
+    greedy = hrs.sampled_rejection_sample(draft, n_draft, cumulative, logits, bonus, md)
+    assert (greedy[:, 0] == 2).all() and (greedy[:, 1] == int(p1.argmax())).all()
+    assert (greedy[:, 2:] == PLACEHOLDER).all()
