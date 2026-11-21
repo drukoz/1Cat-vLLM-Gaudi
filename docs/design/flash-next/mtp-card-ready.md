@@ -34,15 +34,17 @@ commit and pre-step copy) wrote the conv window through a slice of the pool (`hp
 `test_align_commit_slice_writes.py` 10 passed (8 failed before), `test_mtp_align_continuity.py` 76 passed, the
 3-turn CPU engine test (decode across the block, the same prompt again, the next turn) tokens equal to k = 0, copies
 ran, no slice write (`hpu_cpu_engine --slice-write-probe`).
-- **00162 `real4-commit-turns-check`** (any:4, 45 min, card build `b07d1733` = this branch at `05d2db66` + a merge of
-  `origin/feat/flash-next-gaudi-prefill`, pushed as `feat/flash-next-gaudi-mtp-card-ready-cardbuild`; one conflict
-  in qsa.py, both sides kept; 149 CPU tests passed on it): 00126's flags + `VLLM_HPU_PREFIX_ALIGN_SPLIT=1
+- **00170 `real4-commit-turns-check2`** (replaced 00162 at 01:47 UTC, keeps its place; any:4, 50 min; card build
+  `3026297f` = this branch at `05d2db66` + `origin/feat/flash-next-gaudi-prefill` with prefill's reviewed
+  `92e65144` (the decode-end keep for MTP), pushed as `feat/flash-next-gaudi-mtp-card-ready-cardbuild`; one conflict
+  in qsa.py, both sides kept; 93 CPU tests passed on it): 00126's flags + `VLLM_HPU_PREFIX_ALIGN_SPLIT=1
   VLLM_HPU_PREFIX_KEEP_PROMPT_END=1 VLLM_HPU_PREFIX_KEEP_DECODE_END=1`, arms k = 3 (fused verify, timer, draft loop,
-  chunk KV) and k = 0, probe `tools/flash_next/rental/commit_turns_probe.py --block 896 --decode 400`
-  (`MTP_PROBE_SCRIPT`, output `<arm>/turns.json`): one stream across 896, then 2 / 3 / 5 / 8 streams (new graph
-  captures), the first prompt again (must equal round 1 exactly), 8 long prompts crossing at once and again (equal
-  per stream), the next turn (cached tokens). Read: `COMPARE` / `ROUND` lines of `probe.log` per arm, `turns.json`,
-  `server0.log` (no `tensor_data is empty`), acceptance per position before and after the crossings.
+  chunk KV) and k = 0, probe `tools/flash_next/rental/commit_turns_probe.py --block 896 --decode 1100`
+  (`MTP_PROBE_SCRIPT`, output `<arm>/turns.json`): one stream across 896 and 1,792, then 2 / 3 / 5 / 8 streams (new
+  graph captures), the first prompt again (must equal round 1 exactly), 8 long prompts crossing at once and again
+  (equal per stream), the next turn (k = 3 should hit 896, one block before the last decode boundary; k = 0
+  1,792). Read: `COMPARE` / `ROUND` lines of `probe.log` per arm, `turns.json`, `server0.log` (no `tensor_data is
+  empty`), acceptance per position before and after the crossings. It runs after the 8-card jobs (by 10:40 UTC).
 - CPU finding (prefill's flags, scratch tree `reports/mtp-card-ready/scratch-prefill`,
   `reports/mtp-card-ready/cpu4/turns_prefix/summary.json`): with the flags on, the next turn hits 256 tokens at
   k = 0 but 0 at k = 3. Prefill's `keep_last_decode_boundary` refuses speculative configs (the straddling step's state
