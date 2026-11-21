@@ -6,29 +6,34 @@ results are under `/Volumes/Storage/Claude/gaudi-work/reports/async-sched/card/`
 
 ## Handoff (if this agent stops)
 
-Updated 2026-11-21 01:45 UTC.
+Updated 2026-11-21 02:30 UTC.
 
 - **On the branch** (pushed): `8f4816f8` engine-step's `engine_harness.py`, unchanged (same blob as engine-step and
-  the integration build); `7a818007` the flag `VLLM_HPU_FLASH_NEXT_ASYNC_SCHED` (default 0) with the PLE context
-  carry, the output-token ledger and the async scheduler's split fix (section 2.2). CPU: 27 + 7 + 4 tests of this
-  track pass (`tests/unit_tests/worker/test_flash_next_async.py`,
-  `tests/unit_tests/models/flash_next/test_engine_loop_async.py`, `test_engine_async_sampling.py`); the
-  neighbours (host n-gram ids, platform, inputs, engine-step's sync loop) pass. No `bin/gate` run yet.
-- **Card job 00171** `real8-async-ab` (all, 45 min hold), queued 01:37 UTC, waiting for a place from the
-  coordinator. It runs job branch `feat/flash-next-gaudi-async-sched-int` (`0dcc7ddb` = integration `2af8a8fe` +
-  `7a818007` + job arms; never merge it): `headline_job.sh tiny-async async nospec nospec-devids` with
-  `HEADLINE_LEVELS=32,1`. A background `bin/farm job` (pid 72620 on this Mac, log
-  `reports/async-sched/logs/farm_real8_async_ab.out`) waits and fetches into
-  `reports/async-sched/card/00171-real8-async-ab/`. If the session is gone: `bin/farm fetch async-sched 00171
-  00171-real8-async-ab`, then read `headline.md` (arms async against nospec at 32 and 1 streams, greedy and
-  sampled), `tiny-async/summary.json` (must be PASSED), and grep `async/server0.log` for
-  `Async scheduling on for Flash-Next` (the flag took) and `Traceback|Error`.
-- **Next** (coordinator 01:40 UTC: MTP first): MTP under async scheduling, stage 1 (section 2.4): the drafts stay on
-  the device, the accepted counts keep their one host read per step, the worker corrects the scheduler's optimistic
-  `num_computed_tokens`. Then the pull request of `7a818007` (after `bin/gate`), and tell the coordinator the flag
-  and the card result for the integration track.
-- Messages sent: engine-step (runner lines I touch; its candidate sampling refusal under async is not needed on
-  CPU, please drop it), coordinator (status, job 00171, MTP plan).
+  the integration build); `7a818007` mode 1 of `VLLM_HPU_FLASH_NEXT_ASYNC_SCHED` (no speculation: the PLE context
+  carry, the output-token ledger, the async scheduler's split fix); `fb5cefca` mode 2 (MTP stage 1: the drafts
+  stay on the device, the scheduler's optimistic counts corrected, section 2.4); `fd010f8c` merge of the program
+  head `d9791183` (PR 16, clean). Default 0 everywhere.
+- **CPU**: `tests/unit_tests/worker/test_flash_next_async.py` 38, `tests/unit_tests/models/flash_next/`
+  `test_engine_loop_async.py` 7, `test_engine_async_sampling.py` 4, `test_engine_async_spec.py` 3 (all pass, each
+  file in its own process); neighbours pass (host n-gram ids 22, platform 51, inputs 10). On the integration tree +
+  this branch, mtp-card-ready's rehearsal engine with the real MTP drafter: `test_engine_mtp_async.py` 2 passed (MTP
+  k = 3 under mode 2 = the synchronous MTP streams; the file is on the job branch only, it needs
+  `tests/unit_tests/hpu_cpu_engine.py`). `bin/gate wt/async-sched` started 02:25 UTC on `fd010f8c` (log
+  `reports/async-sched/logs/gate_fd010f8c.out`); if it is green: `gh pr create --base feat/flash-next-gaudi`
+  (title "Flash-Next under async scheduling: VLLM_HPU_FLASH_NEXT_ASYNC_SCHED (default 0), modes 1 and 2"),
+  `gh pr merge --merge`.
+- **Card job 00175** `real8-async-mtp` (all, 60 min hold; replaced 00171 in its place, expected start about 04:45
+  UTC). Job branch `feat/flash-next-gaudi-async-sched-int2` (`a0273b7c` = integration `d00c0a9a` + `fb5cefca` +
+  job arms; never merge it): `headline_job.sh tiny-async mtp3-async mtp3 async nospec`, env `HEADLINE_LEVELS=32,1
+  VLLM_HPU_MTP_TIMING=0 HEADLINE_MTP_SAMPLED=1 HEADLINE_MTP_FALLBACK=0`. A background `bin/farm job` (log
+  `reports/async-sched/logs/farm_real8_async_mtp.out`) fetches into `reports/async-sched/card/00175-real8-async-mtp/`;
+  if the session is gone: `bin/farm fetch async-sched 00175 00175-real8-async-mtp`. Read `headline.md` (mtp3-async
+  against mtp3, async against nospec, at 32 and 1 streams, greedy and sampled), `tiny-async/summary.json` (both
+  modes must pass), and grep each arm's `server0.log` for `Async scheduling on for Flash-Next` (the mode took),
+  `Traceback`, `PT_DEVMEM`. The old job branch `feat/flash-next-gaudi-async-sched-int` (00171) is superseded.
+- **Next**: card result to the coordinator and the integration track (flags: mode 1 = `VLLM_HPU_FLASH_NEXT_ASYNC_SCHED=1`,
+  MTP = `=2`; engine-step's branch `01d66e31` drops its candidate-sampling refusal under async). Stage 2 of MTP
+  (accepted counts on the device) only if 00175 shows a remaining in-step gap worth 2 to 4 days.
 
 Labels: **MEASURED** (card, with the file), **VERIFIED** (code or CPU test, with the line or test), **INFERRED**.
 
@@ -176,4 +181,5 @@ after `_with_host_ngram_ids`; after `AsyncHPUModelRunnerOutput(...)`; the top of
 
 | Job | What | State |
 |---|---|---|
-| 00171 `real8-async-ab` | TP8, integration build + async: tiny gate with the flag, then async / nospec / nospec-devids at 32 and 1 streams | queued 01:37 UTC |
+| 00171 `real8-async-ab` | TP8, integration build + mode 1: tiny gate, async / nospec / nospec-devids at 32 and 1 streams | replaced by 00175 (02:20 UTC) |
+| 00175 `real8-async-mtp` | TP8, integration `d00c0a9a` + modes 1 and 2: tiny gate (no speculation and MTP k = 3), mtp3-async, mtp3, async, nospec at 32 and 1 streams, greedy and sampled | queued, about 04:45 UTC |
