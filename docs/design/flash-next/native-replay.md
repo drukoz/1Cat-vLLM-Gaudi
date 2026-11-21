@@ -672,6 +672,15 @@ Cost: the pinned server took 14.9 min to its first throughput line against 7.5-8
 holds every rank to its 18 CPUs through weight load, compile and warmup). So `VLLM_HPU_WORKER_CPU_PIN=3` now pins
 nothing before warmup and places after it (0e055831); job 00219 tests place-only (no pin flag) the same way.
 
+**00219, place-only (MEASURED, one server start, ended about 09:15 UTC):** same build and flags, no pin flag,
+`place.sh` after health. Load 7.7 min to the first throughput line (as unpinned). Greedy steady ms per step: 1 stream
+24.0 / 23.6, 8 streams 40.8 / 38.8, 32 streams 42.6 / 42.0 (pin + place: 27.9 / 28.1, 44.8 / 45.0, 45.8 / 46.7;
+unpinned: 42.1 / 37.7, 67.0 / 66.4, 48.8 / 51.4). Per-rank us per launch: 1 stream median 105 (98-124), 8 streams
+median 98, 32 streams median 114; no slow rank. First pass moved 5117 threads, none failed. The NUMA concern (memory
+touched during an unrestricted load) did not show (`numa_balancing=1`). **So: nothing pinned until warmup, then the
+sibling-aware placement**, which is what `VLLM_HPU_WORKER_CPU_PIN=3` now does inside the worker (place.sh also moves
+every other process of the container off the reserved vCPUs; mode 3 only the engine core: to be card-checked).
+
 ## 8. Build steps
 
 | Step | What | Proof off the card | Card | State |
