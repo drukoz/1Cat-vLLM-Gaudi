@@ -31,6 +31,7 @@ for kv in PT_HPU_LAZY_MODE=1 PT_HPU_LAZY_ACC_PAR_MODE=0 VLLM_HPU_FLASH_NEXT_QSA_
     if [ -z "${!key+x}" ]; then export "$kv"; fi
 done
 export VLLM_HPU_LOG_UNMATCHED_GRAPH_INPUTS=1
+export VLLM_ALLOW_LONG_MAX_MODEL_LEN=1  # the tiny config says 4096 positions; the gate needs 2.5 attention blocks
 mkdir -p "$OUT"
 rc_all=0
 for FLAG in 1 0; do
