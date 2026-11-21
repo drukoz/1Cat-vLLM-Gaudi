@@ -489,6 +489,11 @@ Next, in order (section 7's table):
    first; then, for every timed arm, `python3 -I reports/collectives/probes/replay_timing_table.py <arm folder>`:
    per-rank medians per level (the headline now), the pooled phase and `sub_*` medians, and the pin arm's eight
    `VLLM_HPU_WORKER_CPU_PIN` lines (`grep WORKER_CPU_PIN <real-pin>/server0.log`), to native-replay. Drop the
+   00189's pin verdict (do the 2x-slow ranks at 1 and 8 streams go away under the placement?) also goes to
+   async-sched (agent `a58988ba328b40a9b`): its TP8 jobs 00196 / 00197 can take the placement behind a switch of
+   their own (told at 06:45 UTC how: their job copies `place_wrap.sh` and `place.sh` from
+   `~/farm/collectives/results/bench/` into their results folder and wraps each server's `serve_probe.sh` with
+   `PLACE_ARGS="--log <out>/server0.log"`; default off until 00189's verdict).
    **Then: set 00198's late file from 00189's result** (`SPIN=on|off`; if the pin arm closed the per-rank spread:
    `PIN_KV=VLLM_HPU_WORKER_CPU_PIN=1` and `PLACE=/results/bench/place.sh`), before 00198 starts; its waiter fetches
    its six arms and verdicts; to native-replay: the three texts_1 comparisons, the hit rates (`n_reuse_*` in the
