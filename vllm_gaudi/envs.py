@@ -547,6 +547,10 @@ if TYPE_CHECKING:
     VLLM_HPU_MOE_GLUE_MERGE_GATE_UP: int = 0  # with VLLM_HPU_MOE_GLUE=1: 1 merges the gate_up GEMM into the gate GEMM
     VLLM_HPU_HC_FUSED_COPY_MODE: int = 0  # copies before a fused HC op: 0 all, 1 not its own outputs, 2 block output
     VLLM_HPU_COLLECTIVE_MARK_STEP: int = 1  # 1 (default) mark_step() before every HPU collective, 0 none
+    VLLM_HPU_STEP_TIMING: int = 0  # StepTimingMode: 0 off (default), 1 spans, 2 sync counters, 3 device waits
+    VLLM_HPU_STEP_TIMING_COMPONENTS: int = 0  # 0 (default) none, 1 mode 3 also waits around every model component
+    VLLM_HPU_STEP_TIMING_EVERY: int = 100  # steps per log line and JSON record of the step timer
+    VLLM_HPU_STEP_TIMING_DIR: str = ""  # folder of the step timer's JSON files ("" = the working directory)
     VLLM_HPU_DECODE_CUT_INTERVAL: int = 0  # 0 (default) decode keeps the per-layer cuts, N cut every N-th layer
     VLLM_HPU_GRAPH_ASYNC_REPLAY: int = 0  # 0 (default) the model's HPU graph replays synchronously, 1 asynchronously
     VLLM_HPU_WORKER_CPU_PIN: int = 0  # WorkerCpuPin: 0 off (default), 1 each worker on its CPU share, 2 and its own CPU
@@ -2055,6 +2059,30 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_HPU_COLLECTIVE_MARK_STEP":
     lambda: int(os.environ.get("VLLM_HPU_COLLECTIVE_MARK_STEP", "1")),
 
+    # Step timer of the HPU worker, model runner and engine core (vllm_gaudi/extension/step_timing.py).
+    # 0 (default) = off: no timer exists and nothing is timed, patched or written. 1 = the host spans of
+    # every step (input preparation, the forward call, the launches, sampling, the wait for the device,
+    # the engine's turn between steps), tagged with the step kind and the row count, plus the collectives
+    # per step. 2 = 1 and the debug counters of host synchronisation points (.item(), .cpu(), .tolist(),
+    # copies between host and device, mark_step calls) with their source lines. 3 = 1 with a wait for the
+    # device around every collective and after the forward and the sampler, which gives the device time
+    # of every segment (the step itself is slower in this mode). Any other value is 0 (there is no mode 4:
+    # its op counting hung a TP8 server, job 00013). A process started with a nonzero value rereads
+    # <dir>/step_timing.mode (one integer) when a step starts after two idle seconds.
+    "VLLM_HPU_STEP_TIMING":
+    lambda: int(os.environ.get("VLLM_HPU_STEP_TIMING", "0")),
+    # 1 = mode 3 of the step timer also waits for the device where a model component starts and ends
+    # (hyper-connection, GDN, QSA indexer and attention, MoE and its expert op, PLE), so each component's
+    # device, collective and host time is measured on its own. For a server without HPU graphs
+    # (--enforce-eager): a replayed graph runs no Python. 0 (default) = the model is not touched.
+    "VLLM_HPU_STEP_TIMING_COMPONENTS":
+    lambda: int(os.environ.get("VLLM_HPU_STEP_TIMING_COMPONENTS", "0")),
+    # Steps of one kind and row count per log line and JSON record of the step timer.
+    "VLLM_HPU_STEP_TIMING_EVERY":
+    lambda: int(os.environ.get("VLLM_HPU_STEP_TIMING_EVERY", "100")),
+    # Folder of the step timer's files (step_timing_<role>_r<rank>_<pid>.jsonl); "" is the working directory.
+    "VLLM_HPU_STEP_TIMING_DIR":
+    lambda: os.environ.get("VLLM_HPU_STEP_TIMING_DIR", ""),
     # The mark_step() that modify_model_layers hooks after every VLLM_CONFIG_HIDDEN_LAYERS-th decoder layer,
     # in decode and verification forwards (attention metadata with is_prompt=False). 0 (default) keeps the
     # hooks as they are for every forward. N >= 1 cuts a decode forward after every N-th layer only; a value
