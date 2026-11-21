@@ -6,7 +6,7 @@ results are under `/Volumes/Storage/Claude/gaudi-work/reports/async-sched/card/`
 
 ## Handoff (if this agent stops)
 
-Updated 2026-11-21 11:40 UTC.
+Updated 2026-11-21 11:22 UTC.
 
 - **Card results so far** (placement on, MTP timers 0, compare arms within a job only):
   - 00220, mode 1 with `d3fb1b11` (MEASURED). ms/token sync → async: 1 stream greedy 27.9 → 29.4, sampled
@@ -32,16 +32,25 @@ Updated 2026-11-21 11:40 UTC.
     in `SWITCHABLE` and its test: the union); `915638c2` (= `35d9d4d4` of the job branches) makes mode 3 issue early
     after the chain's stage B too; `9d2ee2e3` tests it on the engine (`VLLM_HPU_VOCAB_PARALLEL_LOGITS=1`).
   - **Gate of stage 2**: `bin/gate reports/async-sched/trees/gate-9d2ee2e3` (frozen copy of `9d2ee2e3`), started
-    11:13 UTC with a 6 h alarm (pid 18115), waiting for a slot. Log `reports/async-sched/logs/gate_9d2ee2e3.out`.
+    about 10:58 UTC with a 6 h alarm (pids 18115 and 18118); it holds a slot and runs. Log
+    `reports/async-sched/logs/gate_9d2ee2e3.out`.
     If green: `gh pr create --base feat/flash-next-gaudi --head feat/flash-next-gaudi-async-sched-s2` with the title
     "Flash-Next MTP under async scheduling, stage 2 (default off): device-made verification inputs, early issue
     (mode 3), device align mode" and the body `reports/async-sched/pr_body_s2.md` (fill in GATE_LINE), then
     `gh pr merge --merge` (owner's rule: default-off and the gate green). If the program head moved, merge it in
     and gate again.
   - engine-step's persistent-inputs branch merged the program head as `887266b1` (the device-context passthrough
-    kept, as asked). s2 merges it with the `SWITCHABLE` union only: scratch branch `s2-pi` in
-    `scratchpad/m1clone`, where the stage 2 engine files run with `VLLM_HPU_PERSISTENT_INPUTS=1`
-    (`reports/async-sched/logs/tests_s2_pi.log`).
+    kept, as asked). s2 merges it with the `SWITCHABLE` union only (scratch branch `s2-pi` in `scratchpad/m1clone`).
+    With `VLLM_HPU_PERSISTENT_INPUTS=1` (MEASURED on CPU, `reports/async-sched/logs/tests_s2_pi.log`): loop_async 7
+    and early 4 pass, but device_inputs fails 6 of 8 and align 2 of 3. Cause (VERIFIED): M1 kept references to the
+    step's host-made inputs and the next step's uploads rewrite those buffers first (one buffer per input in a
+    synchronous engine). engine-step also found that an input uploaded twice in a step shared a pair; they fixed it
+    (a pair per upload of a step).
+  - `feat/flash-next-gaudi-async-sched-s3` (s2 + follow-ups, not gated yet): `59b54a77` no draft scatter when M1 made
+    the step's ids (two H2D copies and two device ops less per step); `a4f1e896` M1 keeps copies of host-made inputs
+    (the fix above); `3e98b623` its unit tests (`tests/unit_tests/worker/test_flash_next_async_spec_keep.py`, 3).
+    CPU runs: `reports/async-sched/logs/tests_s3.log` (without PI) and `tests_s3_pi.log` (s3 + `887266b1`, PI on).
+    After s2's PR: merge the program head into s3, gate, PR.
 - **Card job 00240** `real8-async-m3d` (all, 85 min; replaced 00237, which replaced 00233 and 00229; starts after
   mtp-draft-graph's 00230, by 14:21 UTC at the latest).
   - Job branch `feat/flash-next-gaudi-async-sched-m3-b5` at `1a70d353` (never merge it; `1a70d353` makes a failed
@@ -70,8 +79,9 @@ Updated 2026-11-21 11:40 UTC.
   `place` (the coordinator sets it). `on` = `VLLM_HPU_WORKER_CPU_PIN=1` + `place_wrap.sh` + `place.sh` (rule a^1);
   `place` = the placement without the pin flag. Scripts in `~/farm/async-sched/results/bench` (md5 363bcf9d and
   7e54f2de); spec-lookup hard-links them.
-- **Next**: read 00240; merge the program head into s2, gate, PR; an async arm with persistent inputs; sampled with
-  mtp-draft-graph's D2.
+- **Next**: read 00240; s2's PR when its gate is green; then s3 (merge the head, gate, PR); the persistent-inputs
+  job (mode 2 and mode 3, PI off/on, prefix caching on, 32/8/1; needs PI on the program head and s3); sampled with
+  mtp-draft-graph's D2 (they have no D2 yet: the chain refuses sampled requests).
 - The 1-token prompt note: spec-lookup's `005e1ff9` is not on the program branch yet. When it is, put prompt 0 back
   into `_serve_staggered`.
 
