@@ -836,7 +836,9 @@ all-reduces already split every layer).
    post_holder .. post_events .. post_record .. post_coll ..`; nested, not in the phase sum) **published 03:34:04 UTC**
    (7 min incremental; VERIFIED in the wheel: the sub-timer strings in the backend .so, `ReleaseLaunchState` in all
    three .so files; the bridge clone's local branch `native-replay-lean` commit 6edcb0f = this patch). Sent to the
-   collectives track at 03:35 UTC. **00180 runs lean3t in its tiny-lean and real-lean arms** (the collectives
+   collectives track at 03:35 UTC. **Now job 00181 `real8-bridge-headline2`** (65 min, replaces 00180 in its place; starts
+   after integration's 00178, by 04:53 UTC at the latest): tiny-stock, tiny-lean, real-stock, real-lean, then
+   tiny-lean-inline and real-lean-inline; lean3t in every lean arm. Earlier note: **00180 ran lean3t in its tiny-lean and real-lean arms** (the collectives
    track's `bridge_headline_job.sh` reads `~/farm/collectives/bridge/late/00180.env` at start: `LEAN=lean3t-412153bbab3e`;
    the job log prints it). `INLINE=1` in that file adds tiny-lean-inline and real-lean-inline (+
    `PT_HPU_DISABLE_ASYNC_COLLECTIVE=1`, the real one only if its tiny one passed); the collectives track asked the
