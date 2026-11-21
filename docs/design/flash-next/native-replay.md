@@ -656,7 +656,37 @@ Readings:
 
 ## Handoff (if this agent stops)
 
-**State at 2026-11-21 03:45 UTC (newest first; the older state below stays for its details).** 00174 is read (section
+**State at 2026-11-21 05:35 UTC (newest first).** 00181 is read (section 7.11: run_prep fixed; the collective
+futures are the biggest bridge item; inline collectives -10 us per launch; **two slow ranks per server at 1 and 8
+streams** decide the 1-stream step, not lean). In flight:
+- **00189** `real8-bridge-vendor2` (collectives track, all cards, 95 min, build 4's image and no-speculation env, after
+  integration's 00186/00187): tiny gates (vendor, lean3a flag 0, lean3a flag 1); vendor spinner on against off, the
+  better one kept; then real-rebuild (`lean3a-8f6f7faf88dc`, `PT_HPU_HPUGRAPH_PREPARED_REPLAY=0`, timing 5000: our build
+  on the stock path, per-rank timers), real-lean (flag 1), real-pin (flag 1 + `VLLM_HPU_WORKER_CPU_PIN=1`, or the
+  sibling-aware placement below if 00193 finds a stable map before 00189 starts, about 07:10 UTC at the latest). The
+  collectives parser now splits per-rank medians by level (N=1, 8, 32 from the metrics lines); headline = the per-rank
+  spread. No bridge builds while 00189 runs (the build CPUs may be siblings of the chosen vCPUs).
+- **00193** `cpu-sibs` (this track, all cards held but not opened, 15 min hold, right after 00186):
+  `tools/flash_next/replay/cpu_siblings.py` (pinned C loops alone and in pairs; rules a+-N/2, a^1, a+-1; verify on all
+  144 job CPUs or scan; stability re-run) -> `reports/native-replay/card/00193-cpu-sibs/cpu_siblings.json`. 00192 was the
+  same job with a 15-second hold by mistake (bare MAX_HOLD is seconds), replaced.
+- **Sibling-aware placement** `tools/flash_next/replay/place_workers.py` (038a32dd; CPU tests; checked in the dev
+  container with two fake workers: main threads alone on their vCPUs, the other threads and processes moved off). For
+  00189: generate `place.sh` (bash wrapper around the script with `PLACE_SIBLING_RULE` set to the rule 00193 finds),
+  put it on the node under `~/farm/native-replay/late/`, send its path and md5 to the collectives track (agent
+  a3344386b2bc11c38): it copies it to `~/farm/collectives/results/bench/place.sh` and sets `PIN_PLACE` in
+  `~/farm/collectives/bridge/late/00189.env`; its `place_wrap.sh` runs it as root in the pin arm's container right
+  after health (log `$FARM_OUT/placement.log`).
+- **Pull request.** Gate on `75b1de32` (branch + program head d9791183): 88 files, 2 red = exactly the two rental
+  tests that also fail on the program head's own snapshot (`test_make_rental_bundle`: "not a git repository" in a
+  snapshot; `test_dry_run_defaults_and_bundle_build_options`); the coordinator agreed that counts as green (state it
+  in the PR). The program head then moved to 2e9f9196 (#17, #19, #20); merged as `63693b83` with one conflict in
+  `hpu_model_runner.py` (two functions added at the same place: both kept); my test files pass on it; its gate
+  (`reports/native-replay/logs/gate_63693b83.log`) is queued. On the same two reds: push, `gh pr create --base
+  feat/flash-next-gaudi --body-file reports/native-replay/probes/pr_body_2.txt` (GATE_RESULT filled in), `gh pr merge
+  --merge`, the number to the coordinator.
+
+**State at 2026-11-21 03:45 UTC (the older state below stays for its details).** 00174 is read (section
 7.10). The coordinator approved the step-2 plan (03:35 UTC): lean2 (the run_prep fix) into the collectives track's
 lean + spinner-off job, then lean3 with sub-timers first, then cuts (a)-(d), each measured, and the stock
 `PT_HPU_DISABLE_ASYNC_COLLECTIVE=1` as one arm when cheap. **Owner's rule (BRIEF.md 03:07 UTC): a track merges its own
