@@ -699,6 +699,13 @@ every other process of the container off the reserved vCPUs; mode 3 only the eng
 
 ## Handoff (if this agent stops)
 
+**12:06 UTC (date -u).** place.sh fixed (integration's job 00222: the first version moved every non-worker process
+off the reserved vCPUs, the job's shells included, so each later server of a multi-server container inherited fewer
+CPUs, 144 down to 64). `place_workers.py` (b60f2ee8, 3a733c26) now moves only the server's own process tree (the
+topmost non-shell ancestor of the workers and everything below it), and a closed stdout no longer stops its loop.
+New file `~/farm/native-replay/late/place.sh`, md5 816292ded4fdffb706b76b64948be5c7, sent to integration and
+collectives. Mode 3 in the worker never had the problem (it touches only its own threads and its parent).
+
 **11:05 UTC (date -u): pull request #26 merged** into `feat/flash-next-gaudi` (merge commit ecdc2143; gate on ac63f272:
 103 files, red only the two known rental tests; the program head had moved to #25, GitHub CLEAN): mode 3, the CPU
 tools, the bridge patches, design 7.10-7.13. Integration can enable `VLLM_HPU_WORKER_CPU_PIN=3` (card-proven as
