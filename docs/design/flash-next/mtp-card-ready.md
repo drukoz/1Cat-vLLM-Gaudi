@@ -6,7 +6,7 @@ This file is the track's report. The harness of the track's agents does not writ
 
 ## Handoff (if this agent stops)
 
-Last update: 2026-11-21 01:36 UTC (fourth agent of the track, Opus 5.5, started 23:15 UTC). **The node runs until
+Last update: 2026-11-21 01:48 UTC by `date -u` (fourth agent of the track, Opus 5.5, 23:15 UTC to 01:50 UTC; it ended its run here). **The node runs until
 about 00:00 UTC on 2026-11-22 (BRIEF 00:50); merges allowed again.** Coordinator's plan for this track (00:42 UTC):
 (1) the verify-op crash of 00133, cause and fix, CPU first, then its card check (00162, mine); (2) the pull request
 of the card-proven MTP fixes (gate, merge); (3) with engine-step (agent a8a87f4c2008bde9c): sampled MTP verification
@@ -44,7 +44,8 @@ ran, no slice write (`hpu_cpu_engine --slice-write-probe`).
   graph captures), the first prompt again (must equal round 1 exactly), 8 long prompts crossing at once and again
   (equal per stream), the next turn (k = 3 should hit 896, one block before the last decode boundary; k = 0
   1,792). Read: `COMPARE` / `ROUND` lines of `probe.log` per arm, `turns.json`, `server0.log` (no `tensor_data is
-  empty`), acceptance per position before and after the crossings. It runs after the 8-card jobs (by 10:40 UTC).
+  empty`), acceptance per position before and after the crossings. Placed by the coordinator after the MoE A/B 00161, beside prefill's 00150 / 00151: expected start about 04:00 to
+  04:30 UTC.
 - CPU finding (prefill's flags, scratch tree `reports/mtp-card-ready/scratch-prefill`,
   `reports/mtp-card-ready/cpu4/turns_prefix/summary.json`): with the flags on, the next turn hits 256 tokens at
   k = 0 but 0 at k = 3. Prefill's `keep_last_decode_boundary` refuses speculative configs (the straddling step's state
@@ -155,17 +156,21 @@ outside a git checkout).
    mtp-card-ready 00170 00170-real4-commit-turns-check2` if no waiter copied it), report `COMPARE` lines, the
    next-turn cached tokens at k = 3 (896 expected) and k = 0, acceptance before and after the crossings, any
    `tensor_data is empty` in `server0.log`.
-2. 00138 (TP4, `=2` candidate path at k = 3 and k = 1, plus 8 x 16K-token prompts with CHUNK_KV): read it, compare
-   its sampled step time with 00126's `=1` (184.3 ms at 32 streams, k = 3; 109.1 at k = 1); report acceptance at long
-   prompts. engine-step's 00164 (TP8, its region) and integration's build 2 runs are the other `=2` / region data.
+2. 00138 was CANCELLED at 01:36 UTC (coordinator: covered at TP8 by integration's build 2 arm C, k = 2 with `=2`, and
+   engine-step's 00164, sampled MTP in its region). Read those for the sampled MTP numbers.
 3. The pull request: when `reports/mtp-card-ready/gate/gate-558277d2.txt` ends (the gate on a snapshot of
    `558277d2`), judge its reds (the known tools/rental signal and git reds are not this branch's; anything in
    flash_next or the sampler is), then merge `origin/feat/flash-next-gaudi` again, push, `gh pr create --base
    feat/flash-next-gaudi` with `reports/mtp-card-ready/pr/pr2_body.md` (update its numbers: 00126 / 00127 / 00135 /
    00139, the 00133 fix), `gh pr merge --merge`. The branch carries the qsa-fused merge (`697bffed`): if qsa-fused's
    pull request has not landed first, say so in the body.
-4. k at TP8: integration's 00128 (k = 3: 40.7 ms per token at 32 streams) and 00156 (build 2b, k = 2); by arithmetic
-   on 00128's Ft (0.24 ms per row) k = 2 to 4 are all about 40-41 ms per token at 32 streams.
+4. DONE 01:47 UTC, k at TP8 (sent to the coordinator): integration's 00156 (build 2b, k = 2) 40.1 / 45.7 ms per
+   token at 32 streams greedy (2.29 tokens per step, acceptance 0.755 / 0.537) against 00128's k = 3 40.7: a tie,
+   as the arithmetic said (Ft grows 0.24 ms per row at TP8); k = 2 is the cheaper choice. Caveat: 00156's 1-stream
+   k = 2 (41.8 against 33.0 without speculation) is slower than 00128's k = 3 (24.3): compare k = 2 and k = 3 in one
+   build before fixing k for latency. Sampled (=2) at 32 streams: 46.7 / 53.1 against 58.9 / 52.7 without
+   speculation. **MTP acceptance at long prompts (first measurement, 00156, 8 x about 14.8K tokens, CHUNK_KV on):
+   2.43 tokens per step, 0.796 / 0.629**, higher than at short prompts.
 5. Leftover scratch trees (safe to delete once 00170 has run): `reports/mtp-card-ready/scratch-prefill`,
    `scratch-merge2` (the card build's merges; a stash holds the SCRATCH_* probe patches), `snap-0d1be6fc`,
    `snap-cand`, `prefix-spec` (prefill's reviewed commit, now `92e65144` on their branch). Keep `gate-558277d2`
