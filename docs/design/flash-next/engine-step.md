@@ -11,49 +11,39 @@ This track's harness refuses report files outside the repository, so the handoff
 
 ## Handoff (if this agent stops)
 
-Last update: **2026-11-21 00:35 UTC** (fourth agent, Opus 5.5). Branch `feat/flash-next-gaudi-engine-step`,
-head `e9032e68` (program head `938dada4` merged in at `eaf2131f`). Scratch files, probes and card results:
-`/Volumes/Storage/Claude/gaudi-work/reports/engine-step/` (`card_job/` = submit logs, `card/` = fetched results,
-`logs/` = CPU test logs). Node mirror of this track's results: `node-mirror/farm/engine-step/results/`.
+Last update: **2026-11-21 00:45 UTC** (fourth agent, Opus 5.5, stopping). Branch `feat/flash-next-gaudi-engine-step`,
+head `89cd8692` plus this document (program head `938dada4` merged in at `eaf2131f`), everything pushed. Scratch
+files, probes and card results: `/Volumes/Storage/Claude/gaudi-work/reports/engine-step/` (`card_job/` = submit logs,
+`card/` = fetched results, `logs/` = CPU test logs, `probes/` = Mac probes). Node mirror:
+`node-mirror/farm/engine-step/results/`.
 
 ### State in one paragraph
 
-On the card (section 9): **`VLLM_HPU_CANDIDATE_SAMPLING=1` is card-proven** (00110: -4.9 ms per sampled step at 32
-streams on TP4, 114.6 -> 109.7 ms, every stream on task, a seeded request repeats itself; 00093: 3.18 against 7.46
-ms for the sampler stage at 32 rows on one card) and the coordinator took it into the integration build. I01 and
-I05 changed nothing measurable at a short context (as expected: I01 saves host time that grows with the context;
-the long-prefix rounds could not run because the prefix cache served 0 tokens of a 120,832-token prefix, which
-prefill owns now). The tiny model with I01 + I05 took another token at the 5th position of its 700-token prompt:
-a near tie of the tiny model that the in-graph greedy region resolves the other way (collectives and mtp-card-ready
-saw the same token stream; INFERRED until job 00130 shows it with I05 alone). New since 23:15 UTC: top-k ids that
-the host reads (logprobs, prompt logprobs, the sampled region) now come out of an fp32 id table
-(`v1/sample/topk_ids.py`): the `logprobs=5` crash of spec-lookup's 00086 (OverflowError in the detokenizer, the
-server died) is fixed on the CPU model of the card rule; the sampled region now takes `vocab_parallel.top_k`, so
-with `VLLM_HPU_VOCAB_PARALLEL_LOGITS=2` it gathers each rank's top 64 instead of the logits (job 00144 measures it).
-Job 00130 (tiny model, one card): **I01 alone passes** 16 of 16 on every prompt (I01 is token-correct on a card);
-**I05 alone takes the 700-token near tie** (token 4): the near tie is the in-graph greedy region's, no defect.
-**`logprobs=5` is fixed on the card** (every id valid, the sampled token first, the top 5 equal the CPU's).
-**A request with `prompt_logprobs` ended the engine** (an older defect: the prefill hidden states of Flash-Next are
-flattened, the runner indexed them per request): fixed at `e9032e68` with a CPU test that reproduced the crash;
-it is not in integration's build 2 (synced earlier at `ddc6bbbf`), so it reaches the program branch with the pull
-request after 04:00 UTC.
-No pull request tonight (BRIEF.md 23:45): push and tell the coordinator the commit and the proven flags.
-`21d9eace` (asked by the coordinator for the integration build): TP rank 0 logs once "Candidate sampling
-(VLLM_HPU_CANDIDATE_SAMPLING=1): a sampled decode step drew in the logits region ..." and once "... took vLLM's
-sampler instead: <reason>" (integration was told at 23:55 UTC).
+Card-proven (section 9): **`VLLM_HPU_CANDIDATE_SAMPLING=1`**: -4.9 ms per sampled step at 32 streams on TP4
+(00110: 114.6 -> 109.7 ms; every stream on task; a seeded request repeats itself; 00093: the sampler stage 3.18
+against 7.46 ms at 32 rows on one card); integration builds with it. **I01 (`VLLM_HPU_FLASH_NEXT_DECODE_METADATA=1`)
+is token-correct on a card** (00130, tiny model, 16 of 16) and neutral at a short context (00110); its host saving
+at a long context is unmeasured on a card (needs prefill's prefix-cache fix, see the next rental's jobs). I05
+(`VLLM_HPU_FUSED_GREEDY_LOGITS=1`) gave no measurable gain and resolves one near tie of the random-weight tiny model
+the other way (00130; not a defect). **`logprobs=5` no longer kills the server** (top-k ids out of an fp32 id table,
+`v1/sample/topk_ids.py`, `330f9413`; card-proven in 00130). **`prompt_logprobs` killed the engine** (an older
+defect: Flash-Next's flattened prefill hidden states were indexed per request): fixed at `e9032e68`, CPU-proven (the
+test reproduced the crash), not yet on a card. The sampled region now takes `vocab_parallel.top_k` (int32 ids) and
+logs once per server which path a sampled step took (`21d9eace`). `VLLM_HPU_VOCAB_PARALLEL_LOGITS=2` with candidates
+(`candvp`) has not run on a card: 00144 waits but gets no slot tonight. No pull request tonight (BRIEF.md 23:45).
 
 ### If you take over, in this order
 
-1. Read the two jobs below when they end (`bin/farm ledger | grep -w engine-step`; results under
-   `reports/engine-step/card/` or `bin/farm fetch engine-step <id> <id>-<name>`); put the numbers in section 9 and
-   send the coordinator (`main`) the lines named in the table.
-2. CPU tests of this head: `logs/t_fast_eaf.log` (18 passed: test_topk_ids_card_rule, test_runtime_switches,
-   test_candidate_sampling) and `logs/t_loop_eaf.log` (test_candidate_sampling_loop, test_fused_greedy_min_tokens:
-   running at 23:40 UTC). Push after they are green: `git push origin feat/flash-next-gaudi-engine-step`.
-3. After 04:00 UTC (node gone, Mac free): `bin/gate /Volumes/Storage/Claude/gaudi-work/wt/engine-step --tools`,
-   then one pull request into `feat/flash-next-gaudi`. A stale gate of this track (pid 25332, started 20:10 UTC on
-   `reports/engine-step/merge-wt` = the old merged tree `f0fd0a2b`) waits in the gate queue; stopping it was
-   refused to this agent: let it run or ask the coordinator.
+1. After 04:00 UTC (node gone, Mac free): `bin/gate /Volumes/Storage/Claude/gaudi-work/wt/engine-step --tools`
+   (merge `origin/feat/flash-next-gaudi` into the branch first if it moved), then one pull request into
+   `feat/flash-next-gaudi` (`gh pr create --base feat/flash-next-gaudi`, `gh pr merge --merge`), all flags default
+   off. CPU tests green at `e9032e68`: `logs/t_fast_eaf.log` (18), `logs/t_logline.log` (22), `logs/t_plp_after.log`
+   (9), `logs/t_loop_plp.log` (18), `logs/t_track_3757.log` (29), `logs/t_platform_vp_3757.log` (73).
+2. A stale gate of this track (pid 25332, started 20:10 UTC on `reports/engine-step/merge-wt` = the old merged tree
+   `f0fd0a2b`) and a `bin/farm job` waiter for 00144 (pid 28597) are still running on this Mac; stopping them was
+   refused to this agent by the permission check (the owner was told). Both are harmless.
+3. The next rental: the two jobs under "Pending subtasks" item 0 (I01 at 32 x 120K with prefill's two prefix flags;
+   `candvp` at TP8), then 00144's content at TP4 if TP8 is not free.
 
 ### Card jobs
 
