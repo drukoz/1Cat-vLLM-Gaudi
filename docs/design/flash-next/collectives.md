@@ -341,79 +341,46 @@ Qualification, in order (each decides the next):
 
 ## Handoff (if this agent stops)
 
-State at 23:35 UTC on 2026-11-20 (fourth agent of this track, from 23:15 UTC, Opus 5.5). Branch
-`feat/flash-next-gaudi-collectives`, worktree `/Volumes/Storage/Claude/gaudi-work/wt/collectives`; scratch, logs
-and card results in `/Volumes/Storage/Claude/gaudi-work/reports/collectives/` (`card/<id>-<name>/`, `logs/`,
-`probes/`). This section is the track's report: the harness refuses a REPORT.md.
+State at 00:55 UTC on 2026-11-21 (fourth agent of this track, Opus 5.5). **The node stays until about 00:00 UTC
+on 2026-11-22** (BRIEF 00:50 UTC). Branch `feat/flash-next-gaudi-collectives` (and `-dev`, the same head), worktree
+`/Volumes/Storage/Claude/gaudi-work/wt/collectives`; card results and logs in
+`/Volumes/Storage/Claude/gaudi-work/reports/collectives/` (`card/<id>-<name>/`, `logs/`, `probes/`). This section is
+the track's report: the harness refuses a REPORT.md.
 
-Where things are:
+**Current task (coordinator, 00:40 UTC): deploy native-replay's builds of the PyTorch bridge in farm jobs and
+qualify them on the card** (section 7; native-replay, agent `abe5ca8da150f80ba`, writes the "prepared replay"
+patch and makes the builds). Done:
+- `with_bridge.py` (in-container install and load check) and its CPU test (5 pass); `ab_bridge_job.sh` (TP8
+  real-model A/B, one server per arm in one all-card job; dry-run on the Mac with a stub `farm_job.sh`). Both
+  deployed to `~/farm/collectives/bridge/` on the node (md5 `3933df6a...` and `fbac8df0...`).
+- `bin/farm` has `--bridge <build-id>` (job, tiny, serve), installed by rename at 00:49 UTC; the diff is
+  `tools/flash_next/bridge/farm-bridge-option.diff` (card-farm's `farm.sh` at a2fd0cf8 needs the same change: a
+  `farm install` from wt/card-farm would undo it).
+- Interface agreed with native-replay (section 7). The coordinator has the plan and was asked for places.
 
-- PRs #13 and #14 are merged (program head 938dada4): the cuts behind their flags (default 0), the card tools
-  (`tools/flash_next/collectives/`), the top-k head (`vocab_parallel.top_k`, `first_maximum`). The branch head has
-  only this note on top. **No pull request tonight** (BRIEF 23:45 UTC: card evidence first, pull requests after
-  04:00 UTC; the integration track builds from pushed branches). The second worktree
-  `reports/collectives/dev-wt` (branch `feat/flash-next-gaudi-collectives-dev`) is an ancestor of the branch head
-  and has nothing of its own.
-- Card results, all read and fetched (section 6): 00064, 00108, 00112 (ids), 00073 (collective cost, section 5).
-  Sent to the coordinator (23:25 to 23:35 UTC): the id verdicts, why 00073 failed and what it measured, the cuts'
-  card state, the bench comparison with native-replay's 00065 (native-replay agrees: a served TP8 step pays about
-  150 to 170 us per collective), the pair 00124 / 00125 and the flag state below.
+Waiting for: native-replay's unpatched build `stock-5176b1b2` (`~/farm/native-replay/bridge-build/out/`; its
+build was at 769 of 840 objects at 00:51 UTC), then a lean build `lean-<12 hex>`, and native-replay's minimal
+`bench_replay.py` command line for step b.
 
-What is proven on the card (VERIFIED by the jobs named):
-- `vocab_parallel_argmax` (mode 1's arg max): equal to the CPU at 1 rank (00064, 00108), through the 4-rank
-  (00112) and the 8-rank (00073) all-gather, lazy and replay, tied and untied, rows 1 to 128.
-- The top-k head (mode 2, `vocab_parallel_topk` / `top_k`) at k = 20 and 64: equal at 1 rank (00108) and
-  through the 4-rank all-gather (00112); its second stage (`first_maximum`, the top k of the gathered candidates)
-  at 1 rank (00108). Not run: through an 8-rank gather (the same gather as the arg max's, which passed at 8).
-- The tiny model at TP4 with mode 1 + PLE rider and with mode 2 + replicated embedding: identical tokens, and
-  identical to the greedy region without any cut (00093 at TP1); the 700-token prompt's token 4 is a near tie
-  that the region moves (section 6). Not formally a pass of the smoke.
-- Not on any card: `VLLM_HPU_MTP_REPLICATED_FC=1`; mode 1 or 2 under MTP (greedy verification from the arg max,
-  `hpu_greedy_verify.py`; this branch lacks mtp-card-ready's state-write fixes, so an MTP run belongs on the
-  integration tree).
-- Not worth it (00073): `VLLM_HPU_ALL_REDUCE_AS_GATHER_ROWS` (keep 0) and its fused form.
+Next, in order (section 7's table):
+1. a1, when `out/stock-5176b1b2/manifest.json` exists, two 1-card jobs side by side on the synced commit
+   0a66722b (no new image needed: the wrapper comes from `~/farm/collectives/bridge/`):
+   `bin/farm tiny collectives br-tiny1-stock any:1 12m --no-sync --gdn hc` and
+   `bin/farm tiny collectives br-tiny1-build any:1 12m --no-sync --bridge stock-5176b1b2 --gdn hc`.
+   Pass: `BRIDGE stock-5176b1b2 ok` in the second job's log, `bridge.json` ok, both smokes pass with the same
+   tokens (equal reference matches; the near-tie prompts' `got` lists equal in both `details.json`).
+2. a2: `bin/farm tiny collectives br-tiny8-build all 15m --no-sync --bridge stock-5176b1b2 --gdn hc`.
+3. a3 and b with the lean build (flag 0 and 1); c with `ab_bridge_job.sh` through `bin/farm submit`:
+   `printf 'exec bash ~/farm/collectives/bridge/ab_bridge_job.sh --sha 0a66722b7a55 stock:- lean0:<id>:PT_HPU_HPUGRAPH_PREPARED_REPLAY=0 lean1:<id>:PT_HPU_HPUGRAPH_PREPARED_REPLAY=1\n' | bin/farm submit collectives real8-bridge-ab all 45m`,
+   then `bin/farm wait <id>` and `bin/farm fetch collectives <id> <id>-real8-bridge-ab-stock <id>-real8-bridge-ab-lean0 <id>-real8-bridge-ab-lean1`.
+4. Every result into section 7 and to the coordinator and native-replay.
 
-Card jobs: none waiting (the pair below was cancelled). The real-model pair **00124** `real4-ab3-region` / **00125** `real4-ab3-cuts` (commit 0a66722b, any:4,
-25 min each, side by side on the two halves, in the places of 00082 / 00083; at 23:33 UTC both "start by 02:50
-UTC at the latest"). This agent handed back at about 23:45 UTC, before the pair started: its two background
-`bin/farm job` commands (logs `reports/collectives/logs/farm_real4_ab3_{region,cuts}.log`) copy each job's log and
-results to `reports/collectives/card/<id>-<name>/` if they are still alive when the jobs end; otherwise
-`bin/farm fetch collectives 00124 00124-real4-ab3-region` and `bin/farm fetch collectives 00125
-00125-real4-ab3-cuts` (or the mirror `node-mirror/farm/collectives/results/`). Then, from the worktree root:
-`python3 -I tools/flash_next/collectives/compare_arms.py reports-folder/00124-real4-ab3-region
-reports-folder/00125-real4-ab3-cuts` (`reports-folder` = `/Volumes/Storage/Claude/gaudi-work/reports/collectives/card`).
-Reading: the line `texts ... lone requests: N/6 identical` decides. 6/6: mode 1 + rider are token-exact on the real
-model, and the steady ms per step of the two arms at 1 and 32 streams is their effect (expected under 1 ms per
-step at TP4, inside the noise between the halves). Fewer than 6: look at the first differing token of that
-request (the two arms compute the same bf16 logits, so a difference is a defect of the cuts, unless a server
-error or a compile pause explains it; check both `server0.log`). Also read the `TEXT` lines (no garbage) and the
-`SAMPLED` lines (the sampled round runs neither the region nor the arg max: the same in both arms but for the
-rider's one all-reduce). Cancel the pair if it has not started by about 03:00 UTC.
-
-At 23:43 UTC the queue had moved: the pair "starts by 03:45 / 03:52 UTC at the latest" (after the integration
-headline 00128 and new jobs), i.e. in the worst case after the coordinator's 03:30 harvest; prefill's 00109
-(all cards) waits behind it. **The pair was cancelled at 23:44 UTC on the coordinator's word, before it ran**, so
-that 00109 starts earlier; its question moves to the first jobs of the next rental. The commands (from the
-worktree's committed head, the two halves at once):
-
-    F=/Volumes/Storage/Claude/gaudi-work/bin/farm
-    $F job collectives real4-ab3-region any:4 25m --env VLLM_HPU_FUSED_GREEDY_LOGITS=1 --env VLLM_GRAPH_RESERVED_MEM=0.5 \
-        -- bash tools/flash_next/collectives/ab_job.sh --levels 1,32 --tokens 256 --warm-tokens 320 --repeat-top 2
-    $F job collectives real4-ab3-cuts any:4 25m --env VLLM_HPU_VOCAB_PARALLEL_LOGITS=1 --env VLLM_HPU_PLE_TABLE_RIDER=1 \
-        --env VLLM_GRAPH_RESERVED_MEM=0.5 \
-        -- bash tools/flash_next/collectives/ab_job.sh --levels 1,32 --tokens 256 --warm-tokens 320 --repeat-top 2
-
-Submit the second only after the first prints its job id (the first syncs the commit). Read them as above. Engine-step's
-**00131** `real4-ab4-short-candvp` (ahead of the pair) runs `VLLM_HPU_CANDIDATE_SAMPLING=1` with
-`VLLM_HPU_VOCAB_PARALLEL_LOGITS=2` on the real model at TP4 (its `candvp` arm against `cand`): the served test of
-this track's top-k head and of the logits all-gather it removes from a sampled step. Read its result when it ends.
-
-Pending, in order:
-
-1. Next rental: the pair above first (mode 1 + rider for plain greedy); read engine-step's 00131 `candvp` arm
-   tonight if it runs (the served top-k head). Write both into section 6, tell the coordinator, push.
-2. Pull requests after 04:00 UTC: this note (sections 5 and 6, the handoff); nothing else is unmerged.
-3. Count work left, small (0.15 to 0.19 ms each at TP8, coordinator: not worth card time tonight): the PLE rows on
-   layer 0's mixer all-reduce when the embedding is replicated; the draft's arg-max gather carrying the winner's
-   embedding row. The per-layer floor of 2 is algebraic (section 3); the cost per collective is the host path
-   inside the replay call (section 5), native-replay's domain.
+Earlier work of this track (sections 1 to 6): the cuts are merged (PRs #13, #14) behind their flags; the card
+proved the arg max and the top-k head (00064, 00108, 00112, 00073); a collective costs about 165 us of host time
+under replay at TP8, flat in the payload, no cheaper at 4 ranks or as gather plus sum (00073). The real-model
+pair for mode 1 + rider (00124 / 00125) was cancelled at 23:44 UTC to let prefill's 00109 run; its commands (in
+section 6's last row and below) can run on this node now that it stays:
+`bin/farm job collectives real4-ab3-region any:4 25m --env VLLM_HPU_FUSED_GREEDY_LOGITS=1 --env VLLM_GRAPH_RESERVED_MEM=0.5 -- bash tools/flash_next/collectives/ab_job.sh --levels 1,32 --tokens 256 --warm-tokens 320 --repeat-top 2`
+and the same with `real4-ab3-cuts` and `--env VLLM_HPU_VOCAB_PARALLEL_LOGITS=1 --env VLLM_HPU_PLE_TABLE_RIDER=1`
+instead of the first `--env` (submit the second after the first prints its job id). Pull requests are allowed
+again (BRIEF 00:50 UTC): the note and the bridge tools can go into the program branch through `bin/gate`.
