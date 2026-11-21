@@ -650,7 +650,7 @@ step while the host works.
   `HPUModelRunner._upload`, a persistent pinned host tensor and a persistent device tensor per (name, shape, dtype),
   copied non-blocking (two pairs alternating per input under async scheduling). Same tokens off and on (greedy, n-gram
   k = 3 with oracle drafts); one device address per input shape, which lean5's static launch plan needs (asked
-  collectives for 00210's plan_hit per rank). async-sched's device-made inputs replace five of them in chained
+  collectives for the plan_hit per rank, now from 00234). async-sched's device-made inputs replace five of them in chained
   verification steps (its own tensors; agreed 08:46 UTC).
 - **The lean5 A/B of the persistent inputs:** collectives runs `VLLM_HPU_PERSISTENT_INPUTS=1` against `=0` on one
   image with lean5 on (its ab_bridge template), build 6 preferred, this track's image only if the coordinator or
@@ -658,7 +658,9 @@ step while the host works.
   `PT_HPU_HPUGRAPH_STATIC_PLAN_MISS_LOG=200` (needs `PT_HPU_HPUGRAPH_PREPARED_REPLAY=1
   PT_HPU_HPUGRAPH_PREPARED_REUSE=1 PT_HPU_HPUGRAPH_STATIC_PLAN=1`; it also has lean6h2's H2D timer):
   `HPUGRAPH_PLAN_MISS` lines per launcher, `input_moved` and `first_input <idx> <dtype[shape]>` name the inputs that
-  still move. 00210's lean6m verify arm (without this flag) is the baseline.
+  still move. The baseline (without this flag) is collectives' 00234 (10:00 UTC: 00210's lean6m qualification moved
+  by the coordinator onto build 5's image `eb21ac75` with the dense MoE from 1 token, 100 launches per 1-stream step;
+  starts by 16:25 UTC): collectives sends the miss table when its `real-lean5-verify` arm ends.
 - **A regression of this track on the program branch, being fixed:** the PR 16 merge resolution (`fe4cac24`, in
   PR 20) computed the block table's width before the sparse / dense branch; stub runners without
   `_block_table_max_blocks` fail (`tests/unit_tests/worker/test_flash_next_host_ngram.py`, 4 tests; served models
