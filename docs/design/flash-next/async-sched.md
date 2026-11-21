@@ -6,7 +6,7 @@ results are under `/Volumes/Storage/Claude/gaudi-work/reports/async-sched/card/`
 
 ## Handoff (if this agent stops)
 
-Updated 2026-11-21 06:50 UTC.
+Updated 2026-11-21 07:50 UTC.
 
 - **On the branch** (pushed): `8f4816f8` engine-step's `engine_harness.py`, unchanged; `7a818007` mode 1 of
   `VLLM_HPU_FLASH_NEXT_ASYNC_SCHED` (no speculation: the PLE context carry, the output-token ledger, the async
@@ -20,7 +20,9 @@ Updated 2026-11-21 06:50 UTC.
   branch, mtp-card-ready's rehearsal engine with the real MTP drafter: `test_engine_mtp_async.py` 2 passed (job
   branch int2 only; it needs `tests/unit_tests/hpu_cpu_engine.py`).
 - **Gate**: `bin/gate reports/async-sched/trees/gate-8a171ea5` (a `git archive` of `8a171ea5`, so the worktree
-  stays free while it waits for a slot), log `reports/async-sched/logs/gate_8a171ea5.out`. If green:
+  stays free while it waits for a slot), log `reports/async-sched/logs/gate_8a171ea5.out`. The first run was cut
+  at 07:45 UTC by its own 90 min alarm (45 min waiting for a slot; 38 files ok, 5 at the per-file alarm under a
+  load near 40, 17 not run: `gate_8a171ea5_cut.out`); rerun from 07:48 UTC with a 4 h alarm. If green:
   `gh pr create --base feat/flash-next-gaudi --head feat/flash-next-gaudi-async-sched` (title "Flash-Next under
   async scheduling: VLLM_HPU_FLASH_NEXT_ASYNC_SCHED (default 0), modes 1 and 2", body
   `reports/async-sched/pr_body.md` with the gate line), then `gh pr merge --merge` (owner's rule: default-off and
@@ -49,6 +51,9 @@ Updated 2026-11-21 06:50 UTC.
     00189's pin arm (about 08:20 UTC: "on" if at 1 and 8 streams no rank is above 1.4x the rank median and the
     steady step is not slower than without placement): `echo on > ~/farm/async-sched/results/switches/place`.
     Queue order then: 00184, 00189, 00170 + 00150 (4 cards each, about 50 min), 00202, 00203.
+  - Since 06:58 UTC every job that starts gets whole-core cpusets (the coordinator's queue change; image builds
+    on whole cores of their own): 00202 and 00203 run on another CPU layout than 00186, so compare their arms with
+    each other, not with 00186 (collectives, 07:00 UTC).
   - Waiters with fetch: `reports/async-sched/logs/wait_00202.out` and `wait_00203.out` (`bin/farm wait` then
     `bin/farm fetch`); the submit logs' own waiters end at their 3 h alarm, before the jobs do.
   - If the session is gone: `bin/farm fetch async-sched 00202 00202-real8-async-m1c` (same for 00203). Read
