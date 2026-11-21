@@ -1,0 +1,189 @@
+diff --git a/tools/flash_next/rental/farm/cardq.sh b/tools/flash_next/rental/farm/cardq.sh
+index 33367a27..fac216b8 100755
+--- a/tools/flash_next/rental/farm/cardq.sh
++++ b/tools/flash_next/rental/farm/cardq.sh
+@@ -60,6 +60,17 @@
+ # run next to card jobs, and the rest is the module's jobs' (CARDQ_CPUS, `cardq.sh cpus`): a decode step is
+ # bound by one host thread per worker, so a build must not sit on a job's CPUs. A host with fewer than 4
+ # CPUs per module gets no sets.
++# Whole cores (2026-11-21, collectives track for the coordinator): on this node vCPUs 2k and 2k+1 are hyperthreads
++# of one host core (native-replay's job 00193), so the layout above puts each build CPU next to a job CPU on one
++# core (18 with 19, 37 with 36, ...; four image builds raised a job's graph-launch time from 143 to 232 us in
++# 00190). The file $Q/cpu_layout with the line "cores SINCE" (SINCE: epoch seconds) switches to whole cores when
++# the host allows it (an even number of modules, at least one build CPU per module, and per-module CPUs minus
++# build CPUs even): in each pair of modules 2j, 2j+1 (2P CPUs from 2jP) the middle 2 x KEEP CPUs (whole cores)
++# are for image builds and each module keeps P - KEEP CPUs of whole cores (152 CPUs, 8 modules: modules
++# 0-17 / 20-37 / 38-55 / 58-75 / 76-93 / 96-113 / 114-131 / 134-151, builds 18-19,56-57,94-95,132-133). A job
++# that started before SINCE keeps the module layout for every container it starts (CARDQ_JOB tells which job
++# asks), and while such a job runs, image builds keep to the CPUs that are build CPUs in both layouts (18, 56,
++# 94, 132), so no running job's CPUs change and no build shares a core with a new job.
+ #
+ # Node load. A job's log and the ledger's last column tell how busy the node was while it ran: the highest
+ # 1-minute load average, the three at its end, the busy CPUs on average, the image builds that ran during
+@@ -362,26 +373,84 @@ host_cpus() {
+     case "$R" in '' | *[!0-9]*) R=0 ;; esac
+ }
+ 
++# layout_read: from $Q/cpu_layout ("cores SINCE") LAYOUT=cores and SINCE=epoch seconds; else LAYOUT=modules.
++LAYOUT=modules
++SINCE=""
++layout_read() {
++    local a b
++    LAYOUT=modules
++    SINCE=""
++    if [ -r "$Q/cpu_layout" ] && read -r a b _ <"$Q/cpu_layout" 2>/dev/null; then
++        case "$b" in '' | *[!0-9]*) return 0 ;; esac
++        if [ "$a" = cores ]; then LAYOUT=cores; SINCE="$b"; fi
++    fi
++}
++
++# old_jobs_running: true when a running job started before SINCE (it keeps the module layout).
++old_jobs_running() {
++    local d t
++    for d in "$Q"/jobs/*/; do
++        d="${d%/}"
++        rd "$d/state"
++        [ "$R" = running ] || continue
++        rd "$d/start"
++        t="$R"
++        case "$t" in '' | *[!0-9]*) continue ;; esac
++        if [ "$t" -lt "$SINCE" ]; then return 0; fi
++    done
++    return 1
++}
++
+ # cpus_of WHAT: the --cpuset-cpus value in R: for "build" the CPUs of image builds, else for the modules
+-# "M M M" the CPUs of their jobs (see the header). "" when the host has fewer than 4 CPUs per module.
++# "M M M" the CPUs of their jobs (see the header: the module layout, or whole cores with $Q/cpu_layout). ""
++# when the host has fewer than 4 CPUs per module.
+ cpus_of() {
+-    local what="$1" per keep m lo hi out=""
++    local what="$1" per keep m lo hi out="" cores=0 j
+     keep="${CARDQ_BUILD_CPUS_PER_MODULE:-1}"
+     case "$keep" in '' | *[!0-9]*) keep=1 ;; esac
+     host_cpus
+     per=$((R / NC))
+     R=""
+     if [ "$per" -lt 4 ] || [ "$keep" -ge "$per" ]; then return 0; fi
++    layout_read
++    if [ "$LAYOUT" = cores ] && [ "$keep" -ge 1 ] && [ $((NC % 2)) -eq 0 ] && [ $(((per - keep) % 2)) -eq 0 ]; then
++        cores=1  # whole cores
++        if [ "$what" = build ]; then
++            if old_jobs_running; then cores=2; fi # the CPUs that are build CPUs in both layouts
++        elif [ -n "${CARDQ_JOB:-}" ]; then
++            rd "$Q/jobs/$CARDQ_JOB/start"
++            case "$R" in '' | *[!0-9]*) ;; *) if [ "$R" -lt "$SINCE" ]; then cores=0; fi ;; esac
++        fi
++        R=""
++    fi
+     if [ "$what" = build ]; then
+         if [ "$keep" -eq 0 ]; then return 0; fi
+         for ((m = 0; m < NC; m++)); do
+-            lo=$(((m + 1) * per - keep))
+-            hi=$(((m + 1) * per - 1))
++            if [ "$cores" -eq 0 ]; then
++                lo=$(((m + 1) * per - keep))
++                hi=$(((m + 1) * per - 1))
++            else
++                if [ $((m % 2)) -eq 1 ]; then continue; fi # one block of whole cores per pair of modules
++                lo=$(((m + 1) * per - keep))
++                if [ "$cores" -eq 1 ]; then hi=$((lo + 2 * keep - 1)); else hi=$((lo + keep - 1)); fi
++            fi
+             if [ "$lo" -eq "$hi" ]; then out="$out${out:+,}$lo"; else out="$out${out:+,}$lo-$hi"; fi
+         done
+     else
+         for m in $what; do
+-            out="$out${out:+,}$((m * per))-$(((m + 1) * per - 1 - keep))"
++            if [ "$cores" -eq 1 ]; then
++                j=$((m / 2))
++                if [ $((m % 2)) -eq 0 ]; then
++                    lo=$((2 * j * per))
++                    hi=$((lo + per - keep - 1))
++                else
++                    lo=$((2 * j * per + per + keep))
++                    hi=$((2 * (j + 1) * per - 1))
++                fi
++                out="$out${out:+,}$lo-$hi"
++            else
++                out="$out${out:+,}$((m * per))-$(((m + 1) * per - 1 - keep))"
++            fi
+         done
+     fi
+     R="$out"
+diff --git a/tests/unit_tests/tools/rental/test_sh_cardq_cpu_layout.py b/tests/unit_tests/tools/rental/test_sh_cardq_cpu_layout.py
+new file mode 100644
+index 00000000..1a186a34
+--- /dev/null
++++ b/tests/unit_tests/tools/rental/test_sh_cardq_cpu_layout.py
+@@ -0,0 +1,71 @@
++# SPDX-License-Identifier: Apache-2.0
++"""cardq.sh cpus with $Q/cpu_layout "cores SINCE": whole host cores for image builds and for jobs that started at
++SINCE or later (vCPUs 2k and 2k+1 share a core on the 2026-11-20 node); a job that started before keeps the module
++layout for every container it starts, and builds keep to the CPUs that are build CPUs in both layouts while it runs."""
++import os
++import subprocess
++import time
++from pathlib import Path
++
++REPO_ROOT = Path(__file__).resolve().parents[4]
++CARDQ = REPO_ROOT / "tools" / "flash_next" / "rental" / "farm" / "cardq.sh"
++OLD_ALL = "0-17,19-36,38-55,57-74,76-93,95-112,114-131,133-150"
++NEW_ALL = "0-17,20-37,38-55,58-75,76-93,96-113,114-131,134-151"
++
++
++def cpus(q: Path, *args, **env) -> str:
++    full = dict(os.environ, CARDQ_DIR=str(q), CARDQ_HOST_CPUS="152", **env)
++    proc = subprocess.run(["bash", str(CARDQ), "cpus", *args], capture_output=True, text=True, env=full, check=True)
++    return proc.stdout.strip()
++
++
++def job(q: Path, jid: str, state: str, start: int) -> None:
++    d = q / "jobs" / jid
++    d.mkdir(parents=True, exist_ok=True)
++    (d / "state").write_text(state + "\n")
++    (d / "start").write_text("%d\n" % start)
++
++
++def test_without_the_layout_file_nothing_changes(tmp_path):
++    assert cpus(tmp_path, "--all") == OLD_ALL
++    assert cpus(tmp_path, "--build") == "18,37,56,75,94,113,132,151"
++
++
++def test_whole_cores_for_new_jobs_and_builds(tmp_path):
++    now = int(time.time())
++    (tmp_path / "cpu_layout").write_text("cores %d\n" % now)
++    assert cpus(tmp_path, "--all") == NEW_ALL
++    assert cpus(tmp_path, "0,1,2,3") == "0-17,20-37,38-55,58-75"
++    assert cpus(tmp_path, "7") == "134-151"
++    assert cpus(tmp_path, "--build") == "18-19,56-57,94-95,132-133"
++    for m in range(8):  # every module's share is whole cores: an even first CPU, an even count
++        lo, hi = (int(x) for x in cpus(tmp_path, str(m)).split("-"))
++        assert lo % 2 == 0 and (hi - lo + 1) % 2 == 0 and hi - lo + 1 == 18
++
++
++def test_a_job_that_started_before_keeps_its_cpus_and_builds_stay_off_both_layouts(tmp_path):
++    now = int(time.time())
++    (tmp_path / "cpu_layout").write_text("cores %d\n" % now)
++    job(tmp_path, "00100", "running", now - 600)
++    job(tmp_path, "00101", "waiting", 0)
++    assert cpus(tmp_path, "--all", CARDQ_JOB="00100") == OLD_ALL
++    assert cpus(tmp_path, "4,5,6,7", CARDQ_JOB="00100") == "76-93,95-112,114-131,133-150"
++    job(tmp_path, "00102", "running", now + 1)
++    assert cpus(tmp_path, "--all", CARDQ_JOB="00102") == NEW_ALL
++    build = cpus(tmp_path, "--build")
++    assert build == "18,56,94,132"
++    used = set()
++    for part in (OLD_ALL + "," + NEW_ALL).split(","):
++        lo, hi = (int(x) for x in part.split("-"))
++        used |= set(range(lo, hi + 1))
++    assert not used & {int(c) for c in build.split(",")}
++    job(tmp_path, "00100", "ended", now - 600)
++    assert cpus(tmp_path, "--build") == "18-19,56-57,94-95,132-133"
++
++
++def test_a_host_where_whole_cores_do_not_fit_keeps_the_module_layout(tmp_path):
++    (tmp_path / "cpu_layout").write_text("cores %d\n" % int(time.time()))
++    assert cpus(tmp_path, "--all", CARDQ_BUILD_CPUS_PER_MODULE="2") == \
++        "0-16,19-35,38-54,57-73,76-92,95-111,114-130,133-149"
++    (tmp_path / "cpu_layout").write_text("cores soon\n")
++    assert cpus(tmp_path, "--all") == OLD_ALL

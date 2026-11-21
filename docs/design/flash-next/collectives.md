@@ -447,9 +447,23 @@ NaN garbage (replacement characters over 0.5 % or a run of 40 or more). The spin
 the placement (`PLACE`) are late-bound from 00189's result through `~/farm/collectives/bridge/late/00198.env`.
 Pending.
 
+**The card queue's CPU layout (coordinator, 06:5x UTC; live since 06:58:07 UTC):** the image-build CPUs 18, 37, 56,
+75, 94, 113, 132, 151 had their hyperthread siblings (vCPUs 2k / 2k+1, native-replay's 00193) inside job cpusets;
+in 00190 four builds during one arm raised the graph-launch p50 from 143 to 232 us. `~/farm/cardq.sh` (installed by
+rename; the previous one is `~/farm/.cardq.sh.before-cpu-layout`) now gives builds whole cores when
+`~/farm/q/cpu_layout` says `cores <epoch>`: in each pair of modules the middle core (18-19, 56-57, 94-95, 132-133),
+and every module 18 vCPUs of whole cores (0-17, 20-37, 38-55, 58-75, 76-93, 96-113, 114-131, 134-151). A job that
+started before the switch keeps the old layout for every container it starts; while such a job runs, builds keep to
+18, 56, 94, 132 (build CPUs in both layouts). `cardq.sh adopt` gave the 18 waiting jobs supervisors with the new code.
+Tests: the old outputs unchanged without the file (20 queries), card-farm's `test_sh_cardq.py` and
+`test_sh_farm_job.py` against the new script (64 passed, 1 skipped), a new `test_sh_cardq_cpu_layout.py` (4 pass).
+The patch for card-farm's source (`farm install` would undo it): `tools/flash_next/bridge/cardq-cpu-layout.diff`.
+Rollback: `mv ~/farm/q/cpu_layout ~/farm/q/cpu_layout.off`. The plugin's `VLLM_HPU_WORKER_CPU_PIN` and native-replay's
+`place.sh` cut the container's own CPU mask into equal shares, so they follow the new layout.
+
 ## Handoff (if this agent stops)
 
-State at 06:35 UTC on 2026-11-21 (fourth agent of this track, Opus 5.5). **The node stays until about 00:00 UTC
+State at 07:05 UTC on 2026-11-21 (fourth agent of this track, Opus 5.5). **The node stays until about 00:00 UTC
 on 2026-11-22** (BRIEF 00:50 UTC). Branch `feat/flash-next-gaudi-collectives` (and `-dev`, the same head), worktree
 `/Volumes/Storage/Claude/gaudi-work/wt/collectives`; card results and logs in
 `/Volumes/Storage/Claude/gaudi-work/reports/collectives/` (`card/<id>-<name>/`, `logs/`, `probes/`). This section is
