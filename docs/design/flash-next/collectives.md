@@ -405,18 +405,31 @@ at 8 streams, the opposite of 00174 (where the reference was our own rebuild); p
 6 ms step difference, so either our rebuild as such is slower than the vendor's build in this env or the cost lies
 outside the timed launch path. The vendor bridge stays in the headline builds (coordinator).
 
-**Job 00188 `real8-bridge-vendor`** (all, 75 min, queued 05:00 UTC after integration's 00186 and 00187; build 4's
-image `farm-integration:30f4e37ef08c`, second tag `farm-collectives-int:30f4e37ef08c`; `bridge_vendor_job.sh`):
-build 4's no-speculation env without the accumulation-thread setting; tiny gates (vendor, our unpatched rebuild
-`stock-5176b1b2`, lean3a); then (1) the vendor bridge with the accumulation thread on (default) against off (the
-coordinator: 00178 ran 29.4 to 29.7 ms at 1 stream with it on, 00181's vendor arm 37 ms with it off); the job keeps
-the setting with the lower sum of greedy ms per step at 32 + 8 + 1 (`<job>-<name>-spinner.txt`) for (2) our rebuild
-and (3) `lean3a-8f6f7faf88dc` (lean3t + no GIL release for inputs whose event is done, no argument building for logs
-and traces that are off). Pending.
+**The per-rank spread (native-replay, from 00174's and 00181's timing lines; MEASURED per rank):** in every real arm
+2 of the 8 ranks run about 2x slower per launch for long stretches, every phase 2x (a slower CPU, not more bridge
+work; INFERRED: two busy worker threads on hyperthread siblings of one host core); which two changes with each server
+start. Split by level with vLLM's `Running: N reqs` metrics lines (00181 real-lean, median us per launch): the two
+slow ranks 223 and 235 at 1 stream, 179 and 202 at 8, the other six 140 to 157 and 114 to 142; at 32 streams all
+eight 128 to 155. At 1 stream the slowest rank sets the step (about 150 launches x 90 us = 13 ms), so the step-time
+flips between 00174 and 00181 are this spread, not lean; the per-launch medians are attributable (lean -17 us, the
+`run_prep` fix -12 us, inline collectives -10 us net). Our rebuild and the vendor's build are the same code
+generation (native-replay: GCC 13.4.0, no LTO in either, .text sizes within 0.002 %).
+
+**Job 00189 `real8-bridge-vendor2`** (all, 95 min, queued 05:03 UTC in the place of 00188 after integration's 00186
+and 00187; build 4's image `farm-integration:30f4e37ef08c`, second tag `farm-collectives-int:30f4e37ef08c`;
+`bridge_vendor_job.sh`, coordinator 05:00 and 05:10 UTC): build 4's no-speculation env without the
+accumulation-thread setting; tiny gates (vendor, lean3a with the prepared flag 0, lean3a with the flag 1); then the
+vendor bridge with the accumulation thread on (default) against off (00178 ran 29.4 to 29.7 ms at 1 stream with it
+on, 00181's vendor arm 37 ms with it off: possibly the spread); the job keeps the setting with the lower sum of
+greedy ms per step at 32 + 8 + 1 (`<job>-<name>-spinner.txt`) for real-rebuild (lean3a with the flag 0 and timers:
+our build on the stock path, the control 00181 lacked), real-lean (`lean3a-8f6f7faf88dc`, flag 1: lean3t + no GIL
+release for inputs whose event is done, no argument building for logs and traces that are off) and real-pin (the
+same + `VLLM_HPU_WORKER_CPU_PIN=1`, or native-replay's sibling-aware pin through `late/00189.env` `PIN_KV=...` if it
+is ready before the job starts). Pending.
 
 ## Handoff (if this agent stops)
 
-State at 05:05 UTC on 2026-11-21 (fourth agent of this track, Opus 5.5). **The node stays until about 00:00 UTC
+State at 05:15 UTC on 2026-11-21 (fourth agent of this track, Opus 5.5). **The node stays until about 00:00 UTC
 on 2026-11-22** (BRIEF 00:50 UTC). Branch `feat/flash-next-gaudi-collectives` (and `-dev`, the same head), worktree
 `/Volumes/Storage/Claude/gaudi-work/wt/collectives`; card results and logs in
 `/Volumes/Storage/Claude/gaudi-work/reports/collectives/` (`card/<id>-<name>/`, `logs/`, `probes/`). This section is
@@ -449,11 +462,13 @@ bench8-bridge all 30m` (each arm pairs the flag off and on in one bench run; sum
 
 Next, in order (section 7's table):
 1. Card results so far: 00160 PASS, 00174 and 00181 ok (section 7), each sent to the coordinator and
-   native-replay. **Waiting: 00188** (section 7; this agent's waiter fetches its seven arms, the verdicts and
-   `00188-real8-bridge-vendor-spinner.txt` into `reports/collectives/card/`; else `bin/farm fetch collectives 00188
-   00188-real8-bridge-vendor-<arm>...` and `bin/node-scp :farm/collectives/results/00188-real8-bridge-vendor-
-   {verdicts,spinner}.txt <dir>/`). Report (1) and (2) to the coordinator first, then lean3a's sub-timers
-   (`python3 -I reports/collectives/probes/replay_timing_table.py <real-lean folder>`) to native-replay. Drop the
+   native-replay. **Waiting: 00189** (section 7; this agent's waiter fetches its eight arms, the verdicts and
+   `00189-real8-bridge-vendor2-spinner.txt` into `reports/collectives/card/`; else `bin/farm fetch collectives 00189
+   00189-real8-bridge-vendor2-<arm>...` and `bin/node-scp :farm/collectives/results/00189-real8-bridge-vendor2-
+   {verdicts,spinner}.txt <dir>/`). Report the spinner pair and the rebuild against the vendor to the coordinator
+   first; then, for every timed arm, `python3 -I reports/collectives/probes/replay_timing_table.py <arm folder>`:
+   per-rank medians per level (the headline now), the pooled phase and `sub_*` medians, and the pin arm's eight
+   `VLLM_HPU_WORKER_CPU_PIN` lines (`grep WORKER_CPU_PIN <real-pin>/server0.log`), to native-replay. Drop the
    protective image tags when no job needs them: `sudo -n docker rmi farm-collectives-int:d00c0a9a3e18
    farm-collectives-int:30f4e37ef08c` on the node.
 2. **PR #19 merged at 04:05 UTC** (program head 22ec5ea3): the gated snapshot 04f690be (gate 88 files, 0 red; tool
