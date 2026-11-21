@@ -7660,6 +7660,9 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                             and self.flash_next_sparse_decode_metadata()):
                         # the sparse decode metadata in force (also switchable): records of their own too
                         timer_kind += "+md"
+                    if int(gaudi_envs.VLLM_HPU_VOCAB_PARALLEL_LOGITS) >= 1:
+                        # the vocabulary-parallel arg max (also switchable)
+                        timer_kind += "+vp"
                     mtp_step_timer.draft_start(timer_kind, scheduler_output.total_num_scheduled_tokens,
                                                num_decodes + num_prefills,
                                                self.speculative_config.num_speculative_tokens)
