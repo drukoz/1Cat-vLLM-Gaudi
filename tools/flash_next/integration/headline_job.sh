@@ -14,8 +14,9 @@
 #           --no-sampled-check (sampled verification is off in this build: a sampled request gets HTTP 400);
 #           acceptance per draft position per level from /metrics (SPEC lines).
 #   mtp3-32 server 2 with the 32-stream level only (a short hold).
-#   nospec-noprefix, nospec-noprefix-nocut  the low-stream bisect: A's env without VLLM_HPU_PREFIX_ALIGN_SPLIT and
-#           VLLM_HPU_PREFIX_KEEP_PROMPT_END (then also VLLM_HPU_DECODE_CUT_INTERVAL=0), greedy 8 and 1 streams only.
+#   nospec-noshard, nospec-noprefix, nospec-noprefix-nocut  the low-stream bisect: A's env with
+#           VLLM_HPU_QSA_INDEXER_SHARD=0; A's env without VLLM_HPU_PREFIX_ALIGN_SPLIT and VLLM_HPU_PREFIX_KEEP_PROMPT_END
+#           (then also VLLM_HPU_DECODE_CUT_INTERVAL=0); greedy 8 and 1 streams only.
 #   nospec-pin  the no-speculation server with VLLM_HPU_WORKER_CPU_PIN=1 (HEADLINE_PIN_MODE) and
 #           PT_HPU_DISABLE_HPUGRAPH_REPLAY_HASHCHECK=1 (native-replay's host levers): greedy 1 and 32 streams.
 #   tiny    the tiny model at TP8 with the job's flags (farm_tiny.py --gdn hc; --spec K with HEADLINE_TINY_SPEC=K):
@@ -178,12 +179,18 @@ while [ "$i_arm" -lt "${#ARMS[@]}" ]; do
                 --warm-tokens "$WARM" --repeat-top 2 --no-mintok-check --probe-arg "--sampled-levels=$LEVELS" \
                 --probe-arg --interleave-sampled --probe-arg "--rounds=$ROUNDS"
             ;;
-        nospec-noprefix | nospec-noprefix-nocut)
-            # The low-stream bisect (coordinator, build 3): A's env without the prefix flags, then also without the
-            # decode cut interval; greedy only, HEADLINE_BISECT_LEVELS (default 8,1), HEADLINE_BISECT_TOKENS (default 96).
-            nocut=()
-            if [ "$arm" = nospec-noprefix-nocut ]; then nocut=(VLLM_HPU_DECODE_CUT_INTERVAL=0); fi
-            env VLLM_HPU_PREFIX_ALIGN_SPLIT=0 VLLM_HPU_PREFIX_KEEP_PROMPT_END=0 ${nocut[@]+"${nocut[@]}"} \
+        nospec-noshard | nospec-noprefix | nospec-noprefix-nocut)
+            # The low-stream bisect (coordinator, build 3): A's env without the QSA request shard; A's env without the
+            # prefix flags, then also without the decode cut interval; greedy only, HEADLINE_BISECT_LEVELS (default
+            # 8,1), HEADLINE_BISECT_TOKENS (default 96).
+            change=()
+            case "$arm" in
+                nospec-noshard) change=(VLLM_HPU_QSA_INDEXER_SHARD=0) ;;
+                nospec-noprefix) change=(VLLM_HPU_PREFIX_ALIGN_SPLIT=0 VLLM_HPU_PREFIX_KEEP_PROMPT_END=0) ;;
+                nospec-noprefix-nocut)
+                    change=(VLLM_HPU_PREFIX_ALIGN_SPLIT=0 VLLM_HPU_PREFIX_KEEP_PROMPT_END=0 VLLM_HPU_DECODE_CUT_INTERVAL=0) ;;
+            esac
+            env "${change[@]}" \
                 bash "$HERE/serve_probe.sh" --out "$OUT/$arm" --levels "${HEADLINE_BISECT_LEVELS:-8,1}" \
                 --tokens "${HEADLINE_BISECT_TOKENS:-96}" --warm-tokens "$WARM" --repeat-top 2 --no-mintok-check \
                 --probe-arg --no-sampled-check --probe-arg "--rounds=$ROUNDS"
