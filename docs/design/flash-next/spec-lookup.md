@@ -10,9 +10,9 @@ repository is under `/Volumes/Storage/Claude/gaudi-work/reports/spec-lookup/` (`
 
 ## Handoff (if this agent stops)
 
-State at **2026-11-21 03:10 UTC** (fourth agent, Opus 5.5). Branch head: the commit that holds this text, pushed.
-It contains the program head `5c1e8219` (PR #15 kernel-fixes, merged as `f4dad13a`), mtp-card-ready through
-`f1aa2292` and every commit of this track. **The node was extended (BRIEF 00:50 UTC): it ends about 00:00 UTC on
+State at **2026-11-21 03:35 UTC** (fourth agent, Opus 5.5). Branch head: the commit that holds this text, pushed.
+It contains the program head `a16ebdde` (PR #16 qsa-dataflow, PR #17 this track's padded one-token fix; merged as
+`ace177c2`), mtp-card-ready through `f1aa2292` and every commit of this track. **The node was extended (BRIEF 00:50 UTC): it ends about 00:00 UTC on
 2026-11-22**; everything on it is lost then. Merges are allowed again (one gate at a time).
 
 **Card jobs** (`bin/farm status`, `bin/farm ledger | grep -w spec-lookup`; results in
@@ -59,10 +59,10 @@ prompt passes with the same change on their branch. Serving triggers: a 1-token 
 a prompt whose cached prefix leaves exactly one token, a resumed request with one token left. As its own pull
 request onto the program head: **PR #17** (branch `fix/flash-next-gaudi-spec-padding`, commit `13e7fd11`, worktree
 `reports/spec-lookup/pr-spec-padding`; the module, the runner lines and `test_spec_padding.py`, without the engine
-test, which needs this branch's harness). Its first gate ran during the 03:01 UTC outage of `/Volumes/Storage`
-(every file "Operation not permitted") and is void (`logs/gate_spec_padding_outage.log`); the gate was restarted
-at 03:05 UTC (`logs/gate_spec_padding.log`). Merge with `gh pr merge 17 --merge` only on a green gate, then tell
-the coordinator (integration build 4 takes it from the program branch).
+test, which needs this branch's harness). **Merged at 03:33 UTC** (program head `a16ebdde`) after
+`bin/gate` on that tree: 57 files, 0 red (`logs/gate_spec_padding.log`; a first run during the 03:01 UTC outage of
+`/Volumes/Storage`, when every file read gave "Operation not permitted", is void: `logs/gate_spec_padding_outage.log`).
+This branch merged `a16ebdde` as `ace177c2`.
 
 **The gate.** The third agent's waiting gate was stopped at 23:41 UTC (BRIEF 23:21, since withdrawn by the 00:50
 entry). Run `bin/gate <worktree> --tools` when the merge is due (step 2 below); it waits for the lock.
