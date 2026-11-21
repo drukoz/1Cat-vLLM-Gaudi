@@ -267,6 +267,41 @@ def test_row_quant_is_the_plugins_dynamic_quant_on_the_card(monkeypatch):
         assert differs == 0
 
 
+def _torch_path_on_the_device(case, device_inputs) -> tuple:
+    """Today's torch code for the stage of ``case``, issued on DEVICE: the outputs, still on the device.
+
+    The routing returns its ids as the int64 ``torch.topk`` makes, which is what production hands the vendor op;
+    the caller narrows them on the host.  ``moe_reference.moe_route_reference`` (the CPU oracle) narrows them with
+    ``.to(torch.int32)``, and on a card that cast, issued in the lazy graph that holds the top-k, returns every
+    second id of the table (an 8-byte read of 4-byte ids).  That reference, not the kernel, failed
+    ``route_real_r16`` on all 16 rows in the first three card runs (card probe ``probe_moe_route.py``, job 00038,
+    2026-11-20: the kernel selects the production routing's experts on every row without a tie).
+    """
+    args = [device_inputs[key] for key in INPUT_ORDER[case.kind]]
+    if case.kind == "route":
+        gates, = args
+
+        class Layer:
+            top_k = case.top_k
+
+        return moe_reference.moe_route_torch(gates, gates[:, :case.experts], Layer)
+    want = getattr(moe_reference, f"{OP_NAME[case.kind]}_reference")(*args, *scalars(case))
+    return want if isinstance(want, tuple) else (want, )
+
+
+def _narrowed_on_the_device_line(case, device_inputs, host_ids) -> str:
+    """A measurement, no check: the top-k ids narrowed to int32 on the device in the top-k's own graph.
+
+    ``host_ids`` are the same ids read as int64 and narrowed on the host.  A card returned other ids on 2026-11-20
+    (see ``_torch_path_on_the_device``); a CPU returns the same.  The line shows whether a card still does.
+    """
+    gates = device_inputs["gates"]
+    narrowed = moe_reference.moe_route_reference(gates, case.experts, case.top_k)[0].cpu()
+    same = (narrowed == host_ids).all(dim=1)
+    return (f"MOEHPU {case.name} ids: narrowed to int32 on the device in the graph of the top-k, {int(same.sum())} of "
+            f"{case.rows} rows keep the ids the host reads as int64")
+
+
 @pytest.mark.parametrize("name", ["silu_mul_real_tp8_r16", "silu_mul_real_tp1_r32", "combine_real_r16",
                                   "combine_tiny_r3", "route_real_r16"])
 def test_hpu_op_matches_the_torch_path_on_hpu(name):
@@ -274,13 +309,13 @@ def test_hpu_op_matches_the_torch_path_on_hpu(name):
     case = case_by_name(name)
     inputs = make_inputs(case)
     device_inputs = {key: tensor.to(DEVICE) for key, tensor in inputs.items()}
-    reference = getattr(moe_reference, f"{OP_NAME[case.kind]}_reference")
-    want = reference(*[device_inputs[key] for key in INPUT_ORDER[case.kind]], *scalars(case))
-    want = want if isinstance(want, tuple) else (want, )
+    want = _torch_path_on_the_device(case, device_inputs)
     got = _run(case, device_inputs)
     for key, torch_out in zip(OUTPUT_ORDER[case.kind], want):
         fused, torch_out = got[key].cpu(), torch_out.cpu()
         if key == "ids":  # the same experts wherever no row ties at the cut
+            torch_out = torch_out.to(torch.int32)  # narrowed here, on the host (_torch_path_on_the_device)
+            _measured(_narrowed_on_the_device_line(case, device_inputs, torch_out))
             clear = ~moe_case.route_tie_rows(case, inputs)
             same = (torch.sort(fused, dim=1).values == torch.sort(torch_out, dim=1).values).all(dim=1)
             # Which side a difference comes from: each of them against what CPU torch makes of the same logits.

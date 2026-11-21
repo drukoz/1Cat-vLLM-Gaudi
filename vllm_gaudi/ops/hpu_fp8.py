@@ -406,6 +406,8 @@ class HPUFp8MoEMethod(Fp8MoEMethod):
                 permuted_weights=True,
                 activation=_normalize_moe_activation(layer.activation),
             )
+        if moe_glue is not None and output.shape == input_shape:
+            return output  # not output.view(...): moe_combine is a custom op (_MoeGlueState.row_quant)
         return output.view(*(output.size(0), *input_shape[1:]))
 
 

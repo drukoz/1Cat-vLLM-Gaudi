@@ -52,7 +52,13 @@ float64_pair_t bf16_to_f32_linear(bfloat128 input)
     return result;
 }
 
+// The interleaved build of this kernel (VLLM_HPU_GDN_KERNEL_INTERLEAVE=1) compiles this file through a
+// wrapper that names another recurrence header; everything else is this file.
+#ifdef GDN_CORE_DECODE_RECURRENCE_HEADER
+#include GDN_CORE_DECODE_RECURRENCE_HEADER
+#else
 #include "gdn_core_decode_recurrence.h"
+#endif
 #include "gdn_core_decode_norm.h"
 
 // Causal width-4 conv + SiLU, fp32, for the 128 channels starting at

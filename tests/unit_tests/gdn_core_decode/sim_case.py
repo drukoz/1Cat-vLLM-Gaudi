@@ -45,6 +45,9 @@ CASES = (  # simulator + HPU
 HPU_CASES = CASES + (  # HPU only (too slow for the simulator)
     SimCase("tp8_b16", 2, 6, 17, tuple(range(16)), tuple(range(16)), GdnGateActivation.SIGMOID, 3),
     SimCase("tp8_b64", 2, 6, 65, tuple(range(1, 65)), tuple(range(1, 65)), GdnGateActivation.SIGMOID, 4),
+    # One slot (a 7.7 KB conv pool): the op writes both pools in place while its HPU registration declares only
+    # `out` (BRIEF rule 10: a small undeclared input may reach a kernel as a copy); the card test reads both back.
+    SimCase("tp8_s1", 2, 6, 1, (0, ), (0, ), GdnGateActivation.SIGMOID, 5),
 )
 OUT_ATOL, OUT_RTOL = 1e-3, 1e-3  # TPC exp/log/sigmoid/rsqrt approximations against torch fp32
 SSM_ATOL, SSM_RTOL = 1e-5, 1e-4
