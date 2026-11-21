@@ -12,6 +12,8 @@ PATCH="${2:?PATCH_FILE}"
 NOTE="${3:-}"
 H="$HOME/farm/native-replay/bridge-build"
 mkdir -p "$H/out-logs" "$H/out" "$H/dev-wheels/$ID"
+# a missing patch must not build (and publish) the stock tree under the patch's id
+[ -s "$H/patches/$PATCH" ] || { echo "dev_build: no patch $H/patches/$PATCH" >&2; exit 10; }
 LOG="$H/out-logs/$ID.log"
 echo "dev_build: $ID patch $PATCH start $(date -u +%T)" | tee "$LOG"
 sudo -n docker exec nr-bridge-dev bash -c "
