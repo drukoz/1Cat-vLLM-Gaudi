@@ -676,6 +676,37 @@ sibling (19r xor 1), so mode 2 needs the sibling kept free (a fix for the flag, 
 
 ## Handoff (if this agent stops)
 
+**08:05 UTC (by `date -u`; earlier entries of this session may be off by up to an hour): lean5 built and VLLM_HPU_WORKER_CPU_PIN=3 pushed.**
+- **Mode 3** (773a7f7c, default off): `VLLM_HPU_WORKER_CPU_PIN=3`, `VLLM_HPU_WORKER_CPU_SIBLINGS` (xor1 default, none):
+  after warmup the model thread on share[1], its host sibling share[0] free of the worker's and the engine core's
+  threads, the worker's other threads on the rest, a daemon keeps later threads off both; 7 CPU tests.
+- **lean5** (`lean5-984bf2249087`, `patches/lean5.patch`, published 08:01:58 UTC; bridge clone commit after lean4 on
+  `native-replay-lean`): the static launch plan behind `PT_HPU_HPUGRAPH_STATIC_PLAN` (needs REUSE >= 1). After an
+  unplanned prepared launch the launcher keeps, per ring slot, the launch info as graph::launch left it (physical
+  addresses), the untranslated handles (graph::launch's `addresses`, copied into a thread-local only when the flag
+  is set), the input and output buffers, the intermediates (kept) and the defragmentation generation (new counter,
+  bumped at `device_memory::defragment_memory` entry). A hit (same input buffers, kept outputs and intermediates held
+  by nobody else, same generation) skips update_patching_table, patch_launch_info, allocation, translation and the
+  allocator walks: the tensor infos get the addresses update_patching_table would patch, outputs and in-place outputs
+  are built as there (`create_outdup`), graph::launch only enters the defragmenter's critical section (an empty
+  `lock_addresses`) and launches. A defragmentation between the check and the critical section, or a constant swap
+  by the inference-mode scan (recorded by `update_syn_launch_info` during a planned launch), makes graph::launch
+  translate the handles after all and drops the plan. `=2`: every plan re-translated before use, mismatches counted
+  as `plan_bad`. Not planned (lean4 path): DMA inputs, shape tensors, host-to-device or external tensors,
+  out-duplicates of intermediates or outputs, dynamic shapes. `PT_HPU_HPUGRAPH_STATIC_PLAN_BUMP_EVERY=N` forces
+  invalidations. Timer line: `plan_try plan_hit plan_capture plan_bad defrag_generation`. Estimate (from 00181's
+  split): about 85-95 us per planned launch with inline collectives against 134 (00181 inline arm). The build
+  container `nr-bridge-dev` now runs on the new build cores 18-19, 56-57, 94-95, 132-133 (BRIEF 06:58).
+- **00198** (collectives track, about 12:30-13:00 UTC): arms on the lean5 wheel: tiny-stock, tiny-lean4-nan,
+  tiny-lean5-verify (STATIC_PLAN=2, REUSE=2, BUMP_EVERY=500); real-ref (all off), real-lean4 (REUSE=1),
+  real-lean5-verify (REUSE=2, STATIC_PLAN=2, BUMP_EVERY=5000, inline collectives; text_check 1/32/churn),
+  real-lean5 (REUSE=1, STATIC_PLAN=1, inline; text_check 1/32/churn). `text_check.py --churn` (node md5 daca88b9...):
+  each prompt again alone after a 32-stream burst, a 20K-token prefill and an 8-stream burst; must equal texts_1.
+- Next (coordinator 07:56): lean6, a leaner bridge-side collective issue (inline: no PtTensorInfo copies, no
+  promise/future, cached 2-address translation; about -4 to -6 us per collective, -3 to -4 us per launch).
+  Fewer launches cannot come from the bridge: a launch is a recipe plus the collectives that end it; lazy mode must
+  cut at every collective (HCCL outside Synapse recipes; the next recipe needs its result); no multi-recipe launch.
+
 **06:40 UTC: lean4 built** (`lean4-44fe39c26127`, `patches/lean4.patch`, published 06:28:34, VERIFIED in the wheel; the
 coordinator approved it at 06:25 with a harder qualification). Output-buffer reuse behind
 `PT_HPU_HPUGRAPH_PREPARED_REUSE` (only with `PT_HPU_HPUGRAPH_PREPARED_REPLAY=1`): the bridge allocates every launch's new
