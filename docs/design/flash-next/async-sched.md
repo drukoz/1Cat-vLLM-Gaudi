@@ -329,8 +329,9 @@ not on the program head yet). Not covered by M1: the align-mode lattice rows (ho
 the dense decode metadata (refused, logged once).
 
 M2 (VERIFIED on CPU, `VLLM_HPU_FLASH_NEXT_ASYNC_SCHED=3`, cef6fd98): mode 3 is mode 2 for the engine; in a chained
-verification step (`_mtp_chain_step`) the runner returns `AsyncSpecModelRunnerOutput` right after the chain is issued:
-the step's tokens `[B, 1 + k]` (-1 after the bonus) are copied on a side stream and read by the worker's output
+verification step (`_mtp_chain_step`) the runner returns `AsyncSpecModelRunnerOutput` right after the chain is issued
+(stage A behind the verification, or stage B with the greedy rejection inside the chain's graph; `35d9d4d4`): the
+step's tokens `[B, 1 + k]` (-1 after the bonus) are copied on a side stream and read by the worker's output
 thread; `_mtp_chain_settle`, the post-processing and the drafter call are skipped (the chain drafted on the device,
 M1 makes the next step's inputs from its output). The books (the batch's token rows and `num_tokens(_no_spec)`, the
 requests' `output_token_ids`, `_gdn_num_accepted_by_req`) are queued (`SpecEarlyBooks`) and applied at the start of a
@@ -340,11 +341,12 @@ every pending book first and its `num_computed_tokens` become the true ones (eac
 first early step and advanced by every applied book; the scheduler's still count the early steps' drafts as
 accepted). A chained step that needs its tokens (logprobs, penalties, bad words, `min_tokens`, structured output, a
 KV transfer, a prefill in the batch) reads them as before, after every pending book. Mode 3 needs the chain,
-`SPEC_DEVICE_INPUTS=2`, the sparse decode metadata and prefix caching off (the align-mode pre-step copy and
-boundary commits read the host's counts: M3); otherwise it acts as 2 and logs why. Tests:
-`tests/unit_tests/models/flash_next/test_engine_async_spec_early.py` (3: the streams equal mode 2's, prompts one at a
+`SPEC_DEVICE_INPUTS=2`, the sparse decode metadata and prefix caching off or `VLLM_HPU_FLASH_NEXT_SPEC_DEVICE_ALIGN=2`
+(the align-mode pre-step copy and boundary commits from the device: M3); otherwise it acts as 2 and logs why. Tests:
+`tests/unit_tests/models/flash_next/test_engine_async_spec_early.py` (4: the streams equal mode 2's, prompts one at a
 time and all at once, 128 steps issued before the previous step's tokens reached the host, 122 books applied late
-and 5 after a wait; with prefix caching mode 3 acts as 2), the books in `test_flash_next_async_spec.py`. On CPU every
+and 5 after a wait; the same with the chain's stage B, `VLLM_HPU_VOCAB_PARALLEL_LOGITS=1`; with prefix caching and
+no M3 mode 3 acts as 2), the books in `test_flash_next_async_spec.py`. On CPU every
 copy is done when it is issued, so this proves the books, not the overlap; the rehearsal's oracle cannot force
 acceptance under async (it hooks `take_draft_token_ids`, which an async engine never calls), so M2's runs mostly
 accept 0 (M1's oracle runs cover every count).

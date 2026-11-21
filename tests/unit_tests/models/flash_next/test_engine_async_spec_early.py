@@ -8,6 +8,8 @@ prefix caching off.
   streams equal mode 2's (the same engine whose runner reads every step's tokens first), prompts one at a time and
   all at once (requests joining and finishing make steps that wait for every pending book).
 * With prefix caching on, mode 3 acts as mode 2 (its align-mode commits are stage M3) and says so.
+* With the greedy verification in the logits region (``VLLM_HPU_VOCAB_PARALLEL_LOGITS=1``) the chain runs its stage B
+  (the greedy rejection inside the chain's graph): mode 3 issues those steps early too, with mode 2's streams.
 
 On CPU every copy is done when it is issued, so these runs prove the books, not the overlap.
 """
@@ -31,13 +33,18 @@ STATS = re.compile(r"VLLM_HPU_FLASH_NEXT_ASYNC_SCHED=3: (\d+) steps issued befor
 def runs(tiny_checkpoint, tmp_path_factory):
     out = tmp_path_factory.mktemp("engine_async_spec_early")
     result = {}
-    for name, mode, options in (("m2", "2", ()), ("m3", "3", ()), ("m2_conc", "2", ("--concurrent", )),
-                                ("m3_conc", "3", ("--concurrent", )), ("m3_prefix", "3", ("--prefix-caching", ))):
+    # the chain's stage B: the greedy verification's arg max in the logits region (vocab-parallel logits)
+    fused = {"VLLM_HPU_FUSED_GREEDY_LOGITS": "1", "VLLM_HPU_VOCAB_PARALLEL_LOGITS": "1"}
+    for name, mode, options, extra in (("m2", "2", (), {}), ("m3", "3", (), {}),
+                                       ("m2_conc", "2", ("--concurrent", ), {}),
+                                       ("m3_conc", "3", ("--concurrent", ), {}),
+                                       ("m3_prefix", "3", ("--prefix-caching", ), {}), ("m2_b", "2", (), fused),
+                                       ("m3_b", "3", (), fused)):
         options = ("--k", "2", "--max-tokens", "24") + (options if name == "m3_prefix" else
                                                         ("--no-prefix-caching", ) + options)
         options = tuple(o for o in options if o != "--prefix-caching")  # the engine's default is prefix caching on
         record = hpu_cpu_engine.run(tiny_checkpoint, out / f"{name}.json", *options,
-                                    env={**ENV, "VLLM_HPU_FLASH_NEXT_ASYNC_SCHED": mode})
+                                    env={**ENV, **extra, "VLLM_HPU_FLASH_NEXT_ASYNC_SCHED": mode})
         record["log"] = Path(str(out / f"{name}.json") + ".log").read_text(encoding="utf-8", errors="replace")
         result[name] = record
     return result
@@ -63,3 +70,14 @@ def test_with_prefix_caching_mode_3_acts_as_mode_2(runs):
     log = runs["m3_prefix"]["log"]
     assert "VLLM_HPU_FLASH_NEXT_ASYNC_SCHED=3 acts as 2" in log and "prefix caching off" in log
     assert STATS.search(log) is None
+
+
+def test_stage_b_chained_steps_are_issued_early_too(runs):
+    early, sync = runs["m3_b"], runs["m2_b"]
+    for record in (early, sync):
+        assert "chained behind its verification, stage B" in record["log"]
+    assert _streams(early) == _streams(sync)
+    found = STATS.findall(early["log"])
+    assert found, "no stage-B step was issued early"
+    issued, late, waited, read_first = (int(v) for v in found[-1])
+    assert issued >= 32 and late + waited > 0 and read_first == 0
