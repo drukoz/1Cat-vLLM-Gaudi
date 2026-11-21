@@ -315,8 +315,47 @@ def _validate_flash_next_speculative_config(vllm_config: VllmConfig) -> None:
     if not prefix_caching and os.environ.get("VLLM_COMPACT_GDN", "1").strip().lower() not in ("1", "true"):
         raise ValueError("Flash-Next MTP needs compact GDN state for the per-token verification checkpoints: "
                          "unset VLLM_COMPACT_GDN or set it to 1")
-    if not 1 <= speculative_config.num_speculative_tokens <= 4:
-        raise ValueError("Flash-Next MTP on HPU runs 1 to 4 speculative tokens (the recipe is 3)")
+    # 5 is the largest lattice (1 + k = 6 nodes) the fused GDN verification op takes (GDN_CORE_VERIFY_MAX_NODES);
+    # the CPU tests run the speculative path at k = 3, 4 and 5 (tests/unit_tests/flash_next_spec_sizes.py).
+    if not 1 <= speculative_config.num_speculative_tokens <= 5:
+        raise ValueError("Flash-Next MTP on HPU runs 1 to 5 speculative tokens (the recipe is 3)")
+    global _SPEC_GREEDY_ONLY, _SPECULATIVE_SERVER
+    _SPEC_GREEDY_ONLY = int(gaudi_envs.VLLM_HPU_SPEC_SAMPLED_VERIFY) not in (1, 2)
+    _SPECULATIVE_SERVER = True
+
+
+# Set by _validate_flash_next_speculative_config for a Flash-Next speculative server without
+# VLLM_HPU_SPEC_SAMPLED_VERIFY=1: HpuPlatform.validate_request then refuses a sampled request with an error, where the
+# worker's rejection sampler would otherwise stop the server on it.
+_SPEC_GREEDY_ONLY = False
+# Set for every Flash-Next speculative server: the HPU runner lays a verification step's rows out padded per request
+# (k rows each, -1 indices for missing drafts), while upstream's rejection sampler applies penalties, bad words and
+# allowed token ids over packed rows (repeat_interleave(num_draft_tokens)): the shapes differ whenever the batch is
+# padded or a request drafted fewer than k tokens. Such a request is refused with an error, not run into a worker
+# failure (INFERRED from the code: rejection_sampler.apply_logits_processors, _prepare_spec_decode_inputs).
+_SPECULATIVE_SERVER = False
+
+
+def _refuse_sampled_speculative_request(params) -> None:
+    from vllm.sampling_params import SamplingParams, SamplingType
+
+    if not isinstance(params, SamplingParams):
+        return
+    if _SPEC_GREEDY_ONLY and params.sampling_type != SamplingType.GREEDY:
+        raise ValueError("This Flash-Next server decodes speculatively (MTP) and verifies greedy requests only: "
+                         "send temperature 0 (a request without one takes the checkpoint's generation_config, "
+                         "temperature 1.0), or start the server with VLLM_HPU_SPEC_SAMPLED_VERIFY=1")
+    if _SPECULATIVE_SERVER:
+        unsupported = [name for name, used in (
+            ("presence_penalty", params.presence_penalty != 0.0),
+            ("frequency_penalty", params.frequency_penalty != 0.0),
+            ("repetition_penalty", params.repetition_penalty != 1.0),
+            ("bad_words", bool(getattr(params, "bad_words", None))),
+            ("allowed_token_ids", bool(params.allowed_token_ids)),
+        ) if used]
+        if unsupported:
+            raise ValueError("This Flash-Next server decodes speculatively (MTP), whose HPU verification does not "
+                             "apply %s yet: leave them at their defaults" % ", ".join(unsupported))
 
 
 class HpuPlatform(Platform):
@@ -732,6 +771,7 @@ class HpuPlatform(Platform):
 
     @classmethod
     def validate_request(cls, processed_inputs, params):
+        _refuse_sampled_speculative_request(params)
         if gaudi_envs.VLLM_HPU_DSV41_PREPARED_SHARDS:
             from vllm_gaudi.ops.deepseek_v41_config import validate_sampling
             validate_sampling(params)

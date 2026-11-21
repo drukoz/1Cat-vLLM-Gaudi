@@ -36,6 +36,23 @@ def is_flash_next_mtp(speculative_config) -> bool:
     return FLASH_NEXT_MTP_ARCH in architectures
 
 
+FLASH_NEXT_MULTIMODAL_TARGET = "Qwen4ExpForConditionalGeneration"
+IMAGE_TOKEN_ID_TARGET = "Qwen3_5ForConditionalGeneration"
+
+
+def flash_next_target_model_name(class_name: str) -> str:
+    """The name the proposer's ``load_model`` should look the target up by.
+
+    The Flash-Next multimodal target (``Qwen4ExpForConditionalGeneration`` or the plugin's subclass of it,
+    ``HpuQwen4ExpForConditionalGeneration``) keeps its image token in ``config.image_token_id``, like
+    ``Qwen3_5ForConditionalGeneration``, which upstream's ``load_model`` lists: that name is returned for it.
+    Any other name is returned unchanged.
+    """
+    if class_name.endswith(FLASH_NEXT_MULTIMODAL_TARGET):
+        return IMAGE_TOKEN_ID_TARGET
+    return class_name
+
+
 def split_draft_output(ret) -> tuple[torch.Tensor, torch.Tensor]:
     """(sample, multi) from the draft's return.
 
@@ -52,6 +69,61 @@ def split_draft_output(ret) -> tuple[torch.Tensor, torch.Tensor]:
     return sample, multi
 
 
+MROPE_KEYS = ("mrope_section", "mrope_interleaved")
+
+
+def _rope_parameter_dicts(model_config) -> list[dict]:
+    """The ``rope_parameters`` dicts of a model config's ``hf_config`` and ``hf_text_config`` (each once)."""
+    found: dict[int, dict] = {}
+    for config in (getattr(model_config, "hf_config", None), getattr(model_config, "hf_text_config", None)):
+        rope_parameters = getattr(config, "rope_parameters", None)
+        if isinstance(rope_parameters, dict):
+            found[id(rope_parameters)] = rope_parameters
+    return list(found.values())
+
+
+def config_uses_mrope(model_config) -> bool:
+    """True when a model config still carries an M-RoPE section (its attention layers build MRotaryEmbedding)."""
+    return any(rope_parameters.get("mrope_section") for rope_parameters in _rope_parameter_dicts(model_config))
+
+
+def align_draft_rope_with_target(target_model_config, draft_model_config) -> bool:
+    """Give the MTP draft the rotary embedding the target runs with. Returns True when the draft was changed.
+
+    With ``--language-model-only`` the engine strips the M-RoPE keys from the target's config, so its QSA
+    layers build the plain ``RotaryEmbedding`` and the runner sends one position per token. The draft's
+    config is built on its own (``SpeculativeConfig`` does not pass ``language_model_only`` on) and keeps
+    the keys of a checkpoint with a vision tower: its QSA layer then built ``MRotaryEmbedding`` and read
+    the runner's ``[rows, tokens]`` positions as the three M-RoPE rows, which fails on the first draft pass
+    ("index 1 is out of bounds for dimension 0 with size 1"). The keys are removed from the draft here,
+    before the draft model is built.
+
+    A target that keeps M-RoPE (a server without ``--language-model-only``) is refused: the drafter gathers
+    its positions per row and does not carry the three M-RoPE rows.
+    """
+    if config_uses_mrope(target_model_config):
+        raise NotImplementedError("Flash-Next MTP on HPU runs with --language-model-only: the target keeps "
+                                  "M-RoPE positions, which the drafter does not carry")
+    changed = False
+    for rope_parameters in _rope_parameter_dicts(draft_model_config):
+        for key in MROPE_KEYS:
+            if key in rope_parameters:
+                rope_parameters.pop(key)
+                changed = True
+    return changed
+
+
+def flat_token_rows(hidden: torch.Tensor) -> torch.Tensor:
+    """``hidden`` as ``[T, width]``, one row per token.
+
+    The runner hands the drafter ``[vbs, 1, width]`` after a decode step and ``[1, seq, width]`` after a
+    prefill (one bucket row); ``Qwen4ExpMultiTokenPredictor.forward`` reads the token count from dim 0 and
+    views the rows as ``[T, hc, H]``, so a prefill's ``[1, seq, width]`` failed there with "shape '[1, 4, H]'
+    is invalid".
+    """
+    return hidden.reshape(-1, hidden.shape[-1])
+
+
 def ring_slots_from_lattice(indices: torch.Tensor) -> torch.Tensor:
     """[groups, bs, T] -> [groups, bs] (column 0); [groups, bs] unchanged; ValueError otherwise."""
     if indices.dim() == 3:
@@ -65,7 +137,7 @@ def ring_slots_from_lattice(indices: torch.Tensor) -> torch.Tensor:
 def next_step_hidden(multi: torch.Tensor, last_token_indices: torch.Tensor) -> torch.Tensor:
     """multi viewed as [vbs, hc*H], rows last_token_indices -> [bs, 1, hc*H]."""
     hidden_size = multi.shape[-1]
-    rows = multi.view(-1, hidden_size)[last_token_indices]
+    rows = torch.index_select(multi.view(-1, hidden_size), 0, last_token_indices)  # no advanced indexing (rule 3)
     return rows.view(-1, 1, hidden_size)
 
 
@@ -134,3 +206,93 @@ class DraftRankStats:
                 f"rank1={self.counts[0]} rank2={self.counts[1]} rank3={self.counts[2]} "
                 f"rank4={self.counts[3]} beyond4={self.counts[4]} all_accepted={self.all_accepted}")
 
+class MtpDraftLoop(torch.nn.Module):
+    """The k draft passes of a decode propose in one forward (VLLM_HPU_MTP_DRAFT_GRAPH=1).
+
+    ``HpuFlashNextMtpProposer.propose`` runs every draft pass as its own HPU-graph replay, the LM head and the arg
+    max lazily between the replays, and builds each later pass's attention metadata on the host between them. At 32
+    streams on TP8 the draft costs 16 to 18 ms of a 104 ms step with a device wait of only 0.7 to 2.8 ms at its end
+    (card job 00178, the MTP step timer): the host issue is the cost. This module runs pass 0 over the verification
+    rows, the LM head and the arg max of each request's last accepted row, then the passes 1 .. k-1 (one row per
+    request, the previous pass's ids as int32, its multi-stream hidden, the next position), each with its own
+    metadata, and returns the ``[batch, k]`` draft ids: wrapped in one HPU graph, one replay issues all of it.
+
+    The calls and their order are those of the per-pass proposer (tests/unit_tests/worker/test_mtp_draft_graph.py):
+
+    * ``pass_forward(input_ids=, positions=, hidden_states=, inputs_embeds=None, attn_metadata=, spec_step_idx=)``
+      returns the draft's ``(sample, multi)``; the proposer gives the draft adapter's own forward (its metadata
+      processing, RoPE tables and forward context per pass), not the adapter's graph-wrapped one;
+    * ``draft_tokens(hidden [rows, H])`` returns the ids ``[rows]`` (the proposer's LM head and arg max);
+    * ``step_metadata[j - 1]`` is pass j's attention metadata, built on the host before the call from the base
+      positions + j (the proposer's ``prepare_attn_metadata``).
+
+    The forward reads no device value back (inside a graph capture there is none to read). The pools a pass writes
+    (the draft's KV cache, the QSA key ring and compressed keys) are written with ``index_copy_``, which the lazy
+    graph orders against the next pass's reads; the module holds no submodule and no parameter.
+    """
+
+    def __init__(self, pass_forward, draft_tokens, num_speculative_tokens: int, max_model_len: int) -> None:
+        super().__init__()
+        if int(num_speculative_tokens) < 1:
+            raise ValueError(f"the draft loop needs at least one draft token, got {num_speculative_tokens}")
+        self._pass_forward = pass_forward
+        self._draft_tokens = draft_tokens
+        self.num_speculative_tokens = int(num_speculative_tokens)
+        self.max_model_len = int(max_model_len)
+
+    def forward(self, target_token_ids: torch.Tensor, target_positions: torch.Tensor,
+                target_hidden_states: torch.Tensor, last_token_indices: torch.Tensor, attn_metadata,
+                step_metadata: tuple = ()) -> torch.Tensor:
+        k = self.num_speculative_tokens
+        if len(step_metadata) != k - 1:
+            raise ValueError(f"the draft loop with k = {k} takes the metadata of {k - 1} later passes, "
+                             f"got {len(step_metadata)}")
+        batch_size = last_token_indices.shape[0]
+        ret = self._pass_forward(input_ids=target_token_ids, positions=target_positions,
+                                 hidden_states=target_hidden_states, inputs_embeds=None, attn_metadata=attn_metadata,
+                                 spec_step_idx=0)
+        last_hidden_states, hidden_states = split_draft_output(ret)
+        last_hidden_states = last_hidden_states.view(-1, last_hidden_states.shape[-1])
+        sample_hidden_states = torch.index_select(last_hidden_states, 0, last_token_indices)
+        draft_token_ids = self._draft_tokens(sample_hidden_states)
+        if k == 1:
+            return draft_token_ids.view(-1, 1)
+
+        positions = torch.index_select(target_positions.view(-1), 0, last_token_indices)
+        hidden_states = next_step_hidden(hidden_states, last_token_indices)
+        draft_token_ids_list = [draft_token_ids]
+        for token_index in range(k - 1):
+            # argmax ids are int64: narrowed here for the next pass (an in-graph consumer, card rule 9)
+            input_ids = draft_token_ids_list[-1].int()
+            positions = positions + 1
+            clamped_positions = torch.where(positions >= self.max_model_len, 0, positions)
+            ret = self._pass_forward(input_ids=input_ids.view(-1, 1), positions=clamped_positions.view(-1, 1),
+                                     hidden_states=hidden_states.view(-1, 1, hidden_states.shape[-1]),
+                                     inputs_embeds=None, attn_metadata=step_metadata[token_index],
+                                     spec_step_idx=token_index + 1)
+            last_hidden_states, hidden_states = split_draft_output(ret)
+            last_hidden_states = last_hidden_states.view(-1, last_hidden_states.shape[-1])
+            hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
+            hidden_states = hidden_states[:batch_size]
+            draft_token_ids_list.append(self._draft_tokens(last_hidden_states[:batch_size]))
+        return torch.stack(draft_token_ids_list, dim=1)
+
+
+def draft_argmax(logits: torch.Tensor) -> torch.Tensor:
+    """The draft's token ids ``[rows]`` from its logits ``[rows, vocab]``.
+
+    VLLM_HPU_MTP_DRAFT_IDS=0 (default): ``argmax`` (int64 ids; the draft loop narrows them with ``.int()`` in the
+    same lazy graph). 1: int32 ids from an fp32 id table, the first index of the row maximum as ``argmax`` gives it,
+    with no int64 id made on the device (card rule 9: ``torch.topk`` ids narrowed to int32 in the same lazy graph
+    came back as every second id; for ``argmax`` that is not measured). A row without a maximum (NaN) gets the last
+    id, never an id outside the vocabulary.
+    """
+    from vllm_gaudi import envs as gaudi_envs
+
+    if int(gaudi_envs.VLLM_HPU_MTP_DRAFT_IDS) != 1:
+        return logits.argmax(dim=-1)
+    vocab = logits.shape[-1]
+    ids = torch.arange(vocab, device=logits.device, dtype=torch.float32)
+    is_max = logits == logits.amax(dim=-1, keepdim=True)
+    first = torch.where(is_max, ids, torch.full_like(ids, float(vocab - 1))).amin(dim=-1)
+    return first.to(torch.int32)
