@@ -3,7 +3,8 @@
 """decode_scaling.py stand-in for serve_probe.sh: the build's own decode_scaling (staged next to it as
 decode_scaling_real.py) with the arguments serve_probe.sh passes, then, against the same server while it still runs,
 native-replay's text_check.py (next to it) at 1 stream (6 prompts) and at 32 streams, 600 tokens each, into
-$FARM_OUT/texts_1.json and texts_32.json. Exit code: the probe's, else 4 when a text check failed.
+$FARM_OUT/texts_1.json and texts_32.json, and with TEXT_CHECK_CHURN=1 also its --churn round (texts_churn.json;
+TEXT_CHECK_LONG_TOKENS sets --long-tokens). Exit code: the probe's, else 4 when a text check failed.
 
 Staged as <probe dir>/decode_scaling.py with serve_probe.sh, decode_scaling_real.py and text_check.py beside it.
 """
@@ -26,6 +27,11 @@ def main() -> int:
     for streams in ("1", "32"):
         r = subprocess.run(check + ["--streams", streams, "--out", os.path.join(OUT, "texts_%s.json" % streams)])
         print("TEXTCHECK streams %s rc %d" % (streams, r.returncode), flush=True)
+        failed = failed or r.returncode
+    if os.environ.get("TEXT_CHECK_CHURN", "") == "1":  # the plan-invalidation round (native-replay's lean5)
+        extra = ["--long-tokens", os.environ["TEXT_CHECK_LONG_TOKENS"]] if os.environ.get("TEXT_CHECK_LONG_TOKENS") else []
+        r = subprocess.run(check + ["--churn", "--out", os.path.join(OUT, "texts_churn.json")] + extra)
+        print("TEXTCHECK churn rc %d" % r.returncode, flush=True)
         failed = failed or r.returncode
     return rc if rc else (4 if failed else 0)
 

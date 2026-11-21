@@ -20,7 +20,13 @@
 # the job starts): SPIN=on|off (BRIDGE_SPIN, default off: PT_HPU_SYNCHRONOUS_ACC_QUEUE_FLUSHING=1 in every arm),
 # PIN_KV (BRIDGE_PIN_KV, ';'-separated env of every lean real arm, e.g. VLLM_HPU_WORKER_CPU_PIN=1), PLACE
 # (BRIDGE_PLACE, a placement script inside the container that place_wrap.sh runs in every real arm once its server
-# is healthy). Verdicts: ~/farm/<track>/results/<job>-<name>-verdicts.txt; exit code 0 when all passed.
+# is healthy), ARMSET=lean4|lean5 (BRIDGE_ARMSET, default lean4) and LEAN5 (BRIDGE_LEAN5, a build id): with
+# ARMSET=lean5 every lean arm runs on that wheel (all flags off = lean3a, PREPARED_REPLAY=1 + REUSE = lean4, + STATIC_PLAN
+# = lean5): tiny-stock, tiny-lean4-nan, tiny-lean5-verify (REUSE=2, STATIC_PLAN=2, BUMP_EVERY=500), then real-ref (all
+# flags off), real-lean5 (REUSE=1, STATIC_PLAN=1, inline collectives), real-lean5-verify (REUSE=2, STATIC_PLAN=2,
+# BUMP_EVERY=5000, inline collectives), real-lean4 (REUSE=1), most important first; the lean5 arms also run
+# text_check --churn, whose texts must equal their own texts_1 and real-ref's, and their plan_bad must be 0.
+# Verdicts: ~/farm/<track>/results/<job>-<name>-verdicts.txt; exit code 0 when all passed.
 set -u
 IMG="${1:?image}"
 P="${2:?probe dir inside the container, e.g. /results/bench/intprobe4r}"
@@ -29,11 +35,14 @@ S="${4:-$(basename "$(readlink "$HOME/farm/${CARDQ_TRACK:?}/current")")}"
 SPIN="${BRIDGE_SPIN:-off}"
 PIN_KV="${BRIDGE_PIN_KV:-}"
 PLACE="${BRIDGE_PLACE:-}"
+ARMSET="${BRIDGE_ARMSET:-lean4}"
+L5="${BRIDGE_LEAN5:-}"
 LATE="$HOME/farm/collectives/bridge/late/${CARDQ_JOB:-none}.env"
 if [ -s "$LATE" ]; then
     while IFS='=' read -r k v; do
         case "$v" in *[!A-Za-z0-9._,\;=/-]*) echo "bridge_reuse: ignored a bad value in $LATE: $k"; continue ;; esac
-        case "$k" in SPIN) SPIN="$v" ;; PIN_KV) PIN_KV="$v" ;; PLACE) PLACE="$v" ;; esac
+        case "$k" in SPIN) SPIN="$v" ;; PIN_KV) PIN_KV="$v" ;; PLACE) PLACE="$v" ;; ARMSET) ARMSET="$v" ;;
+            LEAN5) L5="$v" ;; esac
     done <"$LATE"
     echo "bridge_reuse: late-bound settings from $LATE"
 fi
@@ -53,27 +62,49 @@ done
 SPINKV=""
 [ "$SPIN" = off ] && SPINKV=";PT_HPU_SYNCHRONOUS_ACC_QUEUE_FLUSHING=1"
 F1="PT_HPU_HPUGRAPH_PREPARED_REPLAY=1"
-echo "bridge_reuse: image $IMG, lean4 $L, spinner $SPIN, pin ${PIN_KV:-none}, placement ${PLACE:-none}"
-
-bash "$J" --sha "$S" --image "$IMG" "${ENV[@]}" --cmd 'python /farm/farm_tiny.py --gdn hc' \
-    "tiny-stock:-:PT_HPU_HPUGRAPH_REPLAY_TIMING=0$SPINKV" \
-    "tiny-lean4-nan:$L:$F1;PT_HPU_HPUGRAPH_PREPARED_REUSE=2;PT_HPU_HPUGRAPH_REPLAY_TIMING=2000$SPINKV" \
-    "tiny-lean4:$L:$F1;PT_HPU_HPUGRAPH_PREPARED_REUSE=1;PT_HPU_HPUGRAPH_REPLAY_TIMING=2000$SPINKV"
-grep -q '^tiny-stock ok' "$V" || { echo "bridge_reuse: the reference tiny arm failed: no real arm"; cat "$V"; exit 3; }
-
+echo "bridge_reuse: image $IMG, arm set $ARMSET, lean4 $L, lean5 ${L5:-none}, spinner $SPIN, pin ${PIN_KV:-none}, placement ${PLACE:-none}"
 PROBE="bash $P/serve_probe.sh --levels 32,8,1 --tokens 128 --warm-tokens 48 --repeat-top 2 --no-mintok-check --probe-arg --sampled-levels=32,8,1 --probe-arg --interleave-sampled --probe-arg --rounds=2"
 CMD="$PROBE"
 [ -z "$PLACE" ] || CMD="bash /results/bench/place_wrap.sh $PLACE -- $PROBE"
 LEANKV="${PIN_KV:+;$PIN_KV}$SPINKV"
-REAL=("real-ref:$L:$F1;PT_HPU_HPUGRAPH_PREPARED_REUSE=0;PT_HPU_HPUGRAPH_REPLAY_TIMING=5000$LEANKV")
-grep -q '^tiny-lean4-nan ok' "$V" && REAL+=("real-lean4-nan:$L:$F1;PT_HPU_HPUGRAPH_PREPARED_REUSE=2;PT_HPU_HPUGRAPH_REPLAY_TIMING=5000$LEANKV")
-grep -q '^tiny-lean4 ok' "$V" && REAL+=("real-lean4:$L:$F1;PT_HPU_HPUGRAPH_PREPARED_REUSE=1;PT_HPU_HPUGRAPH_REPLAY_TIMING=5000$LEANKV")
+T5="PT_HPU_HPUGRAPH_REPLAY_TIMING=5000"
+if [ "$ARMSET" = lean5 ]; then
+    [ -n "$L5" ] || { echo "bridge_reuse: ARMSET=lean5 needs LEAN5"; exit 2; }
+    bash "$J" --sha "$S" --image "$IMG" "${ENV[@]}" --cmd 'python /farm/farm_tiny.py --gdn hc' \
+        "tiny-stock:-:PT_HPU_HPUGRAPH_REPLAY_TIMING=0$SPINKV" \
+        "tiny-lean4-nan:$L5:$F1;PT_HPU_HPUGRAPH_PREPARED_REUSE=2;PT_HPU_HPUGRAPH_REPLAY_TIMING=2000$SPINKV" \
+        "tiny-lean5-verify:$L5:$F1;PT_HPU_HPUGRAPH_PREPARED_REUSE=2;PT_HPU_HPUGRAPH_STATIC_PLAN=2;PT_HPU_HPUGRAPH_STATIC_PLAN_BUMP_EVERY=500;PT_HPU_HPUGRAPH_REPLAY_TIMING=2000$SPINKV"
+    grep -q '^tiny-stock ok' "$V" || { echo "bridge_reuse: the reference tiny arm failed: no real arm"; cat "$V"; exit 3; }
+    REAL=("real-ref:$L5:$T5$LEANKV")
+    if grep -q '^tiny-lean5-verify ok' "$V"; then
+        REAL+=("real-lean5:$L5:$F1;PT_HPU_HPUGRAPH_PREPARED_REUSE=1;PT_HPU_HPUGRAPH_STATIC_PLAN=1;PT_HPU_DISABLE_ASYNC_COLLECTIVE=1;TEXT_CHECK_CHURN=1;$T5$LEANKV")
+        REAL+=("real-lean5-verify:$L5:$F1;PT_HPU_HPUGRAPH_PREPARED_REUSE=2;PT_HPU_HPUGRAPH_STATIC_PLAN=2;PT_HPU_HPUGRAPH_STATIC_PLAN_BUMP_EVERY=5000;PT_HPU_DISABLE_ASYNC_COLLECTIVE=1;TEXT_CHECK_CHURN=1;$T5$LEANKV")
+    fi
+    grep -q '^tiny-lean4-nan ok' "$V" && REAL+=("real-lean4:$L5:$F1;PT_HPU_HPUGRAPH_PREPARED_REUSE=1;$T5$LEANKV")
+    COMPARE=(real-lean5 real-lean5-verify real-lean4)
+    CHURN=(real-lean5 real-lean5-verify)
+    T32=(real-ref real-lean5 real-lean5-verify real-lean4)
+    PLAN=(tiny-lean5-verify real-lean5 real-lean5-verify)
+else
+    bash "$J" --sha "$S" --image "$IMG" "${ENV[@]}" --cmd 'python /farm/farm_tiny.py --gdn hc' \
+        "tiny-stock:-:PT_HPU_HPUGRAPH_REPLAY_TIMING=0$SPINKV" \
+        "tiny-lean4-nan:$L:$F1;PT_HPU_HPUGRAPH_PREPARED_REUSE=2;PT_HPU_HPUGRAPH_REPLAY_TIMING=2000$SPINKV" \
+        "tiny-lean4:$L:$F1;PT_HPU_HPUGRAPH_PREPARED_REUSE=1;PT_HPU_HPUGRAPH_REPLAY_TIMING=2000$SPINKV"
+    grep -q '^tiny-stock ok' "$V" || { echo "bridge_reuse: the reference tiny arm failed: no real arm"; cat "$V"; exit 3; }
+    REAL=("real-ref:$L:$F1;PT_HPU_HPUGRAPH_PREPARED_REUSE=0;$T5$LEANKV")
+    grep -q '^tiny-lean4-nan ok' "$V" && REAL+=("real-lean4-nan:$L:$F1;PT_HPU_HPUGRAPH_PREPARED_REUSE=2;$T5$LEANKV")
+    grep -q '^tiny-lean4 ok' "$V" && REAL+=("real-lean4:$L:$F1;PT_HPU_HPUGRAPH_PREPARED_REUSE=1;$T5$LEANKV")
+    COMPARE=(real-lean4-nan real-lean4)
+    CHURN=()
+    T32=(real-ref real-lean4-nan real-lean4)
+    PLAN=()
+fi
 bash "$J" --sha "$S" --image "$IMG" "${ENV[@]}" --cmd "$CMD" "${REAL[@]}"
 
 # the long texts: texts_1 of the reuse arms against real-ref's; no NaN garbage in any texts_32
 TC="$R/${P#/results/}/text_check.py"
 REF="$R/$PREFIX-real-ref/texts_1.json"
-for arm in real-lean4-nan real-lean4; do
+for arm in "${COMPARE[@]}"; do
     f="$R/$PREFIX-$arm/texts_1.json"
     if [ -f "$REF" ] && [ -f "$f" ]; then
         python3 "$TC" --compare "$REF" "$f" >"$R/$PREFIX-$arm/texts_1_vs_ref.txt" 2>&1
@@ -88,7 +119,51 @@ for arm in real-lean4-nan real-lean4; do
         echo "texts1-$arm fail no texts_1.json" >>"$V"
     fi
 done
-python3 - "$R" "$PREFIX" real-ref real-lean4-nan real-lean4 >>"$V" <<'PY'
+# the churn round: each prompt alone after bursts and a long prefill must give its plain 1-stream text, the arm's own
+# and real-ref's
+for arm in ${CHURN[@]+"${CHURN[@]}"}; do
+    c="$R/$PREFIX-$arm/texts_churn.json"
+    if [ ! -f "$c" ]; then
+        grep -q "^$arm " "$V" && echo "churn-$arm fail no texts_churn.json" >>"$V"
+        continue
+    fi
+    for pair in "own:$R/$PREFIX-$arm/texts_1.json" "ref:$REF"; do
+        what="${pair%%:*}"
+        b="${pair#*:}"
+        [ -f "$b" ] || { echo "churn-$arm-$what fail no texts_1.json" >>"$V"; continue; }
+        python3 "$TC" --compare "$b" "$c" >"$R/$PREFIX-$arm/texts_churn_vs_$what.txt" 2>&1
+        crc=$?
+        cut -c1-200 "$R/$PREFIX-$arm/texts_churn_vs_$what.txt"
+        if [ "$crc" -eq 0 ]; then echo "churn-$arm-$what ok" >>"$V"; else echo "churn-$arm-$what fail differs (rc $crc)" >>"$V"; fi
+    done
+done
+# the static plans: plan_bad must be 0 in every timing line of the lean5 arms
+for arm in ${PLAN[@]+"${PLAN[@]}"}; do
+    log="$R/$PREFIX-$arm/server0.log"
+    [ -f "$log" ] || log="$R/$PREFIX-$arm/hc/server0.log"
+    [ -f "$log" ] || { grep -q "^$arm " "$V" && echo "plan-$arm fail no server0.log" >>"$V"; continue; }
+    python3 - "$log" "$arm" >>"$V" <<'PY'
+import re, sys
+bad, tries, hits, lines = 0.0, [], [], 0
+for line in open(sys.argv[1], errors="replace"):
+    if "HPUGRAPH_REPLAY_TIMING" not in line:
+        continue
+    f = dict((k, float(v)) for k, v in re.findall(r"(plan_\w+) (-?\d+(?:\.\d+)?)", line))
+    if "plan_try" in f:
+        lines += 1
+        bad = max(bad, f.get("plan_bad", 0.0))
+        tries.append(f["plan_try"])
+        hits.append(f.get("plan_hit", 0.0))
+share = (sum(hits) / sum(tries)) if sum(tries) else 0.0
+if not lines:
+    print("plan-%s fail no plan fields in the timing lines" % sys.argv[2])
+elif bad > 0:
+    print("plan-%s fail plan_bad %.4f per launch (lines %d, plan_hit share %.3f)" % (sys.argv[2], bad, lines, share))
+else:
+    print("plan-%s ok plan_bad 0 (lines %d, plan_hit share %.3f)" % (sys.argv[2], lines, share))
+PY
+done
+python3 - "$R" "$PREFIX" "${T32[@]}" >>"$V" <<'PY'
 import json, os, sys
 root, prefix, arms = sys.argv[1], sys.argv[2], sys.argv[3:]
 for arm in arms:
