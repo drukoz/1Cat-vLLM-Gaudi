@@ -140,7 +140,33 @@ def one_stream(host, port, model, prompt, ntok, out, idx, barrier, timeout_s, mi
     out[idx] = rec
 
 
+_SYNC = {"count": 0}
+
+
+def sync_point(args):
+    """--barrier-dir: every round (warm or measured) waits until --barrier-n probes have reached the same round
+    (files <dir>/<tag>.<round>.<name>), so two servers of one job decode at the same time; at most
+    --barrier-timeout seconds (a dead partner must not stop this probe)."""
+    if not getattr(args, "barrier_dir", ""):
+        return
+    import glob
+    key = "%s.%03d" % (args.barrier_tag or "probe", _SYNC["count"])
+    _SYNC["count"] += 1
+    os.makedirs(args.barrier_dir, exist_ok=True)
+    open(os.path.join(args.barrier_dir, "%s.%s" % (key, args.barrier_name)), "w").close()
+    t0 = time.time()
+    while len(glob.glob(os.path.join(args.barrier_dir, key + ".*"))) < args.barrier_n:
+        if time.time() - t0 > args.barrier_timeout:
+            print("BARRIER %s: timeout after %.0f s, going on alone" % (key, time.time() - t0), flush=True)
+            return
+        time.sleep(0.2)
+    waited = time.time() - t0
+    if waited > 5:
+        print("BARRIER %s: waited %.1f s" % (key, waited), flush=True)
+
+
 def run_round(args, n, ntok, ctx_tokens=0, mintok=None, sampled=False, salt=""):
+    sync_point(args)
     mintok = args.min_tokens if mintok is None else mintok
     out = [None] * n
     barrier = threading.Barrier(n)
@@ -226,6 +252,11 @@ def main():
                          "so the first level's numbers are complete first")
     ap.add_argument("--sampled-rounds", type=int, default=0,
                     help="measured SAMPLED rounds per level (default: --rounds, at least 1)")
+    ap.add_argument("--barrier-dir", default="", help="align every round with other probes (see sync_point)")
+    ap.add_argument("--barrier-n", type=int, default=2)
+    ap.add_argument("--barrier-name", default="probe")
+    ap.add_argument("--barrier-tag", default="")
+    ap.add_argument("--barrier-timeout", type=float, default=900.0)
     ap.add_argument("--rounds", type=int, default=0,
                     help="measured rounds at EVERY level, greedy and sampled, after one warm round (default 0: one "
                          "per level and --repeat-top at the top level, as the coordinator's probe)")

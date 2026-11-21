@@ -146,6 +146,15 @@ clear_cards() {
     fi
 }
 
+# HEADLINE_BARRIER_DIR: align every probe round with the other servers of the job (layout_2xtp4.sh):
+# HEADLINE_BARRIER_N servers, this one named HEADLINE_BARRIER_NAME.
+barrier_args() {
+    if [ -n "${HEADLINE_BARRIER_DIR:-}" ]; then
+        echo "--probe-arg --barrier-dir=$HEADLINE_BARRIER_DIR --probe-arg --barrier-n=${HEADLINE_BARRIER_N:-2}" \
+            "--probe-arg --barrier-name=${HEADLINE_BARRIER_NAME:-probe} --probe-arg --barrier-tag=$1"
+    fi
+}
+
 failed=0
 first=1
 ARMS=("$@")
@@ -182,7 +191,7 @@ while [ "$i_arm" -lt "${#ARMS[@]}" ]; do
             env ${async_env[@]+"${async_env[@]}"} \
                 bash "$HERE/serve_probe.sh" --out "$OUT/$arm" --levels "$LEVELS" --tokens "$TOKENS" \
                 --warm-tokens "$WARM" --repeat-top 2 --no-mintok-check --probe-arg "--sampled-levels=$LEVELS" \
-                --probe-arg --interleave-sampled --probe-arg "--rounds=$ROUNDS"
+                --probe-arg --interleave-sampled --probe-arg "--rounds=$ROUNDS" $(barrier_args "$arm")
             ;;
         nospec-noshard | nospec-noprefix | nospec-noprefix-nocut)
             # The low-stream bisect (coordinator, build 3): A's env without the QSA request shard; A's env without the
@@ -237,7 +246,7 @@ while [ "$i_arm" -lt "${#ARMS[@]}" ]; do
                 VLLM_HPU_MTP_DRAFT_LOOP="${VLLM_HPU_MTP_DRAFT_LOOP:-1}" VLLM_HPU_MTP_CHUNK_KV="${VLLM_HPU_MTP_CHUNK_KV:-1}" \
                 bash "$HERE/serve_probe.sh" --out "$OUT/$arm" --mtp "$k" --levels "$levels" --tokens "$TOKENS" \
                 --warm-tokens "$WARM" --repeat-top 1 --no-mintok-check "${sampled_args[@]}" \
-                --probe-arg "--rounds=$ROUNDS" ${HEADLINE_MTP_CTX:+--ctx "$HEADLINE_MTP_CTX"}
+                --probe-arg "--rounds=$ROUNDS" ${HEADLINE_MTP_CTX:+--ctx "$HEADLINE_MTP_CTX"} $(barrier_args "$arm")
             ;;
         *)
             echo "headline_job: unknown arm $arm (nospec, mtp3, mtp3-32)"
