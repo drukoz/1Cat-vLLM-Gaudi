@@ -118,6 +118,13 @@ collect as before. It can be switched at run time (`VLLM_HPU_RUNTIME_SWITCH_FILE
 and the thresholds restored. With `VLLM_HPU_MTP_TIMING=2` each step's record has the collector's pauses
 (`gc_ms`, `gc_gen2`). Any other value is `0`.
 
+`VLLM_HPU_LOG_UNMATCHED_GRAPH_INPUTS` (integer, default `0`): `1` logs which inputs of a replayed HPU graph the
+graph wrapper copies before each replay. The wrapper binds an input directly only when it is the captured graph's own
+input value; any other input (a view or slice made outside the graph) is copied with a lazy device-to-device copy that
+runs as its own recipe, one launch per replay. The log line (`HPU graph replay copies N unmatched input tensor(s)`)
+names every copied tensor by its path in the forward's arguments, with shape, dtype, contiguity and storage offset,
+the 1st, 100th and 1000th time the same set comes back. Nothing else changes.
+
 `VLLM_HPU_RUNTIME_SWITCH_FILE` (a path, default unset) is an operator's tool for an A/B on one server.
 When set, every worker looks at that file before each step (one `stat`) and, when the file changed, takes
 the flags it lists, one `NAME=VALUE` per line. Only flags the runner reads at every step can be switched:

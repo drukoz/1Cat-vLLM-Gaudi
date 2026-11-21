@@ -537,6 +537,7 @@ if TYPE_CHECKING:
     VLLM_HPU_QSA_INDEXER_SHARD: int = 0  # QsaShardMode: 0 replicated (default), 1 by request (int32), 2 by request (fp32)
     VLLM_HPU_QSA_TABLE_WIDTH: int = 0  # decode block-table columns: 0 the engine's longest context (default), 1 the batch's
     VLLM_HPU_WORKER_GC_FREEZE: int = 0  # 0 Python's collector as is (default), 1 frozen heap, generation 2 only when idle
+    VLLM_HPU_LOG_UNMATCHED_GRAPH_INPUTS: int = 0  # 1 logs the inputs the HPU graph wrapper copies before a replay
     VLLM_HPU_GDN_CORE_DECODE: int = 1  # GdnCoreDecodeMode: 1 fused (default), 0 off, 2 recurrence
     VLLM_HPU_GDN_CORE_DECODE_DEBUG: int = 0  # GdnCoreDecodeDebug: 0 off, 1 check slot indices every step (host sync)
     VLLM_HPU_GDN_CORE_VERIFY: int = 0  # GdnCoreVerifyMode: 0 off (default), 1 fused verification steps
@@ -1966,6 +1967,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # (VLLM_HPU_RUNTIME_SWITCH_FILE); back at 0 the heap is unfrozen and the thresholds restored. Any other value is 0.
     "VLLM_HPU_WORKER_GC_FREEZE":
     lambda: 1 if os.environ.get("VLLM_HPU_WORKER_GC_FREEZE", "0").strip() == "1" else 0,
+
+    # Which inputs of a replayed HPU graph the wrapper copies before each replay (v1/worker/graph_input_log.py):
+    # an input that is not the captured graph's own input value (a view or a slice made outside the graph) is copied
+    # with a lazy device-to-device copy, flushed as its own recipe, one launch per replay. 1 = wrap the wrapper's
+    # copy_to and log every copied tensor's path, shape, dtype and storage offset (1st, 100th and 1000th time).
+    # 0 (default) = nothing.
+    "VLLM_HPU_LOG_UNMATCHED_GRAPH_INPUTS":
+    lambda: 1 if os.environ.get("VLLM_HPU_LOG_UNMATCHED_GRAPH_INPUTS", "0").strip() == "1" else 0,
 
     # Flash-Next GDN decode through the fused core op (flashinfer_gaudi.gdn_core_decode).
     # 1 (default) = fused, 0 = off (the torch path), 2 = recurrence only (a bisect tool).

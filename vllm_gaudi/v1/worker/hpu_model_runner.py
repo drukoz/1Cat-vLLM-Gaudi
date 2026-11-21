@@ -1943,6 +1943,10 @@ def _prompt_hidden_states_per_request(hidden_states: torch.Tensor, token_ids: to
 
 
 def _maybe_wrap_in_hpu_graph(*args, **kwargs):
+    if gaudi_envs.VLLM_HPU_LOG_UNMATCHED_GRAPH_INPUTS:
+        # Which inputs the replay wrapper copies before each replay (each a copy-only recipe): graph_input_log.py.
+        from vllm_gaudi.v1.worker import graph_input_log
+        graph_input_log.install(logger.info)
     return htorch.hpu.wrap_in_hpu_graph(HpuModelAdapter(
         *args, **kwargs), disable_tensor_cache=True) if htorch.utils.internal.is_lazy() else HpuModelAdapter(
             *args, **kwargs)
