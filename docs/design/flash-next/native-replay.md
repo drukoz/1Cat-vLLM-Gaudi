@@ -597,6 +597,47 @@ Step 2 in all: -20 to -35 us per launch, about -3 to -5 ms per 1-stream step, li
 about 50 us per launch (Synapse's own launch, INFERRED 30-35 of syn_launch; allocations; the collective hand-off),
 about 7 ms per 1-stream step; lower needs fewer launches per step (fewer collectives, bigger segments).
 
+### 7.11 lean3t with sub-timers against the image's bridge: job 00181 (real model at TP8, integration build 3)
+
+MEASURED (the collectives track's job 00181 `real8-bridge-headline2`, ended 04:56 UTC, all six arms ok; integration build
+3's image and env, the spinner off (`PT_HPU_SYNCHRONOUS_ACC_QUEUE_FLUSHING=1`) in every arm; reference = the image's own,
+vendor-built bridge; results `reports/collectives/card/00181-real8-bridge-headline2-*/`). Tokens: tiny-lean and
+tiny-lean-inline equal tiny-stock prompt by prompt; the 1-stream texts of both rounds are equal in all three real arms.
+
+Steady ms per step, two rounds (greedy 32 / 8 / 1 streams; sampled 32 / 8 / 1):
+
+| arm | greedy 32 | greedy 8 | greedy 1 | sampled 32 | sampled 8 | sampled 1 |
+|---|---|---|---|---|---|---|
+| image bridge | 49.4, 56.4 | 53.3, 53.5 | 37.6, 37.2 | 57.6, 63.5 | 59.3, 57.7 | 36.2, 38.2 |
+| lean3t (`lean3t-412153bbab3e`, flag 1) | 46.2, 47.0 | 63.1, 61.3 | 43.5, 43.6 | 47.9, 50.7 | 59.4, 59.6 | 44.5, 44.7 |
+| lean3t + `PT_HPU_DISABLE_ASYNC_COLLECTIVE=1` | 45.5, 46.4 | 61.1, 59.9 | 42.2, 43.4 | 51.8, 51.0 | 63.2, 60.5 | 44.0, 44.5 |
+
+Per launch, us (medians over all lines after each rank's first; lean3t / inline): total 143.8 / 133.7; run_prep 2.14 /
+2.20 (**the lean2 fix works**: 14.05 in 00174); unattributed 5.0 / 5.3 (the frees did not move); run_patching 24.4 /
+24.4; launcher_inputs 40.1 / 6.0; syn_launch 43.6 / 48.3; launcher_post 13.7 / 35.9; exec_setup 1.5; hashes, launcher,
+spec, lookup 0. Sub-timers (nested): in_registry 0.54, in_refs 0.52, **in_waits 39.0 of which in_future 34.2** (inline
+0.0) and in_streamwait 3.5; syn_mem 3.1, syn_workspace 0.78, **syn_lock 9.9**, syn_trace 1.0, **syn_call 27.9**,
+syn_after 0.32; **patch_alloc 14.4**, patch_table 22.8 (holds patch_alloc), patch_info 1.3; post_holder 1.05,
+post_events 6.0, post_record 0, post_coll 6.1.
+
+Readings:
+1. **The collective futures are the biggest bridge item**: the main thread waits 34 us per launch for the HCCL job
+   thread (`habana_helpers::JobThread`, a condition-variable sleeper, `pytorch_helpers/habana_helpers/job_thread.h`)
+   to issue the previous launch's collective. Inline issue removes the wait and adds 22 us of issue cost to the post
+   phase: net -10 us per launch, same tokens.
+2. What is left is mostly outside the bridge's bookkeeping: the Synapse call (28 us), the allocator's address lock
+   (10 us: handle to device address for every tensor), the allocations of outputs and intermediates (14 us).
+3. **The step-time flips between jobs are the ranks, not lean.** In every real arm exactly two of the 8 ranks run about
+   2x slower per launch for long stretches, and which two changes with every server start (real-lean 1-stream windows:
+   six ranks 117-158 us, two 229-238; real-lean-inline: six 130-159, two 233-243). Every phase is 2x in the slow ranks: a
+   slower CPU, not more bridge work. At 1 stream the slowest rank sets the step: about 150 x 90 us = 13 ms, more than
+   any per-launch gain (lean about -30 us, inline -10 us: 1.5-4.5 ms). INFERRED: pairs of busy main threads on vCPUs that
+   are hyperthread siblings on the host (the VM hides the sibling map; section 7.9).
+4. Our rebuild is the vendor's binary in all but the patch: `libhabana_pytorch_backend.so` 58,176,608 bytes (image)
+   against 58,158,528 (lean3a), `.text` within 0.002 %, the same GCC 13.4.0, no LTO in either (0 `lto_priv` symbols),
+   the same number of `isra` clones; the plugin likewise. A slower build is unlikely; job 00188 measures it (real-rebuild
+   against the image's bridge).
+
 ## 8. Build steps
 
 | Step | What | Proof off the card | Card | State |
