@@ -379,8 +379,9 @@ Next, in order (section 7's table):
 1b. native-replay's next build `timers-c281d8b53d08` (phase timers; `PT_HPU_HPUGRAPH_REPLAY_TIMING=N` prints one
    `HPUGRAPH_REPLAY_TIMING` line per N replayed launches per thread; about 02:15 UTC): one all-card job, 30 min,
    submitted the moment `out/timers-c281d8b53d08/manifest.json` exists:
-   `printf '%s\n' "exec bash ~/farm/collectives/bridge/ab_bridge_job.sh --sha 0a66722b7a55 --cmd 'python /farm/farm_tiny.py --gdn hc' tiny:timers-c281d8b53d08:PT_HPU_HPUGRAPH_REPLAY_TIMING=2000 && exec bash ~/farm/collectives/bridge/ab_bridge_job.sh --sha 0a66722b7a55 real:timers-c281d8b53d08:PT_HPU_HPUGRAPH_REPLAY_TIMING=5000" | bin/farm submit collectives real8-bridge-timers all 30m`;
-   the timing lines are in `<id>-real8-bridge-timers-tiny/hc/server0.log` and `<id>-real8-bridge-timers-real/server0.log`.
+   `printf '%s\n' "bash ~/farm/collectives/bridge/ab_bridge_job.sh --sha 0a66722b7a55 --cmd 'python /farm/farm_tiny.py --gdn hc' tiny:timers-c281d8b53d08:PT_HPU_HPUGRAPH_REPLAY_TIMING=2000 && exec bash ~/farm/collectives/bridge/ab_bridge_job.sh --sha 0a66722b7a55 real:timers-c281d8b53d08:PT_HPU_HPUGRAPH_REPLAY_TIMING=5000" | bin/farm submit collectives real8-bridge-timers all 30m`;
+   (no `exec` before the first call: it would end the script before the real arm); the timing lines are in
+   `<id>-real8-bridge-timers-tiny/hc/server0.log` and `<id>-real8-bridge-timers-real/server0.log`.
 2. (Replaced by 00160: the 1-card pair a1 and the single TP8 arm a2.)
 3. a3 and b with the lean build (flag 0 and 1); c with `ab_bridge_job.sh` through `bin/farm submit`:
    `printf 'exec bash ~/farm/collectives/bridge/ab_bridge_job.sh --sha 0a66722b7a55 stock:- lean0:<id>:PT_HPU_HPUGRAPH_PREPARED_REPLAY=0 lean1:<id>:PT_HPU_HPUGRAPH_PREPARED_REPLAY=1\n' | bin/farm submit collectives real8-bridge-ab all 45m`,
