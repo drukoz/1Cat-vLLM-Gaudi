@@ -676,7 +676,7 @@ sibling (19r xor 1), so mode 2 needs the sibling kept free (a fix for the flag, 
 
 ## Handoff (if this agent stops)
 
-**08:20 UTC.** lean5's qualification is job **00210** `real8-bridge-reuse2` (collectives track, all cards, 120 min,
+**08:08 UTC (date -u).** lean5's qualification is job **00210** `real8-bridge-reuse2` (collectives track, all cards, 120 min,
 after async-sched's 00202/00203; replaces 00198): tiny-stock, tiny-lean4-nan, tiny-lean5-verify; real-ref, real-lean5,
 real-lean5-verify, real-lean4 (fallback, last); text_check 1/32 (+ churn on the lean5 arms); plan_bad 0 and churn
 texts equal fail the job otherwise. lean6 (`patches/lean6.patch`, PT_HPU_HPUGRAPH_LEAN_COLLECTIVE: the lazy collective
