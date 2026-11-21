@@ -434,7 +434,10 @@ Next, in order (section 7's table):
    (`BRIDGE_INLINE=1`: `PT_HPU_DISABLE_ASYNC_COLLECTIVE=1`). Arm order: tiny-stock, tiny-lean; real-stock,
    real-lean (the main comparison first); tiny-lean-inline (tokens against tiny-stock, `--ref-arm`);
    real-lean-inline if its tiny arm passed. This agent's waiter fetches `00181-real8-bridge-headline2-<arm>/` and
-   the verdicts. To read: the steady ms per step at 32, 8, 1 (greedy and sampled) of
+   the verdicts. Not in 00181 (coordinator, 03:50 UTC: its hold stays 65 min, build 4's headline follows):
+   native-replay's `lean3a-8f6f7faf88dc` (lean3t + no GIL release for inputs whose event is done, no argument
+   building for logs and traces that are off); it goes into the next bridge job with whatever 00181's sub-timers say
+   to cut next, ideally on build 4's image (`bridge_headline_job.sh` takes the image and `EXTRA=<build id>`). To read: the steady ms per step at 32, 8, 1 (greedy and sampled) of
    both real arms from their `scaling.json` (or the `MEAS`/`SAMPLED` lines of `arm.log`), and
    `python3 -I reports/collectives/probes/replay_timing_table.py <real-lean folder>` (phases; `n_*` tensor counts;
    `sub_*` sub-timers, nested): `run_prep` should be back near 2 us; if `unattributed` (total minus the phase sum; 4.3 us for lean in 00174) rises by about 12 us instead,
