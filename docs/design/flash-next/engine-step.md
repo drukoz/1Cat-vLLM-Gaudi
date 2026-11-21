@@ -563,6 +563,13 @@ step while the host works.
   not the captured graph's own input value is copied by `graphs.copy_to`, flushed as its own recipe before the
   replay). To name them: `VLLM_HPU_LOG_UNMATCHED_GRAPH_INPUTS=1` (`ca52fa33`), and the same logger as a Python-only
   sitecustomize for build 5 (`reports/engine-step/probes/hpu_graph_input_log/`, sent to integration at 08:19 UTC).
+- **The 13, predicted on CPU (MEASURED, the census's forward-input check, 08:22 UTC):** every input of the target and
+  draft forwards that is a view made outside the forward or a lazy result still pending at the replay (both unmatched
+  on a card). Exactly 13 per step, all on the draft forwards: pass 0 (16 rows) `input_ids`, `positions`,
+  `hidden_states` (arg max, +1, index_select just before the pass) and the lattice's `load/store_indices_tensor`
+  (`ring_slots_from_lattice`, pending); passes 1 and 2 the same three plus the two lattice tensors as non-contiguous
+  views. The target forward's inputs are all matched. Fix: persistent base tensors into the draft forward and that
+  arithmetic inside the captured draft graph, or mtp-draft-graph's one-graph chain (asked the coordinator).
 - **Plan (coordinator's order, 08:18 UTC):** (1) name and remove the copy-only graphs (persistent base tensors,
   sliced inside the forward), about 13 launches, 2-4 ms per step (INFERRED); (2) I01 in the serve setting once 00207
   (MTP, 32 streams) and 00169 (32 x 120K) agree (integration got the runtime-switch recipe); (3) last: the packed
