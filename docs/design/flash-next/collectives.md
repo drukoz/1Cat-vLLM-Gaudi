@@ -434,9 +434,22 @@ share with the sibling kept free, keeps every other thread off those, and re-app
 probe start at once; the script runs once the server answers `/health`; `placement.log` in the arm's results), with
 `VLLM_HPU_WORKER_CPU_PIN=1` kept. Pending.
 
+**Job 00198 `real8-bridge-reuse`** (all, 90 min, queued 06:32 UTC behind 00189; `bridge_reuse_job.sh`): the
+qualification of native-replay's `lean4-44fe39c26127` (lean3a + output-buffer reuse: `PT_HPU_HPUGRAPH_PREPARED_REUSE=1`
+with `PT_HPU_HPUGRAPH_PREPARED_REPLAY=1`, a launcher reuses its outputs from two launches ago when it holds the only
+references; `=2` also fills every reused buffer with NaN before the launch, so a stale read shows as garbage) on build
+4's image and env. Tiny gates tiny-stock / tiny-lean4-nan / tiny-lean4; real arms real-ref (REUSE=0, exactly lean3a),
+real-lean4-nan, real-lean4, each running the headline probe and then native-replay's `text_check.py` (md5 1d8cb0c9)
+at 1 stream (6 prompts) and 32 streams, 600 tokens each (the probe dir `~/farm/collectives/results/bench/intprobe4r/`:
+build 4's `serve_probe.sh`, its `decode_scaling.py` as `decode_scaling_real.py`, `decode_scaling_textcheck.py` as
+`decode_scaling.py`, `text_check.py`). Verdicts: the texts_1 of both reuse arms equal real-ref's; no texts_32 with
+NaN garbage (replacement characters over 0.5 % or a run of 40 or more). The spinner (`SPIN`), the pin (`PIN_KV`) and
+the placement (`PLACE`) are late-bound from 00189's result through `~/farm/collectives/bridge/late/00198.env`.
+Pending.
+
 ## Handoff (if this agent stops)
 
-State at 05:15 UTC on 2026-11-21 (fourth agent of this track, Opus 5.5). **The node stays until about 00:00 UTC
+State at 06:35 UTC on 2026-11-21 (fourth agent of this track, Opus 5.5). **The node stays until about 00:00 UTC
 on 2026-11-22** (BRIEF 00:50 UTC). Branch `feat/flash-next-gaudi-collectives` (and `-dev`, the same head), worktree
 `/Volumes/Storage/Claude/gaudi-work/wt/collectives`; card results and logs in
 `/Volumes/Storage/Claude/gaudi-work/reports/collectives/` (`card/<id>-<name>/`, `logs/`, `probes/`). This section is
@@ -476,6 +489,10 @@ Next, in order (section 7's table):
    first; then, for every timed arm, `python3 -I reports/collectives/probes/replay_timing_table.py <arm folder>`:
    per-rank medians per level (the headline now), the pooled phase and `sub_*` medians, and the pin arm's eight
    `VLLM_HPU_WORKER_CPU_PIN` lines (`grep WORKER_CPU_PIN <real-pin>/server0.log`), to native-replay. Drop the
+   **Then: set 00198's late file from 00189's result** (`SPIN=on|off`; if the pin arm closed the per-rank spread:
+   `PIN_KV=VLLM_HPU_WORKER_CPU_PIN=1` and `PLACE=/results/bench/place.sh`), before 00198 starts; its waiter fetches
+   its six arms and verdicts; to native-replay: the three texts_1 comparisons, the hit rates (`n_reuse_*` in the
+   parser), the per-rank per-level medians and the `sub_*` medians. Drop the
    protective image tags when no job needs them: `sudo -n docker rmi farm-collectives-int:d00c0a9a3e18
    farm-collectives-int:30f4e37ef08c` on the node.
 2. **PR #19 merged at 04:05 UTC** (program head 22ec5ea3): the gated snapshot 04f690be (gate 88 files, 0 red; tool
