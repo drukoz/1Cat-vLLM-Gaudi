@@ -178,7 +178,16 @@ serve_and_probe() {
     local tag="$1" started log="server$1.log" json="qsa_ab$1.json" rc
     RUN_OK=0
     started="$(date -u +%s)"
-    setsid "${SERVE[@]}" >"$log" 2>&1 &
+    if [ "${QSA_AB_PLACE:-0}" = 1 ] && [ -f "$HERE/place_wrap.sh" ] && [ -f "$HERE/place.sh" ]; then
+        # BRIEF 09:17 UTC: every real-model server under collectives' place_wrap.sh (it resets the CPU mask first)
+        # and native-replay's place.sh after it is healthy; no VLLM_HPU_WORKER_CPU_PIN; one wrap per server start.
+        say "placement: place_wrap.sh $(md5sum "$HERE/place_wrap.sh" | cut -c1-8), place.sh" \
+            "$(md5sum "$HERE/place.sh" | cut -c1-8), log placement$tag.log"
+        PLACE_PORT="$PORT" PLACE_LOG="$PWD/placement$tag.log" PLACE_ARGS="--log $PWD/$log" \
+            setsid bash "$HERE/place_wrap.sh" "$HERE/place.sh" -- "${SERVE[@]}" >"$log" 2>&1 &
+    else
+        setsid "${SERVE[@]}" >"$log" 2>&1 &
+    fi
     SP=$!
     say "server starting (tp $TP, expert parallel, port $PORT, VLLM_HPU_QSA_TOPK_IDS=$TOPK_IDS," \
         "VLLM_HPU_QSA_FUSED=${VLLM_HPU_QSA_FUSED:-0} VLLM_HPU_QSA_INDEXER_SHARD=${VLLM_HPU_QSA_INDEXER_SHARD:-0}), log $log"
