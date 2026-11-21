@@ -110,23 +110,55 @@ for kv in VLLM_HPU_QSA_FUSED=1 VLLM_HPU_QSA_INDEXER_SHARD=1 \
     if [ -z "${!key+x}" ]; then export "$kv"; fi
 done
 
-# The worker placement, switched late (coordinator, 2026-11-21 08:28 UTC): the first word of HEADLINE_PIN_SWITCH
-# (default /results/switches/pin = ~/farm/integration/results/switches/pin on the node), read once here at the job's
-# start. "on": every server of the job, the tiny gate too, with VLLM_HPU_WORKER_CPU_PIN=HEADLINE_PIN_ON_MODE (default
-# 3: native-replay's pin with the model thread's hyperthread sibling kept free); a digit 0..3: that mode; anything
-# else or no file: no pin. A VLLM_HPU_WORKER_CPU_PIN the job sets itself (--env) wins over the file.
+# The worker placement, switched late (coordinator, 2026-11-21 08:28 and 08:49 UTC): the first word of
+# HEADLINE_PIN_SWITCH (default /results/switches/pin = ~/farm/integration/results/switches/pin on the node), read once
+# here at the job's start:
+#   place  every real-model server runs under collectives' place_wrap.sh with native-replay's place.sh (rule a^1 of
+#          job 00193; PLACE_SIBLING_RULE): once the server is healthy, each worker's main thread gets a vCPU of its
+#          own with its hyperthread sibling kept free, re-applied every 2 s; NO VLLM_HPU_WORKER_CPU_PIN, so the load
+#          and warm-up keep every CPU (00189: the pin flag doubled the time to the first throughput line). The
+#          placement's output: <arm>/placement.log. The scripts: /results/late/place/{place_wrap.sh,place.sh} when
+#          both exist (late-bound), else this kit's place/ copies (place_wrap.sh md5 5f7ca629, place.sh 7e54f2de);
+#          HEADLINE_PLACE_WRAP / HEADLINE_PLACE_SCRIPT override. The tiny gate is not placed.
+#   pin3   (or "on") every server of the job, the tiny gate too, with VLLM_HPU_WORKER_CPU_PIN=3
+#          (native-replay's pin with the model thread's sibling kept free; restricts the load to the worker's share)
+#   0..3   VLLM_HPU_WORKER_CPU_PIN=<digit>
+#   anything else or no file: no placement. A VLLM_HPU_WORKER_CPU_PIN the job sets itself (--env) wins over the file.
 PIN_SWITCH="${HEADLINE_PIN_SWITCH:-/results/switches/pin}"
 pin_word="$(head -c 64 "$PIN_SWITCH" 2>/dev/null | awk 'NR == 1 { print $1 }')"
+PLACE_ON=0
 if [ -n "${VLLM_HPU_WORKER_CPU_PIN+x}" ]; then
     echo "headline_job: placement from the job's env: VLLM_HPU_WORKER_CPU_PIN=$VLLM_HPU_WORKER_CPU_PIN" \
         "(the switch $PIN_SWITCH is not read)"
 else
     case "$pin_word" in
-        on) export VLLM_HPU_WORKER_CPU_PIN="${HEADLINE_PIN_ON_MODE:-3}" ;;
+        place) PLACE_ON=1 ;;
+        on | pin3) export VLLM_HPU_WORKER_CPU_PIN=3 ;;
         [0-3]) export VLLM_HPU_WORKER_CPU_PIN="$pin_word" ;;
     esac
-    echo "headline_job: placement switch $PIN_SWITCH says '${pin_word:-nothing (no file)}':" \
-        "VLLM_HPU_WORKER_CPU_PIN=${VLLM_HPU_WORKER_CPU_PIN:-unset (no pin)}"
+    if [ "$PLACE_ON" = 1 ]; then
+        PLACE_WRAP="${HEADLINE_PLACE_WRAP:-}"
+        PLACE_SCRIPT="${HEADLINE_PLACE_SCRIPT:-}"
+        if [ -z "$PLACE_WRAP" ] && [ -z "$PLACE_SCRIPT" ] && [ -r /results/late/place/place_wrap.sh ] &&
+            [ -r /results/late/place/place.sh ]; then
+            PLACE_WRAP=/results/late/place/place_wrap.sh
+            PLACE_SCRIPT=/results/late/place/place.sh
+        fi
+        PLACE_WRAP="${PLACE_WRAP:-$HERE/place/place_wrap.sh}"
+        PLACE_SCRIPT="${PLACE_SCRIPT:-$HERE/place/place.sh}"
+        export PLACE_SIBLING_RULE="${PLACE_SIBLING_RULE:-a^1}"
+        if [ -r "$PLACE_WRAP" ] && [ -r "$PLACE_SCRIPT" ]; then
+            echo "headline_job: placement switch $PIN_SWITCH says 'place': every real-model server under" \
+                "$PLACE_WRAP $PLACE_SCRIPT (rule $PLACE_SIBLING_RULE, no VLLM_HPU_WORKER_CPU_PIN; md5" \
+                "$(md5sum "$PLACE_WRAP" "$PLACE_SCRIPT" 2>/dev/null | awk '{ printf "%s %s ", $2, substr($1, 1, 8) }'))"
+        else
+            echo "headline_job: placement switch says 'place' but $PLACE_WRAP or $PLACE_SCRIPT is missing: NO placement"
+            PLACE_ON=0
+        fi
+    else
+        echo "headline_job: placement switch $PIN_SWITCH says '${pin_word:-nothing (no file)}':" \
+            "VLLM_HPU_WORKER_CPU_PIN=${VLLM_HPU_WORKER_CPU_PIN:-unset (no pin)}, no place.sh"
+    fi
 fi
 
 if [ $# -eq 0 ]; then set -- nospec mtp3; fi
@@ -230,6 +262,20 @@ barrier_args() {
     fi
 }
 
+# placed DIR COMMAND...: one real-model server (COMMAND, a serve_probe.sh run whose out folder is DIR), under the
+# placement when the pin switch said "place" (above): place_wrap.sh runs COMMAND and, once the server answers /health
+# on the job's port, place.sh with the server's log; its output goes to DIR/placement.log.
+placed() {
+    local dir="$1"
+    shift
+    if [ "$PLACE_ON" = 1 ]; then
+        mkdir -p "$dir"
+        PLACE_ARGS="--log $dir/server0.log" PLACE_LOG="$dir/placement.log" bash "$PLACE_WRAP" "$PLACE_SCRIPT" -- "$@"
+    else
+        "$@"
+    fi
+}
+
 # good_kvlp_ref: the job's first kvlp_bf16.json in which every length ran without an error (the kvlp post step of
 # an fp8kv arm compares against it); prints nothing when there is none.
 good_kvlp_ref() {
@@ -282,7 +328,7 @@ while [ "$i_arm" -lt "${#ARMS[@]}" ]; do
             # rounds right after its greedy rounds. nospec-async: VLLM_HPU_FLASH_NEXT_ASYNC_SCHED=1 (async-sched).
             async_env=()
             if [ "$arm" = nospec-async ]; then async_env=(VLLM_HPU_FLASH_NEXT_ASYNC_SCHED=1); fi
-            env ${async_env[@]+"${async_env[@]}"} \
+            placed "$OUT/$arm" env ${async_env[@]+"${async_env[@]}"} \
                 bash "$HERE/serve_probe.sh" --out "$OUT/$arm" --levels "$LEVELS" --tokens "$TOKENS" \
                 --warm-tokens "$WARM" --repeat-top 2 --no-mintok-check --probe-arg "--sampled-levels=$LEVELS" \
                 --probe-arg --interleave-sampled --probe-arg "--rounds=$ROUNDS" $(barrier_args "$arm") $(guard_args)
@@ -298,7 +344,7 @@ while [ "$i_arm" -lt "${#ARMS[@]}" ]; do
                 nospec-noprefix-nocut)
                     change=(VLLM_HPU_PREFIX_ALIGN_SPLIT=0 VLLM_HPU_PREFIX_KEEP_PROMPT_END=0 VLLM_HPU_DECODE_CUT_INTERVAL=0) ;;
             esac
-            env "${change[@]}" \
+            placed "$OUT/$arm" env "${change[@]}" \
                 bash "$HERE/serve_probe.sh" --out "$OUT/$arm" --levels "${HEADLINE_BISECT_LEVELS:-8,1}" \
                 --tokens "${HEADLINE_BISECT_TOKENS:-96}" --warm-tokens "$WARM" --repeat-top 2 --no-mintok-check \
                 --probe-arg --no-sampled-check --probe-arg "--rounds=$ROUNDS"
@@ -510,8 +556,8 @@ while [ "$i_arm" -lt "${#ARMS[@]}" ]; do
             echo "headline_job: arm $arm: k $k, levels $levels, draft graph $draft_graph, ${async_env[*]:-sync}," \
                 "MTP timer $timing, env ${arm_env[*]:-} ${unset_env[*]:-}, serve args ${serve_extra[*]:-}," \
                 "after the probe: ${post_words[*]:-nothing}"
-            env ${unset_env[@]+"${unset_env[@]}"} ${async_env[@]+"${async_env[@]}"} ${switch_env[@]+"${switch_env[@]}"} \
-                ${arm_env[@]+"${arm_env[@]}"} \
+            placed "$ARM_DIR" env ${unset_env[@]+"${unset_env[@]}"} ${async_env[@]+"${async_env[@]}"} \
+                ${switch_env[@]+"${switch_env[@]}"} ${arm_env[@]+"${arm_env[@]}"} \
                 VLLM_HPU_QSA_INDEXER_SHARD="$shard" VLLM_HPU_SPEC_SAMPLED_VERIFY="$sampled_verify" \
                 VLLM_HPU_GDN_CORE_VERIFY="${VLLM_HPU_GDN_CORE_VERIFY:-1}" VLLM_HPU_MTP_TIMING="$timing" \
                 VLLM_HPU_MTP_DRAFT_LOOP="${VLLM_HPU_MTP_DRAFT_LOOP:-1}" VLLM_HPU_MTP_CHUNK_KV="${VLLM_HPU_MTP_CHUNK_KV:-1}" \
