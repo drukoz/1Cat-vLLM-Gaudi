@@ -10,7 +10,7 @@ repository is under `/Volumes/Storage/Claude/gaudi-work/reports/spec-lookup/` (`
 
 ## Handoff (if this agent stops)
 
-State at **2026-11-21 08:10 UTC** (fourth agent, Opus 5.5). Branch head: the commit that holds this text, pushed.
+State at **2026-11-21 09:05 UTC** (fourth agent, Opus 5.5). Branch head: the commit that holds this text, pushed.
 It contains the program head `a16ebdde` (PR #16 qsa-dataflow, PR #17 this track's padded one-token fix; merged as
 `ace177c2`), mtp-card-ready through `f1aa2292` and every commit of this track. **The node was extended (BRIEF 00:50 UTC): it ends about 00:00 UTC on
 2026-11-22**; everything on it is lost then. Merges are allowed again (one gate at a time).
@@ -23,18 +23,19 @@ It contains the program head `a16ebdde` (PR #16 qsa-dataflow, PR #17 this track'
 | 00086, 00087, 00107, 00114 | tiny-model rehearsals (n-gram k = 3 and 8, vLLM's search, the hybrid with the torch and the fused GDN verification) | ended ok; section 7.1 |
 | 00095 `real4-nospec-edit-prose` | real model, no speculation, TP4 + EP4: the reference and the token ids for the replay | ended ok; sections 7.2 to 7.4 |
 | 00133 `real4-ngram5-edit3` | real model, n-gram k = 5, TP4: 85 tok/s for one editing agent, then the conv-commit crash on the second request (fused and torch verification alike) | ended rc 5 at 00:44 UTC; section 7.5 |
-| 00157 `real8-lookup-nospec-hybrid3-pf`, 00159 `real8-lookup-ngram5-pf` | TP8 on build `e85a3292` (integration build 2): never ran. 00157 was replaced by 00208, 00159 cancelled (coordinator 06:50 / 07:02 UTC) | replaced |
-| **00208 `real8-lookup-b4-fold`** (all, 60 min, in 00157's place) | TP8 + EP8 on integration build 4 + this branch: build branch `feat/flash-next-gaudi-spec-lookup-b4`, commit `c9740515` (build 4 `30f4e37e` + `e2d673ef`), image `farm-spec-lookup:c9740515fddd`; build 4's synchronous env. Arms (`lookup_arms.sh`): `tiny-off` (the tiny TP8 gate of the lookup-off reference), `hybrid3` (MTP k = 3 + lookup, modes 1 and 0 per round), `ngram5-nospec` (n-gram k = 5 and, per round, the same round with the requests' lookup off: plain decode steps, the no-speculation reference on the same server). Rounds edit:1, edit:32, mix:32 and the repeat of edit:1 | **waiting**; local waiter `card/submit-real8-lookup-b4-fold.log` (command: `card/submit_b4_fold.sh`) |
+| 00157 `real8-lookup-nospec-hybrid3-pf`, 00159 `real8-lookup-ngram5-pf` | TP8 on build `e85a3292` (integration build 2): never ran. 00157 was replaced by 00208 (then 00224), 00159 cancelled (coordinator 06:50 / 07:02 UTC) | replaced |
+| 00208 `real8-lookup-b4-fold` | the job below on build `c9740515`: replaced by 00224 at 09:00 UTC (the switch value `place`, coordinator 08:55 UTC); never ran | replaced |
+| **00224 `real8-lookup-b4-fold2`** (all, 60 min, in 00157's place) | TP8 + EP8 on integration build 4 + this branch: build branch `feat/flash-next-gaudi-spec-lookup-b4`, commit `d1aff79b` (build 4 `30f4e37e` + `6a6a1ca8`; plugin code as `c9740515`), image `farm-spec-lookup:d1aff79b3648`; build 4's synchronous env. Arms (`lookup_arms.sh`): `tiny-off` (the tiny TP8 gate of the lookup-off reference), `hybrid3` (MTP k = 3 + lookup, modes 1 and 0 per round), `ngram5-nospec` (n-gram k = 5 and, per round, the same round with the requests' lookup off: plain decode steps, the no-speculation reference on the same server). Rounds edit:1, edit:32, mix:32 and the repeat of edit:1 | **waiting**; local waiter `card/submit-real8-lookup-b4-fold2.log` (command: `card/submit_b4_fold.sh`) |
 
 To resubmit: check out `feat/flash-next-gaudi-spec-lookup-b4` in this worktree (the farm runs the worktree's
-HEAD), run `bash reports/spec-lookup/card/submit_b4_fold.sh` with `--replaces 00208` in place of `--replaces 00157`,
-wait for the `farm: job` line, then check out `feat/flash-next-gaudi-spec-lookup` again. Section 7.6 has the
+HEAD), run `EXPECT=<its commit> REPLACES=00224 NAME=<a new name> bash reports/spec-lookup/card/submit_b4_fold.sh`
+(a waiting job's name cannot be reused, even with `--replaces`), wait for the `farm: job` line, then check out `feat/flash-next-gaudi-spec-lookup` again. Section 7.6 has the
 design and what to read.
 
 When it ends:
 ```bash
 cd /Volumes/Storage/Claude/gaudi-work/wt/spec-lookup
-C=/Volumes/Storage/Claude/gaudi-work/reports/spec-lookup/card/00208-real8-lookup-b4-fold
+C=/Volumes/Storage/Claude/gaudi-work/reports/spec-lookup/card/00224-real8-lookup-b4-fold2
 grep -h -E "lookup tiny|lookup_arms" $C.log          # the gate's lines (tiny-off/lookup_tiny.json), arms, placement
 python3 tools/flash_next/lookup_summary.py $C/hybrid3 $C/ngram5-nospec   # + $C/nospec $C/ngram5 after a fallback
 grep -h -E "MEAS|TEXT|fallback|DONE" $C/*/probe.log
@@ -74,9 +75,9 @@ entry). Run `bin/gate <worktree> --tools` when the merge is due (step 2 below); 
 
 **Pending, in order**
 
-1. 00208's numbers (above; section 7.6): the tiny gate first, then the hybrid's mode 1 against mode 0 and n-gram
+1. 00224's numbers (above; section 7.6): the tiny gate first, then the hybrid's mode 1 against mode 0 and n-gram
    against its own lookup-off rounds. The CPU checks of its build are green (section 7.6); to resubmit before it
-   starts, use `--replaces 00208`.
+   starts, use `REPLACES=00224` (above).
 2. **Merge after mtp-card-ready's own pull request** (merges are allowed again, BRIEF 00:50 UTC; one gate at a time).
    This branch contains mtp-card-ready through `f1aa2292`; on its merged head `test_engine_mtp.py` fails one test
    alone (`test_sampled_requests_through_the_speculative_engine`, "output with shape [1, 248320] doesn't match the
@@ -100,7 +101,7 @@ entry). Run `bin/gate <worktree> --tools` when the merge is due (step 2 below); 
    needs that commit, which comes with their pull request.
 3. **Card check of `VLLM_HPU_FLASH_NEXT_NGRAM_PLAIN_STEPS=1`** (`be141e1a`, default 0, CPU-proven: a step in which
    no request drafts runs as a plain decode step instead of a 2-row placeholder verification; at one stream on
-   TP4 the placeholder row cost about 8 ms, 00133). 00208's `ngram5-nospec` arm runs with it on (its lookup-off
+   TP4 the placeholder row cost about 8 ms, 00133). 00224's `ngram5-nospec` arm runs with it on (its lookup-off
    rounds need it, and its edit:1 n-gram rounds use it on steps without a match); the tiny gate checks the plain
    steps with the step timer.
 4. **Rows at 32 streams** (section 7): an n-gram step is as wide as its longest draft, an empty draft is the
@@ -459,7 +460,7 @@ first, then (the job's own fallback) the torch verification; rounds as 00095. ME
   would give 8.53, at k = 3 3.92.
 - 32 streams: not measured (the server was gone). Prompts repeat no more in this track's probes (`ab513444`).
 
-### 7.6 n-gram and the hybrid at TP8 on integration build 4 (job 00208): pending
+### 7.6 n-gram and the hybrid at TP8 on integration build 4 (job 00224): pending
 
 Replaces 00157 and 00159 (below, never run). Coordinator 06:50 UTC: build 4's code and env; 07:02 UTC: TP8 (a TP4 run
 would understate lookup's gain at 32 streams, the cost of a verification row being 2 to 3 times higher there),
@@ -483,9 +484,13 @@ indexer, GDN interleave + glue cache, HC copy mode 2, cut interval 1000, candida
   lookup off on the round's own prompts (the hybrid's mode 1 prompts: the lossless reference of the hybrid).
 - The probe warms once per (kind, streams, mode) now (plain and verification graphs differ at one batch size).
 - Placement: `/results/switches/place` in the container is `~/farm/spec-lookup/results/switches/place`, a HARD
-  LINK to async-sched's switch (`echo on > ~/farm/async-sched/results/switches/place` turns both on; a switch
+  LINK to async-sched's switch (`echo place > ~/farm/async-sched/results/switches/place` reaches both; a switch
   written by replacing the file would not reach this job: then write this track's file too); the two scripts are
   hard links as well (`~/farm/spec-lookup/results/bench/`). Read once at the job's start; never for the tiny gate.
+  Values as async-sched's (coordinator 08:55 UTC): `place` = the placement alone (rule a^1, no
+  `VLLM_HPU_WORKER_CPU_PIN`: the pin flag doubled the server's load time in 00189, 14.9 min against 7.5 to 8.1;
+  collectives' 00219 tests the placement alone); `on`, `a^1`, `a+N/2` = with the pin flag; anything else: off.
+  The job log's `lookup_arms: placement` line says which (rule, pin flag).
 
 CPU on the merged tree (`reports/spec-lookup/logs/b4_cpu/`, VERIFIED): on `039c7d11` (build 4 + `74d3292f`) the
 fast set 152 passed and 1 failed (`test_lookup_probe.py`'s editl prompt-size guard: a large file of the integration
