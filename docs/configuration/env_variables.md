@@ -405,6 +405,47 @@ expert and row). On the real model (TP8, MTP k = 3, job 00177) the first form of
 this path, without the minimum and with an fp32 weighted sum, was slower than
 the vendor op; keep it off until a later A/B shows otherwise.
 
+`VLLM_HPU_FLASH_NEXT_SPEC_LOOKUP` puts prompt lookup beside the Flash-Next MTP
+drafter, as an integer. `0` (default) installs nothing: the MTP drafts are
+verified. `1` (hybrid) keeps the MTP drafter running every step and then, per
+decode request, replaces its `k` drafts by the n-gram continuation when the
+request's last n tokens (n from `VLLM_HPU_FLASH_NEXT_LOOKUP_MAX_NGRAM`, default
+`8`, down to `VLLM_HPU_FLASH_NEXT_LOOKUP_MIN_NGRAM`, default `3`; a 2-token match
+is too often wrong in prose to replace an MTP draft) occur earlier
+in its prompt or output (vLLM's n-gram search: the earliest occurrence of the
+longest match, up to `k` tokens, padded to `k` with the empty draft `-1`, which
+is never accepted). `2` (lookup only) verifies the lookup continuation, or `k`
+empty drafts, for measuring what lookup alone accepts with the MTP shapes. With
+`1` or `2` a request can choose its own mode with `vllm_xargs`
+`{"spec_lookup": 0 | 1 | 2}`. The verification rows keep the MTP shapes (`1 + k`
+wide), so the HPU graphs are the MTP graphs; the MTP drafter's own caches are
+written as with MTP alone. The server logs the rows and accepted drafts of each
+source every 200 steps (`Flash-Next lookup hybrid: ...`). Any other value is
+`0`. Requires the `mtp` method; not yet run on a card.
+
+`VLLM_HPU_FLASH_NEXT_LOOKUP_ORACLE` is a rehearsal hook, empty by default: the
+path of a JSON file of token streams recorded without speculation
+(`{"streams": [[prompt + output ids], ...], "schedule": [L, ...],
+"tamper_every": N}`). The n-gram search of the `ngram` method and of the lookup
+beside MTP then drafts each recorded stream's own continuation (`L` tokens by
+the context length, every `N`-th context with a wrong last token), so drafts
+are accepted on the tiny model, which never repeats its context
+(`tools/flash_next/rental/lookup_tiny.py` runs it on a card). Never set it on a
+production server.
+
+`VLLM_HPU_FLASH_NEXT_NGRAM_PLAIN_STEPS` (integer, default `0`) applies to the
+`ngram` method on Flash-Next. `0` gives a request without an n-gram match the
+1-token placeholder draft (`-1`, never accepted), so every decode step is a
+verification step at least 2 rows wide per request. `1` keeps the placeholder
+only when another request of the step drafts; a step in which no request
+drafts runs as a plain decode step (1 row per request), which spares one row
+per request on fresh text (at one stream on TP4 an extra row cost about 8 ms,
+card job 00133). Any other value is `0`. On the `ngram` method a request sent
+with `vllm_xargs` `{"spec_lookup": 0}` (its lookup off) drafts nothing: the
+n-gram search leaves it out. With `1`, a step of such requests only is a plain
+decode step, so one n-gram server also serves requests without speculation
+(the spec-lookup card jobs' same-server reference).
+
 `VLLM_HPU_MOE_GLUE_MERGE_GATE_UP` (integer, default `0`) applies only with
 `VLLM_HPU_MOE_GLUE=1`. `1` appends the shared expert's gate_up rows of this
 rank to the block's merged gate weight (built once at load, a second

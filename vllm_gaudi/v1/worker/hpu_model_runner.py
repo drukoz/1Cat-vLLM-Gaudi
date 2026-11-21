@@ -60,6 +60,7 @@ from vllm_gaudi.v1.worker.spec_padding import prompt_path_tokens
 from vllm_gaudi.v1.worker.recurrent_spec import (accepted_counts, load_checkpoint_offsets, qsa_modules,
                                                  recurrent_spec_enabled, state_slots_per_request,
                                                  verification_state_width)
+from vllm_gaudi.v1.worker.verify_width import pad_query_rows, verification_width
 from vllm_gaudi.v1.spec_decode.flash_next_mtp_steps import is_flash_next_mtp
 from vllm_gaudi.distributed import vocab_parallel
 from vllm_gaudi.platform import is_flash_next_model
@@ -2475,6 +2476,24 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                 raise ValueError("Unknown speculative decoding method: "
                                  f"{self.speculative_config.method}")
             self.rejection_sampler = RejectionSampler(self.sampler)
+        # Flash-Next prompt lookup beside the MTP drafter (VLLM_HPU_FLASH_NEXT_SPEC_LOOKUP=1, flash_next_lookup.py).
+        self._spec_lookup = None
+        if self.speculative_config is not None and is_flash_next_mtp(self.speculative_config):
+            from vllm_gaudi.v1.spec_decode.flash_next_lookup import HybridLookup, SpecLookupMode, lookup_mode
+
+            if lookup_mode() != SpecLookupMode.OFF:
+                self._spec_lookup = HybridLookup.from_env(self.speculative_config.num_speculative_tokens,
+                                                          self.model_config.max_model_len)
+                logger.info("Flash-Next speculation: lookup beside MTP on (default mode %s, n-gram %d..%d, k = %d)",
+                            self._spec_lookup.default_mode.name, self._spec_lookup.min_ngram,
+                            self._spec_lookup.max_ngram, self._spec_lookup.k)
+        # Card rehearsals on the tiny model (VLLM_HPU_FLASH_NEXT_LOOKUP_ORACLE): recorded streams answer for the
+        # n-gram search. None on every server that does not name a file.
+        self._lookup_oracle = None
+        if self.speculative_config is not None and self.speculative_config.method == "ngram":
+            from vllm_gaudi.v1.spec_decode.flash_next_lookup import lookup_oracle
+
+            self._lookup_oracle = lookup_oracle()
 
         # Keep in int64 to avoid overflow with long context
         self.max_num_reqs = self.scheduler_config.max_num_seqs
@@ -5216,7 +5235,12 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         decode_block_size = self.attn_block_size
 
         num_tokens_per_req = num_scheduled_tokens[:num_decodes]
-        num_tokens = max(num_tokens_per_req)
+        # A verification batch must also be as wide as the previous step's largest accepted count: the
+        # recurrent layers load from lattice column num_accepted - 1 (ragged n-gram drafts, verify_width.py).
+        num_tokens = verification_width(
+            num_tokens_per_req,
+            accepted_counts(self.input_batch.req_ids[:num_decodes], self._gdn_num_accepted_by_req, num_decodes)
+            if self._recurrent_spec and scheduler_output is not None else [], self._recurrent_spec)
         # Bucketing must cover the last scheduled verification token, not
         # only the first one. A DFlash2 block can cross a physical KV page.
         query_ends = context_lens + np.asarray(num_tokens_per_req, dtype=np.int64)
@@ -5268,10 +5292,7 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         else:
             # per request using universal self.positions_cpu then pad
             position_split_tensors = torch.split(self.positions_cpu[:total_num_scheduled_tokens], num_tokens_per_req)
-            positions[:num_decodes] = \
-                pad_sequence(list(position_split_tensors),
-                                batch_first=True,
-                                padding_value=0)[:num_decodes]
+            positions[:num_decodes] = pad_query_rows(position_split_tensors, num_tokens)[:num_decodes]
 
         padded_index = torch.zeros((padded_batch_size, num_tokens), dtype=torch.int64)
         index = positions.to(torch.int64)[:num_decodes]
@@ -5305,10 +5326,7 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             token_ids[:num_decodes] = self.input_ids_cpu[:num_decodes].view(-1, 1)
         else:
             token_ids_split_tensors = torch.split(self.input_ids_cpu[:total_num_scheduled_tokens], num_tokens_per_req)
-            token_ids[:num_decodes] = \
-                pad_sequence(list(token_ids_split_tensors),
-                                batch_first=True,
-                                padding_value=0)[:num_decodes]
+            token_ids[:num_decodes] = pad_query_rows(token_ids_split_tensors, num_tokens)[:num_decodes]
 
         ###################################
         # SLOT_MAPPING [batch, 1]
@@ -5626,9 +5644,7 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                 # Index [:num_decodes*num_tokens] to write all rows for the
                 # decode region (not just the first num_decodes rows).
                 token_ids_device[:num_decodes * num_tokens] = \
-                    pad_sequence(list(token_ids_split_tensors),
-                                    batch_first=True,
-                                    padding_value=0)[:num_decodes].view(-1, 1)
+                    pad_query_rows(token_ids_split_tensors, num_tokens)[:num_decodes].view(-1, 1)
 
             #####################################
             # NOTE(Chendi): Since we can't actually do num_tokens = 2,
@@ -10628,9 +10644,24 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                     prefill_batch_start_idx += len(req_id)
 
                 if draft_token_ids is None:
+                    if not draft_token_ids_prefill:
+                        # Every prefill batch of this step is a chunk that did not finish its prompt: nothing was
+                        # sampled, so nothing is drafted (torch.cat of no tensors raises).
+                        return [[] for _ in self.input_batch.req_ids]
                     draft_token_ids = torch.cat(draft_token_ids_prefill, dim=0)
-                else:
+                elif draft_token_ids_prefill:
                     draft_token_ids = torch.cat([draft_token_ids] + draft_token_ids_prefill, dim=0)
+
+            spec_lookup = getattr(self, "_spec_lookup", None)
+            if spec_lookup is not None and draft_token_ids is not None:
+                # Lookup + MTP hybrid: per request, the n-gram continuation replaces the MTP drafts (host lists;
+                # take_draft_token_ids reads the MTP tensor back to the host anyway).
+                k = self.speculative_config.num_speculative_tokens
+                extra_args = [getattr(getattr(self.requests.get(r), "sampling_params", None), "extra_args", None)
+                              for r in self.input_batch.req_ids]
+                return spec_lookup.merge(draft_token_ids.reshape(-1, k).tolist(), self.input_batch.req_ids,
+                                         self.input_batch.token_ids_cpu, self.input_batch.num_tokens_no_spec,
+                                         sampled_token_ids, num_decodes or 0, extra_args)
 
             # Early exit if there is only one draft token to be generated.
             # [batch_size, 1]
@@ -11066,12 +11097,35 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         # positional arg to NgramProposer.propose(). Pass the statically
         # configured count to match the new signature.
         num_speculative_tokens = self.speculative_config.num_speculative_tokens
+        from vllm_gaudi.v1.spec_decode.flash_next_lookup import drafts_off_rows
+
+        # A request sent with vllm_xargs {"spec_lookup": 0} drafts nothing: the search skips a row without a sampled
+        # token, and with VLLM_HPU_FLASH_NEXT_NGRAM_PLAIN_STEPS=1 a step of such requests is a plain decode step.
+        off = drafts_off_rows([
+            getattr(getattr(self.requests.get(r), "sampling_params", None), "extra_args", None)
+            for r in self.input_batch.req_ids[:len(sampled_token_ids)]
+        ])
+        if off:
+            off_rows = set(off)
+            sampled_token_ids = [[] if i in off_rows else s for i, s in enumerate(sampled_token_ids)]
         draft_token_ids = self.drafter.propose(
             num_speculative_tokens,
             sampled_token_ids,
             self.input_batch.num_tokens_no_spec,
             self.input_batch.token_ids_cpu,
         )
+        oracle = getattr(self, "_lookup_oracle", None)
+        if oracle is not None:
+            # rehearsal: the recorded stream's continuation for every request that sampled this step
+            draft_token_ids = [
+                oracle.draft(self.input_batch.token_ids_cpu[i, :int(self.input_batch.num_tokens_no_spec[i])],
+                             num_speculative_tokens) if sampled else []
+                for i, sampled in enumerate(sampled_token_ids)
+            ]
+        if gaudi_envs.VLLM_HPU_FLASH_NEXT_NGRAM_PLAIN_STEPS == 1 and not any(len(d) for d in draft_token_ids):
+            # no request drafts: the next step runs as a plain decode step, not a 2-row verification of
+            # placeholders (the runner resets the recurrent checkpoint after a plain step)
+            return draft_token_ids
         # swipe draft_token_ids_native replacing [] to [-1]
         for i in range(len(draft_token_ids)):
             if len(draft_token_ids[i]) == 0:
