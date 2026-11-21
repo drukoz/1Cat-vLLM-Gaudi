@@ -80,7 +80,10 @@ def prefill_selection_bias(selected: torch.Tensor, context_lens: torch.Tensor, n
     return bias.masked_fill(nothing_selected, 0.0).unsqueeze(1)
 
 
-def decode_selected_slots(selected: torch.Tensor, block_table: torch.Tensor, block_size: int) -> torch.Tensor:
+def decode_selected_slots(selected: torch.Tensor,
+                          block_table: torch.Tensor,
+                          block_size: int,
+                          form: int | None = None) -> torch.Tensor:
     """Map ``selected`` positions to flat cache slots through ``block_table``.
 
     ``selected`` is ``[bs, W]`` int32 of absolute positions (-1 padded) and
@@ -89,8 +92,26 @@ def decode_selected_slots(selected: torch.Tensor, block_table: torch.Tensor, blo
     pos % block_size`` (``pos = clamp_min(selected, 0)``). Entries with
     ``selected < 0`` map to a valid slot (row 0's first block) so the gather is
     always in range; the caller masks them out.
+
+    ``form`` (``VLLM_HPU_QSA_SLOT_SHIFT`` when None) is how the block and the offset are taken from ``pos``:
+    0 integer division and remainder, 1 shift and mask, 2 through float32 (``floor(pos * 2**-s)``: exact for
+    ``pos < 2**24``). The card runs ``//`` and ``%`` as emulated int32 division (94 us each per QSA layer at 128
+    rows); forms 1 and 2 give the same slots with no division. They need a power-of-two ``block_size``; another
+    size keeps form 0.
     """
     pos = selected.to(torch.long).clamp_min(0)
+    if form is None:
+        form = int(envs.VLLM_HPU_QSA_SLOT_SHIFT)
+    size = int(block_size)
+    if form in (1, 2) and size > 0 and size & (size - 1) == 0:
+        shift = size.bit_length() - 1
+        if form == 1:
+            block = pos >> shift
+            offset = pos & (size - 1)
+        else:
+            block = torch.floor(pos.to(torch.float32) * (1.0 / size)).to(torch.long)
+            offset = pos - block * size
+        return block_table.to(torch.long).gather(1, block) * size + offset
     block_id = block_table.to(torch.long).gather(1, pos // block_size)
     return block_id * block_size + (pos % block_size)
 
