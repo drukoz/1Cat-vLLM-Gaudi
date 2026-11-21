@@ -421,3 +421,45 @@ So the runner and the scheduler spend 2 to 4 ms on the host before such a turn's
 7.6 s per 501-token chunk over a 34K cached prefix (job 00063, warm) is in the model's prompt forward. The harness
 hits the 120,832-token prefix because its engine core cuts chunks at multiples of 896; the card's engine cut them
 at multiples of 2,048 and missed (prefill's root cause, `VLLM_HPU_PREFIX_ALIGN_SPLIT`).
+
+## 11. Sampled speculative steps in the candidate region (`VLLM_HPU_CANDIDATE_SAMPLING=2`, `d5ad5e67`)
+
+Design from mtp-card-ready, interface agreed on 2026-11-21. With deterministic drafts (MTP's arg max, n-gram) the
+draft distribution is one-hot at the draft d, and speculative sampling equals: draw every verification row and
+the bonus row from the target distribution, each with its own noise, then verify the drafts against those draws.
+A draw y accepted when y = d is accepted with probability p(d); a rejected row's draw follows p(x) / (1 - p(d)) for
+x != d, which is the residual distribution max(p - q, 0) renormalized when q is one-hot at d; the rows draw
+independently.
+
+- `_candidate_sampling_decision` serves a decode step of a speculative server when the flag is 2, the method is
+  `mtp` or `ngram`, `VLLM_HPU_SPEC_SAMPLED_VERIFY` (mtp-card-ready's) is 1 or 2, and every request has k drafts:
+  request i owns rows `i * (1 + k) .. i * (1 + k) + k` (the layout of `_prepare_spec_decode_inputs`), each with
+  the request's temperature, top-k and top-p and its own noise row (a seeded request draws its rows from its own
+  generator, in row order). A greedy request's rows take `first_maximum`, its arg max. Anything else (fewer
+  drafts, `min_tokens` below its count, logprobs, ...) is refused and logged once; mtp-card-ready's flag then
+  serves the step.
+- The region returns the per-row tokens as `fused_sampled_token_ids`; the runner's speculative branch already
+  passes them to `greedy_rejection_sample_from_tokens` (accept while a row's draw equals the draft, then the first
+  unequal draw, or the bonus row's draw). That function now clamps the `-1` of padded draft positions before its
+  `index_select` (the CPU refuses `-1`; the positions are masked out anyway).
+- The non-seeded noise comes from one host generator per server (`candidate_sampling.NOISE_SEED`), seeded alike on
+  every TP rank and used by nothing else, so every rank draws the same tokens (also for `=1`).
+- VERIFIED on the CPU (`test_candidate_verification.py`): over 200,000 rows the acceptance rate equals p(d) and
+  the rejected draws equal p without d, renormalized, within 5 sigma; the greedy rejection on draws, padded
+  positions included; the serving loop with n-gram k = 3 and drafts on every step: every verification step with a
+  sampled request runs in the region, the rejection sampler never runs, a greedy request in the batch gives the HF
+  reference's tokens. Card check: job 00164 (TP8, MTP k = 2, integration build 2 + `d5ad5e67`).
+
+## 12. `min_tokens`, `logit_bias` and `min_p` on the general sampler path (`VLLM_HPU_SAMPLER_REQUEST_PARAMS=1`, `299856cd`)
+
+vLLM applies the three through logits processors whose per-row state the input batch feeds (`update_state`); the
+HPU input batch never does, and the HPU samples prefills and decodes in separate calls whose rows are not the
+batch's rows, so all three were ignored on HPU's general path (section 3). With the flag the runner builds them
+per row from each row's own request at every sampling call (`_apply_sampler_request_params`,
+`v1/sample/request_params.py`) and applies them before vLLM's sampler: the min-tokens mask of `fused_greedy`
+(gather, where, scatter of a host-made int64 index), `logit_bias` by `scatter_add`, and vLLM's min_p cut at the
+row's temperature (equal to vLLM's `MinPLogitsProcessor` on the temperature-scaled logits; greedy rows untouched).
+One difference: a request with logprobs gets them after its own bias and masks (vLLM's raw logprobs come first).
+VERIFIED on the CPU (`test_sampler_request_params.py`): the adjustments equal vLLM's rules; in the serving loop a
+`logit_bias` of +100 makes a greedy request write only that token and a stop token before `min_tokens` is not
+emitted, and without the flag both are ignored. Card check: job 00167 (tiny model, one card).
