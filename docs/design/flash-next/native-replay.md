@@ -699,6 +699,12 @@ every other process of the container off the reserved vCPUs; mode 3 only the eng
 
 ## Handoff (if this agent stops)
 
+**11:05 UTC (date -u): pull request #26 merged** into `feat/flash-next-gaudi` (merge commit ecdc2143; gate on ac63f272:
+103 files, red only the two known rental tests; the program head had moved to #25, GitHub CLEAN): mode 3, the CPU
+tools, the bridge patches, design 7.10-7.13. Integration can enable `VLLM_HPU_WORKER_CPU_PIN=3` (card-proven as
+place.sh in 00189 and 00219; mode 3 itself still wants one arm). 00234 (lean5 qualification on build 5) starts by
+16:25 UTC.
+
 **10:01 UTC (date -u).** 00219 read (section 7.13: place-only, nothing pinned before warmup, is the fastest: 1 stream
 24.0 / 23.6 ms, load 7.7 min). lean5's qualification is now job **00234** `real8-bridge-reuse3` (collectives, 120 min,
 starts by 16:25 UTC at the latest) on build 5's image (`farm-integration:eb21ac75a7c8`, dense MoE from 1 token: about
