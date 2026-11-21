@@ -18,6 +18,10 @@ class HPUAsyncScheduler(AsyncScheduler):
         # Keep upstream cadence until the output is actually committed.
         self._completed_batch_reentry = (is_v41(config) and uses_v2(config) and envs.VLLM_HPU_DSV41_BATCH_DECODE
                                          and config.speculative_config is None and config.max_concurrent_batches == 1)
+        # Flash-Next under async scheduling (VLLM_HPU_FLASH_NEXT_ASYNC_SCHED=1) keeps the engine's own chunk split,
+        # the one its synchronous server runs: see _mamba_block_aligned_split.
+        from vllm_gaudi.platform import is_flash_next_model
+        self._engine_recurrent_split = is_flash_next_model(config.model_config)
 
     def schedule(self, throttle_prefills: bool = False):
         """HPU override: fix stale cached-token accounting after preemption.
@@ -143,11 +147,20 @@ class HPUAsyncScheduler(AsyncScheduler):
         the model runner requires context_lens to be a multiple of
         mamba_chunk_size (e.g. 256).  Since block_size must stay large for
         memory-layout reasons, we substitute mamba_chunk_size here.
+
+        Not for Flash-Next: its runner keeps one recurrent state per block and
+        the prefix cache reuses the state at a chunk end, so a prompt's chunks
+        must end on the block grid exactly as the synchronous engine's
+        ``Scheduler`` ends them (a 700-token prompt: 512 + 188 at block 256,
+        where this override gave one chunk of 700 and the next request with
+        the same prompt hit no cached block). The base rule also carries the
+        prefill track's ``VLLM_HPU_PREFIX_ALIGN_SPLIT`` wrapper.
         """
         chunk_size = self.vllm_config.model_config.get_mamba_chunk_size()
         num_mamba_layers = self.vllm_config.model_config.get_num_layers_by_block_type(
             self.vllm_config.parallel_config, "mamba")
-        if num_mamba_layers == 0 or not self.vllm_config.cache_config.enable_prefix_caching:
+        if (num_mamba_layers == 0 or not self.vllm_config.cache_config.enable_prefix_caching
+                or getattr(self, "_engine_recurrent_split", False)):
             return super()._mamba_block_aligned_split(request, num_new_tokens, num_new_local_computed_tokens,
                                                       num_external_computed_tokens)
 

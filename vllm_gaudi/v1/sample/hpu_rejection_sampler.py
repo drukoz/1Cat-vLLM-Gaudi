@@ -178,10 +178,11 @@ SAMPLING_EPS = 1e-5  # vLLM's _SAMPLING_EPS: a temperature below it is greedy (t
 
 
 def sampled_verify_enabled() -> bool:
-    """VLLM_HPU_SPEC_SAMPLED_VERIFY=1: verify the drafts of sampled requests (temperature > 0) on the HPU."""
+    """VLLM_HPU_SPEC_SAMPLED_VERIFY=1 (or 2: over candidates, hpu_candidate_verify.py, with this exact path for the
+    steps it refuses): verify the drafts of sampled requests (temperature > 0) on the HPU."""
     from vllm_gaudi import envs as gaudi_envs
 
-    return int(gaudi_envs.VLLM_HPU_SPEC_SAMPLED_VERIFY) == 1
+    return int(gaudi_envs.VLLM_HPU_SPEC_SAMPLED_VERIFY) in (1, 2)
 
 
 def expand_batch_to_tokens(

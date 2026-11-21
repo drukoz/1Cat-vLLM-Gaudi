@@ -366,6 +366,13 @@ def runner_facts(runner) -> dict:
             "mamba_cache_mode": getattr(cache_config, "mamba_cache_mode", None),
             "prefix_caching": bool(cache_config.enable_prefix_caching),
             "recurrent_pool_slots": int(runner._recurrent_pool_slots),
+            "candidate_verify_steps": int(getattr(runner, "_candidate_verify_steps", 0)),
+            # VLLM_HPU_MTP_DRAFT_GRAPH=1: decode drafts whose k passes ran in one HPU graph (MtpDraftLoop)
+            "draft_graph_calls": int(getattr(getattr(runner, "drafter", None), "draft_graph_calls", 0)),
+            # VLLM_HPU_MTP_DRAFT_CHAIN=1: decode drafts chained behind their verification (MtpDraftChain)
+            "draft_chain_calls": int(getattr(getattr(runner, "drafter", None), "draft_chain_calls", 0)),
+            # VLLM_HPU_FLASH_NEXT_DECODE_METADATA=1 in force (decided at the first decode step; None: never decided)
+            "sparse_decode_md": getattr(runner, "_sparse_decode_md", None),
             "attention_group": runner._get_attention_group_id_for_hybrid(),
             "num_blocks": int(runner.kv_cache_config.num_blocks),
             "groups": groups}
@@ -418,6 +425,7 @@ def _record_draft_calls(runner) -> list[dict]:
         attn_table = runner.input_batch.block_table[runner._get_attention_group_id_for_hybrid()].get_cpu_tensor()
         rows = int(block_table_cpu_tensor.shape[0])
         calls.append({"rows": rows,
+                      "decode": not bool(getattr(common_attn_metadata, "is_prompt", True)),
                       "width": int(block_table_cpu_tensor.shape[1]),
                       "attention_width": int(attn_table.shape[1]),
                       "is_attention_table": bool(block_table_cpu_tensor.shape[1] == attn_table.shape[1]
@@ -425,8 +433,12 @@ def _record_draft_calls(runner) -> list[dict]:
                                                  and block_table_cpu_tensor.data_ptr()
                                                  < attn_table.data_ptr() + attn_table.numel() *
                                                  attn_table.element_size())})
-        return propose(target_token_ids, target_positions, target_hidden_states, last_token_indices,
-                       common_attn_metadata, block_table_cpu_tensor, model_runner, *args, **kwargs)
+        graphs_before = int(getattr(drafter, "draft_graph_calls", 0))
+        out = propose(target_token_ids, target_positions, target_hidden_states, last_token_indices,
+                      common_attn_metadata, block_table_cpu_tensor, model_runner, *args, **kwargs)
+        # VLLM_HPU_MTP_DRAFT_GRAPH=1: this draft's k passes ran in one graph (MtpDraftLoop)
+        calls[-1]["graph"] = int(getattr(drafter, "draft_graph_calls", 0)) > graphs_before
+        return out
 
     drafter.propose = recording
     fill = getattr(drafter, "fill_prefill_chunk", None)
@@ -440,6 +452,37 @@ def _record_draft_calls(runner) -> list[dict]:
 
         drafter.fill_prefill_chunk = recording_fill
     return calls
+
+
+def probe_recurrent_pools(runner) -> dict:
+    """``--slice-write-probe``: the pools the align-mode state copies write (``runner._recurrent_commit_registry``,
+    the GDN conv and ssm pools) become ``SliceWriteProbe`` tensors over the same storage, so a write through a slice
+    of a pool is recorded (card job 00133); the copies that ran are counted (``commit_conv`` / ``commit_ssm`` pairs,
+    the boundary commit after sampling and the pre-step copy before the forward)."""
+    import vllm_gaudi.v1.worker.hpu_model_runner as runner_module
+    import vllm_gaudi.v1.worker.recurrent_commit as commit_module
+    from tests.unit_tests.models.flash_next.slice_write_probe import SliceWriteProbe
+
+    SliceWriteProbe.violations = []
+    record = {"conv_pairs": 0, "ssm_pairs": 0, "violations": SliceWriteProbe.violations}
+    registry = getattr(runner, "_recurrent_commit_registry", None) or {}
+    for gid, entries in list(registry.items()):
+        registry[gid] = [(tensor.as_subclass(SliceWriteProbe), kind, window) for tensor, kind, window in entries]
+    record["pools"] = sum(len(entries) for entries in registry.values())
+
+    def counting(key, function):
+
+        def wrapper(state, pairs, *args, **kwargs):
+            record[key] += len(pairs)
+            return function(state, pairs, *args, **kwargs)
+
+        return wrapper
+
+    conv, ssm = commit_module.commit_conv, commit_module.commit_ssm
+    for module in (runner_module, commit_module):
+        module.commit_conv = counting("conv_pairs", conv)
+        module.commit_ssm = counting("ssm_pairs", ssm)
+    return record
 
 
 def install_oracle_drafts(llm, runner, oracle: dict, k: int) -> list[dict]:
@@ -497,6 +540,18 @@ def install_oracle_drafts(llm, runner, oracle: dict, k: int) -> list[dict]:
     return record
 
 
+def write_switch_file(lines: str) -> None:
+    """Replace the runtime switch file named by VLLM_HPU_RUNTIME_SWITCH_FILE with ``lines`` (NAME=VALUE pairs
+    separated by ';'), with a rename, as an operator's probe does between two rounds."""
+    path = os.environ.get("VLLM_HPU_RUNTIME_SWITCH_FILE", "").strip()
+    if not path:
+        raise SystemExit("--switch-after needs VLLM_HPU_RUNTIME_SWITCH_FILE in the environment")
+    staging = path + ".new"
+    with open(staging, "w", encoding="utf-8") as handle:
+        handle.write("".join(pair.strip() + "\n" for pair in lines.split(";") if pair.strip()))
+    os.replace(staging, path)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="python -m tests.unit_tests.hpu_cpu_engine", description=__doc__.split("\n")[0])
     parser.add_argument("--ckpt", required=True, help="a tiny Flash-Next checkpoint folder (with reference.json)")
@@ -515,10 +570,21 @@ def main(argv: list[str] | None = None) -> int:
                         "drafts become the reference stream with the token after a_n accepted ones changed "
                         "(install_oracle_drafts)")
     parser.add_argument("--temperature", type=float, default=0.0)
+    parser.add_argument("--top-k", type=int, default=0, help="top_k of a sampled run (0: none)")
+    parser.add_argument("--top-p", type=float, default=1.0, help="top_p of a sampled run")
     parser.add_argument("--seed", type=int, default=None, help="per-request seed of a sampled run")
     parser.add_argument("--logprobs", type=int, default=None, help="record the top-N logprobs of every generated token")
+    parser.add_argument("--next-turn", default=None, metavar="IDS_JSON",
+                        help="after the prompts, one more request: the first prompt, its generated tokens and these "
+                        "token ids (a JSON list): the agent's next turn on this engine's own answer")
+    parser.add_argument("--slice-write-probe", action="store_true",
+                        help="record writes through a slice of the recurrent pools the align-mode copies write")
     parser.add_argument("--op-audit", action="store_true",
                         help="record every dispatched op and the custom ops' view and int64 arguments (make_op_audit)")
+    parser.add_argument("--switch-after", nargs=2, action="append", default=[], metavar=("K", "LINES"),
+                        help="after the K-th prompt, replace the runtime switch file (VLLM_HPU_RUNTIME_SWITCH_FILE in the "
+                        "environment) with LINES, NAME=VALUE pairs separated by ';' (repeatable): a flag switched in "
+                        "the middle of a run, as an operator's A/B on one server does")
     args = parser.parse_args(argv)
 
     install()
@@ -539,6 +605,7 @@ def main(argv: list[str] | None = None) -> int:
         kwargs["speculative_config"] = {"method": "mtp", "num_speculative_tokens": args.k}
     llm = LLM(**kwargs)
     runner = find_runner(llm)
+    pool_probe = probe_recurrent_pools(runner) if args.slice_write_probe else None
     steps = _record_steps(runner)
     committed = _record_committed(runner)
     draft_calls = _record_draft_calls(runner) if args.k else []
@@ -550,20 +617,30 @@ def main(argv: list[str] | None = None) -> int:
     source = json.loads(Path(args.prompts or Path(args.ckpt) / "reference.json").read_text(encoding="utf-8"))
     prompts = sorted((list(p["prompt_ids"]) for p in source["prompts"]), key=len)
     params = SamplingParams(temperature=args.temperature, max_tokens=args.max_tokens, detokenize=False,
-                            seed=args.seed, logprobs=args.logprobs)
+                            seed=args.seed, logprobs=args.logprobs, top_k=args.top_k, top_p=args.top_p)
     guard = make_index_guard()
     audit = make_op_audit() if args.op_audit else None
     streams = []
     with guard, (audit if audit is not None else contextlib.nullcontext()):
         batches = [prompts] if args.concurrent else [[prompt] for prompt in prompts]
-        for batch in batches:
+        switches = {int(k): lines for k, lines in args.switch_after}
+        for number, batch in enumerate(batches, 1):
             outputs = llm.generate([{"prompt_token_ids": prompt} for prompt in batch], params, use_tqdm=False)
             for prompt, output in zip(batch, outputs):
-                stream = {"prompt_ids": prompt, "generated_ids": list(output.outputs[0].token_ids)}
+                stream = {"prompt_ids": prompt, "generated_ids": list(output.outputs[0].token_ids),
+                          "num_cached_tokens": getattr(output, "num_cached_tokens", None),
+                          "draft_calls_end": len(draft_calls)}
                 if args.logprobs:
                     stream["top_logprobs"] = [{str(t): float(lp.logprob) for t, lp in step.items()}
                                               for step in (output.outputs[0].logprobs or [])]
                 streams.append(stream)
+            if number in switches:
+                write_switch_file(switches[number])
+        if args.next_turn and streams:
+            turn = streams[0]["prompt_ids"] + streams[0]["generated_ids"] + list(json.loads(args.next_turn))
+            output = llm.generate([{"prompt_token_ids": turn}], params, use_tqdm=False)[0]
+            streams.append({"prompt_ids": turn, "generated_ids": list(output.outputs[0].token_ids),
+                            "num_cached_tokens": getattr(output, "num_cached_tokens", None), "next_turn": True})
     record = {"k": args.k,
               "prefix_caching": not args.no_prefix_caching,
               "concurrent": bool(args.concurrent),
@@ -574,6 +651,7 @@ def main(argv: list[str] | None = None) -> int:
               "oracle": oracle_record,
               "index_events": guard.events(),
               "op_audit": audit.record() if audit is not None else None,
+              "slice_write_probe": pool_probe,
               "runner": runner_facts(runner)}
     Path(args.out).write_text(json.dumps(record), encoding="utf-8")
     return 0

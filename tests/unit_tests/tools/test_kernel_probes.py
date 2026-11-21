@@ -24,6 +24,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 ROOT = Path(__file__).resolve().parents[3]
 PROBES = ROOT / "tools" / "flash_next" / "kernel_probes"
 
@@ -62,9 +64,10 @@ def test_expert_bytes_probe_runs_every_arm(tmp_path):
     assert "VERDICT expert-bytes:" in out
 
 
-def test_moe_layers_probe_runs_every_arm(tmp_path):
+@pytest.mark.parametrize("timing", [[], ["--replay"]], ids=["lazy", "replay"])
+def test_moe_layers_probe_runs_every_arm(tmp_path, timing):
     proc, out = _run([PROBES / "probe_moe_layers.py", "--out", tmp_path / "ml", "--layers", "2", "--iters", "1",
-                      "--rows", "1,32", "--chunks", "64"], tmp_path)
+                      "--rows", "1,32", "--chunks", "64", "--chunk-rows", "32", *timing], tmp_path)
     assert proc.returncode == 0, out[-3000:]
     arms = [line for line in out.splitlines() if line.startswith("PROBE moe-layers local")]
     # TP4 and TP8 at 1 and 32 rows, none and dense at 32, one chunk_size, 2 and 4 slices at 32 rows
@@ -77,6 +80,17 @@ def test_moe_layers_probe_runs_every_arm(tmp_path):
         assert f"VERDICT moe-layers {name}:" in out
     result = json.loads((tmp_path / "ml" / "moe_layers.json").read_text())
     assert len(result["verdicts"]) == 4 and len([k for k in result if k.startswith("local")]) == 9
+
+
+def test_moe_dense_probe_matches_the_vendor_stand_in_and_times_every_form(tmp_path):
+    proc, out = _run([PROBES / "probe_moe_dense.py", "--out", tmp_path / "md", "--layers", "1", "--iters", "1",
+                      "--rows", "32", "--locals", "8"], tmp_path)
+    assert proc.returncode == 0, out[-3000:]
+    forms = [line for line in out.splitlines() if line.startswith("PROBE moe-dense local") and " form " in line]
+    assert len(forms) == 5 and not any("ERROR" in line for line in forms), forms
+    parity = [line for line in out.splitlines() if " parity dense" in line and " vs vendor: " in line]
+    assert len(parity) == 3 and all(float(line.split("relative ")[1].split()[0]) < 0.05 for line in parity), parity
+    assert "VERDICT moe-dense: local8_rows32:" in out
 
 
 def test_view_probe_selftest(tmp_path):

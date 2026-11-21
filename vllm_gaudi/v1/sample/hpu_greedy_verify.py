@@ -29,8 +29,10 @@ def greedy_rejection_sample_from_tokens(
     """
     from vllm_gaudi.v1.sample.hpu_rejection_sampler import _rejection_sample_pytorch
 
-    target_token_ids = torch.index_select(all_token_ids, 0, target_logits_indices)
-    bonus_token_ids = torch.index_select(all_token_ids, 0, bonus_logits_indices).view(-1, 1)
+    # -1 marks a padded draft position (a request with fewer drafts, a padded batch row): its token is masked
+    # out below, so any row serves; clamping keeps the index in range (index_select refuses -1 on the CPU).
+    target_token_ids = torch.index_select(all_token_ids, 0, target_logits_indices.clamp(min=0))
+    bonus_token_ids = torch.index_select(all_token_ids, 0, bonus_logits_indices.clamp(min=0)).view(-1, 1)
     return _rejection_sample_pytorch(
         draft_token_ids,
         target_token_ids,

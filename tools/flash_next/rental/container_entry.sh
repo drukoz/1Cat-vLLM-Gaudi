@@ -19,10 +19,11 @@ usage() {
     echo "       [--variants LIST] [--with-profile] [--from PHASE] [--download] [--skip-install]"
     echo "       [--full-warmup] [--server-timeout S] [--recipe-cache DIR] [--no-warm-pass]"
     echo "       [--quick-gates] [--no-verify-probe] [--load-read-timeout S] [--warm-request-timeout S]"
-    echo "       [--hc-fused] [--moe-glue]"
+    echo "       [--hc-fused] [--moe-glue] [--anatomy]"
     echo "       $(basename "${BASH_SOURCE[0]}") --install-only [--results DIR] [--run-id ID]"
     echo "  --quick-gates, --no-verify-probe, --load-read-timeout S, --warm-request-timeout S, --hc-fused and"
-    echo "  --moe-glue are handed to the orchestrator unchanged (python -m tools.flash_next.rental.main --help)."
+    echo "  --moe-glue are handed to the orchestrator unchanged (python -m tools.flash_next.rental.main --help);"
+    echo "  so is --anatomy (the step-anatomy probe after each variant's first token, with the step timer on)."
 }
 
 need_value() {
@@ -58,6 +59,7 @@ LOAD_READ_TIMEOUT=""
 WARM_REQUEST_TIMEOUT=""
 HC_FUSED=0
 MOE_GLUE=0
+ANATOMY=0
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -134,6 +136,10 @@ while [ $# -gt 0 ]; do
             ;;
         --moe-glue)
             MOE_GLUE=1
+            shift
+            ;;
+        --anatomy)
+            ANATOMY=1
             shift
             ;;
         --load-read-timeout)
@@ -342,7 +348,7 @@ if [ "$SKIP_INSTALL" -eq 0 ]; then
     # script's. The MoE glue kernels are in that library too: nothing more is built for --moe-glue.
     install_step 2 "plugin (vllm-gaudi)" env VLLM_TARGET_DEVICE=hpu \
         VLLM_GAUDI_BUILD_FLASHINFER="$NATIVE" VLLM_GAUDI_BUILD_GDN_FUSED="$NATIVE" \
-        VLLM_GAUDI_BUILD_HC_FUSED="$NATIVE" \
+        VLLM_GAUDI_BUILD_HC_FUSED="$NATIVE" VLLM_GAUDI_BUILD_QSA_FUSED="$NATIVE" \
         pip install "$BUNDLE_ROOT/plugin" --no-build-isolation
     record_build_sha
     install_step 3 "model deps" \
@@ -390,6 +396,7 @@ if [ -n "$LOAD_READ_TIMEOUT" ]; then MAIN_ARGS+=(--load-read-timeout "$LOAD_READ
 if [ -n "$WARM_REQUEST_TIMEOUT" ]; then MAIN_ARGS+=(--warm-request-timeout "$WARM_REQUEST_TIMEOUT"); fi
 if [ "$HC_FUSED" -eq 1 ]; then MAIN_ARGS+=(--hc-fused); fi
 if [ "$MOE_GLUE" -eq 1 ]; then MAIN_ARGS+=(--moe-glue); fi
+if [ "$ANATOMY" -eq 1 ]; then MAIN_ARGS+=(--anatomy); fi
 if [ "$NO_WARM_PASS" -eq 1 ]; then MAIN_ARGS+=(--no-warm-pass); fi
 
 phase "orchestrator (python -m tools.flash_next.rental.main)"
