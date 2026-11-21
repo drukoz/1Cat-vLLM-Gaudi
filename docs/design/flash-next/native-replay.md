@@ -676,6 +676,11 @@ sibling (19r xor 1), so mode 2 needs the sibling kept free (a fix for the flag, 
 
 ## Handoff (if this agent stops)
 
+**06:20 UTC: pull request #21 merged** into `feat/flash-next-gaudi` (merge commit 42d70a7e; gate on 63693b83: 100 files,
+2 red = the two rental tests that also fail on the program head's own snapshot; everything of this branch up to
+f0c36b39 is on the program branch). 00193 found the sibling rule a^1 (section 7.12); `place.sh` (rule a^1) is staged
+in 00189's pin arm by the collectives track.
+
 **State at 2026-11-21 05:35 UTC (newest first).** 00181 is read (section 7.11: run_prep fixed; the collective
 futures are the biggest bridge item; inline collectives -10 us per launch; **two slow ranks per server at 1 and 8
 streams** decide the 1-stream step, not lean). In flight:
