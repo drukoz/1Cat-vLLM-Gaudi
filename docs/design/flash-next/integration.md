@@ -128,6 +128,22 @@ verification is off in build 1); one measured round per level after a warm round
   1 stopped, its memory was released about 20 s after its processes ended (the MTP server's load started 10 s after
   the stop and was not hurt).
 
+## Headline across builds (TP8 + EP8, steady ms per step and tok/s per stream; the owner's target is 10 ms per token)
+
+ms per token = ms per step / tokens per step. Greedy = temperature 0; sampled = no temperature in the request (the
+checkpoint's temperature 1.0, top_k 20, top_p 0.95). Reference (program head, 00021, greedy, no speculation): 41.6 /
+45.9 / 84.1 ms per step at 1 / 8 / 32 streams.
+
+| build (job) | server | streams | greedy ms/step | greedy ms/token (tok/s) | sampled ms/step | sampled ms/token (tok/s) | tokens per step (MTP) |
+|---|---|---|---|---|---|---|---|
+| 1 (00128) | no spec | 1 | 43.6 | 43.6 (22.9) | 39.5 | 39.5 (25.3) | |
+| 1 (00128) | no spec | 8 | 58.7 (one round) | 58.7 (17.0) | 57.4 | 57.4 (17.4) | |
+| 1 (00128) | no spec | 32 | 51.1 (2nd round; 1st 67.3) | 51.1 (19.6) | 68.4 (one round) | 68.4 (14.6) | |
+| 1 (00128) | MTP k = 3 | 1 | 66 | 24.3 (41.1) | not run | | 2.72 |
+| 1 (00128) | MTP k = 3 | 8 | 81 | 29.3 (34.1) | not run | | 2.76 |
+| 1 (00128) | MTP k = 3 | 32 | 106 | **40.7 (24.6)** | not run | | 2.61 |
+| 2 (00142) | (pending) | | | | | | |
+
 ## Merge log (what the conflicts were)
 
 - `b38ffaa1` (first agent) mtp-card-ready into qsa-fused: one conflict in `hpu_flash_next_mtp.py` (vocabulary-parallel
