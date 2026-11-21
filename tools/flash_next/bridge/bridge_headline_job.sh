@@ -16,7 +16,8 @@
 #   LEAN=<build id>   another prepared-replay build than the job's command names
 #   INLINE=1          two more arms, tiny-lean-inline and real-lean-inline: LEAN with PT_HPU_DISABLE_ASYNC_COLLECTIVE=1
 #                     (the stock bridge setting that issues each collective inline instead of through a job thread);
-#                     the real one only if its tiny one passed (about 16 more minutes: give the job the hold)
+#                     after the main comparison; the real one only if its tiny one passed (about 16 more minutes:
+#                     give the job the hold); BRIDGE_INLINE=1 in the job's environment does the same
 set -u
 L="${1:?LEAN build id}"
 INLINE="${BRIDGE_INLINE:-0}"
@@ -41,21 +42,27 @@ ENV=(--env VLLM_HPU_QSA_FUSED=1 --env VLLM_HPU_QSA_INDEXER_SHARD=1 --env VLLM_HP
     --env VLLM_HPU_GDN_GLUE_CACHE=1 --env VLLM_HPU_HC_FUSED_COPY_MODE=2 --env VLLM_HPU_DECODE_CUT_INTERVAL=1000
     --env VLLM_HPU_CANDIDATE_SAMPLING=1 --env VLLM_GRAPH_RESERVED_MEM=0.4 --env VLLM_HPU_PREFIX_ALIGN_SPLIT=1
     --env VLLM_HPU_PREFIX_KEEP_PROMPT_END=1 --env PT_HPU_SYNCHRONOUS_ACC_QUEUE_FLUSHING=1)
-TINY=("tiny-stock:-" "tiny-lean:$L:PT_HPU_HPUGRAPH_PREPARED_REPLAY=1,PT_HPU_HPUGRAPH_REPLAY_TIMING=2000")
-[ "$INLINE" = 1 ] && TINY+=("tiny-lean-inline:$L:PT_HPU_HPUGRAPH_PREPARED_REPLAY=1,PT_HPU_HPUGRAPH_REPLAY_TIMING=2000,PT_HPU_DISABLE_ASYNC_COLLECTIVE=1")
-bash "$J" --sha "$S" --image "$IMG" "${ENV[@]}" --cmd 'python /farm/farm_tiny.py --gdn hc' "${TINY[@]}"
+PROBE="bash $P/serve_probe.sh --levels 32,8,1 --tokens 128 --warm-tokens 48 --repeat-top 2 --no-mintok-check --probe-arg --sampled-levels=32,8,1 --probe-arg --interleave-sampled --probe-arg --rounds=2"
+# 1. the tiny gate of the main comparison
+bash "$J" --sha "$S" --image "$IMG" "${ENV[@]}" --cmd 'python /farm/farm_tiny.py --gdn hc' \
+    "tiny-stock:-" "tiny-lean:$L:PT_HPU_HPUGRAPH_PREPARED_REPLAY=1,PT_HPU_HPUGRAPH_REPLAY_TIMING=2000"
 if ! grep -q '^tiny-stock ok' "$V" || ! grep -q '^tiny-lean ok' "$V"; then
     echo "bridge_headline: a tiny arm failed: no real arm"
     cat "$V"
     exit 3
 fi
-REAL=("real-stock:-" "real-lean:$L:PT_HPU_HPUGRAPH_PREPARED_REPLAY=1,PT_HPU_HPUGRAPH_REPLAY_TIMING=5000")
-if [ "$INLINE" = 1 ] && grep -q '^tiny-lean-inline ok' "$V"; then
-    REAL+=("real-lean-inline:$L:PT_HPU_HPUGRAPH_PREPARED_REPLAY=1,PT_HPU_HPUGRAPH_REPLAY_TIMING=5000,PT_HPU_DISABLE_ASYNC_COLLECTIVE=1")
+# 2. the main comparison first, so it exists even if the inline arms run out of hold (coordinator, 03:40 UTC)
+bash "$J" --sha "$S" --image "$IMG" "${ENV[@]}" --cmd "$PROBE" \
+    "real-stock:-" "real-lean:$L:PT_HPU_HPUGRAPH_PREPARED_REPLAY=1,PT_HPU_HPUGRAPH_REPLAY_TIMING=5000"
+# 3. the inline-collective pair, its tiny arm against tiny-stock's tokens
+if [ "$INLINE" = 1 ]; then
+    bash "$J" --sha "$S" --image "$IMG" "${ENV[@]}" --cmd 'python /farm/farm_tiny.py --gdn hc' --ref-arm tiny-stock \
+        "tiny-lean-inline:$L:PT_HPU_HPUGRAPH_PREPARED_REPLAY=1,PT_HPU_HPUGRAPH_REPLAY_TIMING=2000,PT_HPU_DISABLE_ASYNC_COLLECTIVE=1"
+    if grep -q '^tiny-lean-inline ok' "$V"; then
+        bash "$J" --sha "$S" --image "$IMG" "${ENV[@]}" --cmd "$PROBE" \
+            "real-lean-inline:$L:PT_HPU_HPUGRAPH_PREPARED_REPLAY=1,PT_HPU_HPUGRAPH_REPLAY_TIMING=5000,PT_HPU_DISABLE_ASYNC_COLLECTIVE=1"
+    fi
 fi
-bash "$J" --sha "$S" --image "$IMG" "${ENV[@]}" \
-    --cmd "bash $P/serve_probe.sh --levels 32,8,1 --tokens 128 --warm-tokens 48 --repeat-top 2 --no-mintok-check --probe-arg --sampled-levels=32,8,1 --probe-arg --interleave-sampled --probe-arg --rounds=2" \
-    "${REAL[@]}"
 echo "bridge_headline: verdicts:"
 cat "$V"
 ! grep -q ' fail' "$V"

@@ -10,7 +10,8 @@
 #     ARM = name:BUILD[:KEY=VALUE[,KEY=VALUE...]]; --stop-on-fail: no further arm after one that failed;
 #     --image: every arm in that image (farm_job.sh --image: another track's build, the bundle stays this track's;
 #     the plugin is installed in an image, so its servers run the image's code); --env: for every arm, before
-#     the arm's own KEY=VALUE pairs
+#     the arm's own KEY=VALUE pairs; --ref-arm NAME: tiny arms are compared with arm NAME of an earlier call in
+#     the same job (default: the call's first tiny arm)
 #     BUILD "-" = the image's bridge; otherwise a build id of ~/farm/native-replay/bridge-build/out/, installed by
 #     with_bridge.py at the container's start (exit 7 or 8 and the arm fails if it is not what loads).
 #   e.g. stock:-  lean0:lean-0123456789ab:PT_HPU_HPUGRAPH_PREPARED_REPLAY=0
@@ -36,11 +37,13 @@ CMD=""
 STOP_ON_FAIL=0
 IMAGE_ARGS=()
 COMMON_ENV=()
+REF_ARM=""
 while [ $# -gt 0 ]; do
     case "$1" in
         --sha) SHA="$2"; shift 2 ;;
         --image) IMAGE_ARGS=(--image "$2"); shift 2 ;;
         --env) COMMON_ENV+=(--env "$2"); shift 2 ;;
+        --ref-arm) REF_ARM="$2"; shift 2 ;;
         --cmd) CMD="$2"; shift 2 ;;
         --stop-on-fail) STOP_ON_FAIL=1; shift ;;
         *) break ;;
@@ -116,10 +119,30 @@ for arm in "$@"; do
 done
 # one line per arm and level: the steady ms per token (median gap between chunks) of the measured rounds; with
 # --cmd and the tiny smoke: each arm's result and its tokens against the first arm's, prompt by prompt
-python3 - "$F/$TRACK/results" "$JOB-$NAME" "$RCS" "$VERDICTS" "$@" <<'PY' || rc_all=$?
+python3 - "$F/$TRACK/results" "$JOB-$NAME" "$RCS" "$VERDICTS" "$REF_ARM" "$@" <<'PY' || rc_all=$?
 import json, sys, os, glob
-root, prefix, rcs_path, verdicts_path, arms = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5:]
+root, prefix, rcs_path, verdicts_path, ref_arm, arms = (sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5],
+                                                         sys.argv[6:])
 tiny, first, bad = {}, None, False
+
+
+def tiny_modes(folder):
+    modes = {}
+    for path in sorted(glob.glob(os.path.join(folder, "*", "details.json"))):
+        d = json.load(open(path))
+        modes[d.get("mode") or os.path.basename(os.path.dirname(path))] = {
+            p["index"]: (p.get("match"), p.get("expected"), tuple(p.get("got") or ()), bool(p.get("near_tie")))
+            for p in d.get("prompts", [])}
+    return modes
+
+
+if ref_arm:  # the reference of the tiny arms is an arm of an earlier call in this job
+    ref_modes = tiny_modes(os.path.join(root, "%s-%s" % (prefix, ref_arm)))
+    if ref_modes:
+        first = (ref_arm, ref_modes)
+    else:
+        print("ab_bridge: --ref-arm %s has no tiny results" % ref_arm)
+        bad = True
 rcs = {}
 if os.path.exists(rcs_path):
     for line in open(rcs_path):
@@ -136,12 +159,7 @@ for arm in arms:
     details = sorted(glob.glob(os.path.join(folder, "*", "details.json")))
     if os.path.exists(os.path.join(folder, "summary.json")) and details:
         s = json.load(open(os.path.join(folder, "summary.json")))
-        modes = {}
-        for path in details:
-            d = json.load(open(path))
-            modes[d.get("mode") or os.path.basename(os.path.dirname(path))] = {
-                p["index"]: (p.get("match"), p.get("expected"), tuple(p.get("got") or ()), bool(p.get("near_tie")))
-                for p in d.get("prompts", [])}
+        modes = tiny_modes(folder)
         print("ab_bridge: %-8s tiny smoke passed=%s; %s" % (name, s.get("passed"), "; ".join(
             "%s: %s" % (m, " ".join("%s:%s/%s%s" % (i, v[0], v[1], "~" if v[3] else "") for i, v in sorted(r.items())))
             for m, r in modes.items())))
