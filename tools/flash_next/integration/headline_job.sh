@@ -362,7 +362,7 @@ while [ "$i_arm" -lt "${#ARMS[@]}" ]; do
     echo "=== headline_job: arm $arm start $(date -u +%T)"
     case "$arm" in
         tiny | tiny-chain | tiny-chain-vlg | tiny-chain-vp | tiny-m1 | tiny-m3 | tiny-m3pc1 | tiny-m3pc2 | tiny-il | \
-            tiny-shift | tiny-gv | tiny-pi)
+            tiny-shift | tiny-gv | tiny-pi | tiny-m3pc2b)
             spec=()
             case "${HEADLINE_TINY_SPEC:-0}" in [1-9]) spec=(--spec "$HEADLINE_TINY_SPEC") ;; esac
             tiny_graph="${HEADLINE_TINY_DRAFT_GRAPH:-${VLLM_HPU_MTP_DRAFT_GRAPH:-0}}"
@@ -392,6 +392,10 @@ while [ "$i_arm" -lt "${#ARMS[@]}" ]; do
                 tiny-m3pc1) tiny_graph=1; tiny_md=1; tiny_chain=1; tiny_vp=0; tiny_vlg=0; tiny_m1=2; tiny_async=2
                     tiny_nopc=0; tiny_align=1 ;;
                 tiny-m3pc2) tiny_graph=1; tiny_md=1; tiny_chain=1; tiny_vp=0; tiny_vlg=0; tiny_m1=2; tiny_async=3
+                    tiny_nopc=0; tiny_align=2 ;;
+                # build 6b (coordinator, 13:36 UTC): mode 3 with M3 on the chain's stage B (VERIFY_LOGITS_IN_GRAPH=1);
+                # its pass (and only its pass) lets the arms with the word vlgb run stage B, else they run stage A
+                tiny-m3pc2b) tiny_graph=1; tiny_md=1; tiny_chain=1; tiny_vp=0; tiny_vlg=1; tiny_m1=2; tiny_async=3
                     tiny_nopc=0; tiny_align=2 ;;
             esac
             # build 6's gates: one new flag each on the job's flags (a failure drops the arms with that word)
@@ -429,6 +433,7 @@ while [ "$i_arm" -lt "${#ARMS[@]}" ]; do
                         tiny-m1) m1_ok=0 ;;
                         tiny-m3) m3_ok=0 ;;
                         tiny-m3pc1 | tiny-m3pc2) m3_align_ok=0 ;;
+                        tiny-m3pc2b) m3b_ok=0 ;;
                         tiny-il) il_ok=0 ;;
                         tiny-shift) shift_ok=0 ;;
                         tiny-gv) gv_ok=0 ;;
@@ -459,6 +464,19 @@ while [ "$i_arm" -lt "${#ARMS[@]}" ]; do
                     if [ -z "$last" ] || grep -rqE "ASYNC_SCHED=3 acts as 2|align mode differs" "$OUT/$arm" 2>/dev/null; then
                         echo "headline_job: tiny-m3pc2: mode 3 with M3 did not serve the tiny gate: the m3a arms are left out"
                         m3_align_ok=0
+                    fi
+                fi
+                if [ "$arm" = tiny-m3pc2b ]; then
+                    m3b_ok=0
+                    last="$(grep -rhoE "VLLM_HPU_FLASH_NEXT_ASYNC_SCHED=3: [0-9]+ steps issued.*" "$OUT/$arm" 2>/dev/null | tail -n 1)"
+                    echo "headline_job: tiny-m3pc2b: ${last:-no mode-3 summary line}"
+                    if [ "$rc" -eq 0 ] && [ -n "$last" ] &&
+                        ! grep -rqE "ASYNC_SCHED=3 acts as 2|align mode differs" "$OUT/$arm" 2>/dev/null &&
+                        grep -rqE "chained behind its verification, stage B" "$OUT/$arm" 2>/dev/null; then
+                        m3b_ok=1
+                        echo "headline_job: tiny-m3pc2b passed: the vlgb arms run mode 3 with the chain's stage B"
+                    else
+                        echo "headline_job: tiny-m3pc2b did not pass (rc $rc): the vlgb arms fall back to stage A"
                     fi
                 fi
                 if [ "$arm" = tiny-m1 ] && [ "$rc" -eq 0 ]; then
@@ -631,6 +649,17 @@ while [ "$i_arm" -lt "${#ARMS[@]}" ]; do
                     chainon) draft_graph=1; arm_env+=(VLLM_HPU_MTP_DRAFT_CHAIN=1 VLLM_HPU_FLASH_NEXT_DECODE_METADATA=1)
                         needs_b6+=(chain) ;;
                     vlg) arm_env+=(VLLM_HPU_VERIFY_LOGITS_IN_GRAPH=1) ;;
+                    # build 6b: the chain's stage B only when tiny-m3pc2b passed in this job; else stage A (the proven
+                    # pair), and the job log says which
+                    vlgb)
+                        if [ "${m3b_ok:-0}" = 1 ]; then
+                            arm_env+=(VLLM_HPU_VERIFY_LOGITS_IN_GRAPH=1)
+                            echo "headline_job: arm $arm: vlgb: stage B (tiny-m3pc2b passed)"
+                        else
+                            arm_env+=(VLLM_HPU_VERIFY_LOGITS_IN_GRAPH=0)
+                            echo "headline_job: arm $arm: vlgb: stage A (tiny-m3pc2b did not pass or did not run)"
+                        fi
+                        ;;
                     md) arm_env+=(VLLM_HPU_FLASH_NEXT_DECODE_METADATA=1) ;;
                     m1on) arm_env+=(VLLM_HPU_FLASH_NEXT_SPEC_DEVICE_INPUTS=2) ;;
                     ss0) arm_env+=(PT_HPU_ENABLE_STAGE_SUBMISSION=0) ;;
