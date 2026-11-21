@@ -6532,7 +6532,9 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                 rows_per_request = 1 + int(self.speculative_config.num_speculative_tokens)
         if self.use_structured_output:
             return None, "structured output"
-        if self.use_async_scheduling:
+        if self.use_async_scheduling and os.environ.get("VLLM_HPU_CANDIDATE_SAMPLING_ASYNC", "0") != "1":
+            # async-sched job branch: VLLM_HPU_CANDIDATE_SAMPLING_ASYNC=1 keeps candidate sampling under async
+            # scheduling (CPU: the same tokens as synchronous scheduling for seeded and greedy rows together).
             return None, "async scheduling"
         builtin_processors = (LogitBiasLogitsProcessor, MinTokensLogitsProcessor)
         custom = [type(processor).__name__ for processor in self.input_batch.logitsprocs.non_argmax_invariant

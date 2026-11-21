@@ -195,6 +195,28 @@ while [ "$i_arm" -lt "${#ARMS[@]}" ]; do
                 --tokens "${HEADLINE_BISECT_TOKENS:-96}" --warm-tokens "$WARM" --repeat-top 2 --no-mintok-check \
                 --probe-arg --no-sampled-check --probe-arg "--rounds=$ROUNDS"
             ;;
+        tiny-async)
+            # async-sched track: the tiny gate with VLLM_HPU_FLASH_NEXT_ASYNC_SCHED=2: tokens against the CPU reference
+            # without speculation (async scheduling) and with MTP k = HEADLINE_TINY_SPEC (default 3; stage 1).
+            VLLM_HPU_FLASH_NEXT_ASYNC_SCHED=2 VLLM_HPU_MTP_DRAFT_LOOP="${VLLM_HPU_MTP_DRAFT_LOOP:-1}" \
+                VLLM_HPU_MTP_CHUNK_KV="${VLLM_HPU_MTP_CHUNK_KV:-1}" \
+                "$PYTHON" /farm/farm_tiny.py --gdn hc --spec "${HEADLINE_TINY_SPEC:-3}" --out "$OUT/tiny-async"
+            rc=$?
+            if [ "$rc" -ne 0 ] && [ "${HEADLINE_TINY_ABORT:-1}" = 1 ]; then
+                echo "headline_job: the tiny gate under async scheduling failed (rc $rc): no real-model server"
+                exit 7
+            fi
+            echo "=== headline_job: arm tiny-async rc=$rc end $(date -u +%T)"
+            continue
+            ;;
+        async)
+            # async-sched track: the nospec server with async scheduling (VLLM_HPU_FLASH_NEXT_ASYNC_SCHED=1), candidate
+            # sampling kept under it (VLLM_HPU_CANDIDATE_SAMPLING_ASYNC=1, this job branch only).
+            VLLM_HPU_FLASH_NEXT_ASYNC_SCHED=1 VLLM_HPU_CANDIDATE_SAMPLING_ASYNC="${VLLM_HPU_CANDIDATE_SAMPLING_ASYNC:-1}" \
+                bash "$HERE/serve_probe.sh" --out "$OUT/async" --levels "$LEVELS" --tokens "$TOKENS" \
+                --warm-tokens "$WARM" --repeat-top 2 --no-mintok-check --probe-arg "--sampled-levels=$LEVELS" \
+                --probe-arg --interleave-sampled --probe-arg "--rounds=$ROUNDS"
+            ;;
         nospec-pin)
             # B: native-replay's two host levers on A's env (never run at TP8 before): greedy 1 and 32 streams only;
             # its 1-stream text is compared with A's.
@@ -203,8 +225,11 @@ while [ "$i_arm" -lt "${#ARMS[@]}" ]; do
                 --warm-tokens "$WARM" --repeat-top 2 --no-mintok-check --probe-arg --no-sampled-check \
                 --probe-arg "--rounds=$ROUNDS"
             ;;
-        mtp[1-9] | mtp[1-9]-32 | mtp[1-9]-noshard)
+        mtp[1-9] | mtp[1-9]-32 | mtp[1-9]-noshard | mtp[1-9]-async)
             k="${arm:3:1}"
+            # async-sched track: mtp<K>-async = the same server with VLLM_HPU_FLASH_NEXT_ASYNC_SCHED=2 (stage 1).
+            async_mode="${VLLM_HPU_FLASH_NEXT_ASYNC_SCHED:-0}"
+            case "$arm" in *-async) async_mode=2 ;; esac
             levels="$LEVELS"
             case "$arm" in *-32) levels=32 ;; esac
             shard="$VLLM_HPU_QSA_INDEXER_SHARD"
@@ -217,6 +242,7 @@ while [ "$i_arm" -lt "${#ARMS[@]}" ]; do
                 sampled_args=(--probe-arg "--sampled-levels=${HEADLINE_MTP_SAMPLED_LEVELS:-32}")
                 sampled_verify="${VLLM_HPU_SPEC_SAMPLED_VERIFY:-1}"
             fi
+            VLLM_HPU_FLASH_NEXT_ASYNC_SCHED="$async_mode" \
             VLLM_HPU_QSA_INDEXER_SHARD="$shard" VLLM_HPU_SPEC_SAMPLED_VERIFY="$sampled_verify" \
             VLLM_HPU_GDN_CORE_VERIFY="${VLLM_HPU_GDN_CORE_VERIFY:-1}" VLLM_HPU_MTP_TIMING="${VLLM_HPU_MTP_TIMING:-1}" \
                 VLLM_HPU_MTP_DRAFT_LOOP="${VLLM_HPU_MTP_DRAFT_LOOP:-1}" VLLM_HPU_MTP_CHUNK_KV="${VLLM_HPU_MTP_CHUNK_KV:-1}" \
