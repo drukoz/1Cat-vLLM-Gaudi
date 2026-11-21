@@ -1907,7 +1907,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # (v1/sample/candidate_sampling.py): the 64 largest logits per row are taken in the LM-head region and
     # temperature, top-k, top-p and the draw run on [rows, 64] with noise made on the host; no sampler graph. A
     # step whose requests are outside its conditions (top_k unset or above 64, min_p, penalties, logit_bias,
-    # logprobs, a custom logits processor, speculation, structured output) keeps vLLM's sampler. Same
+    # logprobs, a custom logits processor, speculation unless 2, structured output) keeps vLLM's sampler. Same
     # distribution as vLLM's; the random stream differs. 2 = 1, and the decode steps of a speculative server with
     # deterministic drafts (MTP, n-gram) sample every verification row and the bonus row in the region, then the
     # runner verifies the drafts against those draws (greedy_rejection_sample_from_tokens): speculative sampling

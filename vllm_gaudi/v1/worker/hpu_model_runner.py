@@ -6365,8 +6365,9 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                 rows_per_request = 1 + int(self.speculative_config.num_speculative_tokens)
         if self.use_structured_output:
             return None, "structured output"
-        if self.use_async_scheduling:
-            return None, "async scheduling"
+        # Async scheduling (async-sched track, feat/flash-next-gaudi-async-sched): the region's draws do not read the
+        # step's own output and its noise comes from the host; seeded and greedy requests give the synchronous
+        # tokens there (CPU, 2026-11-21), so it is not refused.
         builtin_processors = (LogitBiasLogitsProcessor, MinTokensLogitsProcessor)
         custom = [type(processor).__name__ for processor in self.input_batch.logitsprocs.non_argmax_invariant
                   if not isinstance(processor, builtin_processors)]
