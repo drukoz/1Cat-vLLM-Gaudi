@@ -4,7 +4,7 @@ Design note, report and handoff of the `hc-kernels` track (branch `feat/flash-ne
 `/Volumes/Storage/Claude/gaudi-work/wt/hc-kernels`). The harness refuses report files for this agent, so this note is
 the report. Labels: MEASURED (card), VERIFIED (simulator or CPU test named), INFERRED (arithmetic or reading).
 
-## 0. Handoff (if this agent stops) — updated 13:12 UTC 2026-11-21
+## 0. Handoff (if this agent stops) — updated 13:10 UTC 2026-11-21
 
 - **Goal 1:** the two hyper-connection TPC kernels (`hc_fused_gate_mix`, `hc_fused_combine_norm`) at 128
   verification rows (32 streams, MTP k = 3) from about 7 ms per step to about 2 ms. **Goal 2:** the GDN verify kernel
