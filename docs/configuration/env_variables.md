@@ -104,6 +104,16 @@ selects are put back to bf16 for them). It halves the per-token K/V bytes: at TP
 13,056 -> 6,912 bytes per token and rank including the indexer's keys, so about 5.4M
 tokens of KV instead of 2.8M at `VLLM_GRAPH_RESERVED_MEM=0.4`. Any other value is `0`.
 
+`VLLM_HPU_QSA_KV_FP8=2` keeps the FP8 K/V storage of `1` and gives every QSA layer a static
+scale for K and one for V, read from `VLLM_HPU_QSA_KV_FP8_SCALES` (a JSON file:
+`{"layers": {"<layer index>": {"k_amax": ..., "v_amax": ...}}, "fp8_max": 240, "margin": 1.0}`;
+scale = amax * margin / fp8_max). The layer's largest K (V) then maps to the top of E4M3 and its
+small elements stay normal numbers; at scale 1.0, elements below 2**-6 lose mantissa bits and
+those below 2**-9 become 0. A layer the file does not name keeps 1.0. The file comes from a
+calibration server run with `VLLM_HPU_QSA_KV_STATS=<folder>` and `--enforce-eager` (every QSA
+layer records the amax of its K and V into `<folder>/kv_amax_rank<r>.json`; it reads tensors back
+to the host), merged over the ranks by `tools/flash_next/rental/kv_scales.py OUT FOLDER`.
+
 `VLLM_HPU_QSA_SLOT_SHIFT` chooses how the Flash-Next sparse QSA decode maps its attended
 positions to K/V cache slots (`decode_selected_slots`: the block `pos // block_size` and the
 offset `pos % block_size` over `[rows, 2,051]` positions). `0` (default): integer division and

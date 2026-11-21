@@ -76,7 +76,7 @@ class QsaMode(enum.IntEnum):
 def qsa_kv_cache_dtype_allowed(cache_dtype: str, kv_fp8: int) -> bool:
     """Whether a QSA layer serves this main KV cache dtype: bf16 (``auto``, ``bfloat16``) always, and the backend's
     FP8 storage ``fp8_inc`` with ``VLLM_HPU_QSA_KV_FP8=1`` (E4M3 K/V, bf16 attention math; qsa_hpu_attention)."""
-    return cache_dtype in ("auto", "bfloat16") or (cache_dtype == "fp8_inc" and int(kv_fp8) == 1)
+    return cache_dtype in ("auto", "bfloat16") or (cache_dtype == "fp8_inc" and int(kv_fp8) in (1, 2))
 
 
 def platform_is_hpu() -> bool:
@@ -558,6 +558,7 @@ class HpuQwen4ExpQSAAttention(Qwen4ExpQSAAttention):
         if not qsa_kv_cache_dtype_allowed(cache_config.cache_dtype, envs.VLLM_HPU_QSA_KV_FP8):
             raise NotImplementedError("Qwen4Exp QSA requires a BF16 main KV cache, or with VLLM_HPU_QSA_KV_FP8=1 "
                                       f"--kv-cache-dtype fp8_inc; got {cache_config.cache_dtype!r}")
+        self.kv_layer_id = int(layer_id)  # the key of VLLM_HPU_QSA_KV_FP8_SCALES and VLLM_HPU_QSA_KV_STATS
         if getattr(quant_config, "kv_cache_scheme", None) is not None:
             raise NotImplementedError("Qwen4Exp QSA does not support KV quantization")
         parallel_config = vllm_config.parallel_config
@@ -649,7 +650,7 @@ class HpuQwen4ExpQSAAttention(Qwen4ExpQSAAttention):
         if self.qsa_mode is QsaMode.SPARSE and platform_is_hpu():
             try:
                 from vllm_gaudi.models.qwen4_exp.qsa_hpu_attention import HpuQsaSparseAttention
-                self.sparse_attn = HpuQsaSparseAttention(self.attn)
+                self.sparse_attn = HpuQsaSparseAttention(self.attn, layer_id=layer_id)
             except Exception as exc:
                 raise RuntimeError(
                     f"VLLM_HPU_FLASH_NEXT_QSA_MODE={int(QsaMode.SPARSE)} (sparse QSA) needs the HPU sparse "
@@ -692,6 +693,9 @@ class HpuQwen4ExpQSAAttention(Qwen4ExpQSAAttention):
         k = self.k_norm(k.view(-1, self.num_kv_heads, self.head_dim)).view(-1, self.num_kv_heads * self.head_dim)
 
         q, k = self.rotary_emb(positions, q, k)
+        if envs.VLLM_HPU_QSA_KV_STATS:
+            from vllm_gaudi.models.qwen4_exp.qsa_hpu_attention import record_kv_stats
+            record_kv_stats(envs.VLLM_HPU_QSA_KV_STATS, self.kv_layer_id, k, v)
 
         md = self._forward_metadata()
         if (self.qsa_mode is QsaMode.SPARSE and self.indexer.compressed_key_cache is not None

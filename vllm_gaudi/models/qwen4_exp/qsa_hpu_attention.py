@@ -80,6 +80,75 @@ def prefill_selection_bias(selected: torch.Tensor, context_lens: torch.Tensor, n
     return bias.masked_fill(nothing_selected, 0.0).unsqueeze(1)
 
 
+def kv_fp8_scales(path: str, layer_id: int) -> tuple[float, float] | None:
+    """``(k_scale, v_scale)`` of QSA layer ``layer_id`` from a calibration file (VLLM_HPU_QSA_KV_FP8_SCALES):
+    ``amax * margin / fp8_max`` each, so the layer's largest K (V) maps to the top of E4M3; None when the file or the
+    layer is missing."""
+    import json
+    try:
+        data = json.load(open(path))
+    except (OSError, ValueError, TypeError):
+        return None
+    rec = (data.get("layers") or {}).get(str(int(layer_id)))
+    if not rec:
+        return None
+    top = float(data.get("fp8_max", 240.0)) / float(data.get("margin", 1.0))
+    k_amax, v_amax = float(rec.get("k_amax", 0.0)), float(rec.get("v_amax", 0.0))
+    if k_amax <= 0.0 or v_amax <= 0.0:
+        return None
+    return k_amax / top, v_amax / top
+
+
+def set_kv_fp8_scales(impl, layer_id: int, path: str) -> tuple[float, float]:
+    """VLLM_HPU_QSA_KV_FP8=2: give this layer's FP8 K and V caches (VLLMFP8KVCache: they store ``x * input_scale``
+    and dequantize with ``output_scale``) the layer's static scales; ``(1.0, 1.0)`` when the file has none."""
+    import logging
+    scales = kv_fp8_scales(path, layer_id) if path else None
+    if scales is None:
+        logging.getLogger(__name__).warning("VLLM_HPU_QSA_KV_FP8=2: no scales for QSA layer %s in %r: scale 1.0",
+                                            layer_id, path)
+        return 1.0, 1.0
+    for cache, scale in ((impl.k_cache, scales[0]), (impl.v_cache, scales[1])):
+        cache.input_scale = 1.0 / scale
+        cache.output_scale = scale
+    return scales
+
+
+_KV_STATS: dict = {}
+
+
+def record_kv_stats(folder: str, layer_id: int, k: torch.Tensor, v: torch.Tensor, every: int = 16) -> None:
+    """VLLM_HPU_QSA_KV_STATS (calibration servers, --enforce-eager: host reads): the running amax of the K this
+    layer stores and of its V, the fraction of elements below 2**-6, and the call count, written to
+    ``<folder>/kv_amax_rank<r>.json`` every ``every`` calls of any layer."""
+    import json
+    import os
+    if k.numel() == 0:
+        return
+    ka, va = k.detach().abs().float(), v.detach().abs().float()
+    rec = _KV_STATS.setdefault(str(int(layer_id)), {"k_amax": 0.0, "v_amax": 0.0, "k_small": 0.0, "v_small": 0.0,
+                                                    "calls": 0, "elements": 0})
+    rec["k_amax"] = max(rec["k_amax"], float(ka.max()))
+    rec["v_amax"] = max(rec["v_amax"], float(va.max()))
+    n = int(ka.numel())
+    rec["k_small"] = (rec["k_small"] * rec["elements"] + float((ka < 2**-6).float().sum())) / (rec["elements"] + n)
+    rec["v_small"] = (rec["v_small"] * rec["elements"] + float((va < 2**-6).float().sum())) / (rec["elements"] + n)
+    rec["elements"] += n
+    rec["calls"] += 1
+    total = sum(r["calls"] for r in _KV_STATS.values())
+    if total % every == 0:
+        try:
+            from vllm.distributed import get_tensor_model_parallel_rank
+            rank = int(get_tensor_model_parallel_rank())
+        except Exception:  # noqa: BLE001 - no TP group (tests)
+            rank = 0
+        os.makedirs(folder, exist_ok=True)
+        path = os.path.join(folder, f"kv_amax_rank{rank}.json")
+        with open(path + ".tmp", "w") as f:
+            json.dump({"rank": rank, "layers": _KV_STATS}, f, indent=1)
+        os.replace(path + ".tmp", path)
+
+
 def decode_selected_slots(selected: torch.Tensor,
                           block_table: torch.Tensor,
                           block_size: int,
@@ -234,7 +303,7 @@ class HpuQsaSparseAttention(torch.nn.Module):
     ``ForwardContext.virtual_engine`` and no per-engine cache list.
     """
 
-    def __init__(self, attn) -> None:
+    def __init__(self, attn, layer_id: int | None = None) -> None:
         super().__init__()
         self.attn = attn
         impl = attn.impl
@@ -248,8 +317,11 @@ class HpuQsaSparseAttention(torch.nn.Module):
         # K/V storage through the backend's caches, bf16 attention math, the decode gather dequantized.
         self.kv_fp8 = getattr(impl, "kv_cache_dtype", None) == "fp8_inc"
         self.k_dequant = self.v_dequant = None
+        self.kv_scales = (1.0, 1.0)
         if self.kv_fp8:
             bf16_attention_math(impl)
+            if int(envs.VLLM_HPU_QSA_KV_FP8) == 2 and layer_id is not None:
+                self.kv_scales = set_kv_fp8_scales(impl, layer_id, envs.VLLM_HPU_QSA_KV_FP8_SCALES)
             self.k_dequant = getattr(impl.k_cache, "dequant_output", None) or (lambda t: t.to(torch.bfloat16))
             self.v_dequant = getattr(impl.v_cache, "dequant_output", None) or (lambda t: t.to(torch.bfloat16))
 

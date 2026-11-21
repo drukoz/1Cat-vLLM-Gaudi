@@ -533,6 +533,8 @@ if TYPE_CHECKING:
     VLLM_HPU_QSA_INDEXER_SHARD: int = 0  # QsaShardMode: 0 replicated (default), 1 by request (int32), 2 by request (fp32)
     VLLM_HPU_QSA_TABLE_WIDTH: int = 0  # decode block-table columns: 0 the engine's longest context (default), 1 the batch's
     VLLM_HPU_QSA_KV_FP8: int = 0  # 1: the QSA layers accept --kv-cache-dtype fp8_inc (FP8 K/V storage, bf16 attention)
+    VLLM_HPU_QSA_KV_FP8_SCALES: str = ""  # with VLLM_HPU_QSA_KV_FP8=2: the per-layer K/V amax JSON (calibration)
+    VLLM_HPU_QSA_KV_STATS: str = ""  # a folder: every QSA layer records its K/V amax (calibration, host reads)
     VLLM_HPU_QSA_SLOT_SHIFT: int = 0  # decode slot mapping: 0 // and % (default), 1 shift and mask, 2 through float32
     VLLM_HPU_QSA_TOPK_FORM: int = 0  # mode-1 decode top-k: 0 topk sorted (default), 1 unsorted, 2 two stages, 3 threshold
     VLLM_HPU_GDN_CORE_DECODE: int = 1  # GdnCoreDecodeMode: 1 fused (default), 0 off, 2 recurrence
@@ -1925,6 +1927,20 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # K/V bytes: at TP8 13,056 -> 6,912 bytes per token and rank with the indexer's keys. Any other value is 0.
     "VLLM_HPU_QSA_KV_FP8":
     lambda: int(os.environ.get("VLLM_HPU_QSA_KV_FP8", "0")),
+    # VLLM_HPU_QSA_KV_FP8=2: FP8 K/V storage with one static scale per QSA layer for K and one for V, from this JSON
+    # ({"layers": {"<layer index>": {"k_amax": .., "v_amax": ..}}, "fp8_max": 240, "margin": 1.0}; scale = amax *
+    # margin / fp8_max, so the layer's largest K and V map to the top of E4M3 and its small elements stay normal
+    # numbers): VLLMFP8KVCache stores x / scale and dequantizes with the scale. A layer the file does not name keeps
+    # 1.0. Written by a calibration server with VLLM_HPU_QSA_KV_STATS (tools/flash_next/rental/kv_scales.py merges
+    # the ranks' files). Unset or unreadable: every layer keeps 1.0 (logged).
+    "VLLM_HPU_QSA_KV_FP8_SCALES":
+    lambda: os.environ.get("VLLM_HPU_QSA_KV_FP8_SCALES", ""),
+    # A folder (calibration servers only, run with --enforce-eager: it reads tensors back to the host). Every QSA
+    # layer records the amax of the K it stores (after k_norm and RoPE) and of its V, and the fraction of elements
+    # below 2**-6 (E4M3's smallest normal number at scale 1.0), into <folder>/kv_amax_rank<r>.json every 16
+    # calls. Unset (default): nothing.
+    "VLLM_HPU_QSA_KV_STATS":
+    lambda: os.environ.get("VLLM_HPU_QSA_KV_STATS", ""),
     # How the Flash-Next sparse QSA decode maps its attended positions to K/V cache slots
     # (qsa_hpu_attention.decode_selected_slots: block_table[pos // block_size] * block_size + pos % block_size over
     # [rows, 2,051]). 0 (default) = integer division and remainder, which the card runs as emulated int32 division:
