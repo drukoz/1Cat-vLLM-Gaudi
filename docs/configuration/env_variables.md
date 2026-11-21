@@ -104,6 +104,14 @@ selects are put back to bf16 for them). It halves the per-token K/V bytes: at TP
 13,056 -> 6,912 bytes per token and rank including the indexer's keys, so about 5.4M
 tokens of KV instead of 2.8M at `VLLM_GRAPH_RESERVED_MEM=0.4`. Any other value is `0`.
 
+`VLLM_HPU_QSA_SLOT_SHIFT` chooses how the Flash-Next sparse QSA decode maps its attended
+positions to K/V cache slots (`decode_selected_slots`: the block `pos // block_size` and the
+offset `pos % block_size` over `[rows, 2,051]` positions). `0` (default): integer division and
+remainder, which the card runs as emulated int32 division (94 us each per QSA layer at 128 rows,
+build 4). `1`: shift and mask. `2`: through float32 (`floor(pos * 2**-s)`, exact below `2**24`).
+Every form gives the same slots; forms 1 and 2 need a power-of-two block size (another size
+keeps form 0).
+
 `VLLM_HPU_GDN_CORE_DECODE` selects the GDN decode core path as an integer.
 `1` (default) is fused: every non-speculative decode step runs through the
 fused core op `torch.ops.flashinfer_gaudi.gdn_core_decode` (conv, gates,
