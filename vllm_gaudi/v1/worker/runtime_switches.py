@@ -19,8 +19,10 @@ from typing import Optional
 
 # VLLM_HPU_VOCAB_PARALLEL_LOGITS is read at every call of the logits region (distributed/vocab_parallel.mode()),
 # which runs as lazy ops after the replayed decode graph: switching it changes the region's graph, not a captured one.
+# VLLM_HPU_VERIFY_LOGITS_IN_GRAPH is read at every decode step (_can_fuse_plain_greedy_sampling,
+# _verify_logits_in_graph); on, the forward takes one more argument, so the verify graph is captured again for it.
 SWITCHABLE = ("VLLM_HPU_FLASH_NEXT_DECODE_METADATA", "VLLM_HPU_FUSED_GREEDY_LOGITS", "VLLM_HPU_CANDIDATE_SAMPLING",
-              "VLLM_HPU_VOCAB_PARALLEL_LOGITS",
+              "VLLM_HPU_VOCAB_PARALLEL_LOGITS", "VLLM_HPU_VERIFY_LOGITS_IN_GRAPH",
               "VLLM_HPU_WORKER_GC_FREEZE")
 
 

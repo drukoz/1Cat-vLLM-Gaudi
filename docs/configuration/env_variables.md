@@ -138,6 +138,8 @@ every row's greedy token)`: int32 `[rows]` in logits-indices order, taken from a
 as `argmax`); with `VLLM_HPU_VOCAB_PARALLEL_LOGITS` `1` or `2` each rank's arg max and a `[rows, 2]` all-gather
 instead of the logits. The final hyper-connection mix, the LM head and the arg max are then one graph segment, and
 the runner verifies the drafts from those tokens (`greedy_rejection_sample_from_tokens`). Any other value is `0`.
+The runner reads it at every decode step, so `VLLM_HPU_RUNTIME_SWITCH_FILE` can switch it on a running server (the
+verify graph is captured again for the extra argument).
 
 `VLLM_HPU_PERSISTENT_INPUTS` (integer, default `0`) sets how a decode step's inputs reach the device. With `0`
 every input of every step is a fresh device tensor copied from an unpinned host tensor (`async_h2d_copy`: a device
