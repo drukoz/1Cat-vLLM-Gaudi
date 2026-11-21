@@ -9,6 +9,12 @@ garbage). Only the standard library; talks to the OpenAI-compatible endpoint of 
     python3 text_check.py --out texts_1.json --streams 1 --prompts 6 --tokens 600
     python3 text_check.py --out texts_32.json --streams 32 --tokens 600
     python3 text_check.py --compare a/texts_1.json b/texts_1.json
+    python3 text_check.py --churn --out texts_churn.json   # the plan-invalidation round (lean5)
+
+``--churn`` runs each of the 1-stream prompts alone again, but first serves around it what invalidates the
+bridge's static launch plans and moves memory: a 32-stream burst, one long prompt (``--long-tokens``, default
+20000, prefilled with a few generated tokens) and an 8-stream burst. The measured prompt then runs alone, so its
+text must equal the plain 1-stream text of the same prompt.
 
 The comparison prints per prompt "same" or the first differing character, and a garbage check of each text (the
 share of the replacement character and of the longest run of one repeated character).
@@ -72,6 +78,28 @@ def garbage(text: str) -> dict:
     return {"replacement_share": round(text.count("�") / max(1, len(text)), 4), "longest_run": best}
 
 
+def long_prompt(tokens: int) -> str:
+    """About ``tokens`` tokens of plain text (about 1.3 words per token in English prose is enough here)."""
+    sentence = ("The keeper wrote down the weather, the ships, the tides and the light every hour of the night. ")
+    words = max(1, int(tokens * 0.75))
+    reps = max(1, words // len(sentence.split()))
+    return "Summarise this log in one sentence.\n" + sentence * reps
+
+
+def churn(base: str, model: str, prompts: list, tokens: int, long_tokens: int, timeout: float) -> list:
+    """Each prompt alone after a 32-stream burst, a long prefill and an 8-stream burst."""
+    results = []
+    burst = [PROMPTS[i % len(PROMPTS)] + " (burst %d)" % i for i in range(32)]
+    for prompt in prompts:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=32) as pool:
+            list(pool.map(lambda p: one(base, model, p, 64, timeout), burst))
+        one(base, model, long_prompt(long_tokens), 8, timeout)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+            list(pool.map(lambda p: one(base, model, p, 64, timeout), burst[:8]))
+        results.append(one(base, model, prompt, tokens, timeout))
+    return results
+
+
 def compare(a_path: str, b_path: str) -> int:
     a = json.load(open(a_path))["results"]
     b = json.load(open(b_path))["results"]
@@ -101,6 +129,8 @@ def main() -> int:
     ap.add_argument("--tokens", type=int, default=600)
     ap.add_argument("--timeout", type=float, default=900.0)
     ap.add_argument("--compare", nargs=2, metavar=("A", "B"))
+    ap.add_argument("--churn", action="store_true", help="the plan-invalidation round (see the module text)")
+    ap.add_argument("--long-tokens", type=int, default=20000)
     args = ap.parse_args()
     if args.compare:
         return compare(*args.compare)
@@ -110,11 +140,15 @@ def main() -> int:
     prompts = [PROMPTS[i % len(PROMPTS)] + ("" if i < len(PROMPTS) else " (variant %d)" % (i // len(PROMPTS)))
                for i in range(n)]
     t0 = time.time()
-    with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, args.streams)) as pool:
-        results = list(pool.map(lambda p: one(base, model, p, args.tokens, args.timeout), prompts))
+    if args.churn:
+        results = churn(base, model, prompts, args.tokens, args.long_tokens, args.timeout)
+    else:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, args.streams)) as pool:
+            results = list(pool.map(lambda p: one(base, model, p, args.tokens, args.timeout), prompts))
     report = {"model": model, "streams": args.streams, "tokens": args.tokens, "seconds": round(time.time() - t0, 1),
-              "results": results}
-    out = args.out or os.path.join(os.environ.get("FARM_OUT", "."), "texts_%d.json" % args.streams)
+              "churn": args.churn, "results": results}
+    name = "texts_churn.json" if args.churn else "texts_%d.json" % args.streams
+    out = args.out or os.path.join(os.environ.get("FARM_OUT", "."), name)
     with open(out, "w") as fh:
         json.dump(report, fh, indent=1)
     worst = max((garbage(r["text"])["longest_run"] for r in results), default=0)

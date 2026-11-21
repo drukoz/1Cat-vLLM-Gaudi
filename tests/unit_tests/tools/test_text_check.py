@@ -61,3 +61,19 @@ def test_garbage():
     assert tc.garbage("abc")["longest_run"] == 1
     assert tc.garbage("a!!!!!b")["longest_run"] == 5
     assert tc.garbage("��ab")["replacement_share"] == 0.5
+
+
+def test_churn_round(tmp_path, monkeypatch):
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _Stub)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        out = tmp_path / "churn.json"
+        monkeypatch.setattr("sys.argv", ["text_check.py", "--port", str(server.server_address[1]), "--out", str(out),
+                                         "--churn", "--prompts", "2", "--tokens", "16", "--long-tokens", "200"])
+        assert tc.main() == 0
+        report = json.loads(out.read_text())
+        assert report["churn"] is True and len(report["results"]) == 2
+        assert report["results"][0]["text"].startswith("echo: Write a long")
+    finally:
+        server.shutdown()
+    assert len(tc.long_prompt(1000).split()) > 600
