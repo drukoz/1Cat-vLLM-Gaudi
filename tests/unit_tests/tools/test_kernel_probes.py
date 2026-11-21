@@ -16,6 +16,8 @@
 * ``probe_hc_copies.py`` (the owned copies in front of the fused hyper-connection ops): every copy mode returns
   the bits of mode 0.
 * ``decode_ab_client.py --compare``: the 1-stream rounds are the test of two arms' texts.
+* ``probe_moe_forms.py`` (the coordinator's MoE plan: the 2-D gate / up GEMM, the sum as a matmul, W2 with a shared
+  scale; the small-row forms with a per-tensor scale): every form runs; the exact forms equal the dense form.
 * ``probe_moe_grouped.py`` (only the routed pairs, at most C per expert, against the dense form and the vendor op
   with chunk 64): with no pair beyond C the grouped result is the dense form's; the overflow counts and the op
   counts are printed.
@@ -114,6 +116,19 @@ def test_moe_grouped_probe_matches_the_dense_form_and_counts_overflow(tmp_path):
            for line in out.splitlines() if " aten ops per layer" in line}
     assert set(ops) == {"dense", "grouped"}, ops
     assert "VERDICT moe-grouped: rows 16: vendor-chunk64" in out
+
+
+def test_moe_forms_probe_runs_every_form_and_the_exact_forms_match_dense(tmp_path):
+    proc, out = _run([PROBES / "probe_moe_forms.py", "--out", tmp_path / "mf", "--layers", "2", "--iters", "1",
+                      "--big-rows", "64", "--small-rows", "3", "--local", "32"], tmp_path)
+    assert proc.returncode == 0, out[-3000:]
+    timed = [line for line in out.splitlines() if "us per layer wall" in line]
+    assert len(timed) == 8 and not any("ERROR" in line for line in out.splitlines()), out[-3000:]
+    against = {line.split(" form ")[1].split()[0]: float(line.split("mean ")[1].split()[0])
+               for line in out.splitlines() if " x even " in line and " against dense:" in line}
+    assert against["flat13"] < 1e-6 and against["flat13-mmsum"] < 1e-3  # (a) and the ones-matmul sum are exact
+    assert against["flatdown"] > 0  # (c2) rounds W2 twice
+    assert "form vendor-t  " in out and "VERDICT moe-forms" in out
 
 
 def test_view_probe_selftest(tmp_path):
