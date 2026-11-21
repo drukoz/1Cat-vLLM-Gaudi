@@ -278,13 +278,17 @@ def sampled_rejection_sample(
     n_draft = cumulative - torch.cat((torch.zeros(1, dtype=torch.int32, device=device), cumulative[:-1]))
     pos = torch.arange(max_draft, device=device, dtype=torch.int32).unsqueeze(0)
     valid = pos < n_draft.unsqueeze(1)
+    # Prompt lookup pads with -1 (the n-gram placeholder of a request without a match, the hybrid's padding of a
+    # draft shorter than k) and the runner counts the padding as drafts: such a position is never accepted, and
+    # the token drawn there comes from the whole target row (nothing to exclude).
+    real = draft >= 0
     draft_ids = draft.reshape(-1).clamp(0, vocab_size - 1)
 
     probs = target_logits.softmax(dim=-1, dtype=torch.float32)
     flat = torch.arange(num_tokens, device=device, dtype=torch.int32) * vocab_size + draft_ids
     p_draft = torch.index_select(probs.reshape(-1), 0, flat).view(batch_size, max_draft)
     uniform = _uniform(num_tokens, max_draft, num_draft_tokens, sampling_metadata.generators, device)
-    accepted_sampled = p_draft >= uniform.view(batch_size, max_draft)
+    accepted_sampled = (p_draft >= uniform.view(batch_size, max_draft)) & real
 
     q = torch.empty((batch_size, vocab_size), dtype=torch.float32, device=device)
     q.exponential_()
@@ -294,7 +298,8 @@ def sampled_rejection_sample(
     request = torch.arange(num_tokens, device=device, dtype=torch.int32) // max_draft
     scores = probs / torch.index_select(q, 0, request)
     vocab = torch.arange(vocab_size, device=device, dtype=torch.int32)
-    scores = torch.where(vocab.unsqueeze(0) == draft_ids.unsqueeze(1), torch.zeros_like(scores), scores)
+    excluded = (vocab.unsqueeze(0) == draft_ids.unsqueeze(1)) & real.reshape(-1, 1)
+    scores = torch.where(excluded, torch.zeros_like(scores), scores)
     recovered = scores.argmax(dim=-1).to(torch.int32).view(batch_size, max_draft)
 
     target_argmax = target_logits.argmax(dim=-1).to(torch.int32).view(batch_size, max_draft)
