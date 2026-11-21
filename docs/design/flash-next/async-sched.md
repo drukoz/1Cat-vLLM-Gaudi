@@ -6,7 +6,7 @@ results are under `/Volumes/Storage/Claude/gaudi-work/reports/async-sched/card/`
 
 ## Handoff (if this agent stops)
 
-Updated 2026-11-21 11:25 UTC.
+Updated 2026-11-21 11:40 UTC.
 
 - **Card results so far** (placement on, MTP timers 0, compare arms within a job only):
   - 00220, mode 1 with `d3fb1b11` (MEASURED). ms/token sync → async: 1 stream greedy 27.9 → 29.4, sampled
@@ -42,9 +42,10 @@ Updated 2026-11-21 11:25 UTC.
     kept, as asked). s2 merges it with the `SWITCHABLE` union only: scratch branch `s2-pi` in
     `scratchpad/m1clone`, where the stage 2 engine files run with `VLLM_HPU_PERSISTENT_INPUTS=1`
     (`reports/async-sched/logs/tests_s2_pi.log`).
-- **Card job 00237** `real8-async-m3c` (all, 85 min; replaced 00233, which had replaced 00229; starts after
+- **Card job 00240** `real8-async-m3d` (all, 85 min; replaced 00237, which replaced 00233 and 00229; starts after
   mtp-draft-graph's 00230, by 14:21 UTC at the latest).
-  - Job branch `feat/flash-next-gaudi-async-sched-m3-b5` at `107dcf9a` (never merge it): the M2 job branch
+  - Job branch `feat/flash-next-gaudi-async-sched-m3-b5` at `1a70d353` (never merge it; `1a70d353` makes a failed
+    `tiny-m3` gate leave out the `async3` arms, which `107dcf9a` of 00237 did not): the M2 job branch
     `44a51fcd` (build 5 + their chain + M1 + M2) + M3 + the M1 fix + harness: gates `tiny-m3pc1` (prefix caching on,
     mode 2, M3 = 1; passes only with M3's check line at 0 differences) and `tiny-m3pc2` (mode 3 + M3 = 2; passes only
     if steps were issued early and nothing acted as 2), word `m3a` (M3 = 2; the arm is left out when a `tiny-m3pc`
@@ -57,7 +58,7 @@ Updated 2026-11-21 11:25 UTC.
     `PT_HPU_SYNCHRONOUS_ACC_QUEUE_FLUSHING=1`, `VLLM_HPU_QSA_SLOT_SHIFT=0`, chain + draft graph + I01 +
     `SPEC_DEVICE_INPUTS=2`, levels 32/8/1, greedy, 2 rounds, step timer mode 1, MTP timers 0,
     `HEADLINE_PLACE_SWITCH=/results/switches/place`, `HEADLINE_HOLD_S=5040`. The waiter writes
-    `reports/async-sched/logs/wait_00237.out`; else `bin/farm fetch async-sched 00237 00237-real8-async-m3c`.
+    `reports/async-sched/logs/wait_00240.out`; else `bin/farm fetch async-sched 00240 00240-real8-async-m3d`.
   - Read: the `tiny-m3`, `tiny-m3pc1`, `tiny-m3pc2` lines in the job log; `python3 -I
     reports/async-sched/tools/ab_table.py <dir> --pairs mtp2-async3-cuts-nopc-greedy:mtp2-async-cuts-nopc-greedy,
     mtp2-async3-cuts-greedy-m3a-turns:mtp2-async-cuts-greedy-turns`; `timer_spans.py <dir>` (mode 3's gain shows as
@@ -69,7 +70,7 @@ Updated 2026-11-21 11:25 UTC.
   `place` (the coordinator sets it). `on` = `VLLM_HPU_WORKER_CPU_PIN=1` + `place_wrap.sh` + `place.sh` (rule a^1);
   `place` = the placement without the pin flag. Scripts in `~/farm/async-sched/results/bench` (md5 363bcf9d and
   7e54f2de); spec-lookup hard-links them.
-- **Next**: read 00237; merge the program head into s2, gate, PR; an async arm with persistent inputs; sampled with
+- **Next**: read 00240; merge the program head into s2, gate, PR; an async arm with persistent inputs; sampled with
   mtp-draft-graph's D2.
 - The 1-token prompt note: spec-lookup's `005e1ff9` is not on the program branch yet. When it is, put prompt 0 back
   into `_serve_staggered`.
