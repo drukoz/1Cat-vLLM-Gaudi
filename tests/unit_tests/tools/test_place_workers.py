@@ -71,3 +71,17 @@ def test_apply_moves_threads():
     # a second pass changes nothing
     assert pw.apply(plan, {0: 10, 1: 20}, setaffinity=setaffinity, getaffinity=lambda t: aff[t],
                     tids=lambda pid: threads[pid], pids=lambda: [10, 20, 30], allowed=range(8))["moved"] == 0
+
+
+def test_server_tree_leaves_the_job_shells_alone(tmp_path):
+    # /proc of a container: 1 init, 10 job shell (bash), 20 serve script (bash), 30 API server (python),
+    # 40 engine core, 50 and 51 workers, 60 a probe client started by the job shell, 70 a second job shell
+    procs = {1: (0, "tini"), 10: (1, "bash"), 20: (10, "bash"), 30: (20, "python3"), 40: (30, "python3"),
+             50: (40, "python3"), 51: (40, "python3"), 60: (10, "python3"), 70: (1, "bash")}
+    for pid, (ppid, comm) in procs.items():
+        d = tmp_path / str(pid)
+        d.mkdir()
+        (d / "stat").write_text("%d (%s) S %d 0 0 0" % (pid, comm, ppid))
+        (d / "comm").write_text(comm + "\n")
+    tree = pw.server_tree({0: 50, 1: 51}, proc=str(tmp_path))
+    assert tree == {30, 40, 50, 51}

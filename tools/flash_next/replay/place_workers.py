@@ -11,8 +11,11 @@ Run once inside the server's container, as root, right after the server is healt
 - every worker's main thread (the process's first thread, which runs the model) gets one vCPU of its own, in the
   worker's share of the container's CPUs (the same equal shares as ``VLLM_HPU_WORKER_CPU_PIN=1``);
 - that vCPU's sibling (by ``PLACE_SIBLING_RULE``: ``a+N/2``, ``a^1``, or empty when unknown) gets no thread at all;
-- the worker's other threads keep to the rest of its share; every other process of the container keeps off the
-  reserved vCPUs;
+- the worker's other threads keep to the rest of its share; every other process of the server's own process tree
+  (the API server, the engine core, their helpers) keeps off the reserved vCPUs. Processes outside it, such as the
+  job's shells, keep their CPUs: a shell that starts the next server must hand it the whole CPU set (integration's
+  job 00222 started six servers in one container, and each one inherited fewer CPUs from the shells the first
+  version had moved);
 - a background copy re-applies it every 2 s (a thread started later inherits its creator's mask) until the workers
   are gone.
 
@@ -116,8 +119,53 @@ def all_pids(proc: str = "/proc") -> list[int]:
     return [int(e) for e in os.listdir(proc) if e.isdigit()]
 
 
+def _parent(pid: int, proc: str) -> int | None:
+    try:
+        with open(os.path.join(proc, str(pid), "stat")) as fh:
+            stat = fh.read()
+        return int(stat[stat.rindex(")") + 2:].split()[1])
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def _is_shell(pid: int, proc: str) -> bool:
+    try:
+        with open(os.path.join(proc, str(pid), "comm")) as fh:
+            comm = fh.read().strip()
+    except OSError:
+        return True
+    return comm in ("bash", "sh", "dash", "zsh", "tini", "dumb-init", "timeout", "su", "sudo", "docker-init")
+
+
+def server_tree(workers: dict[int, int], proc: str = "/proc") -> set[int]:
+    """The server's processes: the topmost ancestor of the workers that is not a shell (the API server), and every
+    process below it. Shells and other processes of the container are not in it."""
+    roots = set()
+    for pid in workers.values():
+        node = pid
+        while True:
+            parent = _parent(node, proc)
+            if parent is None or parent <= 1 or _is_shell(parent, proc):
+                break
+            node = parent
+        roots.add(node)
+    children: dict[int, list[int]] = {}
+    for pid in all_pids(proc):
+        parent = _parent(pid, proc)
+        if parent is not None:
+            children.setdefault(parent, []).append(pid)
+    tree, todo = set(), list(roots)
+    while todo:
+        pid = todo.pop()
+        if pid in tree:
+            continue
+        tree.add(pid)
+        todo.extend(children.get(pid, []))
+    return tree
+
+
 def apply(the_plan: dict, workers: dict[int, int], *, setaffinity=None, getaffinity=None, tids=thread_ids,
-          pids=all_pids, allowed=None) -> dict:
+          pids=None, allowed=None) -> dict:
     """Puts every thread where the plan says; returns counts (threads moved, failures)."""
     setaffinity = setaffinity or os.sched_setaffinity
     getaffinity = getaffinity or os.sched_getaffinity
@@ -141,7 +189,7 @@ def apply(the_plan: dict, workers: dict[int, int], *, setaffinity=None, getaffin
         for tid in tids(pid):
             put(tid, {main[rank]} if tid == pid else set(helpers[rank]))
     free = allowed - reserved
-    for pid in pids():
+    for pid in (pids() if pids is not None else server_tree(workers)):
         if pid in worker_pids or pid == os.getpid():
             continue
         for tid in tids(pid):
