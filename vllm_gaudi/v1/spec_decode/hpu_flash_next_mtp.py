@@ -27,6 +27,7 @@ file is HPU-only and is checked on hardware, run sheet stage 3e.
 import itertools
 
 import torch
+import vllm_gaudi.envs as gaudi_envs
 from vllm_gaudi.utils import async_h2d_copy
 from vllm_gaudi.v1.attention.backends.hpu_attn import HPUAttentionMetadataV1
 from vllm.model_executor.models.llama_eagle3 import Eagle3LlamaForCausalLM
@@ -35,6 +36,7 @@ from vllm_gaudi.v1.spec_decode.flash_next_mtp_steps import (DRAFT_RANK_TOP, Draf
                                                              next_step_hidden, ring_slots_from_lattice,
                                                              split_draft_output)
 from vllm_gaudi.v1.worker.flash_next_inputs import build_block_table
+from vllm_gaudi.v1.worker.flash_next_decode_metadata import draft_step_block_table_and_slots
 from vllm_gaudi.v1.spec_decode.hpu_eagle import HpuEagleProposer
 
 
@@ -191,6 +193,8 @@ class HpuFlashNextMtpProposer(HpuEagleProposer):
             positions,
             model_runner,
             ring_slots=None):
+        if gaudi_envs.VLLM_HPU_FLASH_NEXT_DECODE_METADATA == 1 and model_runner.flash_next_sparse_decode_metadata():
+            return self.sparse_attn_metadata(block_table_cpu_tensor, positions, model_runner, ring_slots)
         # Prepare attn metadata on CPU. (Improve for pure HPU based attn metadata preparation)
         block_size = model_runner.block_size
         batch_size = positions.shape[0]
@@ -270,6 +274,31 @@ class HpuFlashNextMtpProposer(HpuEagleProposer):
         )
 
         return common_attn_metadata
+
+    def sparse_attn_metadata(self, block_table_cpu_tensor, positions, model_runner, ring_slots=None):
+        """``prepare_attn_metadata`` under VLLM_HPU_FLASH_NEXT_DECODE_METADATA=1: the same ``block_table`` and
+        ``slot_mapping`` (``flash_next_decode_metadata.draft_step_block_table_and_slots``), built without
+        per-row lists, and no paged-attention buffers, which the draft's sparse QSA layer does not read."""
+        block_table, slot_mapping = draft_step_block_table_and_slots(
+            block_table_cpu_tensor, positions, int(positions.shape[0]), model_runner.block_size, self.max_model_len,
+            model_runner._block_table_max_blocks, model_runner._PAD_BLOCK_ID, model_runner._PAD_SLOT_ID)
+        return HPUAttentionMetadataV1.make_decode_metadata(
+            block_list=None,
+            block_usage=None,
+            block_groups=None,
+            input_positions=None,
+            slot_mapping=async_h2d_copy(slot_mapping, device=self.device),
+            block_size=model_runner.block_size,
+            window_block_list=None,
+            window_block_usage=None,
+            window_block_groups=None,
+            chunked_block_list=None,
+            chunked_block_usage=None,
+            chunked_block_groups=None,
+            block_table=async_h2d_copy(block_table, device=self.device),
+            load_indices_tensor=ring_slots,
+            store_indices_tensor=ring_slots,
+        )
 
     def _draft_tokens(self, hidden_states):
         """``(draft token of every row [rows], top DRAFT_RANK_TOP ids [rows, top] or None)``.
