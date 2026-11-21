@@ -427,15 +427,14 @@ Next, in order (section 7's table):
    env (headline_job.sh's build flags + 00178's prefix flags) + `PT_HPU_SYNCHRONOUS_ACC_QUEUE_FLUSHING=1`, build 3's
    own probe pair staged at `~/farm/collectives/results/bench/intprobe/` (levels 32, 8, 1; 128 tokens; two rounds
    per level; greedy and sampled interleaved). Arms tiny-stock, tiny-lean, then real-stock and real-lean.
-   **Submitted as job 00180 `real8-bridge-headline` at 03:25 UTC** with native-replay's `lean2-81b9b47e3599` (the
-   `run_prep` fix: the kept launcher's tensors are released right after each prepared launch); id sent to the
-   coordinator and native-replay. **At 03:36 UTC late-bound to `lean3t-412153bbab3e`** (lean2 + sub-timers,
-   appended to each timing line as `| sub ...`, nested in the phases) through `~/farm/collectives/bridge/late/
-   00180.env` (`LEAN=...`; the script reads it when the job starts; the job log prints it). `INLINE=1` in that
-   file would add tiny-lean-inline and real-lean-inline (`PT_HPU_DISABLE_ASYNC_COLLECTIVE=1`): it needs about 16
-   more minutes than the 45-minute hold, asked of the coordinator at 03:37 UTC (a resubmit with `bin/farm submit
-   collectives real8-bridge-headline all 65m 00180` keeps the place). This agent's waiter fetches `00180-real8-bridge-headline-{tiny-stock,tiny-lean,
-   real-stock,real-lean}/` and the verdicts. To read: the steady ms per step at 32, 8, 1 (greedy and sampled) of
+   Submitted as job 00180 at 03:25 UTC with native-replay's `lean2-81b9b47e3599` (the `run_prep` fix), then, on the
+   coordinator's word (03:40 UTC), **replaced by job 00181 `real8-bridge-headline2`** (all, 65 min, same place,
+   starts after integration's 00178, by 04:53 UTC at the latest): `lean3t-412153bbab3e` (lean2 + sub-timers,
+   appended to each timing line as `| sub ...`, nested in the phases) and the inline-collective pair
+   (`BRIDGE_INLINE=1`: `PT_HPU_DISABLE_ASYNC_COLLECTIVE=1`). Arm order: tiny-stock, tiny-lean; real-stock,
+   real-lean (the main comparison first); tiny-lean-inline (tokens against tiny-stock, `--ref-arm`);
+   real-lean-inline if its tiny arm passed. This agent's waiter fetches `00181-real8-bridge-headline2-<arm>/` and
+   the verdicts. To read: the steady ms per step at 32, 8, 1 (greedy and sampled) of
    both real arms from their `scaling.json` (or the `MEAS`/`SAMPLED` lines of `arm.log`), and
    `python3 -I reports/collectives/probes/replay_timing_table.py <real-lean folder>` (phases; `n_*` tensor counts;
    `sub_*` sub-timers, nested): `run_prep` should be back near 2 us; if `unattributed` (total minus the phase sum; 4.3 us for lean in 00174) rises by about 12 us instead,
