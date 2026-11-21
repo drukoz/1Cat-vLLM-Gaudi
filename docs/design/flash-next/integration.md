@@ -9,7 +9,7 @@ Labels: MEASURED (card, with its file), VERIFIED (CPU test or code line), INFERR
 
 ## Handoff (if this agent stops)
 
-**Build 5 (fifth agent of the track, Opus 5.5, started 08:04 UTC on 2026-11-21; updated 09:03 UTC).**
+**Build 5 (fifth agent of the track, Opus 5.5, started 08:04 UTC on 2026-11-21; updated 09:47 UTC).**
 
 - **Tree.** Base = build 4 (`8cdc5999`) with the program head `adbcff30` (PRs #18 to #22) merged in, so the tree is the
   program head plus what build 4 carried that the head lacks (qsa-fused's branch, mtp-card-ready + the per-step record,
@@ -44,7 +44,13 @@ Labels: MEASURED (card, with its file), VERIFIED (CPU test or code line), INFERR
   |delta| of its two passes on one server = the noise floor of the FP8 comparison) + the `place` switch + collectives'
   fixed place_wrap.sh; image `farm-integration:eb21ac75a7c8`), all cards, hold 110 min. 00218 (commit `385cf2b7`) was
   the first submission, cancelled by the replacement (the coordinator's 08:49 change: placement without the pin flag).
-  The pin and ss0 switch files are the coordinator's to set before the start. Submitted by
+  Set before the start (VERIFIED on the node at 09:46 UTC): `switches/pin` = `place` (00219: place-only gives a
+  7.7 min load, no slow rank, 1-stream greedy 24 ms per step); no `ss0` file (00209: stage submission is not the
+  cause of the MoE cuts); `late/place/` = place_wrap.sh 363bcf9d + place.sh 7e54f2de; `late/run5.sh` (md5 d62ff800)
+  = `export VLLM_HPU_MOE_DENSE_MIN_TOKENS=1` + the same arms (coordinator, 09:50: kernel-fixes' 00213 measured dense
+  from 1 token at 1 stream 74.0 -> 43.5 ms per sync MTP k = 3 step, launches 256 -> 124, 8 streams plain 49.1 -> 32.4,
+  logprob mean |delta| 0.0072, top-1 99.81 %). So every 1-stream and 8-stream row of build 5 against 00186 carries
+  dense-at-1 and the placement on top of the build changes. Submitted by
   `NAME=real8-build5b reports/integration/late/submit_b5.sh --replaces 00218` (log `reports/integration/card/submit-real8-build5b.log`; it copies the results
   when the job ends while it still runs). Read: `python3 -I reports/integration/b5/b5_compare.py
   reports/integration/card/00222-real8-build5b` (the table against 00186 and 00205), the TEXT lines, the REQUIRE-LOG
