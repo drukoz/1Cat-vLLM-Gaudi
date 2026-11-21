@@ -176,6 +176,34 @@ while [ "$i_arm" -lt "${#ARMS[@]}" ]; do
                 --warm-tokens "$WARM" --repeat-top 2 --no-mintok-check --probe-arg "--sampled-levels=$LEVELS" \
                 --probe-arg --interleave-sampled --probe-arg "--rounds=$ROUNDS"
             ;;
+        tiny-async)
+            # async-sched track: the tiny gate with VLLM_HPU_FLASH_NEXT_ASYNC_SCHED=1 (async scheduling on): tokens
+            # against the CPU reference, one prompt at a time (the carried PLE context from each second decode step).
+            VLLM_HPU_FLASH_NEXT_ASYNC_SCHED=1 "$PYTHON" /farm/farm_tiny.py --gdn hc --out "$OUT/tiny-async"
+            rc=$?
+            if [ "$rc" -ne 0 ] && [ "${HEADLINE_TINY_ABORT:-1}" = 1 ]; then
+                echo "headline_job: the tiny gate under async scheduling failed (rc $rc): no real-model server"
+                exit 7
+            fi
+            echo "=== headline_job: arm tiny-async rc=$rc end $(date -u +%T)"
+            continue
+            ;;
+        async)
+            # async-sched track: the nospec server with async scheduling (VLLM_HPU_FLASH_NEXT_ASYNC_SCHED=1), candidate
+            # sampling kept under it (VLLM_HPU_CANDIDATE_SAMPLING_ASYNC=1, this job branch only).
+            VLLM_HPU_FLASH_NEXT_ASYNC_SCHED=1 VLLM_HPU_CANDIDATE_SAMPLING_ASYNC="${VLLM_HPU_CANDIDATE_SAMPLING_ASYNC:-1}" \
+                bash "$HERE/serve_probe.sh" --out "$OUT/async" --levels "$LEVELS" --tokens "$TOKENS" \
+                --warm-tokens "$WARM" --repeat-top 2 --no-mintok-check --probe-arg "--sampled-levels=$LEVELS" \
+                --probe-arg --interleave-sampled --probe-arg "--rounds=$ROUNDS"
+            ;;
+        nospec-devids)
+            # async-sched track: the nospec server with the PLE n-gram ids in the graph (what async scheduling must
+            # use), greedy only: the device cost of the ids without the overlap.
+            VLLM_HPU_PLE_HOST_NGRAM_IDS=0 \
+                bash "$HERE/serve_probe.sh" --out "$OUT/nospec-devids" --levels "${HEADLINE_DEVIDS_LEVELS:-32,1}" \
+                --tokens "$TOKENS" --warm-tokens "$WARM" --repeat-top 2 --no-mintok-check \
+                --probe-arg --no-sampled-check --probe-arg "--rounds=$ROUNDS"
+            ;;
         nospec-pin)
             # B: native-replay's two host levers on A's env (never run at TP8 before): greedy 1 and 32 streams only;
             # its 1-stream text is compared with A's.
