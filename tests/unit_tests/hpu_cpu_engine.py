@@ -426,6 +426,8 @@ def _record_draft_calls(runner) -> list[dict]:
         rows = int(block_table_cpu_tensor.shape[0])
         calls.append({"rows": rows,
                       "decode": not bool(getattr(common_attn_metadata, "is_prompt", True)),
+                      # VLLM_HPU_MTP_DRAFT_CHAIN: whether the runner took this step as chained
+                      "chain_step": bool(getattr(runner, "_mtp_chain_step", False)),
                       "width": int(block_table_cpu_tensor.shape[1]),
                       "attention_width": int(attn_table.shape[1]),
                       "is_attention_table": bool(block_table_cpu_tensor.shape[1] == attn_table.shape[1]
