@@ -11,7 +11,7 @@ This track's harness refuses report files outside the repository, so the handoff
 
 ## Handoff (if this agent stops)
 
-Last update: **2026-11-21 08:40 UTC** (fourth agent, Opus 5.5; the node was extended to about 00:00 UTC on
+Last update: **2026-11-21 08:44 UTC** (fourth agent, Opus 5.5; the node was extended to about 00:00 UTC on
 2026-11-22). Branch `feat/flash-next-gaudi-engine-step`, head after `bcef8aa5` (merged into the program branch as PR #20;
 code of this track up to `01d66e31`), pushed. A second branch of this track,
 **`feat/flash-next-gaudi-engine-step-mtp-record`** (`2b90707f`, worktree `reports/engine-step/trees/mtp-record`):
@@ -63,6 +63,7 @@ question answered on the CPU (section 14).
 | 00164 `real8-mtp2-cand2-sampled`, 00166 `real8-candvp-short2` | (TP8 jobs) | folded into 00206 at 07:03 UTC (00164 replaced, 00166 cancelled) | - |
 | 00206 `real8-mtp2-candsw` | | replaced by 00207 at 07:58 UTC (the collector arms added) | - |
 | **00207** `real8-mtp2-candsw-gc` (all, TP8 + EP8, 35m, `4b180729` = build 4 `30f4e37e` + the probe's `--spec-arms` + `VLLM_HPU_WORKER_GC_FREEZE`; local branch `engine-step-int4-card`) | one MTP k = 2 server, build 4's mtp2 env (00186's `versions.txt`) with `VLLM_HPU_MTP_TIMING=2`: `serve_long_probe.sh --arms both --no-long --spec-arms cand,cand2,cand2vp --gc-arms --logprobs-check` (`SERVE_SPEC_K=2`) | queued | as 00206 (greedy base / both; sampled cand / cand2 / cand2vp at 32 and 1 streams: step ms, tokens per chunk, acceptance per position; the `Candidate sampling` lines; seeded; logprobs under MTP), then the collector rounds (`gc32`, `gc1`: off / on, twice): `python3 reports/engine-step/probes/gc_steps.py reports/engine-step/card/00207-*` gives p50 / p99 per rank of the replay call and the step and the generation-2 counts; the `SCHED:` line (may the container take SCHED_FIFO) |
+| 00218 `real8-build5` (integration's, about 11:30 UTC, image `farm-integration:385cf2b7a8ac`) | this track's asks inside build 5 | queued | `reports/integration/card/00218-real8-build5/`: `mtp2-async-fp8kv-hpulog-32-greedy-dg32-kvlp-long/server0.log` (`HPU_GRAPH_UNMATCHED`, draft graph off then on; probe_dg32.log, scaling_dg32.json) -> mtp-draft-graph and section 15; `mtp2-async-sw-cap-kvlp/scaling_sw.json` (I01 off / dg / md); `mtp2-kvlpfb/mtp_step_record_r*.jsonl` (per-rank `replay_first_ms` skew); if ss0 is on, `mtp2-async-ss0-greedy/` and `mtp2-async-irlog-lv1-greedy/habana_logs/` (integration sends the two greps) |
 | **00169** `real8-i01-long120k` (all, 50m) | I01 at 32 x 120K over a shared prefix with prefill's prefix flags, and an MTP k = 2 part (`probe.log`, `mtp2/probe.log`) | queued | `prepare_inputs` and step time base against I01 at a long context |
 
 ### Pending subtasks after those steps, in order
