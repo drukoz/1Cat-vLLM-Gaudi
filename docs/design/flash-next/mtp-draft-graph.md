@@ -8,7 +8,7 @@ file), VERIFIED (CPU test or code line), INFERRED.
 
 ## Handoff (if this agent stopped)
 
-Last update: 2026-11-21 05:15 UTC (`date -u`), first agent of the track (Opus 5.5), started 04:35 UTC.
+Last update: 2026-11-21 05:40 UTC (`date -u`), first agent of the track (Opus 5.5), started 04:35 UTC.
 
 **Goal (coordinator, 04:45 UTC).** Run the k draft passes of an MTP decode draft in ONE HPU graph behind a default-off
 flag. Basis: build 3's timer (00178, TP8, k = 3) at 32 streams: the draft costs 16.3 to 18.2 ms of a 104 ms step
@@ -30,27 +30,48 @@ flag. Basis: build 3's timer (00178, TP8, k = 3) at 32 streams: the draft costs 
   covering every accepted count, and every prompt at once: padded batch rows, requests at different positions):
   `pytest tests/unit_tests/models/flash_next/test_engine_mtp.py -k one_graph` 6 passed in 193 s
   (`reports/mtp-draft-graph/cpu/engine_graph_all.log`).
-- Card: nothing yet. Plan below.
+- `e3dbc22a` merge of the program head `2e9f9196` (PR #20 engine-step: its sparse-QSA draft metadata, which the
+  one-graph path calls too); `d3bbf2a6` the flag as a runtime switch (`runtime_switches.SWITCHABLE`) and the MTP
+  timer's kind `verify+graph`; CPU engine `--switch-after` and a test that switches the flag mid-run (8 passed).
+- Gate of `d3bbf2a6`: running on the snapshot `reports/mtp-draft-graph/gate-d3bbf2a6`, output
+  `reports/mtp-draft-graph/gate/gate-d3bbf2a6.txt`. Then the pull request (default off).
+- Card: job 00194 below (00191, the two-server design, was replaced).
 
-**Card plan (integration agent's advice, 05:05 UTC).** Test branch `feat/flash-next-gaudi-mtp-draft-graph-b4` =
-integration build 4 (`integration/card-build-20261120b` at `7901b089`; its plugin code is final at `bcaa3ed6`) + this
-branch. One all-card job running `tools/flash_next/rental/mtp_draft_graph_ab.sh` (on the test branch): (1) the tiny
-model at TP8 with the flag on, `--spec 3` (headline_job.sh arm `tiny`: the job ends if tokens differ); (2) the real
-model, MTP k = 3, flag off; (3) the same with the flag on. `HEADLINE_LEVELS=32,1 HEADLINE_ROUNDS=2
-VLLM_HPU_MTP_TIMING=1 HEADLINE_MTP_FALLBACK=0` and build 4's env (`VLLM_HPU_QSA_FUSED=1 VLLM_HPU_QSA_INDEXER_SHARD=1
-VLLM_HPU_GDN_KERNEL_INTERLEAVE=1 VLLM_HPU_GDN_GLUE_CACHE=1 VLLM_HPU_HC_FUSED_COPY_MODE=2
+**Card job 00194 `real8-draft-graph-switch`** (all, 55 min; replaced 00191 at 05:37 UTC and kept its place: after
+integration's 00187, start by 06:46 UTC at the latest). Test branch `feat/flash-next-gaudi-mtp-draft-graph-b4` at
+`8b27af1b` = integration build 4 (`integration/card-build-20261120b` at `5dc6993f`, plugin code `bcaa3ed6`) + this
+branch's `fe52724c` and `d3bbf2a6` (cherry-picked as `f4bcd11d`) + the kit changes `f2fa0677` and `8b27af1b`; image
+`farm-mtp-draft-graph:8b27af1b3b1c`. Command (from `wt/mtp-draft-graph` with the test branch checked out):
+`bin/farm job mtp-draft-graph real8-draft-graph-switch all 55m --env <build 4's env> --env HEADLINE_LEVELS=32,1
+--env HEADLINE_ROUNDS=3 --env HEADLINE_MTP_FALLBACK=0 --env HEADLINE_TINY_SPEC=3 --env HEADLINE_TINY_DRAFT_GRAPH=1
+-- bash tools/flash_next/integration/headline_job.sh tiny mtp3-switch mtp3-graph` (full line in
+`reports/mtp-draft-graph/card/submit-switch.log`'s process; build 4's env as integration gave it: `VLLM_HPU_QSA_FUSED=1
+VLLM_HPU_QSA_INDEXER_SHARD=1 VLLM_HPU_GDN_KERNEL_INTERLEAVE=1 VLLM_HPU_GDN_GLUE_CACHE=1 VLLM_HPU_HC_FUSED_COPY_MODE=2
 VLLM_HPU_DECODE_CUT_INTERVAL=1000 VLLM_HPU_CANDIDATE_SAMPLING=1 VLLM_GRAPH_RESERVED_MEM=0.4
 VLLM_HPU_PREFIX_ALIGN_SPLIT=1 VLLM_HPU_PREFIX_KEEP_PROMPT_END=1 VLLM_MOE_CHUNK=64,8192
-VLLM_MOE_TOKEN_BOUNDARY=512,1000000 PT_HPU_SYNCHRONOUS_ACC_QUEUE_FLUSHING=1`, the MTP arm adds
-`VLLM_HPU_GDN_CORE_VERIFY=1 VLLM_HPU_MTP_DRAFT_LOOP=1 VLLM_HPU_MTP_CHUNK_KV=1 VLLM_HPU_SPEC_SAMPLED_VERIFY=2`); no
-async scheduling (not card-proven: async-sched's 00179 decides). References without the flag: build 3 (00178) 39.4 to
-40.6 ms per token at 32 streams, 24.5 to 27.9 at 1 stream; with the MoE chunk (00161) 38.0 at 32.
+VLLM_MOE_TOKEN_BOUNDARY=512,1000000 PT_HPU_SYNCHRONOUS_ACC_QUEUE_FLUSHING=1 VLLM_HPU_GDN_CORE_VERIFY=1
+VLLM_HPU_MTP_DRAFT_LOOP=1 VLLM_HPU_MTP_CHUNK_KV=1 VLLM_HPU_SPEC_SAMPLED_VERIFY=2 VLLM_HPU_MTP_TIMING=1`; no async
+scheduling). Arms:
+1. `tiny`: the tiny model at TP8, `--spec 3`, flag on: tokens against the CPU reference and the mode without
+   speculation (the job ends with exit 7 if they differ).
+2. `mtp3-switch`: ONE real-model server, MTP k = 3, started with the flag off; `decode_scaling.py --switch-arm
+   off=VLLM_HPU_MTP_DRAFT_GRAPH=0 --switch-arm on=VLLM_HPU_MTP_DRAFT_GRAPH=1` through the server's runtime switch
+   file: per level (32, then 1 stream) one warm round per arm, then off, on, off, on, off, on (128 tokens). No
+   server-to-server spread; at 1 stream the off and on texts must be the same (the drafts are the same).
+3. `mtp3-graph`: a server started with the flag on (the production form), the same levels and rounds.
+References without the flag: build 3 (00178) 39.4 to 40.6 ms per token at 32 streams, 24.5 to 27.9 at 1 stream; with
+the MoE chunk (00161) 38.0 at 32. Build 4's async MTP k = 2 (00186): 33.7 at 32 streams.
 
-**What to read when the job ends.** Per arm, `server0.log`: the line `Flash-Next MTP: the 3 draft passes of a decode
-step run in one HPU graph` (the path is on), no traceback, no `PT_DEVMEM`; the `MTP step timing` lines (the draft span
-and its laps: `graph_positions`, `graph_meta`, `graph`, `final_wait` with the flag; `pass0`, `pass0_wait`,
-`pass1_meta`, `pass1`, ... without); `probe.log` / `scaling.json` (ms per token, tokens per step, acceptance per
-position: with the flag it must equal the flag-off arm's within noise, which shows the drafts are right on the card).
+**What to read when 00194 ends** (`bin/farm fetch mtp-draft-graph 00194 00194-real8-draft-graph-switch` if the
+waiter is gone): `headline.md` (rows `mtp3-switch/off`, `mtp3-switch/on`, `mtp3-graph`: ms per step, tokens per step,
+ms per token, acceptance per position), `mtp3-switch/probe.log` (MEAS / SPEC / TEXT lines per arm; a `SWITCH` line
+means a round may not be its arm), `mtp3-switch/server0.log`: `Runtime switches from` lines, the line `Flash-Next MTP:
+the 3 draft passes of a decode step run in one HPU graph`, no traceback or `PT_DEVMEM`, the `MTP step timing` lines:
+kind `verify` (flag off: laps `pass0`, `pass0_wait`, `pass1_meta`, `pass1`, `pass2_meta`, `pass2`, `final_wait`)
+against `verify+graph` (flag on: `graph_positions`, `graph_meta`, `graph`, `final_wait`) at rows 128 (32 streams)
+and 4 (1 stream); the draft span is the `draft` value, the timer's JSON in `mtp_step_timing_r*.jsonl`. The
+coordinator wants: the draft span per step and ms per token at 32 and 1 stream with and without the flag, the
+rounds, acceptance per position.
 
 ## Design (VERIFIED in code unless marked)
 
