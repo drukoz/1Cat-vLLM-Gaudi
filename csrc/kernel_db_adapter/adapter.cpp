@@ -10,7 +10,7 @@
 // to an ordered list of members. See docs/design/flash-next/native-extensions.md.
 //
 // Members: the custom libraries next to this file (libgdn_fused_gaudi2.so,
-// libhc_fused_gaudi2.so, libflashinfer_gaudi_kernels.so; each optional: a file
+// libhc_fused_gaudi2.so, libqsa_fused_gaudi2.so, libflashinfer_gaudi_kernels.so; each optional: a file
 // that is not there is not a member and not a failure), then Intel's stock
 // library (required). A member that is present but cannot be used (dlopen fails, a
 // required entry point is missing, its GetKernelGuids fails) is reported on
@@ -121,7 +121,8 @@ std::vector<MemberSpec> member_specs() {
         // serves the hyper-connection kernels from one built before they existed (_native.py).
         const std::filesystem::path dir = std::filesystem::path(self).parent_path();
         for (const char* sibling :
-             {"libgdn_fused_gaudi2.so", "libhc_fused_gaudi2.so", "libflashinfer_gaudi_kernels.so"}) {
+             {"libgdn_fused_gaudi2.so", "libhc_fused_gaudi2.so", "libqsa_fused_gaudi2.so",
+              "libflashinfer_gaudi_kernels.so"}) {
             std::filesystem::path candidate = dir / sibling;
             std::error_code ec;
             if (std::filesystem::exists(candidate, ec)) {

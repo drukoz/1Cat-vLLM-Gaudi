@@ -36,15 +36,33 @@ def _recurrent_layer_counts(kv_cache_spec: dict[str, KVCacheSpec]) -> dict[Mamba
 
 
 def recurrent_positions(kv_cache_spec: dict[str, KVCacheSpec]) -> dict[MambaSpec, int]:
-    """State tensors the runner allocates per distinct recurrent spec: min(layers of that spec, attention layers).
+    """State tensors the runner allocates per distinct recurrent spec: the most layers of it in one engine group.
 
-    The engine groups a hybrid model's layers into groups of the attention-layer count (a recurrent spec with
-    fewer layers keeps a group of its own, see ``hpu_kv_cache_groups``), and the runner shares one state
-    tensor between the layers at the same position of every group (``_mamba_state_tensors`` in
-    ``HPUModelRunner.initialize_kv_cache``).
+    The runner shares one state tensor between the layers at the same position of every group of a spec
+    (``_mamba_state_tensors`` in ``HPUModelRunner.initialize_kv_cache``). The engine's grouping (vLLM
+    ``_get_kv_cache_groups_uniform_page_size`` under ``hpu_kv_cache_groups``) buckets the layers by spec, takes
+    the fewest layers of any bucket as the group size (the most, when that is under 1.5 times the fewest), and
+    splits a bucket of n layers into ``cdiv(n, group size)`` groups ``layers[i::groups]``: a group holds at most
+    ``cdiv(n, groups)`` layers. A recurrent spec with fewer layers than the attention layers (the PLE short conv)
+    is grouped apart, all its layers in one group. The MTP draft's attention layer makes 13 attention layers
+    next to 36 GDN layers: 3 GDN groups of 12, so 12 positions, not 13.
     """
-    n_attn = sum(isinstance(s, AttentionSpec) for s in kv_cache_spec.values())
-    return {spec: (min(n, n_attn) if n_attn > 0 else n) for spec, n in _recurrent_layer_counts(kv_cache_spec).items()}
+    minor = minor_recurrent_layers(kv_cache_spec)
+    buckets: dict[KVCacheSpec, int] = {}
+    for spec in kv_cache_spec.values():
+        if spec not in minor:
+            buckets[spec] = buckets.get(spec, 0) + 1
+    positions: dict[MambaSpec, int] = {}
+    if buckets:
+        fewest, most = min(buckets.values()), max(buckets.values())
+        group_size = most if most < fewest * 1.5 else fewest
+        for spec, n in buckets.items():
+            if isinstance(spec, MambaSpec):
+                groups = -(-n // group_size)
+                positions[spec] = -(-n // groups)
+    for spec, names in minor.items():
+        positions[spec] = len(names)
+    return positions
 
 
 def num_recurrent_groups(kv_cache_spec: dict[str, KVCacheSpec]) -> int:

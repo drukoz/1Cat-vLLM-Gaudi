@@ -348,7 +348,7 @@ if [ "$SKIP_INSTALL" -eq 0 ]; then
     # script's. The MoE glue kernels are in that library too: nothing more is built for --moe-glue.
     install_step 2 "plugin (vllm-gaudi)" env VLLM_TARGET_DEVICE=hpu \
         VLLM_GAUDI_BUILD_FLASHINFER="$NATIVE" VLLM_GAUDI_BUILD_GDN_FUSED="$NATIVE" \
-        VLLM_GAUDI_BUILD_HC_FUSED="$NATIVE" \
+        VLLM_GAUDI_BUILD_HC_FUSED="$NATIVE" VLLM_GAUDI_BUILD_QSA_FUSED="$NATIVE" \
         pip install "$BUNDLE_ROOT/plugin" --no-build-isolation
     record_build_sha
     install_step 3 "model deps" \

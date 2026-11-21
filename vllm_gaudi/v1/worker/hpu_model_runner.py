@@ -62,6 +62,12 @@ from vllm_gaudi.v1.worker.recurrent_spec import (accepted_counts, load_checkpoin
 from vllm_gaudi.v1.spec_decode.flash_next_mtp_steps import is_flash_next_mtp
 from vllm_gaudi.distributed import vocab_parallel
 from vllm_gaudi.platform import is_flash_next_model
+from vllm_gaudi.v1.worker.flash_next_async_spec import (ChainOut, PendingBooks, SpecEarlyBooks, VerifyInputAdvance,
+                                                        VerifyInputs, align_commits, align_gather, align_lattice_rows,
+                                                        align_precopy, device_commit_conv, device_commit_ssm,
+                                                        stand_in_chain, trim_verified, use_scheduled_drafts)
+from vllm_gaudi.v1.worker.flash_next_async import (AsyncOutputLedger, PleContextCarry, SpecDraftHandoff,
+                                                   needs_output_token_values)
 
 from vllm.v1.attention.backend import AttentionBackend, AttentionType, CommonAttentionMetadata
 from vllm.model_executor.layers.attention import Attention
@@ -738,6 +744,37 @@ class AsyncHPUModelRunnerOutput(AsyncModelRunnerOutput):
 
         output = self._model_runner_output
         output.sampled_token_ids[:len(valid_sampled_token_ids)] = valid_sampled_token_ids
+        return output
+
+
+class AsyncSpecModelRunnerOutput(AsyncModelRunnerOutput):
+    """VLLM_HPU_FLASH_NEXT_ASYNC_SCHED=3 (async-sched stage 2, M2): a chained verification step's output, returned
+    before its tokens reach the host. The tokens ``[B, 1 + k]`` (-1 after the bonus) are copied on a side stream; the
+    worker's output thread reads them, and the runner's books read the same host copy one step later."""
+
+    def __init__(self, model_runner_output: ModelRunnerOutput, sampled_token_ids: torch.Tensor, num_decodes: int,
+                 vocab_size: int, copy_stream, extra: Optional[torch.Tensor] = None):
+        self._model_runner_output = model_runner_output
+        self._extra = extra  # M3: [2, B] int32 next load counts and running blocks, copied with the tokens
+        self._sampled_token_ids = sampled_token_ids  # kept until the copy is done
+        self._num_decodes = num_decodes
+        self._vocab_size = vocab_size
+        self.ready_event = torch.hpu.Event()
+        default_stream = torch.hpu.current_stream()
+        with torch.hpu.stream(copy_stream):
+            copy_stream.wait_stream(default_stream)
+            self.sampled_cpu = sampled_token_ids.to('cpu', non_blocking=True)
+            self.extra_cpu = extra.to('cpu', non_blocking=True) if extra is not None else None
+            self.ready_event.record()
+
+    def get_output(self) -> ModelRunnerOutput:
+        self.ready_event.synchronize()
+        rows = self.sampled_cpu.tolist()
+        self._sampled_token_ids = None
+        output = self._model_runner_output
+        output.sampled_token_ids[:self._num_decodes] = [
+            trim_verified(rows[r], self._vocab_size) for r in range(self._num_decodes)
+        ]
         return output
 
 
@@ -2435,6 +2472,11 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                     from vllm_gaudi.v1.spec_decode.hpu_flash_next_mtp import HpuFlashNextMtpProposer
 
                     self.drafter = HpuFlashNextMtpProposer(self.vllm_config, self.device, self)  # type: ignore
+                    from vllm_gaudi.v1.spec_decode import mtp_step_timer
+                    self._mtp_step_timer = mtp_step_timer.from_env(rank=0 if is_driver_worker else 1,
+                                                                   is_driver=is_driver_worker, log=logger.info,
+                                                                   device_type=str(self.device).split(":")[0])
+                    self.drafter.mtp_step_timer = self._mtp_step_timer
                     self.use_aux_hidden_state_outputs = True
                 else:
                     from vllm_gaudi.v1.spec_decode.hpu_eagle import HpuEagleProposer
@@ -2484,6 +2526,53 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         _hpu_init_sync("after_input_batch")
 
         self.use_async_scheduling = self.scheduler_config.async_scheduling
+        # VLLM_HPU_FLASH_NEXT_ASYNC_SCHED=2: the engine schedules ahead of a speculative step; this runner keeps its
+        # synchronous step and hands the drafts over on the device (flash_next_async.SpecDraftHandoff).
+        self._spec_draft_handoff = (SpecDraftHandoff()
+                                    if self.use_async_scheduling and self.speculative_config is not None else None)
+        if self._spec_draft_handoff is not None:
+            self.use_async_scheduling = False
+        # VLLM_HPU_FLASH_NEXT_SPEC_DEVICE_INPUTS (async-sched stage 2, M1): a verification step's inputs that depend
+        # on the previous verification's acceptance, made on the device (flash_next_async_spec.VerifyInputAdvance).
+        self._verify_advance = (VerifyInputAdvance()
+                                if int(gaudi_envs.VLLM_HPU_FLASH_NEXT_SPEC_DEVICE_INPUTS) in (1, 2)
+                                and self.speculative_config is not None and is_flash_next_model(self.model_config)
+                                else None)
+        self._verify_step = 0
+        self._verify_refusals: set = set()
+        # VLLM_HPU_FLASH_NEXT_SPEC_DEVICE_ALIGN (stage 2, M3): a verification step's prefix-cache align mode (the
+        # pre-step copy, the lattices, the load count, the boundary commits) made on the device; 1 also checks it
+        # against the host's, 2 uses it (flash_next_async_spec.align_*).
+        self._align_flag = (int(gaudi_envs.VLLM_HPU_FLASH_NEXT_SPEC_DEVICE_ALIGN)
+                            if self._verify_advance is not None and self.cache_config.enable_prefix_caching else 0)
+        self._align_dev = None  # the last verification step's device state for the next one: step, rows, prev, n
+        self._align_step = None  # this verification step's align inputs, for the commits after it
+        self._align_pre_books = None  # =1: the host's running blocks and load counts before its pre-step copy
+        self._align_stats = {"steps": 0, "checked": 0, "differences": 0}
+        # VLLM_HPU_FLASH_NEXT_ASYNC_SCHED=3 (stage 2, M2): a chained verification step is issued before the previous
+        # one's tokens reach the host; its books follow one step late (flash_next_async_spec.SpecEarlyBooks).
+        self._spec_early = None
+        self._spec_early_stream = None
+        self._spec_early_waited = False
+        self._spec_early_logged: set = set()
+        if int(gaudi_envs.VLLM_HPU_FLASH_NEXT_ASYNC_SCHED) == 3 and self._spec_draft_handoff is not None:
+            missing = [
+                name for name, ok in (
+                    ("VLLM_HPU_MTP_DRAFT_CHAIN=1", int(getattr(gaudi_envs, "VLLM_HPU_MTP_DRAFT_CHAIN", 0)) == 1),
+                    ("VLLM_HPU_FLASH_NEXT_SPEC_DEVICE_INPUTS=2",
+                     int(gaudi_envs.VLLM_HPU_FLASH_NEXT_SPEC_DEVICE_INPUTS) == 2),
+                    ("VLLM_HPU_FLASH_NEXT_DECODE_METADATA=1", int(gaudi_envs.VLLM_HPU_FLASH_NEXT_DECODE_METADATA) == 1),
+                    ("prefix caching off or VLLM_HPU_FLASH_NEXT_SPEC_DEVICE_ALIGN=2 (the align mode on the device)",
+                     not self.cache_config.enable_prefix_caching
+                     or int(gaudi_envs.VLLM_HPU_FLASH_NEXT_SPEC_DEVICE_ALIGN) == 2),
+                ) if not ok
+            ]
+            if missing or self._verify_advance is None:
+                logger.warning("VLLM_HPU_FLASH_NEXT_ASYNC_SCHED=3 acts as 2: it needs %s",
+                               ", ".join(missing) or "the device-made verification inputs")
+            else:
+                self._spec_early = SpecEarlyBooks()
+                self._spec_early_stream = torch.hpu.Stream()
         self.use_structured_output: bool = False  # Default to false. Set to true when needed during a run
         # Cache token ids on device to avoid h2d copies
         self.input_ids_hpu = torch.zeros(
@@ -3803,6 +3892,12 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                           request_ids: Union[None, list[str]] = None,
                           pad_to: Optional[int] = None,
                           logits_reqs=None) -> SamplingMetadata:
+        if self._async_ledger is not None and needs_output_token_values(self.input_batch):
+            # Async scheduling, a pass that reads output token values (penalties, bad words): the recorded steps'
+            # tokens, then the penalty pad for any older placeholder (a request that needed no values till now).
+            self._async_ledger.settle()
+            self._async_ledger.neutralize([self.requests[r].output_token_ids for r in self.input_batch.req_ids
+                                           if r is not None and r in self.requests], self.input_batch.vocab_size)
         # Create the sampling metadata.
         req_id_output_token_ids_lst = \
             self._generate_req_id_output_token_ids_lst(request_ids, \
@@ -4650,6 +4745,10 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             tables = None
             if self.use_async_scheduling:
                 reason = "async scheduling keeps the sampled token ids on the device"
+            elif self._spec_draft_handoff is not None:
+                reason = "async scheduling with speculation keeps the drafts on the device"
+            elif self._verify_advance is not None and int(gaudi_envs.VLLM_HPU_FLASH_NEXT_SPEC_DEVICE_INPUTS) == 2:
+                reason = "VLLM_HPU_FLASH_NEXT_SPEC_DEVICE_INPUTS=2 makes a verification step's ids on the device"
             else:
                 from vllm_gaudi.models.qwen4_exp.ple_ops import collect_ngram_host_tables
                 try:
@@ -4706,8 +4805,403 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             from vllm_gaudi.models.qwen4_exp.ple_ops import HOST_NGRAM_IDS_KWARG
             kwargs[HOST_NGRAM_IDS_KWARG] = async_h2d_copy(ple_inputs[2], dtype=torch.int32, device=device)
         else:
-            kwargs["ngram_context"] = async_h2d_copy(ple_inputs[1], dtype=torch.int32, device=device)
+            context = ple_inputs[1]
+            # A context already on the device (the rows async scheduling carries, flash_next_async.py) goes in as is.
+            kwargs["ngram_context"] = (context if isinstance(context, torch.Tensor) and context.device.type != "cpu"
+                                       else async_h2d_copy(context, dtype=torch.int32, device=device))
         return kwargs
+
+    # Async scheduling of a Flash-Next server (VLLM_HPU_FLASH_NEXT_ASYNC_SCHED=1, v1/worker/flash_next_async.py):
+    # the PLE n-gram context of the decode rows carried on the device, and placeholders for the in-flight tokens in
+    # output_token_ids. Class defaults: a synchronous runner, another model and a runner built without __init__
+    # (unit tests) have neither.
+    _ple_carry: Optional[PleContextCarry] = None
+    _async_ledger: Optional[AsyncOutputLedger] = None
+    _flash_next_async_checked = False
+    _spec_draft_handoff: Optional[SpecDraftHandoff] = None
+
+    def _advance_verify_inputs(self, num_decodes, padded, num_tokens, block_table_cpu_tensor, block_size, sparse_md,
+                               token_ids, positions, slot_mapping, num_accepted, scheduler_output,
+                               block_table_device=None):
+        """VLLM_HPU_FLASH_NEXT_SPEC_DEVICE_INPUTS (stage 2, M1): this verification step's inputs from the previous
+        verification's on the device. Returns (made or None, served, ids, positions, slots, accepted counts): the
+        host's tensors, or with =2 the device-made ones; ``served`` False when this step cannot be advanced at all."""
+        mode = int(gaudi_envs.VLLM_HPU_FLASH_NEXT_SPEC_DEVICE_INPUTS)
+        if mode not in (1, 2):  # switched off while serving (VLLM_HPU_RUNTIME_SWITCH_FILE)
+            self._verify_advance.reset()
+            return None, False, token_ids, positions, slot_mapping, num_accepted
+        reason = None
+        if not sparse_md:
+            reason = "the dense decode metadata (it needs VLLM_HPU_FLASH_NEXT_DECODE_METADATA=1)"
+        elif self.uses_mrope:
+            reason = "M-RoPE positions"
+        elif num_accepted is None:
+            reason = "a batch without the GDN acceptance input"
+        if reason is not None:
+            if reason not in self._verify_refusals:
+                self._verify_refusals.add(reason)
+                logger.info("VLLM_HPU_FLASH_NEXT_SPEC_DEVICE_INPUTS=%d: a verification step keeps the host's inputs: %s",
+                            mode, reason)
+            self._verify_advance.reset()
+            return None, False, token_ids, positions, slot_mapping, num_accepted
+        chain = self._verify_advance.pending_chain(self._verify_step)
+        if chain is not None:
+            # The drafts this step verifies, as the scheduler has them when it has them (a synchronous engine); under
+            # async scheduling the scheduler has placeholders and the device drafts stay.
+            use_scheduled_drafts(chain, self.input_batch.req_ids, scheduler_output.scheduled_spec_decode_tokens)
+        with_context = model_requires_raw_input_tokens(self.model)
+        eos_token_id = self._ple_eos_and_ngram()[0] if with_context else 0
+        if block_table_device is not None and block_table_device.shape[0] == padded * num_tokens:
+            # The sparse decode metadata's table, already on the device: request r's row at r * (1 + k).
+            table, stride = block_table_device, num_tokens
+        else:
+            table_cpu = torch.zeros((padded, block_table_cpu_tensor.shape[1]), dtype=torch.int32)
+            rows = min(num_decodes, padded, block_table_cpu_tensor.shape[0])
+            table_cpu[:rows] = block_table_cpu_tensor[:rows].to(torch.int32)
+            table, stride = async_h2d_copy(table_cpu, device=self.device), 1
+        made = self._verify_advance.advance(self._verify_step, self.input_batch.req_ids, num_decodes, padded,
+                                            num_tokens - 1, table, block_size, self._PAD_BLOCK_ID * block_size,
+                                            eos_token_id, with_context, table_row_stride=stride)
+        if made is None:
+            return None, True, token_ids, positions, slot_mapping, num_accepted
+        made.slot_mapping = made.slot_mapping.to(slot_mapping.dtype)
+        made.num_accepted = made.num_accepted.to(num_accepted.dtype)
+        if self.use_prefix_caching and self._align_flag != 2:
+            # Align mode: the load count also follows the pre-step copy and the self commits (the host's books, or
+            # M3's device-made count with VLLM_HPU_FLASH_NEXT_SPEC_DEVICE_ALIGN=2), not just a + 1.
+            made.num_accepted = None
+        if mode == 2:
+            count = num_accepted if made.num_accepted is None else made.num_accepted
+            return made, True, made.token_ids, made.positions, made.slot_mapping, count
+        return made, True, token_ids, positions, slot_mapping, num_accepted
+
+    def _finish_verify_inputs(self, made, num_decodes, padded, num_tokens, token_ids, positions, slot_mapping,
+                              num_accepted, ple_inputs):
+        """The PLE context of a device-made step (=2) or the check against the host's (=1); then this step's inputs
+        are kept for the next one. Returns the PLE inputs the model gets."""
+        mode = int(gaudi_envs.VLLM_HPU_FLASH_NEXT_SPEC_DEVICE_INPUTS)
+        context = ple_inputs[1] if ple_inputs is not None and len(ple_inputs) >= 2 else None
+        if made is not None:
+            if mode == 2:
+                if made.ngram_context is not None and ple_inputs is not None:
+                    ple_inputs = (ple_inputs[0], made.ngram_context) + tuple(ple_inputs[2:])
+                    context = made.ngram_context
+                self._log_verify_advance({})
+            else:
+                bad = self._verify_advance.check(made, VerifyInputs(token_ids, positions, slot_mapping, num_accepted,
+                                                                    context))
+                self._log_verify_advance(bad)
+        if context is not None and context.device.type != torch.device(self.device).type:
+            context = async_h2d_copy(context.to(torch.int32), device=self.device)
+        self._verify_advance.record(self._verify_step, self.input_batch.req_ids, num_decodes, padded, num_tokens - 1,
+                                    VerifyInputs(token_ids, positions, slot_mapping, num_accepted, context))
+        return ple_inputs
+
+    def _set_verify_chain(self, num_decodes, sampled_token_ids, defer_books: bool = False):
+        """The acceptance this step leaves for the next verification step: mtp-draft-graph's chain output
+        (``_mtp_chain_out``) when the step chained, else a stand-in from the host's read and the device drafts."""
+        advance = self._verify_advance
+        recorded = advance._recorded
+        if (recorded is None or recorded.step != self._verify_step or num_decodes == 0
+                or int(gaudi_envs.VLLM_HPU_FLASH_NEXT_SPEC_DEVICE_INPUTS) not in (1, 2)):
+            advance.set_chain(self._verify_step, None)
+            return
+        chain = getattr(self, "_mtp_chain_out", None)
+        if chain is not None:
+            out = ChainOut(accepted=chain.accepted, next_ids=chain.next_ids, num_decodes=int(chain.num_decodes),
+                           k=int(chain.k), sampled=getattr(chain, "sampled", None),
+                           last_row=getattr(chain, "last_row", None))
+        else:
+            drafts = self._draft_token_ids
+            if drafts is None:
+                advance.set_chain(self._verify_step, None)
+                return
+            if not isinstance(drafts, torch.Tensor):
+                drafts = torch.tensor([list(row) for row in drafts[:num_decodes]], dtype=torch.int32)
+            out = stand_in_chain(sampled_token_ids[:num_decodes], drafts.to(self.device), recorded.padded,
+                                 recorded.k)
+        advance.set_chain(self._verify_step, out)
+        if self._align_flag in (1, 2):
+            return self._align_after_step(out, defer_books)
+        return None
+
+    def _align_verify_step(self, num_decodes, padded, num_tokens, block_size, positions, load_indices, store_indices,
+                           num_accepted, boundary):
+        """VLLM_HPU_FLASH_NEXT_SPEC_DEVICE_ALIGN (stage 2, M3): this verification step's align mode on the device:
+        the running block curr from the true context (the step's device positions), the pre-step copy plan, the
+        lattices of every group and the load counts. =2 runs the pre-step copies on the device and returns the
+        device lattices and counts (no host boundary commits: they run on the device after the step); =1 compares
+        them with the host's and returns the host's."""
+        k = num_tokens - 1
+        dev = positions.device
+        real = torch.arange(padded, dtype=torch.int32, device=dev) < num_decodes
+        ctx = positions.reshape(padded, num_tokens)[:, 0].to(torch.int32)
+        ctx = torch.where(real, ctx, torch.zeros_like(ctx))
+        ids = tuple(self.input_batch.req_ids[:num_decodes])
+        carried = self._align_dev
+        if (self._align_flag == 2 and carried is not None and carried["step"] == self._verify_step - 1
+                and carried["ids"] == ids and carried["padded"] == padded):
+            prev, n = carried["prev"], carried["n"]
+        else:  # the host's books, exact here (the step before was synchronous or every pending book is applied)
+            pre_blocks, pre_counts = self._align_pre_books
+            prev_cpu = torch.zeros(padded, dtype=torch.int32)
+            n_cpu = torch.ones(padded, dtype=torch.int32)
+            prev_cpu[:num_decodes] = torch.tensor([-1 if b is None else int(b) for b in pre_blocks], dtype=torch.int32)
+            n_cpu[:num_decodes] = torch.tensor([int(c) for c in pre_counts], dtype=torch.int32)
+            prev, n = async_h2d_copy(prev_cpu, device=self.device), async_h2d_copy(n_cpu, device=self.device)
+        curr, planned, src, ssm_src, n_after = align_precopy(ctx, prev, n, k, block_size, real)
+        rows = {}
+        for gid in range(len(self.input_batch.block_table.block_tables)):
+            table = self.input_batch.block_table[gid].get_cpu_tensor()
+            rows_cpu = torch.zeros((padded, table.shape[1]), dtype=torch.int32)
+            m = min(num_decodes, table.shape[0])
+            rows_cpu[:m] = table[:m].to(torch.int32)
+            rows[gid] = async_h2d_copy(rows_cpu, device=self.device)
+        # the recurrent groups' lattices (the commit registry: GDN and PLE); any other group keeps the host's rows
+        recurrent = set(self._recurrent_commit_registry)
+        lattice = torch.stack([
+            align_lattice_rows(rows[gid], curr, k, real, self._MAMBA_PAD_BLOCK_ID)
+            if gid in recurrent else load_indices[gid].to(torch.int32) for gid in range(len(rows))
+        ], dim=0)
+        self._align_stats["steps"] += 1
+        self._align_step = {"step": self._verify_step, "ids": ids, "padded": padded, "k": k, "ctx": ctx,
+                            "curr": curr, "real": real, "rows": rows, "lattice": lattice, "block_size": block_size}
+        if self._align_flag == 1:
+            host_curr = [self._align_running_block_by_req.get(r) for r in ids]
+            bad = {}
+            groups = sorted(recurrent)
+            mine_cpu = lattice[groups].to("cpu").to(torch.int64)
+            if not torch.equal(mine_cpu, load_indices[groups].to("cpu").to(torch.int64)):
+                bad["lattice"] = 1
+            if not torch.equal(mine_cpu, store_indices[groups].to("cpu").to(torch.int64)):
+                bad["store_lattice"] = 1
+            if n_after[:num_decodes].to("cpu").tolist() != num_accepted[:num_decodes].to("cpu").tolist():
+                bad["load_count"] = 1
+            if curr[:num_decodes].to("cpu").tolist() != host_curr:
+                bad["running_block"] = 1
+            self._log_align(bad)
+            return load_indices, store_indices, num_accepted, boundary
+        pad_slot = int(self._MAMBA_PAD_BLOCK_ID)
+        for gid, entries in self._recurrent_commit_registry.items():
+            group_rows = rows[gid]
+            conv_src = align_gather(group_rows, src[:, None])[:, 0]
+            ssm_slot = align_gather(group_rows, ssm_src[:, None])[:, 0]
+            dst = align_gather(group_rows, curr[:, None])[:, 0]
+            for tensor, kind, window in entries:
+                if kind == "ssm":
+                    device_commit_ssm(tensor, ssm_slot, dst, planned, pad_slot)
+                else:
+                    device_commit_conv(tensor, conv_src, dst, n - 1, planned, window, pad_slot)
+        self._log_align({})
+        return lattice.to(load_indices.dtype), lattice.to(store_indices.dtype), n_after.to(num_accepted.dtype), None
+
+    def _align_after_step(self, chain, defer_books: bool):
+        """=1/=2 after the step's acceptance (``chain.accepted``): the boundary commits and the next load counts on
+        the device. =2 runs the commits and keeps (prev, n) for the next step; its host books are set now on a
+        synchronous step, or returned ([2, B] next counts and running blocks) to travel with mode 3's async copy.
+        =1 compares the next counts with the host's books (set by the step's own read)."""
+        step = self._align_step
+        if step is None or step["step"] != self._verify_step:
+            self._align_dev = None
+            return None
+        padded, real, ctx, curr = step["padded"], step["real"], step["ctx"], step["curr"]
+        committed = torch.where(real, chain.accepted[:padded].to(torch.int32) + 1, torch.zeros_like(ctx))
+        registry = self._recurrent_commit_registry
+        if not registry:
+            self._align_dev = None
+            return None
+        self_commit = None
+        pad_slot = int(self._MAMBA_PAD_BLOCK_ID)
+        for gid, entries in registry.items():
+            store = step["lattice"][gid]
+            mask, t, ssm_src, conv_src, dst, group_self = align_commits(ctx, committed, step["block_size"], store,
+                                                                        step["rows"][gid], real)
+            self_commit = group_self if self_commit is None else (self_commit | group_self)
+            if self._align_flag == 2:
+                for tensor, kind, window in entries:
+                    if kind == "ssm":
+                        device_commit_ssm(tensor, ssm_src, dst, mask, pad_slot)
+                    else:
+                        device_commit_conv(tensor, conv_src, dst, t, mask, window, pad_slot)
+        next_n = torch.where(self_commit, torch.ones_like(committed), torch.clamp(committed, min=1))
+        ids = step["ids"]
+        if self._align_flag == 1:
+            host_n = [self._gdn_num_accepted_by_req.get(r, 1) for r in ids]
+            self._log_align({} if next_n[:len(ids)].to("cpu").tolist() == host_n else {"next_load_count": 1})
+            return None
+        self._align_dev = {"step": self._verify_step, "ids": ids, "padded": padded, "prev": curr, "n": next_n}
+        books = torch.stack([next_n, curr], dim=0)
+        if defer_books:
+            return books
+        values = books.to("cpu").tolist()
+        for r, req_id in enumerate(ids):
+            self._gdn_num_accepted_by_req[req_id] = int(values[0][r])
+            self._align_running_block_by_req[req_id] = int(values[1][r])
+        return None
+
+    def _log_align(self, bad: dict) -> None:
+        stats = self._align_stats
+        if self._align_flag == 1:
+            stats["checked"] += 1
+        if bad:
+            stats["differences"] += 1
+            if stats["differences"] <= 8:
+                logger.warning("VLLM_HPU_FLASH_NEXT_SPEC_DEVICE_ALIGN=%d: step %d's device-made align mode differs "
+                               "from the host's: %s", self._align_flag, self._verify_step, bad)
+        if stats["steps"] == 1 or stats["steps"] % 16 == 0:
+            logger.info("VLLM_HPU_FLASH_NEXT_SPEC_DEVICE_ALIGN=%d: %d verification steps made, %d checked, %d with "
+                        "differences", self._align_flag, stats["steps"], stats["checked"], stats["differences"])
+
+    def _log_verify_advance(self, bad: dict) -> None:
+        stats = self._verify_advance.stats
+        mode = int(gaudi_envs.VLLM_HPU_FLASH_NEXT_SPEC_DEVICE_INPUTS)
+        if bad and (stats.mismatched_steps <= 8 or stats.mismatched_steps % 100 == 0):
+            logger.warning("VLLM_HPU_FLASH_NEXT_SPEC_DEVICE_INPUTS=%d: step %d's device-made inputs differ from the "
+                           "host's: %s", mode, self._verify_step, bad)
+        if stats.advanced == 1 or stats.advanced % 16 == 0:
+            logger.info("VLLM_HPU_FLASH_NEXT_SPEC_DEVICE_INPUTS=%d: %d verification steps, %d advanced on the "
+                        "device, %d checked, %d with differences %s", mode, stats.verify_steps, stats.advanced,
+                        stats.checked, stats.mismatched_steps, stats.mismatches)
+
+    def _spec_continues(self, scheduler_output) -> bool:
+        """=3: whether this step's batch is the last early step's (no request new, resumed or finished; each with
+        its 1 + k verification tokens), so its inputs can come from the device without the previous step's books."""
+        last = self._spec_early.pending[-1]
+        if scheduler_output.scheduled_new_reqs or scheduler_output.finished_req_ids:
+            return False
+        cached = scheduler_output.scheduled_cached_reqs
+        if any(getattr(cached, "resumed_from_preemption", None) or []):
+            return False
+        scheduled = scheduler_output.num_scheduled_tokens
+        if set(scheduled) != set(last.req_ids):
+            return False
+        width = int(self.speculative_config.num_speculative_tokens) + 1
+        return all(int(n) == width for n in scheduled.values())
+
+    def _settle_spec_books(self, block: bool) -> None:
+        """=3: apply the pending books in step order: each step's tokens into the batch's token rows, the counts,
+        the requests' output tokens and the recurrent lattice's accepted counts. Without ``block`` only the books
+        whose copy is done (at most two stay pending)."""
+        books = self._spec_early
+        while books.pending:
+            pending = books.pending[0]
+            if not block and len(books.pending) <= books.MAX_PENDING:
+                query = getattr(pending.event, "query", None)
+                if callable(query) and not query():
+                    break
+            pending.event.synchronize()
+            books.pending.popleft()
+            for req_id, row in zip(pending.req_ids, books.apply(pending, self.input_batch.vocab_size)):
+                index = self.input_batch.req_id_to_index.get(req_id)
+                if index is None or req_id not in self.requests or not row:
+                    continue
+                start = int(self.input_batch.num_tokens_no_spec[index])
+                end = start + len(row)
+                self.input_batch.token_ids_cpu[index, start:end] = row
+                self.input_batch.num_tokens_no_spec[index] = end
+                self.input_batch.num_tokens[index] = end
+                self.requests[req_id].output_token_ids.extend(row)
+                if self._recurrent_spec:
+                    self._gdn_num_accepted_by_req[req_id] = max(1, len(row))
+            if pending.align is not None:  # M3: the next load counts (self commits) and running blocks
+                values = pending.align.tolist()
+                for r, req_id in enumerate(pending.req_ids):
+                    if req_id in self.requests:
+                        self._gdn_num_accepted_by_req[req_id] = int(values[0][r])
+                        self._align_running_block_by_req[req_id] = int(values[1][r])
+            if block:
+                books.stats.waited += 1
+            else:
+                books.stats.settled_late += 1
+        if block:
+            self._spec_early_waited = True
+
+    def _spec_override_computed(self) -> None:
+        """=3, after waiting for every pending book: the batch's num_computed_tokens are the true ones (the
+        scheduler's still count the early steps' drafts as accepted)."""
+        books = self._spec_early
+        for req_id, index in self.input_batch.req_id_to_index.items():
+            if req_id in books.true_computed:
+                self.input_batch.num_computed_tokens_cpu[index] = books.true_computed[req_id]
+        books.true_computed.clear()
+        self._spec_early_waited = False
+
+    def _issue_early_output(self, num_decodes, num_prefills, warmup_mode, sampling_metadata):
+        """=3: this chained step's output now, before its tokens reach the host, or None when the step keeps the
+        synchronous order (logged once per reason)."""
+        books = self._spec_early
+        reason = None
+        if num_prefills:
+            reason = "a prefill in the batch"
+        elif warmup_mode:
+            reason = "warmup"
+        elif self.profiler.enabled:
+            reason = "the profiler"
+        elif sampling_metadata is not None and sampling_metadata.max_num_logprobs is not None:
+            reason = "logprobs"
+        elif needs_output_token_values(self.input_batch):
+            reason = "penalties or bad words"
+        elif any((self.requests[r].sampling_params is not None and (self.requests[r].sampling_params.min_tokens or 0) > 0)
+                 for r in self.input_batch.req_ids[:num_decodes]):
+            reason = "min_tokens"
+        elif self.use_structured_output:
+            reason = "structured output"
+        elif has_kv_transfer_group():
+            reason = "a KV transfer"
+        if reason is not None:
+            books.stats.sync_steps += 1
+            books.stats.reasons[reason] = books.stats.reasons.get(reason, 0) + 1
+            if reason not in self._spec_early_logged:
+                self._spec_early_logged.add(reason)
+                logger.info("VLLM_HPU_FLASH_NEXT_ASYNC_SCHED=3: a chained step reads its tokens first: %s", reason)
+            return None
+        chain = self._mtp_chain_out
+        req_ids = list(self.input_batch.req_ids[:num_decodes])
+        self._draft_token_ids = chain.drafts
+        # the next step's device-made inputs (M1) from the chain; with M3 its align books travel with the copy
+        align_books = self._set_verify_chain(num_decodes, None, defer_books=True)
+        output = ModelRunnerOutput(req_ids=req_ids,
+                                   req_id_to_index={req_id: i
+                                                    for i, req_id in enumerate(req_ids)},
+                                   sampled_token_ids=[[] for _ in req_ids],
+                                   logprobs=None,
+                                   prompt_logprobs_dict={},
+                                   pooler_output=[],
+                                   kv_connector_output=KVConnectorOutput(finished_sending=None, finished_recving=None))
+        early = AsyncSpecModelRunnerOutput(output, chain.sampled, num_decodes, self.input_batch.vocab_size,
+                                           self._spec_early_stream, extra=align_books)
+        seeds = {req_id: int(self.input_batch.num_computed_tokens_cpu[i])
+                 for i, req_id in enumerate(req_ids)} if not books.pending else {}
+        books.push(PendingBooks(self._verify_step, tuple(req_ids), early.sampled_cpu, early.ready_event, seeds,
+                                align=early.extra_cpu))
+        books.stats.issued += 1
+        if books.stats.issued == 1 or books.stats.issued % 32 == 0:
+            logger.info("VLLM_HPU_FLASH_NEXT_ASYNC_SCHED=3: %d steps issued before the previous step's tokens reached "
+                        "the host; books applied %d late, %d after a wait; %d chained steps read first %s",
+                        books.stats.issued, books.stats.settled_late, books.stats.waited, books.stats.sync_steps,
+                        books.stats.reasons)
+        return early
+
+    def _flash_next_async_begin_step(self, scheduler_output=None) -> None:
+        """Under async scheduling, once per engine step before its batches are built: the last step's decode
+        contexts become this step's (no wait for the device: see flash_next_async.AsyncOutputLedger). With
+        speculation (the runner's step stays synchronous): the true num_computed_tokens of the last step's
+        verification rows."""
+        if self._spec_draft_handoff is not None:
+            self._spec_draft_handoff.begin_step()
+            if scheduler_output is not None:
+                self._spec_draft_handoff.correct_computed(self.input_batch.req_ids,
+                                                          self.input_batch.num_computed_tokens_cpu, self.requests,
+                                                          scheduler_output.scheduled_spec_decode_tokens)
+            if self._spec_early is not None and self._spec_early_waited:
+                self._spec_override_computed()
+            return
+        if not self._flash_next_async_checked:
+            self._flash_next_async_checked = True
+            if is_flash_next_model(self.model_config):
+                self._ple_carry, self._async_ledger = PleContextCarry(), AsyncOutputLedger()
+        if self._ple_carry is not None:
+            self._ple_carry.begin_step()
 
     def _form_prefill_batch(self, contents):
         if len(contents.req_ids) == 0:
@@ -5289,12 +5783,11 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         logits_indices[:num_decodes] = query_start_loc_cpu[1:num_decodes + 1] - 1
 
         positions_device = async_h2d_copy(positions, dtype=position_dtype, device=self.device)
-        # VLLM_HPU_QSA_TABLE_WIDTH=1: as wide as the batch's longest request needs, not as the engine's longest
-        # context (the QSA indexer scores every column's keys); the same width with the sparse decode metadata.
-        table_width = decode_block_table_width(num_blocks, self._block_table_max_blocks,
-                                               gaudi_envs.VLLM_HPU_QSA_TABLE_WIDTH)
         if sparse_md:
-            # One row per request (the pages of its last scheduled token), repeated over its verification rows.
+            # One row per request (the pages of its last scheduled token), repeated over its verification rows, as
+            # wide as VLLM_HPU_QSA_TABLE_WIDTH says (the same width as the dense branch's table below).
+            table_width = decode_block_table_width(num_blocks, self._block_table_max_blocks,
+                                                   gaudi_envs.VLLM_HPU_QSA_TABLE_WIDTH)
             block_table_cpu = request_block_table(block_table_cpu_tensor, num_blocks, num_tokens,
                                                   padded_batch_size * num_tokens, table_width, self._PAD_BLOCK_ID)
             block_list = block_groups = block_usage = None
@@ -5303,6 +5796,10 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
 
             block_table_cpu = None
             if getattr(self, '_needs_block_table', False):
+                # VLLM_HPU_QSA_TABLE_WIDTH=1: as wide as the batch's longest request needs, not as the engine's longest
+                # context (the QSA indexer scores every column's keys).
+                table_width = decode_block_table_width(num_blocks, self._block_table_max_blocks,
+                                                       gaudi_envs.VLLM_HPU_QSA_TABLE_WIDTH)
                 block_table_cpu = build_block_table(block_tables_list, padded_batch_size * num_tokens, table_width,
                                                     self._PAD_BLOCK_ID)
 
@@ -5376,8 +5873,13 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                 if self.use_prefix_caching:
                     # Align mode (M3-T10c): move each request's running state into its running block first, so
                     # num_accepted below is the post-copy count (upstream vLLM preprocess_mamba).
-                    self._precopy_align_states(num_decodes, list(context_lens), list(num_scheduled_tokens),
-                                               mamba_block_size, normalize=not is_spec_batch)
+                    if self._align_flag in (1, 2) and is_spec_batch:
+                        ids = self.input_batch.req_ids[:num_decodes]
+                        self._align_pre_books = ([self._align_running_block_by_req.get(r) for r in ids],
+                                                 [self._gdn_num_accepted_by_req.get(r, 1) for r in ids])
+                    if not (self._align_flag == 2 and is_spec_batch):
+                        self._precopy_align_states(num_decodes, list(context_lens), list(num_scheduled_tokens),
+                                                   mamba_block_size, normalize=not is_spec_batch)
                 decode_req_ids = self.input_batch.req_ids[:num_decodes]
                 decode_accepted = accepted_counts(decode_req_ids, self._gdn_num_accepted_by_req, num_decodes)
                 load_offsets = load_checkpoint_offsets(decode_accepted, is_spec_batch)
@@ -5408,7 +5910,11 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                     load_rows = []
                     store_rows = []
                     for group_idx in range(len(self.input_batch.block_table.block_tables)):
-                        if group_idx in self._compact_gdn_group_ids:
+                        # The attention group's rows are KV blocks (kernel blocks of attn_block_size tokens), not
+                        # state blocks: no layer reads its lattice row, and a request with fewer kernel blocks than
+                        # 1 + k (one 512-token block holds four at k >= 4) failed the null-block check.
+                        if group_idx in self._compact_gdn_group_ids or not isinstance(
+                                self.kv_cache_config.kv_cache_groups[group_idx].kv_cache_spec, MambaSpec):
                             load_rows.append(load_state_indices_cpu[group_idx])
                             store_rows.append(store_state_indices_cpu[group_idx])
                             continue
@@ -5551,6 +6057,29 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             if num_tokens > 1:
                 token_ids_device = token_ids_device.view(-1, 1)
 
+        if self._spec_draft_handoff is not None and scheduler_output is not None:
+            # Async scheduling with speculation: the last step's drafts into this batch's draft slots, on the device.
+            token_ids_device = self._spec_draft_handoff.scatter_drafts(token_ids_device,
+                                                                       self.input_batch.req_ids[:num_decodes],
+                                                                       num_tokens,
+                                                                       scheduler_output.scheduled_spec_decode_tokens)
+        verify_made, verify_ok = None, False
+        if self._verify_advance is not None and num_tokens > 1 and scheduler_output is not None:
+            # VLLM_HPU_FLASH_NEXT_SPEC_DEVICE_INPUTS: this verification step's acceptance-dependent inputs from the
+            # previous one's, on the device (flash_next_async_spec); =2 uses them from here on.
+            (verify_made, verify_ok, token_ids_device, positions_device, slot_mapping_device,
+             num_accepted_tokens) = self._advance_verify_inputs(num_decodes, padded_batch_size, num_tokens,
+                                                                block_table_cpu_tensor, decode_block_size, sparse_md,
+                                                                token_ids_device, positions_device,
+                                                                slot_mapping_device, num_accepted_tokens,
+                                                                scheduler_output, block_table_device)
+        if (self._align_flag in (1, 2) and verify_ok and self.use_prefix_caching and self._recurrent_spec
+                and num_tokens > 1 and load_indices_tensor is not None and not self._compact_gdn_group_ids):
+            (load_indices_tensor, store_indices_tensor, num_accepted_tokens,
+             recurrent_boundary) = self._align_verify_step(num_decodes, padded_batch_size, num_tokens,
+                                                           self.cache_config.mamba_block_size, positions_device,
+                                                           load_indices_tensor, store_indices_tensor,
+                                                           num_accepted_tokens, recurrent_boundary)
         # call prepare_spec_decode_inputs to get the logits indices and
         if scheduler_output is not None:
             logits_indices, spec_decode_metadata = self._prepare_spec_decode_inputs(scheduler_output, logits_indices,
@@ -5617,6 +6146,17 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             # VLLM_HPU_PLE_HOST_NGRAM_IDS=1: token_ids is the CPU copy of the step's input ids ([padded_batch_size *
             # num_tokens] row-major), speculative drafts included; hash it here instead of in the graph.
             ple_inputs = self._with_host_ngram_ids(ple_inputs, token_ids)
+            if self._ple_carry is not None and len(ple_inputs) == 2:
+                # Async scheduling: rows that decoded in the last step take their context from the device.
+                ple_inputs = (ple_inputs[0],
+                              self._ple_carry.decode_context(
+                                  async_h2d_copy(ple_inputs[1], dtype=torch.int32, device=self.device),
+                                  self.input_batch.req_ids[:num_decodes], token_ids_device,
+                                  num_tokens_per_req[:num_decodes]))
+        if verify_ok:
+            ple_inputs = self._finish_verify_inputs(verify_made, num_decodes, padded_batch_size, num_tokens,
+                                                    token_ids_device, positions_device, slot_mapping_device,
+                                                    num_accepted_tokens, ple_inputs)
 
         return DecodeInputData(num_decodes=num_decodes,
                                token_ids=token_ids_device,
@@ -6739,6 +7279,12 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
     ) -> ModelRunnerOutput | None:
 
         self._poll_runtime_switches()
+        if self._spec_early is not None:
+            # =3: the books of steps issued before their tokens reached the host; a step that does not continue
+            # the batch waits for all of them first (then its inputs are the host's, from exact books)
+            self._spec_early_waited = False
+            if self._spec_early.pending:
+                self._settle_spec_books(block=not self._spec_continues(scheduler_output))
         self.run_defragmenter(scheduler_output, warmup_mode)
 
         batch_changed = self._update_states(scheduler_output)
@@ -6884,15 +7430,72 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             # Swap
             self.input_batch.swap_states(first_prompt_index, last_decode_index)
 
+    # VLLM_HPU_MTP_TIMING=1: the speculative step's timer (mtp_step_timer.py). A class default, so a runner built
+    # without __init__ (unit tests) is untimed.
+    _mtp_step_timer = None
+    # VLLM_HPU_SPEC_SAMPLED_VERIFY=2: the host noise generator of the candidate verification (seeded alike on every
+    # rank at its first use, so every rank draws the same tokens) and the refusals already logged.
+    _candidate_noise = None
+    _candidate_refusals_logged: Optional[set] = None
+    _candidate_verify_steps = 0  # steps verified over candidates (the CPU engine rehearsal reads it)
+
+    def _candidate_verify(self, logits_device: torch.Tensor, spec_decode_metadata,
+                          sampling_metadata: SamplingMetadata, request_ids: list[str]) -> Optional[torch.Tensor]:
+        """VLLM_HPU_SPEC_SAMPLED_VERIFY=2: a verification step with sampled requests over the top candidates of its
+        rows (hpu_candidate_verify.py), ``[batch, k + 1]`` int32 tokens; None when the step does not qualify (a
+        seeded request, logprobs, top_k outside 1..64), which then takes the exact path of ``=1``."""
+        from vllm_gaudi.v1.sample import hpu_candidate_verify as candidate_verify
+        from vllm_gaudi.v1.sample.hpu_rejection_sampler import PLACEHOLDER_TOKEN_ID
+
+        batch = int(spec_decode_metadata.bonus_logits_indices.shape[0])
+        params = [self.requests[req_id].sampling_params for req_id in request_ids]
+        if not params or len(params) > batch or any(p is None for p in params):
+            return None
+        params = params + [params[0]] * (batch - len(params))  # the padded batch repeats its first request
+        temperatures = [float(p.temperature) for p in params]
+        top_ks = [int(p.top_k) for p in params]
+        top_ps = [float(p.top_p) for p in params]
+        reason = candidate_verify.refusal(temperatures, top_ks, top_ps,
+                                          seeded=any(p.seed is not None for p in params),
+                                          logprobs=sampling_metadata.max_num_logprobs is not None)
+        if reason is not None:
+            if self._candidate_refusals_logged is None:
+                self._candidate_refusals_logged = set()
+            if reason not in self._candidate_refusals_logged:
+                self._candidate_refusals_logged.add(reason)
+                logger.info("VLLM_HPU_SPEC_SAMPLED_VERIFY=2: a step with %s takes the exact sampled verification",
+                            reason)
+            return None
+        max_draft = int(spec_decode_metadata.target_logits_indices.shape[0]) // batch
+        if self._candidate_noise is None:
+            self._candidate_noise = torch.Generator().manual_seed(candidate_verify.NOISE_SEED)
+            logger.info("VLLM_HPU_SPEC_SAMPLED_VERIFY=2: sampled verification over the top %d candidates of every row "
+                        "(first step: %d requests, k = %d)", candidate_verify.CANDIDATES, batch, max_draft)
+        inputs = candidate_verify.host_inputs(temperatures, top_ks, top_ps, max_draft, self._candidate_noise)
+        self._candidate_verify_steps += 1
+        return candidate_verify.candidate_rejection_sample(logits_device, spec_decode_metadata.target_logits_indices,
+                                                           spec_decode_metadata.bonus_logits_indices,
+                                                           spec_decode_metadata.draft_token_ids,
+                                                           spec_decode_metadata.cu_num_draft_tokens,
+                                                           inputs.to(logits_device.device, non_blocking=True),
+                                                           PLACEHOLDER_TOKEN_ID)
+
     @torch.inference_mode()
     def sample_tokens(self, grammar_output: "GrammarOutput | None") -> ModelRunnerOutput | AsyncModelRunnerOutput:
         if self.scheduler_output is None:
             # Nothing to do (PP non-final rank case), output isn't used.
             return None  # noqa
+        if self._mtp_step_timer is not None:
+            self._mtp_step_timer.step_start()
         scheduler_output = self.scheduler_output
         warmup_mode = self.warmup_mode
         self.scheduler_output = None
         self.warmup_mode = False
+        early_output = None  # VLLM_HPU_FLASH_NEXT_ASYNC_SCHED=3: this step's output before its tokens reach the host
+        if self.use_async_scheduling or self._spec_draft_handoff is not None:
+            self._flash_next_async_begin_step(scheduler_output)
+        if self._verify_advance is not None:
+            self._verify_step += 1
 
         # NOTE(kzawora): Since scheduler doesn't differentiate between prefills
         # and decodes, we must handle mixed batches. In _update_states we make
@@ -6989,9 +7592,14 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         decode_data, dummy_decode_input_data_across_dp = decode_input_data
         prefill_sampled_token_ids = []
         prefill_sampled_requests = []
+        # One entry per prefill batch for the drafter: its sampled tokens, or None for a chunk that does not
+        # complete its prompt (no logits, nothing sampled). prefill_sampled_token_ids skips those chunks.
+        prefill_sampled_by_batch: list[Optional[torch.Tensor]] = []
         decode_sampled_token_ids = []
         decode_sampled_requests = []
         device_prepared_dflash_drafts = None
+        # A step whose only work is prefill chunks that complete no prompt samples nothing.
+        sampling_metadata = None
         # Logprobs tracking: collect (req_ids, logprobs_tensors) segments
         # from each sampling call to combine at the end.
         logprobs_segments: list[tuple[list[str], LogprobsTensors | None]] = []
@@ -7091,6 +7699,9 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                             prefill_sampled_token_ids.append(sampler_output.sampled_token_ids.flatten())
                             prefill_sampled_requests.extend(logits_requests)
                             logprobs_segments.append((list(logits_requests), sampler_output.logprobs_tensors))
+                        prefill_sampled_by_batch.append(prefill_sampled_token_ids[-1])
+                    else:
+                        prefill_sampled_by_batch.append(None)
                 if self.is_driver_worker and self.profiler.enabled:
                     # Stop recording 'execute_model_generic' event
                     self.profiler.end()
@@ -7135,6 +7746,10 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             self.event_start = self.profiler.get_timestamp_us()
             self.profiler.start("internal", "decode")
             fuse_greedy_sampling = self._can_fuse_plain_greedy_sampling(pd_info.decode_req_ids)
+            # VLLM_HPU_MTP_DRAFT_CHAIN=1: whether this step's draft is chained behind its verification (decided
+            # before the forward; async scheduling's mode 3 reads it too)
+            self._mtp_chain_step = self._mtp_chain_decision(decode_data, num_decodes, num_prefills, warmup_mode)
+            self._mtp_chain_out = None
             greedy_stop_ids = (self._fused_greedy_stop_ids(pd_info.decode_req_ids,
                                                            int(decode_data.logits_indices.shape[0]))
                                if fuse_greedy_sampling else None)
@@ -7200,11 +7815,20 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                     elif fused_sampled_token_ids is not None:
                         # Greedy verification from the arg max of every row: no sampler pass over logits.
                         sampler_output, sampling_metadata = None, None
+                    elif spec_decode_metadata is not None:
+                        # The rejection sampler samples the bonus rows itself, so only the sampling metadata here
+                        # (no discarded sampler pass): one row per request of the padded batch, its bonus row, as
+                        # that sampler pass and the sampled verification read it (idea-sweep I07). Padded to the
+                        # logits' 1 + k rows per request, a sampled request's temperature did not fit its row.
+                        htorch.core.mark_step()
+                        sampling_metadata = self._prepare_sampling(batch_changed, pd_info.decode_req_ids,
+                                                                   int(spec_decode_metadata.bonus_logits_indices.shape[0]))
+                        htorch.core.mark_step()
+                        sampler_output = None
                     else:
-                        sampler_output, sampling_metadata = self._run_sampling(
-                            batch_changed, logits_device if spec_decode_metadata is None else
-                            logits_device[spec_decode_metadata.bonus_logits_indices], pd_info.decode_req_ids,
-                            logits_device.shape[0])
+                        sampler_output, sampling_metadata = self._run_sampling(batch_changed, logits_device,
+                                                                               pd_info.decode_req_ids,
+                                                                               logits_device.shape[0])
 
                     if spec_decode_metadata is None:
                         assert sampler_output is not None
@@ -7221,7 +7845,13 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                     else:
                         # Handling spec decode sampling.
                         sampled_token_ids = None
-                        if fused_sampled_token_ids is not None:
+                        if fused_sampled_token_ids is not None and self._mtp_chain_step:
+                            # VLLM_HPU_MTP_DRAFT_CHAIN=1, stage B: the greedy rejection runs inside the chained
+                            # draft's graph, right behind the verification's per-row ids
+                            self._mtp_chain_issue(None, decode_data, non_flattened_hidden_states, aux_hidden_states,
+                                                  num_decodes, verify_ids=fused_sampled_token_ids)
+                            sampled_token_ids = self._mtp_chain_out.sampled
+                        elif fused_sampled_token_ids is not None:
                             from vllm_gaudi.v1.sample.hpu_greedy_verify import greedy_rejection_sample_from_tokens
 
                             sampled_token_ids = greedy_rejection_sample_from_tokens(
@@ -7243,6 +7873,12 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                                     spec_decode_metadata.bonus_logits_indices,
                                     spec_decode_metadata.cu_num_draft_tokens,
                                 )
+                        if (sampled_token_ids is None and sampling_metadata is not None
+                                and not sampling_metadata.all_greedy
+                                and int(gaudi_envs.VLLM_HPU_SPEC_SAMPLED_VERIFY) == 2):
+                            # Sampled verification over candidates (idea-sweep I07); None: the exact path below.
+                            sampled_token_ids = self._candidate_verify(logits_device, spec_decode_metadata,
+                                                                       sampling_metadata, pd_info.decode_req_ids)
                         if sampled_token_ids is None:
                             sampler_output = self.rejection_sampler(
                                 spec_decode_metadata,
@@ -7263,42 +7899,24 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                                 )
                         if step_timer is not None:
                             step_timer.lap("sample")
-                        decode_sampled_token_ids = \
-                            self.rejection_sampler.parse_output(
-                                sampled_token_ids,
-                                self.input_batch.vocab_size,
-                        )
-                        if step_timer is not None:
-                            step_timer.lap("wait")  # the first host read of this step's device results
-                        if isinstance(decode_sampled_token_ids, tuple):
-                            decode_sampled_token_ids, _ = decode_sampled_token_ids
-                        # Trim output in case of dummy padding
-                        decode_sampled_token_ids = decode_sampled_token_ids[:num_decodes]
-                        if self._recurrent_spec:
-                            for req_id, accepted_tokens in zip(
-                                    self.input_batch.req_ids[:num_decodes],
-                                    decode_sampled_token_ids,
-                            ):
-                                self._gdn_num_accepted_by_req[req_id] = max(1, len(accepted_tokens))
-                            if decode_data is not None and decode_data.recurrent_boundary is not None:
-                                # Align mode (M3-T10b): accepted tokens that complete a
-                                # position block move their state from the store lattice
-                                # into that block's slot for prefix-cache reuse.
-                                self_commits = self._commit_recurrent_boundaries(
-                                    decode_data.recurrent_boundary,
-                                    [len(a) for a in decode_sampled_token_ids])
-                                # T10c: a commit into the running block itself replaced the
-                                # multi-token window, so the next step starts from one token.
-                                for i in self_commits:
-                                    self._gdn_num_accepted_by_req[self.input_batch.req_ids[i]] = 1
-                        # convert decode_sampled_token_ids as list of tensor
-                        spec_decode_num_tokens = [len(v) for v in decode_sampled_token_ids]
-                        decode_sampled_token_ids = [
-                            torch.tensor(v, device="cpu").int() for v in decode_sampled_token_ids
-                        ]
-                        decode_sampled_token_ids_device = \
-                            sampled_token_ids.to("hpu", non_blocking=True)
+                        if self._mtp_chain_step and self._mtp_chain_out is None:
+                            # VLLM_HPU_MTP_DRAFT_CHAIN=1, stage A: the draft goes behind the verification now, before
+                            # the host reads anything (the books below read the result as before)
+                            self._mtp_chain_issue(sampled_token_ids, decode_data, non_flattened_hidden_states,
+                                                  aux_hidden_states, num_decodes)
+                        if self._mtp_chain_step and self._mtp_chain_out is not None and self._spec_early is not None:
+                            # =3: the chained step (stage A here, or stage B's chain inside the verification graph)
+                            early_output = self._issue_early_output(num_decodes, num_prefills, warmup_mode,
+                                                                    sampling_metadata)
+                        if early_output is None:
+                            if self._spec_early is not None and self._spec_early.pending:
+                                self._settle_spec_books(block=True)  # the books of earlier steps before this read
+                                self._spec_early.true_computed.clear()  # the host's books are exact again
+                            decode_sampled_token_ids, spec_decode_num_tokens, decode_sampled_token_ids_device = \
+                                self._mtp_chain_settle(sampled_token_ids, decode_data, num_decodes, step_timer)
                     decode_sampled_requests.extend(self.input_batch.req_ids[:num_decodes])
+                    if early_output is not None:
+                        return early_output
                     ##### Sampling End #####
 
             if self.is_driver_worker and self.profiler.enabled:
@@ -7390,7 +8008,10 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             }
             # For the output, postprocessed_sampled_token_ids will be filled during serialization
         else:
-            prefill_sampled_token_ids_device = prefill_sampled_token_ids
+            # The drafter indexes its prefill tokens by prefill batch: a chunk that completes no prompt has None
+            # there (structured output samples every prefill row together, after the loop).
+            prefill_sampled_token_ids_device = (prefill_sampled_token_ids
+                                                if self.use_structured_output else prefill_sampled_by_batch)
             # From this point onward, all operations are done on CPU.
             # We already have tokens. Let's copy the data to
             # CPU as is, and then discard padded tokens.
@@ -7475,6 +8096,22 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             else:
                 if step_timer is not None:
                     step_timer.lap("post")
+                mtp_step_timer = None if warmup_mode else self._mtp_step_timer
+                if mtp_step_timer is not None:
+                    timer_kind = "prefill" if num_decodes == 0 else ("verify" if num_prefills == 0 else "mixed")
+                    if self._mtp_chain_step:
+                        # the draft was issued behind the verification (inside the "verify" span)
+                        timer_kind += "+chain"
+                    elif int(gaudi_envs.VLLM_HPU_MTP_DRAFT_GRAPH) == 1:
+                        # the one-graph drafts in records of their own (the flag can be switched at run time)
+                        timer_kind += "+graph"
+                    if (int(gaudi_envs.VLLM_HPU_FLASH_NEXT_DECODE_METADATA) == 1
+                            and self.flash_next_sparse_decode_metadata()):
+                        # the sparse decode metadata in force (also switchable): records of their own too
+                        timer_kind += "+md"
+                    mtp_step_timer.draft_start(timer_kind, scheduler_output.total_num_scheduled_tokens,
+                                               num_decodes + num_prefills,
+                                               self.speculative_config.num_speculative_tokens)
                 with self.profiler.record_event('internal', 'propose_draft_tokens'):
                     self._draft_token_ids = self.propose_draft_token_ids(
                         scheduler_output, postprocessed_sampled_token_ids, sampling_metadata,
@@ -7483,10 +8120,22 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                         non_flattened_hidden_states_prefills, sample_hidden_states_prefills,
                         aux_hidden_states_prefills, num_decodes,
                         prefill_data if num_prefills > 0 else None, decode_data if num_decodes > 0 else None)
+                if mtp_step_timer is not None:
+                    mtp_step_timer.draft_end()
                 if step_timer is not None:
                     step_timer.lap("draft")
         ################## Spec Decode end ##################
+        if self._verify_advance is not None:
+            self._set_verify_chain(num_decodes, postprocessed_sampled_token_ids)
 
+        if self._spec_draft_handoff is not None:
+            # Async scheduling with speculation: the drafts stay on the device for the next step, with the counts
+            # that correct the scheduler's (flash_next_async.SpecDraftHandoff).
+            self._spec_draft_handoff.record(self._draft_token_ids, self.input_batch.req_ids[:num_reqs],
+                                            self.input_batch.num_computed_tokens_cpu,
+                                            scheduler_output.num_scheduled_tokens,
+                                            scheduler_output.scheduled_spec_decode_tokens,
+                                            postprocessed_sampled_token_ids)
         # Create output.
         all_req_ids = pd_info.decode_req_ids + pd_info.prompt_req_ids
         # Compute prompt logprobs from prefill hidden states.
@@ -7519,6 +8168,10 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                 async_output_copy_stream=self.async_output_copy_stream,
                 native_copy=gaudi_envs.VLLM_HPU_DSV4_NATIVE_DECODE_GRAPH and num_prefills == 0 and num_decodes == 1,
             )
+            if self._async_ledger is not None:
+                # One placeholder per sampled token in output_token_ids, settled from this host copy.
+                self._async_ledger.record(self.requests, self.input_batch.req_ids[:num_reqs], self.invalid_req_indices,
+                                          async_output._sampled_token_ids_cpu, async_output._async_copy_ready_event)
             # Hybrid recurrent states and request rows are still being
             # established while prefills enter the decode batch. Settle those
             # transitions before scheduling another batch, then retain normal
@@ -7532,7 +8185,8 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             return async_output
         model_runner_output = ModelRunnerOutput(
             req_ids=all_req_ids,
-            req_id_to_index=self.input_batch.req_id_to_index,
+            # A copy: under async scheduling with speculation the engine reads it after the next step's state update.
+            req_id_to_index=req_id_to_index_output_copy,
             sampled_token_ids=postprocessed_sampled_token_ids,
             logprobs=logprobs,
             prompt_logprobs_dict=prompt_logprobs_dict,  # type: ignore[arg-type]
@@ -7676,7 +8330,9 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             with HabanaMemoryProfiler() as m:  # noqa: SIM117
                 #logger.info("Loading drafter model %s...", self.vllm_config.speculative_config.draft_model_config)
                 self.drafter.load_model(self.model.model)
-                if self.use_aux_hidden_state_outputs:
+                # The Flash-Next target returns (hidden, [multi]) itself (_MtpTargetOutputs): it has no EAGLE3
+                # auxiliary layers to set, and set_aux_hidden_state_layers asserts on a model without them.
+                if self.use_aux_hidden_state_outputs and not is_flash_next_mtp(self.speculative_config):
                     if self.speculative_config.use_dflash():
                         from vllm.v1.worker.gpu.spec_decode.eagle.eagle3_utils import (
                             set_eagle3_aux_hidden_state_layers, )
@@ -10352,7 +11008,10 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             assert isinstance(self.drafter, EagleProposer)
 
             draft_token_ids = None
-            if decode_data is not None:
+            if decode_data is not None and self._mtp_chain_step and self._mtp_chain_out is not None:
+                # VLLM_HPU_MTP_DRAFT_CHAIN=1: the chained draft already ran behind the verification
+                draft_token_ids = self._mtp_chain_out.drafts[:num_decodes]
+            elif decode_data is not None:
                 assert num_decodes is not None
                 draft_token_ids = self.propose_eagle_decode(
                     sampled_token_ids,
@@ -10379,6 +11038,20 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                 for idx, (req_id, prompt_len, token_ids, position_ids, attn_metadata, logits_indices, logits_requests,
                           _ple_inputs) in enumerate(zip(*shallow_tuple(prefill_data))):
                     if idx >= len(prefill_sampled_token_ids_tensor):
+                        continue
+                    if prefill_sampled_token_ids_tensor[idx] is None:
+                        # A chunk that completes no prompt sampled nothing; its requests are still prefilling, and
+                        # the scheduler drops a prefilling request's drafts. Zero rows keep the draft rows in the
+                        # input batch's request order (take_draft_token_ids pairs them by position).
+                        if gaudi_envs.VLLM_HPU_MTP_CHUNK_KV == 1 and hasattr(self.drafter, "fill_prefill_chunk"):
+                            self._fill_draft_kv_for_chunk(scheduler_output, hidden_states_prefills,
+                                                          aux_hidden_states_prefills, idx, req_id, token_ids,
+                                                          position_ids, attn_metadata, prefill_batch_start_idx)
+                        draft_token_ids_prefill.append(
+                            torch.zeros((len(req_id), self.speculative_config.num_speculative_tokens),
+                                        dtype=torch.int64,
+                                        device=self.device))
+                        prefill_batch_start_idx += len(req_id)
                         continue
                     _draft_token_ids = self.propose_eagle_prefill(
                         prefill_sampled_token_ids_tensor,
@@ -10690,6 +11363,130 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         output.index_copy_(0, active_rows_hpu, drafts)
         return output
 
+    # VLLM_HPU_MTP_DRAFT_CHAIN=1 (the draft chained behind the verification): this step's decision, taken before the
+    # verification's forward, and the chain's device outputs (MtpChainOut) from the draft's issue until the next
+    # step's decision. Async scheduling's mode 3 builds the next step's inputs from _mtp_chain_out.
+    _mtp_chain_step = False
+    _mtp_chain_out = None
+    _mtp_chain_refusals = None
+
+    def _mtp_chain_decision(self, decode_data, num_decodes: int, num_prefills: int, warmup_mode: bool) -> bool:
+        """Whether this step chains its draft behind its verification (VLLM_HPU_MTP_DRAFT_CHAIN=1). A step the
+        chain cannot serve takes today's path; each reason is logged once."""
+        if int(gaudi_envs.VLLM_HPU_MTP_DRAFT_CHAIN) != 1 or warmup_mode:
+            return False
+        if self.speculative_config is None or not is_flash_next_mtp(self.speculative_config):
+            return False
+        reason = None
+        if not hasattr(getattr(self, "drafter", None), "propose_chain"):
+            reason = "the drafter has no chained draft"
+        elif int(gaudi_envs.VLLM_HPU_MTP_DRAFT_GRAPH) != 1:
+            reason = "it needs VLLM_HPU_MTP_DRAFT_GRAPH=1"
+        elif getattr(self.drafter, "draft_rank_stats", None) is not None:
+            reason = "the draft-rank log is on"
+        elif decode_data is None or decode_data.spec_decode_metadata is None or num_decodes <= 0:
+            return False
+        elif num_prefills > 0:
+            reason = "a prefill in the step"
+        elif self.use_structured_output:
+            reason = "structured output"
+        elif not (int(gaudi_envs.VLLM_HPU_FLASH_NEXT_DECODE_METADATA) == 1
+                  and self.flash_next_sparse_decode_metadata()):
+            reason = "it needs the sparse decode metadata (VLLM_HPU_FLASH_NEXT_DECODE_METADATA=1 in force)"
+        else:
+            for req_id in self.input_batch.req_ids[:num_decodes]:
+                params = self.requests[req_id].sampling_params
+                if params is None or params.sampling_type != SamplingType.GREEDY:
+                    reason = "a sampled request (greedy only so far)"
+                    break
+        if reason is None:
+            return True
+        refusals = self._mtp_chain_refusals
+        if refusals is None:
+            refusals = self._mtp_chain_refusals = set()
+        if reason not in refusals:
+            refusals.add(reason)
+            logger.info("VLLM_HPU_MTP_DRAFT_CHAIN=1: a step keeps the draft after the host read: %s", reason)
+        return False
+
+    def _mtp_chain_issue(self, sampled_token_ids, decode_data, hidden_states, aux_hidden_states, num_decodes: int,
+                         verify_ids=None):
+        """Issue the chained draft (drafter.propose_chain) on the verification's device result and keep its device
+        outputs in ``self._mtp_chain_out``. Host work: a real-row mask and the requests' attention block table,
+        copied to the device whole (fresh tensors, not views: no unmatched graph input)."""
+        from vllm_gaudi.v1.spec_decode.flash_next_mtp_steps import MtpChainOut
+
+        spec = decode_data.spec_decode_metadata
+        batch = int(spec.bonus_logits_indices.shape[0])
+        real = async_h2d_copy(torch.arange(batch) < num_decodes, device=self.device)
+        table = self.input_batch.block_table[self._get_attention_group_id_for_hybrid()].get_cpu_tensor()
+        max_blocks = int(self._block_table_max_blocks)
+        width = min(int(table.shape[1]), max_blocks)
+        table_full = torch.full((batch, max_blocks), int(self._PAD_BLOCK_ID), dtype=torch.int32)
+        table_full[:num_decodes, :width] = table[:num_decodes, :width].to(torch.int32)
+        table_full = async_h2d_copy(table_full, device=self.device)
+        if self.use_aux_hidden_state_outputs and aux_hidden_states is not None:
+            verify_hidden = tuple(aux_hidden_states)
+        else:
+            verify_hidden = (hidden_states, )
+        drafts = self.drafter.propose_chain(sampled_token_ids, spec.cu_num_draft_tokens, real, decode_data.position_ids,
+                                            verify_hidden, decode_data.attn_metadata, table_full, self,
+                                            verify_ids=verify_ids, spec_decode_metadata=spec)
+        if drafts.sampled is not None:  # stage B: the chain's graph made the verification's result
+            sampled_token_ids = drafts.sampled
+        stage = "B (the greedy rejection in the chain's graph)" if verify_ids is not None else "A"
+        logged = self._mtp_chain_refusals
+        if logged is None:
+            logged = self._mtp_chain_refusals = set()
+        if stage not in logged:
+            logged.add(stage)
+            logger.info("VLLM_HPU_MTP_DRAFT_CHAIN=1: a step's draft is chained behind its verification, stage %s",
+                        stage)
+        self._mtp_chain_out = MtpChainOut(accepted=drafts.accepted, next_ids=drafts.next_ids,
+                                          sampled=sampled_token_ids, last_row=drafts.last_row,
+                                          num_decodes=int(num_decodes), k=int(drafts.drafts.shape[1]),
+                                          drafts=drafts.drafts)
+
+    def _mtp_chain_settle(self, sampled_token_ids, decode_data, num_decodes: int, step_timer=None):
+        """The host read of a verification's result and the books after it (parse_output, the accepted counts of
+        the recurrent lattice, the align-mode commits): the runner's code after the rejection sampler, in a method
+        of its own so async scheduling's mode 3 can run it one step late behind the chained draft. Returns
+        ``(decode_sampled_token_ids, spec_decode_num_tokens, decode_sampled_token_ids_device)``."""
+        decode_sampled_token_ids = \
+            self.rejection_sampler.parse_output(
+                sampled_token_ids,
+                self.input_batch.vocab_size,
+        )
+        if step_timer is not None:
+            step_timer.lap("wait")  # the first host read of this step's device results
+        if isinstance(decode_sampled_token_ids, tuple):
+            decode_sampled_token_ids, _ = decode_sampled_token_ids
+        # Trim output in case of dummy padding
+        decode_sampled_token_ids = decode_sampled_token_ids[:num_decodes]
+        if self._recurrent_spec:
+            for req_id, accepted_tokens in zip(
+                    self.input_batch.req_ids[:num_decodes],
+                    decode_sampled_token_ids,
+            ):
+                self._gdn_num_accepted_by_req[req_id] = max(1, len(accepted_tokens))
+            if decode_data is not None and decode_data.recurrent_boundary is not None:
+                # Align mode (M3-T10b): accepted tokens that complete a
+                # position block move their state from the store lattice
+                # into that block's slot for prefix-cache reuse.
+                self_commits = self._commit_recurrent_boundaries(
+                    decode_data.recurrent_boundary,
+                    [len(a) for a in decode_sampled_token_ids])
+                # T10c: a commit into the running block itself replaced the
+                # multi-token window, so the next step starts from one token.
+                for i in self_commits:
+                    self._gdn_num_accepted_by_req[self.input_batch.req_ids[i]] = 1
+        # convert decode_sampled_token_ids as list of tensor
+        spec_decode_num_tokens = [len(v) for v in decode_sampled_token_ids]
+        decode_sampled_token_ids = [torch.tensor(v, device="cpu").int() for v in decode_sampled_token_ids]
+        decode_sampled_token_ids_device = \
+            sampled_token_ids.to("hpu", non_blocking=True)
+        return decode_sampled_token_ids, spec_decode_num_tokens, decode_sampled_token_ids_device
+
     def propose_eagle_decode(
         self,
         sampled_token_ids: list[list[int]],
@@ -10714,7 +11511,10 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         # Decodes are the first num_decodes requests.
         # Prefill are the next num_reqs - num_decodes requests.
         # Note: sampled_token_ids includes both decode and prefill sampled tokens
-        block_table_cpu_tensor = self.input_batch.block_table[0].get_cpu_tensor()
+        # The drafter's attention layer reads the ATTENTION group's blocks. In a hybrid model group 0 can be a
+        # recurrent-state group (Flash-Next: the GDN layers come first), whose rows are state slots.
+        block_table_cpu_tensor = self.input_batch.block_table[
+            self._get_attention_group_id_for_hybrid()].get_cpu_tensor()
         decode_block_table = block_table_cpu_tensor[:num_decodes]
 
         common_attn_metadata = decode_data.attn_metadata
@@ -10723,22 +11523,55 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                                         decode_data.spec_decode_metadata,
                                         sampled_token_ids)
 
-        target_token_ids = decode_sampled_token_ids_tensor.reshape(-1, 1)[hidden_states_indices]
-        target_positions = decode_data.position_ids[hidden_states_indices]
+        # hidden_states_indices holds -1 for the rows after a request's last accepted one (their draft outputs are
+        # never read): row 0 stands in for them, so no gather on the device gets a negative index, and
+        # index_select replaces the advanced indexing (card rule 3).
+        picked = hidden_states_indices.clamp(min=0)
+        target_token_ids = torch.index_select(decode_sampled_token_ids_tensor.reshape(-1, 1), 0, picked)
+        target_positions = torch.index_select(decode_data.position_ids, 0, picked)
 
         if self.use_aux_hidden_state_outputs and \
                 aux_hidden_states is not None:
-            target_hidden_states = torch.cat([h[hidden_states_indices] for h in aux_hidden_states], dim=-1)
+            target_hidden_states = torch.cat([torch.index_select(h, 0, picked) for h in aux_hidden_states], dim=-1)
         else:
-            target_hidden_states = hidden_states[hidden_states_indices]
+            target_hidden_states = torch.index_select(hidden_states, 0, picked)
 
         if target_hidden_states.dim() == 2:
             target_hidden_states = target_hidden_states.unsqueeze(1)
+        if gaudi_envs.VLLM_HPU_MTP_DRAFT_LOOP == 1 and hasattr(self.drafter, "host_base_positions"):
+            # The position of each request's last accepted token, from the host books (the step's tokens are
+            # counted already): the draft loop then reads nothing back from the device. Padded rows take 0.
+            rows = len(decode_data.spec_decode_metadata.num_draft_tokens)
+            bases = [int(self.input_batch.num_tokens_no_spec[i]) - 2 if i < num_decodes else 0 for i in range(rows)]
+            self.drafter.host_base_positions = torch.tensor(bases, dtype=torch.int64)
         draft_token_ids = self.drafter.propose(target_token_ids, target_positions, target_hidden_states,
                                                last_token_indices, common_attn_metadata, decode_block_table, self)
 
         draft_token_ids = draft_token_ids[:num_decodes]
         return draft_token_ids
+
+    def _fill_draft_kv_for_chunk(self, scheduler_output, hidden_states_prefills, aux_hidden_states_prefills, idx,
+                                 req_ids, token_ids, position_ids, attn_metadata, batch_start_idx) -> None:
+        """VLLM_HPU_MTP_CHUNK_KV=1: the draft's first step over a prefill chunk that completes no prompt.
+
+        Without it the draft never sees such a chunk, so its attention layer has no KV for those positions and
+        every later draft attends to whatever the blocks hold there: on a prompt above the chunk threshold (2048
+        tokens) that is most of the context. The input at the chunk's last token is the prompt's next token
+        (upstream's rule for a partial prefill); nothing is sampled.
+        """
+        if len(req_ids) != 1:
+            return  # merged prefill batches do not happen for hybrid models; keep today's behaviour
+        context = int(self.input_batch.num_computed_tokens_cpu[batch_start_idx])
+        num_tokens = int(scheduler_output.num_scheduled_tokens[req_ids[0]])
+        if num_tokens < 1 or context + num_tokens >= int(self.input_batch.num_prompt_tokens[batch_start_idx]):
+            return
+        next_token_id = int(self.input_batch.token_ids_cpu[batch_start_idx, context + num_tokens])
+        if self.use_aux_hidden_state_outputs:
+            target_hidden_states = torch.cat(aux_hidden_states_prefills[idx], dim=-1)
+        else:
+            target_hidden_states = hidden_states_prefills[idx]
+        self.drafter.fill_prefill_chunk(token_ids, position_ids, target_hidden_states, attn_metadata, num_tokens - 1,
+                                        next_token_id)
 
     def propose_eagle_prefill(
         self,
@@ -10756,7 +11589,9 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         # The input batch block table include both decodes and prefills
         # Decodes are the first num_decodes requests.
         # Prefill are the next num_reqs - num_decodes requests and divide into batches
-        block_table_cpu_tensor = self.input_batch.block_table[0].get_cpu_tensor()
+        # (the attention group's table, as in propose_eagle_decode)
+        block_table_cpu_tensor = self.input_batch.block_table[
+            self._get_attention_group_id_for_hybrid()].get_cpu_tensor()
         batch_size = logits_indices.shape[0]
         prefill_batch_block_table = block_table_cpu_tensor[batch_start_idx:batch_start_idx + batch_size]
 
@@ -10773,10 +11608,16 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         token_ids = token_ids.squeeze()
         target_token_ids = token_ids.clone()
         target_token_ids[:-1].copy_(token_ids[1:])
-        target_token_ids[logits_indices] = next_token_ids
+        # index_copy_, not an indexed assignment (index_put_ has no HPU kernel, card rule 3)
+        target_token_ids.index_copy_(0, logits_indices.long(), next_token_ids.to(target_token_ids.dtype))
         target_token_ids = target_token_ids.unsqueeze(0)
         if target_hidden_states.dim() == 2:
             target_hidden_states = target_hidden_states.unsqueeze(0)
+        if gaudi_envs.VLLM_HPU_MTP_DRAFT_LOOP == 1 and hasattr(self.drafter, "host_base_positions"):
+            # the last prompt token's position (num_tokens_no_spec counts the token this prefill sampled)
+            self.drafter.host_base_positions = torch.tensor(
+                [int(self.input_batch.num_tokens_no_spec[batch_start_idx + i]) - 2 for i in range(batch_size)],
+                dtype=torch.int64)
         _draft_token_ids = self.drafter.propose(target_token_ids, position_ids, target_hidden_states, logits_indices,
                                                 attn_metadata, prefill_batch_block_table, self)
         return _draft_token_ids
@@ -11209,10 +12050,12 @@ class HPUAttentionMetadataProcessor:
             # Unfortunately one_hot on CPU
             # doesn't handle out of bounds classes so we need to convert
             # all negative values to 0 (block_mapping) or bs (block_groups)
+            # A second pass over the same metadata (the MTP drafter reuses the target's decode metadata) finds
+            # the padding already rewritten to batch_size by the masked_fill_ below: that is out of bounds too.
             block_groups = block_groups.to(torch.long)
-            block_mapping = torch.nn.functional.relu(block_groups)
+            oob_values = block_groups.lt(0) | block_groups.ge(batch_size)
+            block_mapping = block_groups.masked_fill(oob_values, 0)
             block_mapping = torch.nn.functional.one_hot(block_mapping, num_classes=batch_size)
-            oob_values = block_groups.lt(0)
             block_mapping.masked_fill_(oob_values.unsqueeze(-1), 0)
             block_groups.masked_fill_(oob_values, batch_size)
             if is_window_block:

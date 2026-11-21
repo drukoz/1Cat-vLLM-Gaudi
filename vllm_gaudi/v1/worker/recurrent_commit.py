@@ -132,16 +132,26 @@ def commit_conv(state: torch.Tensor,
     ts = list(t_per_pair) if t_per_pair is not None else [p[1] for p in pairs]
     if len(ts) != len(pairs):
         raise ValueError(f"t_per_pair has {len(ts)} entries for {len(pairs)} pairs.")
-    # Two-phase: read every window (clone) before writing any. src == dst is the common
-    # case (the store lattice's column-0 slot commits into its own head) and consecutive
-    # pairs can share slots, so an in-order copy-read copy would read corrupted rows.
-    windows = []
-    for (i, _t, src, dst), t in zip(pairs, ts):
+    for (i, _t, _src, _dst), t in zip(pairs, ts):
         if t < 0:
             raise ValueError(f"pair token index must be non-negative, got {t} (request {i}).")
-        windows.append(state[src].narrow(row_dim - 1, t, window_len).clone())
-    for (_i, _t, _src, dst), window in zip(pairs, windows):
-        state[dst].narrow(row_dim - 1, 0, window_len).copy_(window)
+    # Two pairs on one dst: the later one wins (all of them write the same head rows).
+    last_of_dst = {int(p[3]): j for j, p in enumerate(pairs)}
+    keep = sorted(last_of_dst.values())
+    # Two-phase: every source and destination row is read (index_select makes copies) before
+    # the one write. src == dst is the common case (the store lattice's column-0 slot commits
+    # into its own head) and consecutive pairs can share slots.
+    srcs = torch.tensor([int(pairs[j][2]) for j in keep], dtype=torch.long, device=state.device)
+    dsts = torch.tensor([int(pairs[j][3]) for j in keep], dtype=torch.long, device=state.device)
+    src_rows = state.index_select(0, srcs)
+    dst_rows = state.index_select(0, dsts)
+    windows = torch.stack([src_rows[n].narrow(row_dim - 1, ts[j], window_len) for n, j in enumerate(keep)])
+    rest = dst_rows.narrow(row_dim, window_len, dst_rows.shape[row_dim] - window_len)
+    # Whole rows on the pool itself, never a write through a slice of it: the lazy bridge turns a slice
+    # write into hpu::slice_insert, and an HPU graph captured after it found the GDN conv pool without data
+    # (card job 00133: "ValidateSyncInputTensors tensor_data is empty" at gdn_core_verify's first input,
+    # on the request after a block commit). commit_ssm writes whole rows the same way.
+    state.index_copy_(0, dsts, torch.cat((windows, rest), dim=row_dim))
 
 
 def align_precopy_plan(prev_blocks: Sequence[int | None], context_lens: Sequence[int], num_scheduled: Sequence[int],
