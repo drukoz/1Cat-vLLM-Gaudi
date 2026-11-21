@@ -54,6 +54,7 @@ from vllm_gaudi.v1.worker.runtime_switches import RuntimeSwitchFile
 from vllm_gaudi.v1.worker.recurrent_commit import (apply_align_precopy, boundary_commits, commit_conv, commit_ssm,
                                                    self_commit_requests)
 from vllm_gaudi.v1.worker.recurrent_lattice import align_lattices
+from vllm_gaudi.v1.worker.spec_padding import prompt_path_tokens
 from vllm_gaudi.v1.worker.recurrent_spec import (accepted_counts, load_checkpoint_offsets, qsa_modules,
                                                  recurrent_spec_enabled, state_slots_per_request,
                                                  verification_state_width)
@@ -5786,6 +5787,11 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             assert req_id is not None
             seq_num_scheduled_tokens = scheduler_output.num_scheduled_tokens[req_id]
             seq_num_prompt_tokens = self.input_batch.num_prompt_tokens[idx]
+            if idx >= num_decodes:
+                # never the scheduler's -1 draft placeholders of a padded one-token request (spec_padding.py)
+                seq_num_scheduled_tokens = prompt_path_tokens(seq_num_scheduled_tokens,
+                                                              int(self.input_batch.num_tokens_no_spec[idx]),
+                                                              int(self.input_batch.num_computed_tokens_cpu[idx]))
             num_scheduled_tokens.append(seq_num_scheduled_tokens)
             num_prompt_tokens.append(seq_num_prompt_tokens)
         return (self._prepare_prefill_inputs(num_prefills, num_decodes, num_scheduled_tokens),
