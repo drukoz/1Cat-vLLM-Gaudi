@@ -30,16 +30,18 @@ after the next horizontal rule are history (06:50 UTC and before).
 - The gate of `436855e7` had one red file, `test_gdn_core_decode_batch.py::test_padded_batch_matches_off[negative]`
   ("RECURRENCE pad=-1: conv slot 5 differs from OFF"). It passed alone on the program head `adbcff30` and on this
   branch, and it was green in the gate of `d44ca56d`. INFERRED: intermittent, and not this branch's code.
-- **Card job 00228 `real8-chain-b5`** (all, 100 min; replaced 00212; the coordinator places it right after build
-  5's 00222, about 13:00 UTC).
-  - Branch and image: `feat/flash-next-gaudi-mtp-draft-graph-b5` at `ea1715fa`, image
-    `farm-mtp-draft-graph:ea1715fa06e8`. It is build 5 (`integration/card-build-20261120b` at `eb21ac75`) plus:
+- **Card job 00230 `real8-chain-b5b`** (all, 100 min; it replaced 00228, which had replaced 00212; the coordinator
+  places it right after build 5's 00222, about 13:00 UTC).
+  - Branch and image: `feat/flash-next-gaudi-mtp-draft-graph-b5` at `915d8863` (`ea1715fa` + `HEADLINE_TINY_IRLOG_ARMS`:
+    the bridge's IR-graph and lazy logs of the tiny gate `tiny-chain-vlg` for engine-step's census of the step's
+    cuts), image `farm-mtp-draft-graph:915d88638866`. It is build 5 (`integration/card-build-20261120b` at `eb21ac75`) plus:
     - the chain (`f3d82f32`, `357f220c`, `2a07e787`, `6a7a87ce`);
     - engine-step's `844a37f2` (`VLLM_HPU_VERIFY_LOGITS_IN_GRAPH`) and `ca52fa33` (`VLLM_HPU_LOG_UNMATCHED_GRAPH_INPUTS`);
     - `64656082`: the verify graph's ids handed to the chain whole, VLG runtime-switchable;
     - async-sched's M1 (`249647f7`, `c1906d33`, `70d41eb9`), with `0cc01f43` putting its flag in SWITCHABLE;
     - the harness (`7fe2bea8`, `ea1715fa`).
-  - Submit script and log: `reports/mtp-draft-graph/card/submit-chain-b5.log`.
+  - Submit script and log: `reports/mtp-draft-graph/card/submit-chain-b5-3.log` (the script in this agent's scratchpad,
+    `submit_chain_b5.sh`: the `--env` list below plus `HEADLINE_TINY_IRLOG_ARMS=tiny-chain-vlg`).
   - Env: build 5's serve-candidate env as 00222 runs it, every server async (`ASYNC_SCHED=2`, MTP timer 0), levels
     32 and 1, 2 rounds.
   - Arms:
@@ -51,8 +53,8 @@ after the next horizontal rule are history (06:50 UTC and before).
     5. `tiny-m1` and `mtp2-async-cuts-m1sw`: async-sched's M1, 0 against 2, with the chain on.
   - Placement: async-sched's switch, through the hard link `~/farm/mtp-draft-graph/results/switches/place`.
   - Arms can be changed late with `~/farm/mtp-draft-graph/results/late/run-chain.sh`.
-  - async-sched builds its M2 job on `ea1715fa`.
-- **What to read when 00228 ends** (`bin/farm fetch mtp-draft-graph 00228 00228-real8-chain-b5` if no waiter
+  - async-sched builds its M2 job on `ea1715fa` or `915d8863` (the same code).
+- **What to read when 00230 ends** (`bin/farm fetch mtp-draft-graph 00230 00230-real8-chain-b5b` if no waiter
   copied it):
   - `headline.md`;
   - per arm folder, `tools/ab_summary.py <arm folder>` (rounds per arm, means, text identity);
