@@ -10,7 +10,7 @@ repository is under `/Volumes/Storage/Claude/gaudi-work/reports/spec-lookup/` (`
 
 ## Handoff (if this agent stops)
 
-State at **2026-11-21 09:05 UTC** (fourth agent, Opus 5.5). Branch head: the commit that holds this text, pushed.
+State at **2026-11-21 12:25 UTC** (fourth agent, Opus 5.5). Branch head: the commit that holds this text, pushed.
 It contains the program head `a16ebdde` (PR #16 qsa-dataflow, PR #17 this track's padded one-token fix; merged as
 `ace177c2`), mtp-card-ready through `f1aa2292` and every commit of this track. **The node was extended (BRIEF 00:50 UTC): it ends about 00:00 UTC on
 2026-11-22**; everything on it is lost then. Merges are allowed again (one gate at a time).
@@ -25,19 +25,20 @@ It contains the program head `a16ebdde` (PR #16 qsa-dataflow, PR #17 this track'
 | 00133 `real4-ngram5-edit3` | real model, n-gram k = 5, TP4: 85 tok/s for one editing agent, then the conv-commit crash on the second request (fused and torch verification alike) | ended rc 5 at 00:44 UTC; section 7.5 |
 | 00157 `real8-lookup-nospec-hybrid3-pf`, 00159 `real8-lookup-ngram5-pf` | TP8 on build `e85a3292` (integration build 2): never ran. 00157 was replaced by 00208 (then 00224), 00159 cancelled (coordinator 06:50 / 07:02 UTC) | replaced |
 | 00208 `real8-lookup-b4-fold` | the job below on build `c9740515`: replaced by 00224 at 09:00 UTC (the switch value `place`, coordinator 08:55 UTC); never ran | replaced |
-| **00224 `real8-lookup-b4-fold2`** (all, 60 min, in 00157's place) | TP8 + EP8 on integration build 4 + this branch: build branch `feat/flash-next-gaudi-spec-lookup-b4`, commit `d1aff79b` (build 4 `30f4e37e` + `6a6a1ca8`; plugin code as `c9740515`), image `farm-spec-lookup:d1aff79b3648`; build 4's synchronous env. Arms (`lookup_arms.sh`): `tiny-off` (the tiny TP8 gate of the lookup-off reference), `hybrid3` (MTP k = 3 + lookup, modes 1 and 0 per round), `ngram5-nospec` (n-gram k = 5 and, per round, the same round with the requests' lookup off: plain decode steps, the no-speculation reference on the same server). Rounds edit:1, edit:32, mix:32 and the repeat of edit:1 | **waiting**; local waiter `card/submit-real8-lookup-b4-fold2.log` (command: `card/submit_b4_fold.sh`) |
+| 00224 `real8-lookup-b4-fold2` | the same arms on build 4 (`d1aff79b`): replaced by 00244 at 12:15 UTC (coordinator 12:30 UTC: judge lookup on build 5's baseline); never ran | replaced |
+| **00244 `real8-lookup-b5-fold`** (all, 60 min, in 00157's place) | TP8 + EP8 on integration build 5 + this track: build branch `feat/flash-next-gaudi-spec-lookup-b5`, commit `4edb5d9f` (build 5 `eb21ac75` + `feat/flash-next-gaudi-spec-lookup-b4` `d1aff79b`), image `farm-spec-lookup:4edb5d9ff37f`; build 5's synchronous serving env (dense MoE from 1 token, the chunk table 0,64,8192 / 16,512,1000000, slot shift off). Arms: `tiny-off`, `hybrid2` (MTP k = 2 + lookup, modes 1 and 0: mode 0 is build 5's synchronous MTP k = 2, 00222 arm C), `ngram5-nospec`; rounds edit:1, edit:32, mix:32 and the repeat of edit:1 | **waiting**; local waiter `card/submit-real8-lookup-b5-fold.log` (command: `card/submit_b5_fold.sh`) |
 
 To resubmit: check out `feat/flash-next-gaudi-spec-lookup-b4` in this worktree (the farm runs the worktree's
-HEAD), run `EXPECT=<its commit> REPLACES=00224 NAME=<a new name> bash reports/spec-lookup/card/submit_b4_fold.sh`
+HEAD), run `EXPECT=<its commit> REPLACES=00244 NAME=<a new name> bash reports/spec-lookup/card/submit_b5_fold.sh`
 (a waiting job's name cannot be reused, even with `--replaces`), wait for the `farm: job` line, then check out `feat/flash-next-gaudi-spec-lookup` again. Section 7.6 has the
 design and what to read.
 
 When it ends:
 ```bash
 cd /Volumes/Storage/Claude/gaudi-work/wt/spec-lookup
-C=/Volumes/Storage/Claude/gaudi-work/reports/spec-lookup/card/00224-real8-lookup-b4-fold2
+C=/Volumes/Storage/Claude/gaudi-work/reports/spec-lookup/card/00244-real8-lookup-b5-fold
 grep -h -E "lookup tiny|lookup_arms" $C.log          # the gate's lines (tiny-off/lookup_tiny.json), arms, placement
-python3 tools/flash_next/lookup_summary.py $C/hybrid3 $C/ngram5-nospec   # + $C/nospec $C/ngram5 after a fallback
+python3 tools/flash_next/lookup_summary.py $C/hybrid2 $C/ngram5-nospec   # + $C/nospec $C/ngram5 after a fallback
 grep -h -E "MEAS|TEXT|fallback|DONE" $C/*/probe.log
 ```
 and report to the coordinator (SendMessage `main`) and in section 7.6: first the tiny gate (`lookup tiny
@@ -75,9 +76,11 @@ entry). Run `bin/gate <worktree> --tools` when the merge is due (step 2 below); 
 
 **Pending, in order**
 
-1. 00224's numbers (above; section 7.6): the tiny gate first, then the hybrid's mode 1 against mode 0 and n-gram
+1. 00244's numbers (above; section 7.6): the tiny gate first, then the hybrid's mode 1 against mode 0 and n-gram
    against its own lookup-off rounds. The CPU checks of its build are green (section 7.6); to resubmit before it
-   starts, use `REPLACES=00224` (above).
+   starts, use `REPLACES=00244` (above). Check the dense MoE form in its server logs (`grep -c "keep their
+   stacked experts\|runs the dense MoE form" $C/*/server0.log`): integration's kit stops on a silent fallback, this
+   track's does not.
 2. **Merge after mtp-card-ready's own pull request** (merges are allowed again, BRIEF 00:50 UTC; one gate at a time).
    This branch contains mtp-card-ready through `f1aa2292`; on its merged head `test_engine_mtp.py` fails one test
    alone (`test_sampled_requests_through_the_speculative_engine`, "output with shape [1, 248320] doesn't match the
@@ -101,7 +104,7 @@ entry). Run `bin/gate <worktree> --tools` when the merge is due (step 2 below); 
    needs that commit, which comes with their pull request.
 3. **Card check of `VLLM_HPU_FLASH_NEXT_NGRAM_PLAIN_STEPS=1`** (`be141e1a`, default 0, CPU-proven: a step in which
    no request drafts runs as a plain decode step instead of a 2-row placeholder verification; at one stream on
-   TP4 the placeholder row cost about 8 ms, 00133). 00224's `ngram5-nospec` arm runs with it on (its lookup-off
+   TP4 the placeholder row cost about 8 ms, 00133). 00244's `ngram5-nospec` arm runs with it on (its lookup-off
    rounds need it, and its edit:1 n-gram rounds use it on steps without a match); the tiny gate checks the plain
    steps with the step timer.
 4. **Rows at 32 streams** (section 7): an n-gram step is as wide as its longest draft, an empty draft is the
@@ -460,7 +463,19 @@ first, then (the job's own fallback) the torch verification; rounds as 00095. ME
   would give 8.53, at k = 3 3.92.
 - 32 streams: not measured (the server was gone). Prompts repeat no more in this track's probes (`ab513444`).
 
-### 7.6 n-gram and the hybrid at TP8 on integration build 4 (job 00224): pending
+### 7.6 n-gram and the hybrid at TP8 on integration build 5 (job 00244): pending
+
+00244 (12:15 UTC, coordinator 12:30 UTC) is the job below rebased onto integration build 5 (`eb21ac75`: build 4 +
+program head `adbcff30` + mtp-draft-graph, dense MoE from kernel-fixes, native-replay's pin 3, qsa-fused's FP8 K/V
+and slot shift (both off), async-sched `d3fb1b11`; 00222: MTP k = 2 + async + dense from 1 token + placement = 28.3
+ms per token at 32 streams, 17.6 at 8, 15.3 at 1; its synchronous MTP k = 2 arm C 29.6 / 18.7 / 16.1). Build 5
+descends from build 4, so `4edb5d9f` merges `d1aff79b` (this track as merged into build 4) with one conflict
+(`envs.py`, build 5's worker pin lines kept). The env adds to build 4's: `VLLM_HPU_MOE_DENSE=1`,
+`VLLM_HPU_MOE_DENSE_MIN_TOKENS=1`, `VLLM_MOE_CHUNK=0,64,8192`, `VLLM_MOE_TOKEN_BOUNDARY=16,512,1000000`,
+`VLLM_HPU_QSA_SLOT_SHIFT=0`. The hybrid runs at k = 2 (`hybrid2`), build 5's serving k. CPU on `4edb5d9f`:
+`reports/spec-lookup/logs/b5_cpu/` (fast set 168 passed, the known editl guard failed; engine tests in `summary.txt`).
+The rest of this section describes the job as first built on build 4 (00208, 00224); arms, gate and switch are
+unchanged.
 
 Replaces 00157 and 00159 (below, never run). Coordinator 06:50 UTC: build 4's code and env; 07:02 UTC: TP8 (a TP4 run
 would understate lookup's gain at 32 streams, the cost of a verification row being 2 to 3 times higher there),
