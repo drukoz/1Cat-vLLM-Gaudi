@@ -34,6 +34,12 @@ NAMESPACE = "flashinfer_gaudi"
 
 CASES = HPU_CASES
 CASE_NAMES = [case.name for case in CASES]
+# The interleaved ops (docs/design/flash-next/hc-kernels.md): the schemas of gate_mix and combine_norm under their
+# own names and GUIDs; the same outputs and node parameters as the shipped ops.
+IL_OPS = {"gate_mix": ("hc_gate_mix_il", "hc_fused_gate_mix_il_bf16_gaudi2"),
+          "combine_norm": ("hc_combine_norm_il", "hc_fused_combine_norm_il_bf16_gaudi2")}
+IL_CASES = [case for case in CASES if case.kind in IL_OPS]
+IL_NAMES = [f"{case.name}__il" for case in IL_CASES]
 
 # name -> (schema op, tensor specs, scalar args, text the error must contain)
 NEGATIVES = {
@@ -68,6 +74,9 @@ def _arg_strings(case) -> list[str]:
 
 def _input_lines() -> list[str]:
     lines = [" ".join([_schema(OP_NAME[case.kind]), case.name] + _arg_strings(case)) for case in CASES]
+    lines += [" ".join([_schema(IL_OPS[case.kind][0]), f"{case.name}__il"] + _arg_strings(case)) for case in IL_CASES]
+    lines.append(" ".join([_schema("hc_gate_mix_il"), "neg/gate_mix_il_shape_mismatch", "t:bf16:2,512", "t:bf16:2,256",
+                           "i:4"]))
     for name, (op, tensors, scalar_args, _) in NEGATIVES.items():
         lines.append(" ".join([_schema(op), name] + [f"t:{t}" for t in tensors] + scalar_args))
     return lines
@@ -135,7 +144,7 @@ def parsed(program, tmp_path_factory):
             }
         else:
             lines[fields[0]] = {"status": "error", "message": " ".join(fields[2:])}
-    missing = [n for n in CASE_NAMES + list(NEGATIVES) if n not in lines]
+    missing = [n for n in CASE_NAMES + IL_NAMES + list(NEGATIVES) if n not in lines]
     assert not missing, f"no output line for: {missing}\nstdout:\n{proc.stdout}"
     return lines
 
@@ -150,6 +159,22 @@ def test_callbacks(case, parsed):
     assert line["guid"] == exp["guid"]
     assert line["size"] == len(exp["bytes"]) == 12
     assert line["hex"] == exp["bytes"].hex()
+
+
+@pytest.mark.parametrize("case", IL_CASES, ids=IL_NAMES)
+def test_interleaved_callbacks(case, parsed):
+    """The interleaved op of a case: the shipped op's outputs and node parameters, its own GUID."""
+    line = parsed[f"{case.name}__il"]
+    exp = _expected(case)
+    assert line["status"] == "ok", line.get("message")
+    assert line["outputs"] == exp["outputs"]
+    assert line["guid"] == IL_OPS[case.kind][1]
+    assert line["size"] == 12 and line["hex"] == exp["bytes"].hex()
+
+
+def test_interleaved_gate_mix_rejects_what_the_shipped_one_rejects(parsed):
+    line = parsed["neg/gate_mix_il_shape_mismatch"]
+    assert line["status"] == "error" and "gate" in line["message"], line
 
 
 @pytest.mark.parametrize("name", list(NEGATIVES))

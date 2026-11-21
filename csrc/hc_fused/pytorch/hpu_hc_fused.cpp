@@ -25,6 +25,15 @@ constexpr auto kSiluSplitSchema = "flashinfer_gaudi::hc_silu_split";
 constexpr auto kGateMixSchema = "flashinfer_gaudi::hc_gate_mix";
 constexpr auto kCombineSchema = "flashinfer_gaudi::hc_combine";
 constexpr auto kCombineNormSchema = "flashinfer_gaudi::hc_combine_norm";
+// The interleaved kernels (docs/design/flash-next/hc-kernels.md): the schemas of hc_gate_mix and
+// hc_combine_norm under their own names, served by the GUIDs kHcFusedGateMixIlGuid and
+// kHcFusedCombineNormIlGuid (each optional in the kernel library: flashinfer_gaudi._native says whether it is
+// served, and the layer asks before it calls one):
+//   hc_gate_mix_il(Tensor xn, Tensor gate, int hc_count) -> Tensor
+//   hc_combine_norm_il(Tensor residual, Tensor block_output, Tensor injection, Tensor norm_weight,
+//                      float eps, int hc_count) -> (Tensor, Tensor)
+constexpr auto kGateMixIlSchema = "flashinfer_gaudi::hc_gate_mix_il";
+constexpr auto kCombineNormIlSchema = "flashinfer_gaudi::hc_combine_norm_il";
 constexpr int64_t kVectorLanes = kHcFusedVectorLanes;
 constexpr int64_t kMaxStreams = 64;
 
@@ -226,6 +235,37 @@ const bool combine_norm_registered = [] {
     return true;
 }();
 
+const bool gate_mix_il_registered = [] {
+    habana::custom_op::registerUserCustomOp(
+        kGateMixIlSchema, kHcFusedGateMixIlGuid,
+        [](const at::Stack& stack) {
+            const auto& xn = stack.at(0).toTensor();
+            const int64_t hc_count = stack.at(2).toInt();
+            validate_gate_mix(xn, stack.at(1).toTensor(), hc_count);
+            return habana::PartialOutputMetaDataVector{bf16_output({xn.size(0), xn.size(1) / hc_count})};
+        },
+        [](const at::Stack& stack, size_t& size) -> std::shared_ptr<void> {
+            return node_params(size, 0.0, stack.at(2).toInt(), 0);
+        });
+    return true;
+}();
+
+const bool combine_norm_il_registered = [] {
+    habana::custom_op::registerUserCustomOp(
+        kCombineNormIlSchema, kHcFusedCombineNormIlGuid,
+        [](const at::Stack& stack) {
+            const auto& residual = stack.at(0).toTensor();
+            validate_combine_norm(residual, stack.at(1).toTensor(), stack.at(2).toTensor(), stack.at(3).toTensor(),
+                                  stack.at(4).toDouble(), stack.at(5).toInt());
+            return habana::PartialOutputMetaDataVector{bf16_output(residual.sizes().vec()),
+                                                       bf16_output(residual.sizes().vec())};
+        },
+        [](const at::Stack& stack, size_t& size) -> std::shared_ptr<void> {
+            return node_params(size, stack.at(4).toDouble(), stack.at(5).toInt(), 0);
+        });
+    return true;
+}();
+
 // ---- MoE glue ops: validation, output metadata and node parameters ---------------------------
 void validate_moe_route(const at::Tensor& gates, int64_t experts, int64_t top_k) {
     check_matrix(gates, "gates");
@@ -389,6 +429,22 @@ std::tuple<at::Tensor, at::Tensor> run_combine_norm(const at::Tensor& residual, 
     return std::make_tuple(outputs.at(0), outputs.at(1));
 }
 
+at::Tensor run_gate_mix_il(const at::Tensor& xn, const at::Tensor& gate, int64_t hc_count) {
+    validate_gate_mix(xn, gate, hc_count);
+    TORCH_CHECK(gate_mix_il_registered);
+    return execute(kGateMixIlSchema, xn, {xn, gate, hc_count}, 1).at(0);
+}
+
+std::tuple<at::Tensor, at::Tensor> run_combine_norm_il(const at::Tensor& residual, const at::Tensor& block_output,
+                                                       const at::Tensor& injection, const at::Tensor& norm_weight,
+                                                       double eps, int64_t hc_count) {
+    validate_combine_norm(residual, block_output, injection, norm_weight, eps, hc_count);
+    TORCH_CHECK(combine_norm_il_registered);
+    const auto outputs = execute(kCombineNormIlSchema, residual,
+                                 {residual, block_output, injection, norm_weight, eps, hc_count}, 2);
+    return std::make_tuple(outputs.at(0), outputs.at(1));
+}
+
 std::tuple<at::Tensor, at::Tensor> run_moe_route(const at::Tensor& gates, int64_t experts, int64_t top_k) {
     validate_moe_route(gates, experts, top_k);
     TORCH_CHECK(moe_route_registered);
@@ -428,4 +484,6 @@ TORCH_LIBRARY_IMPL(flashinfer_gaudi, HPU, m) {
     m.impl("hc_gate_mix", run_gate_mix);
     m.impl("hc_combine", run_combine);
     m.impl("hc_combine_norm", run_combine_norm);
+    m.impl("hc_gate_mix_il", run_gate_mix_il);
+    m.impl("hc_combine_norm_il", run_combine_norm_il);
 }

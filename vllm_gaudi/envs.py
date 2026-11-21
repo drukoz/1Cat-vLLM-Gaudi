@@ -546,6 +546,7 @@ if TYPE_CHECKING:
     VLLM_HPU_MOE_GLUE: int = 0  # 0 torch MoE glue (default), 1 the fused MoE glue kernels
     VLLM_HPU_MOE_GLUE_MERGE_GATE_UP: int = 0  # with VLLM_HPU_MOE_GLUE=1: 1 merges the gate_up GEMM into the gate GEMM
     VLLM_HPU_HC_FUSED_COPY_MODE: int = 0  # copies before a fused HC op: 0 all, 1 not its own outputs, 2 block output
+    VLLM_HPU_HC_FUSED_IL: int = 0  # with VLLM_HPU_HC_FUSED=1: 0 shipped kernels, 1 interleaved gate_mix + combine_norm
     VLLM_HPU_MOE_DENSE: int = 0  # 0 vendor MoE op (default), 1 dense batched FP8 experts up to MAX_TOKENS rows
     VLLM_HPU_MOE_DENSE_MAX_TOKENS: int = 512  # with VLLM_HPU_MOE_DENSE=1: the most tokens a step runs dense
     VLLM_HPU_COLLECTIVE_MARK_STEP: int = 1  # 1 (default) mark_step() before every HPU collective, 0 none
@@ -2053,6 +2054,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # value is 0. Read once per layer at construction. Not yet run on a card.
     "VLLM_HPU_HC_FUSED_COPY_MODE":
     lambda: int(os.environ.get("VLLM_HPU_HC_FUSED_COPY_MODE", "0")),
+
+    # With VLLM_HPU_HC_FUSED=1 only: which TPC kernels run the two hyper-connection ops that cost the most at many
+    # rows (docs/design/flash-next/hc-kernels.md). 0 (default) = the shipped hc_gate_mix and hc_combine_norm;
+    # 1 = their interleaved versions hc_gate_mix_il and hc_combine_norm_il (the same inputs and outputs:
+    # residual_out bit for bit, the gated mix and the norm inside the HC contract of
+    # tests/unit_tests/hc_fused/hc_case.py). Any other value is 0. Read once per layer at construction. A layer
+    # whose interleaved ops are not served (an older extension, or a kernel library built without them) logs one
+    # line and keeps the shipped fused ops. Not yet run on a card.
+    "VLLM_HPU_HC_FUSED_IL":
+    lambda: int(os.environ.get("VLLM_HPU_HC_FUSED_IL", "0")),
 
     # FP8 per-channel routed experts (VllmMixtureOfExpertsOpFP8PerChannel) only. 1 = a step of at most
     # VLLM_HPU_MOE_DENSE_MAX_TOKENS tokens runs every local expert on every row as two batched FP8 GEMMs over the

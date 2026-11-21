@@ -15,9 +15,10 @@ from __future__ import annotations
 
 import torch
 
-from flashinfer_gaudi.hc_fused import (NAMESPACE, OP_NAMES, SCHEMAS, hc_combine, hc_combine_norm,  # noqa: F401
-                                       hc_fused_available, hc_fused_missing_ops, hc_gate_mix, hc_norm, hc_silu,
-                                       hc_silu_split)
+from flashinfer_gaudi.hc_fused import (IL_OP_NAMES, IL_SCHEMAS, NAMESPACE, OP_NAMES, SCHEMAS,  # noqa: F401
+                                       hc_combine, hc_combine_norm, hc_combine_norm_il, hc_fused_available,
+                                       hc_fused_il_missing_ops, hc_fused_missing_ops, hc_gate_mix, hc_gate_mix_il,
+                                       hc_norm, hc_silu, hc_silu_split)
 from tests.unit_tests.hc_fused.hc_reference import (hc_combine_norm_reference, hc_combine_reference,
                                                     hc_gate_mix_reference, hc_norm_reference, hc_silu_reference,
                                                     hc_silu_split_reference)
@@ -29,6 +30,9 @@ CPU_KERNELS = {
     "hc_gate_mix": hc_gate_mix_reference,
     "hc_combine": hc_combine_reference,
     "hc_combine_norm": hc_combine_norm_reference,
+    # The interleaved kernels (docs/design/flash-next/hc-kernels.md) compute the same functions.
+    "hc_gate_mix_il": hc_gate_mix_reference,
+    "hc_combine_norm_il": hc_combine_norm_reference,
 }
 
 # Kept for the life of the process: the registrations go away with the Library object.

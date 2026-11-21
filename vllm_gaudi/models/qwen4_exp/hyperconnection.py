@@ -197,6 +197,10 @@ class HpuGatedResidual(nn.Module):
         self._hc_copy = {"copy_mode": copy_mode} if copy_mode in (1, 2) else {}
         self._hc_fused_ok: bool | None = None  # None = the once-per-layer check has not run yet
         self._hc_fused_logged = False  # the layer's one "is off" line was written
+        # VLLM_HPU_HC_FUSED_IL (read once, here; only with the fused path): 1 = the interleaved kernels of
+        # hc_gate_mix and hc_combine_norm (docs/design/flash-next/hc-kernels.md). Anything else = the shipped ones.
+        self.hc_fused_il_requested = self.hc_fused_requested and envs.VLLM_HPU_HC_FUSED_IL == 1
+        self._hc_il: bool | None = None  # None = not decided yet (the layer's first fused call decides)
 
         norm_size = (self.hyper_hidden_size if config.hc_per_branch_norm else config.hidden_size)
         group_size = config.hidden_size if config.hc_per_branch_norm else None
@@ -328,6 +332,33 @@ class HpuGatedResidual(nn.Module):
                 return f"the {name} is on {tensor.device}, the hidden states on {device}"
         return None
 
+    def _hc_fused_il_reason(self, ops, device: torch.device) -> str | None:
+        """Why the interleaved kernels cannot serve this layer (``None``: they can). Asked once per layer."""
+        missing = ops.hc_fused_il_missing_ops(device)
+        if missing:
+            return f"the hc_fused_ops extension has no {device.type} kernel for {', '.join(missing)}"
+        if device.type == "hpu":
+            try:
+                from flashinfer_gaudi import _native
+                missing = _native.hc_fused_il_missing_kernels()
+            except Exception as exc:  # noqa: BLE001 - whatever stops the question, the shipped kernels run
+                return f"the kernel library cannot be asked for its kernels ({type(exc).__name__}: {exc})"
+            if missing:
+                return f"the kernel library serves no TPC kernel for {', '.join(missing)}"
+        return None
+
+    def _hc_fused_il_decide(self, ops, device: torch.device) -> None:
+        """Set ``_hc_il`` once: the interleaved ops when requested and served, else the shipped ones (one log line)."""
+        if not self.hc_fused_il_requested:
+            self._hc_il = False
+            return
+        reason = self._hc_fused_il_reason(ops, device)
+        self._hc_il = reason is None
+        if reason is not None:
+            logger.warning(
+                "HC interleaved kernels (VLLM_HPU_HC_FUSED_IL=1) are off for %s: %s; using the shipped fused "
+                "kernels", self.layer_name, reason)
+
     def _hc_fused(self, hidden_states: torch.Tensor, combine: bool = False, block_output=None, injection=None):
         """The fused op module when this call runs the fused kernels, else ``None`` (the torch path).
 
@@ -347,7 +378,10 @@ class HpuGatedResidual(nn.Module):
         if reason is not None:
             self._hc_fused_log_off(reason)
             return None
-        return _hc_fused_ops()
+        ops = _hc_fused_ops()
+        if self._hc_il is None:
+            self._hc_fused_il_decide(ops, hidden_states.device)
+        return ops
 
     def _hc_fused_raised(self, exc: Exception) -> None:
         """A fused op raised when it was called (it refused its inputs, or its extension is broken).
@@ -367,7 +401,8 @@ class HpuGatedResidual(nn.Module):
             lora = ops.hc_silu(self.input_mix_weight_down(xn), self.hc_count, **self._hc_copy)
             injection = None
         gate = self.input_mix_weight_up(lora)  # GEMM 2 (matrix engine)
-        block_input = ops.hc_gate_mix(xn, gate, self.hc_count, **self._hc_copy)
+        gate_mix = ops.hc_gate_mix_il if self._hc_il else ops.hc_gate_mix
+        block_input = gate_mix(xn, gate, self.hc_count, **self._hc_copy)
         return hidden_states, block_input, injection
 
     def _hc_fused_mix(self, ops,
@@ -383,8 +418,9 @@ class HpuGatedResidual(nn.Module):
         prev_injection: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
         # One kernel: the combine, rounded to bf16, and the norm of the rounded result.
-        hidden_states, xn = ops.hc_combine_norm(hidden_states, prev_block_output, prev_injection, self.hc_norm.weight,
-                                                self.config.rms_norm_eps, self.hc_count, **self._hc_copy)
+        combine_norm = ops.hc_combine_norm_il if self._hc_il else ops.hc_combine_norm
+        hidden_states, xn = combine_norm(hidden_states, prev_block_output, prev_injection, self.hc_norm.weight,
+                                         self.config.rms_norm_eps, self.hc_count, **self._hc_copy)
         return self._hc_fused_mix_tail(ops, hidden_states, xn)
 
     # -- torch path (default), with the fused path in front of it ------------

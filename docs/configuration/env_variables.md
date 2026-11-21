@@ -266,6 +266,26 @@ another op, the MTP draft layer's `flatten` view of its input. Any other value
 is `0`. The flag is read once per layer at construction. The values are the
 same in every mode. Not yet run on a card.
 
+`VLLM_HPU_HC_FUSED_IL` (integer, default `0`) applies only with
+`VLLM_HPU_HC_FUSED=1`. It selects the TPC kernels of the two hyper-connection
+ops that cost the most at many rows (MTP verification: 32 streams with k = 3
+are 128 rows). `0` keeps `hc_gate_mix` and `hc_combine_norm`. `1` calls their
+interleaved versions, `torch.ops.flashinfer_gaudi.hc_gate_mix_il` and
+`hc_combine_norm_il`: the same inputs and outputs, written so that each basic
+block of the TPC program holds several independent chains (the four streams of
+a chunk, one token's four streams), with a sigmoid of 25 instead of about 45
+vector instructions in the gated mix. `residual_out` of the combine is the
+shipped kernel's bit for bit; the gated mix and the norm stay inside the
+hyper-connection kernels' tolerance (at most one bf16 step from the torch
+oracle, at least 99 % of the elements bit-exact; 99.99 % bit-equal to the
+shipped kernels in the simulator). The interleaved kernels are optional members
+of `libhc_fused_gaudi2.so`: a layer whose extension has no interleaved op, or
+whose kernel library does not list the GUID, logs one warning (`HC interleaved
+kernels (VLLM_HPU_HC_FUSED_IL=1) are off for <layer>: <reason>; using the
+shipped fused kernels`) and keeps the shipped ops. Any other value is `0`. The
+flag is read once per layer at construction. See
+`docs/design/flash-next/hc-kernels.md`. Not yet run on a card.
+
 `VLLM_HPU_MOE_GLUE` selects the path of the element-wise ops of the Flash-Next
 MoE block as an integer. `0` (default) keeps the torch path. `1` computes the
 router logits and the shared-gate logit with one merged GEMM (the weight is
