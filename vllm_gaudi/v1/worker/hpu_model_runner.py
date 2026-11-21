@@ -6528,10 +6528,14 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             LoraMask.setLoraMask(lora_mask)
             if verify_in_graph:
                 additional_kwargs["verify_logits_indices"] = logits_indices
+            if gaudi_envs.VLLM_HPU_KV_CACHES_IN_GRAPH_ARGS:
+                additional_kwargs["kv_caches"] = kv_caches
+            # else VLLM_HPU_KV_CACHES_IN_GRAPH_ARGS=0: the HPU graph wrapper gets no cache tensors among its inputs
+            # (no per-replay copy_ of each); the layers hold their caches and HpuModelAdapter.forward drops the
+            # argument anyway.
             hidden_states = self.model.forward(input_ids=token_ids,
                                                positions=position_ids,
                                                attn_metadata=trimmed_attn_metadata,
-                                               kv_caches=kv_caches,
                                                inputs_embeds=inputs_embeds,
                                                model_mm_kwargs=model_mm_kwargs,
                                                **additional_kwargs)

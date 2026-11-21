@@ -540,6 +540,7 @@ if TYPE_CHECKING:
     VLLM_HPU_LOG_UNMATCHED_GRAPH_INPUTS: int = 0  # 1 logs the inputs the HPU graph wrapper copies before a replay
     VLLM_HPU_VERIFY_LOGITS_IN_GRAPH: int = 0  # 1 a greedy verification's LM head and arg max inside the forward graph
     VLLM_HPU_PERSISTENT_INPUTS: int = 0  # 1 a decode step's inputs into persistent device tensors from pinned host ones
+    VLLM_HPU_KV_CACHES_IN_GRAPH_ARGS: int = 1  # 0 the model forward's HPU graph wrapper never gets the caches as inputs
     VLLM_HPU_GDN_CORE_DECODE: int = 1  # GdnCoreDecodeMode: 1 fused (default), 0 off, 2 recurrence
     VLLM_HPU_GDN_CORE_DECODE_DEBUG: int = 0  # GdnCoreDecodeDebug: 0 off, 1 check slot indices every step (host sync)
     VLLM_HPU_GDN_CORE_VERIFY: int = 0  # GdnCoreVerifyMode: 0 off (default), 1 fused verification steps
@@ -2017,6 +2018,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # inputs keep their addresses (native-replay's static launch plan, lean5, hits only then). Any other value is 0.
     "VLLM_HPU_PERSISTENT_INPUTS":
     lambda: 1 if os.environ.get("VLLM_HPU_PERSISTENT_INPUTS", "0").strip() == "1" else 0,
+
+    # The caches in the model forward's arguments (HPUModelRunner._execute_model_generic, every prompt, decode and
+    # verification forward). 1 (default) = passed as ``kv_caches=`` as before: HpuModelAdapter.forward drops the
+    # argument (the attention and GDN layers hold their own caches), but the HPU graph wrapper lists every cache
+    # tensor among its user inputs, finds them unmatched (written in place by the graph) and calls copy_ on each
+    # before every replay: a self-copy the bridge skips, after the dispatch, its running hash and, when the cache's
+    # execution is in progress, a join of the pending launch thread (00222: 50 of a verify replay's 54 copied
+    # inputs). 0 = the forward is called without ``kv_caches``. Read at every forward; set it at server start (a
+    # change makes every graph again). Any other value is 1.
+    "VLLM_HPU_KV_CACHES_IN_GRAPH_ARGS":
+    lambda: 0 if os.environ.get("VLLM_HPU_KV_CACHES_IN_GRAPH_ARGS", "1").strip() == "0" else 1,
 
     # Flash-Next GDN decode through the fused core op (flashinfer_gaudi.gdn_core_decode).
     # 1 (default) = fused, 0 = off (the torch path), 2 = recurrence only (a bisect tool).

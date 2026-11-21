@@ -153,6 +153,14 @@ indices and the PLE inputs. The inputs are no longer fresh tensors: the same inp
 steps later under async scheduling) rewrites them, so code that reads a step's input in a later step must keep its
 own copy. Any other value is `0`.
 
+`VLLM_HPU_KV_CACHES_IN_GRAPH_ARGS` (integer, default `1`) sets whether the model forward's arguments carry the
+caches. With `1` every prompt, decode and verification forward gets `kv_caches=` as before: the model ignores the
+argument (its attention and GDN layers hold their own caches), but the HPU graph wrapper lists every cache tensor among
+its user inputs and, as the graph writes them in place, copies each one onto itself before every replay (skipped by
+the bridge after a dispatch and, while the cache is still being written by a launch in flight, a join of the launch
+thread). With `0` the forward is called without the caches, so the wrapper never sees them. The tokens are the same.
+Set it at server start: a change makes every graph again. Any other value is `1`.
+
 `VLLM_HPU_RUNTIME_SWITCH_FILE` (a path, default unset) is an operator's tool for an A/B on one server.
 When set, every worker looks at that file before each step (one `stat`) and, when the file changed, takes
 the flags it lists, one `NAME=VALUE` per line. Only flags the runner reads at every step can be switched:
