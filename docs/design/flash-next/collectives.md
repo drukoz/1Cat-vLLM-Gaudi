@@ -432,7 +432,22 @@ share with the sibling kept free, keeps every other thread off those, and re-app
 `~/farm/collectives/results/bench/place.sh` with `PIN_PLACE=/results/bench/place.sh` in
 `~/farm/collectives/bridge/late/00189.env`: the pin arm runs last, on its own, through `place_wrap.sh` (the server and
 probe start at once; the script runs once the server answers `/health`; `placement.log` in the arm's results), with
-`VLLM_HPU_WORKER_CPU_PIN=1` kept. Pending.
+`VLLM_HPU_WORKER_CPU_PIN=1` kept. **Ran 07:35 to 08:39 UTC, exit 0, all eight arms ok** (`card/00189-real8-bridge-
+vendor2-*`; `python3 -I reports/collectives/probes/bridge_verdict.py <arm folders>`). Greedy ms per step, two rounds,
+at 1 / 8 / 32 streams: real-pin 27.9, 28.1 / 44.8, 45.0 / 45.8, 46.7; real-lean (no pin, the start before) 42.1, 37.7 /
+67.0, 66.4 / 48.8, 51.4; real-rebuild 48.8, 47.2 / 68.7, 64.7 / 63.9, 73.0; vendor spinner on 37.8, 38.4 / 52.0, 52.1 /
+56.2, 54.7; vendor spinner off 49.1, 50.1 / 66.0, 69.5 / 66.5, 54.1 (the job chose the spinner on; the coordinator reads
+the pair as confounded by the per-start spread, build 4's 00186 measured 33.1 / 34.3 at 1 stream with it off).
+Per-rank us per launch (ranks 0 to 7): real-pin at 1 stream 122 102 120 130 156 128 119 131 (median 125, slowest
+1.25x), at 8 streams 122 118 95 88 142 125 96 120 (median 119), at 32 streams median 133: no slow rank at any level;
+real-lean at 1 stream median 145, at 8 streams 199 126 175 176 120 131 127 125 (rank 0 at 1.54x); real-rebuild medians
+175 / 169 / 176. The pin: eight shares of 18 CPUs (0-17, 20-37, ..., 134-151, 144 of 152); `place.sh`: main threads on
+CPUs 1, 21, 39, 59, 77, 97, 115, 135 with their siblings free, 16 helper CPUs each, first pass 2058 threads moved, 0
+failed. **Verdict: the placement pays and the slow pairs are gone** (one pinned start, so INFERRED as lasting). **Its
+cost:** the pinned server needed 14.9 min to its first throughput line against 7.5 to 8.1 min unpinned (INFERRED: the
+pin holds each rank to 18 CPUs through weight load, compile and warm-up), about 7 min more per server start; the
+coordinator asked for place-only (job 00219 below) and native-replay changed its built-in mode 3 to pin nothing until
+warm-up (0e055831).
 
 **Job 00210 `real8-bridge-reuse2`** (all, 120 min, in the place of 00198, behind async-sched's 00202 / 00203;
 `bridge_reuse_job.sh` with `BRIDGE_ARMSET=lean5 BRIDGE_LEAN5=lean5-984bf2249087`; coordinator 08:07 UTC): native-replay's
@@ -442,13 +457,34 @@ one wheel for every arm (all flags off = lean3a; `PT_HPU_HPUGRAPH_PREPARED_REPLA
 re-translation check of every plan, `PT_HPU_HPUGRAPH_STATIC_PLAN_BUMP_EVERY=N` forced invalidations). Tiny gates
 tiny-stock / tiny-lean4-nan / tiny-lean5-verify (REUSE=2, STATIC_PLAN=2, BUMP_EVERY=500); real arms, most important
 first: real-ref (all flags off), real-lean5 (REUSE=1, STATIC_PLAN=1, inline collectives), real-lean5-verify (REUSE=2,
-STATIC_PLAN=2, BUMP_EVERY=5000, inline collectives), real-lean4 (REUSE=1, the fallback). Each real arm: the headline
-probe, `text_check.py` (md5 daca88b9) at 1 and 32 streams, and for the lean5 arms `--churn` (each prompt alone after a
-32-stream burst, a 20K-token prefill and an 8-stream burst). Checks: texts_1 = real-ref's; churn = the arm's own texts_1
-and real-ref's; texts_32 coherent; `plan_bad` 0 in every timing line of the lean5 arms. The spinner, pin and
-placement: `~/farm/collectives/bridge/late/00210.env` (`SPIN=`, `PIN_KV=`, `PLACE=`) from 00189's verdict. For
-native-replay, per rank and level: plan_hit/plan_try, reuse_hit/reuse_try, total_us, `sub_*`, defrag generations
-(`python3 -I reports/collectives/probes/bridge_verdict.py <arm folder>`). Pending.
+STATIC_PLAN=2, BUMP_EVERY=5000, inline collectives), real-ref-alt (`REF_PAIR=1`: real-ref with the other spinner
+setting, coordinator 08:17 UTC), real-lean4 (REUSE=1, the fallback; `LEAN4=0` leaves it out). Each real arm: the
+headline probe, `text_check.py` (md5 daca88b9) at 1 and 32 streams; real-ref, real-ref-alt and the lean5 arms also
+`--churn` (each prompt alone after a 32-stream burst, a 20K-token prefill and an 8-stream burst). Pass rules
+(coordinator 08:41 UTC, from qsa-fused's 00184: on one server two greedy rounds of the same 32 prompts gave equal texts
+in only 3 and 5 of 32 streams; a churned prompt's KV can come from the prefix cache, written under another batch):
+hard, texts_1 = real-ref's, each lean5 arm's churn texts = real-ref's churn texts request by request, `plan_bad` 0 in
+every timing line of the lean5 arms (only verify mode counts it), the NaN mode, no garbage in texts_32 (never
+compared); reported only, how many churn texts equal the arm's own texts_1 (real-ref's count is the noise floor) and
+how many of real-ref-alt's equal real-ref's (two servers, all flags off). `bridge_reuse_job.sh` aab596d4 (node md5
+962fc724) checks each real arm as it ends and skips an arm that cannot end before `CARDQ_DEADLINE` (exit code then
+nonzero). Late file `~/farm/collectives/bridge/late/00210.env` (08:43 UTC): `SPIN=on`, `REF_PAIR=1`,
+`PIN_KV=VLLM_HPU_WORKER_CPU_PIN=1`, `PLACE=/results/bench/place.sh`, `LEAN4=0`; if 00219 shows place-only works,
+`PIN_KV` goes (coordinator: then 120 min, else 135). For native-replay, per rank and level: plan_hit/plan_try,
+reuse_hit/reuse_try, total_us, `sub_*`, defrag generations (`python3 -I reports/collectives/probes/bridge_verdict.py
+<arm folder>`). Pending.
+
+**Job 00219 `real8-place-only`** (all, 15 min, submitted 08:45 UTC; the coordinator places it after the 4-card pair
+running at 09:00, before kernel-fixes' 00213): one arm through `ab_bridge_job.sh`, exactly 00189's real-pin (build 4's
+image and no-speculation env, spinner on, lean3a with `PREPARED_REPLAY=1` and timing 5000, the `intprobe4` probe) with
+`place_wrap.sh` 5f7ca629 + `place.sh` 7e54f2de after health and no `VLLM_HPU_WORKER_CPU_PIN`. `place.sh` needs nothing
+the pin sets: it cuts its own (the container's) CPU mask into the same equal shares, finds the workers from the
+`HPU worker rank=` lines (unpinned servers print them too) and sets every thread's mask itself. Decides: the time to
+the first throughput line (real-pin 14.9 min) and the per-rank us per launch at 1 and 8 streams and ms per step at 1 /
+8 / 32 against real-pin (INFERRED risk: memory first-touched during an unrestricted load on another NUMA node than the
+share; the node has `numa_balancing=1`). Its answer binds 00210 and integration's build-5 job and async-sched's jobs.
+`place_wrap.sh` b9aac4db (md5 363bcf9d; not in 00219) no longer leaves its health poller behind when the wrapped
+command ends before health (integration runs seven servers in one container). Pending.
 
 **The card queue's CPU layout (coordinator, 06:5x UTC; live since 06:58:07 UTC):** the image-build CPUs 18, 37, 56,
 75, 94, 113, 132, 151 had their hyperthread siblings (vCPUs 2k / 2k+1, native-replay's 00193) inside job cpusets;
@@ -466,8 +502,32 @@ Rollback: `mv ~/farm/q/cpu_layout ~/farm/q/cpu_layout.off`. The plugin's `VLLM_H
 
 ## Handoff (if this agent stops)
 
-State at 08:10 UTC on 2026-11-21 (fourth agent of this track, Opus 5.5). **The node stays until about 00:00 UTC
-on 2026-11-22** (BRIEF 00:50 UTC). Branch `feat/flash-next-gaudi-collectives` (and `-dev`, the same head), worktree
+State at 09:05 UTC on 2026-11-21 (fourth agent of this track, Opus 5.5). **The node stays until about 00:00 UTC
+on 2026-11-22** (BRIEF 00:50 UTC).
+
+**Now (09:05 UTC), in order:**
+1. **00219 (place-only proof)**: this agent's waiter fetches `card/00219-real8-place-only-real-place/` (else `bin/farm
+   fetch collectives 00219 00219-real8-place-only-real-place`). Report to the coordinator at once, then integration
+   (`a751467dff2502109`, build 5's job 00218 runs every server place-only if it works), async-sched
+   (`a58988ba328b40a9b`) and native-replay: minutes from the arm's start (`ab_bridge: arm real-place: ... [hh:mm:ss]`
+   in the job log) to the first `Avg prompt throughput` line of its `server0.log` (real-pin 14.9, unpinned 7.5 to 8.1),
+   `bridge_verdict.py` on it and on `card/00189-real8-bridge-vendor2-real-pin`, and `placement.log`.
+2. **Then bind 00210** (it starts by 12:57 UTC at the latest): if place-only matches real-pin, remove the `PIN_KV=`
+   line from `~/farm/collectives/bridge/late/00210.env` (keep `SPIN=on`, `REF_PAIR=1`, `PLACE=`, and `LEAN4=0` unless
+   the coordinator wants real-lean4 back); if not, ask the coordinator for the 135 min it offered (resubmit with
+   `--replaces 00210`: the `cmd.sh` of `~/farm/q/jobs/00210/`). Its waiter fetches the arms; report the verdicts, the
+   spinner pair (real-ref against real-ref-alt) and the per-rank per-level coverage to the coordinator, native-replay
+   and engine-step (`a8a87f4c2008bde9c`: plan_hit/plan_try per rank and level).
+3. **The stale test (coordinator 08:47 UTC)**: branch `fix/flash-next-gaudi-draft-rank-topk-test` (worktree
+   `wt/collectives-fix`, 0f85066a on the program head adbcff30): `test_proposer_only_reaches_topk_under_the_gate` now
+   checks PR 13's one guarded `.topk(` in `_draft_tokens`; the file passes (15). Gate it (`bin/gate wt/collectives-fix`),
+   open the PR to `feat/flash-next-gaudi`, merge when green (test-only). Not ours: `test_flash_next_host_ngram.py`
+   fails 4 on the head (`HPUModelRunner` stub without `_block_table_max_blocks`, from 121c88b0); 9 worker files need
+   `habana_frameworks` (not on the Mac).
+4. Offers outstanding: engine-step's `VLLM_HPU_PERSISTENT_INPUTS` (8efc6969) A/B with lean5 once it is in an image
+   (build 6 preferred); native-replay's `lean6m-43fdd6850644` (lean5 + `PT_HPU_HPUGRAPH_STATIC_PLAN_MISS_LOG=N`: one
+   stderr line per missing launcher with the miss reason and the first moved input) for a later arm, or for 00210's
+   lean5 arms if the coordinator wants it (`LEAN5=` is late-bound; the log env would need a script change). Branch `feat/flash-next-gaudi-collectives` (and `-dev`, the same head), worktree
 `/Volumes/Storage/Claude/gaudi-work/wt/collectives`; card results and logs in
 `/Volumes/Storage/Claude/gaudi-work/reports/collectives/` (`card/<id>-<name>/`, `logs/`, `probes/`). This section is
 the track's report: the harness refuses a REPORT.md.
