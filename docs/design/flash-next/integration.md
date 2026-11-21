@@ -9,7 +9,7 @@ Labels: MEASURED (card, with its file), VERIFIED (CPU test or code line), INFERR
 
 ## Handoff (if this agent stops)
 
-Updated 2026-11-21 02:25 UTC (fourth agent of the track, Opus 5.5, started 23:12 UTC).
+Updated 2026-11-21 04:56 UTC (fourth agent of the track, Opus 5.5, started 23:12 UTC).
 
 **Now (02:25 UTC), for whoever takes the track next.** Builds 1 and 2 are measured (tables below: 00128, 00156).
 Three jobs of this track wait or run on the node; the `farm job` commands that submitted them ran in the fourth
@@ -32,6 +32,25 @@ when `bin/farm ledger | grep -w integration` shows it ended:
   HEADLINE_HOLD_S=4500`. Arms in priority order: tiny gate (`--spec 3`); no spec 32 / 8 / 1 (2 greedy + 2 sampled
   rounds); MTP k = 3 (greedy 32 / 8 / 1, then sampled 32 and 1 with `=2`); the low-stream bisect (greedy 8 and 1, 96
   tokens): `VLLM_HPU_QSA_INDEXER_SHARD=0`, then prefix flags off, then also `VLLM_HPU_DECODE_CUT_INTERVAL=0`.
+**Build 4 and the layout re-check (submitted 04:55 UTC; the fourth agent's last step):**
+- **00186** `real8-build4` (all, 80 min, image `farm-integration:30f4e37ef08c`; plugin code `bcaa3ed6` = builds 1-3 +
+  program head a16ebdde + engine-step ba1441b7 + prefill 92e65144 + engine-step-mtp-record 2b90707f + async-sched
+  fb5cefca; CPU `reports/integration/cpu/out-b9/summary.txt`: 164 files, 160 green, 3 card-only skips,
+  test_moe_glue_layer's order test fixed in bcaa3ed6 and green alone). Arms: `tiny mtp2-async nospec-async mtp2 nospec`
+  (32 / 8 / 1 streams, two greedy and two sampled rounds; async arms first: `VLLM_HPU_FLASH_NEXT_ASYNC_SCHED=2` with
+  `MTP_TIMING=0`, `=1`; the synchronous mtp2 arm with `MTP_TIMING=2`, the per-step record). `--env`: prefix flags, MoE
+  chunk, `PT_HPU_SYNCHRONOUS_ACC_QUEUE_FLUSHING=1`, health / request timeouts 900 / 600 s. Late-bound:
+  `reports/integration/late/make_run4.sh KEY=VALUE...` (`ARMS=...` to change the arms, e.g. without the async arms if
+  async-sched's 00179 shows async wrong). The submitting `farm job` copies the results to
+  `reports/integration/card/00186-real8-build4/` if it still runs; otherwise `bin/farm fetch integration 00186
+  00186-real8-build4`.
+- **00187** `layout-2xtp4` (all, 50 min, stage-1, same image): `tools/flash_next/integration/layout_2xtp4.sh` (on the
+  node: `~/farm/integration/results/late/layout_2xtp4.sh 30f4e37ef08c`): two TP4 + EP4 containers (cards 0,1,2,7 /
+  3,4,5,6, their module groups' CPUs), each `headline_job.sh mtp3 mtp1` at 16 streams, two greedy + two sampled rounds,
+  every round barrier-aligned across the two servers (`--barrier-dir`). Nothing copies its results: `bin/farm fetch
+  integration 00187 00187-layout-2xtp4`. Compare per-server ms per token at 16 streams and the sum of the two
+  aggregate tok/s with build 4's TP8 at 32 streams.
+
 **For build 4 (notes received after the hand-back, 02:40 UTC):**
 - MoE: 00161 (build 2 image, MTP k = 3) measured `VLLM_MOE_CHUNK=64,8192 VLLM_MOE_TOKEN_BOUNDARY=512,1000000` at
   38.7 / 38.0 ms per token at 32 streams against 43.1 / 40.8 without (about -12 ms per step), 26.2 / 26.4 against
