@@ -40,17 +40,21 @@ def rows_table(positions: torch.Tensor, slot_mapping: torch.Tensor, load_rows: t
                         torch.where(valid, store_rows, neg).to(torch.int32)), dim=1)
 
 
-def qsa_index_prepare_ref(key_ring: torch.Tensor, key_cache: torch.Tensor, qk: torch.Tensor, rows: torch.Tensor,
-                          q_norm_weight: torch.Tensor, k_norm_weight: torch.Tensor, cos_sin: torch.Tensor, eps: float,
-                          heads: int, ring_rows: int, ratio: int) -> torch.Tensor:
-    """K1. ``key_ring`` ``[S * R, D]`` and ``key_cache`` ``[C, D]`` are written in place; returns ``q_idx`` ``[T, H * D]``.
+def qsa_index_prepare_ref(key_ring: torch.Tensor, qk: torch.Tensor, rows: torch.Tensor, q_norm_weight: torch.Tensor,
+                          k_norm_weight: torch.Tensor, cos_sin: torch.Tensor, eps: float, heads: int, ring_rows: int,
+                          ratio: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """K1: ``(q_idx [T, H * D], pooled [T, D])``; writes nothing (card rule 10).
 
-    ``qk`` ``[T, (H + 1) * D]`` (queries, then the raw key), ``rows`` int32 ``[T, 4]`` (``rows_table``),
-    ``cos_sin`` ``[P, 2 * R2]`` (cosines, then sines). Write-then-read: every real row's raw key is in the
-    ring before any block is compressed, as on the torch path.
+    ``qk`` ``[T, (H + 1) * D]`` (queries, then the raw key), ``rows`` int32 ``[T, 4]`` (``rows_table``: position,
+    attention slot, ring slot read, ring slot written), ``cos_sin`` ``[P, 2 * R2]`` (cosines, then sines).
+    ``pooled[t]`` is the compressed key of a row that completes a block (a real row: ring slot written in
+    ``[0, S)`` and position ``>= 0``; ``position % ratio == ratio - 1``; attention slot ``>= 0``), zeros on every
+    other row. Its ratio raw keys are the ring rows of the read slot as they stand after this step's ring writes
+    (every real row's raw key at ``store * R + position % R``, the last row wins), then the row's own key: the
+    torch path's write-then-read order, without writing the ring. ``apply_prepare_writes`` does the layer's writes.
     """
     T = int(qk.shape[0])
-    dim = int(key_cache.shape[1])
+    dim = int(key_ring.shape[1])
     slots = int(key_ring.shape[0]) // ring_rows
     pos = rows[:, 0].long()
     sm = rows[:, 1].long()
@@ -59,22 +63,43 @@ def qsa_index_prepare_ref(key_ring: torch.Tensor, key_cache: torch.Tensor, qk: t
     cos, sin = cos_sin[pos.clamp_min(0)].chunk(2, dim=-1)
     q = index_queries(qk[:, :heads * dim].reshape(T, heads, dim), q_norm_weight, eps, cos, sin)
     raw_k = qk[:, heads * dim:(heads + 1) * dim]
-    real = (store >= 0) & (store < slots)
+    ring = key_ring.clone()
+    real = (store >= 0) & (store < slots) & (pos >= 0)
     if bool(real.any()):
         idx = (store * ring_rows + pos % ring_rows)[real]
-        key_ring.index_copy_(0, idx, raw_k[real].to(key_ring.dtype))
-    row = torch.div(sm, ratio, rounding_mode="floor")
-    complete = real & ((pos % ratio) == ratio - 1) & (row >= 0) & (row < key_cache.shape[0])
+        ring.index_copy_(0, idx, raw_k[real].to(ring.dtype))
+    pooled = torch.zeros(T, dim, dtype=qk.dtype)
+    complete = real & ((pos % ratio) == ratio - 1) & (sm >= 0)
     if bool(complete.any()):
         sel = complete.nonzero().reshape(-1)
         p = pos[sel]
         ls = load[sel]
-        blk = [key_ring.index_select(0, ls * ring_rows + (p - (ratio - 1) + j) % ring_rows) for j in range(ratio - 1)]
-        blk.append(raw_k[sel].to(key_ring.dtype))
+        blk = [ring.index_select(0, ls * ring_rows + (p - (ratio - 1) + j) % ring_rows) for j in range(ratio - 1)]
+        blk.append(raw_k[sel].to(ring.dtype))
         cs, sn = cos_sin[(p - (ratio - 1)).clamp_min(0)].chunk(2, dim=-1)
         keys = compress_block_keys(torch.stack(blk, dim=1), k_norm_weight, eps, cs, sn)
-        key_cache.index_copy_(0, row[sel], keys.to(key_cache.dtype))
-    return q.reshape(T, heads * dim)
+        pooled[sel] = keys.to(pooled.dtype)
+    return q.reshape(T, heads * dim), pooled
+
+
+def apply_prepare_writes(key_ring: torch.Tensor, key_cache: torch.Tensor, qk: torch.Tensor, rows: torch.Tensor,
+                         pooled: torch.Tensor, heads: int, ring_rows: int, ratio: int) -> None:
+    """The layer's writes after K1 (``HpuQsaIndexer._select_decode_kernels``), in place: every real row's raw key
+    into the ring at ``store * R + position % R``, and ``pooled`` of every row that completes a block into the
+    compressed cache at ``attention slot // ratio`` (rows inside the cache)."""
+    dim = int(key_ring.shape[1])
+    slots = int(key_ring.shape[0]) // ring_rows
+    pos = rows[:, 0].long()
+    sm = rows[:, 1].long()
+    store = rows[:, 3].long()
+    raw_k = qk[:, heads * dim:(heads + 1) * dim]
+    real = (store >= 0) & (store < slots) & (pos >= 0)
+    if bool(real.any()):
+        key_ring.index_copy_(0, (store * ring_rows + pos % ring_rows)[real], raw_k[real].to(key_ring.dtype))
+    row = torch.div(sm, ratio, rounding_mode="floor")
+    complete = real & ((pos % ratio) == ratio - 1) & (row >= 0) & (row < key_cache.shape[0])
+    if bool(complete.any()):
+        key_cache.index_copy_(0, row[complete], pooled[complete].to(key_cache.dtype))
 
 
 def qsa_index_emit_ref(blocks: torch.Tensor, positions: torch.Tensor, block_table: torch.Tensor, ratio: int,

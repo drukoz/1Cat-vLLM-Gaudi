@@ -3,9 +3,10 @@
 
 Runs both ops (HPU kernels from the ``qsa_fused_ops`` extension, TPC kernels from ``libqsa_fused_gaudi2.so``) on
 every case of ``qsa_case.HPU_CASES`` and checks them with ``qsa_case.compare`` against the torch references on the
-CPU: the simulator cases plus the target's 32 x 4 verification shape. The prepare op writes its ring and cache
-inputs in place on the card; the test compares them after the call. The whole module skips without a Gaudi card or
-without the built extension. ``docs/design/flash-next/qsa-fused.md`` says what a pass means.
+CPU: the simulator cases plus the target's 32 x 4 verification shape. The prepare op returns the indexer queries
+and the pooled keys and writes no input (card rule 10); the test checks that its ring input is unchanged. The
+whole module skips without a Gaudi card or without the built extension. ``docs/design/flash-next/qsa-fused.md``
+says what a pass means.
 """
 
 import pytest
@@ -27,9 +28,9 @@ from tests.unit_tests.qsa_fused.qsa_case import EPS, HPU_CASES, case_by_name, co
 def _run(case, inputs: dict) -> dict:
     hpu = {name: t.to("hpu") for name, t in inputs.items()}
     if case.kernel == "prepare":
-        q = qsa_index_prepare(hpu["key_ring"], hpu["key_cache"], hpu["qk"], hpu["rows"], hpu["q_norm_weight"],
-                              hpu["k_norm_weight"], hpu["cos_sin"], EPS, case.heads, case.ring_rows, case.ratio)
-        return {"key_ring": hpu["key_ring"].cpu(), "key_cache": hpu["key_cache"].cpu(), "q_idx": q.cpu()}
+        q, pooled = qsa_index_prepare(hpu["key_ring"], hpu["qk"], hpu["rows"], hpu["q_norm_weight"],
+                                      hpu["k_norm_weight"], hpu["cos_sin"], EPS, case.heads, case.ring_rows, case.ratio)
+        return {"key_ring": hpu["key_ring"].cpu(), "q_idx": q.cpu(), "pooled": pooled.cpu()}
     if case.kernel == "threshold":
         return {"meta": qsa_index_threshold(hpu["scores"], hpu["positions"], case.ratio, case.topk).cpu()}
     if case.kernel == "select":
@@ -48,6 +49,9 @@ def test_hpu_op_matches_reference(case):
     got = _run(case, inputs)
     print("QSAHPU " + summary(case, inputs, got))
     messages = compare(case, inputs, got)
+    if case.kernel == "prepare" and not torch.equal(got["key_ring"].view(torch.int16),
+                                                    inputs["key_ring"].view(torch.int16)):
+        messages.append("key_ring: the op wrote its input (card rule 10: it writes declared outputs only)")
     if messages:
         print("\n".join(messages))
     assert messages == []

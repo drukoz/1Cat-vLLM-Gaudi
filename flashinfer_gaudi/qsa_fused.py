@@ -13,11 +13,14 @@ Schemas (torch shapes; every integer tensor int32). ``qsa_index_threshold`` and 
 the place of ``select_blocks``: scores ``[T, N]`` fp32 (``N`` a multiple of 128) -> meta ``[T, 4 + N / 16]`` ->
 blocks ``[T, topk]`` (ascending, ties at the cut to the lowest block).
 
-    qsa_index_prepare(Tensor(a!) key_ring, Tensor(b!) key_cache, Tensor qk, Tensor rows, Tensor q_norm_weight,
-                      Tensor k_norm_weight, Tensor cos_sin, float eps, int heads, int ring_rows, int ratio) -> Tensor
-        key_ring [S * R, D] bf16 and key_cache [C, D] bf16 are written in place; qk [T, (H + 1) * D] bf16;
-        rows [T, 4] int32 (position, attention slot, ring slot read, ring slot written; -1 slots on padding);
-        weights [D] bf16; cos_sin [P, 2 * R2] bf16. Returns q_idx [T, H * D] bf16.
+    qsa_index_prepare(Tensor key_ring, Tensor qk, Tensor rows, Tensor q_norm_weight, Tensor k_norm_weight,
+                      Tensor cos_sin, float eps, int heads, int ring_rows, int ratio) -> (Tensor, Tensor)
+        key_ring [S * R, D] bf16 (read only); qk [T, (H + 1) * D] bf16; rows [T, 4] int32 (position, attention
+        slot, ring slot read, ring slot written; -1 slots on padding); weights [D] bf16; cos_sin [P, 2 * R2] bf16.
+        Returns q_idx [T, H * D] bf16 and pooled [T, D] bf16: the compressed key of each row that completes a
+        block (zeros on every other row), its ring keys read as they stand after this step's ring writes. The op
+        writes no input (card rule 10: a custom op's stores into its inputs are lost on the card): the layer writes
+        the step's raw keys into the ring and ``pooled`` into the compressed cache with ``index_copy_``.
     qsa_index_emit(Tensor blocks, Tensor positions, Tensor block_table, int ratio, int block_size)
         -> (Tensor, Tensor)
         blocks [T, topk] int32 (select_blocks), positions [T] int32, block_table [T, MB] int32. Returns
@@ -35,9 +38,9 @@ OP_NAMES = ("qsa_index_prepare", "qsa_index_emit", "qsa_index_threshold", "qsa_i
 GUIDS = {"qsa_index_prepare": "qsa_fused_prepare_bf16_gaudi2", "qsa_index_emit": "qsa_fused_emit_i32_gaudi2",
          "qsa_index_threshold": "qsa_fused_threshold_f32_gaudi2", "qsa_index_select": "qsa_fused_select_i32_gaudi2"}
 SCHEMAS = {
-    "qsa_index_prepare": ("qsa_index_prepare(Tensor(a!) key_ring, Tensor(b!) key_cache, Tensor qk, Tensor rows, "
-                          "Tensor q_norm_weight, Tensor k_norm_weight, Tensor cos_sin, float eps, int heads, "
-                          "int ring_rows, int ratio) -> Tensor"),
+    "qsa_index_prepare": ("qsa_index_prepare(Tensor key_ring, Tensor qk, Tensor rows, Tensor q_norm_weight, "
+                          "Tensor k_norm_weight, Tensor cos_sin, float eps, int heads, int ring_rows, int ratio) "
+                          "-> (Tensor, Tensor)"),
     "qsa_index_emit": ("qsa_index_emit(Tensor blocks, Tensor positions, Tensor block_table, int ratio, "
                        "int block_size) -> (Tensor, Tensor)"),
     "qsa_index_threshold": "qsa_index_threshold(Tensor scores, Tensor positions, int ratio, int topk) -> Tensor",
@@ -58,9 +61,9 @@ for _schema in SCHEMAS.values():
 
 # Fake kernels: allocation only, no data access and no mutation.
 @torch.library.register_fake(f"{NAMESPACE}::qsa_index_prepare", lib=_LIBRARY)
-def _qsa_index_prepare_fake(key_ring, key_cache, qk, rows, q_norm_weight, k_norm_weight, cos_sin, eps, heads,
-                            ring_rows, ratio):
-    return qk.new_empty((qk.shape[0], heads * key_cache.shape[1]))
+def _qsa_index_prepare_fake(key_ring, qk, rows, q_norm_weight, k_norm_weight, cos_sin, eps, heads, ring_rows, ratio):
+    dim = key_ring.shape[1]
+    return qk.new_empty((qk.shape[0], heads * dim)), qk.new_empty((qk.shape[0], dim))
 
 
 @torch.library.register_fake(f"{NAMESPACE}::qsa_index_emit", lib=_LIBRARY)
@@ -90,12 +93,12 @@ def qsa_index_select(meta: torch.Tensor, topk: int) -> torch.Tensor:
     return torch.ops.flashinfer_gaudi.qsa_index_select(meta, int(topk))
 
 
-def qsa_index_prepare(key_ring: torch.Tensor, key_cache: torch.Tensor, qk: torch.Tensor, rows: torch.Tensor,
-                      q_norm_weight: torch.Tensor, k_norm_weight: torch.Tensor, cos_sin: torch.Tensor, eps: float,
-                      heads: int, ring_rows: int, ratio: int) -> torch.Tensor:
-    """K1 as ``torch.ops.flashinfer_gaudi.qsa_index_prepare`` (mutates ``key_ring`` and ``key_cache``)."""
-    return torch.ops.flashinfer_gaudi.qsa_index_prepare(key_ring, key_cache, qk, rows, q_norm_weight, k_norm_weight,
-                                                        cos_sin, float(eps), int(heads), int(ring_rows), int(ratio))
+def qsa_index_prepare(key_ring: torch.Tensor, qk: torch.Tensor, rows: torch.Tensor, q_norm_weight: torch.Tensor,
+                      k_norm_weight: torch.Tensor, cos_sin: torch.Tensor, eps: float, heads: int, ring_rows: int,
+                      ratio: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """K1 as ``torch.ops.flashinfer_gaudi.qsa_index_prepare``: ``(q_idx [T, H * D], pooled [T, D])``, no write."""
+    return torch.ops.flashinfer_gaudi.qsa_index_prepare(key_ring, qk, rows, q_norm_weight, k_norm_weight, cos_sin,
+                                                        float(eps), int(heads), int(ring_rows), int(ratio))
 
 
 def qsa_index_emit(blocks: torch.Tensor, positions: torch.Tensor, block_table: torch.Tensor, ratio: int,

@@ -272,20 +272,20 @@ after either path** and no test compares them (on the torch path they hold which
 ## Schemas
 
 ```
-qsa_index_prepare(Tensor(a!) key_ring, Tensor(b!) key_cache, Tensor qk, Tensor rows, Tensor q_norm_weight,
-                  Tensor k_norm_weight, Tensor cos_sin, float eps, int heads, int ring_rows, int ratio) -> Tensor
+qsa_index_prepare(Tensor key_ring, Tensor qk, Tensor rows, Tensor q_norm_weight, Tensor k_norm_weight,
+                  Tensor cos_sin, float eps, int heads, int ring_rows, int ratio) -> (Tensor, Tensor)
 qsa_index_emit(Tensor blocks, Tensor positions, Tensor block_table, int ratio, int block_size) -> (Tensor, Tensor)
 ```
 
 | Arg | Torch shape, dtype | TPC dims (fastest first) | Meaning |
 |---|---|---|---|
-| `key_ring` | `[S * R, D]` bf16 | `{D, S * R}` | the flat raw-key ring. **Written by K1** |
-| `key_cache` | `[C, D]` bf16 | `{D, C}` | the compressed key cache. **Written by K1**, read by the scores |
+| `key_ring` | `[S * R, D]` bf16 | `{D, S * R}` | the flat raw-key ring before this step. **Read only** (card rule 10) |
 | `qk` | `[T, (H + 1) * D]` bf16 | `{(H + 1) * D, T}` | `index_qk_proj` output: `H` query heads, then the raw key |
 | `rows` | `[T, 4]` int32 | `{4, T}` | the row table |
 | `q_norm_weight`, `k_norm_weight` | `[D]` bf16 | `{D}` | `q_layernorm.weight`, `k_layernorm.weight` |
 | `cos_sin` | `[P, 2 * R2]` bf16 | `{2 * R2, P}` | the attention's `rotary_emb.cos_sin_cache` (bf16: `RotaryEmbedding` casts it to the model dtype) |
 | K1 -> `q_idx` | `[T, H * D]` bf16 | `{H * D, T}` | indexer queries after norm and RoPE |
+| K1 -> `pooled` | `[T, D]` bf16 | `{D, T}` | the compressed key of a row that completes a block, zeros on every other row |
 | `blocks` | `[T, topk]` int32 | `{topk, T}` | `select_blocks` output (`-1` = none), any order |
 | `positions` | `[T]` int32 | `{T}` | position of each row (`-1` on a padding row under M-RoPE) |
 | `block_table` | `[T, MB]` int32 | `{MB, T}` | kernel block ids per query row (`md.block_table`) |
@@ -313,13 +313,14 @@ for h in range(H):                                   # index_queries
     x = qk[t, h*D:(h+1)*D].float()
     y = bf16(x * rsqrt(sum(x*x) * (1/D) + eps) * (1.0 + q_norm_weight.float()))
     q_idx[t, h] = rope(y, cos_sin[max(p, 0)])
-if 0 <= ss < S:                                      # a real row
-    key_ring[ss*R + p mod R] = raw                   # exact copy
-    c = sm >> log2(ratio)
-    if p mod ratio == ratio - 1 and 0 <= c < C:
-        blk = [ring_row(ls*R + (p - ratio + 1 + j) mod R) for j < ratio - 1] + [raw]
-        pooled = bf16(((blk[0] + blk[1]) + blk[2] + ...) * (1 / ratio))      # fp32, in order
-        key_cache[c] = rope(bf16(norm(pooled, k_norm_weight)), cos_sin[max(p - ratio + 1, 0)])
+pooled[t] = 0
+if 0 <= ss < S and p >= 0 and p mod ratio == ratio - 1 and sm >= 0:     # a real row that completes a block
+    blk = [ring_row(ls*R + (p - ratio + 1 + j) mod R) for j < ratio - 1] + [raw]
+    mean = bf16(((blk[0] + blk[1]) + blk[2] + ...) * (1 / ratio))          # fp32, in order
+    pooled[t] = rope(bf16(norm(mean, k_norm_weight)), cos_sin[max(p - ratio + 1, 0)])
+# then the layer (qsa.py _select_decode_kernels), with torch ops after K1:
+#   key_ring[ss*R + p mod R] = raw for every real row        (ring_write)
+#   key_cache[sm // ratio] = pooled[t] for every row that completes a block (index_copy_; the others the scratch row)
 
 def rope(y, cs):          # rope_neox_partial; c = cs[:R2], s = cs[R2:]
     out[j]      = bf16(bf16(y[j] * c[j]) - bf16(y[R2+j] * s[j]))      for j < R2
@@ -328,9 +329,9 @@ def rope(y, cs):          # rope_neox_partial; c = cs[:R2], s = cs[R2:]
 ```
 
 - **Write-then-read without a race.** `ring_row(i)` is the raw key of the last real row of this call that writes
-  ring row `i`, read from that row's `qk`, else the ring's row as it was before the call. No point reads a ring row
-  that a point of the same call writes, so the in-place hazard of `tpcsim.md` does not arise; no two real rows write
-  the same ring row (`R >= ratio + k`, distinct slots per request).
+  ring row `i`, read from that row's `qk`, else the ring's row as it was before the call (K1 writes no ring row;
+  the layer's `ring_write` after K1 does, so the result is what the torch path reads after its own ring write). No
+  two real rows write the same ring row (`R >= ratio + k`, distinct slots per request).
 - The RoPE half swap is `v_element_shift_xor_bf16(y, R2)` (lane `j` <-> lane `R2 + j` inside every `2 R2` lanes), in
   the bf16 lane domain where the order is linear; the products and sums go through fp32 and one RHNE rounding.
 - `1.0 + weight` is its own fp32 addition, as in `gemma_rms_norm`. The mean of squares is the kernel's own sum
@@ -395,15 +396,17 @@ block_size, rotary_half, topk}`, 28 bytes, the same for every GUID (unused field
 
 | Kernel | Tensors (in + out) | Index space | One point owns | Special functions | VLM |
 |---|---|---|---|---|---|
-| `qsa_fused_prepare_bf16_gaudi2` | 7 + 1 | `{T}` | one row: its `q_idx` row, its ring row, its compressed row | `rsqrt` | 0 bytes |
+| `qsa_fused_prepare_bf16_gaudi2` | 6 + 2 | `{T}` | one row: its `q_idx` row and its `pooled` row | `rsqrt` | 0 bytes |
 | `qsa_fused_emit_i32_gaudi2` | 3 + 2 | `{T}` | one row of `slots` and `valid` | none | 0 bytes |
 | `qsa_fused_threshold_f32_gaudi2` | 2 + 1 | `{T}` | one row of `meta` | none | 0 bytes |
 | `qsa_fused_select_i32_gaudi2` | 1 + 1 | `{T}` | one row of `blocks` | none | 0 bytes |
 
-- **In-place tensors.** `key_ring` and `key_cache` are inputs K1 stores to, declared as whole tensors read by
-  every point: the form the card-proven `gdn_core_decode` uses for its state pools.
-- **Access patterns.** K1: every input whole (data-dependent rows of the ring, the cache, `cos_sin`; `qk` and
-  `rows` of other rows for write-then-read); `q_idx` by row. K4: `blocks`, `positions`, `block_table`, `slots`,
+- **No in-place tensors (card rule 10).** Version 2 stored into its inputs `key_ring` and `key_cache` (the form
+  `gdn_core_decode` uses for its large state pools); on the card those stores never reached the caller's tensors
+  (jobs 00063 and 00088). K1 now writes only `q_idx` and `pooled`; the layer writes the ring and the cache with
+  `index_copy_` after it.
+- **Access patterns.** K1: every input whole (data-dependent rows of the ring and `cos_sin`; `qk` and `rows` of
+  other rows for write-then-read); `q_idx` and `pooled` by row. K4: `blocks`, `positions`, `block_table`, `slots`,
   `valid` by row. The simulator runs every case with its index-space mapping test and partition shuffle on.
 - **Instruction counts** (simulator, VERIFIED): K1 5.6 K words per row at the real geometry (180,746 for 32 rows)
   and 8.8 K at 32 x 4 rows (1,122,610 for 128 rows: the write-then-read search scans the 128 rows); K4 11.8 K

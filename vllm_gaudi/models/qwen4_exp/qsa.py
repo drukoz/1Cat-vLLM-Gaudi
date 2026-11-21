@@ -397,9 +397,13 @@ class HpuQsaIndexer(nn.Module):
                                md: object) -> QsaDecodeSelection:
         """Mode 2: ``qsa_index_prepare`` (K1), the request-major torch scores and top-k, ``qsa_index_emit`` (K4).
 
-        K1 does what ``index_queries`` and the write half of ``_select_decode`` do (the ring, the compressed
-        rows: write-then-score holds, K1 runs before the scores read the cache); K4 maps the selected blocks to
-        the attention's K/V cache slots. Every tensor a kernel gets is its own (``owned``): card rule 1.
+        K1 does what ``index_queries`` and the compression of ``_select_decode`` do: it returns the indexer
+        queries and the compressed key of every row that completes a block (``pooled``), reading the ring as it
+        stands after this step's raw keys. It writes no input (card rule 10: a custom op's stores into its
+        inputs are lost on the card), so the step's raw keys go into the ring and ``pooled`` into the compressed
+        cache here, with the torch path's two writes, before the scores read the cache (write-then-score). K4
+        maps the selected blocks to the attention's K/V cache slots. Every tensor a kernel gets is its own
+        (``owned``): card rule 1.
         """
         from flashinfer_gaudi.qsa_fused import qsa_index_emit, qsa_index_prepare
 
@@ -413,8 +417,17 @@ class HpuQsaIndexer(nn.Module):
         bs, lens, T_cols, valid, load_rows, store_rows = self._decode_rows(md, positions, load, store, shared=True)
         rows = rows_table(positions, slot_mapping, load_rows, store_rows, valid)
         cache = self.compressed_key_cache
-        q_idx = qsa_index_prepare(self._key_ring_flat, cache, owned(qk), rows, self.q_layernorm.weight,
-                                  self.k_layernorm.weight, owned(cos_sin), self.eps, H, self._key_ring_rows, ratio)
+        q_idx, pooled = qsa_index_prepare(self._key_ring_flat, owned(qk), rows, self.q_layernorm.weight,
+                                          self.k_layernorm.weight, owned(cos_sin), self.eps, H, self._key_ring_rows,
+                                          ratio)
+        # The writes K1 does not do, as _select_decode does them (K1 has read the ring before them).
+        scratch = torch.full((T,), self.key_ring_slots - 1, dtype=torch.long, device=positions.device)
+        ring_write(self._key_ring_flat, torch.where(valid, store_rows, scratch), positions, qk[:, H * D:(H + 1) * D],
+                   rows=self._key_ring_rows)
+        complete = valid & ((positions % ratio) == ratio - 1)
+        row_slots = compressed_row_slots(slot_mapping.long(), ratio)
+        scratch_row = torch.full_like(row_slots, cache.shape[0] - 1)
+        cache.index_copy_(0, torch.where(complete, row_slots, scratch_row), pooled.to(cache.dtype))
         rpb = int(md.block_size) // ratio
         blocks_sel = select_blocks_request_major(q_idx.view(T, H, D), positions, md.block_table, lens, bs, T_cols, cache,
                                                  rpb, ratio, self.block_topk, self.shard_mode, md=md,

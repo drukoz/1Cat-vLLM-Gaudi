@@ -1,25 +1,27 @@
 // SPDX-License-Identifier: Apache-2.0
 // qsa_fused_prepare: the per-row work of the sparse-QSA indexer before the scores (VLLM_HPU_QSA_FUSED=2).
-// Replaces index_queries, the ring write and read, compress_block_keys and the compressed-row write of
-// HpuQsaIndexer._select_decode (vllm_gaudi/models/qwen4_exp/qsa.py) for one decode step.
+// Replaces index_queries, the ring read and compress_block_keys of HpuQsaIndexer._select_decode
+// (vllm_gaudi/models/qwen4_exp/qsa.py) for one decode step. It writes only its declared outputs (card rule 10: a
+// custom op's stores into its inputs are lost on the card, jobs 00063 / 00088): the layer writes the step's raw
+// keys into the ring and `pooled` into the compressed key cache (index_copy_) after this kernel.
 //
-//   key_ring       {D, S * R} bf16      the flat raw-key ring; written in place
-//   key_cache      {D, C} bf16          the compressed key cache; written in place
+//   key_ring       {D, S * R} bf16      the flat raw-key ring as it stands before this step (read only)
 //   qk             {(H + 1) * D, T}     index_qk_proj output: H query heads, then the raw key
 //   rows           {4, T} int32         per row: position p, attention slot sm, ring slot read ls, ring slot
 //                                       written ss (ls = ss = -1 on a padding row)
 //   q_norm_weight  {D} bf16, k_norm_weight {D} bf16
 //   cos_sin        {2 * R2, P} bf16     the attention's cos_sin_cache: R2 cosines, then R2 sines
 //   q_idx          {H * D, T} bf16      out: the indexer queries after gemma_rms_norm and RoPE
+//   pooled         {D, T} bf16          out: the compressed key of a row that completes a block, zeros elsewhere
 //
-// For every row: q_idx = rope(norm(q_h), cos_sin[max(p, 0)]) for each head h. For a real row
-// (0 <= ss < S): key_ring[ss * R + p mod R] = raw key; if p mod ratio == ratio - 1 and the compressed row
-// c = sm >> log2(ratio) is in [0, C), the block's ratio raw keys (ring rows ls * R + (p - ratio + 1 + j) mod R
-// for j < ratio - 1, then the row's own raw key) are pooled in fp32 (sequential sum, times 1 / ratio, one
-// rounding to bf16), normed with k_norm_weight and rotated at max(p - ratio + 1, 0) into key_cache[c].
-// Write-then-read: a ring row that another row of this call writes is read from that row's qk instead
-// (the torch path writes every raw key before it reads), so no point reads a ring row a point stores.
-// Padding rows write nothing. One index-space point is one row.
+// For every row: q_idx = rope(norm(q_h), cos_sin[max(p, 0)]) for each head h. A real row (0 <= ss < S, p >= 0)
+// with p mod ratio == ratio - 1 and sm >= 0 completes a block: its ratio raw keys (ring rows
+// ls * R + (p - ratio + 1 + j) mod R for j < ratio - 1 as they stand after this step's ring writes, then the row's
+// own raw key) are pooled in fp32 (sequential sum, times 1 / ratio, one rounding to bf16), normed with
+// k_norm_weight and rotated at max(p - ratio + 1, 0) into pooled[row]; every other row's pooled is zero.
+// Write-then-read: the ring rows this step writes (ss * R + p mod R of every real row) are read from the writing
+// row's qk instead (the last such row), so the result is what the torch path reads after its ring write.
+// One index-space point is one row.
 #pragma clang fp contract(off)
 #include "qsa_fused_common.h"
 
@@ -52,20 +54,17 @@ static inline void qsa_store_head(tensor target, int column, int row, int dim, b
     }
 }
 
-void main(tensor key_ring, tensor key_cache, tensor qk, tensor rows, tensor q_norm_weight, tensor k_norm_weight,
-          tensor cos_sin, tensor q_idx,
+void main(tensor key_ring, tensor qk, tensor rows, tensor q_norm_weight, tensor k_norm_weight, tensor cos_sin,
+          tensor q_idx, tensor pooled,
           float eps, float inv_dim, float inv_ring, float inv_ratio, int heads, int ring_rows, int ratio, int r2)
 {
     const int5 index_start = get_index_space_offset();
     const int5 index_end = get_index_space_size() + index_start;
-    const int dim = get_dim_size(key_cache, 0);
+    const int dim = get_dim_size(key_ring, 0);
     const int slots = get_dim_size(key_ring, 1) / ring_rows;
-    const int cache_rows = get_dim_size(key_cache, 1);
     const int positions = get_dim_size(cos_sin, 1);
     const int total_rows = get_dim_size(rows, 1);
     const int key_column = heads * dim;
-    int ratio_log2 = 0;  // ratio is a power of two (the glue checks)
-    while ((1 << ratio_log2) < ratio) ++ratio_log2;
     const bfloat128 q_weight = qsa_load_head(q_norm_weight, 0, 0, dim);
     const bfloat128 k_weight = qsa_load_head(k_norm_weight, 0, 0, dim);
 
@@ -84,12 +83,12 @@ void main(tensor key_ring, tensor key_cache, tensor qk, tensor rows, tensor q_no
             qsa_store_head(q_idx, h * dim, row, dim, qsa_rope(y, cs, r2));
         }
 
-        if (ss < 0 || ss >= slots || p < 0) continue;  // a padding row writes nothing
+        // A padding row, or a row that completes no block: a zero pooled row.
+        if (ss < 0 || ss >= slots || p < 0 || (p & (ratio - 1)) != ratio - 1 || sm < 0) {
+            qsa_store_head(pooled, 0, row, dim, (bfloat128)0);
+            continue;
+        }
         const bfloat128 raw = qsa_load_head(qk, key_column, row, dim);
-        qsa_store_head(key_ring, 0, ss * ring_rows + qsa_mod(p, ring_rows, inv_ring), dim, raw);
-
-        const int compressed = sm >= 0 ? sm >> ratio_log2 : -1;
-        if ((p & (ratio - 1)) != ratio - 1 || compressed < 0 || compressed >= cache_rows) continue;
 
         // The block's ratio raw keys, summed in order in fp32.
         float128 sum = v_convert_bf16_to_f32_all_b((bfloat128)0);
@@ -117,11 +116,11 @@ void main(tensor key_ring, tensor key_cache, tensor qk, tensor rows, tensor q_no
         const float128 own = v_convert_bf16_to_f32_all_b(raw);
         sum.v1 = v_f32_mul_b(v_f32_add_b(sum.v1, own.v1), inv_ratio);
         sum.v2 = v_f32_mul_b(v_f32_add_b(sum.v2, own.v2), inv_ratio);
-        const bfloat128 pooled = v_convert_f32_to_bf16_all_b(sum, SW_RHNE);
-        const bfloat128 normed = qsa_gemma_norm(pooled, k_weight, inv_dim, eps);
+        const bfloat128 block_key = v_convert_f32_to_bf16_all_b(sum, SW_RHNE);
+        const bfloat128 normed = qsa_gemma_norm(block_key, k_weight, inv_dim, eps);
         int key_row = p - (ratio - 1);
         key_row = key_row < 0 ? 0 : (key_row >= positions ? positions - 1 : key_row);
         const bfloat128 key_cs = qsa_load_head(cos_sin, 0, key_row, 2 * r2);
-        qsa_store_head(key_cache, 0, compressed, dim, qsa_rope(normed, key_cs, r2));
+        qsa_store_head(pooled, 0, row, dim, qsa_rope(normed, key_cs, r2));
     }
 }

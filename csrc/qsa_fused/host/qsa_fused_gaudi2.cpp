@@ -5,9 +5,9 @@
 // Every size comes from the tensor geometry and the node parameters. Anything outside the gates of
 // qsa_fused_params.h is rejected here with a GlueCodeReturn: no kernel runs on a shape it cannot handle.
 //
-//   prepare  inputs  key_ring {D, S*R} bf16, key_cache {D, C} bf16, qk {(H+1)*D, T} bf16, rows {4, T} i32,
+//   prepare  inputs  key_ring {D, S*R} bf16 (read only), qk {(H+1)*D, T} bf16, rows {4, T} i32,
 //                    q_norm_weight {D} bf16, k_norm_weight {D} bf16, cos_sin {2*R2, P} bf16
-//            output  q_idx {H*D, T} bf16
+//            outputs q_idx {H*D, T} bf16, pooled {D, T} bf16 (no input is written: card rule 10)
 //   emit     inputs  blocks {topk, T} i32, positions {T} i32, block_table {MB, T} i32
 //            outputs slots {topk*ratio + ratio - 1, T} i32, valid {same} i32
 //   threshold inputs scores {N, T} f32 (N a multiple of 128), positions {T} i32; output meta {4 + N / 16, T} i32
@@ -32,11 +32,11 @@ namespace {
 
 using namespace tpc_lib_api;
 
-constexpr unsigned kMaxInputs = 7;
+constexpr unsigned kMaxInputs = 6;
 constexpr unsigned kMaxOutputs = 2;
 
 const KernelInfo kKernels[] = {
-    {Kind::Prepare, kQsaFusedPrepareGuid, 7, 1},
+    {Kind::Prepare, kQsaFusedPrepareGuid, 6, 2},
     {Kind::Emit, kQsaFusedEmitGuid, 3, 2},
     {Kind::Threshold, kQsaFusedThresholdGuid, 2, 1},
     {Kind::Select, kQsaFusedSelectGuid, 1, 1},
@@ -85,7 +85,7 @@ struct Resolved {
     uint64_t rows = 0;                         // T: the index space
     uint64_t outputColumns[kMaxOutputs] = {};  // every output is {columns, T}
     TensorDataType outputType[kMaxOutputs] = {DATA_BF16, DATA_I32};
-    uint64_t dim = 0, ringRows = 0, cacheRows = 0, qkColumns = 0, cosColumns = 0, positions = 0;  // prepare
+    uint64_t dim = 0, ringRows = 0, qkColumns = 0, cosColumns = 0, positions = 0;  // prepare
     uint64_t topk = 0, tableColumns = 0;                                                         // emit
 };
 
@@ -94,14 +94,13 @@ GlueCodeReturn Resolve(const KernelInfo& kernel, const TensorGeometry* const* in
 {
     if (kernel.kind == Kind::Prepare) {
         const TensorGeometry& ring = *in[0];
-        const TensorGeometry& cache = *in[1];
-        const TensorGeometry& qk = *in[2];
-        const TensorGeometry& rows = *in[3];
-        const TensorGeometry& qw = *in[4];
-        const TensorGeometry& kw = *in[5];
-        const TensorGeometry& cs = *in[6];
-        if (!Is(ring, DATA_BF16, 2) || !Is(cache, DATA_BF16, 2) || !Is(qk, DATA_BF16, 2) || !Is(qw, DATA_BF16, 1) ||
-            !Is(kw, DATA_BF16, 1) || !Is(cs, DATA_BF16, 2)) {
+        const TensorGeometry& qk = *in[1];
+        const TensorGeometry& rows = *in[2];
+        const TensorGeometry& qw = *in[3];
+        const TensorGeometry& kw = *in[4];
+        const TensorGeometry& cs = *in[5];
+        if (!Is(ring, DATA_BF16, 2) || !Is(qk, DATA_BF16, 2) || !Is(qw, DATA_BF16, 1) || !Is(kw, DATA_BF16, 1) ||
+            !Is(cs, DATA_BF16, 2)) {
             return GLUE_INCOMPATIBLE_DATA_TYPE;
         }
         if (!Is(rows, DATA_I32, 2)) return GLUE_INCOMPATIBLE_DATA_TYPE;
@@ -110,9 +109,9 @@ GlueCodeReturn Resolve(const KernelInfo& kernel, const TensorGeometry* const* in
             !PowerOfTwo(s.rotary_half)) {
             return GLUE_KERNEL_INVALID_SCALAR_ARGUMENT;
         }
-        const uint64_t dim = cache.maxSizes[0];
+        const uint64_t dim = ring.maxSizes[0];
         const uint64_t tokens = qk.maxSizes[1];
-        if (dim > kQsaFusedMaxDim || ring.maxSizes[0] != dim || qw.maxSizes[0] != dim || kw.maxSizes[0] != dim) {
+        if (dim > kQsaFusedMaxDim || qw.maxSizes[0] != dim || kw.maxSizes[0] != dim) {
             return GLUE_INCOMPATIBLE_INPUT_SIZE;
         }
         if (ring.maxSizes[1] % static_cast<uint64_t>(s.ring_rows) != 0) return GLUE_INCOMPATIBLE_INPUT_SIZE;
@@ -122,19 +121,19 @@ GlueCodeReturn Resolve(const KernelInfo& kernel, const TensorGeometry* const* in
             return GLUE_INCOMPATIBLE_INPUT_SIZE;
         }
         // positions and slots are int32 and the kernel's float modulo needs n < 2^24
-        if (cs.maxSizes[1] > (uint64_t{1} << 24) || ring.maxSizes[1] > (uint64_t{1} << 30) ||
-            cache.maxSizes[1] > (uint64_t{1} << 30)) {
+        if (cs.maxSizes[1] > (uint64_t{1} << 24) || ring.maxSizes[1] > (uint64_t{1} << 30)) {
             return GLUE_INCOMPATIBLE_INPUT_SIZE;
         }
         r.rows = tokens;
         r.dim = dim;
         r.ringRows = ring.maxSizes[1];
-        r.cacheRows = cache.maxSizes[1];
         r.qkColumns = qk.maxSizes[0];
         r.cosColumns = cs.maxSizes[0];
         r.positions = cs.maxSizes[1];
         r.outputColumns[0] = static_cast<uint64_t>(s.heads) * dim;
         r.outputType[0] = DATA_BF16;
+        r.outputColumns[1] = dim;
+        r.outputType[1] = DATA_BF16;
         return GLUE_SUCCESS;
     }
     if (kernel.kind == Kind::Threshold) {
@@ -200,7 +199,7 @@ void MapDimension(TensorAccessPattern& pattern, unsigned tensorDim, unsigned ind
     pattern.mapping[tensorDim].end_b = static_cast<float>(endB);
 }
 
-// Every point reads the whole tensor (data-dependent rows: the ring, the cache, other rows of the step).
+// Every point reads the whole tensor (data-dependent rows: the ring, other rows of the step, cos_sin).
 void MapWhole(TensorAccessPattern& pattern, const TensorGeometry& geometry)
 {
     for (unsigned d = 0; d < geometry.dims; ++d) MapDimension(pattern, d, 0, 0, 0, geometry.maxSizes[d] - 1);
@@ -287,10 +286,12 @@ GlueCodeReturn Instantiate(const KernelInfo& kernel, HabanaKernelParams* params,
     instance->indexSpaceGeometry[0] = r.rows;
 
     if (kernel.kind == Kind::Prepare) {
-        // The ring and the cache are read and written at data-dependent rows, the row table and qk of every
-        // row are read by the write-then-read search, cos_sin at data-dependent positions: whole tensors.
+        // The ring is read at data-dependent rows (never written: card rule 10), the row table and qk of every
+        // row by the write-then-read search, cos_sin at data-dependent positions: whole tensors. Point t writes
+        // row t of q_idx and of pooled.
         for (unsigned input = 0; input < kernel.inputs; ++input) MapWhole(inputPattern[input], *in[input]);
         MapRow(outputPattern[0], r.outputColumns[0]);
+        MapRow(outputPattern[1], r.outputColumns[1]);
         QsaFusedPrepareArgs args{};
         args.eps = scalar.eps;
         args.inv_dim = 1.0f / static_cast<float>(r.dim);

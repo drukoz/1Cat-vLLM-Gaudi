@@ -8,10 +8,11 @@ sim_host.cpp`` reads (TPC dims are the torch dims reversed: the bytes of a conti
 TPC tensor as it is); ``compare`` checks the kernel's outputs against ``qsa_reference``:
 
 * emit: ``slots`` and ``valid`` bit-exact (integers);
-* prepare: the ring bit-exact (copies); every compressed row and query element either bit-exact or at most
-  ``BF16_STEPS`` bf16 steps from the reference, and at least ``EXACT_FRACTION`` of them bit-exact (the
-  kernel's ``rsqrt`` and its sum of squares round differently from torch's; the rest of the arithmetic
-  keeps the torch path's rounding points); rows the step does not write unchanged, bit for bit.
+* prepare: every query element and every pooled element of a row that completes a block either bit-exact or
+  at most ``BF16_STEPS`` bf16 steps from the reference, and at least ``EXACT_FRACTION`` of them bit-exact (the
+  kernel's ``rsqrt`` and its sum of squares round differently from torch's; the rest of the arithmetic keeps
+  the torch path's rounding points); the pooled rows of every other row exactly zero. The op writes no input
+  (card rule 10); the card test also checks that ``key_ring`` is unchanged.
 """
 
 from __future__ import annotations
@@ -131,10 +132,8 @@ def make_inputs(case: Case) -> dict:
                     rows.append((p, 4096 + 128 * len(rows) + p % 128, load, store))  # a distinct attention slot
                 else:
                     rows.append((0, -1, -1, -1))
-        cache_rows = (4096 + 128 * T + 256) // case.ratio + 8
         return {
             "key_ring": _bf16(gen, case.slots * case.ring_rows, D, scale=1.5),
-            "key_cache": _bf16(gen, cache_rows, D, scale=1.5),
             "qk": _bf16(gen, T, (H + 1) * D, scale=2.0),
             "rows": torch.tensor(rows, dtype=torch.int32),
             "q_norm_weight": _bf16(gen, D, scale=0.2),
@@ -163,12 +162,10 @@ def make_inputs(case: Case) -> dict:
 
 def reference(case: Case, inputs: dict) -> dict:
     if case.kernel == "prepare":
-        ring = inputs["key_ring"].clone()
-        cache = inputs["key_cache"].clone()
-        q = qsa_index_prepare_ref(ring, cache, inputs["qk"], inputs["rows"], inputs["q_norm_weight"],
-                                  inputs["k_norm_weight"], inputs["cos_sin"], EPS, case.heads, case.ring_rows,
-                                  case.ratio)
-        return {"key_ring": ring, "key_cache": cache, "q_idx": q}
+        q, pooled = qsa_index_prepare_ref(inputs["key_ring"], inputs["qk"], inputs["rows"], inputs["q_norm_weight"],
+                                          inputs["k_norm_weight"], inputs["cos_sin"], EPS, case.heads, case.ring_rows,
+                                          case.ratio)
+        return {"q_idx": q, "pooled": pooled}
     if case.kernel == "threshold":
         return {"meta": qsa_index_threshold_ref(inputs["scores"], inputs["positions"], case.ratio, case.topk)}
     if case.kernel == "select":
@@ -191,12 +188,10 @@ def manifest(case: Case, inputs: dict) -> list[str]:
     if case.kernel == "prepare":
         lines += [f"guid {PREPARE_GUID}", f"eps {EPS!r}", f"heads {case.heads}", f"ring_rows {case.ring_rows}",
                   f"ratio {case.ratio}", f"rotary_half {case.rotary_half}"]
-        for name in ("key_ring", "key_cache"):
-            lines.append(f"inout {name} bf16 {_tpc_dims(inputs[name])}")
-        for name in ("qk", "rows", "q_norm_weight", "k_norm_weight", "cos_sin"):
+        for name in ("key_ring", "qk", "rows", "q_norm_weight", "k_norm_weight", "cos_sin"):
             lines.append(f"in {name} {_DTYPES[inputs[name].dtype]} {_tpc_dims(inputs[name])}")
         T = inputs["qk"].shape[0]
-        lines.append(f"out q_idx bf16 {case.heads * case.dim} {T}")
+        lines += [f"out q_idx bf16 {case.heads * case.dim} {T}", f"out pooled bf16 {case.dim} {T}"]
         return lines
     if case.kernel == "threshold":
         T = inputs["scores"].shape[0]
@@ -246,6 +241,14 @@ def _bf16_steps(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     return (ordered(a) - ordered(b)).abs()
 
 
+def completing_rows(case: Case, inputs: dict) -> torch.Tensor:
+    """bool ``[T]``: the prepare rows that complete a compression block (``qsa_index_prepare_ref``'s rule)."""
+    rows = inputs["rows"].long()
+    pos, sm, store = rows[:, 0], rows[:, 1], rows[:, 3]
+    slots = inputs["key_ring"].shape[0] // case.ring_rows
+    return (store >= 0) & (store < slots) & (pos >= 0) & (pos % case.ratio == case.ratio - 1) & (sm >= 0)
+
+
 def compare(case: Case, inputs: dict, got: dict) -> list[str]:
     want = reference(case, inputs)
     errors = []
@@ -273,14 +276,13 @@ def compare(case: Case, inputs: dict, got: dict) -> list[str]:
                 errors.append(f"{name}: {bad.shape[0]} entries differ, first at {bad[0].tolist()}: "
                               f"{int(got[name][tuple(bad[0])])} vs {int(want[name][tuple(bad[0])])}")
         return errors
-    if not torch.equal(got["key_ring"], want["key_ring"]):
-        errors.append(f"key_ring: {int((got['key_ring'] != want['key_ring']).any(1).sum())} rows differ")
-    written = (want["key_cache"].view(torch.int16) != inputs["key_cache"].view(torch.int16)).any(1)
-    unwritten = ~written
-    if not torch.equal(got["key_cache"][unwritten], want["key_cache"][unwritten]):
-        errors.append("key_cache: a row the step does not write changed")
+    complete = completing_rows(case, inputs)
+    if not torch.equal(got["pooled"][~complete].view(torch.int16),
+                       torch.zeros_like(got["pooled"][~complete]).view(torch.int16)):
+        errors.append(f"pooled: {int((got['pooled'][~complete] != 0).any(1).sum())} rows that complete no block "
+                      "are not zero")
     for name, g, w in (("q_idx", got["q_idx"], want["q_idx"]),
-                       ("key_cache rows", got["key_cache"][written], want["key_cache"][written])):
+                       ("pooled rows", got["pooled"][complete], want["pooled"][complete])):
         if g.numel() == 0:
             continue
         steps = _bf16_steps(g, w)

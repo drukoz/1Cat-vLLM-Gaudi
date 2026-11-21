@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """The references of the fused QSA ops equal the torch path of the indexer and the decode attention (CPU).
 
-``qsa_index_prepare_ref`` against ``HpuQsaIndexer._select_decode``'s writes and ``index_queries`` (the side caches
-outside the scratch slot and row, the queries), and ``qsa_index_emit_ref`` against ``expand_selection`` +
+``qsa_index_prepare_ref`` (which writes no input) plus the layer's writes (``apply_prepare_writes``) against
+``HpuQsaIndexer._select_decode``'s writes and ``index_queries`` (the side caches outside the scratch slot and row,
+the queries), and ``qsa_index_emit_ref`` against ``expand_selection`` +
 ``decode_selected_slots`` + the valid mask, on the runner's decode layout (tiny-model indexer geometry, seeded
 weights): 1 and 32 rows, the verification lattice at k = 3 and 5, ragged and padding requests, slot moves.
 Then the mode-2 indexer (the references registered as the ops' CPU kernels) equals mode 1 end to end.
@@ -23,7 +24,8 @@ pytest.importorskip("vllm")
 import tests.unit_tests.qsa_fused.qsa_ops  # noqa: E402,F401  the references as the CPU kernels
 from tests.unit_tests.models.flash_next.qsa_fused_ranks import (  # noqa: E402
     MAX_MODEL_LEN, RATIO, bind_random_caches, build_indexer, make_requests, real_rows, rope_table, runner_metadata)
-from tests.unit_tests.qsa_fused.qsa_reference import qsa_index_emit_ref, qsa_index_prepare_ref, rows_table  # noqa: E402
+from tests.unit_tests.qsa_fused.qsa_reference import (apply_prepare_writes, qsa_index_emit_ref,  # noqa: E402
+                                                      qsa_index_prepare_ref, rows_table)
 from vllm_gaudi.models.qwen4_exp import qsa_fused_path  # noqa: E402
 from vllm_gaudi.models.qwen4_exp.qsa_fused_path import QsaDecodeSelection, QsaFusedMode, QsaShardMode  # noqa: E402
 from vllm_gaudi.models.qwen4_exp.qsa_hpu_attention import decode_selected_slots, rows_without_selection  # noqa: E402
@@ -96,8 +98,10 @@ def test_prepare_reference_equals_torch_path(world, name, moves):
     assert torch.equal(rows, qsa_fused_path.rows_table(md.positions, md.slot_mapping.reshape(-1)[:T], load_rows,
                                                        store_rows, valid))
     ring_r, cache_r = ring0.clone(), cache0.clone()
-    q_ref = qsa_index_prepare_ref(ring_r, cache_r, qk, rows, indexer.q_layernorm.weight, indexer.k_layernorm.weight,
-                                  table, indexer.eps, H, indexer._key_ring_rows, RATIO)
+    q_ref, pooled = qsa_index_prepare_ref(ring_r, qk, rows, indexer.q_layernorm.weight, indexer.k_layernorm.weight,
+                                          table, indexer.eps, H, indexer._key_ring_rows, RATIO)
+    assert torch.equal(ring_r.view(torch.int16), ring0.view(torch.int16)), "K1 wrote its ring input"
+    apply_prepare_writes(ring_r, cache_r, qk, rows, pooled, H, indexer._key_ring_rows, RATIO)
     cos, sin = csa(md.positions)
     q_torch = index_queries(qk[:, :H * D].view(T, H, D), indexer.q_layernorm.weight, indexer.eps, cos, sin)
     assert torch.equal(q_ref, q_torch.reshape(T, H * D))
