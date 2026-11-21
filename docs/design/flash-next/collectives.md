@@ -386,7 +386,7 @@ together; accsync on the image's bridge (it is a stock setting). Results:
 
 ## Handoff (if this agent stops)
 
-State at 03:10 UTC on 2026-11-21 (fourth agent of this track, Opus 5.5). **The node stays until about 00:00 UTC
+State at 03:30 UTC on 2026-11-21 (fourth agent of this track, Opus 5.5). **The node stays until about 00:00 UTC
 on 2026-11-22** (BRIEF 00:50 UTC). Branch `feat/flash-next-gaudi-collectives` (and `-dev`, the same head), worktree
 `/Volumes/Storage/Claude/gaudi-work/wt/collectives`; card results and logs in
 `/Volumes/Storage/Claude/gaudi-work/reports/collectives/` (`card/<id>-<name>/`, `logs/`, `probes/`). This section is
@@ -419,8 +419,20 @@ bench8-bridge all 30m` (each arm pairs the flag off and on in one bench run; sum
 
 Next, in order (section 7's table):
 1. 00160 PASSED and 00174 ended ok (section 7); both sent to the coordinator and native-replay (03:10 UTC).
-   Next with native-replay: its `run_prep` fix, then lean + accsync together, and accsync on the image's bridge
-   (a stock setting, for the integration build); the bench step b if native-replay still wants it.
+   **Next (coordinator, 03:15 UTC): lean with native-replay's `run_prep` fix + the accumulation thread off, on the
+   integration build's env, so the numbers compare with the headline.** Ready since 03:25 UTC:
+   `bridge_headline_job.sh LEAN IMAGE SHA` (deployed): every arm in integration build 3's image (second tag
+   `farm-collectives-int:d00c0a9a3e18`, so integration's image pruning cannot remove it; drop the tag with
+   `sudo -n docker rmi farm-collectives-int:d00c0a9a3e18` on the node when done), the headline's no-speculation
+   env (headline_job.sh's build flags + 00178's prefix flags) + `PT_HPU_SYNCHRONOUS_ACC_QUEUE_FLUSHING=1`, build 3's
+   own probe pair staged at `~/farm/collectives/results/bench/intprobe/` (levels 32, 8, 1; 128 tokens; two rounds
+   per level; greedy and sampled interleaved). Arms tiny-stock, tiny-lean, then real-stock and real-lean. Submit
+   when native-replay names the fixed build:
+   `printf 'exec bash ~/farm/collectives/bridge/bridge_headline_job.sh <lean id> farm-collectives-int:d00c0a9a3e18 0a66722b7a55\n' | bin/farm submit collectives real8-bridge-headline all 45m`,
+   then send the id to the coordinator and native-replay.
+2. Pull request: the gate runs on the snapshot worktree `reports/collectives/gate-snap-04f690be` (program head
+   merged at 90fdeec3; log `reports/collectives/logs/gate_04f690be.log`; my tool tests 10 pass on it). When green:
+   push the snapshot commit to its own branch, open the pull request from it, merge (owner's rule 03:07 UTC).
 1b. native-replay's next builds: `timers-c281d8b53d08` (phase timers: `PT_HPU_HPUGRAPH_REPLAY_TIMING=N` prints one
    `HPUGRAPH_REPLAY_TIMING` line per N replayed launches per thread; about 01:47 UTC) and, about 20 minutes later,
    `lean-e1dbb4942fb8` (the timers plus the first prepared-replay step behind `PT_HPU_HPUGRAPH_PREPARED_REPLAY=1`;
