@@ -52,7 +52,7 @@ def test_the_mode_is_the_fused_mode_plus_the_flag():
         assert MOE not in tiny_smoke.GDN_MODES[other], other
     assert HC not in tiny_smoke.GDN_MODES["moe"]  # one kernel family per mode
     assert tiny_smoke.GDN_MODES["hc"] == dict(tiny_smoke.GDN_MODES["fused"], **{HC: "1"})  # as before
-    assert list(tiny_smoke.GDN_MODES) == ["pytorch", "fused", "hc", "moe"]
+    assert list(tiny_smoke.GDN_MODES) == ["pytorch", "fused", "hc", "moe", "qsa"]
 
 
 def test_which_checks_apply_to_the_mode():

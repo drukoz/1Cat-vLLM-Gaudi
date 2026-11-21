@@ -28,7 +28,7 @@ HF_HUB_VERSION="1.33.0"
 # --with-profile), then "report". --from is checked against them here, before the container starts,
 # so a misspelt phase costs nothing. A test keeps these lists equal to main.py and variants.json.
 GATE_PHASES="preflight build fused_gdn tiny card_tests"
-KNOWN_VARIANTS="A B C P"
+KNOWN_VARIANTS="A B B4 B5 C P"
 DEFAULT_VARIANTS="A B C"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -52,6 +52,8 @@ usage() {
     echo "                    to the orchestrator; the checks that decide the GDN kernel still run)"
     echo "  --no-verify-probe skip only the automatic crash probe that follows a crashed or hung GDN"
     echo "                    verify op test (passed to the orchestrator)"
+    echo "  --qsa-fused       ask for the fused QSA decode path (off by default): VLLM_HPU_QSA_FUSED=2 and"
+    echo "                    VLLM_HPU_QSA_INDEXER_SHARD=1 when its kernels' card test passed, else =1"
     echo "  --hc-fused        ask for the fused hyper-connection kernels (off by default; passed to the"
     echo "                    orchestrator): the servers get VLLM_HPU_HC_FUSED=1 only when the card test of"
     echo "                    the kernels in gate fused_gdn passed, otherwise VLLM_HPU_HC_FUSED=0 and the run"
@@ -189,6 +191,7 @@ NO_VERIFY_PROBE=0
 LOAD_READ_TIMEOUT=""
 WARM_REQUEST_TIMEOUT=""
 HC_FUSED=0
+QSA_FUSED=0
 MOE_GLUE=0
 ANATOMY=0
 
@@ -281,6 +284,10 @@ while [ $# -gt 0 ]; do
             ;;
         --no-verify-probe)
             NO_VERIFY_PROBE=1
+            shift
+            ;;
+        --qsa-fused)
+            QSA_FUSED=1
             shift
             ;;
         --hc-fused)
@@ -505,6 +512,7 @@ if [ -n "$LOAD_READ_TIMEOUT" ]; then ENTRY_ARGS+=(--load-read-timeout "$LOAD_REA
 if [ -n "$WARM_REQUEST_TIMEOUT" ]; then ENTRY_ARGS+=(--warm-request-timeout "$WARM_REQUEST_TIMEOUT"); fi
 # The operator's request only: the orchestrator sets VLLM_HPU_HC_FUSED per server, after the card test.
 if [ "$HC_FUSED" -eq 1 ]; then ENTRY_ARGS+=(--hc-fused); fi
+if [ "$QSA_FUSED" -eq 1 ]; then ENTRY_ARGS+=(--qsa-fused); fi
 # The same for the MoE glue kernels: the request only, VLLM_HPU_MOE_GLUE is the orchestrator's to set.
 if [ "$MOE_GLUE" -eq 1 ]; then ENTRY_ARGS+=(--moe-glue); fi
 # The step-anatomy probe after each variant's first token (tools/flash_next/anatomy).

@@ -50,16 +50,18 @@ def _uses_lmcache_connector() -> bool:
 
 _LAZY_ACC_PAR_ENV = "PT_HPU_LAZY_ACC_PAR_MODE"  # flashinfer_gaudi._native.LAZY_ACC_PAR_ENV
 _FUSED_CUSTOM_OP_FLAGS = ("VLLM_HPU_HC_FUSED", "VLLM_HPU_MOE_GLUE")  # both load the hc_fused_ops extension
+_QSA_FUSED_FLAG = "VLLM_HPU_QSA_FUSED"  # 2 and 3 load the qsa_fused_ops extension (0 and 1 are torch only)
 
 
 def _default_serial_lazy_accumulation(environ=None) -> str | None:
-    """With the fused hyper-connection or MoE glue kernels requested, default PT_HPU_LAZY_ACC_PAR_MODE to 0.
+    """With the fused hyper-connection, MoE glue or QSA kernels requested, default PT_HPU_LAZY_ACC_PAR_MODE to 0.
 
     A custom HPU op is not safe next to the lazy bridge's accumulation thread
     (``flashinfer_gaudi._native.lazy_accumulation_reason``), and the bridge may read the variable as soon as
     it is imported. So this runs first in ``register``, before the platform module imports the bridge, in the
     process that starts the workers; they inherit the value. Returns "0" when it set the variable and None
-    when it did nothing: neither flag is exactly 1, the process is eager (``PT_HPU_LAZY_MODE=0``), or the
+    when it did nothing: no kernel flag asks for a custom op (``VLLM_HPU_HC_FUSED`` or ``VLLM_HPU_MOE_GLUE``
+    exactly 1, ``VLLM_HPU_QSA_FUSED`` 2 or 3), the process is eager (``PT_HPU_LAZY_MODE=0``), or the
     variable is already set. A value the user set is never replaced; a lazy process that keeps the thread on
     gets no fused kernels from the loader.
     """
@@ -70,6 +72,10 @@ def _default_serial_lazy_accumulation(environ=None) -> str | None:
             requested = requested or int(environ.get(flag, "0")) == 1
         except ValueError:
             pass
+    try:
+        requested = requested or int(environ.get(_QSA_FUSED_FLAG, "0")) in (2, 3)
+    except ValueError:
+        pass
     if not requested or environ.get("PT_HPU_LAZY_MODE", "1").strip() == "0" or _LAZY_ACC_PAR_ENV in environ:
         return None
     environ[_LAZY_ACC_PAR_ENV] = "0"
@@ -251,6 +257,32 @@ def _load_moe_glue_if_requested(flag: int, warn=None) -> bool | None:
     return loaded
 
 
+def _load_qsa_fused_if_requested(flag: int, warn=None) -> bool | None:
+    """With VLLM_HPU_QSA_FUSED=2 or 3, load the fused QSA decode kernels and warn once when they are not usable.
+
+    Returns the loader's result, or ``None`` when the flag is not 2 or 3: then nothing is imported, loaded or logged.
+    Before warmup, for the reason of the hyper-connection loader (GC_KERNEL_PATH). The loader never raises; the
+    QSA layers then run the mode-1 torch data flow (qsa_fused_path).
+    """
+    if flag not in (2, 3):
+        return None
+    from flashinfer_gaudi._native import load_qsa_fused_extension, qsa_fused_extension_errors
+
+    loaded = load_qsa_fused_extension()
+    if not loaded and _hpu_visible():
+        reason = "; ".join(qsa_fused_extension_errors()) or "no error recorded"
+        # Not "has no HPU kernel": the rental's GDN fallback scan (gates.GDN_FALLBACK_RE) counts those lines.
+        message = (f"QSA fused (VLLM_HPU_QSA_FUSED={int(flag)}): the kernels are not loaded, the qsa_fused_ops "
+                   f"extension did not load ({reason}); the QSA layers run the torch data flow of mode 1. Build "
+                   "it with tools/build_flashinfer_gaudi.py --qsa-fused-only, or set VLLM_HPU_QSA_FUSED=1.")
+        if warn is None:
+            from vllm.logger import init_logger
+
+            warn = init_logger(__name__).warning
+        warn(message)
+    return loaded
+
+
 def register_ops():
     """Register custom PluggableLayers for the HPU platform"""
     from flashinfer_gaudi import load_native_extensions
@@ -279,6 +311,8 @@ def register_ops():
     _load_hc_fused_if_requested(_gaudi_envs.VLLM_HPU_HC_FUSED)
     # The fused MoE glue kernels, only with VLLM_HPU_MOE_GLUE=1 (default 0: nothing happens here).
     _load_moe_glue_if_requested(_gaudi_envs.VLLM_HPU_MOE_GLUE)
+    # The fused QSA decode kernels, only with VLLM_HPU_QSA_FUSED=2 or 3 (default 0: nothing happens here).
+    _load_qsa_fused_if_requested(_gaudi_envs.VLLM_HPU_QSA_FUSED)
     # One line per process with what the loader decided (state, GC_KERNEL_PATH, combined database, errors):
     # the server log then shows which kernel database every worker really runs.
     from flashinfer_gaudi._native import kernel_database_status
