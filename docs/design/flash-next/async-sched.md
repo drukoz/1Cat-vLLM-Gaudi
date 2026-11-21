@@ -6,7 +6,7 @@ results are under `/Volumes/Storage/Claude/gaudi-work/reports/async-sched/card/`
 
 ## Handoff (if this agent stops)
 
-Updated 2026-11-21 06:45 UTC.
+Updated 2026-11-21 06:30 UTC.
 
 - **On the branch** (pushed): `8f4816f8` engine-step's `engine_harness.py`, unchanged; `7a818007` mode 1 of
   `VLLM_HPU_FLASH_NEXT_ASYNC_SCHED` (no speculation: the PLE context carry, the output-token ledger, the async
@@ -42,8 +42,9 @@ Updated 2026-11-21 06:45 UTC.
   - If the session is gone: `bin/farm fetch async-sched 00196 00196-real8-async-m1b` (same for 00197). Read
     `python3 -I reports/async-sched/tools/ab_table.py <dir> --pairs nospec-async:nospec` (00196) and
     `--pairs mtp2-async:mtp2` (00197); `tiny-async/summary.json` (both modes must pass); the timer records of each
-    arm (spans `wait`, `async_wait`, `gap`, `rpc_gap`, the engine's `update_from_output`; the census counters with
-    their source lines), greedy and sampled rounds told apart by time.
+    arm with `python3 -I reports/async-sched/tools/timer_spans.py <dir> [--sites]` (spans `wait`, `async_wait`,
+    `gap`, `rpc_gap`, the engine's `update_from_output`; `--sites`: the census with source lines; `t` is epoch
+    seconds and `raw` in each record has every step, so greedy and sampled rounds can be told apart by time).
   - 00179 cancelled (00186 answered it); 00195 replaced by 00196.
 - The 1-token prompt left out of `test_engine_async_spec.py`'s staggered schedule: a defect of the speculative
   prompt path, fixed by spec-lookup in `005e1ff9` (its own pull request, not on the program branch at `2e9f9196`).
@@ -223,14 +224,28 @@ a pending event on the same host address (`device.cpp:1166-1176`).
 
 Build 4's ledger called `settle(keep=1)` at the start of every `sample_tokens`, on the main thread: an
 `event.synchronize()` of the step before last, which through the flush waited for the copy of the step in flight
-too. Mode 2 never makes that call (its runner step is synchronous), and mode 2 greedy is not slower. `d3fb1b11`:
+too. And in this runner `execute_model` only updates the batch and keeps the scheduler output (VERIFIED,
+`hpu_model_runner.py` `execute_model`: `self.scheduler_output = scheduler_output; return None`); the step's inputs,
+its forward and its sampling are all issued in `sample_tokens`, after that hook. So the worker waited for all of
+step N on the device before it prepared step N+1: no overlap at all, plus the cost of the async machinery (the
+output thread, the engine's batch queue), which fits mode 1 being slower than synchronous. Also VERIFIED:
+`device::synchronize_event` holds `usr_event_mutex_` during `synEventSynchronize` (`device.cpp:827`), so the output
+thread's wait in `AsyncHPUModelRunnerOutput.get_output` blocks event operations of the main thread (creating and
+recording the next copy's event, `wait_stream`) until the device reaches the event; those come after the next
+step's forward is issued. Mode 2 never makes that call (its runner step is synchronous), and mode 2 greedy is not slower. `d3fb1b11`:
 no wait in a steady decode step. Placeholders keep `output_token_ids` at their synchronous length (`min_tokens`),
 the values are settled only before a sampler pass that reads them (penalties, bad words) from a window of the last
 64 steps, and older placeholders become the penalty pad (CPU: `test_output_token_ids_have_the_synchronous_length_and_no_wait`
 and the penalty tests). INFERRED: mode 1's async step is nearly flat in the stream count (54 to 67 ms) while the
 synchronous step grows (34 to 51 ms), which a wait for the step in flight alone may not explain; 00196 times the
 spans of every step (and counts the host synchronisation points) with the fix. Mode 2 sampled has a gap of the same
-size without any ledger: cause unknown, 00197.
+size without any ledger: cause unknown, 00197. CPU first (06:27 UTC, mtp-card-ready's rehearsal engine with the real
+MTP drafter on the int3 tree, k = 2, `VLLM_HPU_SPEC_SAMPLED_VERIFY=2`, the step timer in mode 1, six prompts at
+once; records in `reports/async-sched/cpu/`, read with `reports/async-sched/tools/timer_spans.py`): the verification step's host spans outside the model and the drafter (setup, prepare, sample, post, wait,
+gap) are within noise of each other in synchronous MTP and mode 2, greedy and sampled (for example 2 rows,
+sampled: prepare 1.98 against 1.41 ms, sample 2.89 against 2.61, gap 0.27 against 0.23). No host work runs only
+for sampled requests under mode 2, and the drafter has no sampled path (VERIFIED). So the card's gap is an
+interaction with the device, which only the card's spans and census can show (INFERRED).
 
 ## 3. What is on the branch
 
