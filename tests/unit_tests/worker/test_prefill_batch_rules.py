@@ -47,9 +47,19 @@ def test_flash_next_may_merge():
     dict(use_merged_prefill=True),
     dict(has_kv_transfer=True),
     dict(data_parallel_size=2),
+    dict(prefill_checkpoint=True),
 ])
 def test_other_servers_keep_one_request_per_prompt_forward(overrides):
     assert _refusal(**overrides) is not None
+
+
+@pytest.mark.parametrize("value, on", [(None, False), ("0", False), ("", False), ("1", True)])
+def test_prefill_checkpoint_blocks_merging_until_its_maps_are_per_row(monkeypatch, value, on):
+    if value is None:
+        monkeypatch.delenv("VLLM_HPU_PREFILL_CHECKPOINT", raising=False)
+    else:
+        monkeypatch.setenv("VLLM_HPU_PREFILL_CHECKPOINT", value)
+    assert pb.prefill_checkpoint_on() is on
 
 
 @pytest.mark.parametrize("count, sizes, groups", [

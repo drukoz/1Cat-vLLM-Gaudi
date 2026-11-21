@@ -24,9 +24,11 @@ from typing import Optional
 # VLLM_HPU_MTP_DRAFT_CHAIN is decided before every verification (HPUModelRunner._mtp_chain_decision).
 # VLLM_HPU_FLASH_NEXT_SPEC_DEVICE_INPUTS (async-sched's stage 2, M1) is read at every verification step by a server
 # started at 1 or 2 (the device-made inputs' object exists only then); 0 turns it off while serving.
+# VLLM_HPU_PREFILL_BATCH is read at every step by a server started with it at N >= 2 (its prompt bs buckets go up to
+# N): a smaller value caps the rows of a merged prompt forward, 0 or 1 gives every prompt chunk its own forward.
 SWITCHABLE = ("VLLM_HPU_FLASH_NEXT_DECODE_METADATA", "VLLM_HPU_FUSED_GREEDY_LOGITS", "VLLM_HPU_CANDIDATE_SAMPLING",
               "VLLM_HPU_VOCAB_PARALLEL_LOGITS", "VLLM_HPU_MTP_DRAFT_GRAPH", "VLLM_HPU_MTP_DRAFT_CHAIN",
-              "VLLM_HPU_FLASH_NEXT_SPEC_DEVICE_INPUTS")
+              "VLLM_HPU_FLASH_NEXT_SPEC_DEVICE_INPUTS", "VLLM_HPU_PREFILL_BATCH")
 
 
 def parse_switches(text: str) -> dict[str, str]:

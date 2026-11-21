@@ -53,7 +53,7 @@ from vllm_gaudi.v1.sample.candidate_sampling import NOISE_SEED as CANDIDATE_NOIS
 from vllm_gaudi.v1.sample.topk_ids import topk_with_ids
 from vllm_gaudi.v1.sample.request_params import RowParams, apply_request_adjustments, request_adjustments
 from vllm_gaudi.v1.worker.runtime_switches import RuntimeSwitchFile
-from vllm_gaudi.v1.worker.prefill_batch import (ChunkShape, group_sizes, prefill_batch_refusal,
+from vllm_gaudi.v1.worker.prefill_batch import (ChunkShape, group_sizes, prefill_batch_refusal, prefill_checkpoint_on,
                                                 reads_what_another_writes, resolve_prefill_batch_rows,
                                                 within_graph_limit)
 from vllm_gaudi.v1.worker.recurrent_commit import (apply_align_precopy, boundary_commits, commit_conv, commit_ssm,
@@ -4121,6 +4121,7 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             use_merged_prefill=self.use_merged_prefill,
             has_kv_transfer=self.vllm_config.kv_transfer_config is not None,
             data_parallel_size=int(self.parallel_config.data_parallel_size),
+            prefill_checkpoint=prefill_checkpoint_on(),
         )
         if refusal is not None:
             logger.warning("VLLM_HPU_PREFILL_BATCH=%d is ignored: %s; every prompt chunk stays its own forward.", rows,
@@ -4129,6 +4130,30 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         logger.info("VLLM_HPU_PREFILL_BATCH=%d: up to %d prompt chunks of one step with the same padded shape run "
                     "as one forward", rows, rows)
         return rows
+
+    def _prefill_batch_rows_now(self) -> int:
+        """The most chunks per prompt forward in this step: the server's ``VLLM_HPU_PREFILL_BATCH``, or less when the
+        runtime switch file (``VLLM_HPU_RUNTIME_SWITCH_FILE``) set a smaller value (0 or 1: one chunk per forward)."""
+        rows = getattr(self, "prefill_batch_rows", 0)
+        if rows and getattr(self, "_runtime_switches", None) is not None:
+            rows = min(rows, resolve_prefill_batch_rows())
+        return rows
+
+    def _count_prefill_batch(self, batches: list[BatchContents]) -> None:
+        """Count the merged prompt forwards; log the first one and every 32nd (the card jobs read these lines)."""
+        for contents in batches:
+            if len(contents.req_ids) > 1:
+                self._prefill_batch_merged = getattr(self, "_prefill_batch_merged", 0) + 1
+                self._prefill_batch_merged_rows = getattr(self, "_prefill_batch_merged_rows", 0) + len(
+                    contents.req_ids)
+                merged = self._prefill_batch_merged
+                if merged == 1 or merged % 32 == 0:
+                    logger.info("VLLM_HPU_PREFILL_BATCH: %d merged prompt forwards so far, %d chunks in them (this "
+                                "one: %d rows of %d query tokens at contexts %s)", merged,
+                                self._prefill_batch_merged_rows, len(contents.req_ids),
+                                max(len(t) for t in contents.token_ids), sorted(set(contents.context_lens)))
+            else:
+                self._prefill_batch_single = getattr(self, "_prefill_batch_single", 0) + 1
 
     def _prefill_chunk_shape(self, contents: BatchContents) -> ChunkShape:
         """The one-row prompt bucket of a one-request ``contents`` and its logits class (VLLM_HPU_PREFILL_BATCH)."""
@@ -4139,7 +4164,7 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                           context_bucket=int(ctx_bucket),
                           has_logits=len(contents.logits_positions[0]) > 0)
 
-    def _prefill_batch_sizes(self, shape: ChunkShape) -> list[int]:
+    def _prefill_batch_sizes(self, shape: ChunkShape, max_rows: int) -> list[int]:
         """Row counts a forward of ``shape`` may have: prompt bs buckets of exactly this query and context bucket
         (no padded rows), inside the prompt-graph limit when a one-row forward of the shape is inside it."""
         prepared = None
@@ -4150,7 +4175,7 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         one_row_graphed = (self.use_hpu_graph and not self.model_config.enforce_eager
                            and within_graph_limit(1, shape.query_bucket, ctx_tokens, limit))
         sizes = [1]
-        for rows in range(2, self.prefill_batch_rows + 1):
+        for rows in range(2, max_rows + 1):
             if prepared is not None and (rows, shape.query_bucket, shape.context_bucket) not in prepared:
                 continue
             if one_row_graphed and not within_graph_limit(rows, shape.query_bucket, ctx_tokens, limit):
@@ -4158,7 +4183,7 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             sizes.append(rows)
         return sizes
 
-    def _group_prefill_contents(self, singles: list[BatchContents]) -> list[BatchContents]:
+    def _group_prefill_contents(self, singles: list[BatchContents], max_rows: int) -> list[BatchContents]:
         """VLLM_HPU_PREFILL_BATCH: merge runs of consecutive one-request chunks with the same padded shape.
 
         A run ends at a chunk of another shape or logits class, at a request that asks for prompt logprobs, at a
@@ -4173,7 +4198,7 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             if not run:
                 return
             start = 0
-            for size in group_sizes(len(run), self._prefill_batch_sizes(run_shape)):
+            for size in group_sizes(len(run), self._prefill_batch_sizes(run_shape, max_rows)):
                 merged = run[start]
                 merge_contents(merged, *run[start + 1:start + size])
                 batches.append(merged)
@@ -4183,7 +4208,7 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         for single in singles:
             shape = self._prefill_chunk_shape(single)
             alone = single.req_ids[0] in self.input_batch.num_prompt_logprobs
-            joins = (bool(run) and not alone and shape == run_shape and len(run) < self.prefill_batch_rows
+            joins = (bool(run) and not alone and shape == run_shape and len(run) < max_rows
                      and not reads_what_another_writes([(c.blocks[0], c.context_lens[0]) for c in run] +
                                                        [(single.blocks[0], single.context_lens[0])],
                                                        self.attn_block_size))
@@ -4194,6 +4219,7 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             if alone:
                 flush()
         flush()
+        self._count_prefill_batch(batches)
         return batches
 
     def _can_merge_prefill_contents(self, lhs, rhs):
@@ -4260,6 +4286,7 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             self._get_attention_group_id_for_hybrid()].get_cpu_tensor()
         all_batch_contents = [BatchContents()]
         singles: list[BatchContents] = []
+        rows_now = self._prefill_batch_rows_now()
 
         for batch_idx in range(num_decodes, num_reqs):
             req_id = self.input_batch.req_ids[batch_idx]
@@ -4304,7 +4331,7 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                 blocks=[blocks],
                 logits_positions=[logits_positions],
             )
-            if self.prefill_batch_rows and not warmup:
+            if rows_now and not warmup:
                 singles.append(new_batch_contents)
             elif self._can_merge_prefill_contents(all_batch_contents[-1], new_batch_contents):
                 merge_contents(all_batch_contents[-1], new_batch_contents)
@@ -4312,7 +4339,7 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                 all_batch_contents.append(new_batch_contents)
         if singles:
             # VLLM_HPU_PREFILL_BATCH: equal-shape chunks of consecutive requests share a forward
-            all_batch_contents.extend(self._group_prefill_contents(singles))
+            all_batch_contents.extend(self._group_prefill_contents(singles, rows_now))
 
         num_real_prefill_batches = 0
         for content in all_batch_contents:

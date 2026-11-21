@@ -26,6 +26,7 @@ selection-bias attention per row, the PLE short conv per row). Pure functions he
 from __future__ import annotations
 
 import math
+import os
 from dataclasses import dataclass
 from typing import Iterable, Optional, Sequence
 
@@ -46,8 +47,16 @@ def resolve_prefill_batch_rows() -> int:
     return value
 
 
+def prefill_checkpoint_on() -> bool:
+    """prefill's ``VLLM_HPU_PREFILL_CHECKPOINT`` (one forward per turn) is set: its prompt path reads the Mamba2-style
+    checkpoint maps, which a prompt batch of several rows does not get yet (read from the environment: the flag is
+    defined on the prefill branch)."""
+    return os.environ.get("VLLM_HPU_PREFILL_CHECKPOINT", "0").strip() not in ("", "0")
+
+
 def prefill_batch_refusal(model_type: str, num_mamba_like_layers: int, num_gdn: int, use_merged_prefill: bool,
-                          has_kv_transfer: bool, data_parallel_size: int) -> Optional[str]:
+                          has_kv_transfer: bool, data_parallel_size: int,
+                          prefill_checkpoint: bool = False) -> Optional[str]:
     """Why this server cannot merge prompt chunks (None: it can)."""
     if model_type not in PREFILL_BATCH_MODEL_TYPES:
         return f"model type {model_type!r} is not one of {PREFILL_BATCH_MODEL_TYPES}"
@@ -59,6 +68,10 @@ def prefill_batch_refusal(model_type: str, num_mamba_like_layers: int, num_gdn: 
         return "a KV transfer connector is configured"
     if data_parallel_size > 1:
         return "data parallel size > 1 (dummy prefill padding across ranks)"
+    if prefill_checkpoint:
+        # its checkpoint blocks are filled from the per-request maps, which only one-row batches get today: a
+        # merged row would leave its checkpoint block stale and the next turn would resume from it
+        return "VLLM_HPU_PREFILL_CHECKPOINT is on and its checkpoint maps are one-row only"
     return None
 
 
