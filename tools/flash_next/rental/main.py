@@ -244,7 +244,8 @@ def tiny_serve_command(ckpt: Path, port: int = TINY_PORT) -> list:
         str(port),
         "--host",
         "127.0.0.1",
-    ]
+    ] + (["--no-enable-prefix-caching"] if os.environ.get("FARM_SERVE_NO_PREFIX_CACHING") == "1" else [])
+    # async-sched job branch: the tiny gate of mode 3 without prefix caching (rental/serve.py has the same opt-out)
 
 
 def server_env(variant_env: dict, gdn_env: dict) -> dict:

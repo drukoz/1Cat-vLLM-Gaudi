@@ -590,7 +590,8 @@ while [ "$i_arm" -lt "${#ARMS[@]}" ]; do
                 echo "headline_job: arm $arm left out: a tiny-m3pc gate failed (async-sched's M3)"
                 continue
             fi
-            if [ "$needs_async3" = 1 ] && [ "${m3_ok:-1}" != 1 ]; then
+            # an m3a arm (mode 3 with prefix caching, M3) answers to the tiny-m3pc gates above, not to tiny-m3
+            if [ "$needs_async3" = 1 ] && [ "$needs_m3" != 1 ] && [ "${m3_ok:-1}" != 1 ]; then
                 echo "headline_job: arm $arm left out: the tiny-m3 gate failed (async-sched's M2, mode 3)"
                 continue
             fi
