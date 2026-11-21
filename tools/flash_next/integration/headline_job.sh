@@ -22,6 +22,8 @@
 #           measured rounds off, on, off, on (decode_scaling.py --switch-arm): an A/B without the
 #           server-to-server spread. Rows of scaling.json carry "arm" (off / on); the MTP timer's records of
 #           the one-graph drafts have the kind verify+graph.
+#           HEADLINE_SWITCH_SET=graph-md: four arms, the 2 x 2 of VLLM_HPU_MTP_DRAFT_GRAPH and
+#           VLLM_HPU_FLASH_NEXT_DECODE_METADATA (off, on, md, on-md).
 #   mtp<K>-async-switch  the same A/B on the mtp<K>-async server (VLLM_HPU_FLASH_NEXT_ASYNC_SCHED=2, the MTP timer
 #           at HEADLINE_ASYNC_MTP_TIMING: set 0 for this A/B, the timer's device wait hides async's overlap).
 #   nospec-noshard, nospec-noprefix, nospec-noprefix-nocut  the low-stream bisect: A's env with
@@ -250,9 +252,21 @@ while [ "$i_arm" -lt "${#ARMS[@]}" ]; do
                     rm -f "$OUT/$arm/switches" "$OUT/$arm/switches.new"
                     switch_env=(VLLM_HPU_RUNTIME_SWITCH_FILE="$OUT/$arm/switches")
                     switch_args=(--probe-arg "--switch-file=$OUT/$arm/switches"
-                        --probe-arg "--switch-arm=off=VLLM_HPU_MTP_DRAFT_GRAPH=0"
-                        --probe-arg "--switch-arm=on=VLLM_HPU_MTP_DRAFT_GRAPH=1"
                         --probe-arg "--server-log=$OUT/$arm/server0.log")
+                    # HEADLINE_SWITCH_SET: graph (default) = off / on; graph-md = the 2 x 2 with engine-step's
+                    # VLLM_HPU_FLASH_NEXT_DECODE_METADATA (the sparse-QSA decode metadata, also switchable)
+                    case "${HEADLINE_SWITCH_SET:-graph}" in
+                        graph-md)
+                            switch_args+=(--probe-arg "--switch-arm=off=VLLM_HPU_MTP_DRAFT_GRAPH=0;VLLM_HPU_FLASH_NEXT_DECODE_METADATA=0"
+                                --probe-arg "--switch-arm=on=VLLM_HPU_MTP_DRAFT_GRAPH=1;VLLM_HPU_FLASH_NEXT_DECODE_METADATA=0"
+                                --probe-arg "--switch-arm=md=VLLM_HPU_MTP_DRAFT_GRAPH=0;VLLM_HPU_FLASH_NEXT_DECODE_METADATA=1"
+                                --probe-arg "--switch-arm=on-md=VLLM_HPU_MTP_DRAFT_GRAPH=1;VLLM_HPU_FLASH_NEXT_DECODE_METADATA=1")
+                            ;;
+                        *)
+                            switch_args+=(--probe-arg "--switch-arm=off=VLLM_HPU_MTP_DRAFT_GRAPH=0"
+                                --probe-arg "--switch-arm=on=VLLM_HPU_MTP_DRAFT_GRAPH=1")
+                            ;;
+                    esac
                     ;;
             esac
             # mtp<K>-async: VLLM_HPU_FLASH_NEXT_ASYNC_SCHED=2 (async scheduling with MTP) and the MTP timer at
