@@ -19,7 +19,8 @@
 # PREFILL_MAX_SECONDS / PREFILL_STOP_RESERVE / PREFILL_MIN_LINE_SECONDS as in prefill_job.sh. Run it under the
 # placement wrap (place_wrap.sh place.sh -- bash ab_job.sh ...). Writes versions.txt, server0.log, <NAME>/,
 # <NAME>.log, server_events_*.json, merged.log (the VLLM_HPU_PREFILL_BATCH lines of the server log after each
-# line). Exit: 0 every line ran, 3 the server died, 4 not healthy in time, 5 a line failed, 6 the time ran out.
+# line), hlsmi_mem.csv (card memory every 15 s). Exit: 0 every line ran, 3 the server died, 4 not healthy in time,
+# 5 a line failed, 6 the time ran out.
 
 set -u
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -71,10 +72,15 @@ SERVE=(vllm serve /models/Qwen3.8-Flash-Next-FP8 --served-model-name fn --host 1
 
 "${SERVE[@]}" >server0.log 2>&1 &
 SP=$!
+# card memory every 15 s (merged prompt graphs are larger: a PT_DEVMEM line or a peak near 96 GiB is the bound)
+( while :; do t=$(date -u +%T); hl-smi --query-aip=index,memory.used --format=csv,noheader 2>/dev/null | sed "s/^/$t, /"; sleep 15; done ) >>hlsmi_mem.csv 2>/dev/null &
+SAMPLER=$!
 stop_server() {
     kill -TERM "$SP" 2>/dev/null
-    for _ in $(seq 1 18); do kill -0 "$SP" 2>/dev/null || return 0; sleep 5; done
-    kill -KILL "$SP" 2>/dev/null
+    for _ in $(seq 1 18); do kill -0 "$SP" 2>/dev/null || break; sleep 5; done
+    kill -0 "$SP" 2>/dev/null && kill -KILL "$SP" 2>/dev/null
+    kill "$SAMPLER" 2>/dev/null
+    return 0
 }
 trap 'stop_server; exit 130' INT TERM
 while :; do
