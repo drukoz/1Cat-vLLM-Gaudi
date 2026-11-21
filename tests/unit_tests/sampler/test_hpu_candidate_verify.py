@@ -189,3 +189,18 @@ def test_refusal_names_what_the_candidates_cannot_serve():
     assert "top_k 0" in cv.refusal([1.0], [0], [0.95], seeded=False, logprobs=False)
     assert "top_k -1" in cv.refusal([0.7], [-1], [1.0], seeded=False, logprobs=False)
     assert "top_k 65" in cv.refusal([1.0], [65], [1.0], seeded=False, logprobs=False)
+
+
+def test_a_lookup_padding_draft_is_never_accepted():
+    # Prompt lookup pads its drafts with -1 (spec-lookup's 2dd6bc75 for the exact path): no candidate id is -1, so
+    # such a position is never accepted and its token comes from the whole target row (nothing to exclude).
+    vocab, batch = 30, 40000
+    torch.manual_seed(13)
+    p = torch.softmax(torch.randn(vocab) * 1.5, dim=0)
+    target = _vllm_probs(p.log().unsqueeze(0), torch.ones(1), torch.tensor([20]), torch.tensor([0.95]))[0]
+    logits, _, n_draft = _requests([p, p], [0], batch)
+    draft = torch.full((batch, ), -1, dtype=torch.int32)
+    out = _run(logits, draft, n_draft, 1, [1.0] * batch, [20] * batch, [0.95] * batch, 5)
+    assert (out[:, 0] >= 0).all() and (out[:, 1] == PH).all()  # always rejected, never a bonus after it
+    stat, dof = _chi_square(torch.bincount(out[:, 0].long(), minlength=vocab).double(), target.double())
+    assert stat < _chi_square_bound(dof), (stat, dof)
