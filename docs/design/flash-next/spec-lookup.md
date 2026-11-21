@@ -10,60 +10,61 @@ repository is under `/Volumes/Storage/Claude/gaudi-work/reports/spec-lookup/` (`
 
 ## Handoff (if this agent stops)
 
-State at **2026-11-20 23:50 UTC** (fourth agent, Opus 5.5). Branch head: the commit that holds this text, pushed.
-It contains the program head `938dada4` (merged as `49eb18cb`: PR #14 collectives), mtp-card-ready through
-`f1aa2292` and every commit of this track. The node ends about 04:00 UTC on 2026-11-21: everything on it is lost.
+State at **2026-11-21 01:05 UTC** (fourth agent, Opus 5.5). Branch head: the commit that holds this text, pushed.
+It contains the program head `5c1e8219` (PR #15 kernel-fixes, merged as `f4dad13a`), mtp-card-ready through
+`f1aa2292` and every commit of this track. **The node was extended (BRIEF 00:50 UTC): it ends about 00:00 UTC on
+2026-11-22**; everything on it is lost then. Merges are allowed again (one gate at a time).
 
 **Card jobs** (`bin/farm status`, `bin/farm ledger | grep -w spec-lookup`; results in
 `reports/spec-lookup/card/<id>-<name>/`, mirrored under `node-mirror/farm/spec-lookup/results/`)
 
 | Job | What | State |
 |---|---|---|
-| 00086, 00087, 00107, 00114 | tiny-model rehearsals (n-gram k = 3 and 8, vLLM's search, the hybrid with the torch and the fused GDN verification) | ended ok 20:33 to 20:38 UTC; read, reported to the coordinator; numbers in section 7 |
-| 00095 `real4-nospec-edit-prose` | real model, no speculation, TP4 + EP4: the reference and the token ids for the replay | ended ok 23:22 UTC; numbers and the replay in section 7 |
-| **00133 `real4-ngram5-edit3`** (any:4, 45 min; replaced 00120 and then 00129 with `--replaces`, keeping the place and the coordinator's bump) | real model, n-gram k = 5 with prefix caching and the fused GDN verification op (`--env VLLM_HPU_GDN_CORE_VERIFY=1`), `--env VLLM_GRAPH_RESERVED_MEM=0.5` (BRIEF 23:22 UTC: graphs made at run time), `hlsmi.log` every 15 s, rounds `edit:1:384`, `edit:32:384`, `prose:32:256`, `prose:1:256` (the same rounds and prompts as 00095); if that server dies, is not healthy or its probe fails (rc 3, 4, 5), the same job reruns n-gram k = 5 with the torch verification into `torch-verify/` (rounds `edit:1`, `edit:32`); commit `f2b86e91` | **waiting** (submitted 23:46 UTC; "starts by 01:55 UTC at the latest", behind the integration and MTP jobs). Its local waiter writes `reports/spec-lookup/card/submit-real4-ngram5-edit3.log`; if that waiter is gone: `bin/farm fetch spec-lookup 00133 00133-real4-ngram5-edit3` |
+| 00086, 00087, 00107, 00114 | tiny-model rehearsals (n-gram k = 3 and 8, vLLM's search, the hybrid with the torch and the fused GDN verification) | ended ok; section 7.1 |
+| 00095 `real4-nospec-edit-prose` | real model, no speculation, TP4 + EP4: the reference and the token ids for the replay | ended ok; sections 7.2 to 7.4 |
+| 00133 `real4-ngram5-edit3` | real model, n-gram k = 5, TP4: 85 tok/s for one editing agent, then the conv-commit crash on the second request (fused and torch verification alike) | ended rc 5 at 00:44 UTC; section 7.5 |
+| **00157 `real8-lookup-nospec-hybrid3-pf`** (all, 45 min; replaced 00153 / 00154) | TP8 on the integration build 2 + this branch + mtp-card-ready's conv-commit fix `5c770d96` (build `e85a3292`, branch `feat/flash-next-gaudi-spec-lookup-tp8`, pushed); build 2's flags with the prefix flags; arms `nospec` and `hybrid3` (`lookup_arms.sh`), rounds edit:1, edit:32, mix:32 and a repeat of edit:1 (the 00133 case at TP8) | **waiting**: placed by the coordinator after prefill's agent headline, about 03:45 to 05:00 UTC; local waiter `card/submit-real8-lookup-nospec-hybrid3-pf.log` |
+| **00159 `real8-lookup-ngram5-pf`** (all, 35 min; replaced 00155) | the same build and rounds, arm `ngram5` | **waiting**, after 00157; local waiter `card/submit-real8-lookup-ngram5-pf.log` |
 
-When 00133 ends:
+The exact submit commands are in section 7.6. Both jobs run the build `e85a3292`: to resubmit, check out
+`feat/flash-next-gaudi-spec-lookup-tp8` in this worktree first (the farm runs the worktree's HEAD), submit with
+`--replaces <id>`, wait for the `farm: job` line, then check out `feat/flash-next-gaudi-spec-lookup` again.
+
+When they end:
 ```bash
 cd /Volumes/Storage/Claude/gaudi-work/wt/spec-lookup
 C=/Volumes/Storage/Claude/gaudi-work/reports/spec-lookup/card
-python3 tools/flash_next/lookup_summary.py $C/00095-real4-nospec-edit-prose $C/00133-real4-ngram5-edit3
-grep -E "MEAS|fallback|DONE|ERROR|^job:" $C/00133-real4-ngram5-edit3/probe.log $C/00133-real4-ngram5-edit3.log
+python3 tools/flash_next/lookup_summary.py $C/00157-real8-lookup-nospec-hybrid3-pf/nospec \
+    $C/00157-real8-lookup-nospec-hybrid3-pf/hybrid3 $C/00159-real8-lookup-ngram5-pf/ngram5
+grep -h -E "MEAS|TEXT|fallback|DONE|lookup_arms" $C/00157-*/*/probe.log $C/00159-*/*/probe.log $C/00157-*.log $C/00159-*.log
 ```
-and report to the coordinator (SendMessage `main`) and in section 7: measured tokens per step against the replay
-(edit k = 5: 4.72), ms per step at 1 stream and at 32 streams (192 rows), ms per token against 00095 (29.9 and
-108.0 ms), the cost per extra verification row `c = (T_32,ngram - 108.0) / (192 - 32)` and `rho = c / 108`,
-the prose round at 32 streams (the ragged-width penalty), and whether the 1-stream edit stream equals 00095's
-token for token (`lookup_summary.py` prints it; a difference is a defect unless it is a near-tie).
-
-**The gate and pull requests.** BRIEF 23:21 UTC: card evidence first, pull requests only after the node is gone
-(after 04:00 UTC, when the Mac's CPUs are free); a gate that was only waiting leaves the queue. This track's
-waiting gate (pid 29898) was stopped at 23:41 UTC (`reports/spec-lookup/logs/gate_8dfb638a.log`, rc 143; it
-never held the lock). Run `bin/gate <worktree> --tools` after 04:00 UTC.
+and report to the coordinator (SendMessage `main`) and in section 7.6: per arm and round tokens per step, ms per
+step, ms per token and tok/s per stream against `nospec`; the hybrid's mode 1 against mode 0 (lookup's gain over
+MTP alone); the mix round's halves (`by_kind` in probe.json: edit and prose streams in one batch); `c` at 32
+streams = (ngram5 edit:32 ms per step - nospec edit:32 ms per step) / 160 and at 1 stream / 5; and whether the
+repeat round (the last edit:1, a second request on prompt 100 past the 512-token block) ran and equals the first
+edit:1 stream token for token (TEXT lines; at TP8 a difference points at the commit path, coordinator 00:57 UTC).
 
 **Pending, in order**
 
-1. 00133's numbers (above); the coordinator asked for (a) the 1-stream edit ms per token and tok/s per stream,
-   (b) `c` at 32 streams on the head's path, (c) the hybrid on the mixed load from the same numbers (7.4). If the
-   fused-verification server failed, the job's own fallback ran the torch verification (`torch-verify/`); the
-   first server's traceback is in `00133-real4-ngram5-edit3/server0.log`.
-2. **Merge after 04:00 UTC** (BRIEF 23:21), after mtp-card-ready's own pull request: their sampled-verification
-   fix `0d1be6fc` is on origin since about 23:40 UTC (`origin/feat/flash-next-gaudi-mtp-card-ready` at `fb3c2fb3`),
-   but their branch also carries merges of qsa-fused and kernel-fixes, so do not merge their branch here: wait for
-   their pull request to land on the program head, then `git fetch origin && git merge origin/feat/flash-next-gaudi`,
-   `bin/gate <worktree> --tools`, push, `gh pr create --base feat/flash-next-gaudi`, `gh pr merge --merge`.
-   Until then the gate is red on their test: on this branch's merged head
-   `tests/unit_tests/models/flash_next/test_engine_mtp.py` fails one test, run alone
-   (`test_sampled_requests_through_the_speculative_engine`: "output with shape [1, 248320] doesn't match the
-   broadcast shape [4, 248320]"; 13 passed; `reports/spec-lookup/logs/m8_test_engine_mtp_54990f1f.log`), red since
-   the program head's merge into `f1aa2292`, fixed by `0d1be6fc`. Their commit also says every speculative step on
-   `f1aa2292` + head runs one discarded sampler pass over the `1 + k` padded rows: a small extra cost inside
-   00133's numbers. Card-proven so far: n-gram with prefix caching (tiny model: 00086 k = 3, 00087 k = 8 and
-   vLLM's search; real model: 00133), the hybrid (tiny model, 00107 torch and 00114 fused verification). All flags
-   of this track default off (`VLLM_HPU_FLASH_NEXT_SPEC_LOOKUP`, `..._LOOKUP_MIN_NGRAM`, `..._LOOKUP_MAX_NGRAM`,
-   `..._LOOKUP_ORACLE`); n-gram itself is chosen by `--speculative-config`. Tonight the integration track builds
-   from pushed branches directly: tell the coordinator the commit and the proven flags (done at 23:47 UTC for
-   `ff3fbbc9`).
+1. 00157 and 00159's numbers (above).
+2. **Merge after mtp-card-ready's own pull request** (merges are allowed again, BRIEF 00:50 UTC; one gate at a time).
+   This branch contains mtp-card-ready through `f1aa2292`; on its merged head `test_engine_mtp.py` fails one test
+   alone (`test_sampled_requests_through_the_speculative_engine`, "output with shape [1, 248320] doesn't match the
+   broadcast shape [4, 248320]", `reports/spec-lookup/logs/m8_test_engine_mtp_54990f1f.log`), fixed by their
+   `0d1be6fc`; their `5c770d96` fixes the conv-commit crash of 00133. Both are on
+   `origin/feat/flash-next-gaudi-mtp-card-ready`, whose branch also carries merges of qsa-fused, so do not merge
+   their branch here: when their pull request has landed, `git fetch origin && git merge origin/feat/flash-next-gaudi`,
+   `bin/gate <worktree> --tools`, push, `gh pr create --base feat/flash-next-gaudi` (body draft:
+   `reports/spec-lookup/pr/pr1_body.txt`; fill in the gate line and the card lines), `gh pr merge --merge`. My
+   `2dd6bc75` changes their `sampled_rejection_sample` (a lookup padding draft -1 is never accepted for a sampled
+   request; told the coordinator for them at 01:00 UTC): resolve a conflict there in favour of keeping `real`.
+   Card-proven so far: n-gram with prefix caching (tiny 00086 k = 3, 00087 k = 8 and vLLM's search; real model
+   00133 at 1 stream until the conv-commit crash, which `5c770d96` fixes), the hybrid (tiny 00107 torch and 00114
+   fused verification). All flags of this track default off (`VLLM_HPU_FLASH_NEXT_SPEC_LOOKUP`,
+   `..._LOOKUP_MIN_NGRAM`, `..._LOOKUP_MAX_NGRAM`, `..._LOOKUP_ORACLE`); n-gram itself is chosen by
+   `--speculative-config`. A sampled-request engine test of both lookup paths (`test_lookup_engine.py -k sampled`)
+   was running at 01:05 UTC (`reports/spec-lookup/logs/m9_test_lookup_engine_sampled.log`).
 3. **Rows at 32 streams** (section 7): an n-gram step is as wide as its longest draft, an empty draft is the
    2-row placeholder, so 32 streams carry `32 (1 + k)` rows as soon as one stream drafts. Two code steps would
    fix the economics of a mixed load: per-request (ragged) verification rows (rows `sum(1 + d_i)`, not
