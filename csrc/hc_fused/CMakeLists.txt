@@ -119,6 +119,66 @@ endif()
 set(HC_FUSED_MOE_GLUE_BUILT "${MOE_GLUE_BUILT}" CACHE INTERNAL "The MoE glue kernels in the library" FORCE)
 message(STATUS "hc_fused: MoE glue kernels in the library: [${MOE_GLUE_BUILT}]")
 
+# The interleaved hyper-connection kernels (docs/design/flash-next/hc-kernels.md): optional at build time
+# exactly like the MoE glue kernels above. A kernel that does not compile is left out; GetKernelGuids then
+# does not list its GUID, flashinfer_gaudi._native reports it missing, and the layers keep the shipped
+# hc_fused_gate_mix / hc_fused_combine_norm. HC_FUSED_IL_BUILT in CMakeCache.txt records which were built.
+option(HC_FUSED_IL "Build the interleaved kernels (GUIDs hc_fused_*_il_bf16_gaudi2) into the library" ON)
+set(HC_FUSED_IL_KERNELS
+    hc_fused_gate_mix_il_gaudi2
+    hc_fused_combine_norm_il_gaudi2)
+set(HC_FUSED_IL_KERNEL_HEADERS
+    "${CMAKE_CURRENT_SOURCE_DIR}/kernels/hc_fused_common.h"
+    "${CMAKE_CURRENT_SOURCE_DIR}/kernels/hc_fused_il.h")
+set(HC_FUSED_IL_BUILT_LIST "")
+set(HC_FUSED_IL_DEFINITIONS "")
+set(HC_FUSED_IL_EMBEDDED_OBJECTS "")
+if(HC_FUSED_IL)
+    foreach(kernel IN LISTS HC_FUSED_IL_KERNELS)
+        set(kernel_source "${CMAKE_CURRENT_SOURCE_DIR}/kernels/${kernel}.c")
+        set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${kernel_source}" ${HC_FUSED_IL_KERNEL_HEADERS})
+        execute_process(
+            COMMAND "${TPC_COMPILER}" -Wall -Werror -O2 -march=gaudi2 "-I${TPC_INCLUDE_DIR}"
+                    "${kernel_source}" -c -o "${CMAKE_CURRENT_BINARY_DIR}/${kernel}.probe.o"
+            RESULT_VARIABLE HC_FUSED_IL_PROBE_RESULT
+            OUTPUT_VARIABLE HC_FUSED_IL_PROBE_LOG
+            ERROR_VARIABLE HC_FUSED_IL_PROBE_LOG)
+        file(REMOVE "${CMAKE_CURRENT_BINARY_DIR}/${kernel}.probe.o")
+        if(NOT HC_FUSED_IL_PROBE_RESULT EQUAL 0)
+            string(REGEX MATCH "[^\n]*error[^\n]*" HC_FUSED_IL_PROBE_ERROR "${HC_FUSED_IL_PROBE_LOG}")
+            message(WARNING
+                "${kernel}.c does not compile with the default TPC flags "
+                "(tpc-clang exit ${HC_FUSED_IL_PROBE_RESULT}: ${HC_FUSED_IL_PROBE_ERROR}). "
+                "Building libhc_fused_gaudi2.so without it: its GUID is absent and the layers keep the "
+                "shipped kernel (VLLM_HPU_HC_FUSED_IL has no effect for it).")
+            continue()
+        endif()
+        add_custom_command(
+            OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/${kernel}.o"
+            COMMAND "${TPC_COMPILER}" -Wall -Werror -O2 -march=gaudi2 "-I${TPC_INCLUDE_DIR}"
+                    "${kernel_source}" -c -o "${CMAKE_CURRENT_BINARY_DIR}/${kernel}.o"
+            DEPENDS "${kernel_source}" ${HC_FUSED_IL_KERNEL_HEADERS}
+            VERBATIM)
+        add_custom_command(
+            OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/${kernel}_embedded.o"
+            COMMAND "${ELF_OBJCOPY}" -I binary -O elf64-x86-64 -B i386:x86-64
+                    ${kernel}.o ${kernel}_embedded.o
+            DEPENDS "${CMAKE_CURRENT_BINARY_DIR}/${kernel}.o"
+            WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}"
+            VERBATIM)
+        set_source_files_properties("${CMAKE_CURRENT_BINARY_DIR}/${kernel}_embedded.o"
+            PROPERTIES EXTERNAL_OBJECT TRUE GENERATED TRUE)
+        list(APPEND HC_FUSED_IL_EMBEDDED_OBJECTS "${CMAKE_CURRENT_BINARY_DIR}/${kernel}_embedded.o")
+        list(APPEND HC_FUSED_IL_BUILT_LIST "${kernel}")
+        # hc_fused_gate_mix_il_gaudi2 -> HC_FUSED_HAS_HC_FUSED_GATE_MIX_IL (host/hc_fused_gaudi2.cpp)
+        string(REGEX REPLACE "_gaudi2$" "" kernel_stem "${kernel}")
+        string(TOUPPER "${kernel_stem}" kernel_define)
+        list(APPEND HC_FUSED_IL_DEFINITIONS "HC_FUSED_HAS_${kernel_define}=1")
+    endforeach()
+endif()
+set(HC_FUSED_IL_BUILT "${HC_FUSED_IL_BUILT_LIST}" CACHE INTERNAL "The interleaved kernels in the library" FORCE)
+message(STATUS "hc_fused: interleaved kernels in the library: [${HC_FUSED_IL_BUILT_LIST}]")
+
 add_library(
     hc_fused_gaudi2
     SHARED
@@ -127,8 +187,9 @@ add_library(
     host/entry_points.cpp
     ${HC_FUSED_EMBEDDED_OBJECTS}
     ${MOE_GLUE_EMBEDDED_OBJECTS}
+    ${HC_FUSED_IL_EMBEDDED_OBJECTS}
 )
-target_compile_definitions(hc_fused_gaudi2 PRIVATE ${MOE_GLUE_DEFINITIONS})
+target_compile_definitions(hc_fused_gaudi2 PRIVATE ${MOE_GLUE_DEFINITIONS} ${HC_FUSED_IL_DEFINITIONS})
 target_include_directories(
     hc_fused_gaudi2
     PRIVATE

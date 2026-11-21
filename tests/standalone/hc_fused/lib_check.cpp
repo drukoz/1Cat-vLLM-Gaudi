@@ -123,9 +123,9 @@ void CheckGuids()
     uint32_t count = 0;
     Expect(g_guids(DEVICE_ID_GAUDI2, &count, nullptr), GLUE_SUCCESS, "guids/size_query");
     // The six hyper-connection GUIDs, then the MoE glue GUIDs that were built into the library (0 to 4;
-    // moe_lib_check.cpp checks those).
-    Report(count >= kHcFusedGuidCount && count <= kHcFusedGuidCount + kMoeGlueGuidCount, "guids/count",
-           "count " + std::to_string(count));
+    // moe_lib_check.cpp checks those), then the interleaved hyper-connection GUIDs that were built (0 to 2).
+    Report(count >= kHcFusedGuidCount && count <= kHcFusedGuidCount + kMoeGlueGuidCount + kHcFusedIlGuidCount,
+           "guids/count", "count " + std::to_string(count));
     std::vector<GuidInfo> guids(count);
     uint32_t filled = count;
     Expect(g_guids(DEVICE_ID_GAUDI2, &filled, guids.data()), GLUE_SUCCESS, "guids/fill");

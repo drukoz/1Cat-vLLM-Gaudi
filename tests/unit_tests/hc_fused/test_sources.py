@@ -25,6 +25,17 @@ GUID_CONSTANT = {
     "combine_norm": "kHcFusedCombineNormGuid",
 }
 SCALAR_TAIL = "float eps, float inv_group, float inv_hc, int hc_count)"
+# The interleaved kernels (docs/design/flash-next/hc-kernels.md): op name -> (kernel file, GUID constant, GUID,
+# the shipped kind whose inputs, outputs and scalar arguments they take).
+IL_KERNELS = {
+    "hc_gate_mix_il": ("hc_fused_gate_mix_il_gaudi2", "kHcFusedGateMixIlGuid", "hc_fused_gate_mix_il_bf16_gaudi2",
+                       "gate_mix"),
+    "hc_combine_norm_il": ("hc_fused_combine_norm_il_gaudi2", "kHcFusedCombineNormIlGuid",
+                           "hc_fused_combine_norm_il_bf16_gaudi2", "combine_norm"),
+}
+# Files of the interleaved kernels: they may use a fused multiply-add where the oracle does not round
+# (inside their sigmoid, and y + y * w of the norm, docs/design/flash-next/hc-kernels.md).
+IL_FILES = {"hc_fused_il.h", *(f"{kernel}.c" for kernel, _, _, _ in IL_KERNELS.values())}
 
 
 def _code(path: Path) -> str:
@@ -35,8 +46,13 @@ def _code(path: Path) -> str:
 def test_params_header_has_the_python_guids():
     text = (CSRC / "hc_fused_params.h").read_text()
     found = dict(re.findall(r'inline constexpr const char\* (kHcFused\w+Guid) = "([^"]+)";', text))
-    assert found == {GUID_CONSTANT[kind]: GUIDS[kind] for kind in KINDS}
+    assert found == {
+        **{GUID_CONSTANT[kind]: GUIDS[kind] for kind in KINDS},
+        **{constant: guid for _, constant, guid, _ in IL_KERNELS.values()}
+    }
     assert f"kHcFusedGuidCount = {len(KINDS)};" in text
+    assert f"kHcFusedIlGuidCount = {len(IL_KERNELS)};" in text
+    assert set(IL_KERNELS) == set(hc_ops.IL_OP_NAMES)
     assert all(len(guid) < 64 for guid in GUIDS.values())  # MAX_NODE_NAME
     assert len(set(GUIDS.values())) == len(GUIDS)
 
@@ -86,7 +102,8 @@ def test_kernels_use_no_fused_multiply_add_and_no_tanh_sigmoid():
     """The oracle rounds every product and sum; v_sigmoid_f32 is the tanh form that fails the stress cases."""
     for path in sorted((CSRC / "kernels").iterdir()):
         code = _code(path)
-        assert "v_f32_mac_b" not in code, path.name
+        if path.name not in IL_FILES:
+            assert "v_f32_mac_b" not in code, path.name
         assert "v_sigmoid_f32" not in code, path.name
         assert "__local__" not in code, path.name
         if path.suffix == ".c" and "hc_fused_silu.h" not in code:
@@ -106,6 +123,33 @@ def test_cmake_builds_every_kernel_without_vlm():
     assert "gdn_fused" not in code  # its own library: a failure here cannot remove the GDN kernels
 
 
+def test_interleaved_kernels_take_the_shipped_kinds_tensors_and_scalars():
+    glue = (CSRC / "host" / "hc_fused_gaudi2.cpp").read_text()
+    rows = dict(
+        (constant, (int(inputs), int(outputs)))
+        for constant, inputs, outputs in re.findall(r"\{Kind::\w+, (kHcFused\w+Guid), (\d), (\d)\}", glue))
+    for op, (kernel, constant, guid, kind) in IL_KERNELS.items():
+        source = _code(CSRC / "kernels" / f"{kernel}.c")
+        mains = re.findall(r"void main\((.*?)\)\s*\n", source, re.S)
+        assert len(mains) == 1, kernel
+        assert " ".join((mains[0] + ")").split()).endswith(SCALAR_TAIL), kernel
+        assert len(re.findall(r"\btensor\b", mains[0])) == sum(rows[constant]) == sum(rows[GUID_CONSTANT[kind]])
+        assert "#pragma clang fp contract(off)" in source, kernel
+        assert f"_binary_{kernel}_o_start" in glue
+        assert hc_ops.IL_SCHEMAS[op] == hc_ops.SCHEMAS[OP_NAME[kind]].replace(OP_NAME[kind] + "(", op + "(")
+
+
+def test_cmake_builds_the_interleaved_kernels_as_optional_members():
+    code = "\n".join(line for line in (CSRC / "CMakeLists.txt").read_text().splitlines()
+                     if not line.lstrip().startswith("#"))
+    for kernel, _, _, _ in IL_KERNELS.values():
+        assert kernel in code
+        define = "HC_FUSED_HAS_" + kernel.removesuffix("_gaudi2").upper()
+        assert f"#ifdef {define}" in (CSRC / "host" / "hc_fused_gaudi2.cpp").read_text()
+    assert 'option(HC_FUSED_IL "' in code
+    assert "${HC_FUSED_IL_EMBEDDED_OBJECTS}" in code and "${HC_FUSED_IL_DEFINITIONS}" in code
+
+
 def test_op_file_registers_each_schema_with_its_guid():
     text = (CSRC / "pytorch" / "hpu_hc_fused.cpp").read_text()
     for kind in KINDS:
@@ -114,6 +158,10 @@ def test_op_file_registers_each_schema_with_its_guid():
         assert f'm.impl("{op}", run_{kind});' in text
         assert re.search(rf"k\w+Schema, {GUID_CONSTANT[kind]},", text), kind
         assert hc_ops.SCHEMAS[op] in " ".join(line.strip().lstrip("/ ") for line in text.splitlines())
+    for op, (_, constant, _, _) in IL_KERNELS.items():
+        assert f'"flashinfer_gaudi::{op}"' in text
+        assert f'm.impl("{op}", run_{op.removeprefix("hc_")});' in text
+        assert re.search(rf"k\w+Schema, {constant},", text), op
     assert "m.def(" not in text and "TORCH_LIBRARY_FRAGMENT" not in text  # the schemas are defined in Python
 
 
