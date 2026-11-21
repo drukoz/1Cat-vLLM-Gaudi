@@ -15,7 +15,8 @@ import numpy as np
 import pytest
 import torch
 
-from vllm_gaudi.v1.worker.flash_next_async import (AsyncOutputLedger, PleContextCarry, needs_output_token_values)
+from vllm_gaudi.v1.worker.flash_next_async import (AsyncOutputLedger, PleContextCarry, SpecDraftHandoff,
+                                                   needs_output_token_values)
 from vllm_gaudi.v1.worker.flash_next_inputs import build_ple_inputs
 
 EOS = 7
@@ -234,7 +235,7 @@ def _config(async_scheduling, speculative=False):
                            speculative_config=SimpleNamespace(method="mtp") if speculative else None)
 
 
-@pytest.mark.parametrize("value", [None, "0", "2"])
+@pytest.mark.parametrize("value", [None, "0", "3"])
 def test_platform_default_turns_async_off(platform_module, monkeypatch, value):
     if value is not None:
         monkeypatch.setenv("VLLM_HPU_FLASH_NEXT_ASYNC_SCHED", value)
@@ -257,3 +258,96 @@ def test_platform_flag_does_not_turn_async_on(platform_module, monkeypatch, spec
     config = _config(False, speculative=speculative)
     assert platform_module.resolve_flash_next_async_scheduling(config) is False
     assert config.scheduler_config.async_scheduling is False
+
+
+def _spec_config(async_scheduling, method="mtp"):
+    return SimpleNamespace(scheduler_config=SimpleNamespace(async_scheduling=async_scheduling),
+                           speculative_config=SimpleNamespace(method=method))
+
+
+def test_platform_mode_2_keeps_async_for_mtp(platform_module, monkeypatch):
+    """vLLM kept async scheduling on for MTP (requested); the HPU hook had turned it off for the speculative
+    config just before: mode 2 turns it back on."""
+    monkeypatch.setenv("VLLM_HPU_FLASH_NEXT_ASYNC_SCHED", "2")
+    config = _spec_config(False)
+    assert platform_module.resolve_flash_next_async_scheduling(config, requested=True) is True
+    assert config.scheduler_config.async_scheduling is True
+
+
+@pytest.mark.parametrize("mode,requested,method", [("2", False, "mtp"), ("2", True, "ngram"), ("1", True, "mtp"),
+                                                   ("0", True, "mtp")])
+def test_platform_mode_2_only_for_requested_mtp(platform_module, monkeypatch, mode, requested, method):
+    monkeypatch.setenv("VLLM_HPU_FLASH_NEXT_ASYNC_SCHED", mode)
+    config = _spec_config(False, method=method)
+    assert platform_module.resolve_flash_next_async_scheduling(config, requested=requested) is False
+    assert config.scheduler_config.async_scheduling is False
+
+
+def test_platform_mode_2_without_speculation_is_mode_1(platform_module, monkeypatch):
+    monkeypatch.setenv("VLLM_HPU_FLASH_NEXT_ASYNC_SCHED", "2")
+    config = _config(True)
+    assert platform_module.resolve_flash_next_async_scheduling(config, requested=True) is True
+    assert config.scheduler_config.async_scheduling is True
+
+
+def test_handoff_corrects_only_the_optimistic_counts():
+    handoff = SpecDraftHandoff()
+    handoff.begin_step()
+    # Step N: rows a, b, c verified 1 + 3 tokens from 10, 20, 30; committed 2, 4 and 1 tokens; d was a prompt.
+    handoff.record(torch.zeros((4, 3), dtype=torch.int64), ["a", "b", "c", "d"], [10, 20, 30, 0],
+                   {"a": 4, "b": 4, "c": 4, "d": 7}, {"a": [1, 2, 3], "b": [1, 2, 3], "c": [1, 2, 3]},
+                   [[5, 6], [5, 6, 7, 8], [5], [9]])
+    handoff.begin_step()
+    states = {name: SimpleNamespace(num_computed_tokens=None) for name in "abcd"}
+    computed = np.array([14, 22, 31, 7])  # a optimistic, b exact (all accepted), c already corrected, d a prompt
+    spec = {"a": [-1] * 3, "b": [-1] * 3, "c": [-1] * 3, "d": [-1] * 3}
+    assert handoff.correct_computed(["a", "b", "c", "d"], computed, states, spec) == 1
+    assert computed.tolist() == [12, 22, 31, 7] and states["a"].num_computed_tokens == 12
+    assert states["c"].num_computed_tokens is None  # 31 is neither 34 nor anything this step knew
+
+
+def test_handoff_correction_needs_a_verification_row():
+    handoff = SpecDraftHandoff()
+    handoff.begin_step()
+    handoff.record(None, ["a"], [10], {"a": 4}, {"a": [1, 2, 3]}, [[5]])
+    handoff.begin_step()
+    computed = np.array([14])
+    assert handoff.correct_computed(["a"], computed, {}, {}) == 0 and computed.tolist() == [14]
+
+
+def test_handoff_scatters_drafts_by_request():
+    handoff = SpecDraftHandoff()
+    handoff.begin_step()
+    drafts = torch.tensor([[11, 12, 13], [21, 22, 23], [31, 32, 33]])
+    handoff.record(drafts, ["a", "b", "c"], [0, 0, 0], {"a": 1, "b": 1, "c": 1}, {}, [[1], [1], [1]])
+    handoff.begin_step()
+    # This step: rows c, a, new (no drafts recorded), padding; a has 2 draft slots scheduled, c 3.
+    ids = torch.tensor([[7, -1, -1, -1], [8, -1, -1, -1], [9, -1, -1, -1], [0, 0, 0, 0]], dtype=torch.int32)
+    out = handoff.scatter_drafts(ids.view(-1, 1), ["c", "a", "new"], 4, {"c": [-1] * 3, "a": [-1] * 2,
+                                                                          "new": [-1] * 3})
+    assert out.shape == (16, 1) and out.dtype == torch.int32
+    assert out.view(4, 4).tolist() == [[7, 31, 32, 33], [8, 11, 12, -1], [9, -1, -1, -1], [0, 0, 0, 0]]
+    assert ids.view(4, 4)[0].tolist() == [7, -1, -1, -1]  # out of place
+    assert handoff.scattered == 5
+
+
+def test_handoff_scatters_host_draft_lists_too():
+    handoff = SpecDraftHandoff()
+    handoff.begin_step()
+    handoff.record([[11, 12], [21]], ["a", "b"], [0, 0], {"a": 1, "b": 1}, {}, [[1], [1]])
+    handoff.begin_step()
+    ids = torch.full((2 * 3, 1), -1, dtype=torch.int32)
+    out = handoff.scatter_drafts(ids, ["b", "a"], 3, {"a": [-1, -1], "b": [-1, -1]})
+    assert out.view(2, 3).tolist() == [[-1, 21, -1], [-1, 11, 12]]
+
+
+def test_handoff_is_one_step_only():
+    handoff = SpecDraftHandoff()
+    handoff.begin_step()
+    handoff.record(torch.tensor([[11, 12]]), ["a"], [0], {"a": 3}, {"a": [1, 2]}, [[1]])
+    handoff.begin_step()
+    handoff.begin_step()  # a step that recorded nothing (no speculative config call)
+    ids = torch.full((3, 1), -1, dtype=torch.int32)
+    assert torch.equal(handoff.scatter_drafts(ids, ["a"], 3, {"a": [-1, -1]}), ids)
+    computed = np.array([3])
+    assert handoff.correct_computed(["a"], computed, {}, {"a": [-1, -1]}) == 0

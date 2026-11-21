@@ -121,18 +121,48 @@ are active whenever async scheduling is on for a Flash-Next model (it is wrong w
 - The per-step cost of the in-graph n-gram ids against the host ids (device time, about 0.5 to 1 ms INFERRED).
 - Steps with a prefill (an agent's new turn) synchronize (hybrid rule above): no overlap on those steps.
 
-### 2.4 Speculation (MTP, lookup) under async scheduling: later
+### 2.4 Speculation (MTP) under async scheduling: stage 1 on the branch (`VLLM_HPU_FLASH_NEXT_ASYNC_SCHED=2`)
 
-Upstream supports async scheduling with EAGLE/MTP (drafts and the accepted counts stay on the device:
-`valid_sampled_token_count`, `_draft_token_ids` as a device tensor, `update_num_computed_tokens_for_batch_change`).
-The HPU runner asserts no speculation under async (`hpu_model_runner.py`, `use_async_scheduling` and
-`speculative_config`). For Flash-Next MTP it would need: the accepted count per row on the device for the GDN
-lattice offsets (`load_checkpoint_offsets` reads `_gdn_num_accepted_by_req` on the host today), the align-mode
-boundary commits (`_commit_recurrent_boundaries` takes host accepted counts), the next verification's positions
-and slot mapping from a device count, the draft ids on the device for the next input, and the PLE carry with
-`num_committed = 1 + accepted` (`advance_ple_context` already takes it as a device tensor). About 2 to 4 days; the
-prize is the same ~7 ms per step against a 106 ms MTP step at 32 streams (00128), so it waits for the verification
-step's own cost to fall.
+The coordinator's priority (01:40 UTC): the 32-agent plan is MTP (k = 2 or 3 at TP8), so async scheduling without
+speculation only helps a no-MTP server.
+
+What an MTP step does today (VERIFIED from the code, integration tree; the timer of 00128 for the sizes): the
+runner verifies 1 + k rows per request, reads the verification result on the host (`parse_output`), updates its
+books (accepted counts, the GDN lattice, align-mode commits), runs the drafter, returns. The engine then reads the
+drafts back (`take_draft_token_ids`: a host read that waits for the draft passes, `final_wait` 4.5 / 6.5 / 6.0 ms
+at 1 / 8 / 32 streams), schedules the next step with them and sends it.
+
+Upstream's async speculation (GPU) keeps the drafts and the accepted counts on the device and corrects positions
+there. Stage 1 keeps the host read of the verification result that the HPU step has anyway and drops the rest:
+
+- Platform: mode 2 keeps vLLM's async scheduling with a Flash-Next MTP config (vLLM itself keeps it on for MTP;
+  the HPU hook turned it off).
+- Runner (`SpecDraftHandoff`): with async scheduling and a speculative config the runner keeps its synchronous
+  step (`use_async_scheduling` False inside the runner). The engine schedules step N+1 during step N: its draft
+  slots arrive as -1 placeholders and its `num_computed_tokens` counts every draft of step N as accepted. At the end
+  of step N the handoff keeps the drafter's output (on the device, never read back) and, per verification row,
+  the scheduler's optimistic count and the true one (start + committed tokens). At the start of step N+1 it gives
+  every verification row whose count is still the optimistic one the true count (a count that is neither is left:
+  preemption, resume); in the decode batch it writes step N's drafts into the draft slots (one `index_select` +
+  `index_copy`, out of place) before the verification metadata reads them from the input ids.
+- The host n-gram ids cannot hash drafts only the device has: the in-graph ids run (logged once).
+- The runner's output copies `req_id_to_index` (the engine reads it after the next step's state update; the
+  live dict gave a `KeyError` in the CPU loop).
+
+What it saves (INFERRED from 00128's MTP timer, TP8): `final_wait` (about 6 ms at 32 streams) and the engine turn
+(about 2 ms) per step, and the next step's input preparation overlaps the draft passes on the device: about 8 ms of
+a 106 ms MTP step at 32 streams (8 %), 5 to 6 ms of 66 ms at 1 stream. What stays: the host read of the
+verification result inside the step and the drafter's host work after it (the device idles for the parse, the
+books and the first draft pass's issue, about 4 to 5 ms). Stage 2 would move the accepted counts to the device
+(lattice offsets, positions, slot mapping of the next verification, align commits): 2 to 4 days, only if stage 1's
+card number shows the remaining in-step gap is worth it.
+
+CPU evidence (engine-step's harness on this branch; n-gram as the vehicle because the harness loads no drafter
+model, with oracle drafts returned as a tensor the way the MTP drafter returns them, one wrong draft every few
+steps): `test_engine_async_spec.py`: the async run gives the reference tokens, corrects counts and writes drafts;
+without the correction the tokens go wrong; without the scatter they stay right with fewer accepted drafts. The real
+MTP drafter under async runs in mtp-card-ready's rehearsal engine (`tests/unit_tests/hpu_cpu_engine.py`, on the
+integration tree only), checked on the job branch before the card.
 
 ## 3. What is on the branch
 

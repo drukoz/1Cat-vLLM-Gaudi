@@ -194,3 +194,116 @@ def _row_tokens(sampled_cpu) -> list[int]:
 def needs_output_token_values(input_batch) -> bool:
     """Whether a sampler pass over ``input_batch`` reads the output token values (penalties or bad words)."""
     return (not getattr(input_batch, "no_penalties", True)) or bool(getattr(input_batch, "bad_words_token_ids", None))
+
+
+@dataclasses.dataclass
+class _Drafts:
+    drafts: Any  # the drafter's output: [rows, k] tensor on the device, or one host list per row
+    rows: dict[str, int]  # request id -> row of ``drafts``
+    computed: dict[str, tuple[int, int]]  # request id -> (the scheduler's optimistic count, the true count)
+
+
+class SpecDraftHandoff:
+    """Speculative decoding under async scheduling (``VLLM_HPU_FLASH_NEXT_ASYNC_SCHED=2``): the drafts stay where
+    the drafter left them.
+
+    The engine schedules step N+1 before it has step N's output: step N+1's draft slots come as -1 placeholders
+    (vLLM's ``AsyncScheduler``), and its ``num_computed_tokens`` takes every draft of step N as accepted. The runner
+    keeps its synchronous speculative step (it reads the verification result on the host before the drafter, as
+    without async scheduling), so at the end of step N it knows each request's accepted count, and the drafter's
+    output never has to reach the host. :meth:`record` keeps both after the drafter; at the start of step N+1
+    :meth:`correct_computed` gives every request the true count where the scheduler's still assumes the rejected
+    drafts, and :meth:`scatter_drafts` writes step N's drafts into step N+1's draft slots on the device, before the
+    verification metadata reads them from the input ids. What is saved: the host read of the drafts and the wait
+    for the draft passes it forces, and the engine's turn between two steps (it runs during the step).
+    """
+
+    def __init__(self) -> None:
+        self._previous: Optional[_Drafts] = None
+        self._current: Optional[_Drafts] = None
+        self.corrections = 0  # requests whose count was corrected (tests and logs)
+        self.scattered = 0  # draft slots written from the device
+
+    def begin_step(self) -> None:
+        self._previous, self._current = self._current, None
+
+    def record(self, drafts, req_ids: Sequence[Optional[str]], num_computed: Sequence[int],
+               num_scheduled: Mapping[str, int], scheduled_spec_tokens: Mapping[str, Sequence[int]],
+               sampled: Sequence[Sequence[int]]) -> None:
+        """After the drafter of a step: ``drafts`` row ``i`` belongs to ``req_ids[i]``, which ran with
+        ``num_computed[i]`` computed tokens and ``num_scheduled[req]`` scheduled ones (``len(scheduled_spec_tokens
+        [req])`` of them drafts) and committed ``len(sampled[i])`` tokens (the accepted drafts and the bonus)."""
+        rows, computed = {}, {}
+        for row, req_id in enumerate(req_ids):
+            if req_id is None:
+                continue
+            rows[req_id] = row
+            spec = len(scheduled_spec_tokens.get(req_id, ()) or ())
+            committed = len(sampled[row]) if row < len(sampled) else 0
+            if spec > 0 and committed > 0:
+                start = int(num_computed[row])
+                optimistic, true = start + int(num_scheduled[req_id]), start + committed
+                if optimistic != true:
+                    computed[req_id] = (optimistic, true)
+        self._current = _Drafts(drafts, rows, computed) if (drafts is not None or computed) else None
+
+    def correct_computed(self, req_ids: Sequence[Optional[str]], num_computed_cpu, requests: Mapping[str, Any],
+                         scheduled_spec_tokens: Mapping[str, Sequence[int]]) -> int:
+        """At the start of a step: the true ``num_computed_tokens`` (in ``num_computed_cpu[row]`` and the request
+        state) of every verification row whose count from the scheduler still takes the last step's rejected
+        drafts as accepted. A count that is neither (a preemption, a resumed request) is left as it is."""
+        previous = self._previous
+        if previous is None or not previous.computed:
+            return 0
+        done = 0
+        for row, req_id in enumerate(req_ids):
+            entry = previous.computed.get(req_id) if req_id is not None else None
+            if entry is None or not scheduled_spec_tokens.get(req_id):
+                continue
+            optimistic, true = entry
+            if int(num_computed_cpu[row]) == optimistic:
+                num_computed_cpu[row] = true
+                state = requests.get(req_id)
+                if state is not None:
+                    state.num_computed_tokens = true
+                done += 1
+        self.corrections += done
+        return done
+
+    def scatter_drafts(self, token_ids: torch.Tensor, req_ids: Sequence[str], num_tokens: int,
+                       scheduled_spec_tokens: Mapping[str, Sequence[int]]) -> torch.Tensor:
+        """Write the last step's drafts into the draft slots of a verification batch.
+
+        ``token_ids`` is the batch's input ids on the device, ``[padded_rows * num_tokens, 1]`` (row ``i``'s first
+        slot is its input token, the next ``len(scheduled_spec_tokens[req_ids[i]])`` are its drafts, -1 from the
+        scheduler); returns it with every draft slot of a request the last step drafted for set to that draft.
+        """
+        previous = self._previous
+        if previous is None or previous.drafts is None or num_tokens < 2:
+            return token_ids
+        drafts = previous.drafts
+        width = int(drafts.shape[1]) if isinstance(drafts, torch.Tensor) else max((len(d) for d in drafts), default=0)
+        targets, sources, values = [], [], []
+        for row, req_id in enumerate(req_ids):
+            source = previous.rows.get(req_id)
+            count = min(len(scheduled_spec_tokens.get(req_id, ()) or ()), num_tokens - 1, width)
+            if source is None or count <= 0:
+                continue
+            targets.extend(range(row * num_tokens + 1, row * num_tokens + 1 + count))
+            if isinstance(drafts, torch.Tensor):
+                sources.extend(range(source * width, source * width + count))
+            else:
+                own = list(drafts[source])[:count]
+                values.extend(own + [-1] * (count - len(own)))
+        if not targets:
+            return token_ids
+        target_index = torch.tensor(targets, dtype=torch.int64).to(token_ids.device, non_blocking=True)
+        if isinstance(drafts, torch.Tensor):
+            source_index = torch.tensor(sources, dtype=torch.int64).to(drafts.device, non_blocking=True)
+            # The drafts were made in an earlier graph: narrowing them here is the safe form of card rule 9.
+            picked = drafts.reshape(-1).index_select(0, source_index).to(token_ids.dtype)
+        else:
+            picked = torch.tensor(values, dtype=token_ids.dtype).to(token_ids.device, non_blocking=True)
+        self.scattered += len(targets)
+        # Out of place (a new tensor of the same shape): no write through a view of the batch's input ids.
+        return token_ids.reshape(-1).index_copy(0, target_index, picked).view(token_ids.shape)

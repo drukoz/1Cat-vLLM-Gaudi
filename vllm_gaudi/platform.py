@@ -126,24 +126,34 @@ def is_flash_next_model(model_config: Optional[ModelConfig]) -> bool:
     return any(arch in FLASH_NEXT_ARCHS for arch in architectures)
 
 
-def resolve_flash_next_async_scheduling(vllm_config: "VllmConfig") -> bool:
+def resolve_flash_next_async_scheduling(vllm_config: "VllmConfig", requested: Optional[bool] = None) -> bool:
     """Whether a Flash-Next server keeps vLLM's async scheduling (``VLLM_HPU_FLASH_NEXT_ASYNC_SCHED``); logs it.
 
     ``0`` (default): async scheduling is turned off, as it was before the flag. ``1``: vLLM's decision stands
-    (on unless ``--no-async-scheduling``); a speculative config has already turned it off above (the HPU runner
-    does not run speculation under async scheduling). Under async scheduling the runner carries the PLE n-gram
-    context of the decode rows on the device (``v1/worker/flash_next_async.py``).
+    (on unless ``--no-async-scheduling``) without speculation; a speculative config has already turned it off above.
+    ``2``: as ``1``, and with the Flash-Next MTP draft too: ``requested`` is vLLM's decision before the HPU hook
+    turned it off for the speculative config (vLLM keeps async scheduling on for MTP). Under async scheduling the
+    runner carries the PLE n-gram context of the decode rows on the device, and with speculation it keeps its
+    synchronous step and hands the drafts over on the device (``v1/worker/flash_next_async.py``).
     """
     scheduler_config = vllm_config.scheduler_config
-    if int(gaudi_envs.VLLM_HPU_FLASH_NEXT_ASYNC_SCHED) == 1:
+    mode = int(gaudi_envs.VLLM_HPU_FLASH_NEXT_ASYNC_SCHED)
+    speculative_config = getattr(vllm_config, "speculative_config", None)
+    if mode == 2 and speculative_config is not None and requested and \
+            getattr(speculative_config, "method", None) == "mtp":
+        scheduler_config.async_scheduling = True
+        logger.info("[HPU] Async scheduling on for Flash-Next with MTP (VLLM_HPU_FLASH_NEXT_ASYNC_SCHED=2): the "
+                    "engine schedules during the step, the drafts stay on the device")
+        return True
+    if mode in (1, 2):
         if scheduler_config.async_scheduling:
-            logger.info("[HPU] Async scheduling on for Flash-Next (VLLM_HPU_FLASH_NEXT_ASYNC_SCHED=1): the PLE "
-                        "n-gram context of the decode rows is carried on the device")
-        elif getattr(vllm_config, "speculative_config", None) is not None:
-            logger.warning("[HPU] VLLM_HPU_FLASH_NEXT_ASYNC_SCHED=1 has no effect: async scheduling stays off with "
-                           "a speculative config on HPU")
+            logger.info("[HPU] Async scheduling on for Flash-Next (VLLM_HPU_FLASH_NEXT_ASYNC_SCHED=%d): the PLE "
+                        "n-gram context of the decode rows is carried on the device", mode)
+        elif speculative_config is not None:
+            logger.warning("[HPU] VLLM_HPU_FLASH_NEXT_ASYNC_SCHED=%d has no effect: async scheduling stays off with "
+                           "this speculative config on HPU (=2 keeps it for MTP)", mode)
         else:
-            logger.info("[HPU] VLLM_HPU_FLASH_NEXT_ASYNC_SCHED=1, but async scheduling is off for this server")
+            logger.info("[HPU] VLLM_HPU_FLASH_NEXT_ASYNC_SCHED=%d, but async scheduling is off for this server", mode)
         return bool(scheduler_config.async_scheduling)
     if scheduler_config.async_scheduling:
         scheduler_config.async_scheduling = False
@@ -603,10 +613,11 @@ class HpuPlatform(Platform):
 
         # NOTE: vLLM has default enabled async scheduling with speculative decoding is on.
         # However, for HPU, speculative decoding is not supported with async scheduling.
+        requested_async_scheduling = vllm_config.scheduler_config.async_scheduling
         vllm_config.scheduler_config.async_scheduling = \
             vllm_config.scheduler_config.async_scheduling and vllm_config.speculative_config is None
         if is_flash_next_model(vllm_config.model_config):
-            resolve_flash_next_async_scheduling(vllm_config)
+            resolve_flash_next_async_scheduling(vllm_config, requested_async_scheduling)
         _validate_hpu_dflash2_config(vllm_config)
         _validate_flash_next_speculative_config(vllm_config)
 

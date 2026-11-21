@@ -49,7 +49,8 @@ from vllm_gaudi.v1.worker.recurrent_spec import (accepted_counts, load_checkpoin
 from vllm_gaudi.v1.spec_decode.flash_next_mtp_steps import is_flash_next_mtp
 from vllm_gaudi.distributed import vocab_parallel
 from vllm_gaudi.platform import is_flash_next_model
-from vllm_gaudi.v1.worker.flash_next_async import AsyncOutputLedger, PleContextCarry, needs_output_token_values
+from vllm_gaudi.v1.worker.flash_next_async import (AsyncOutputLedger, PleContextCarry, SpecDraftHandoff,
+                                                   needs_output_token_values)
 
 from vllm.v1.attention.backend import AttentionBackend, AttentionType, CommonAttentionMetadata
 from vllm.model_executor.layers.attention import Attention
@@ -2354,6 +2355,12 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         _hpu_init_sync("after_input_batch")
 
         self.use_async_scheduling = self.scheduler_config.async_scheduling
+        # VLLM_HPU_FLASH_NEXT_ASYNC_SCHED=2: the engine schedules ahead of a speculative step; this runner keeps its
+        # synchronous step and hands the drafts over on the device (flash_next_async.SpecDraftHandoff).
+        self._spec_draft_handoff = (SpecDraftHandoff()
+                                    if self.use_async_scheduling and self.speculative_config is not None else None)
+        if self._spec_draft_handoff is not None:
+            self.use_async_scheduling = False
         self.use_structured_output: bool = False  # Default to false. Set to true when needed during a run
         # Cache token ids on device to avoid h2d copies
         self.input_ids_hpu = torch.zeros(
@@ -4445,6 +4452,8 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             tables = None
             if self.use_async_scheduling:
                 reason = "async scheduling keeps the sampled token ids on the device"
+            elif self._spec_draft_handoff is not None:
+                reason = "async scheduling with speculation keeps the drafts on the device"
             else:
                 from vllm_gaudi.models.qwen4_exp.ple_ops import collect_ngram_host_tables
                 try:
@@ -4514,10 +4523,19 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
     _ple_carry: Optional[PleContextCarry] = None
     _async_ledger: Optional[AsyncOutputLedger] = None
     _flash_next_async_checked = False
+    _spec_draft_handoff: Optional[SpecDraftHandoff] = None
 
-    def _flash_next_async_begin_step(self) -> None:
+    def _flash_next_async_begin_step(self, scheduler_output=None) -> None:
         """Under async scheduling, once per engine step before its batches are built: the last step's decode
-        contexts become this step's, and every placeholder but the step in flight gets its token."""
+        contexts become this step's, and every placeholder but the step in flight gets its token. With speculation
+        (the runner's step stays synchronous): the true num_computed_tokens of the last step's verification rows."""
+        if self._spec_draft_handoff is not None:
+            self._spec_draft_handoff.begin_step()
+            if scheduler_output is not None:
+                self._spec_draft_handoff.correct_computed(self.input_batch.req_ids,
+                                                          self.input_batch.num_computed_tokens_cpu, self.requests,
+                                                          scheduler_output.scheduled_spec_decode_tokens)
+            return
         if not self._flash_next_async_checked:
             self._flash_next_async_checked = True
             if is_flash_next_model(self.model_config):
@@ -5350,6 +5368,12 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             if num_tokens > 1:
                 token_ids_device = token_ids_device.view(-1, 1)
 
+        if self._spec_draft_handoff is not None and scheduler_output is not None:
+            # Async scheduling with speculation: the last step's drafts into this batch's draft slots, on the device.
+            token_ids_device = self._spec_draft_handoff.scatter_drafts(token_ids_device,
+                                                                       self.input_batch.req_ids[:num_decodes],
+                                                                       num_tokens,
+                                                                       scheduler_output.scheduled_spec_decode_tokens)
         # call prepare_spec_decode_inputs to get the logits indices and
         if scheduler_output is not None:
             logits_indices, spec_decode_metadata = self._prepare_spec_decode_inputs(scheduler_output, logits_indices,
@@ -6433,8 +6457,8 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         warmup_mode = self.warmup_mode
         self.scheduler_output = None
         self.warmup_mode = False
-        if self.use_async_scheduling:
-            self._flash_next_async_begin_step()
+        if self.use_async_scheduling or self._spec_draft_handoff is not None:
+            self._flash_next_async_begin_step(scheduler_output)
 
         # NOTE(kzawora): Since scheduler doesn't differentiate between prefills
         # and decodes, we must handle mixed batches. In _update_states we make
@@ -6984,6 +7008,14 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                         prefill_data if num_prefills > 0 else None, decode_data if num_decodes > 0 else None)
         ################## Spec Decode end ##################
 
+        if self._spec_draft_handoff is not None:
+            # Async scheduling with speculation: the drafts stay on the device for the next step, with the counts
+            # that correct the scheduler's (flash_next_async.SpecDraftHandoff).
+            self._spec_draft_handoff.record(self._draft_token_ids, self.input_batch.req_ids[:num_reqs],
+                                            self.input_batch.num_computed_tokens_cpu,
+                                            scheduler_output.num_scheduled_tokens,
+                                            scheduler_output.scheduled_spec_decode_tokens,
+                                            postprocessed_sampled_token_ids)
         # Create output.
         all_req_ids = pd_info.decode_req_ids + pd_info.prompt_req_ids
         # Compute prompt logprobs from prefill hidden states.
@@ -7033,7 +7065,8 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             return async_output
         model_runner_output = ModelRunnerOutput(
             req_ids=all_req_ids,
-            req_id_to_index=self.input_batch.req_id_to_index,
+            # A copy: under async scheduling with speculation the engine reads it after the next step's state update.
+            req_id_to_index=req_id_to_index_output_copy,
             sampled_token_ids=postprocessed_sampled_token_ids,
             logprobs=logprobs,
             prompt_logprobs_dict=prompt_logprobs_dict,  # type: ignore[arg-type]
