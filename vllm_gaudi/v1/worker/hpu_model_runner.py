@@ -40,6 +40,8 @@ from vllm_gaudi.v1.core.sched.prefill_pacing import prompt_graph_knob
 from vllm_gaudi.v1.core.recurrent_state_pool import pool_pad_block_id, pool_slots_from_env, pool_tensor_slots
 from vllm_gaudi.v1.worker.hpu_dp_utils import set_hpu_dp_metadata
 from vllm_gaudi.v1.worker.gdn_state_layout import has_contiguous_dflash_checkpoints
+from vllm_gaudi.v1.worker.gc_control import GcControl
+from vllm_gaudi.v1.worker.persistent_inputs import PersistentInputs
 from vllm_gaudi.v1.worker.flash_next_inputs import (build_block_table, build_ple_inputs, decode_block_table_width,
                                                     dummy_ple_inputs,
                                                     model_requires_block_table, model_requires_raw_input_tokens)
@@ -1618,6 +1620,8 @@ class HpuModelAdapter(torch.nn.Module, HpuKVConnectorModelRunnerMixin):
         #        selected_token_indices = kwargs.pop('selected_token_indices')
         if 'warmup_mode' in kwargs:
             kwargs.pop('warmup_mode')
+        # VLLM_HPU_VERIFY_LOGITS_IN_GRAPH: a greedy verification's logits region in this (captured) forward.
+        verify_logits_indices = kwargs.pop('verify_logits_indices', None)
         input_ids = kwargs['input_ids']
         model_has_chunked_attention = kwargs.pop('model_has_chunked_attention', False)
         framework_attn_metadata = isinstance(kwargs.get('attn_metadata'), Mapping)
@@ -1804,6 +1808,12 @@ class HpuModelAdapter(torch.nn.Module, HpuKVConnectorModelRunnerMixin):
                     raise RuntimeError("Async GDN DMA requires every compiled decoder group to execute")
             if self._rotary_prepare_cos_sin is not None:
                 self._reset_rotary_cos_sin()
+        if verify_logits_indices is not None:
+            # The final mix, the LM head and the arg max in one graph segment; the ids leave the graph as int32 from
+            # an fp32 id table (card rule 9). Returned: (the model's output as before, selected rows, ids [rows]).
+            main = hidden_states[0] if isinstance(hidden_states, tuple) else hidden_states
+            selected = main.view(-1, main.shape[-1])[verify_logits_indices]
+            return hidden_states, selected, vocab_parallel.greedy_ids(self.model, selected)
         return hidden_states
 
     def gdn_dma_pipeline(self):
@@ -2054,6 +2064,10 @@ def _prompt_hidden_states_per_request(hidden_states: torch.Tensor, token_ids: to
 
 
 def _maybe_wrap_in_hpu_graph(*args, **kwargs):
+    if gaudi_envs.VLLM_HPU_LOG_UNMATCHED_GRAPH_INPUTS:
+        # Which inputs the replay wrapper copies before each replay (each a copy-only recipe): graph_input_log.py.
+        from vllm_gaudi.v1.worker import graph_input_log
+        graph_input_log.install(logger.info)
     return htorch.hpu.wrap_in_hpu_graph(HpuModelAdapter(*args, **kwargs), **
                                         _hpu_graph_wrap_kwargs()) if htorch.utils.internal.is_lazy() else HpuModelAdapter(
                                             *args, **kwargs)
@@ -4820,8 +4834,26 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         from vllm_gaudi.models.qwen4_exp.ple_ops import host_ngram_ids
         return query_start_loc, ngram_context, host_ngram_ids(tables, token_ids, query_start_loc, ngram_context)
 
+    _persistent_inputs = None
+
+    def _upload(self, name: str, source, dtype=None):
+        """One per-step input to the device. ``VLLM_HPU_PERSISTENT_INPUTS=1``: into a persistent device tensor per
+        (name, shape, dtype) and upload of the step, from a persistent pinned host tensor, non-blocking
+        (persistent_inputs.py; two step parities under async scheduling; ``execute_model`` starts each step). The
+        tensor is rewritten by a later step's upload: keep a copy to read it in a later step. Otherwise
+        ``async_h2d_copy`` as before (a tensor keeps its dtype)."""
+        if isinstance(source, torch.Tensor):
+            dtype = None  # as async_h2d_copy: a tensor is copied as it is
+        if not gaudi_envs.VLLM_HPU_PERSISTENT_INPUTS:
+            return async_h2d_copy(source, dtype=dtype, device=self.device)
+        inputs = self._persistent_inputs
+        if inputs is None:
+            inputs = self._persistent_inputs = PersistentInputs(self.device, self.pin_memory,
+                                                                buffers=2 if self.use_async_scheduling else 1)
+        return inputs.upload(name, source, dtype)
+
     @staticmethod
-    def _ple_forward_kwargs(ple_inputs, device) -> dict:
+    def _ple_forward_kwargs(ple_inputs, device, upload=None) -> dict:
         """The Flash-Next PLE model inputs of one forward (models with ``requires_raw_input_tokens``).
 
         ``(query_start_loc, ngram_context)`` goes out under those two names. With the host n-gram ids as a third
@@ -4829,15 +4861,20 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         model puts the ids where the PLE layers expect the context (``_MtpTargetOutputs.forward``). All are int32
         tensors, hashed by their metadata, with one shape per bucket.
         """
-        kwargs = {"query_start_loc": async_h2d_copy(ple_inputs[0], dtype=torch.int32, device=device)}
+        if upload is None:  # ``upload(name, source, dtype)``: the runner's _upload (VLLM_HPU_PERSISTENT_INPUTS)
+
+            def upload(_name, source, dtype):
+                return async_h2d_copy(source, dtype=dtype, device=device)
+
+        kwargs = {"query_start_loc": upload("ple_query_start_loc", ple_inputs[0], torch.int32)}
         if len(ple_inputs) > 2:
             from vllm_gaudi.models.qwen4_exp.ple_ops import HOST_NGRAM_IDS_KWARG
-            kwargs[HOST_NGRAM_IDS_KWARG] = async_h2d_copy(ple_inputs[2], dtype=torch.int32, device=device)
+            kwargs[HOST_NGRAM_IDS_KWARG] = upload("ple_ngram_ids", ple_inputs[2], torch.int32)
         else:
             context = ple_inputs[1]
             # A context already on the device (the rows async scheduling carries, flash_next_async.py) goes in as is.
             kwargs["ngram_context"] = (context if isinstance(context, torch.Tensor) and context.device.type != "cpu"
-                                       else async_h2d_copy(context, dtype=torch.int32, device=device))
+                                       else upload("ple_ngram_context", context, torch.int32))
         return kwargs
 
     # Async scheduling of a Flash-Next server (VLLM_HPU_FLASH_NEXT_ASYNC_SCHED=1, v1/worker/flash_next_async.py):
@@ -5820,13 +5857,12 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
 
         logits_indices[:num_decodes] = query_start_loc_cpu[1:num_decodes + 1] - 1
 
-        positions_device = async_h2d_copy(positions, dtype=position_dtype, device=self.device)
-        # VLLM_HPU_QSA_TABLE_WIDTH=1: as wide as the batch's longest request needs, not as the engine's longest
-        # context (the QSA indexer scores every column's keys); the same width with the sparse decode metadata.
-        table_width = decode_block_table_width(num_blocks, self._block_table_max_blocks,
-                                               gaudi_envs.VLLM_HPU_QSA_TABLE_WIDTH)
+        positions_device = self._upload("positions", positions, position_dtype)
         if sparse_md:
-            # One row per request (the pages of its last scheduled token), repeated over its verification rows.
+            # One row per request (the pages of its last scheduled token), repeated over its verification rows, as
+            # wide as VLLM_HPU_QSA_TABLE_WIDTH says (the same width as the dense branch's table below).
+            table_width = decode_block_table_width(num_blocks, self._block_table_max_blocks,
+                                                   gaudi_envs.VLLM_HPU_QSA_TABLE_WIDTH)
             block_table_cpu = request_block_table(block_table_cpu_tensor, num_blocks, num_tokens,
                                                   padded_batch_size * num_tokens, table_width, self._PAD_BLOCK_ID)
             block_list = block_groups = block_usage = None
@@ -5835,6 +5871,10 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
 
             block_table_cpu = None
             if getattr(self, '_needs_block_table', False):
+                # VLLM_HPU_QSA_TABLE_WIDTH=1: as wide as the batch's longest request needs, not as the engine's longest
+                # context (the QSA indexer scores every column's keys).
+                table_width = decode_block_table_width(num_blocks, self._block_table_max_blocks,
+                                                       gaudi_envs.VLLM_HPU_QSA_TABLE_WIDTH)
                 block_table_cpu = build_block_table(block_tables_list, padded_batch_size * num_tokens, table_width,
                                                     self._PAD_BLOCK_ID)
 
@@ -6023,15 +6063,13 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                                                 pin_memory=self.pin_memory)
             query_start_loc_p_cpu[1:] = torch.cumsum(seq_lens_cpu.clone().to(dtype=torch.int32), dim=0)
 
-            seq_lens_tensor = async_h2d_copy(seq_lens_cpu, device=self.device)
-            load_indices_tensor = async_h2d_copy(load_state_indices_cpu, device=self.device)
-            store_indices_tensor = async_h2d_copy(store_state_indices_cpu, device=self.device)
+            seq_lens_tensor = self._upload("seq_lens", seq_lens_cpu)
+            load_indices_tensor = self._upload("load_indices", load_state_indices_cpu)
+            store_indices_tensor = self._upload("store_indices", store_state_indices_cpu)
             query_start_loc_p = async_h2d_copy(query_start_loc_p_cpu, dtype=torch.int32)
             if is_recurrent_spec_decode:
-                num_accepted_tokens = async_h2d_copy(
-                    torch.tensor(decode_accepted_padded, dtype=torch.int32),
-                    device=self.device,
-                )
+                num_accepted_tokens = self._upload("num_accepted_tokens",
+                                                   torch.tensor(decode_accepted_padded, dtype=torch.int32))
             else:
                 num_accepted_tokens = None
 
@@ -6047,12 +6085,11 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             recurrent_boundary = None
 
         # CPU<>HPU sync *should not* happen here.
-        block_list_device = async_h2d_copy(block_list, device=self.device) if block_list is not None else None
-        block_usage_device = async_h2d_copy(block_usage, device=self.device) if block_usage is not None else None
-        block_groups_device = async_h2d_copy(block_groups, device=self.device) if block_groups is not None else None
-        block_table_device = async_h2d_copy(block_table_cpu, device=self.device) \
-            if block_table_cpu is not None else None
-        slot_mapping_device = async_h2d_copy(slot_mapping, device=self.device)
+        block_list_device = self._upload("block_list", block_list) if block_list is not None else None
+        block_usage_device = self._upload("block_usage", block_usage) if block_usage is not None else None
+        block_groups_device = self._upload("block_groups", block_groups) if block_groups is not None else None
+        block_table_device = self._upload("block_table", block_table_cpu) if block_table_cpu is not None else None
+        slot_mapping_device = self._upload("slot_mapping", slot_mapping)
         window_block_list_device = async_h2d_copy(window_block_list,
                                                   device=self.device) if self.interleaved_sliding_window else None
         window_block_usage_device = async_h2d_copy(window_block_usage,
@@ -6066,7 +6103,7 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         chunked_block_groups_device = async_h2d_copy(chunked_block_groups,
                                                      device=self.device) if self.model_has_chunked_attention else None
 
-        token_ids_device = async_h2d_copy(token_ids, device=self.device)
+        token_ids_device = self._upload("token_ids", token_ids)
         # when DP also enabled, some DP ranks will exeucte dummy run with empty
         # SchedulerOutput, in this case we need skip the prepare_input_ids
         if self.use_async_scheduling and scheduler_output is not None:
@@ -6123,7 +6160,7 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                                                                                     token_ids_device, num_tokens)
         else:
             spec_decode_metadata = None
-        logits_indices_device = async_h2d_copy(logits_indices, device=self.device)
+        logits_indices_device = self._upload("logits_indices", logits_indices)
 
         draft_block_table = None
         if (spec_decode_metadata is not None and gaudi_envs.VLLM_HPU_DFLASH2_DEVICE_PREPARE
@@ -6294,17 +6331,14 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             cu_num_draft_tokens, arange = self._get_cumsum_and_arange(num_draft_tokens, cumsum_dtype=np.int32)
 
             # TODO: Optimize the CPU -> GPU copy.
-            cu_num_draft_tokens = torch.from_numpy(cu_num_draft_tokens).to(self.device, non_blocking=True)
-            cu_num_sampled_tokens = torch.from_numpy(cu_num_sampled_tokens).to(self.device, non_blocking=True)
+            cu_num_draft_tokens = self._upload("cu_num_draft_tokens", torch.from_numpy(cu_num_draft_tokens))
+            cu_num_sampled_tokens = self._upload("cu_num_sampled_tokens", torch.from_numpy(cu_num_sampled_tokens))
 
             ##################################################
             logits_indices = torch.from_numpy(logits_indices)
-            target_logits_indices_device = \
-                torch.from_numpy(target_logits_indices).to(
-                self.device, non_blocking=True)
-            bonus_logits_indices_device = \
-                torch.from_numpy(bonus_logits_indices).to(
-                self.device, non_blocking=True)
+            target_logits_indices_device = self._upload("target_logits_indices",
+                                                        torch.from_numpy(target_logits_indices))
+            bonus_logits_indices_device = self._upload("bonus_logits_indices", torch.from_numpy(bonus_logits_indices))
             draft_token_ids = token_ids_device[target_logits_indices_device + 1]
 
             spec_decode_metadata = SpecDecodeMetadata(
@@ -6469,7 +6503,8 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                                fuse_greedy_sampling=False,
                                ple_inputs=None,
                                greedy_stop_ids=None,
-                               candidate_sampling=None):
+                               candidate_sampling=None,
+                               verify_in_graph=False):
         # FORWARD.
         batch_size = token_ids.size(0)
         framework_attn_metadata = isinstance(attn_metadata, Mapping)
@@ -6501,7 +6536,8 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             additional_kwargs.update({"model_has_chunked_attention": True})
         if ple_inputs is not None:
             # Flash-Next PLE layer kwargs (models with requires_raw_input_tokens).
-            additional_kwargs.update(self._ple_forward_kwargs(ple_inputs, self.device))
+            additional_kwargs.update(self._ple_forward_kwargs(
+                ple_inputs, self.device, self._upload if gaudi_envs.VLLM_HPU_PERSISTENT_INPUTS else None))
         trimmed_attn_metadata = attn_metadata if framework_attn_metadata else trim_attn_metadata(attn_metadata)
         if self.is_driver_worker:
             model_event_name = ("model_forward_"
@@ -6530,6 +6566,8 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             # Full-graph Dynamo cannot trace setattr on LoraMask, while doing
             # it immediately before the call preserves the existing lifetime.
             LoraMask.setLoraMask(lora_mask)
+            if verify_in_graph:
+                additional_kwargs["verify_logits_indices"] = logits_indices
             replay_timer = self._mtp_step_timer if not warmup_mode else None
             replay_t0 = time.perf_counter() if replay_timer is not None and replay_timer.per_step else None
             hidden_states = self.model.forward(input_ids=token_ids,
@@ -6541,6 +6579,9 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                                                **additional_kwargs)
             if replay_t0 is not None:  # VLLM_HPU_MTP_TIMING=2: the replay call of the target forward, per step
                 replay_timer.replay(time.perf_counter() - replay_t0)
+            verify_selected = verify_ids = None
+            if verify_in_graph:
+                hidden_states, verify_selected, verify_ids = hidden_states
         if step_timer is not None:
             step_timer.lap("forward")
             step_timer.phase = "logits"
@@ -6572,7 +6613,12 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                                                      f'{batch_size}_'
                                                      f'seq{seq_len}_ctx'
                                                      f'{num_blocks}')):
-            if fuse_greedy_sampling:
+            if verify_ids is not None:
+                # VLLM_HPU_VERIFY_LOGITS_IN_GRAPH: the replayed forward already selected the rows and took their
+                # greedy tokens (int32 [rows], logits_indices order); nothing runs here.
+                hidden_states, fused_sampled_token_ids = verify_selected, verify_ids.unsqueeze(-1)
+                logits = None
+            elif fuse_greedy_sampling:
                 stop_kwargs = {}
                 if greedy_stop_ids is not None:  # min_tokens of the rows below it (fused_greedy.py)
                     stop_kwargs = dict(stop_ids=async_h2d_copy(greedy_stop_ids[0], device=self.device),
@@ -6906,18 +6952,32 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
 
         return lora_mask, lora_logits_mask
 
+    def _deterministic_drafts(self) -> bool:
+        """A speculative config whose drafts are one token per position, verified by arg max (Flash-Next MTP, n-gram)."""
+        spec = self.speculative_config
+        return spec is not None and (is_flash_next_mtp(spec) or getattr(spec, "method", None) == "ngram")
+
+    def _verify_logits_in_graph(self, fuse_greedy_sampling: bool, greedy_stop_ids, decode_data) -> bool:
+        """VLLM_HPU_VERIFY_LOGITS_IN_GRAPH for this decode step: a speculative step whose rows the greedy region
+        takes, without a min_tokens mask (the region's stop-id mask has one row per request, not per row)."""
+        return (bool(gaudi_envs.VLLM_HPU_VERIFY_LOGITS_IN_GRAPH) and fuse_greedy_sampling and greedy_stop_ids is None
+                and getattr(decode_data, "spec_decode_metadata", None) is not None and self._deterministic_drafts())
+
     def _can_fuse_plain_greedy_sampling(self, request_ids: list[str]) -> bool:
         """Whether argmax can safely run in the compiled LM-head region."""
         # VLLM_HPU_VOCAB_PARALLEL_LOGITS >= 1 asks for the arg max without the logits all-gather: the same
         # region, for the same plain greedy requests, and also for the greedy verification of a Flash-Next
         # MTP step (the rejection sampler needs the arg max of every verification row and nothing else).
         vocab_parallel_on = vocab_parallel.mode() != vocab_parallel.VocabParallelMode.OFF
-        if not (gaudi_envs.VLLM_HPU_FUSED_GREEDY_LOGITS or vocab_parallel_on):
+        # VLLM_HPU_VERIFY_LOGITS_IN_GRAPH: the greedy verification of a speculative step with deterministic drafts
+        # (Flash-Next MTP, n-gram) takes the arg max of every row inside the replayed forward.
+        in_graph = bool(gaudi_envs.VLLM_HPU_VERIFY_LOGITS_IN_GRAPH) and self._deterministic_drafts()
+        if not (gaudi_envs.VLLM_HPU_FUSED_GREEDY_LOGITS or vocab_parallel_on or in_graph):
             return False
         if not request_ids or self.use_structured_output:
             return False
-        if self.speculative_config is not None and not (vocab_parallel_on
-                                                        and is_flash_next_mtp(self.speculative_config)):
+        if self.speculative_config is not None and not in_graph and not (
+                vocab_parallel_on and is_flash_next_mtp(self.speculative_config)):
             return False
 
         # Built-in min-tokens and logit-bias processors are covered by the
@@ -7293,6 +7353,29 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         self.defragmenter.update_state(new | cached, scheduler_output.finished_req_ids)
         self.defragmenter.defragment()
 
+    _gc_control = None
+
+    def _gc_step_begin(self) -> None:
+        """VLLM_HPU_WORKER_GC_FREEZE (gc_control.py): this step's collector mode, and the step marked busy until
+        sample_tokens returns, so the idle collector runs only between steps."""
+        control = self._gc_control
+        if control is None:
+            if not gaudi_envs.VLLM_HPU_WORKER_GC_FREEZE:
+                return
+            control = self._gc_control = GcControl(log=logger.info)
+            sample = self.sample_tokens
+
+            def sample_tokens(*args, **kwargs):
+                try:
+                    return sample(*args, **kwargs)
+                finally:
+                    control.step_end()
+
+            self.sample_tokens = sample_tokens
+        control.apply(gaudi_envs.VLLM_HPU_WORKER_GC_FREEZE)
+        if control.mode:
+            control.step_begin()
+
     @torch.inference_mode()
     def _poll_runtime_switches(self) -> None:
         """VLLM_HPU_RUNTIME_SWITCH_FILE: take the per-step flags the operator changed since the last step
@@ -7338,6 +7421,10 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                 return EMPTY_MODEL_RUNNER_OUTPUT
             # For D case, wait until kv finish load here
             return self.kv_connector_no_forward(scheduler_output, self.vllm_config)
+        if not warmup_mode:
+            self._gc_step_begin()
+        if self._persistent_inputs is not None:
+            self._persistent_inputs.begin_step()  # VLLM_HPU_PERSISTENT_INPUTS: this step's uploads, own pairs
 
         if self.is_pooling_model:
             # 1. padding input_ids and positions 2. fill attn_metadata
@@ -7819,7 +7906,8 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                 fuse_greedy_sampling=fuse_greedy_sampling,
                 ple_inputs=decode_data.ple_inputs,
                 greedy_stop_ids=greedy_stop_ids,
-                candidate_sampling=candidate_sampling)
+                candidate_sampling=candidate_sampling,
+                verify_in_graph=self._verify_logits_in_graph(fuse_greedy_sampling, greedy_stop_ids, decode_data))
             htorch.core.mark_step()
             if step_timer is not None:
                 step_timer.lap("launch_model")

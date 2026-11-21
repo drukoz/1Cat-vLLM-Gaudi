@@ -60,7 +60,24 @@ FLAGS = ("VLLM_HPU_FLASH_NEXT_DECODE_METADATA", "VLLM_HPU_FUSED_GREEDY_LOGITS", 
          "VLLM_HPU_VOCAB_PARALLEL_LOGITS")
 ARMS = {name: dict(zip(FLAGS, values)) for name, values in (
     ("base", (0, 0, 0, 0)), ("both", (1, 1, 0, 0)), ("i01", (1, 0, 0, 0)), ("i05", (0, 1, 0, 0)),
-    ("cand", (0, 0, 1, 0)), ("candvp", (0, 0, 1, 2)))}
+    ("cand", (0, 0, 1, 0)), ("candvp", (0, 0, 1, 2)), ("cand2", (0, 0, 2, 0)), ("cand2vp", (0, 0, 2, 2)), ("gc", (0, 0, 0, 0)))}
+
+
+def _load_spec_probe():
+    """tools/flash_next/rental/spec_probe.py (standard library only), loaded by its path; None when missing."""
+    import importlib.util
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "rental", "spec_probe.py")
+    try:
+        spec = importlib.util.spec_from_file_location("engine_step_spec_probe", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+    except Exception:  # noqa: BLE001 - a probe records what it can
+        return None
+
+
+SPEC_PROBE = _load_spec_probe()
+GC_FLAG = "VLLM_HPU_WORKER_GC_FREEZE"
 SWITCH_LINE = "Runtime switches from"
 REFUSAL_LINE = "is off for this server"
 
@@ -120,6 +137,7 @@ def run_round(args, label, prompts, ntok, min_tokens=False, sampling=None):
                                                          barrier, args.timeout, min_tokens, sampling), daemon=True)
                for i in range(n)]
     t_start = time.perf_counter()
+    wall_start = time.time()
     for t in threads:
         t.start()
     for t in threads:
@@ -142,6 +160,7 @@ def run_round(args, label, prompts, ntok, min_tokens=False, sampling=None):
         gaps = [b - a for a, b in zip(r["times"], r["times"][1:])]
         tpc = comp / len(r["times"])
         per.append({"steady_ms": 1000.0 * statistics.median(gaps) / max(tpc, 1e-9),
+                    "step_ms": 1000.0 * statistics.median(gaps), "tokens_per_chunk": tpc,
                     "gap_p90_ms": 1000.0 * sorted(gaps)[int(0.9 * (len(gaps) - 1))],
                     "pause_s": sum(g for g in gaps if g > 0.5), "ttft_s": r["times"][0] - r["t0"],
                     "span_ms": 1000.0 * (r["times"][-1] - r["times"][0]) / max(1, comp - 1), "tokens": comp,
@@ -150,9 +169,12 @@ def run_round(args, label, prompts, ntok, min_tokens=False, sampling=None):
                     "first": r["times"][0], "last": r["times"][-1],
                     "gaps_ms": [round(1000.0 * g, 2) for g in gaps]})
     res = {"label": label, "streams": n, "tokens": ntok, "min_tokens": bool(min_tokens), "ok": len(per),
-           "errors": errors, "untimed": untimed, "wall_s": wall, "texts": texts}
+           "errors": errors, "untimed": untimed, "wall_s": wall, "texts": texts,
+           "t_start": round(wall_start, 3), "t_end": round(wall_start + wall, 3)}
     if per:
         res["steady_ms_p50"] = statistics.median(p["steady_ms"] for p in per)
+        res["step_ms_p50"] = statistics.median(p["step_ms"] for p in per)
+        res["tokens_per_chunk_p50"] = statistics.median(p["tokens_per_chunk"] for p in per)
         res["steady_ms_min"] = min(p["steady_ms"] for p in per)
         res["steady_ms_max"] = max(p["steady_ms"] for p in per)
         res["gap_p90_ms_p50"] = statistics.median(p["gap_p90_ms"] for p in per)
@@ -248,7 +270,9 @@ class Probe:
         """Replace the switch file with the arm's flags (a rename) while no request runs."""
         if arm == self.arm:
             return
-        flags = ARMS[arm]
+        flags = dict(ARMS[arm])
+        if getattr(self.args, "gc_arms", False):  # only then: a server without the flag refuses the whole file
+            flags[GC_FLAG] = 1 if arm == "gc" else 0
         if self.args.switch_file:
             time.sleep(self.args.settle)  # the last round's requests are done on every worker
             before = log_count(self.args.server_log, SWITCH_LINE)
@@ -285,12 +309,31 @@ class Probe:
     def run(self, kind, arm, prompts, ntok, tag="", min_tokens=False, sampling=None):
         self.set_arm(arm)
         label = "%s-%d%s:%s" % (kind, len(prompts), tag, arm)
+        before = self.spec_counters()
         res = run_round(self.args, label, prompts, ntok, min_tokens, sampling)
+        after = self.spec_counters()
         res.update(kind=kind, arm=arm, tag=tag, at_s=round(self.elapsed(), 1))
+        if before is not None and after is not None:
+            spec = SPEC_PROBE.spec_summary(SPEC_PROBE.counters_delta(before, after)) or {}
+            res["spec"] = spec
+            if spec.get("drafts"):
+                rates = ", ".join("%.3f" % r for r in (spec.get("position_rates") or []) if r is not None)
+                print("SPEC  %-24s step ms p50=%s tokens per chunk %s acceptance length %s, per position [%s], "
+                      "drafts %s" % (label, _f(res.get("step_ms_p50")), _f(res.get("tokens_per_chunk_p50")),
+                                     _f(spec.get("acceptance_length")), rates, spec.get("drafts")), flush=True)
         self.results["rounds"].append(res)
         self.check_switch()
         self.save()
         return res
+
+    def spec_counters(self):
+        """The server's speculative counters (vllm:spec_decode_*), or None (no speculation, no reader)."""
+        if SPEC_PROBE is None or not self.args.spec_arms:
+            return None
+        try:
+            return SPEC_PROBE.read_spec_counters("http://%s:%d" % (self.args.host, self.args.port))
+        except Exception:  # noqa: BLE001
+            return None
 
     def compare(self, kind, first, second):
         """Texts of two rounds of one kind (same prompts)."""
@@ -381,7 +424,7 @@ def summary(probe):
     for res in probe.results["rounds"]:
         if res.get("tag") != "" or res.get("steady_ms_p50") is None or res.get("min_tokens"):
             continue
-        if res["kind"] not in ("short", "long", "sampled"):
+        if res["kind"] not in ("short", "long", "sampled", "sampled1", "gc32", "gc1"):
             continue
         rows.setdefault((res["kind"], res["arm"]), []).append(res)
     print("\nSUMMARY steady ms per token (median gap between chunks), measured rounds only")
@@ -393,6 +436,14 @@ def summary(probe):
         print("  %-6s %-5s rounds %d: %s (all-gaps p50 %s), total tok/s %s" % (
             kind, arm, len(values), " ".join("%.2f" % v for v in values), " ".join("%.2f" % v for v in gaps),
             " ".join(_f(r.get("aggregate_tok_s")) for r in rounds)))
+        specs = [r.get("spec") or {} for r in rounds]
+        if any(sp.get("drafts") for sp in specs):
+            print("  %-6s %-5s step ms %s, tokens per chunk %s, acceptance length %s, per position %s" % (
+                kind, arm, " ".join(_f(r.get("step_ms_p50")) for r in rounds),
+                " ".join(_f(r.get("tokens_per_chunk_p50")) for r in rounds),
+                " ".join(_f(sp.get("acceptance_length")) for sp in specs),
+                " ".join("[%s]" % ", ".join("%.3f" % x for x in (sp.get("position_rates") or []) if x is not None)
+                         for sp in specs)))
     out = []
     for (kind, arm), value in sorted(table.items()):
         base = table.get((kind, "base"))
@@ -409,6 +460,15 @@ def summary(probe):
                         "delta_ms": value - cand, "delta_pct": 100.0 * (value - cand) / cand})
             print("  %-6s %-5s against cand: %.2f -> %.2f ms per token (%+.2f ms, %+.1f %%)" % (
                 kind, arm, cand, value, value - cand, 100.0 * (value - cand) / cand))
+    for kind in sorted({k for k, _ in table}):  # a speculative server: the candidate paths against each other
+        for arm, against in (("cand2", "cand"), ("cand2vp", "cand"), ("cand2vp", "cand2")):
+            a, b = table.get((kind, against)), table.get((kind, arm))
+            if a is None or b is None:
+                continue
+            out.append({"kind": kind, "arm": arm, "against": against, "base_ms": a, "arm_ms": b,
+                        "delta_ms": b - a, "delta_pct": 100.0 * (b - a) / a})
+            print("  %-7s %-7s against %-5s: %.2f -> %.2f ms per token (%+.2f ms, %+.1f %%)" % (
+                kind, arm, against, a, b, b - a, 100.0 * (b - a) / a))
     probe.results["summary"] = out
     probe.save()
 
@@ -434,6 +494,14 @@ def main():
     ap.add_argument("--no-sampled", action="store_true", help="leave out the rounds without a temperature")
     ap.add_argument("--candvp", action="store_true", help="add the candvp arm (candidates on the vocabulary-"
                     "parallel head) to the sampled rounds")
+    ap.add_argument("--spec-arms", default="", help="a speculative server (SERVE_SPEC_K): the sampled rounds' arms "
+                    "instead of base / cand / candvp, each with a 32-stream and a 1-stream round, in turn and twice, "
+                    "with the speculative counters per round (e.g. cand,cand2,cand2vp: VLLM_HPU_CANDIDATE_SAMPLING=1, "
+                    "which leaves speculative steps to VLLM_HPU_SPEC_SAMPLED_VERIFY's path, 2, the candidate region, "
+                    "and 2 with VLLM_HPU_VOCAB_PARALLEL_LOGITS=2)")
+    ap.add_argument("--gc-arms", action="store_true", help="after the other rounds: greedy rounds at N streams and "
+                    "1 stream with VLLM_HPU_WORKER_GC_FREEZE off (base) and on (gc), in turn and twice; every arm's "
+                    "switch file then carries the flag (the server must know it)")
     ap.add_argument("--logprobs-check", action="store_true", help="last: a request with logprobs=5 and one with "
                     "prompt_logprobs=2, the ids checked, then /health (a server that dies there loses nothing)")
     args = ap.parse_args()
@@ -510,8 +578,26 @@ def main():
         print("TASK %-5s sampled: %d of %d streams go on with their own numbers" % (arm, on_task, n), flush=True)
         probe.save()
 
+    spec_arms = [a for a in args.spec_arms.split(",") if a]
+    for arm in spec_arms:
+        if arm not in ARMS:
+            raise SystemExit("unknown spec arm %r" % arm)
+    if spec_arms and not args.no_sampled:
+        # A speculative server: the sampled verification paths in turn, twice, 32 streams and 1 stream each.
+        for arm in spec_arms:
+            measure("sampled", arm, short_prompts, warm=24, sampling={})
+            sampled_words(arm)
+            measure("sampled1", arm, [one_prompt], warm=24, sampling={})
+        for arm in spec_arms:
+            measure("sampled", arm, short_prompts, sampling={})
+            measure("sampled1", arm, [one_prompt], sampling={})
+        last_arm = spec_arms[-1]
+        seeded = [probe.run("text1", last_arm, [one_prompt], 48, tag="-seeded%d" % i, sampling={"seed": 20261120})
+                  for i in (1, 2)]
+        probe.compare("seeded", seeded[0], seeded[1])
+        print("SEED %s: %r" % (last_arm, (seeded[0]["texts"][0] or "")[:120]), flush=True)
     # vLLM's sampler first (it runs on a card today): what a sampled step of real traffic costs.
-    if not args.no_sampled:
+    if not args.no_sampled and not spec_arms:
         measure("sampled", "base", short_prompts, warm=24, sampling={})
         sampled_words("base")
 
@@ -542,7 +628,7 @@ def main():
 
     # --- sampling over candidates: its first run on a card comes after the long rounds, so a failure of the
     # new region costs none of them. cand, base, cand: with the base round above that is two of each, in turn.
-    if not args.no_sampled:
+    if not args.no_sampled and not spec_arms:
         measure("sampled", "cand", short_prompts, warm=24, sampling={})
         sampled_words("cand")
         measure("sampled", "base", short_prompts, sampling={})
@@ -572,9 +658,15 @@ def main():
         if mintok.get("steady_ms_p50") is not None and last.get("steady_ms_p50") is not None:
             print("MINTOK %s arm %s: %.2f ms per token with min_tokens, %.2f without" % (
                 kind, main_arm, mintok["steady_ms_p50"], last["steady_ms_p50"]), flush=True)
+    if args.gc_arms:
+        # The worker's collector frozen (gc) against as is (base), greedy, N streams and 1 stream, in turn, twice.
+        for first in (True, False):
+            for arm in ("base", "gc"):
+                measure("gc32", arm, short_prompts, warm=24 if first else None)
+                measure("gc1", arm, [one_prompt], warm=24 if first else None)
     probe.set_arm("base")
     summary(probe)
-    if not args.no_sampled:
+    if not args.no_sampled and not spec_arms:
         # Last: a seeded request through vLLM's sampler (a generator on the device). It may end the server.
         seeded = [probe.run("text1", "base", [one_prompt], 48, tag="-seeded%d" % i, sampling={"seed": 20261120})
                   for i in (1, 2)]

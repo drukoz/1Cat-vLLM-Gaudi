@@ -114,11 +114,51 @@ before vLLM's sampler (`vllm_gaudi/v1/sample/request_params.py`): the stop ids o
 probability at its temperature get `-inf`. One difference from vLLM: a request with logprobs gets them after its
 own bias and masks (vLLM's raw logprobs come before them). Any other value is `0`. CPU-checked; not yet on a card.
 
+`VLLM_HPU_WORKER_GC_FREEZE` (integer, default `0`) sets a worker's Python garbage collector while steps run. Every
+collective of a TP step is a barrier across the ranks, so one rank's generation-2 collection stalls all of them. `1`:
+at the first step the heap is collected once and frozen (`gc.freeze()`), automatic generation-2 collections are off
+while steps run, and a daemon thread runs a full collection when no step has run for 0.5 s; generations 0 and 1
+collect as before. It can be switched at run time (`VLLM_HPU_RUNTIME_SWITCH_FILE`); back at `0` the heap is unfrozen
+and the thresholds restored. With `VLLM_HPU_MTP_TIMING=2` each step's record has the collector's pauses
+(`gc_ms`, `gc_gen2`). Any other value is `0`.
+
+`VLLM_HPU_LOG_UNMATCHED_GRAPH_INPUTS` (integer, default `0`): `1` logs which inputs of a replayed HPU graph the
+graph wrapper copies before each replay. The wrapper binds an input directly only when it is the captured graph's own
+input value; any other input (a view or slice made outside the graph) is copied with a lazy device-to-device copy that
+runs as its own recipe, one launch per replay. The log line (`HPU graph replay copies N unmatched input tensor(s)`)
+names every copied tensor by its path in the forward's arguments, with shape, dtype, contiguity and storage offset,
+the 1st, 100th and 1000th time the same set comes back. Nothing else changes.
+
+`VLLM_HPU_VERIFY_LOGITS_IN_GRAPH` (integer, default `0`) moves a greedy verification step's logits region into the
+captured forward. With `0` the forward returns its hidden states and the runner runs the LM head, the logits
+all-gather and the rejection sampler as separate lazy graphs after the replay. With `1`, for a speculative decode step
+with deterministic drafts (Flash-Next MTP, n-gram) whose requests the greedy region takes (all plainly greedy, no
+`min_tokens` mask), the forward also takes the logits indices and returns `(its output as before, the selected rows,
+every row's greedy token)`: int32 `[rows]` in logits-indices order, taken from an fp32 id table (ties to the lowest id,
+as `argmax`); with `VLLM_HPU_VOCAB_PARALLEL_LOGITS` `1` or `2` each rank's arg max and a `[rows, 2]` all-gather
+instead of the logits. The final hyper-connection mix, the LM head and the arg max are then one graph segment, and
+the runner verifies the drafts from those tokens (`greedy_rejection_sample_from_tokens`). Any other value is `0`.
+The runner reads it at every decode step, so `VLLM_HPU_RUNTIME_SWITCH_FILE` can switch it on a running server (the
+verify graph is captured again for the extra argument).
+
+`VLLM_HPU_PERSISTENT_INPUTS` (integer, default `0`) sets how a decode step's inputs reach the device. With `0`
+every input of every step is a fresh device tensor copied from an unpinned host tensor (`async_h2d_copy`: a device
+allocation per input, and the bridge stages each copy through its pinned pool). With `1` each input (by name, shape
+and dtype) has a persistent pinned host tensor and a persistent device tensor: the host fills its tensor and copies it
+non-blocking into the same device tensor every step (an input uploaded twice in one step gets a pair per upload; two
+step parities alternate under async scheduling). The values are the same; the forward's inputs keep their addresses
+from step to step, which a static launch plan of the HPU graph replay needs. Covered: the decode builder's inputs
+(ids, positions, slots, block tables, lengths, state indices, accepted counts, logits indices), the speculative
+indices and the PLE inputs. The inputs are no longer fresh tensors: the same input's upload in the next step (two
+steps later under async scheduling) rewrites them, so code that reads a step's input in a later step must keep its
+own copy. Any other value is `0`.
+
 `VLLM_HPU_RUNTIME_SWITCH_FILE` (a path, default unset) is an operator's tool for an A/B on one server.
 When set, every worker looks at that file before each step (one `stat`) and, when the file changed, takes
 the flags it lists, one `NAME=VALUE` per line. Only flags the runner reads at every step can be switched:
-`VLLM_HPU_FLASH_NEXT_DECODE_METADATA`, `VLLM_HPU_FUSED_GREEDY_LOGITS`, `VLLM_HPU_CANDIDATE_SAMPLING` and
-`VLLM_HPU_VOCAB_PARALLEL_LOGITS` (read at every call of the logits region, which runs after the replayed graph);
+`VLLM_HPU_FLASH_NEXT_DECODE_METADATA`, `VLLM_HPU_FUSED_GREEDY_LOGITS`, `VLLM_HPU_CANDIDATE_SAMPLING`,
+`VLLM_HPU_VOCAB_PARALLEL_LOGITS` (read at every call of the logits region, which runs after the replayed graph) and
+`VLLM_HPU_WORKER_GC_FREEZE`;
 any other name is reported and the file is ignored. Replace the file with a rename while no request runs, so every worker sees the change
 at the same step. `tools/flash_next/engine_step/long_context_probe.py` measures two arms of one server
 this way.

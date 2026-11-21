@@ -11,9 +11,29 @@ This track's harness refuses report files outside the repository, so the handoff
 
 ## Handoff (if this agent stops)
 
-Last update: **2026-11-21 03:07 UTC** (fourth agent, Opus 5.5; the node was extended to about 00:00 UTC on
-2026-11-22). Branch `feat/flash-next-gaudi-engine-step`, head `fe4cac24` (the program head with PR 16 merged in; code of
-this track up to `01d66e31`), pushed. A second branch of this track,
+Last update: **2026-11-21 11:21 UTC** (fourth agent, Opus 5.5; the node was extended to about 00:00 UTC on
+2026-11-22). Branch `feat/flash-next-gaudi-engine-step`, pushed; merged into the program branch up to `bcef8aa5` (PR
+#20); since then, not yet in a PR, all default-off: `ff160409` (`VLLM_HPU_WORKER_GC_FREEZE`), `ca52fa33`
+(`VLLM_HPU_LOG_UNMATCHED_GRAPH_INPUTS`), `844a37f2` (`VLLM_HPU_VERIFY_LOGITS_IN_GRAPH`), `8efc6969`
+(`VLLM_HPU_PERSISTENT_INPUTS` and the block-table width guard), the probe's `--spec-arms` (`6d5b8eef`), docs; the
+program head `adbcff30` (PRs #18, #21, #22) merged in at `a0bd1753` (two conflicts in `hpu_model_runner.py`, both
+sides kept), and `83a3fa35` (the logger wraps the `sys.modules` graphs module; its test failed after the host
+n-gram test in one session), `e4c442ef` (`VLLM_HPU_VERIFY_LOGITS_IN_GRAPH` runtime-switchable, the entry
+mtp-draft-graph's build-5 card branch has as `64656082`; when that branch merges, the `SWITCHABLE` tuple conflicts
+on one line: take the union), and `887266b1`: the program head `4f070c75` (PRs #23 mtp-draft-graph, #24 kernel-fixes,
+#25 async-sched) merged in; three conflicts, both sides kept (async-sched's list, 10:40 UTC): `_ple_forward_kwargs`
+passes a device n-gram context (async scheduling's carried rows) through and uploads a host one with the runner's
+`upload`; `SWITCHABLE` and its test take the union. CPU at `887266b1` (`logs/m887_*.log`): `test_runtime_switches`
+3, `test_verify_logits_in_graph` 2, `test_persistent_inputs_loop` 2, `test_engine_loop_async` 7 (also 7 with
+`VLLM_HPU_PERSISTENT_INPUTS=1`), the four worker files of this track green; `8a5bc621`: each upload of a step its
+own pair, and the persistent inputs' contract written down (section 15; CPU: `test_persistent_inputs` 4,
+`test_persistent_inputs_loop` 2, `test_engine_loop_async` 7 with the flag). Next PR: gate of `8a5bc621` in
+`reports/engine-step/merge-wt` (`logs/gate_8a5bc621.log`); the worker tests by hand at `83a3fa35`
+(`logs/worker_tests_83a3fa35.log`) are as on the program head (9 files need the card, `test_gdn_state_layout` has 1
+card-only test, `test_draft_rank_stats` expects 3 `.topk(`, stale since collectives' `2d644ce9`), the rest green; open
+and merge the PR when the gate is green, then tell the coordinator and async-sched (it adds an async arm with
+`VLLM_HPU_PERSISTENT_INPUTS=1`). A fix branch, `fix/flash-next-gaudi-block-table-width-guard` (`33eb7cb1`, on
+`adbcff30`; still needed on `4f070c75`, merges into it cleanly), waits for its gate (section 15). A second branch of this track,
 **`feat/flash-next-gaudi-engine-step-mtp-record`** (`2b90707f`, worktree `reports/engine-step/trees/mtp-record`):
 mtp-card-ready's head `7c4d65e3` plus `VLLM_HPU_MTP_TIMING=2` (one record per speculative step, section 14), for
 integration build 4 in place of mtp-card-ready's branch (the timer exists only there). Scratch files, probes and
@@ -32,24 +52,44 @@ CPU-proven, card job queued: **`VLLM_HPU_CANDIDATE_SAMPLING=2`** (sampled MTP ve
 region, 00164). Host time per decode step outside the forward is spread thin (section 13; the copy bench 00173:
 packing the 11 copies saves 0.2 ms at 32 rows, not built; the coordinator leaves the rest to async-sched). The
 candidate region no longer refuses async scheduling (`01d66e31`, async-sched's request). Build 2's 1-stream MTP
-question answered on the CPU (section 14).
+question answered on the CPU (section 14). Section 15 (the host's serial work of a 32-stream MTP step): CPU-proven,
+default off: the verify's LM head and arg max inside the captured forward, the persistent per-step inputs, the
+collector freeze, the unmatched-input logger. 00223 (1 card): the verify forward and the draft passes have no cut a
+collective would not explain (only the per-layer hook, which follows the MoE all-reduce); the nine step-level cuts
+between the graphs are listed there; 00235 (TP2, replaced 00226) is to name the TP8 front cuts. The census's
+"29 .item() per step" from tensor printing (async-sched's 00220) is one capture step, not every step (section 15).
 
 ### If you take over, in this order
 
-1. The gate. The program head moved (PR 16 qsa-dataflow); it is merged in at **`fe4cac24`** (conflicts in
-   `envs.py`, `env_variables.md` and the decode block table, resolved keeping both sides: the sparse decode
-   metadata's table takes PR 16's `VLLM_HPU_QSA_TABLE_WIDTH` width too; test at `ba1441b7`). **Gate of
-   `ba1441b7`**: snapshot `reports/engine-step/merge-wt2`, log `reports/engine-step/logs/gate_ba1441b7.log`
-   (wrapper pid 19401, no `--tools`), started 03:07 UTC (the first try died in the /Volumes/Storage outage of 03:01
-   to 03:05). The gate of `01d66e31` (`--tools`) ended with every flash_next file green and 4 red rental tool
-   files (environment: "not a git repository", container signals, the outage; kernel-fixes' gate fails the same).
-   Owner's rule (03:07): merge the PR as soon as its gate is green (everything in it is default-off or
-   card-proven); PR text in the scratchpad `pr_engine_step.md` of this session (summary below). When green: from
-   `wt/engine-step`, merge `origin/feat/flash-next-gaudi` again if it moved, push, `gh pr create --base
-   feat/flash-next-gaudi`, `gh pr merge --merge`; tell the coordinator the number.
-2. Read 00164, 00166 and 00169 when they land (table below); section 9 and the coordinator.
-3. Build 4 runs the `mtp-record` branch with `VLLM_HPU_MTP_TIMING=2`: read `mtp_step_record_r*.jsonl` (verify ms of
-   the steps whose `prev_committed` is `{"1": n}` against the others).
+1. **Done: PR #20 merged** into `feat/flash-next-gaudi` at 04:46 UTC (merge commit `2e9f9196`): this branch up to
+   `bcef8aa5` (program head with PR 16 and PR 19 merged in). Gate of `ba1441b7`: 69 files, 0 red (one file failed
+   only in the parallel pass, `test_gdn_core_decode_batch.py`, green alone). Owner's rule (03:07 UTC): merge your
+   own PR as soon as its gate is green and the change is card-proven or default-off, then tell the coordinator the
+   number. Next PR: gate the branch (`bin/gate <snapshot>`, no `--tools`: the rental tool tests fail on this Mac for
+   every track), merge the program head first.
+2. Read 00236 (replaced 00207) and 00169 when they land (table below); section 9 and the coordinator.
+3. Section 15 (the host's serial work, coordinator 08:10 UTC), in this order: (a) integration's build-5 round with
+   the unmatched-input logger (`HPU_GRAPH_UNMATCHED` lines): fix every named input (persistent base tensor, sliced
+   inside the forward; a slice that reaches a custom op gets an owned copy inside the graph, card rule 1); (b) I01
+   in the serve setting once 00207 and 00169 agree; (c) last, the packed upload (`VLLM_HPU_PACKED_INPUTS`) with
+   async-sched's per-input switch. Rank skew: native-replay's pin mode 3, seen per rank with `replay_first_ms`.
+   (d) 00235's TP2 cut log (it replaced 00226): name the cuts of 00205's `embed` and `ple` segments (`python3
+   reports/engine-step/probes/cutlog/cuts.py reports/engine-step/card/00235-*/habana_logs`, then `seq.py` on the
+   verify and draft captures) and tell the coordinator. (e) The chain job (coordinator 09:19 UTC) is
+   mtp-draft-graph's 00230 `real8-chain-b5b` (it replaced 00228), after 00222 (about 13:00 UTC), on its branch
+   `feat/flash-next-gaudi-mtp-draft-graph-b5` (build 5 `eb21ac75` + the chain + async-sched's M1 + this track's
+   `844a37f2` and `ca52fa33`); arms `on-md`, `chain-md`, `vlg`, `chain-vlg`, `all`, `chain-all` on one server (`vlg`
+   against `on-md` is this track's flag alone). Its tiny gate `tiny-chain-vlg` (TP8 tiny, k = 2, draft graph + I01 +
+   chain + VLG, VP 0, `REPLICATED_FC` and `REPLICATED_EMBEDDING` on, the unmatched-input log) carries
+   `LOG_LEVEL_PT_IRGRAPH=1` and `LOG_LEVEL_PT_LAZY=1`: `window.py` on
+   `reports/mtp-draft-graph/card/00230-real8-chain-b5b/tiny-chain-vlg/habana_logs` (one rank's main thread: 8 ranks
+   write there) shows which of the nine step-level cuts of section 15 are gone; tell the coordinator. The
+   unmatched-input lines of the three chain gates are in the job log, after each gate's `arm ... start` line.
+   (f) The tensor-formatting reads (coordinator 09:58 UTC; section 15): name the callers from 00235 / 00236's
+   `TENSOR_READS` lines, remove or guard the formatting (default path if it is pure logging; CPU test), then tell
+   the coordinator and async-sched (`a58988ba328b40a9b`) the sites and the count that remains.
+4. Build 4's code with this track's card tools and flags is the local branch `engine-step-int4-card` (`4b180729`);
+   the CPU census tree is `reports/engine-step/trees/b4`.
 
 ### Card jobs
 
@@ -60,8 +100,13 @@ question answered on the CPU (section 14).
 | 00158 `real4-mtp3-cand2-sampled` | | cancelled | - |
 | 00167 `tiny-request-params` (1 card, `9a3ed1d1`) | `tiny_checks.py --arms params` | ended 01:46 UTC, exit 0 | done: section 9 (`PARAMS ok`) |
 | 00173 `h2d-copies-1card` (1 card, `01d66e31`) | `h2d_copies_bench.py` at 32 and 1 rows | ended 02:02 UTC, exit 0 | done: section 13 |
-| **00164** `real8-mtp2-cand2-sampled` (all, 40m, `3ed03d13` = integration build 2 + `d5ad5e67`) | `headline_job.sh mtp2` with `HEADLINE_MTP_SAMPLED=1 HEADLINE_MTP_SAMPLED_LEVELS=32,1 VLLM_HPU_SPEC_SAMPLED_VERIFY=2 VLLM_HPU_CANDIDATE_SAMPLING=2` | queued (8-card sequence) | step time and acceptance per draft position, sampled at 32 and 1 streams, against build 2's arm C; the `Candidate sampling` lines must say the region drew; no rejection-sampler error |
-| **00166** `real8-candvp-short2` (all, 35m) | `serve_long_probe.sh --arms both --no-long --candvp --logprobs-check` at TP8 | queued | `SUMMARY`, `TASK`, `LOGPROBS`, the `Candidate sampling` lines: does `candvp` hold at TP8 |
+| 00164 `real8-mtp2-cand2-sampled`, 00166 `real8-candvp-short2` | (TP8 jobs) | folded into 00206 at 07:03 UTC (00164 replaced, 00166 cancelled) | - |
+| 00206 `real8-mtp2-candsw` | | replaced by 00207 at 07:58 UTC (the collector arms added) | - |
+| **00236** `real8-mtp2-candsw-gc-fmt` (replaced 00207 at 10:25 UTC, same place, hold and arguments, starts by 15:31 UTC; all, TP8 + EP8, 35m, `4b180729` = build 4 `30f4e37e` + the probe's `--spec-arms` + `VLLM_HPU_WORKER_GC_FREEZE`; local branch `engine-step-int4-card`) | one MTP k = 2 server, build 4's mtp2 env (00186's `versions.txt`) with `VLLM_HPU_MTP_TIMING=2`, plus the tensor-formatting hook in its formatting-only mode (`TENSOR_READ_SITES=1 TENSOR_READ_LIGHT=1`, `reports/engine-step/probes/tensor_reads/sitecustomize.py` written into `$FARM_OUT/treads` and put first on PYTHONPATH; submit log `card_job/submit_candsw_gc_fmt.log`): `serve_long_probe.sh --arms both --no-long --spec-arms cand,cand2,cand2vp --gc-arms --logprobs-check` (`SERVE_SPEC_K=2`) | queued | as 00206 (greedy base / both; sampled cand / cand2 / cand2vp at 32 and 1 streams: step ms, tokens per chunk, acceptance per position; the `Candidate sampling` lines; seeded; logprobs under MTP), then the collector rounds (`gc32`, `gc1`: off / on, twice): `python3 reports/engine-step/probes/gc_steps.py reports/engine-step/card/00236-*` gives p50 / p99 per rank of the replay call and the step and the generation-2 counts; the `SCHED:` line (may the container take SCHED_FIFO); `grep TENSOR_READS` in the server logs: the real model's (FP8) capture-time tensor formatting with its callers (section 15) |
+| 00223 `tiny-cutlog` (1 card, `4b18072924bb`, `LOG_LEVEL_PT_IRGRAPH=1`, `LOG_LEVEL_PT_LAZY=1`) | `farm_tiny.py --gdn hc --spec 3`, every `step marker due to` reason | ended 09:01 UTC, exit 0 | done: section 15 (the cut reasons; parsers `reports/engine-step/probes/cutlog/`) |
+| **00235** `tiny-cutlog-tp2-reads` (replaced 00226 at 10:18 UTC, same place and hold, starts by 12:42 UTC; any:2, 10m, `--no-sync` = `4b18072924bb`; coordinator GO 09:19 UTC, runs beside 00225 and 00119 after build 5, about 13:00 UTC) | the same at `--tp 2` with 00205's flags through tiny_smoke's `--env` (`PLE_HOST_NGRAM_IDS=1`, `COLLECTIVE_MARK_STEP=0`, `DECODE_CUT_INTERVAL=1000`, `QSA_FUSED=1`, `QSA_INDEXER_SHARD=1`, `GDN_KERNEL_INTERLEAVE=1`, `GDN_GLUE_CACHE=1`, `HC_FUSED_COPY_MODE=2`, `CANDIDATE_SAMPLING=1`, `PT_HPU_LAZY_ACC_PAR_MODE=0`, `PT_HPU_SYNCHRONOUS_ACC_QUEUE_FLUSHING=1`); and the tensor-formatting hook in full mode (`TENSOR_READ_SITES=1`, every 50 steps; its lines collected into `treads/tensor_reads.txt`); submit log `card_job/submit_cutlog_tp2_reads.log` | queued | `cuts.py` / `seq.py` on `card/00235-tiny-cutlog-tp2-reads/habana_logs`: every cut inside the verify and draft captures with its op, which are collectives (with `COLLECTIVE_MARK_STEP=0`), and what cuts after the embedding and the PLE cast; the `TENSOR_READS` lines (`first <kind> at step S: <frames>`: who formats device tensors; does a read during capture cut the graph); tell the coordinator and async-sched |
+| 00218 `real8-build5` | | cancelled 08:57 UTC; build 5 is 00222 | - |
+| 00222 `real8-build5b` (integration's, starts by 11:22 UTC) | this track's asks inside build 5 (as planned for 00218) | queued | `reports/integration/card/00222-real8-build5b/` (arm folders as integration names them; planned: `mtp2-async-fp8kv-hpulog-32-greedy-dg32-kvlp-long/server0.log` (`HPU_GRAPH_UNMATCHED`, draft graph off then on; probe_dg32.log, scaling_dg32.json) -> mtp-draft-graph and section 15; `mtp2-async-sw-cap-kvlp/scaling_sw.json` (I01 off / dg / md); `mtp2-kvlpfb/mtp_step_record_r*.jsonl` (per-rank `replay_first_ms` skew); if ss0 is on, `mtp2-async-ss0-greedy/` and `mtp2-async-irlog-lv1-greedy/habana_logs/` (integration sends the two greps)) |
 | **00169** `real8-i01-long120k` (all, 50m) | I01 at 32 x 120K over a shared prefix with prefill's prefix flags, and an MTP k = 2 part (`probe.log`, `mtp2/probe.log`) | queued | `prepare_inputs` and step time base against I01 at a long context |
 
 ### Pending subtasks after those steps, in order
@@ -536,3 +581,133 @@ accepting 1,0,2,1,1, the prefix flags on; runs in `probes/mtp_ops/`):
   or of a path. INFERRED from four rounds: the span tracks the share of steps whose first draft was rejected (0.25:
   51.5 ms, 0.37: 64-66, 0.40: 67-71; k = 3 0.17: 54). The timer keeps 25-step means; a per-step record keyed by
   the previous step's accepted count would show it directly.
+
+## 15. The host's serial work in a 32-stream MTP step (coordinator, 08:10 UTC; step-anatomy's 00205 trace)
+
+00205 (integration build 4b, TP8, dense MoE, sync MTP k = 3, 32 streams, I01 off, no worker CPU pin): 84.9 ms per
+step, prepare 6.2 ms, 154 launches, 178 host-to-device DMA rows, 13 copy-only graphs; the device idles about 30 ms per
+step while the host works.
+
+- **Rank skew (MEASURED, step-anatomy's per-rank extracts `reports/step-anatomy/trace_work/ext_00205d_r*.json`):** the
+  8 ranks' step markers are within 80 us every step (the broadcast is not the cause), but ranks 0 and 1 reach their
+  first graph launch 18.5 ms after the step start against 10.8-11.6 ms on ranks 2-7, every step, and then launch
+  20-30 % slower (rank 1 is 22 ms behind rank 7 at the verify forward's 119th launch): two systematically slow hosts.
+  Fix to measure: native-replay's `VLLM_HPU_WORKER_CPU_PIN=3` + `VLLM_HPU_WORKER_CPU_SIBLINGS` (the model thread on
+  its own vCPU, its hyperthread sibling free). The per-step record has `t` + `replay_first_ms` per rank (`07932956`
+  on the `mtp-record` branch, for build 5) to see the skew in every job.
+- **H2D census (MEASURED on the CPU engine, `reports/engine-step/probes/h2d_census.py`, build 4's code):** our Python
+  issues 31 host-to-device copies per steady MTP k = 3 step at 4 and at 32 streams (13 in `_create_decode_input_data`,
+  4 in `_prepare_spec_decode_inputs`, 2 PLE, 10 from the drafter's `prepare_attn_metadata` on 2 passes, 2 blocking
+  in `hpu_eagle.prepare_inputs`), 29 non-blocking, none from a pinned buffer, each with a fresh device allocation (25
+  per step); 4 scalar operands in lazy ops between the graphs. With I01: 22 copies, 16 allocations. So the trace's
+  178 rows are about 5 DMA commands per copy call (INFERRED; native-replay's H2D timer build will count both).
+- **Copy-only graphs:** between the captured graphs our Python issues 8 recipes per step, all with compute (the
+  speculative input gather, the LM head, the rejection sampler, 2 in `parse_output`, 1 per draft pass). The 13
+  copy-only graphs are the replay wrapper's copies of unmatched inputs (native-replay, bridge source: an input that is
+  not the captured graph's own input value is copied by `graphs.copy_to`, flushed as its own recipe before the
+  replay). To name them: `VLLM_HPU_LOG_UNMATCHED_GRAPH_INPUTS=1` (`ca52fa33`), and the same logger as a Python-only
+  sitecustomize for build 5 (`reports/engine-step/probes/hpu_graph_input_log/`, sent to integration at 08:19 UTC).
+- **The 13, predicted on CPU (MEASURED, the census's forward-input check, 08:22 UTC):** every input of the target and
+  draft forwards that is a view made outside the forward or a lazy result still pending at the replay (both unmatched
+  on a card). Exactly 13 per step, all on the draft forwards: pass 0 (16 rows) `input_ids`, `positions`,
+  `hidden_states` (arg max, +1, index_select just before the pass) and the lattice's `load/store_indices_tensor`
+  (`ring_slots_from_lattice`, pending); passes 1 and 2 the same three plus the two lattice tensors as non-contiguous
+  views. The target forward's inputs are all matched. Fix: persistent base tensors into the draft forward and that
+  arithmetic inside the captured draft graph, or mtp-draft-graph's one-graph chain (asked the coordinator).
+- **The verify forward's wrapper graphs (coordinator, 08:22 UTC; mtp-draft-graph's follow-up c).** Step 2 of the
+  rank-0 trace in order (`reports/engine-step/probes/trace/seq.py`, `seq_00205d_s2.txt`): inside the replay an
+  "embed" segment and a cast-only "ple" segment that no collective ends, the final hyper-connection mix last; after
+  it the LM head, a 500-op memcpy (the logits all-gather's concatenation) and the rejection sampler (324 ops).
+  - Tail, done on CPU: **`VLLM_HPU_VERIFY_LOGITS_IN_GRAPH=1`** (`844a37f2`, default 0): for a greedy verification
+    step the forward takes the logits indices and returns the selected rows and int32 per-row greedy ids from an
+    fp32 id table (`vocab_parallel.greedy_ids`, card rule 9); the final mix, LM head and arg max are one segment,
+    the runner verifies from the ids; mtp-draft-graph's chain (Stage B) takes the greedy rejection into its graph
+    and reads the ids. CPU: same tokens off and on (n-gram k = 3, oracle drafts), the rejection sampler never runs.
+  - Front: every lazy flush during capture ends a segment (native-replay, bridge source). Stage submission is not
+    the cutter (qsa-fused's 00209: `PT_HPU_ENABLE_STAGE_SUBMISSION=0` leaves the MoE layer's launches as they are).
+- **The cut reasons of the verify forward and the draft passes (MEASURED, 00223 `tiny-cutlog`, 1 card, the tiny
+  model (3 GDN + 1 QSA layers, MoE, HC, PLE) with MTP k = 3 on the old draft loop, image `4b18072924bb`,
+  `LOG_LEVEL_PT_IRGRAPH=1`):** parsers `reports/engine-step/probes/cutlog/` (`cuts.py`: the cuts inside each
+  capture with the ops around them; `seq.py`: a capture's ops with its cuts; `window.py`: every cut between the
+  graphs in a time window). `host step marker` is logged by PT_IRGRAPH and PT_LAZY both: count one. The verify
+  forward (797 lazy ops): 4 cuts, all `host step marker`, one after each decoder layer, after `mixture_of_experts`
+  and `add` (shared + routed): `modify_model_layers`' hook (`VLLM_CONFIG_HIDDEN_LAYERS=1`; the tiny run had
+  `VLLM_HPU_DECODE_CUT_INTERVAL=0`). Nothing else: no cut between the embedding, the PLE and layer 0, no host read,
+  data-dependent op, shape change or CPU fallback. The draft passes (6 captures, 223-254 ops): no cut. At TP > 1
+  the hook follows the MoE runner's all-reduce (the layer returns `mlp_out`; the HC combine waits for the next
+  layer), so it adds no launch; 00205 had `DECODE_CUT_INTERVAL=1000` anyway. So 00205's boundaries with no
+  collective within 150 us (verify: `embed`, row 23, and the `ple` cast, row 31; drafts: embed | 25-op | 65-100-op
+  segments, and `qsa_attention` | `moe` in passes 1 and 2) come from TP-only code or from 00205 flags the tiny run
+  lacked (`PLE_HOST_NGRAM_IDS=1`, `QSA_FUSED=1`, `QSA_INDEXER_SHARD=1`, `HC_FUSED_COPY_MODE=2`, ...). `seq.py`'s
+  `coll` needs the collective to start within 150 us of the segment's end, so an all-reduce a slow host issues
+  late reads as none: row 23 to 25 is most likely the vocabulary-parallel embedding's all-reduce (INFERRED). 00235
+  (TP2, 00205's flags) names them.
+- **The step-level cuts between the graphs (MEASURED, 00223, 161 steady steps; per step; none is a collective):**
+  (1) `host step marker` launches 3 pending PLE input ops (cast, add, index) before the verify replay; (2)
+  `HPUGraph::replayV3`, the verify; (3) 3 x `host step marker` after it: the first launches `index` + `linear` (the
+  logits rows and the LM head outside the graph), two are empty; (4) `d2h_maybe_eval` after the 34-op sampler /
+  rejection (`argmax`, `any`, `where`): the sampled ids to the host; (5) `replayV3`, draft pass 0: the pending
+  draft-input ops (`clamp index_select*3 cat`) and the copy-only D2D inputs launch first; (6)
+  `EvaluateTensorData-PT_USE_MARKSTEP` after pass 0's `index_select linear argmax index_select*2`:
+  `_draft_positions_cpu` reads `target_positions` (`hpu_flash_next_mtp.py:260`; gone with
+  `VLLM_HPU_MTP_DRAFT_LOOP=1`'s host positions); (7), (8) `replayV3`, passes 1 and 2: the positions + 1 (7 ops) and
+  the LM head + arg max + next inputs (9 ops) launch first; (9) `d2h_maybe_eval` after `linear argmax cat`: the
+  drafts to the host. Prefill only: `out shape changed` twice per GDN layer (the chunked path: after the `cumsum`,
+  before the `eye` / `tril` solve, and after the solve's `matmul`). Startup only: `bindings-synchronize_device`
+  (626), `local scalar` (2). mtp-draft-graph's chain and `VLLM_HPU_VERIFY_LOGITS_IN_GRAPH` take out (3)'s flush,
+  the pending-op launches of (5) to (8) and the read (6) (coordinator, 09:19 UTC): check with `window.py` when the
+  chain job runs.
+- **The tensor-printing reads (coordinator 09:58 UTC, from async-sched's 00220 census): one capture step, not every
+  step (MEASURED).** In `nospec-async-census/timing/step_timing_worker_r0_*.jsonl` the item, tolist, scalar and
+  all_reduce counters have n = 1 in the first rows=8 window: one step made 1454 `.item()`, 384 `.tolist()`, 500 scalar
+  reads (all inside torch's tensor printing) and 98 all-reduces; `sync_sites` divides by the window's 50 steps (29.08,
+  7.68, 5.6 "per step"). The 10 later rows=8 windows have none (h2d 14-16, mark_step 2-4, d2h_to 1). All-reduces are
+  counted only while the forward runs in Python, so that step is the capture of the bucket's graph (warmup skipped).
+  CPU (engine harness, tiny model, device tensors marked, 8 rows, `reports/engine-step/probes/tensor_reads/cpu_reads.py`):
+  sync and async no-spec decode steps format no device tensor; the device reads per step are the output's lists
+  (async `get_output`, 1.84 per step). So the printing is HPU- or FP8-only code that runs while a graph is captured.
+  The callers: the hook `reports/engine-step/probes/tensor_reads/sitecustomize.py` (PYTHONPATH first,
+  `TENSOR_READ_SITES=1`; `TENSOR_READ_LIGHT=1` wraps only str / repr / format / contains) in 00235 (tiny TP2, full)
+  and 00236 (real model, formatting only): `TENSOR_READS ... first <kind> at step S: <8 frames>`. A host read of a
+  pending tensor during a capture also ends a graph segment (a cut in every replay): check against 00235's IR log.
+  async-sched agreed (10:26 UTC); its steady mode-1 gap (forward 36-41 ms async against 29-34 sync, post 2-8 ms
+  against 0.2) has the 14 pageable H2D per step as first suspect: it adds an async arm with
+  `VLLM_HPU_PERSISTENT_INPUTS=1` once that is on the program head.
+- **Stage 1 of the upload, done on CPU: `VLLM_HPU_PERSISTENT_INPUTS=1`** (`8efc6969`, default 0; coordinator GO
+  08:38 UTC): every per-step input of the decode builder, the speculative indices and the PLE inputs through
+  `HPUModelRunner._upload`, a persistent pinned host tensor and a persistent device tensor per (name, shape, dtype),
+  copied non-blocking (each upload of a step its own pair; two step parities under async scheduling, `begin_step` at
+  every `execute_model`). Same tokens off and on (greedy, n-gram
+  k = 3 with oracle drafts); one device address per input shape, which lean5's static launch plan needs (asked
+  collectives for the plan_hit per rank, now from 00234). async-sched's device-made inputs replace five of them in chained
+  verification steps (its own tensors; agreed 08:46 UTC).
+- **The persistent inputs' contract (async-sched, 11:05 UTC; VERIFIED in its code):** the inputs are no longer fresh
+  tensors: the same input's upload in the next step (two steps later under async scheduling) rewrites them. async-sched's
+  M1 kept a step's host-made positions, ids and PLE context for the next step's device advance and read them after the
+  next upload (`test_engine_spec_device_align` 2 of 3 red with the flag, synchronous, M1 = 2); its fix keeps copies
+  (`feat/flash-next-gaudi-async-sched-s3` `a4f1e896`). Other code that keeps a step's inputs across steps (the PLE
+  carry, the draft chain, spec-lookup) needs the same care. This track's side: an input uploaded twice in one step
+  (two prefill chunks of one bucket) shared one pair, so the second upload could rewrite the first one's pinned buffer
+  while its non-blocking copy, or its device tensor while its forward, still read them; each upload of a step now gets
+  its own pair (`begin_step`, unit test `test_a_second_upload_in_one_step_gets_its_own_pair`).
+- **The lean5 A/B of the persistent inputs:** collectives runs `VLLM_HPU_PERSISTENT_INPUTS=1` against `=0` on one
+  image with lean5 on (its ab_bridge template), build 6 preferred, this track's image only if the coordinator or
+  collectives says so (do not sync it for this unasked). Best on native-replay's `lean6m-43fdd6850644` with
+  `PT_HPU_HPUGRAPH_STATIC_PLAN_MISS_LOG=200` (needs `PT_HPU_HPUGRAPH_PREPARED_REPLAY=1
+  PT_HPU_HPUGRAPH_PREPARED_REUSE=1 PT_HPU_HPUGRAPH_STATIC_PLAN=1`; it also has lean6h2's H2D timer):
+  `HPUGRAPH_PLAN_MISS` lines per launcher, `input_moved` and `first_input <idx> <dtype[shape]>` name the inputs that
+  still move. The baseline (without this flag) is collectives' 00234 (10:00 UTC: 00210's lean6m qualification moved
+  by the coordinator onto build 5's image `eb21ac75` with the dense MoE from 1 token, 100 launches per 1-stream step;
+  starts by 16:25 UTC): collectives sends the miss table when its `real-lean5-verify` arm ends.
+- **A regression of this track on the program branch, being fixed:** the PR 16 merge resolution (`fe4cac24`, in
+  PR 20) computed the block table's width before the sparse / dense branch; stub runners without
+  `_block_table_max_blocks` fail (`tests/unit_tests/worker/test_flash_next_host_ngram.py`, 4 tests; served models
+  unaffected). Fix branch `fix/flash-next-gaudi-block-table-width-guard` (`33eb7cb1`), gate
+  `reports/engine-step/logs/gate_fixbt.log` (wrapper pid 87075, worktree `reports/engine-step/trees/fixbt`); open
+  and merge its PR when green. Also fixed on this branch in `8efc6969`. Note: `bin/gate` does not run
+  `tests/unit_tests/worker/`; run the worker tests a change touches by hand.
+- **Plan (coordinator's order, 08:18 UTC):** (1) name and remove the copy-only graphs (persistent base tensors,
+  sliced inside the forward), about 13 launches, 2-4 ms per step (INFERRED); (2) I01 in the serve setting once 00207
+  (MTP, 32 streams) and 00169 (32 x 120K) agree (integration got the runtime-switch recipe); (3) last: the packed
+  upload (`VLLM_HPU_PACKED_INPUTS`, 22-31 calls to 1-3 from pinned buffers, about 0.5-1.5 ms per step), with
+  async-sched's per-input host-made / device-made switch agreed (08:29 UTC).

@@ -539,6 +539,10 @@ if TYPE_CHECKING:
     VLLM_HPU_QSA_TABLE_WIDTH: int = 0  # decode block-table columns: 0 the engine's longest context (default), 1 the batch's
     VLLM_HPU_QSA_KV_FP8: int = 0  # 1: the QSA layers accept --kv-cache-dtype fp8_inc (FP8 K/V storage, bf16 attention)
     VLLM_HPU_QSA_SLOT_SHIFT: int = 0  # decode slot mapping: 0 // and % (default), 1 shift and mask, 2 through float32
+    VLLM_HPU_WORKER_GC_FREEZE: int = 0  # 0 Python's collector as is (default), 1 frozen heap, generation 2 only when idle
+    VLLM_HPU_LOG_UNMATCHED_GRAPH_INPUTS: int = 0  # 1 logs the inputs the HPU graph wrapper copies before a replay
+    VLLM_HPU_VERIFY_LOGITS_IN_GRAPH: int = 0  # 1 a greedy verification's LM head and arg max inside the forward graph
+    VLLM_HPU_PERSISTENT_INPUTS: int = 0  # 1 a decode step's inputs into persistent device tensors from pinned host ones
     VLLM_HPU_GDN_CORE_DECODE: int = 1  # GdnCoreDecodeMode: 1 fused (default), 0 off, 2 recurrence
     VLLM_HPU_GDN_CORE_DECODE_DEBUG: int = 0  # GdnCoreDecodeDebug: 0 off, 1 check slot indices every step (host sync)
     VLLM_HPU_GDN_CORE_VERIFY: int = 0  # GdnCoreVerifyMode: 0 off (default), 1 fused verification steps
@@ -2014,6 +2018,41 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # every form (a power-of-two block size; another size keeps form 0). Any other value is 0.
     "VLLM_HPU_QSA_SLOT_SHIFT":
     lambda: int(os.environ.get("VLLM_HPU_QSA_SLOT_SHIFT", "0")),
+
+    # A worker's Python garbage collector while steps run (v1/worker/gc_control.py). 0 (default) = as is. 1 = at
+    # the first step the heap is collected once and frozen (gc.freeze), automatic generation-2 collections are off
+    # while steps run, and a daemon thread collects when no step has run for 0.5 s: every collective of a TP step
+    # is a barrier across the ranks, so one rank's generation-2 pause stalls all of them. Switchable at run time
+    # (VLLM_HPU_RUNTIME_SWITCH_FILE); back at 0 the heap is unfrozen and the thresholds restored. Any other value is 0.
+    "VLLM_HPU_WORKER_GC_FREEZE":
+    lambda: 1 if os.environ.get("VLLM_HPU_WORKER_GC_FREEZE", "0").strip() == "1" else 0,
+
+    # Which inputs of a replayed HPU graph the wrapper copies before each replay (v1/worker/graph_input_log.py):
+    # an input that is not the captured graph's own input value (a view or a slice made outside the graph) is copied
+    # with a lazy device-to-device copy, flushed as its own recipe, one launch per replay. 1 = wrap the wrapper's
+    # copy_to and log every copied tensor's path, shape, dtype and storage offset (1st, 100th and 1000th time).
+    # 0 (default) = nothing.
+    "VLLM_HPU_LOG_UNMATCHED_GRAPH_INPUTS":
+    lambda: 1 if os.environ.get("VLLM_HPU_LOG_UNMATCHED_GRAPH_INPUTS", "0").strip() == "1" else 0,
+
+    # A greedy verification step's logits region inside the captured forward (engine-step, step-anatomy's 00205
+    # census). 0 (default) = the forward returns its hidden states and the runner runs the LM head, the logits
+    # all-gather and the rejection sampler as separate lazy graphs after the replay. 1 = for a speculative decode step
+    # whose requests are all plainly greedy, the forward also takes the logits indices and returns the selected
+    # hidden states and every row's greedy token (int32, from an fp32 id table; with VLLM_HPU_VOCAB_PARALLEL_LOGITS
+    # >= 1 the per-rank arg max and a [rows, 2] all-gather instead of the logits): the final hyper-connection mix,
+    # the LM head and the arg max are one graph segment, and the runner verifies the drafts with
+    # greedy_rejection_sample_from_tokens. Any other value is 0.
+    "VLLM_HPU_VERIFY_LOGITS_IN_GRAPH":
+    lambda: 1 if os.environ.get("VLLM_HPU_VERIFY_LOGITS_IN_GRAPH", "0").strip() == "1" else 0,
+
+    # A decode step's per-step inputs (v1/worker/persistent_inputs.py). 0 (default) = async_h2d_copy: a fresh device
+    # tensor per input and step, copied from an unpinned host tensor (the bridge stages it). 1 = a persistent pinned
+    # host tensor and a persistent device tensor per input (name, shape, dtype), filled and copied non-blocking each
+    # step (two alternating pairs under async scheduling): no per-step device allocation or staging, and the forward's
+    # inputs keep their addresses (native-replay's static launch plan, lean5, hits only then). Any other value is 0.
+    "VLLM_HPU_PERSISTENT_INPUTS":
+    lambda: 1 if os.environ.get("VLLM_HPU_PERSISTENT_INPUTS", "0").strip() == "1" else 0,
 
     # Flash-Next GDN decode through the fused core op (flashinfer_gaudi.gdn_core_decode).
     # 1 (default) = fused, 0 = off (the torch path), 2 = recurrence only (a bisect tool).
