@@ -676,6 +676,19 @@ sibling (19r xor 1), so mode 2 needs the sibling kept free (a fix for the flag, 
 
 ## Handoff (if this agent stops)
 
+**08:20 UTC.** lean5's qualification is job **00210** `real8-bridge-reuse2` (collectives track, all cards, 120 min,
+after async-sched's 00202/00203; replaces 00198): tiny-stock, tiny-lean4-nan, tiny-lean5-verify; real-ref, real-lean5,
+real-lean5-verify, real-lean4 (fallback, last); text_check 1/32 (+ churn on the lean5 arms); plan_bad 0 and churn
+texts equal fail the job otherwise. lean6 (`patches/lean6.patch`, PT_HPU_HPUGRAPH_LEAN_COLLECTIVE: the lazy collective
+issued inline without the job thread's copies, about -3 to -4 us per launch) is deferred by the coordinator. Sent to
+engine-step (bridge view of the census's 178 H2D copies and 13 copy-only graphs per 32-stream MTP step): a CPU->HPU
+copy is an immediate DMA on the DMA_H2D sub-stream, never a graph; with `non_blocking=False` (the default) the bridge
+spin-waits on the host until it completes (`backend/helpers/tensor_utils.cpp` `copy_data_to_device`); an HPU->HPU
+copy outside a captured graph is a lazy op flushed as its own recipe at the next replay or mark_step (a full launch);
+batching: one pinned host buffer and one persistent device buffer per dtype, one `non_blocking` copy per step, the
+device views as the graph's static inputs (double-buffered under async scheduling: the bridge's H2D waits only for
+the destination's last writer).
+
 **08:05 UTC (by `date -u`; earlier entries of this session may be off by up to an hour): lean5 built and VLLM_HPU_WORKER_CPU_PIN=3 pushed.**
 - **Mode 3** (773a7f7c, default off): `VLLM_HPU_WORKER_CPU_PIN=3`, `VLLM_HPU_WORKER_CPU_SIBLINGS` (xor1 default, none):
   after warmup the model thread on share[1], its host sibling share[0] free of the worker's and the engine core's
