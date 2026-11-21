@@ -551,6 +551,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--top-p", type=float, default=1.0, help="top_p of a sampled run")
     parser.add_argument("--seed", type=int, default=None, help="per-request seed of a sampled run")
     parser.add_argument("--logprobs", type=int, default=None, help="record the top-N logprobs of every generated token")
+    parser.add_argument("--next-turn", default=None, metavar="IDS_JSON",
+                        help="after the prompts, one more request: the first prompt, its generated tokens and these "
+                        "token ids (a JSON list): the agent's next turn on this engine's own answer")
     parser.add_argument("--slice-write-probe", action="store_true",
                         help="record writes through a slice of the recurrent pools the align-mode copies write")
     parser.add_argument("--op-audit", action="store_true",
@@ -602,6 +605,11 @@ def main(argv: list[str] | None = None) -> int:
                     stream["top_logprobs"] = [{str(t): float(lp.logprob) for t, lp in step.items()}
                                               for step in (output.outputs[0].logprobs or [])]
                 streams.append(stream)
+        if args.next_turn and streams:
+            turn = streams[0]["prompt_ids"] + streams[0]["generated_ids"] + list(json.loads(args.next_turn))
+            output = llm.generate([{"prompt_token_ids": turn}], params, use_tqdm=False)[0]
+            streams.append({"prompt_ids": turn, "generated_ids": list(output.outputs[0].token_ids),
+                            "num_cached_tokens": getattr(output, "num_cached_tokens", None), "next_turn": True})
     record = {"k": args.k,
               "prefix_caching": not args.no_prefix_caching,
               "concurrent": bool(args.concurrent),
