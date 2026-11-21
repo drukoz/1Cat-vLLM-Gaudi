@@ -7450,10 +7450,13 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             else:
                 mtp_step_timer = None if warmup_mode else self._mtp_step_timer
                 if mtp_step_timer is not None:
-                    mtp_step_timer.draft_start(
-                        "prefill" if num_decodes == 0 else ("verify" if num_prefills == 0 else "mixed"),
-                        scheduler_output.total_num_scheduled_tokens, num_decodes + num_prefills,
-                        self.speculative_config.num_speculative_tokens)
+                    timer_kind = "prefill" if num_decodes == 0 else ("verify" if num_prefills == 0 else "mixed")
+                    if int(gaudi_envs.VLLM_HPU_MTP_DRAFT_GRAPH) == 1:
+                        # the one-graph drafts in records of their own (the flag can be switched at run time)
+                        timer_kind += "+graph"
+                    mtp_step_timer.draft_start(timer_kind, scheduler_output.total_num_scheduled_tokens,
+                                               num_decodes + num_prefills,
+                                               self.speculative_config.num_speculative_tokens)
                 with self.profiler.record_event('internal', 'propose_draft_tokens'):
                     self._draft_token_ids = self.propose_draft_token_ids(
                         scheduler_output, postprocessed_sampled_token_ids, sampling_metadata,

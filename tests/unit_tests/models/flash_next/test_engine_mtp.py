@@ -198,6 +198,31 @@ def test_the_draft_passes_in_one_graph_with_several_requests_at_once(engine_runs
     assert graph["runner"]["draft_graph_calls"] == len([c for c in graph["draft_calls"] if c.get("decode")])
 
 
+def test_the_one_graph_draft_switched_at_run_time(engine_runs):
+    # VLLM_HPU_MTP_DRAFT_GRAPH in the runtime switch file (VLLM_HPU_RUNTIME_SWITCH_FILE, an A/B on one server):
+    # the server starts with the per-pass drafter, takes the one-graph draft after the second prompt and drops it
+    # after the fourth. Every draft and every stream equal the per-pass drafter's; the decode drafts of prompts 3 and
+    # 4 ran in one graph, the others did not.
+    loop = {"VLLM_HPU_MTP_DRAFT_LOOP": "1"}
+    accept = [2, 0, 3, 1]
+    per_pass = _oracle_run(engine_runs, accept, env=loop, tag="_loop")
+    switch_file = engine_runs["dir"] / "draft_graph.switches"
+    run = _oracle_run(engine_runs, accept, "--switch-after", "2", "VLLM_HPU_MTP_DRAFT_GRAPH=1", "--switch-after", "4",
+                      "VLLM_HPU_MTP_DRAFT_GRAPH=0", env={**loop, "VLLM_HPU_RUNTIME_SWITCH_FILE": str(switch_file)},
+                      tag="_switch")
+    assert [e["drafter"] for e in run["oracle"]] == [e["drafter"] for e in per_pass["oracle"]]
+    assert [p["generated_ids"] for p in run["prompts"]] == [p["generated_ids"] for p in per_pass["prompts"]]
+    start = 0
+    for number, prompt in enumerate(run["prompts"], 1):
+        calls = run["draft_calls"][start:prompt["draft_calls_end"]]
+        start = prompt["draft_calls_end"]
+        decode = [call for call in calls if call.get("decode")]
+        assert decode, number
+        assert all(call["graph"] == (number in (3, 4)) for call in decode), (number, decode)
+        assert not any(call.get("graph") for call in calls if not call.get("decode"))
+    assert 0 < run["runner"]["draft_graph_calls"] < len([c for c in run["draft_calls"] if c.get("decode")])
+
+
 @pytest.mark.parametrize("k", [4, 5], ids=["k4", "k5"])
 def test_oracle_drafts_at_the_sizes_above_the_recipe(engine_runs, k):
     # k + 1 lattice entries exceed the kernel blocks of a request's first block (two per 256-token block here, four
