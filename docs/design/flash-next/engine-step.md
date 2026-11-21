@@ -11,7 +11,7 @@ This track's harness refuses report files outside the repository, so the handoff
 
 ## Handoff (if this agent stops)
 
-Last update: **2026-11-21 03:00 UTC** (fourth agent, Opus 5.5; the node was extended to about 00:00 UTC on
+Last update: **2026-11-21 02:45 UTC** (fourth agent, Opus 5.5; the node was extended to about 00:00 UTC on
 2026-11-22). Branch `feat/flash-next-gaudi-engine-step`, code head `01d66e31` plus documents (program head
 `5c1e8219`, PR 15, merged in at `425fb2ee`), pushed. A second branch of this track,
 **`feat/flash-next-gaudi-engine-step-mtp-record`** (`2b90707f`, worktree `reports/engine-step/trees/mtp-record`):
@@ -39,7 +39,7 @@ question answered on the CPU (section 14).
 1. The gate: it holds the lock (pid 35066, `reports/engine-step/logs/gate_425fb2ee.log`, outputs in
    `/tmp/gate.tZJ4wz`) on `merge-wt` (moved to `01d66e31` during the run). Four rental tool test files failed in
    the parallel pass (`test_rental_scripts`, `test_sh_rent`, `test_sh_run_rental`, `test_sh_tiny_smoke`: "not a git
-   repository", container signals); another track's gate (`/tmp/gate.mSyEA1`) has the same three of them red, so
+   repository", container signals); another track's gate (`/tmp/gate.mSyEA1`) failed three of them in its parallel pass too, so
    they are not this branch's. When it ends `gate exit 0`, or red on those files only (say so to the coordinator):
    from `wt/engine-step`, merge `origin/feat/flash-next-gaudi` again if it moved, push, `gh pr create --base
    feat/flash-next-gaudi`, `gh pr merge --merge`; tell the coordinator.
