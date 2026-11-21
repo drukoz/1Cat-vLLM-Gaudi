@@ -75,20 +75,41 @@ def corpus(root: Path, want_chars: int) -> str:
     return "\n\n".join(parts)
 
 
+MARKER = "QQQQKVLPMARKERQQQQ"
+
+
+def chat_frame(args) -> tuple[list, list]:
+    """``--chat``: the chat template's token ids before and after a user message (generation prompt, no thinking),
+    from the server's /tokenize: the prompt then ends where an assistant answer starts, so the answer is the
+    needle check (a raw completion of the question ended at once in job 00222). ``([], [])`` when the server's
+    template cannot be split around the message."""
+    mark = post(args, "/tokenize", {"model": args.model, "prompt": MARKER, "add_special_tokens": False}, 600.0)["tokens"]
+    chat = post(args, "/tokenize", {"model": args.model, "messages": [{"role": "user", "content": MARKER}],
+                                    "add_generation_prompt": True, "add_special_tokens": False,
+                                    "chat_template_kwargs": {"enable_thinking": False}}, 600.0)["tokens"]
+    for i in range(len(chat) - len(mark) + 1):
+        if chat[i:i + len(mark)] == mark:
+            return chat[:i], chat[i + len(mark):]
+    say("chat template not split around the message: raw prompts")
+    return [], []
+
+
 def prompt_ids(args, length: int) -> list:
-    """``length`` token ids: the corpus cut to ``length`` minus the question, the needle at 30 %, the question."""
+    """``length`` token ids: the corpus cut to ``length`` minus the question, the needle at 30 %, the question
+    (``--chat``: inside the chat template's user message, followed by its assistant header)."""
+    pre, post_ids = chat_frame(args) if args.chat else ([], [])
     text = corpus(Path(args.docs), length * 6)
     q_ids = post(args, "/tokenize", {"model": args.model, "prompt": NEEDLE_QUESTION, "add_special_tokens": False},
                  600.0)["tokens"]
     n_ids = post(args, "/tokenize", {"model": args.model, "prompt": "\n" + NEEDLE_SENTENCE + "\n",
                                      "add_special_tokens": False}, 600.0)["tokens"]
     body = post(args, "/tokenize", {"model": args.model, "prompt": text, "add_special_tokens": False}, 1200.0)["tokens"]
-    room = length - len(q_ids) - len(n_ids)
+    room = length - len(q_ids) - len(n_ids) - len(pre) - len(post_ids)
     if len(body) < room:
         raise RuntimeError("the corpus has %d tokens, %d wanted" % (len(body), room))
     body = body[:room]
     at = int(0.3 * room)
-    return body[:at] + n_ids + body[at:] + q_ids
+    return pre + body[:at] + n_ids + body[at:] + q_ids + post_ids
 
 
 def one_request(args, ids: list) -> dict:
@@ -152,6 +173,9 @@ def main():
     ap.add_argument("--docs", default=None, help="the build's source tree (default: this script's tree)")
     ap.add_argument("--timeout", type=float, default=1800.0)
     ap.add_argument("--label", default="")
+    ap.add_argument("--chat", action="store_true",
+                    help="wrap the prompt in the server's chat template (user message + assistant header): the "
+                    "answer is then the needle check; prompts differ from a run without it (sha)")
     args = ap.parse_args()
     if args.docs is None:
         here = Path(__file__).resolve().parents[3]
