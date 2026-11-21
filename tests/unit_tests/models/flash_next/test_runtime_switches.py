@@ -16,7 +16,8 @@ import os  # noqa: E402
 
 import pytest  # noqa: E402
 
-from vllm_gaudi.v1.worker.runtime_switches import SWITCHABLE, RuntimeSwitchFile, parse_switches  # noqa: E402
+from vllm_gaudi.v1.worker.runtime_switches import (GRAPH_SWITCHABLE, SWITCHABLE, RuntimeSwitchFile,  # noqa: E402
+                                                    parse_switches)
 
 pytestmark = pytest.mark.skipif(not eh.hpu_cpu_stubs.STUBBED, reason="CPU-only: needs the stubbed Gaudi runtime")
 
@@ -34,7 +35,12 @@ def write(path, text: str) -> None:
 
 def test_switch_file_format():
     assert set(SWITCHABLE) == {"VLLM_HPU_FLASH_NEXT_DECODE_METADATA", "VLLM_HPU_FUSED_GREEDY_LOGITS",
-                               "VLLM_HPU_CANDIDATE_SAMPLING", "VLLM_HPU_VOCAB_PARALLEL_LOGITS"}
+                               "VLLM_HPU_CANDIDATE_SAMPLING", "VLLM_HPU_VOCAB_PARALLEL_LOGITS",
+                               "VLLM_HPU_MOE_DENSE_MIN_TOKENS", "VLLM_HPU_MOE_DENSE_MAX_TOKENS"}
+    assert set(GRAPH_SWITCHABLE) == {"VLLM_HPU_MOE_DENSE_MIN_TOKENS", "VLLM_HPU_MOE_DENSE_MAX_TOKENS"}
+    assert parse_switches("VLLM_HPU_MOE_DENSE_MIN_TOKENS=1\nVLLM_HPU_MOE_DENSE_MAX_TOKENS=512\n") == {
+        "VLLM_HPU_MOE_DENSE_MIN_TOKENS": "1", "VLLM_HPU_MOE_DENSE_MAX_TOKENS": "512"
+    }
     assert parse_switches("# arm B\n\nVLLM_HPU_FUSED_GREEDY_LOGITS = 1  # in-graph greedy\n") == {
         "VLLM_HPU_FUSED_GREEDY_LOGITS": "1"
     }
@@ -59,6 +65,45 @@ def test_a_change_is_seen_once(tmp_path):
     with pytest.raises(ValueError):
         switches.poll()
     assert switches.poll() is None  # a refused file is not read again until it changes
+
+
+def test_moe_dense_range_drops_the_captured_graphs(tmp_path, monkeypatch):
+    """The MoE dense range is read inside the forward: a file naming it drops the model's and the drafter's captured
+    HPU graphs (``wrap_in_hpu_graph``'s ``clear_cache``), so the next steps capture the path in force; a file that
+    names only per-step flags keeps them."""
+    import types
+
+    from vllm_gaudi.v1.worker.hpu_model_runner import HPUModelRunner
+
+    dropped = []
+
+    class Graphed:  # what wrap_in_hpu_graph leaves on the module it wraps
+
+        def __init__(self, name):
+            self.name = name
+
+        def clear_cache(self):
+            dropped.append(self.name)
+
+    path = tmp_path / "switches"
+    runner = types.SimpleNamespace(model=Graphed("model"), drafter=types.SimpleNamespace(model=Graphed("drafter")),
+                                   _runtime_switches=RuntimeSwitchFile(str(path)))
+    runner._drop_hpu_graphs = types.MethodType(HPUModelRunner._drop_hpu_graphs, runner)
+    for name in GRAPH_SWITCHABLE + ("VLLM_HPU_FUSED_GREEDY_LOGITS", ):
+        monkeypatch.setenv(name, "0")  # monkeypatch restores them after the test
+    write(path, "VLLM_HPU_MOE_DENSE_MIN_TOKENS=1\nVLLM_HPU_MOE_DENSE_MAX_TOKENS=512\n")
+    HPUModelRunner._poll_runtime_switches(runner)
+    assert dropped == ["model", "drafter"]
+    assert os.environ["VLLM_HPU_MOE_DENSE_MIN_TOKENS"] == "1"
+    assert os.environ["VLLM_HPU_MOE_DENSE_MAX_TOKENS"] == "512"
+    HPUModelRunner._poll_runtime_switches(runner)  # the file did not change: nothing
+    assert dropped == ["model", "drafter"]
+    write(path, "VLLM_HPU_FUSED_GREEDY_LOGITS=1\n")
+    HPUModelRunner._poll_runtime_switches(runner)  # a flag read outside the captured forward: the graphs stay
+    assert dropped == ["model", "drafter"]
+    assert os.environ["VLLM_HPU_FUSED_GREEDY_LOGITS"] == "1"
+    runner.drafter, runner.model = None, object()  # no drafter, an eager model: nothing to drop
+    assert HPUModelRunner._drop_hpu_graphs(runner) == []
 
 
 @pytest.fixture(scope="module")

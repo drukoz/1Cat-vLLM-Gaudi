@@ -1504,7 +1504,8 @@ _MOE_DENSE_LOGGED = set()
 
 
 def _log_moe_dense_once(key, message, *args):
-    """One log line per process and event (VLLM_HPU_MOE_DENSE: kept, dropped, first use)."""
+    """One log line per process and event (VLLM_HPU_MOE_DENSE: kept, dropped, and the first step of each size
+    on the dense form and on the vendor op)."""
     if key not in _MOE_DENSE_LOGGED:
         _MOE_DENSE_LOGGED.add(key)
         logger.warning(message, *args)
@@ -1598,8 +1599,12 @@ class VllmMixtureOfExpertsOpFP8PerChannel(VllmMixtureOfExpertsOpBase):
         if (self.dense_weights is not None and self.w13_input_scale is None and self.is_gated
                 and activation == "silu"
                 and envs.VLLM_HPU_MOE_DENSE_MIN_TOKENS <= tokens_num <= envs.VLLM_HPU_MOE_DENSE_MAX_TOKENS):
-            _log_moe_dense_once("used", "VLLM_HPU_MOE_DENSE=1: a step of %d tokens runs the dense MoE form", tokens_num)
+            _log_moe_dense_once(("used", tokens_num),
+                                "VLLM_HPU_MOE_DENSE=1: a step of %d tokens runs the dense MoE form", tokens_num)
             return moe_dense_fp8(x, topk_ids, topk_weights, *self.dense_weights, self.experts_min)
+        if self.dense_weights is not None:
+            _log_moe_dense_once(("vendor", tokens_num), "VLLM_HPU_MOE_DENSE=1: a step of %d tokens runs the vendor op",
+                                tokens_num)
         kwargs = self._get_extra_kwargs(tokens_num)
         # Non-gated experts tell the fused kernel to skip the gate split+multiply.
         # Added only when non-gated so gated layers pass the exact kwargs they did

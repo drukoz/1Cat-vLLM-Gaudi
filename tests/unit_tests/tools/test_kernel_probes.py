@@ -16,6 +16,9 @@
 * ``probe_hc_copies.py`` (the owned copies in front of the fused hyper-connection ops): every copy mode returns
   the bits of mode 0.
 * ``decode_ab_client.py --compare``: the 1-stream rounds are the test of two arms' texts.
+* ``moe_rt_driver.py`` (moe_rt_ab.sh's probe: the MoE dense range switched at run time on one server): against a
+  stand-in server it switches every setting, measures every level and prompt set, compares the prompt logprobs of
+  the settings, and stops (exit 9) when a switch reaches no worker's graphs.
 """
 
 import json
@@ -166,3 +169,119 @@ def test_decode_ab_client_compares_the_one_stream_rounds(tmp_path):
     assert "1-stream rounds (the test): the same text in 1 of 1" in out
     source = client.read_text()
     assert '"min_tokens"] =' not in source and "min_tokens\": ntok" not in source  # no request carries it
+
+
+def _fake_moe_rt_server(tmp_path, drop_lines=True):
+    """A stand-in of the served model for moe_rt_driver.py: streamed completions (two tokens per chunk after the
+    first), prompt logprobs that depend on the switch file's setting, /tokenize (one token per word), and the
+    workers' drop lines in server0.log whenever a request sees a changed switch file."""
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    switch = tmp_path / "switches"
+    log = tmp_path / "server0.log"
+    log.write_text("(Worker_TP0_EP0 pid=1) WARNING VLLM_HPU_MOE_DENSE=1: 48 MoE layers keep their stacked experts\n")
+    state = {"stamp": None, "low": 513}
+
+    def poll():
+        try:
+            status = os.stat(switch)
+        except OSError:
+            return
+        stamp = (status.st_mtime_ns, status.st_size, status.st_ino)
+        if stamp != state["stamp"]:
+            state["stamp"] = stamp
+            for line in switch.read_text().splitlines():
+                if line.startswith("VLLM_HPU_MOE_DENSE_MIN_TOKENS="):
+                    state["low"] = int(line.split("=", 1)[1])
+            if drop_lines:
+                with open(log, "a") as handle:
+                    for rank in range(8):
+                        handle.write("(Worker_TP%d_EP%d pid=1) INFO Runtime switches: flags read inside the forward "
+                                     "changed; captured HPU graphs dropped: model, drafter\n" % (rank, rank))
+
+    def ids_of(text):
+        return [1] + [sum(map(ord, word)) % 50000 + 2 for word in text.split()]
+
+    class Handler(BaseHTTPRequestHandler):
+
+        def log_message(self, *args):
+            pass
+
+        def _json(self, obj):
+            data = json.dumps(obj).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+        def do_POST(self):
+            body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+            poll()
+            if self.path == "/tokenize":
+                return self._json({"tokens": ids_of(body["prompt"]), "count": len(ids_of(body["prompt"]))})
+            if body.get("prompt_logprobs"):
+                ids = ids_of(body["prompt"])
+                shift = 0.001 if state["low"] <= 512 else 0.0  # the dense form moves the logprobs a little
+                entries = [None]
+                for position, token in enumerate(ids[1:], 1):
+                    entry = {str(token): {"logprob": -1.0 - (position % 7) * 0.1 + shift, "rank": 1 + position % 3}}
+                    if position % 3:
+                        entry["7"] = {"logprob": -0.5, "rank": 1}
+                    entries.append(entry)
+                return self._json({"choices": [{"text": "x", "prompt_logprobs": entries}]})
+            if not body.get("stream"):
+                return self._json({"choices": [{"text": "ok"}]})
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.end_headers()
+            left = body["max_tokens"]
+            first = True
+            while left > 0:
+                n = 1 if first else min(2, left)
+                first = False
+                left -= n
+                chunk = {"choices": [{"text": " w%d" % left * n}]}
+                self.wfile.write(b"data: " + json.dumps(chunk).encode() + b"\n\n")
+                self.wfile.flush()
+                import time
+                time.sleep(0.002)
+            usage = {"choices": [], "usage": {"completion_tokens": body["max_tokens"], "prompt_tokens": 9}}
+            self.wfile.write(b"data: " + json.dumps(usage).encode() + b"\n\ndata: [DONE]\n\n")
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    return server, switch
+
+
+@pytest.mark.parametrize("drop_lines", [True, False])
+def test_moe_rt_driver_switches_measures_and_compares(tmp_path, drop_lines):
+    server, switch = _fake_moe_rt_server(tmp_path, drop_lines)
+    try:
+        proc, out = _run([PROBES / "moe_rt_driver.py", "--port", server.server_address[1], "--out",
+                          tmp_path / "scaling.json", "--levels", "1,2", "--sampled-levels=1", "--interleave-sampled"],
+                         tmp_path, MOE_RT_SWITCH_FILE=str(switch), MOE_RT_SETTINGS="off,1", MOE_RT_LEVELS="1,3",
+                         MOE_RT_ROUNDS="1", MOE_RT_TOKENS="9", MOE_RT_WARM="3", MOE_RT_ACCURACY="1",
+                         MOE_RT_ACC_PROMPTS="2", MOE_RT_ACC_ORDER="1,off,1")
+    finally:
+        server.shutdown()
+    if not drop_lines:  # a switch that reached no worker's graphs: no verdict
+        assert proc.returncode == 9, out
+        assert "moe_rt: FAIL: the switch to off reached no worker's graphs" in out
+        return
+    assert proc.returncode == 0, out
+    result = json.loads((tmp_path / "moe_rt.json").read_text())
+    assert json.loads((tmp_path / "scaling.json").read_text())["levels"] == result["levels"]
+    cells = {(m["setting"], m["streams"], m["prompt_set"]) for m in result["levels"] if m["ok"] and not m["errors"]}
+    assert cells == {(s, n, p) for s in ("off", "1") for n in (1, 3) for p in ("story", "code")}
+    for m in result["levels"]:
+        assert m["tokens_per_step_p50"] == pytest.approx(2.0)  # (9 - 1) / 4 chunks after the first
+    assert [s["workers"] for s in result["switches"]] == [8, 8]
+    assert "VLLM_HPU_MOE_DENSE_MIN_TOKENS=1\n" in switch.read_text()  # the accuracy runs ended on the dense form
+    pairs = {(p["a"], p["b"]): p for p in result["accuracy"]["pairs"]}
+    assert pairs[("1#0", "off#1")]["mean_abs"] == pytest.approx(0.001)
+    assert pairs[("1#0", "1#2")]["max_abs"] == 0.0
+    assert pairs[("1#0", "off#1")]["top1_agree"] == 1.0
+    assert len(result["accuracy"]["prompts"]) == 2 and all(300 <= p["tokens"] <= 480 for p in result["accuracy"]["prompts"])
+    assert "ACC  1#0" in out and "MEAS  off  N=3" in out and "TEXT  N=1" in out

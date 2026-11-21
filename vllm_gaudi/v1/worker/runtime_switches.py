@@ -19,8 +19,14 @@ from typing import Optional
 
 # VLLM_HPU_VOCAB_PARALLEL_LOGITS is read at every call of the logits region (distributed/vocab_parallel.mode()),
 # which runs as lazy ops after the replayed decode graph: switching it changes the region's graph, not a captured one.
+# The MoE dense range (VLLM_HPU_MOE_DENSE_MIN_TOKENS / _MAX_TOKENS, extension/ops.py) is read inside the model's
+# forward, so a captured HPU graph keeps the path it was captured with: when the file names one of these
+# (GRAPH_SWITCHABLE), the runner drops the captured graphs of the model and of the drafter and the next steps capture
+# again. The server must start with VLLM_HPU_MOE_DENSE=1 (the stacked experts are kept only then); a minimum above
+# the maximum is the vendor op at every size.
+GRAPH_SWITCHABLE = ("VLLM_HPU_MOE_DENSE_MIN_TOKENS", "VLLM_HPU_MOE_DENSE_MAX_TOKENS")
 SWITCHABLE = ("VLLM_HPU_FLASH_NEXT_DECODE_METADATA", "VLLM_HPU_FUSED_GREEDY_LOGITS", "VLLM_HPU_CANDIDATE_SAMPLING",
-              "VLLM_HPU_VOCAB_PARALLEL_LOGITS")
+              "VLLM_HPU_VOCAB_PARALLEL_LOGITS") + GRAPH_SWITCHABLE
 
 
 def parse_switches(text: str) -> dict[str, str]:
@@ -65,4 +71,4 @@ class RuntimeSwitchFile:
             return parse_switches(handle.read())
 
 
-__all__ = ["SWITCHABLE", "RuntimeSwitchFile", "parse_switches"]
+__all__ = ["GRAPH_SWITCHABLE", "SWITCHABLE", "RuntimeSwitchFile", "parse_switches"]
