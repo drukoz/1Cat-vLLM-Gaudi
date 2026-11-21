@@ -10,7 +10,7 @@ repository is under `/Volumes/Storage/Claude/gaudi-work/reports/spec-lookup/` (`
 
 ## Handoff (if this agent stops)
 
-State at **2026-11-21 02:55 UTC** (fourth agent, Opus 5.5). Branch head: the commit that holds this text, pushed.
+State at **2026-11-21 03:10 UTC** (fourth agent, Opus 5.5). Branch head: the commit that holds this text, pushed.
 It contains the program head `5c1e8219` (PR #15 kernel-fixes, merged as `f4dad13a`), mtp-card-ready through
 `f1aa2292` and every commit of this track. **The node was extended (BRIEF 00:50 UTC): it ends about 00:00 UTC on
 2026-11-22**; everything on it is lost then. Merges are allowed again (one gate at a time).
@@ -23,8 +23,8 @@ It contains the program head `5c1e8219` (PR #15 kernel-fixes, merged as `f4dad13
 | 00086, 00087, 00107, 00114 | tiny-model rehearsals (n-gram k = 3 and 8, vLLM's search, the hybrid with the torch and the fused GDN verification) | ended ok; section 7.1 |
 | 00095 `real4-nospec-edit-prose` | real model, no speculation, TP4 + EP4: the reference and the token ids for the replay | ended ok; sections 7.2 to 7.4 |
 | 00133 `real4-ngram5-edit3` | real model, n-gram k = 5, TP4: 85 tok/s for one editing agent, then the conv-commit crash on the second request (fused and torch verification alike) | ended rc 5 at 00:44 UTC; section 7.5 |
-| **00157 `real8-lookup-nospec-hybrid3-pf`** (all, 45 min; replaced 00153 / 00154) | TP8 on the integration build 2 + this branch + mtp-card-ready's conv-commit fix `5c770d96` (build `e85a3292`, branch `feat/flash-next-gaudi-spec-lookup-tp8`, pushed); build 2's flags with the prefix flags; arms `nospec` and `hybrid3` (`lookup_arms.sh`), rounds edit:1, edit:32, mix:32 and a repeat of edit:1 (the 00133 case at TP8) | **waiting**: placed by the coordinator after prefill's agent headline (`farm status` at 01:12 UTC: starts by 04:38 UTC at the latest); local waiter `card/submit-real8-lookup-nospec-hybrid3-pf.log` |
-| **00159 `real8-lookup-ngram5-pf`** (all, 35 min; replaced 00155) | the same build and rounds, arm `ngram5` | **waiting**, after 00157 (starts by 06:45 UTC at the latest); local waiter `card/submit-real8-lookup-ngram5-pf.log` |
+| **00157 `real8-lookup-nospec-hybrid3-pf`** (all, 45 min; replaced 00153 / 00154) | TP8 on the integration build 2 + this branch + mtp-card-ready's conv-commit fix `5c770d96` (build `e85a3292`, branch `feat/flash-next-gaudi-spec-lookup-tp8`, pushed); build 2's flags with the prefix flags; arms `nospec` and `hybrid3` (`lookup_arms.sh`), rounds edit:1, edit:32, mix:32 and a repeat of edit:1 (the 00133 case at TP8) | **waiting**: placed by the coordinator behind the 8-card integration jobs (`farm status` at 03:09 UTC: starts by 08:44 UTC at the latest); local waiter `card/submit-real8-lookup-nospec-hybrid3-pf.log` |
+| **00159 `real8-lookup-ngram5-pf`** (all, 35 min; replaced 00155) | the same build and rounds, arm `ngram5` | **waiting**, after 00157 (starts by 10:14 UTC at the latest); local waiter `card/submit-real8-lookup-ngram5-pf.log` |
 
 The exact submit commands are in section 7.6. Both jobs run the build `e85a3292`: to resubmit, check out
 `feat/flash-next-gaudi-spec-lookup-tp8` in this worktree first (the farm runs the worktree's HEAD), submit with
@@ -56,8 +56,13 @@ request's real tokens; the scheduler rejects the placeholders. VERIFIED: `test_l
 test_one_token_prompt_joining_a_verifying_batch` failed in all three configurations (n-gram with prefix caching
 off and on, MTP k = 3 with prefix caching on) and passes; async-sched's staggered schedule with the 1-token
 prompt passes with the same change on their branch. Serving triggers: a 1-token prompt beside running requests,
-a prompt whose cached prefix leaves exactly one token, a resumed request with one token left. Cherry-pickable
-alone (the engine test needs this branch's harness).
+a prompt whose cached prefix leaves exactly one token, a resumed request with one token left. As its own pull
+request onto the program head: **PR #17** (branch `fix/flash-next-gaudi-spec-padding`, commit `13e7fd11`, worktree
+`reports/spec-lookup/pr-spec-padding`; the module, the runner lines and `test_spec_padding.py`, without the engine
+test, which needs this branch's harness). Its first gate ran during the 03:01 UTC outage of `/Volumes/Storage`
+(every file "Operation not permitted") and is void (`logs/gate_spec_padding_outage.log`); the gate was restarted
+at 03:05 UTC (`logs/gate_spec_padding.log`). Merge with `gh pr merge 17 --merge` only on a green gate, then tell
+the coordinator (integration build 4 takes it from the program branch).
 
 **The gate.** The third agent's waiting gate was stopped at 23:41 UTC (BRIEF 23:21, since withdrawn by the 00:50
 entry). Run `bin/gate <worktree> --tools` when the merge is due (step 2 below); it waits for the lock.
