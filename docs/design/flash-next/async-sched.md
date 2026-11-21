@@ -6,7 +6,7 @@ results are under `/Volumes/Storage/Claude/gaudi-work/reports/async-sched/card/`
 
 ## Handoff (if this agent stops)
 
-Updated 2026-11-21 10:55 UTC.
+Updated 2026-11-21 11:25 UTC.
 
 - **Card results so far** (placement on, MTP timers 0, compare arms within a job only):
   - 00220, mode 1 with `d3fb1b11` (MEASURED). ms/token sync → async: 1 stream greedy 27.9 → 29.4, sampled
@@ -28,12 +28,20 @@ Updated 2026-11-21 10:55 UTC.
   - `feat/flash-next-gaudi-async-sched`: done, merged as PR #25 (`4f070c75`): modes 1 and 2 on the program head.
   - `feat/flash-next-gaudi-async-sched-s2`: stage 2 (section 2.6), all default-off, CPU-green. M1 `97a3a08a`
     `54c9f552` `959890bf`; M2 `cef6fd98`; M3 `a0f29355` `f7bb35ce`; `f616e3e1` (M1 with prefix caching keeps the
-    align mode's load count). mtp-draft-graph's chain is on the program head now (PR #23), so s2 only needs the
-    program head merged in (two conflicts, `SWITCHABLE` in `runtime_switches.py` and its test: the union), then its
-    gate, then a PR (owner's rule: default-off and the gate green).
-  - engine-step's persistent-inputs branch (`e4c442ef`) conflicts with the program head in the same two files plus
-    `_ple_forward_kwargs`; they have the resolution (keep the device-context passthrough, else `upload`). s2 merges
-    it with that one conflict only.
+    align mode's load count). `78478ead` merges the program head `4f070c75` (PRs #23 chain, #24, #25; conflicts only
+    in `SWITCHABLE` and its test: the union); `915638c2` (= `35d9d4d4` of the job branches) makes mode 3 issue early
+    after the chain's stage B too; `9d2ee2e3` tests it on the engine (`VLLM_HPU_VOCAB_PARALLEL_LOGITS=1`).
+  - **Gate of stage 2**: `bin/gate reports/async-sched/trees/gate-9d2ee2e3` (frozen copy of `9d2ee2e3`), started
+    11:13 UTC with a 6 h alarm (pid 18115), waiting for a slot. Log `reports/async-sched/logs/gate_9d2ee2e3.out`.
+    If green: `gh pr create --base feat/flash-next-gaudi --head feat/flash-next-gaudi-async-sched-s2` with the title
+    "Flash-Next MTP under async scheduling, stage 2 (default off): device-made verification inputs, early issue
+    (mode 3), device align mode" and the body `reports/async-sched/pr_body_s2.md` (fill in GATE_LINE), then
+    `gh pr merge --merge` (owner's rule: default-off and the gate green). If the program head moved, merge it in
+    and gate again.
+  - engine-step's persistent-inputs branch merged the program head as `887266b1` (the device-context passthrough
+    kept, as asked). s2 merges it with the `SWITCHABLE` union only: scratch branch `s2-pi` in
+    `scratchpad/m1clone`, where the stage 2 engine files run with `VLLM_HPU_PERSISTENT_INPUTS=1`
+    (`reports/async-sched/logs/tests_s2_pi.log`).
 - **Card job 00237** `real8-async-m3c` (all, 85 min; replaced 00233, which had replaced 00229; starts after
   mtp-draft-graph's 00230, by 14:21 UTC at the latest).
   - Job branch `feat/flash-next-gaudi-async-sched-m3-b5` at `107dcf9a` (never merge it): the M2 job branch
