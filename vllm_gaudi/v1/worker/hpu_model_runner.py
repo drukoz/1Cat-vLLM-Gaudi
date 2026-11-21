@@ -4907,8 +4907,13 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             return None, True, token_ids, positions, slot_mapping, num_accepted
         made.slot_mapping = made.slot_mapping.to(slot_mapping.dtype)
         made.num_accepted = made.num_accepted.to(num_accepted.dtype)
+        if self.use_prefix_caching and self._align_flag != 2:
+            # Align mode: the load count also follows the pre-step copy and the self commits (the host's books, or
+            # M3's device-made count with VLLM_HPU_FLASH_NEXT_SPEC_DEVICE_ALIGN=2), not just a + 1.
+            made.num_accepted = None
         if mode == 2:
-            return made, True, made.token_ids, made.positions, made.slot_mapping, made.num_accepted
+            count = num_accepted if made.num_accepted is None else made.num_accepted
+            return made, True, made.token_ids, made.positions, made.slot_mapping, count
         return made, True, token_ids, positions, slot_mapping, num_accepted
 
     def _finish_verify_inputs(self, made, num_decodes, padded, num_tokens, token_ids, positions, slot_mapping,
