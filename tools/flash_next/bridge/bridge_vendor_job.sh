@@ -20,6 +20,9 @@
 #                                   on the stock path); REBUILD overrides the third argument
 #   BRIDGE_PIN_KV / PIN_KV          a fifth real arm, real-pin: LEAN, flag 1, timing 5000, plus this env (';'-separated,
 #                                   e.g. VLLM_HPU_WORKER_CPU_PIN=1), last
+#   BRIDGE_PIN_PLACE / PIN_PLACE    a placement script (a path inside the container, e.g. /results/bench/place.sh)
+#                                   that place_wrap.sh runs once the pin arm's server is healthy; the pin arm then
+#                                   runs in a call of its own (even with PIN_KV empty)
 set -u
 IMG="${1:?image}"
 P="${2:?probe dir inside the container, e.g. /results/bench/intprobe4}"
@@ -28,11 +31,13 @@ L="${4:?LEAN build id}"
 S="${5:-$(basename "$(readlink "$HOME/farm/${CARDQ_TRACK:?}/current")")}"
 RB_KV="${BRIDGE_REBUILD_KV:-PT_HPU_HPUGRAPH_REPLAY_TIMING=0}"
 PIN_KV="${BRIDGE_PIN_KV:-}"
+PIN_PLACE="${BRIDGE_PIN_PLACE:-}"
 LATE="$HOME/farm/collectives/bridge/late/${CARDQ_JOB:-none}.env"
 if [ -s "$LATE" ]; then
     while IFS='=' read -r k v; do
-        case "$v" in *[!A-Za-z0-9._,\;=-]*) echo "bridge_vendor: ignored a bad value in $LATE: $k"; continue ;; esac
-        case "$k" in REBUILD) [ -n "$v" ] && RB="$v" ;; REBUILD_KV) RB_KV="$v" ;; PIN_KV) PIN_KV="$v" ;; esac
+        case "$v" in *[!A-Za-z0-9._,\;=/-]*) echo "bridge_vendor: ignored a bad value in $LATE: $k"; continue ;; esac
+        case "$k" in REBUILD) [ -n "$v" ] && RB="$v" ;; REBUILD_KV) RB_KV="$v" ;; PIN_KV) PIN_KV="$v" ;;
+            PIN_PLACE) PIN_PLACE="$v" ;; esac
     done <"$LATE"
     echo "bridge_vendor: late-bound settings from $LATE"
 fi
@@ -96,9 +101,15 @@ MORE=()
 grep -q '^tiny-rebuild ok' "$V" && MORE+=("real-rebuild:$RB:$RB_KV$SPINKV")
 if grep -q '^tiny-lean ok' "$V"; then
     MORE+=("real-lean:$L:PT_HPU_HPUGRAPH_PREPARED_REPLAY=1;PT_HPU_HPUGRAPH_REPLAY_TIMING=5000$SPINKV")
-    [ -z "$PIN_KV" ] || MORE+=("real-pin:$L:PT_HPU_HPUGRAPH_PREPARED_REPLAY=1;PT_HPU_HPUGRAPH_REPLAY_TIMING=5000;$PIN_KV$SPINKV")
+    if [ -n "$PIN_KV" ] && [ -z "$PIN_PLACE" ]; then
+        MORE+=("real-pin:$L:PT_HPU_HPUGRAPH_PREPARED_REPLAY=1;PT_HPU_HPUGRAPH_REPLAY_TIMING=5000;$PIN_KV$SPINKV")
+    fi
 fi
 [ ${#MORE[@]} -eq 0 ] || bash "$J" --sha "$S" --image "$IMG" "${ENV[@]}" --cmd "$PROBE" "${MORE[@]}"
+if [ -n "$PIN_PLACE" ] && grep -q '^tiny-lean ok' "$V"; then
+    bash "$J" --sha "$S" --image "$IMG" "${ENV[@]}" --cmd "bash /results/bench/place_wrap.sh $PIN_PLACE -- $PROBE" \
+        "real-pin:$L:PT_HPU_HPUGRAPH_PREPARED_REPLAY=1;PT_HPU_HPUGRAPH_REPLAY_TIMING=5000${PIN_KV:+;$PIN_KV}$SPINKV"
+fi
 echo "bridge_vendor: verdicts:"
 cat "$V"
 ! grep -q ' fail' "$V"
