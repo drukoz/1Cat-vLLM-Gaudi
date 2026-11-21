@@ -52,7 +52,10 @@ after the next horizontal rule are history (06:50 UTC and before).
     4. `mtp2-async-cuts-chainsw`: on-md, chain-md, vlg, chain-vlg, all, chain-all on one server.
     5. `tiny-m1` and `mtp2-async-cuts-m1sw`: async-sched's M1, 0 against 2, with the chain on.
   - Placement: async-sched's switch, through the hard link `~/farm/mtp-draft-graph/results/switches/place`.
-  - Arms can be changed late with `~/farm/mtp-draft-graph/results/late/run-chain.sh`.
+  - Late-bound (coordinator 09:50 UTC): `~/farm/mtp-draft-graph/results/late/run-chain.sh` on the node exports
+    `VLLM_HPU_MOE_DENSE_MIN_TOKENS=1` (the new serve baseline: the dense MoE form from 1 token, kernel-fixes'
+    00213) for the whole job, then runs the arms as submitted. Remove that file after 00230, or a later job of
+    this track with the same wrapper picks it up.
   - async-sched builds its M2 job on `ea1715fa` or `915d8863` (the same code).
 - **What to read when 00230 ends** (`bin/farm fetch mtp-draft-graph 00230 00230-real8-chain-b5b` if no waiter
   copied it):
