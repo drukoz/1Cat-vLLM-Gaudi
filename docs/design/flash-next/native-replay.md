@@ -833,8 +833,11 @@ all-reduces already split every layer).
 3. **lean3t** (`lean3t-412153bbab3e`, `patches/lean3t.patch`: lean2 plus the sub-timers of section 7.10, printed after
    the tensor counts as `| sub in_registry .. in_refs .. in_waits .. in_future .. in_streamwait .. syn_mem ..
    syn_workspace .. syn_lock .. syn_trace .. syn_call .. syn_after .. patch_alloc .. patch_table .. patch_info ..
-   post_holder .. post_events .. post_record .. post_coll ..`; nested, not in the phase sum) builds from 03:3x UTC (node
-   pid 3387075, log `out-logs/lean3t-412153bbab3e.log`). `probes/replay_timing.py` prints the sub-phases; the collectives
+   post_holder .. post_events .. post_record .. post_coll ..`; nested, not in the phase sum) **published 03:34:04 UTC**
+   (7 min incremental; VERIFIED in the wheel: the sub-timer strings in the backend .so, `ReleaseLaunchState` in all
+   three .so files; the bridge clone's local branch `native-replay-lean` commit 6edcb0f = this patch). Sent to the
+   collectives track at 03:35 UTC with two options: swap it into 00180 instead of lean2 (same prepared path), or a
+   separate job with the arms below. `probes/replay_timing.py` prints the sub-phases; the collectives
    track's parser reads them as `sub_*`. Arms to ask for (collectives track places the job): tiny-lean3t and
    tiny-lean3t-inline (tokens), real-lean3t and real-lean3t-inline (`PT_HPU_DISABLE_ASYNC_COLLECTIVE=1`, VERIFIED in
    `habana_kernels/hccl_kernels.cpp:354`: the collective runs inline instead of `JobThreadLazyHCCL::addJob` +
