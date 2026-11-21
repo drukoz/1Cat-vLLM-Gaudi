@@ -311,6 +311,9 @@ def main():
                       m["aggregate_tok_s"] or 0), flush=True)
         else:
             print("MINTOK N=%d FAILED: %s" % (n, m.get("error_samples")), flush=True)
+    if not args.interleave_sampled:
+        for n in (sampled_levels if levels and not args.no_sampled_check else []):
+            sampled_level(n)
     if args.ctx:
         n, ctx = (int(x) for x in args.ctx.split(":"))
         w = run_round(args, n, args.warm_tokens, ctx, salt="Warm round. ")
@@ -326,9 +329,6 @@ def main():
                       w.get("ttft_p50_s")), flush=True)
         else:
             print("CTX FAILED: %s" % m.get("error_samples"), flush=True)
-    if not args.interleave_sampled:
-        for n in (sampled_levels if levels and not args.no_sampled_check else []):
-            sampled_level(n)
     save()
     return 0
 

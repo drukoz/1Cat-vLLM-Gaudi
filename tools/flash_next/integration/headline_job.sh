@@ -45,8 +45,8 @@
 # and two at the top level, as in job 00128), HEADLINE_LEVELS (default 32,8,1: the 32-stream numbers first),
 # HEADLINE_MTP_SAMPLED=1 (the MTP server with VLLM_HPU_SPEC_SAMPLED_VERIFY=1 and a SAMPLED 32-stream level last;
 # HEADLINE_MTP_SAMPLED_LEVELS), HEADLINE_MTP_CTX=N:TOKENS (one greedy round of N streams with long prompts on
-# the MTP server, after its short greedy levels and before its sampled levels), HEADLINE_TINY_SPEC=K (the tiny gate
-# with --spec K). MTP arms are mtp<K>
+# the MTP server, at the very end: a long-prompt crash (spec-lookup 00133) must not cost the sampled rounds),
+# HEADLINE_TINY_SPEC=K (the tiny gate with --spec K). MTP arms are mtp<K>
 # (k = K drafted tokens), mtp<K>-32 (32 streams only) and mtp<K>-noshard.
 # Results: $FARM_OUT/<arm>/ (versions.txt, server0.log, scaling.json, probe.log, summary.json) and
 # $FARM_OUT/headline.md + headline.json (headline_table.py), written after every arm.
