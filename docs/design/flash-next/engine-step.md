@@ -595,8 +595,10 @@ step while the host works.
 - **The lean5 A/B of the persistent inputs:** collectives runs `VLLM_HPU_PERSISTENT_INPUTS=1` against `=0` on one
   image with lean5 on (its ab_bridge template), build 6 preferred, this track's image only if the coordinator or
   collectives says so (do not sync it for this unasked). Best on native-replay's `lean6m-43fdd6850644` with
-  `PT_HPU_HPUGRAPH_STATIC_PLAN_MISS_LOG=200`: `HPUGRAPH_PLAN_MISS` lines per launcher, `input_moved` and
-  `first_input <idx> <dtype[shape]>` name the inputs that still move.
+  `PT_HPU_HPUGRAPH_STATIC_PLAN_MISS_LOG=200` (needs `PT_HPU_HPUGRAPH_PREPARED_REPLAY=1
+  PT_HPU_HPUGRAPH_PREPARED_REUSE=1 PT_HPU_HPUGRAPH_STATIC_PLAN=1`; it also has lean6h2's H2D timer):
+  `HPUGRAPH_PLAN_MISS` lines per launcher, `input_moved` and `first_input <idx> <dtype[shape]>` name the inputs that
+  still move. 00210's lean6m verify arm (without this flag) is the baseline.
 - **A regression of this track on the program branch, being fixed:** the PR 16 merge resolution (`fe4cac24`, in
   PR 20) computed the block table's width before the sparse / dense branch; stub runners without
   `_block_table_max_blocks` fail (`tests/unit_tests/worker/test_flash_next_host_ngram.py`, 4 tests; served models
