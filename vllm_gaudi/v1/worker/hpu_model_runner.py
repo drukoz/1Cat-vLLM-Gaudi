@@ -39,6 +39,7 @@ from vllm_gaudi.v1.core.recurrent_state_pool import pool_pad_block_id, pool_slot
 from vllm_gaudi.v1.worker.hpu_dp_utils import set_hpu_dp_metadata
 from vllm_gaudi.v1.worker.gdn_state_layout import has_contiguous_dflash_checkpoints
 from vllm_gaudi.v1.worker.gc_control import GcControl
+from vllm_gaudi.v1.worker.persistent_inputs import PersistentInputs
 from vllm_gaudi.v1.worker.flash_next_inputs import (build_block_table, build_ple_inputs, decode_block_table_width,
                                                     dummy_ple_inputs,
                                                     model_requires_block_table, model_requires_raw_input_tokens)
@@ -4641,8 +4642,24 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         from vllm_gaudi.models.qwen4_exp.ple_ops import host_ngram_ids
         return query_start_loc, ngram_context, host_ngram_ids(tables, token_ids, query_start_loc, ngram_context)
 
+    _persistent_inputs = None
+
+    def _upload(self, name: str, source, dtype=None):
+        """One per-step input to the device. ``VLLM_HPU_PERSISTENT_INPUTS=1``: into a persistent device tensor per
+        (name, shape, dtype), from a persistent pinned host tensor, non-blocking (persistent_inputs.py; two
+        alternating pairs under async scheduling). Otherwise ``async_h2d_copy`` as before (a tensor keeps its dtype)."""
+        if isinstance(source, torch.Tensor):
+            dtype = None  # as async_h2d_copy: a tensor is copied as it is
+        if not gaudi_envs.VLLM_HPU_PERSISTENT_INPUTS:
+            return async_h2d_copy(source, dtype=dtype, device=self.device)
+        inputs = self._persistent_inputs
+        if inputs is None:
+            inputs = self._persistent_inputs = PersistentInputs(self.device, self.pin_memory,
+                                                                buffers=2 if self.use_async_scheduling else 1)
+        return inputs.upload(name, source, dtype)
+
     @staticmethod
-    def _ple_forward_kwargs(ple_inputs, device) -> dict:
+    def _ple_forward_kwargs(ple_inputs, device, upload=None) -> dict:
         """The Flash-Next PLE model inputs of one forward (models with ``requires_raw_input_tokens``).
 
         ``(query_start_loc, ngram_context)`` goes out under those two names. With the host n-gram ids as a third
@@ -4650,12 +4667,17 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         model puts the ids where the PLE layers expect the context (``_MtpTargetOutputs.forward``). All are int32
         tensors, hashed by their metadata, with one shape per bucket.
         """
-        kwargs = {"query_start_loc": async_h2d_copy(ple_inputs[0], dtype=torch.int32, device=device)}
+        if upload is None:  # ``upload(name, source, dtype)``: the runner's _upload (VLLM_HPU_PERSISTENT_INPUTS)
+
+            def upload(_name, source, dtype):
+                return async_h2d_copy(source, dtype=dtype, device=device)
+
+        kwargs = {"query_start_loc": upload("ple_query_start_loc", ple_inputs[0], torch.int32)}
         if len(ple_inputs) > 2:
             from vllm_gaudi.models.qwen4_exp.ple_ops import HOST_NGRAM_IDS_KWARG
-            kwargs[HOST_NGRAM_IDS_KWARG] = async_h2d_copy(ple_inputs[2], dtype=torch.int32, device=device)
+            kwargs[HOST_NGRAM_IDS_KWARG] = upload("ple_ngram_ids", ple_inputs[2], torch.int32)
         else:
-            kwargs["ngram_context"] = async_h2d_copy(ple_inputs[1], dtype=torch.int32, device=device)
+            kwargs["ngram_context"] = upload("ple_ngram_context", ple_inputs[1], torch.int32)
         return kwargs
 
     def _form_prefill_batch(self, contents):
@@ -5237,13 +5259,12 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
 
         logits_indices[:num_decodes] = query_start_loc_cpu[1:num_decodes + 1] - 1
 
-        positions_device = async_h2d_copy(positions, dtype=position_dtype, device=self.device)
-        # VLLM_HPU_QSA_TABLE_WIDTH=1: as wide as the batch's longest request needs, not as the engine's longest
-        # context (the QSA indexer scores every column's keys); the same width with the sparse decode metadata.
-        table_width = decode_block_table_width(num_blocks, self._block_table_max_blocks,
-                                               gaudi_envs.VLLM_HPU_QSA_TABLE_WIDTH)
+        positions_device = self._upload("positions", positions, position_dtype)
         if sparse_md:
-            # One row per request (the pages of its last scheduled token), repeated over its verification rows.
+            # One row per request (the pages of its last scheduled token), repeated over its verification rows, as
+            # wide as VLLM_HPU_QSA_TABLE_WIDTH says (the same width as the dense branch's table below).
+            table_width = decode_block_table_width(num_blocks, self._block_table_max_blocks,
+                                                   gaudi_envs.VLLM_HPU_QSA_TABLE_WIDTH)
             block_table_cpu = request_block_table(block_table_cpu_tensor, num_blocks, num_tokens,
                                                   padded_batch_size * num_tokens, table_width, self._PAD_BLOCK_ID)
             block_list = block_groups = block_usage = None
@@ -5252,6 +5273,10 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
 
             block_table_cpu = None
             if getattr(self, '_needs_block_table', False):
+                # VLLM_HPU_QSA_TABLE_WIDTH=1: as wide as the batch's longest request needs, not as the engine's longest
+                # context (the QSA indexer scores every column's keys).
+                table_width = decode_block_table_width(num_blocks, self._block_table_max_blocks,
+                                                       gaudi_envs.VLLM_HPU_QSA_TABLE_WIDTH)
                 block_table_cpu = build_block_table(block_tables_list, padded_batch_size * num_tokens, table_width,
                                                     self._PAD_BLOCK_ID)
 
@@ -5431,15 +5456,13 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                                                 pin_memory=self.pin_memory)
             query_start_loc_p_cpu[1:] = torch.cumsum(seq_lens_cpu.clone().to(dtype=torch.int32), dim=0)
 
-            seq_lens_tensor = async_h2d_copy(seq_lens_cpu, device=self.device)
-            load_indices_tensor = async_h2d_copy(load_state_indices_cpu, device=self.device)
-            store_indices_tensor = async_h2d_copy(store_state_indices_cpu, device=self.device)
+            seq_lens_tensor = self._upload("seq_lens", seq_lens_cpu)
+            load_indices_tensor = self._upload("load_indices", load_state_indices_cpu)
+            store_indices_tensor = self._upload("store_indices", store_state_indices_cpu)
             query_start_loc_p = async_h2d_copy(query_start_loc_p_cpu, dtype=torch.int32)
             if is_recurrent_spec_decode:
-                num_accepted_tokens = async_h2d_copy(
-                    torch.tensor(decode_accepted_padded, dtype=torch.int32),
-                    device=self.device,
-                )
+                num_accepted_tokens = self._upload("num_accepted_tokens",
+                                                   torch.tensor(decode_accepted_padded, dtype=torch.int32))
             else:
                 num_accepted_tokens = None
 
@@ -5455,12 +5478,11 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             recurrent_boundary = None
 
         # CPU<>HPU sync *should not* happen here.
-        block_list_device = async_h2d_copy(block_list, device=self.device) if block_list is not None else None
-        block_usage_device = async_h2d_copy(block_usage, device=self.device) if block_usage is not None else None
-        block_groups_device = async_h2d_copy(block_groups, device=self.device) if block_groups is not None else None
-        block_table_device = async_h2d_copy(block_table_cpu, device=self.device) \
-            if block_table_cpu is not None else None
-        slot_mapping_device = async_h2d_copy(slot_mapping, device=self.device)
+        block_list_device = self._upload("block_list", block_list) if block_list is not None else None
+        block_usage_device = self._upload("block_usage", block_usage) if block_usage is not None else None
+        block_groups_device = self._upload("block_groups", block_groups) if block_groups is not None else None
+        block_table_device = self._upload("block_table", block_table_cpu) if block_table_cpu is not None else None
+        slot_mapping_device = self._upload("slot_mapping", slot_mapping)
         window_block_list_device = async_h2d_copy(window_block_list,
                                                   device=self.device) if self.interleaved_sliding_window else None
         window_block_usage_device = async_h2d_copy(window_block_usage,
@@ -5474,7 +5496,7 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         chunked_block_groups_device = async_h2d_copy(chunked_block_groups,
                                                      device=self.device) if self.model_has_chunked_attention else None
 
-        token_ids_device = async_h2d_copy(token_ids, device=self.device)
+        token_ids_device = self._upload("token_ids", token_ids)
         # when DP also enabled, some DP ranks will exeucte dummy run with empty
         # SchedulerOutput, in this case we need skip the prepare_input_ids
         if self.use_async_scheduling and scheduler_output is not None:
@@ -5506,7 +5528,7 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                                                                                     token_ids_device, num_tokens)
         else:
             spec_decode_metadata = None
-        logits_indices_device = async_h2d_copy(logits_indices, device=self.device)
+        logits_indices_device = self._upload("logits_indices", logits_indices)
 
         draft_block_table = None
         if (spec_decode_metadata is not None and gaudi_envs.VLLM_HPU_DFLASH2_DEVICE_PREPARE
@@ -5666,17 +5688,14 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             cu_num_draft_tokens, arange = self._get_cumsum_and_arange(num_draft_tokens, cumsum_dtype=np.int32)
 
             # TODO: Optimize the CPU -> GPU copy.
-            cu_num_draft_tokens = torch.from_numpy(cu_num_draft_tokens).to(self.device, non_blocking=True)
-            cu_num_sampled_tokens = torch.from_numpy(cu_num_sampled_tokens).to(self.device, non_blocking=True)
+            cu_num_draft_tokens = self._upload("cu_num_draft_tokens", torch.from_numpy(cu_num_draft_tokens))
+            cu_num_sampled_tokens = self._upload("cu_num_sampled_tokens", torch.from_numpy(cu_num_sampled_tokens))
 
             ##################################################
             logits_indices = torch.from_numpy(logits_indices)
-            target_logits_indices_device = \
-                torch.from_numpy(target_logits_indices).to(
-                self.device, non_blocking=True)
-            bonus_logits_indices_device = \
-                torch.from_numpy(bonus_logits_indices).to(
-                self.device, non_blocking=True)
+            target_logits_indices_device = self._upload("target_logits_indices",
+                                                        torch.from_numpy(target_logits_indices))
+            bonus_logits_indices_device = self._upload("bonus_logits_indices", torch.from_numpy(bonus_logits_indices))
             draft_token_ids = token_ids_device[target_logits_indices_device + 1]
 
             spec_decode_metadata = SpecDecodeMetadata(
@@ -5874,7 +5893,8 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             additional_kwargs.update({"model_has_chunked_attention": True})
         if ple_inputs is not None:
             # Flash-Next PLE layer kwargs (models with requires_raw_input_tokens).
-            additional_kwargs.update(self._ple_forward_kwargs(ple_inputs, self.device))
+            additional_kwargs.update(self._ple_forward_kwargs(
+                ple_inputs, self.device, self._upload if gaudi_envs.VLLM_HPU_PERSISTENT_INPUTS else None))
         trimmed_attn_metadata = attn_metadata if framework_attn_metadata else trim_attn_metadata(attn_metadata)
         if self.is_driver_worker:
             model_event_name = ("model_forward_"
