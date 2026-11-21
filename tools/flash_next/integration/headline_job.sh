@@ -119,8 +119,8 @@ done
 #          and warm-up keep every CPU (00189: the pin flag doubled the time to the first throughput line). The
 #          placement's output: <arm>/placement.log. The scripts: /results/late/place/{place_wrap.sh,place.sh} when
 #          both exist (late-bound), else this kit's place/ copies (place_wrap.sh md5 7b159d11 = collectives' 98213f8c,
-#          which also widens its mask to the cgroup cpuset; place.sh 816292de = native-replay 3a733c26, which moves
-#          only the server's own process tree);
+#          which also widens its mask to the cgroup cpuset; place.sh 44273de4 = native-replay ba96f64b, which keeps
+#          shells and the server's ancestors on the whole set);
 #          HEADLINE_PLACE_WRAP / HEADLINE_PLACE_SCRIPT override. The tiny gate is not placed.
 #   pin3   (or "on") every server of the job, the tiny gate too, with VLLM_HPU_WORKER_CPU_PIN=3
 #          (native-replay's pin with the model thread's sibling kept free; restricts the load to the worker's share)
