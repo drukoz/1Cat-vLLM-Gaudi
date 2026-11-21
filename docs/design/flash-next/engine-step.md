@@ -692,10 +692,12 @@ step while the host works.
 - **The nine step-level cuts under the chain and VLG (MEASURED, mtp-draft-graph's 00230 `tiny-chain-vlg`, TP8 tiny,
   k = 2, `window.py` on one rank, 44 steady steps):** a chained step is the verify replay and the chain graph's replay
   with nothing pending, one 3-op launch before the verify (`cast add index`, the PLE input path: gone with
-  `PLE_HOST_NGRAM_IDS=1` in 00235), and one `bindings-synchronize_device` (a `torch.hpu.synchronize()`, asked
-  mtp-draft-graph where). Of 00223's nine, (3) the post-verify logits flush, (4) the sampler launch, (5)-(8) the
-  draft prep launches and per-pass replays and (6) the draft positions' read are gone; the two host reads fold into
-  the one sync. mtp-draft-graph's card numbers (same server): chain-vlg -6.0 % at 32 streams, -9.7 % at 1 stream; VLG
+  `PLE_HOST_NGRAM_IDS=1` in 00235), a 4- to 5-tensor copy flush before the chain replay, and the read of the chain's
+  `sampled` output (a graph output: no `d2h_maybe_eval`). The gate's one `bindings-synchronize_device` per step is
+  this track's MTP step timer (`VLLM_HPU_MTP_TIMING=2`: `MtpStepTimer.draft_end()` does mark_step + synchronize every
+  step), not the chain: read logs taken under the timer without it. Of 00223's nine, (3) the post-verify logits
+  flush, (4) the sampler launch, (5)-(8) the draft prep launches and per-pass replays and (6) the draft positions'
+  read are gone; the two host reads become the read of `sampled`. mtp-draft-graph's card numbers (same server): chain-vlg -6.0 % at 32 streams, -9.7 % at 1 stream; VLG
   alone -0.6 ms at 32 streams, flat at 1 stream. `runner._verify_ids_raw` (`bd2e731b`, kvargs branch) lets the chain
   take the verify ids unviewed (its fifth copied input).
 - **`VLLM_HPU_VOCAB_PARALLEL_LOGITS` was not exact on the card (coordinator 12:55 UTC, from mtp-draft-graph's 00230;
