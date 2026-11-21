@@ -436,3 +436,29 @@ def test_requests_after_a_block_committed_during_speculative_decode(engine_runs)
     # Turn 3's prefix-cache hit: 0 on this build with or without MTP (prompt chunks end at the engine's block, not
     # the recurrent block: prefill's VLLM_HPU_PREFIX_ALIGN_SPLIT, BRIEF 23:46)
     assert spec["prompts"][2]["num_cached_tokens"] == base["prompts"][2]["num_cached_tokens"]
+
+
+def test_per_step_timing_records_through_the_runner(engine_runs, tmp_path):
+    """``VLLM_HPU_MTP_TIMING=2`` through the runner (``mtp_step_timer.py``): one record per speculative step, with its
+    rows and, per decode request, the tokens it committed in the step (the oracle's forced count plus one) and in its
+    previous step."""
+    path = tmp_path / "timing.oracle.json"
+    path.write_text(json.dumps({"streams": engine_runs["base"]["prompts"], "accept": [2, 0, 3, 1]}), encoding="utf-8")
+    hpu_cpu_engine.run(engine_runs["ckpt"], tmp_path / "timing.json", "--k", str(K), "--oracle", str(path),
+                       env={"VLLM_HPU_MTP_TIMING": "2"}, cwd=tmp_path)
+    files = list(tmp_path.glob("mtp_step_record_r*.jsonl"))
+    assert len(files) == 1, files
+    records = [json.loads(line) for line in files[0].read_text(encoding="utf-8").splitlines()]
+    verify = [r for r in records if r["kind"] == "verify"]
+    assert verify and max(r["rows"] for r in verify) == 1 + K
+    assert all(r["rows"] <= r["requests"] * (1 + K) and r["verify_ms"] > 0 and r["draft_ms"] > 0 for r in verify)
+    seen = set()
+    for r in verify:
+        seen |= set(r["committed"])
+    assert seen <= {str(n) for n in range(1, K + 2)} and {"1", str(K + 1)} <= seen  # accept 0 and accept k ran
+    chained = 0
+    for before, after in zip(verify, verify[1:]):  # one request at a time: its steps follow each other
+        if after["prev_committed"] != {"none": 1}:
+            assert after["prev_committed"] == before["committed"], (before, after)
+            chained += 1
+    assert chained >= len(verify) // 2

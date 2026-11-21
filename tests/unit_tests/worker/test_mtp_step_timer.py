@@ -115,3 +115,96 @@ def test_from_env_is_none_by_default_and_a_timer_with_the_flag(monkeypatch, tmp_
     assert isinstance(timer, MtpStepTimer) and timer.rank == 3
     assert timer.log is None and timer.device_wait is None  # only the driver logs; a CPU device waits for nothing
     assert os.path.dirname(timer.path) == str(tmp_path)
+
+
+def test_per_step_records_with_the_tokens_committed_in_the_step_and_the_one_before(tmp_path):
+    """VLLM_HPU_MTP_TIMING=2: one line per step; ``prev_committed`` is each request's count of its previous step."""
+    clock = Clock()
+    timer = MtpStepTimer(clock=clock, every=25, directory=str(tmp_path), per_step=True)
+
+    def step(req_ids, counts, verify, draft, rows=8, kind="verify"):
+        timer.step_start()
+        timer.step_tokens(req_ids, counts)
+        clock.advance(verify)
+        timer.draft_start(kind, rows, len(req_ids), 3)
+        clock.advance(draft)
+        timer.draft_end()
+
+    step(["a", "b"], [3, 1], verify=50.0, draft=12.0)
+    step(["a", "b"], [1, 4], verify=70.0, draft=11.0)
+    step([], [], verify=30.0, draft=5.0, rows=128, kind="prefill")  # no decodes: the counts of a and b are kept
+    step(["a", "c"], [2, 0], verify=55.0, draft=10.0)  # c is new; 0: not known (async scheduling)
+    lines = [json.loads(line) for line in open(timer.step_path).read().splitlines()]
+    assert [line["step"] for line in lines] == [0, 1, 2, 3]
+    assert lines[0]["committed"] == {"3": 1, "1": 1} and lines[0]["prev_committed"] == {"none": 2}
+    assert lines[0]["verify_ms"] == pytest.approx(50.0) and lines[0]["draft_ms"] == pytest.approx(12.0)
+    assert lines[0]["rows"] == 8 and lines[0]["requests"] == 2 and lines[0]["k"] == 3 and lines[0]["kind"] == "verify"
+    assert lines[1]["committed"] == {"1": 1, "4": 1} and lines[1]["prev_committed"] == {"3": 1, "1": 1}
+    assert lines[2]["kind"] == "prefill" and lines[2]["committed"] == {} and lines[2]["prev_committed"] == {}
+    assert lines[3]["committed"] == {"2": 1, "none": 1} and lines[3]["prev_committed"] == {"1": 1, "none": 1}
+    assert lines[3]["verify_ms"] == pytest.approx(55.0)
+    assert not os.path.exists(timer.path)  # the 25-step means are written as before, at 25 steps of a key
+
+
+def test_no_per_step_records_without_the_mode(tmp_path):
+    clock = Clock()
+    timer = MtpStepTimer(clock=clock, every=1, directory=str(tmp_path))
+    timer.step_start()
+    timer.step_tokens(["a"], [2])  # ignored without per_step
+    timer.draft_start("verify", 4, 1, 3)
+    timer.draft_end()
+    assert os.path.exists(timer.path) and not os.path.exists(timer.step_path)
+    timer.per_step = True
+    timer.step_tokens(["a"], [2])  # outside a step: ignored
+    assert timer._committed is None
+
+
+def test_from_env_mode_two_records_every_step(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("VLLM_HPU_MTP_TIMING", "1")
+    assert mtp_step_timer.from_env(device_type="cpu").per_step is False
+    monkeypatch.setenv("VLLM_HPU_MTP_TIMING", "2")
+    timer = mtp_step_timer.from_env(rank=2, device_type="cpu")
+    assert timer.per_step is True
+    assert os.path.basename(timer.step_path) == "mtp_step_record_r2_%d.jsonl" % os.getpid()
+    assert os.path.dirname(timer.step_path) == str(tmp_path)
+    monkeypatch.setenv("VLLM_HPU_MTP_TIMING", "3")
+    assert mtp_step_timer.from_env(device_type="cpu") is None
+
+
+def test_per_step_records_carry_the_replay_calls_laps_and_collector_pauses(tmp_path, monkeypatch):
+    """VLLM_HPU_MTP_TIMING=2 also records the wall clock, the target forward's replay calls (runner replay()), the
+    draft's laps, VLLM_HPU_WORKER_GC_FREEZE and the collector's pauses of the step."""
+
+    class Pauses:
+        def __init__(self):
+            self.ms, self.gen2, self.collections, self.resets = 0.0, 0, 0, 0
+
+        def reset(self):
+            self.resets += 1
+            self.ms, self.gen2, self.collections = 0.0, 0, 0
+
+    clock = Clock()
+    timer = MtpStepTimer(clock=clock, every=25, directory=str(tmp_path), per_step=True)
+    timer.gc_pauses = Pauses()
+    monkeypatch.setenv("VLLM_HPU_WORKER_GC_FREEZE", "1")
+    timer.replay(0.5)  # outside a step: ignored
+    timer.step_start()
+    timer.step_tokens(["a"], [2])
+    clock.advance(6.0)  # input preparation, then a 20 ms replay call ending now
+    clock.advance(20.0)
+    timer.replay(0.020)
+    timer.replay(0.004)
+    timer.gc_pauses.ms, timer.gc_pauses.gen2, timer.gc_pauses.collections = 7.5, 1, 3
+    clock.advance(14.0)
+    timer.draft_start("verify", 3, 1, 2)
+    clock.advance(3.0)
+    timer.lap("pass0")
+    clock.advance(5.0)
+    timer.draft_end()
+    line = json.loads(open(timer.step_path).read().splitlines()[0])
+    assert line["replay_ms"] == pytest.approx(24.0) and line["replays"] == 2
+    assert line["replay_first_ms"] == pytest.approx(6.0) and line["verify_ms"] == pytest.approx(40.0)
+    assert line["laps"]["pass0"] == pytest.approx(3.0) and line["laps"]["final_wait"] == pytest.approx(5.0)
+    assert line["gc_freeze"] == 1 and line["gc_ms"] == 7.5 and line["gc_gen2"] == 1 and line["gc_collections"] == 3
+    assert isinstance(line["t"], float) and timer.gc_pauses.resets == 1
