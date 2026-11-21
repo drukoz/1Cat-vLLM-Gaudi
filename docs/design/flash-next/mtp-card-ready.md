@@ -218,6 +218,26 @@ short-prompt numbers.
 6. Merge proven steps per the protocol: merge `origin/feat/flash-next-gaudi` into the branch (one conflict, in
    `hpu_flash_next_mtp.py`), `bin/gate <worktree> --tools`, PR to `feat/flash-next-gaudi`.
 
+## I07, sampled verification: what is built and where it should end
+
+- `VLLM_HPU_SPEC_SAMPLED_VERIFY=1` (exact, `hpu_rejection_sampler.sampled_rejection_sample`): card-proven in 00126 (TP4,
+  coherent sampled texts, acceptance length 2.62 at 1 stream, 2.23 at 32), but about 26 ms per step at k = 3 (13 at
+  k = 1), mostly upstream's RejectionSampler / Sampler pass: the one-card cost of the rejection maths is 5.4 ms at 4
+  rows and 27.6 ms at 128 rows (00135).
+- `=2` (`hpu_candidate_verify.py`): the same distribution over the top-64 candidates after the logits all-gather,
+  13.3 ms at 128 rows on one card (00135); skips upstream's sampler pass. Real-model run pending (00138, integration
+  build 2).
+- **End state (proposed to engine-step, 00:47 UTC):** for arg-max drafts (MTP), speculative sampling equals "sample
+  every verification row and the bonus row from the target distribution, each with its own noise, then the greedy
+  rejection on the sampled tokens". Proof: with q one-hot at d, speculative sampling accepts with p(d) and on a
+  rejection draws from p without d; a draw y ~ p accepted when y = d gives P(accept) = p(d) and
+  P(y = x | y != d) = p(x) / (1 - p(d)); rows are independent. So engine-step's sampled region
+  (`VLLM_HPU_CANDIDATE_SAMPLING=1`, candidates inside the compiled LM-head region, vocabulary-parallel in its candvp
+  form) can serve a verification step: expand the request parameters to rows (row r is request r // (1 + k) in the
+  HPU's padded layout), one noise row per row, return the per-row tokens as `fused_sampled_token_ids`; the runner's
+  spec branch already hands them to `greedy_rejection_sample_from_tokens` (PR 13). Sampled verification would then
+  cost about what greedy verification costs. Card check needed: the first-draft acceptance against p(d).
+
 ## Card results
 
 | Job | What | Result |
