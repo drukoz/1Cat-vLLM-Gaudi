@@ -377,6 +377,15 @@ expert and row). On the real model (TP8, MTP k = 3, job 00177) the first form of
 this path, without the minimum and with an fp32 weighted sum, was slower than
 the vendor op; keep it off until a later A/B shows otherwise.
 
+`VLLM_HPU_MOE_ROUTE_STATS` (a folder, default unset) is for statistics jobs only.
+With `VLLM_HPU_MOE_DENSE=1`, every per-channel FP8 MoE op writes the per-expert
+pair counts of its last call (its local experts, then the call's row count)
+into one row of a process-wide buffer inside its graph, and the runner appends
+the buffer to `<folder>/rank<r>.jsonl` after every step (one device-to-host
+read per step, so the step times of such a run are not the served model's).
+It measures the real router's per-expert load (`tools/flash_next/kernel_probes/
+moe_rt_ab.sh` with `MOE_RT_ROUTE_STATS=1`).
+
 `VLLM_HPU_MOE_GLUE_MERGE_GATE_UP` (integer, default `0`) applies only with
 `VLLM_HPU_MOE_GLUE=1`. `1` appends the shared expert's gate_up rows of this
 rank to the block's merged gate weight (built once at load, a second

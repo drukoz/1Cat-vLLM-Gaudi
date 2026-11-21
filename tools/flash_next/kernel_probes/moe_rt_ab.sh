@@ -19,6 +19,10 @@
 # or a switch reached no worker's graphs.
 # The kit is copied to /tmp and changed there only: serve_probe.sh adds the profiler setting, decode_scaling.py is the
 # driver.
+# MOE_RT_ROUTE_STATS=1: the servers also log the real router's per-expert pair counts of every MoE call after every
+# step (VLLM_HPU_MOE_ROUTE_STATS=$FARM_OUT/<arm>/<arm>/route_stats/rank<r>.jsonl; read with the workstation's
+# reports/kernel-fixes/tools/route_stats.py). A stats run: one device-to-host read per step, its times are not the
+# served model's.
 # Results: $FARM_OUT/<arm>/<arm>/{moe_rt.json,scaling.json,probe.log,server0.log,trace/}; the probe's lines start
 # with MEAS, TEXT, ACC and "moe_rt:".
 set -u
@@ -89,9 +93,15 @@ for arm in "$@"; do
     profiler='{"profiler": "torch", "torch_profiler_dir": "'"$OUT/$arm/$arm/trace"'", "torch_profiler_with_stack": false,'
     profiler+=' "torch_profiler_use_gzip": true, "torch_profiler_record_shapes": false}'
     echo "=== moe_rt_ab: arm $arm (accuracy $accuracy) $(date -u +%T)"
-    MOE_AB_PROFILER_CONFIG="$profiler" MOE_RT_TRACE_DIR="$OUT/$arm/$arm/trace" MOE_RT_ACCURACY="$accuracy" \
-        VLLM_HPU_STEP_TIMING_DIR="$OUT/$arm/$arm/timing" FARM_OUT="$OUT/$arm" bash "$KIT/headline_job.sh" "$arm"
+    stats=()
+    if [ "${MOE_RT_ROUTE_STATS:-0}" = 1 ]; then stats=(VLLM_HPU_MOE_ROUTE_STATS="$OUT/$arm/$arm/route_stats"); fi
+    env ${stats[@]+"${stats[@]}"} MOE_AB_PROFILER_CONFIG="$profiler" MOE_RT_TRACE_DIR="$OUT/$arm/$arm/trace" \
+        MOE_RT_ACCURACY="$accuracy" VLLM_HPU_STEP_TIMING_DIR="$OUT/$arm/$arm/timing" FARM_OUT="$OUT/$arm" \
+        bash "$KIT/headline_job.sh" "$arm"
     rc=$?
+    if [ ${#stats[@]} -gt 0 ]; then
+        wc -l "$OUT/$arm/$arm/route_stats"/rank*.jsonl 2>/dev/null | sed "s/^/moe_rt_ab: $arm route stats /"
+    fi
     echo "moe_rt_ab: arm $arm ended with exit code $rc $(date -u +%T)"
     [ "$rc" -eq 0 ] || failed=$((failed + 1))
     grep -hE "^(MEAS|TEXT|ACC|moe_rt:|=== moe_rt)" "$OUT/$arm/$arm/probe.log" 2>/dev/null | sed "s/^/moe_rt_ab: $arm: /" | cut -c1-330

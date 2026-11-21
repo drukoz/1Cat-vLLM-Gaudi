@@ -7,6 +7,7 @@ from copy import deepcopy
 import functools
 from functools import partial, wraps
 import itertools
+import json
 import math
 import os
 import time
@@ -6824,6 +6825,25 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             logger.info("Runtime switches: flags read inside the forward changed; captured HPU graphs dropped: %s",
                         ", ".join(self._drop_hpu_graphs()) or "none")
 
+    def _dump_moe_route_stats(self, scheduler_output, num_prefills: int, num_decodes: int) -> None:
+        """VLLM_HPU_MOE_ROUTE_STATS=<folder> (stats jobs only): append one JSON line per step to
+        <folder>/rank<r>.jsonl with every MoE op's per-expert pair counts of its last call and its row count
+        (extension/ops.py ``moe_route_stats_rows``): one device-to-host read per step."""
+        from vllm_gaudi.extension.ops import moe_route_stats_rows  # local to avoid circular import
+
+        rows = moe_route_stats_rows()
+        if rows is None:
+            return
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        spec = getattr(scheduler_output, "scheduled_spec_decode_tokens", None) or {}
+        record = {"t": time.time(), "prefills": int(num_prefills), "decodes": int(num_decodes),
+                  "tokens": int(scheduler_output.total_num_scheduled_tokens),
+                  "spec_tokens": int(sum(len(v) for v in spec.values())), "ops": rows}
+        folder = gaudi_envs.VLLM_HPU_MOE_ROUTE_STATS
+        os.makedirs(folder, exist_ok=True)
+        with open(os.path.join(folder, f"rank{rank}.jsonl"), "a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record) + "\n")
+
     def _drop_hpu_graphs(self) -> list[str]:
         """Drop the captured HPU graphs of the model and of the drafter (``wrap_in_hpu_graph``'s ``clear_cache``).
 
@@ -7742,6 +7762,8 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             ):
                 return async_output.get_output()
             return async_output
+        if gaudi_envs.VLLM_HPU_MOE_ROUTE_STATS and not warmup_mode:
+            self._dump_moe_route_stats(scheduler_output, num_prefills, num_decodes)
         model_runner_output = ModelRunnerOutput(
             req_ids=all_req_ids,
             # A copy: under async scheduling with speculation the engine reads it after the next step's state update.

@@ -557,6 +557,7 @@ if TYPE_CHECKING:
     VLLM_HPU_MOE_DENSE: int = 0  # 0 vendor MoE op (default), 1 dense batched FP8 experts up to MAX_TOKENS rows
     VLLM_HPU_MOE_DENSE_MAX_TOKENS: int = 512  # with VLLM_HPU_MOE_DENSE=1: the most tokens a step runs dense
     VLLM_HPU_MOE_DENSE_MIN_TOKENS: int = 17  # with VLLM_HPU_MOE_DENSE=1: the fewest tokens a step runs dense
+    VLLM_HPU_MOE_ROUTE_STATS: str = ""  # a folder: per-step per-expert pair counts of every MoE op (stats jobs)
     VLLM_HPU_COLLECTIVE_MARK_STEP: int = 1  # 1 (default) mark_step() before every HPU collective, 0 none
     VLLM_HPU_DECODE_CUT_INTERVAL: int = 0  # 0 (default) decode keeps the per-layer cuts, N cut every N-th layer
     VLLM_HPU_GRAPH_ASYNC_REPLAY: int = 0  # 0 (default) the model's HPU graph replays synchronously, 1 asynchronously
@@ -2142,6 +2143,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # hit (the dense form reads every local expert: job 00177 lost at 1 stream).
     "VLLM_HPU_MOE_DENSE_MIN_TOKENS":
     lambda: int(os.environ.get("VLLM_HPU_MOE_DENSE_MIN_TOKENS", "17")),
+    # A folder (stats jobs only; default unset = off). With VLLM_HPU_MOE_DENSE=1, every per-channel FP8 MoE op
+    # writes the per-expert pair counts of its last call (local experts, and its row count) into one row of a
+    # process-wide buffer inside its graph, and the runner appends the buffer to <folder>/rank<r>.jsonl after every
+    # step (one device-to-host read per step): the real router's per-expert load, for the grouped-MoE scope.
+    "VLLM_HPU_MOE_ROUTE_STATS":
+    lambda: os.environ.get("VLLM_HPU_MOE_ROUTE_STATS", ""),
 
     # The htorch.core.mark_step() that HpuCommunicator issues before every all-reduce and all-gather
     # (a workaround for a Habana bridge bug with PT_HPU_ENABLE_LAZY_COLLECTIVES). 1 (default) keeps it.
