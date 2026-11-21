@@ -11,7 +11,7 @@ This track's harness refuses report files outside the repository, so the handoff
 
 ## Handoff (if this agent stops)
 
-Last update: **2026-11-21 08:20 UTC** (fourth agent, Opus 5.5; the node was extended to about 00:00 UTC on
+Last update: **2026-11-21 08:32 UTC** (fourth agent, Opus 5.5; the node was extended to about 00:00 UTC on
 2026-11-22). Branch `feat/flash-next-gaudi-engine-step`, head after `bcef8aa5` (merged into the program branch as PR #20;
 code of this track up to `01d66e31`), pushed. A second branch of this track,
 **`feat/flash-next-gaudi-engine-step-mtp-record`** (`2b90707f`, worktree `reports/engine-step/trees/mtp-record`):
@@ -570,6 +570,20 @@ step while the host works.
   (`ring_slots_from_lattice`, pending); passes 1 and 2 the same three plus the two lattice tensors as non-contiguous
   views. The target forward's inputs are all matched. Fix: persistent base tensors into the draft forward and that
   arithmetic inside the captured draft graph, or mtp-draft-graph's one-graph chain (asked the coordinator).
+- **The verify forward's wrapper graphs (coordinator, 08:22 UTC; mtp-draft-graph's follow-up c).** Step 2 of the
+  rank-0 trace in order (`reports/engine-step/probes/trace/seq.py`, `seq_00205d_s2.txt`): inside the replay an
+  "embed" segment and a cast-only "ple" segment that no collective ends, the final hyper-connection mix last; after
+  it the LM head, a 500-op memcpy (the logits all-gather's concatenation) and the rejection sampler (324 ops).
+  - Tail, done on CPU: **`VLLM_HPU_VERIFY_LOGITS_IN_GRAPH=1`** (`844a37f2`, default 0): for a greedy verification
+    step the forward takes the logits indices and returns the selected rows and int32 per-row greedy ids from an
+    fp32 id table (`vocab_parallel.greedy_ids`, card rule 9); the final mix, LM head and arg max are one segment,
+    the runner verifies from the ids; mtp-draft-graph's chain (Stage B) takes the greedy rejection into its graph
+    and reads the ids. CPU: same tokens off and on (n-gram k = 3, oracle drafts), the rejection sampler never runs.
+  - Front: native-replay (bridge source) — every lazy flush during capture ends a segment; stage submission (on by
+    default) switches on at the first data-dependent op and then flushes every 10, 20, 40 ... ops until a host
+    mark_step: the likely cause (INFERRED). qsa-fused's 1-card 00209 tests `PT_HPU_ENABLE_STAGE_SUBMISSION=0` on
+    the MoE layer; integration has an optional build-5 arm (the env and the `step marker due to` grep recipe,
+    08:30 UTC).
 - **Plan (coordinator's order, 08:18 UTC):** (1) name and remove the copy-only graphs (persistent base tensors,
   sliced inside the forward), about 13 launches, 2-4 ms per step (INFERRED); (2) I01 in the serve setting once 00207
   (MTP, 32 streams) and 00169 (32 x 120K) agree (integration got the runtime-switch recipe); (3) last: the packed
