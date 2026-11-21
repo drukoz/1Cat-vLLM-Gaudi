@@ -11,7 +11,7 @@ This track's harness refuses report files outside the repository, so the handoff
 
 ## Handoff (if this agent stops)
 
-Last update: **2026-11-21 12:33 UTC** (fourth agent, Opus 5.5; the node was extended to about 00:00 UTC on
+Last update: **2026-11-21 12:40 UTC** (fourth agent, Opus 5.5; the node was extended to about 00:00 UTC on
 2026-11-22). Branch `feat/flash-next-gaudi-engine-step`, pushed; merged into the program branch up to `bcef8aa5` (PR
 #20); since then, not yet in a PR, all default-off: `ff160409` (`VLLM_HPU_WORKER_GC_FREEZE`), `ca52fa33`
 (`VLLM_HPU_LOG_UNMATCHED_GRAPH_INPUTS`), `844a37f2` (`VLLM_HPU_VERIFY_LOGITS_IN_GRAPH`), `8efc6969`
@@ -29,14 +29,21 @@ passes a device n-gram context (async scheduling's carried rows) through and upl
 own pair, and the persistent inputs' contract written down (section 15; CPU: `test_persistent_inputs` 4,
 `test_persistent_inputs_loop` 2, `test_engine_loop_async` 7 with the flag); `69e0ba41`: the program head `4d66755e`
 (PRs #26 native-replay, #27 async-sched s2) merged in, `SWITCHABLE` and its test the union again (CPU:
-`test_runtime_switches` + `test_persistent_inputs` 7 passed). Next PR: gate of `69e0ba41` in
-`reports/engine-step/merge-wt` (`logs/gate_69e0ba41.log`); integration takes `69e0ba41` (merge, not cherry-picks)
+`test_runtime_switches` + `test_persistent_inputs` 7 passed); `2fa838b0`: the program head `2c84deea` (PR #28, this
+track's block-table width fix, merged 12:20 UTC) merged in, the decode positions' `_upload` kept. Next PR: gate of
+`2fa838b0` in `reports/engine-step/merge-wt` (`logs/gate_2fa838b0.log`). Note: from `4d66755e` (PR #27) the head
+fails `tests/unit_tests/worker/test_flash_next_host_ngram.py` 11 of 22 on `_verify_advance` (stub runners without
+`__init__`); async-sched fixes it with class defaults in its s3 PR (12:35 UTC); integration takes `69e0ba41` (merge, not cherry-picks)
 plus async-sched's s3 `a4f1e896` for build 6 (recipe sent 12:12 UTC); the worker tests by hand at `83a3fa35`
 (`logs/worker_tests_83a3fa35.log`) are as on the program head (9 files need the card, `test_gdn_state_layout` has 1
 card-only test, `test_draft_rank_stats` expects 3 `.topk(`, stale since collectives' `2d644ce9`), the rest green; open
 and merge the PR when the gate is green, then tell the coordinator and async-sched (it adds an async arm with
-`VLLM_HPU_PERSISTENT_INPUTS=1`). A fix branch, `fix/flash-next-gaudi-block-table-width-guard` (`33eb7cb1`, on
-`adbcff30`; still needed on `4f070c75`, merges into it cleanly), waits for its gate (section 15). A second branch of this track,
+`VLLM_HPU_PERSISTENT_INPUTS=1`). The fix branch `fix/flash-next-gaudi-block-table-width-guard` (`33eb7cb1`): gate green (71 files, 0 red),
+merged as PR #28 (`2c84deea`, 12:20 UTC). A side branch, **`feat/flash-next-gaudi-engine-step-kvargs`** (`8b7cb498`, off `69e0ba41`, worktree
+`reports/engine-step/trees/kvargs`): `VLLM_HPU_KV_CACHES_IN_GRAPH_ARGS` (coordinator GO 12:22 UTC; section 15),
+CPU 2 passed, its tiny card gate 00250 (`tools/flash_next/engine_step/tiny_kvargs_gate.sh`); when it passes, hand
+integration the commit for build 6 and merge it into the PR branch. The build-5 card branch `engine-step-int5-card`
+(`daedd894`, worktree `trees/int5`) is the image of 00245 / 00246. A second branch of this track,
 **`feat/flash-next-gaudi-engine-step-mtp-record`** (`2b90707f`, worktree `reports/engine-step/trees/mtp-record`):
 mtp-card-ready's head `7c4d65e3` plus `VLLM_HPU_MTP_TIMING=2` (one record per speculative step, section 14), for
 integration build 4 in place of mtp-card-ready's branch (the timer exists only there). Scratch files, probes and
