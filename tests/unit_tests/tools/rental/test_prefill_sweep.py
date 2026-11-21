@@ -487,3 +487,34 @@ def test_warm_salted_sends_the_turn_again_without_prefix_hits(server, tmp_path):
     sent = [r for r in server.requests if r["max_tokens"] == 4]
     assert "cache_salt" in sent[-1]["fields"] and "cache_salt" not in sent[-2]["fields"]
     assert ps.completion_payload("m", [1], 2, cache_salt="s")["cache_salt"] == "s"
+
+
+def test_agents_take_their_first_context_from_a_list_and_warm_up_before_the_measured_loop(server, tmp_path):
+    """The serving headline: agents at a mix of contexts, a warm-up loop (its compiles stay out of the measured loop)
+    and TTFT percentiles."""
+    code, report, out = run_tool(server, tmp_path, "--plan", "agents", "--agents", "4", "--agent-contexts",
+                                 "1024,3072", "--agent-new-tokens", "256", "--agent-output", "8", "--agent-seconds",
+                                 "1.0", "--agent-warmup-seconds", "0.5", "--canaries", "0")
+    assert code == 0
+    setup, warmup, loop = report["cases"]
+    assert setup["case"] == "agents setup 4x1024..3072"
+    assert sorted(r["sent_tokens"] for r in setup["requests"]) == [1024, 1024, 3072, 3072]
+    assert warmup["setting"].endswith("warm-up") and warmup["agents"]["turns"] >= 4
+    assert loop["case"] == warmup["case"] and not loop["setting"].endswith("warm-up")
+    # the measured loop goes on from the warm-up's conversations: no first turn of a fresh context in it
+    assert min(r["sent_tokens"] for r in loop["requests"]) > 1024 + 8 + 256
+    for key in ("ttft_p50_s", "ttft_p90_s", "ttft_p99_s", "itl_p99_ms", "stream_tokens_per_s_p50"):
+        assert loop["agents"][key] is not None, key
+    assert "TTFT s p50 / p90 / p99" in (out / "prefill_sweep.md").read_text()
+
+
+def test_turn2_salted_resends_the_second_turn_without_prefix_hits(server, tmp_path):
+    code, report, _ = run_tool(server, tmp_path, "--plan", "baseline", "--cold-tokens", "", "--warm-tokens", "",
+                               "--concurrent", "", "--turn2-tokens", "2048", "--turn2-generate", "16",
+                               "--warm-salted", "--shared-prefix", "0", "--canaries", "0", "--case-max-tokens", "4")
+    assert code == 0
+    cases = by_case(report)
+    salted = [name for name in cases if name.startswith("turn2 ") and name.endswith("salted")]
+    assert len(salted) == 1, list(cases)
+    assert cases[salted[0]]["tokens_equal"] in (True, False)
+    assert "cache_salt" in server.requests[-1]["fields"]
