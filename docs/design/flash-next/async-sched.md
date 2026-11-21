@@ -79,8 +79,10 @@ Updated 2026-11-21 09:50 UTC.
       - Waiter: `reports/async-sched/logs/wait_00229.out`; else `bin/farm fetch async-sched 00229 00229-real8-async-m3`.
       - Read: the `tiny-m3` line in the job log; `ab_table.py <dir> --pairs mtp2-async3-cuts-nopc-greedy:mtp2-async-cuts-nopc-greedy`;
         the spans with `timer_spans.py`. The gain shows as prepare and forward issue under the device's busy time.
-  - **Next: M3**, the align-mode pre-step copy and boundary commits from the device acceptance, so mode 3 serves
-    with prefix caching on. Then sampled, with mtp-draft-graph's D2.
+  - M3 is CPU-green (`VLLM_HPU_FLASH_NEXT_SPEC_DEVICE_ALIGN`, section 2.6): mode 3 now serves with prefix caching on.
+    PR #25 (modes 1 and 2) is merged into the program head as `4f070c75` (gate 72 files, 0 red).
+  - **Next**: M3's card A/B (with a multi-turn workload, prefix hits on committed blocks), then sampled with
+    mtp-draft-graph's D2.
 - The 1-token prompt note: spec-lookup's `005e1ff9` is not on the program branch yet. When it is, put prompt 0 back
   into `_serve_staggered`.
 
@@ -366,6 +368,24 @@ and 5 after a wait; with prefix caching mode 3 acts as 2), the books in `test_fl
 copy is done when it is issued, so this proves the books, not the overlap; the rehearsal's oracle cannot force
 acceptance under async (it hooks `take_draft_token_ids`, which an async engine never calls), so M2's runs mostly
 accept 0 (M1's oracle runs cover every count).
+
+M3 (VERIFIED on CPU, `VLLM_HPU_FLASH_NEXT_SPEC_DEVICE_ALIGN`, a0f29355): with prefix caching (align mode) a
+verification step's running block is `cdiv(ctx + 1 + k, bs) - 1` of its TRUE context, so under mode 3 the host (one
+step behind) cannot make the align mode. On the device, from the step's device positions and the carried state (the
+last step's running block and next load count; seeded from the host's books when the step does not continue the
+last one): the pre-step plan (`align_precopy_plan`'s rule: a copy when the window moved), the copies (conv from
+row[prev] at row offset n - 1, ssm from row[prev + n - 1], into row[curr]; masked rows copy the pad slot onto itself;
+whole rows with one `index_copy_`, never a write through a slice), the recurrent groups' lattices row[curr : curr + 1
++ k] (other groups keep the host's rows) and the load counts; after the step's acceptance (the chain's or the
+stand-in's) the boundary commits of the committed token whose position completes a block (ssm from store[t], conv
+window from store[0] at row offset t) and the self commits (next load count 1). The host's books follow: now on a
+synchronous step, with the async copy (`AsyncSpecModelRunnerOutput`'s extra rows) under mode 3. Tests:
+`tests/unit_tests/worker/test_flash_next_async_align.py` (50: plan, lattices, commits, self commits and both conv
+layouts equal `recurrent_lattice` / `recurrent_commit`), `tests/unit_tests/models/flash_next/test_engine_spec_device_align.py`
+(prefix caching on, 160-token generations crossing 256-token blocks; oracle acceptance: `=1` without a difference,
+`=2` the host's streams; mode 3 with `=2` serves with prefix caching and gives the synchronous streams, the agent's
+next turn included; no copy through a slice). On this build the CPU engine's next turn gets no prefix-cache hit, so the
+committed slots are checked by the unit tests and the check mode, not by a hit (the card's multi-turn probe should).
 
 M1 for mtp-draft-graph's chain card job on build 5: `feat/flash-next-gaudi-async-sched-m1-b5` (28b113fa, 12b7d8c6,
 ad21795c on build 5's 57ca7c31; the M1 flag is read every step, so one server started at `=2` runs the `=0` and
