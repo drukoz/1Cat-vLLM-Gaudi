@@ -84,6 +84,36 @@ for kv in VLLM_HPU_QSA_FUSED=1 VLLM_HPU_QSA_INDEXER_SHARD=1 \
     if [ -z "${!key+x}" ]; then export "$kv"; fi
 done
 
+# async-sched job branch: the sibling-aware placement (native-replay's place.sh, rule a^1 of job 00193, through
+# collectives' place_wrap.sh), switched late: the first word of the switch file, read once here at the job's start
+# (HEADLINE_PLACE_SWITCH, default /results/switches/place = ~/farm/async-sched/results/switches/place on the node),
+# "on" (rule a^1) or a rule ("a^1", "a+N/2") turns it on; "off", anything else or no file: off. On: every server arm
+# runs with VLLM_HPU_WORKER_CPU_PIN=1 (each worker on its share of the CPUs) under
+# /results/bench/place_wrap.sh /results/bench/place.sh (HEADLINE_PLACE_WRAP, HEADLINE_PLACE_SCRIPT), the placement's
+# output in the arm's placement.log.
+PLACE_SWITCH="${HEADLINE_PLACE_SWITCH:-/results/switches/place}"
+PLACE_WRAP="${HEADLINE_PLACE_WRAP:-/results/bench/place_wrap.sh}"
+PLACE_SCRIPT="${HEADLINE_PLACE_SCRIPT:-/results/bench/place.sh}"
+PLACE_RULE=""
+if [ -r "$PLACE_SWITCH" ]; then
+    case "$(awk 'NR == 1 { print $1 }' "$PLACE_SWITCH")" in
+        on) PLACE_RULE="a^1" ;;
+        "a^1") PLACE_RULE="a^1" ;;
+        "a+N/2") PLACE_RULE="a+N/2" ;;
+    esac
+fi
+if [ -n "$PLACE_RULE" ] && { [ ! -r "$PLACE_WRAP" ] || [ ! -r "$PLACE_SCRIPT" ]; }; then
+    echo "headline_job: placement switch on but $PLACE_WRAP or $PLACE_SCRIPT is missing: placement OFF"
+    PLACE_RULE=""
+fi
+if [ -n "$PLACE_RULE" ]; then
+    export VLLM_HPU_WORKER_CPU_PIN=1 PLACE_SIBLING_RULE="$PLACE_RULE"
+    echo "headline_job: placement ON (rule $PLACE_RULE; switch $PLACE_SWITCH; md5" \
+        "$(md5sum "$PLACE_WRAP" "$PLACE_SCRIPT" 2>/dev/null | awk '{ printf "%s %s ", $2, substr($1, 1, 8) }'))"
+else
+    echo "headline_job: placement off (switch $PLACE_SWITCH: $(head -c 40 "$PLACE_SWITCH" 2>/dev/null || echo none))"
+fi
+
 if [ $# -eq 0 ]; then set -- nospec mtp3; fi
 mkdir -p "$OUT"
 
@@ -161,6 +191,19 @@ barrier_args() {
     fi
 }
 
+# placed ARM COMMAND...: one server start (COMMAND), under the placement when the switch turned it on (above).
+placed() {
+    local arm="$1"
+    shift
+    if [ -n "$PLACE_RULE" ]; then
+        mkdir -p "$OUT/$arm"
+        PLACE_ARGS="--log $OUT/$arm/server0.log" PLACE_LOG="$OUT/$arm/placement.log" \
+            bash "$PLACE_WRAP" "$PLACE_SCRIPT" -- "$@"
+    else
+        "$@"
+    fi
+}
+
 failed=0
 first=1
 ARMS=("$@")
@@ -216,7 +259,7 @@ while [ "$i_arm" -lt "${#ARMS[@]}" ]; do
             async_env=()
             case "$arm" in nospec-async*) async_env=(VLLM_HPU_FLASH_NEXT_ASYNC_SCHED=1) ;; esac
             case "$arm" in *-census) async_env+=(VLLM_HPU_STEP_TIMING=2) ;; esac
-            env ${async_env[@]+"${async_env[@]}"} \
+            placed "$arm" env ${async_env[@]+"${async_env[@]}"} \
                 bash "$HERE/serve_probe.sh" --out "$OUT/$arm" --levels "$LEVELS" --tokens "$TOKENS" \
                 --warm-tokens "$WARM" --repeat-top 2 --no-mintok-check --probe-arg "--sampled-levels=$LEVELS" \
                 --probe-arg --interleave-sampled --probe-arg "--rounds=$ROUNDS" $(barrier_args "$arm") $(guard_args)
@@ -224,7 +267,7 @@ while [ "$i_arm" -lt "${#ARMS[@]}" ]; do
         nospec-async-spin)
             # async-sched job branch: nospec-async with the bridge's accumulation-queue thread back
             # (PT_HPU_SYNCHRONOUS_ACC_QUEUE_FLUSHING=0): does synchronous flushing cost async scheduling its overlap?
-            PT_HPU_SYNCHRONOUS_ACC_QUEUE_FLUSHING=0 VLLM_HPU_FLASH_NEXT_ASYNC_SCHED=1 \
+            placed "$arm" env PT_HPU_SYNCHRONOUS_ACC_QUEUE_FLUSHING=0 VLLM_HPU_FLASH_NEXT_ASYNC_SCHED=1 \
                 bash "$HERE/serve_probe.sh" --out "$OUT/$arm" --levels "$LEVELS" --tokens "$TOKENS" \
                 --warm-tokens "$WARM" --repeat-top 2 --no-mintok-check --probe-arg --no-sampled-check \
                 --probe-arg "--rounds=$ROUNDS"
@@ -232,7 +275,7 @@ while [ "$i_arm" -lt "${#ARMS[@]}" ]; do
         nospec-devids)
             # async-sched job branch: the nospec server (no async scheduling) with the PLE n-gram ids in the graph
             # (VLLM_HPU_PLE_HOST_NGRAM_IDS=0, what async scheduling must use): the ids' cost alone.
-            VLLM_HPU_PLE_HOST_NGRAM_IDS=0 \
+            placed "$arm" env VLLM_HPU_PLE_HOST_NGRAM_IDS=0 \
                 bash "$HERE/serve_probe.sh" --out "$OUT/$arm" --levels "$LEVELS" --tokens "$TOKENS" \
                 --warm-tokens "$WARM" --repeat-top 2 --no-mintok-check --probe-arg --no-sampled-check \
                 --probe-arg "--rounds=$ROUNDS"
@@ -288,7 +331,7 @@ while [ "$i_arm" -lt "${#ARMS[@]}" ]; do
                 sampled_args=(--probe-arg "--sampled-levels=${HEADLINE_MTP_SAMPLED_LEVELS:-32}")
                 sampled_verify="${VLLM_HPU_SPEC_SAMPLED_VERIFY:-1}"
             fi
-            env ${async_env[@]+"${async_env[@]}"} \
+            placed "$arm" env ${async_env[@]+"${async_env[@]}"} \
             VLLM_HPU_QSA_INDEXER_SHARD="$shard" VLLM_HPU_SPEC_SAMPLED_VERIFY="$sampled_verify" \
             VLLM_HPU_GDN_CORE_VERIFY="${VLLM_HPU_GDN_CORE_VERIFY:-1}" VLLM_HPU_MTP_TIMING="$timing" \
                 VLLM_HPU_MTP_DRAFT_LOOP="${VLLM_HPU_MTP_DRAFT_LOOP:-1}" VLLM_HPU_MTP_CHUNK_KV="${VLLM_HPU_MTP_CHUNK_KV:-1}" \
