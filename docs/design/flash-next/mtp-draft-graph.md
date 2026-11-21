@@ -236,6 +236,57 @@ rounds, acceptance per position.
 
 ## Card results
 
+**00230 `real8-chain-b5b`** (12:01 to 13:00 UTC, exit 0, 9 arms, the only failed gate `tiny-chain-vp`; build 5's tree
+plus the chain, engine-step's VLG and async-sched's M1; build 5's serve env, every server with async scheduling
+(mode 2, MTP timer 0), dense MoE from 1 token (late-bound `VLLM_HPU_MOE_DENSE_MIN_TOKENS=1`), MTP k = 2, greedy,
+levels 32 and 1, 2 rounds per arm; results `reports/mtp-draft-graph/card/00230-real8-chain-b5b/`). The placement was
+on, with the place.sh bug that takes 16 CPUs from each later server (144, 128, 112, 96 of 152): read only A/Bs on one
+server as clean. MEASURED, steady ms per token, mean of 2 rounds:
+
+| server (CPUs) | arm | 32 streams | 1 stream |
+|---|---|---|---|
+| cuts (144) | off / on (graph) / md (I01) / on-md / all (+VP) | 27.91 / 27.14 / 27.83 / 27.13 / 27.51 | 15.92 / 15.07 / 15.03 / 14.23 / 15.70 |
+| plain (128) | off / on / md / on-md / all | 28.51 / 27.68 / 28.07 / 27.85 / 27.79 | 15.70 / 14.84 / 15.32 / 14.54 / 15.79 |
+| chain, cuts (112) | on-md / **chain-md** / vlg / **chain-vlg** / all | 27.22 / **24.94** / 26.59 / **24.99** / 26.57 | 14.08 / **13.03** / 14.04 / **12.68** / 15.40 |
+| M1, cuts (96) | m1off (chain-md) / m1on | 24.84 / 26.06 | 12.73 / 13.50 |
+
+- **The chain:**
+  - Stage A (chain-md against on-md): -2.28 ms per token at 32 streams (-8.4 %, about -4.7 ms per step at 2.29
+    tokens per step); -1.05 at 1 stream (-7.5 %).
+  - Stage B on the verify graph's ids (chain-vlg against vlg): -1.60 at 32 streams (-6.0 %); -1.36 at 1 stream
+    (-9.7 %).
+  - Best at 1 stream: chain-vlg, 12.68 ms per token = 78.9 tok/s per stream.
+  - The M1 server repeats chain-md: 24.84 / 12.73.
+  - Same 1-stream text in all four chain and non-chain arms, same acceptance (2.309 tokens per step, 55 drafts at
+    1 stream; 2.25 to 2.33 at 32 streams). No traceback.
+  - On all 8 ranks the log says stage A and stage B were chained; the only refusal logged was steps with a prefill.
+  - The gain is about 40 % of the INFERRED 12 ms per step: the host read now waits for the chain graph's device
+    time too.
+- **The chain graph's copied inputs:** the tiny gates with `VLLM_HPU_LOG_UNMATCHED_GRAPH_INPUTS=1` show one copy
+  flush per replay.
+  - Stage A: 4 tensors, the verification's hidden rows `[rows, H]` bf16 and three small int32.
+  - Stage B on VLG: the same plus the `[rows, 1]` view of the verify ids. The `_base` unwrap does not take on the
+    card.
+  - engine-step's `runner._verify_ids_raw` (`bd2e731b`, their kvargs branch) gives the raw ids: read it in
+    `_mtp_chain_issue` when it lands.
+- **VLG** (engine-step) against on-md: -0.6 ms at 32 streams, flat at 1 stream.
+- **VP (`VLLM_HPU_VOCAB_PARALLEL_LOGITS=1`, not this track's):** wrong or tie-different greedy ids.
+  - `tiny-chain-vp` FAILED in its non-speculative `[hc]` mode: a 700-token prompt diverges at token 4.
+  - On the real model at 1 stream it changes the greedy text and lowers tokens per step from 2.29 to 2.10.
+  - So the chain-all arm was dropped. engine-step is checking the card's argmax tie rule (job 00252).
+- **Draft graph + I01** against off (same server): -0.78 / -0.66 ms at 32 streams, -1.69 / -1.16 at 1 stream.
+- **REPLICATED_FC + REPLICATED_EMBEDDING** (cuts against plain, cross-server, so 16 CPUs and server spread
+  confound it): -0.6 to -0.7 ms at 32 streams, within noise at 1 stream.
+  - KV capacity: 2,296,169 tokens with REPLICATED_EMBEDDING against 2,378,571 without (-82,402 tokens, -3.5 %).
+- **async-sched's M1:**
+  - `tiny-m1` passed: 208 of 223 steps advanced on the device and checked, 0 differences.
+  - On the server, m1on against m1off: +1.22 ms at 32 streams (+4.9 %), +0.77 at 1 stream (+6.0 %).
+  - About 87 % of the steps used device-made inputs; texts were identical.
+  - It is an enabler for M2's early issue, not a gain by itself.
+- engine-step's IR logs of `tiny-chain-vlg` (their census of the step's cuts) are in `tiny-chain-vlg/habana_logs`.
+
+### Earlier card results
+
 **00194 `real8-draft-graph-switch`** (06:00 to 06:22 UTC, exit 0, all three arms ok; TP8 + EP8; build 4's code and env;
 MTP k = 3; greedy; 128 tokens; results `reports/mtp-draft-graph/card/00194-real8-draft-graph-switch/`, `headline.md`;
 analysis `tools/ab_summary.py`, `tools/timer_ab.py`). MEASURED:
