@@ -370,6 +370,15 @@ per step (7.3). With `rho = c / T32` the speed-up on edits is `a / (1 + 32 k rho
   | QSA data-flow change | n-gram | x0.66 | x1.07 | x1.66 (k = 4 to 5: x1.69) |
   | QSA data-flow change | hybrid | x0.97 | x1.20 | x1.43 |
 
+  **TP8 with every card-proven flag** (integration 00128, 00:00 UTC, MEASURED: plain step 51.1 ms at 32 streams,
+  MTP k = 3 step 106.4 ms with 2.61 tokens per step, 40.7 ms per token): the hybrid runs MTP's shapes, so its step
+  is MTP's (plus the lookup search on the host, about 0.1 ms per step at these contexts), and only its acceptance
+  differs: edits about 106.4 / 3.68 = 29 ms per token (x1.77 against 51.1), prose 106.4 / 2.61 = 41 (x1.25),
+  half and half 34 (x1.51) (INFERRED from the measured steps and the replay). The cost per verification row there
+  is about `c` = (106.4 - D - 51.1) / 96 = 0.2 to 0.4 ms (D, the draft passes and the rest of the step at TP8, 15
+  to 35 ms, not measured), `rho` = 0.004 to 0.008: on edits the n-gram server then gains x2.1 (rho 0.008) to
+  x3.2 (rho 0.004) at its best depth, k = 5 to 12 (k = 8 within 3 % of the best across that band); on prose it
+  still loses (x0.6 to x0.85).
   The hybrid is the server for a mixed load once the verification rows are cheap; the n-gram server wins only on
   a pure copy load, until its rows become per-request (Handoff, pending 3). At one stream both pay (the step is
   host-bound): MTP alone 1.69x at TP4 (00099 / 00104), n-gram on edits x4 to x6 by 7.4.
