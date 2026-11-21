@@ -227,3 +227,34 @@ def test_the_watch_sees_the_casts_it_is_there_for():
         x.argmax(dim=-1).int()
         torch.gather(x, -1, torch.topk(x, 4, dim=-1).indices)  # ids used as they are: no cast
     assert [dtype for _, dtype in watch.casts] == ["torch.int32", "torch.float32", "torch.int32"]
+
+
+def test_shard_reductions_run_on_the_heads_own_dtype(monkeypatch):
+    """The shard's logits reach the reductions in the head's dtype; only reduced values become fp32.
+
+    On the card a ``.to(torch.float32)`` of the whole shard right after the head's matmul is fused into the GEMM,
+    which then hands out its fp32 accumulator (job 00254): the arg max would compare other values than the gathered
+    path's bf16 logits. So no op may convert a ``[rows, shard]`` tensor to fp32 before the reduction."""
+    logits = distinct_logits(rows=3, seed=11)
+    ranks = Ranks(logits, 4, monkeypatch)
+    owner = ranks.owner(1)
+    shard_logits, start, count = vocab_parallel._shard_logits(owner, ranks.shard(1))
+    assert shard_logits.dtype == torch.bfloat16 and (start, count) == (ranks.per, ranks.per)
+    width = ranks.per + PADDING
+    seen = []
+
+    class WholeShardCasts(TorchDispatchMode):
+
+        def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+            out = func(*args, **(kwargs or {}))
+            if (func.__name__.startswith(("_to_copy", "to.")) and isinstance(out, torch.Tensor)
+                    and out.dtype == torch.float32 and out.dim() == 2 and out.shape[-1] >= ranks.per - 1
+                    and out.shape[-1] <= width and args and args[0].dtype == torch.bfloat16):
+                seen.append(tuple(out.shape))
+            return out
+
+    with WholeShardCasts():
+        for fn in (vocab_parallel.vocab_parallel_argmax,
+                   lambda own, shard: vocab_parallel.vocab_parallel_candidates(own, shard, 8)):
+            ranks.on_every_rank(fn)
+    assert seen == [], seen

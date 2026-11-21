@@ -15,8 +15,12 @@ take, :func:`top_tokens` and :func:`top_k` gather the full logits exactly as the
 Exactness (``docs/design/flash-next/collectives.md`` has the argument and the tests that check it):
 
 * :func:`top_tokens` returns, for every row, the lowest token id among the largest logits: the value
-  ``logits.float().argmax(-1)`` has on the CPU. The values compared are the bf16 logits converted to fp32
-  (exact), so no rounding differs from the gathered path.
+  ``logits.float().argmax(-1)`` has on the CPU. The values compared are the head's logits in their own dtype (bf16),
+  as the gathered path's all-gather materializes them; only the reduced values are converted to fp32 (exact), so no
+  rounding differs from the gathered path. A conversion of the whole shard right after the head's matmul would not
+  do: in the matmul's lazy graph the graph compiler fuses the cast into the GEMM, which then hands out its fp32
+  accumulator (engine-step's card job 00254: 99.997 % of a shard's logits off their bf16 values, the arg max on 2
+  of 100 random rows), and a near-tie that is a tie in bf16 resolves another way (00230's tiny gate and texts).
 * :func:`top_k` returns the ``k`` largest logit values exactly. The ids are the tokens that hold them; when
   several tokens tie at the ``k``-th value, which of the tied tokens are returned is not defined (it is not
   defined for ``torch.topk`` over the gathered logits either).
@@ -90,10 +94,12 @@ def unsupported_reason(model) -> str | None:
 
 
 def _shard_logits(owner, hidden_states: torch.Tensor) -> tuple[torch.Tensor, int, int]:
-    """``(fp32 logits of this rank's real vocabulary rows [rows, n], first global id, n)``.
+    """``(logits of this rank's real vocabulary rows [rows, n] in the head's dtype, first global id, n)``.
 
     The head's padding rows (zero weights at the end of the last shard) are cut off: their logit is 0 and
-    would beat every negative logit.
+    would beat every negative logit. The logits keep the head's dtype: the reductions run on the values the gathered
+    path compares, and only their results are converted (see the module's exactness note: a cast of the whole shard
+    here is fused into the matmul on the card and compares its fp32 accumulators).
     """
     head = owner.lm_head
     logits = owner.logits_processor(head, hidden_states, skip_gather=True)
@@ -102,11 +108,11 @@ def _shard_logits(owner, hidden_states: torch.Tensor) -> tuple[torch.Tensor, int
     count = int(indices.org_vocab_end_index) - start
     if count < logits.shape[-1]:
         logits = logits.narrow(-1, 0, count)
-    return logits.to(torch.float32), start, count
+    return logits, start, count
 
 
 def _lowest_id_of_max(values: torch.Tensor, ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """``(max over the last dim [rows], the lowest of the ``ids`` that hold it [rows])``, both fp32.
+    """``(max over the last dim [rows] in the dtype of ``values``, the lowest of the fp32 ``ids`` that hold it [rows])``.
 
     Written with max / where / min so that the choice among equal values does not depend on how the
     device's arg max breaks ties. A row whose values are all NaN gets ``_NO_TOKEN``; the caller clamps it.
@@ -127,6 +133,7 @@ def vocab_parallel_argmax(model, hidden_states: torch.Tensor) -> torch.Tensor:
     rows = logits.shape[0]
     if count > 0:
         value, token = _lowest_id_of_max(logits, _id_table(start, count, rows, logits.device))
+        value = value.to(torch.float32)  # the shard's largest logit as the head made it (exact in fp32)
     else:  # a shard with no real row: it never wins
         value = torch.full((rows, ), float("-inf"), dtype=torch.float32, device=logits.device)
         token = torch.full((rows, ), _NO_TOKEN, dtype=torch.float32, device=logits.device)
@@ -163,10 +170,11 @@ def vocab_parallel_candidates(model, hidden_states: torch.Tensor, k: int) -> tup
     local_k = min(k, count)
     if local_k > 0:
         values, index = torch.topk(logits, local_k, dim=-1)
+        values = values.to(torch.float32)  # the head's values, converted after the selection (exact)
         ids = torch.gather(_id_table(start, count, rows, logits.device), -1, index)
     else:
-        values = logits.new_empty((rows, 0))
-        ids = logits.new_empty((rows, 0))
+        values = torch.empty((rows, 0), dtype=torch.float32, device=logits.device)
+        ids = torch.empty((rows, 0), dtype=torch.float32, device=logits.device)
     if local_k < k:  # a shard with fewer real rows than k: pad with entries that never win
         pad = (rows, k - local_k)
         values = torch.cat((values, torch.full(pad, float("-inf"), dtype=torch.float32, device=logits.device)), -1)
