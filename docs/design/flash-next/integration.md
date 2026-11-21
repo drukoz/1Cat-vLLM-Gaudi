@@ -9,7 +9,7 @@ Labels: MEASURED (card, with its file), VERIFIED (CPU test or code line), INFERR
 
 ## Handoff (if this agent stops)
 
-**Build 5 (fifth agent of the track, Opus 5.5, started 08:04 UTC on 2026-11-21; updated 08:59 UTC).**
+**Build 5 (fifth agent of the track, Opus 5.5, started 08:04 UTC on 2026-11-21; updated 09:03 UTC).**
 
 - **Tree.** Base = build 4 (`8cdc5999`) with the program head `adbcff30` (PRs #18 to #22) merged in, so the tree is the
   program head plus what build 4 carried that the head lacks (qsa-fused's branch, mtp-card-ready + the per-step record,
@@ -23,7 +23,8 @@ Labels: MEASURED (card, with its file), VERIFIED (CPU test or code line), INFERR
   Merge log below. Image of the code commit `125429d3`: `farm-integration:125429d31188` (built 08:18 UTC, 278 s).
 - **CPU.** dense + FP8 K/V + pin tests 63 passed; slot shift + FP8 K/V 24 passed; async worker test 39 passed; 54
   non-gate files on a snapshot of `125429d3` (`reports/integration/cpu/out-b10x/summary.txt`): 51 green, 3 card-only
-  skips. `bin/gate` on the final tree: see the job plan line below.
+  skips. **`bin/gate --tools` on a snapshot of `716ff094` (the job's code; later commits touch only the kit, a probe
+  tool and docs): 119 files, 0 red** (09:02 UTC; `reports/integration/b5/gate-716ff094.txt`).
 - **Kit (this commit's tools/flash_next/integration).** An MTP arm is `mtp<K>` plus words: server `async graph rfc noshard
   spin inline fp8kv pin3 hpulog ss0 irlog`, probe `32 lv<N>_<N> greedy switch`, and steps on the same server after the
   probe `sw dg32 cap kvlp kvlpfb long` (serve_probe.sh `--post-cmd`). `HEADLINE_TRACE_ENV=1` starts every MTP server
