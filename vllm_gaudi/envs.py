@@ -537,6 +537,7 @@ if TYPE_CHECKING:
     VLLM_HPU_RUNTIME_SWITCH_FILE: str = ""  # a file of per-step flags a running server rereads (an A/B on one server)
     VLLM_HPU_CANDIDATE_SAMPLING: int = 0  # 0 vLLM's sampler (default), 1 sampling over candidates, 2 also speculative steps
     VLLM_HPU_SAMPLER_REQUEST_PARAMS: int = 0  # 0 as before (ignored on HPU), 1 min_tokens/logit_bias/min_p per row
+    VLLM_HPU_QSA_KV_FP8: int = 0  # 1: the QSA layers accept --kv-cache-dtype fp8_inc (FP8 K/V storage, bf16 attention)
     VLLM_HPU_GDN_CORE_DECODE: int = 1  # GdnCoreDecodeMode: 1 fused (default), 0 off, 2 recurrence
     VLLM_HPU_GDN_CORE_DECODE_DEBUG: int = 0  # GdnCoreDecodeDebug: 0 off, 1 check slot indices every step (host sync)
     VLLM_HPU_GDN_CORE_VERIFY: int = 0  # GdnCoreVerifyMode: 0 off (default), 1 fused verification steps
@@ -1990,6 +1991,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # sampler (fixed shapes, host-made int64 indices). Any other value is 0.
     "VLLM_HPU_SAMPLER_REQUEST_PARAMS":
     lambda: int(os.environ.get("VLLM_HPU_SAMPLER_REQUEST_PARAMS", "0")),
+
+    # FP8 storage of the Flash-Next sparse QSA K/V cache (qsa_hpu_attention, G5-3). 0 (default) = a QSA layer
+    # refuses every main KV cache dtype but bf16. 1 = it also serves --kv-cache-dtype fp8_inc: the backend's
+    # VLLMFP8KVCache quantizes K and V to E4M3 on write (scale 1.0) and dequantizes them when the prefill fetches
+    # its context; the sparse decode dequantizes the gathered rows. The attention math of the QSA layers stays bf16
+    # (the backend's FP8 matmuls and FP8 fused SDPA of fp8_inc are put back to bf16 for them). Halves the per-token
+    # K/V bytes: at TP8 13,056 -> 6,912 bytes per token and rank with the indexer's keys. Any other value is 0.
+    "VLLM_HPU_QSA_KV_FP8":
+    lambda: int(os.environ.get("VLLM_HPU_QSA_KV_FP8", "0")),
 
     # Flash-Next GDN decode through the fused core op (flashinfer_gaudi.gdn_core_decode).
     # 1 (default) = fused, 0 = off (the torch path), 2 = recurrence only (a bisect tool).
