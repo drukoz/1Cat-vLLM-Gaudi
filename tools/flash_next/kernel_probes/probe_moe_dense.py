@@ -155,6 +155,27 @@ def dense_moe_fused(torch, layer, local, x, ids32, weights, expert_ids):
     return (down.float() * wmat.t().unsqueeze(-1)).sum(dim=0).to(torch.bfloat16)
 
 
+def dense_moe_folded(torch, layer, local, x, ids32, weights, expert_ids):
+    """dense-fused with the routing weight folded into the down GEMM's row scale (a pair that is not routed gets
+    scale 0) and the sum over the experts accumulated in fp32 straight from the bf16 GEMM output: no [E, T, H] fp32
+    product (job 00177: the served dense form lost on the real model; one suspect is that intermediate)."""
+    w13, w2, s13, s2 = layer
+    rows = x.shape[0]
+    routed = (ids32.unsqueeze(-1) == expert_ids).to(torch.float32)
+    wmat = (routed * weights.float().unsqueeze(-1)).sum(dim=1)  # [T, E]
+    x8, xs = quantize_rows(torch, x)
+    a = x8.unsqueeze(0).expand(local, rows, H).contiguous()
+    a_scale = xs.unsqueeze(0).expand(local, rows, 1).contiguous()
+    gate_up = torch.ops.hpu.fp8_gemm_v2(a, False, w13, True, None, torch.bfloat16, a_scale, s13.unsqueeze(1), None,
+                                        False)
+    mid = (torch.nn.functional.silu(gate_up[..., :I].float()) * gate_up[..., I:].float()).to(torch.bfloat16)
+    m8, ms = quantize_rows(torch, mid)
+    m_scale = ms * wmat.t().unsqueeze(-1)  # [E, T, 1]: the routing weight rides on the row scale
+    down = torch.ops.hpu.fp8_gemm_v2(m8, False, w2, True, None, torch.bfloat16, m_scale, s2.unsqueeze(1), None,
+                                     False)
+    return down.sum(dim=0, dtype=torch.float32).to(torch.bfloat16)
+
+
 def replay_us(torch, dev, run, layers, iters):
     class Layers(torch.nn.Module):
 
@@ -187,7 +208,7 @@ def main():
     ap.add_argument("--iters", type=int, default=6)
     ap.add_argument("--rows", default="32,128")
     ap.add_argument("--locals", default="64,128")
-    ap.add_argument("--forms", default="vendor,vendor-chunk64,dense,dense-fused")
+    ap.add_argument("--forms", default="vendor,vendor-chunk64,dense,dense-fused,dense-folded")
     a = ap.parse_args()
     a.out.mkdir(parents=True, exist_ok=True)
     os.environ.setdefault("PT_HPU_LAZY_MODE", "1")
@@ -207,7 +228,8 @@ def main():
             try:
                 y_vendor = vendor_moe(torch, sets[0], local, xs[0], ids_d, w_d).float().cpu()
                 ref = float(y_vendor.abs().max()) or 1.0
-                for name, fn in (("dense", dense_moe), ("dense-fused", dense_moe_fused)):
+                for name, fn in (("dense", dense_moe), ("dense-fused", dense_moe_fused),
+                                 ("dense-folded", dense_moe_folded)):
                     y = fn(torch, sets[0], local, xs[0], ids32_d, w_d, expert_ids).float().cpu()
                     diff = float((y_vendor - y).abs().max())
                     say(f"local {local:3d} rows {rows:3d} parity {name} vs vendor: max abs diff {diff:.3e}, "
@@ -218,8 +240,9 @@ def main():
             for form in a.forms.split(","):
                 key = f"local{local}_rows{rows}_{form}"
                 try:
-                    if form in ("dense", "dense-fused"):
-                        fn = dense_moe if form == "dense" else dense_moe_fused
+                    if form in ("dense", "dense-fused", "dense-folded"):
+                        fn = {"dense": dense_moe, "dense-fused": dense_moe_fused,
+                              "dense-folded": dense_moe_folded}[form]
 
                         def run(sets=sets, xs=xs, fn=fn):
                             return tuple(fn(torch, layer, local, x, ids32_d, w_d, expert_ids)
@@ -242,11 +265,12 @@ def main():
     lines = []
     for key in sorted(k for k in results if k.endswith("_vendor")):
         base = key[:-len("vendor")]
-        v, c, d, f = (results.get(base + n, {}).get("us_per_layer")
-                      for n in ("vendor", "vendor-chunk64", "dense", "dense-fused"))
+        v, c, d, f, g = (results.get(base + n, {}).get("us_per_layer")
+                         for n in ("vendor", "vendor-chunk64", "dense", "dense-fused", "dense-folded"))
         if v:
             lines.append(f"{base.rstrip('_')}: vendor {v:.1f}, vendor chunk 64 {c or float('nan'):.1f}, "
-                         f"dense {d or float('nan'):.1f}, dense-fused {f or float('nan'):.1f} us")
+                         f"dense {d or float('nan'):.1f}, dense-fused {f or float('nan'):.1f}, "
+                         f"dense-folded {g or float('nan'):.1f} us")
     print("VERDICT moe-dense: " + ("; ".join(lines) or "no dense form ran"), flush=True)
     results["verdict"] = lines
     (a.out / "moe_dense.json").write_text(json.dumps(results, indent=1) + "\n")
