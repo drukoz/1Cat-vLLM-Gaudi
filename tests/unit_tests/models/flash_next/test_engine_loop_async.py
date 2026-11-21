@@ -115,12 +115,16 @@ def test_prefix_cache_hit_gives_the_same_tokens(engine, reference):
     assert engine.tokens["cache-second"] == prompt["generated_ids"][:8]
 
 
-def test_output_token_ids_hold_the_tokens_and_one_placeholder(engine, reference):
-    """At every sampler pass of a decode step, each request's output_token_ids is its tokens so far (all real) and
-    one placeholder for the step in flight: the length synchronous scheduling has (min_tokens reads it)."""
+def test_output_token_ids_have_the_synchronous_length_and_no_wait(engine, reference, monkeypatch):
+    """At every sampler pass of a decode step each request's output_token_ids has the length synchronous
+    scheduling gives it (its tokens so far, the one in flight included: min_tokens reads it), and a decode loop
+    without penalties never waits for the device to fill the values (on the card an event wait flushes every copy
+    in flight: it made a 1-stream step about 20 ms slower, job 00186)."""
     runner = engine.runner
     seen = []
     original = runner._prepare_sampling
+    settles = []
+    monkeypatch.setattr(AsyncOutputLedger, "settle", lambda self, keep=0: settles.append(keep) or 0)
 
     def spy(batch_changed, request_ids=None, *args, **kwargs):
         for request_id in request_ids or []:
@@ -137,13 +141,16 @@ def test_output_token_ids_hold_the_tokens_and_one_placeholder(engine, reference)
         engine.run()
     finally:
         del runner._prepare_sampling
+    assert not settles, "the ledger waited for the device in a loop that reads no token values"
     assert len(seen) > 10
+    lengths = {}
     for request_id, tokens in seen:
         want = reference[int(request_id.split("-")[1])]["generated_ids"]
-        if not tokens:
-            continue  # the prompt's own sampler pass
-        assert tokens[-1] == -1 and -1 not in tokens[:-1], (request_id, tokens)
-        assert tokens[:-1] == want[:len(tokens) - 1], (request_id, tokens)
+        assert all(t == -1 or t == want[i] for i, t in enumerate(tokens)), (request_id, tokens)
+        lengths.setdefault(request_id, []).append(len(tokens))
+    for request_id, values in lengths.items():
+        decode = [v for v in values if v]
+        assert decode == list(range(1, len(decode) + 1)), (request_id, values)
 
 
 def test_without_the_carry_the_tokens_go_wrong(engine, reference, monkeypatch):

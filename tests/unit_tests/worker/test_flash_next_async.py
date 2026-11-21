@@ -216,6 +216,18 @@ def test_ledger_leaves_replaced_and_rewritten_lists_alone():
     assert requests["a"].output_token_ids == [42] and requests["b"].output_token_ids == [99]
 
 
+def test_ledger_keeps_a_bounded_window():
+    requests = _requests("a")
+    ledger = AsyncOutputLedger(max_pending=2)
+    for value in (5, 6, 7):
+        ledger.record(requests, ["a"], invalid_rows=[], sampled_cpu=[[value]], event=None)
+    assert requests["a"].output_token_ids == [-1, -1, -1] and len(ledger) == 2
+    assert ledger.settle() == 2
+    assert requests["a"].output_token_ids == [-1, 6, 7]  # the oldest record left the window unsettled
+    assert AsyncOutputLedger.neutralize([requests["a"].output_token_ids], pad=1000) == 1
+    assert requests["a"].output_token_ids == [1000, 6, 7]
+
+
 def test_needs_output_token_values():
     assert not needs_output_token_values(SimpleNamespace(no_penalties=True, bad_words_token_ids={}))
     assert needs_output_token_values(SimpleNamespace(no_penalties=False, bad_words_token_ids={}))
