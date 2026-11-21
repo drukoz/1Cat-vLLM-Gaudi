@@ -26,8 +26,13 @@ mode 3) and the queue place. **6a = job 00249 `real8-build6a`** (queued 12:22 UT
 then A6, A6+il, A6+shift, A6+pi, A6+gv6, pin3-noplace last. The GDN variant is late-bound: `reports/integration/late/
 make_run6.sh a --gv 7` or `--no-gv` (default 6). Its waiter: `reports/integration/card/submit-real8-build6a.log`;
 results `reports/integration/card/00249-real8-build6a/` (else `bin/farm fetch integration 00249 00249-real8-build6a`).
-6b waits for 00230's verdict (chain arms), 00240's (mode 3, "all"), 00241's (scaled FP8) and engine-step's
-KV_CACHES_IN_GRAPH_ARGS commit; its stacked arm carries prefill's prompt-graph flags (kit word `pg`,
+**6b = job 00253 `real8-build6b`** (queued 12:55 UTC after the coordinator's positive chain verdict from 00230;
+commit `b15243ba`, image `farm-integration:b15243baf5f0`, hold 1h55m, right after 6a): gates tiny, tiny-chain,
+tiny-chain-vlg, tiny-m3pc1, tiny-m3pc2; A6 with the switch A/B off / chain stage A / chain stage B, pf, kvlp and kvlpc;
+mode 3 with kvlpfloor; "all" (mode 3, chain stage B, il, shift, gv6, pi, pg, pf, cap); FP8 at 32 streams with kvlpc.
+Late-bound through `make_run6.sh b` (ARMS=...): mode 3 out if 00240 fails (the floor moves to a mode-2 chain server),
+the GDN variant, the scaled FP8 arm (00241), engine-step's KV_CACHES_IN_GRAPH_ARGS. VOCAB_PARALLEL_LOGITS and the
+replicated FC / embedding stay off (coordinator, 12:55); its stacked arm carries prefill's prompt-graph flags (kit word `pg`,
 `HEADLINE_PG_ENV="VLLM_HPU_PROMPT_GRAPH_MAX_TOKENS=64000;VLLM_GRAPH_RESERVED_MEM=0.4"`; check line "Prompt forwards up to
 64000 tokens ... replay HPU graphs") and, like A6, the post step `pf` (a 64K-token prompt, so the step timer records
 2,048-token prompt chunks: build 5 had 1.64 to 1.97 s per chunk op by op). CPU: the async loop test with `VLLM_HPU_PERSISTENT_INPUTS=1` 7 passed. Build 5's record
