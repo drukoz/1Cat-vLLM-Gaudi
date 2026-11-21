@@ -164,6 +164,40 @@ def test_host_book_draft_positions_give_the_same_drafts(engine_runs):
     assert [p["generated_ids"] for p in host["prompts"]] == [p["generated_ids"] for p in device["prompts"]]
 
 
+@pytest.mark.parametrize("k,accept", [(1, [1, 0]), (2, [2, 0, 1]), (3, [2, 0, 3, 1]), (4, [4, 1, 3, 0, 2]),
+                                      (5, [5, 2, 0, 4, 1, 3])],
+                         ids=["k1", "k2", "k3", "k4", "k5"])
+def test_the_draft_passes_in_one_graph_give_the_same_drafts(engine_runs, k, accept):
+    # VLLM_HPU_MTP_DRAFT_GRAPH=1: the k passes of every decode draft run in one forward (MtpDraftLoop, one HPU graph
+    # on a card) with the metadata of the later passes built first. Against the per-pass drafter with the same
+    # host-book positions (VLLM_HPU_MTP_DRAFT_LOOP=1): the drafter's own ids and every stream are the same, at every
+    # accepted count 0..k (oracle drafts), and every decode draft took the one-graph path (prefill drafts do not).
+    loop = {"VLLM_HPU_MTP_DRAFT_LOOP": "1"}
+    per_pass = _oracle_run(engine_runs, accept, k=k, env=loop, tag="_loop")
+    graph = _oracle_run(engine_runs, accept, k=k, env={**loop, "VLLM_HPU_MTP_DRAFT_GRAPH": "1"}, tag="_graph")
+    assert [e["drafter"] for e in graph["oracle"]] == [e["drafter"] for e in per_pass["oracle"]]
+    assert [p["generated_ids"] for p in graph["prompts"]] == [p["generated_ids"] for p in per_pass["prompts"]]
+    decode_drafts = [call for call in graph["draft_calls"] if call.get("decode")]
+    assert decode_drafts and graph["runner"]["draft_graph_calls"] == len(decode_drafts)
+    assert any(not call.get("decode") and not call.get("fill") for call in graph["draft_calls"])  # prefill drafts
+    assert per_pass["runner"]["draft_graph_calls"] == 0
+    _check_oracle(engine_runs, graph, accept, k)
+
+
+def test_the_draft_passes_in_one_graph_with_several_requests_at_once(engine_runs):
+    # Every prompt in one generate call: decode drafts of several requests (padded batch rows, requests at different
+    # positions, prefills joining a running batch). The drafter's ids and the streams equal the per-pass drafter's.
+    loop = {"VLLM_HPU_MTP_DRAFT_LOOP": "1"}
+    accept = [3, 1, 0, 2]
+    per_pass = _oracle_run(engine_runs, accept, "--concurrent", env=loop, tag="_loop")
+    graph = _oracle_run(engine_runs, accept, "--concurrent", env={**loop, "VLLM_HPU_MTP_DRAFT_GRAPH": "1"},
+                        tag="_graph")
+    assert [e["drafter"] for e in graph["oracle"]] == [e["drafter"] for e in per_pass["oracle"]]
+    assert [p["generated_ids"] for p in graph["prompts"]] == [p["generated_ids"] for p in per_pass["prompts"]]
+    assert max(call["rows"] for call in graph["draft_calls"] if call.get("decode")) > 1
+    assert graph["runner"]["draft_graph_calls"] == len([c for c in graph["draft_calls"] if c.get("decode")])
+
+
 @pytest.mark.parametrize("k", [4, 5], ids=["k4", "k5"])
 def test_oracle_drafts_at_the_sizes_above_the_recipe(engine_runs, k):
     # k + 1 lattice entries exceed the kernel blocks of a request's first block (two per 256-token block here, four

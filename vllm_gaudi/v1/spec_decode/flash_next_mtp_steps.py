@@ -206,6 +206,78 @@ class DraftRankStats:
                 f"rank1={self.counts[0]} rank2={self.counts[1]} rank3={self.counts[2]} "
                 f"rank4={self.counts[3]} beyond4={self.counts[4]} all_accepted={self.all_accepted}")
 
+class MtpDraftLoop(torch.nn.Module):
+    """The k draft passes of a decode propose in one forward (VLLM_HPU_MTP_DRAFT_GRAPH=1).
+
+    ``HpuFlashNextMtpProposer.propose`` runs every draft pass as its own HPU-graph replay, the LM head and the arg
+    max lazily between the replays, and builds each later pass's attention metadata on the host between them. At 32
+    streams on TP8 the draft costs 16 to 18 ms of a 104 ms step with a device wait of only 0.7 to 2.8 ms at its end
+    (card job 00178, the MTP step timer): the host issue is the cost. This module runs pass 0 over the verification
+    rows, the LM head and the arg max of each request's last accepted row, then the passes 1 .. k-1 (one row per
+    request, the previous pass's ids as int32, its multi-stream hidden, the next position), each with its own
+    metadata, and returns the ``[batch, k]`` draft ids: wrapped in one HPU graph, one replay issues all of it.
+
+    The calls and their order are those of the per-pass proposer (tests/unit_tests/worker/test_mtp_draft_graph.py):
+
+    * ``pass_forward(input_ids=, positions=, hidden_states=, inputs_embeds=None, attn_metadata=, spec_step_idx=)``
+      returns the draft's ``(sample, multi)``; the proposer gives the draft adapter's own forward (its metadata
+      processing, RoPE tables and forward context per pass), not the adapter's graph-wrapped one;
+    * ``draft_tokens(hidden [rows, H])`` returns the ids ``[rows]`` (the proposer's LM head and arg max);
+    * ``step_metadata[j - 1]`` is pass j's attention metadata, built on the host before the call from the base
+      positions + j (the proposer's ``prepare_attn_metadata``).
+
+    The forward reads no device value back (inside a graph capture there is none to read). The pools a pass writes
+    (the draft's KV cache, the QSA key ring and compressed keys) are written with ``index_copy_``, which the lazy
+    graph orders against the next pass's reads; the module holds no submodule and no parameter.
+    """
+
+    def __init__(self, pass_forward, draft_tokens, num_speculative_tokens: int, max_model_len: int) -> None:
+        super().__init__()
+        if int(num_speculative_tokens) < 1:
+            raise ValueError(f"the draft loop needs at least one draft token, got {num_speculative_tokens}")
+        self._pass_forward = pass_forward
+        self._draft_tokens = draft_tokens
+        self.num_speculative_tokens = int(num_speculative_tokens)
+        self.max_model_len = int(max_model_len)
+
+    def forward(self, target_token_ids: torch.Tensor, target_positions: torch.Tensor,
+                target_hidden_states: torch.Tensor, last_token_indices: torch.Tensor, attn_metadata,
+                step_metadata: tuple = ()) -> torch.Tensor:
+        k = self.num_speculative_tokens
+        if len(step_metadata) != k - 1:
+            raise ValueError(f"the draft loop with k = {k} takes the metadata of {k - 1} later passes, "
+                             f"got {len(step_metadata)}")
+        batch_size = last_token_indices.shape[0]
+        ret = self._pass_forward(input_ids=target_token_ids, positions=target_positions,
+                                 hidden_states=target_hidden_states, inputs_embeds=None, attn_metadata=attn_metadata,
+                                 spec_step_idx=0)
+        last_hidden_states, hidden_states = split_draft_output(ret)
+        last_hidden_states = last_hidden_states.view(-1, last_hidden_states.shape[-1])
+        sample_hidden_states = torch.index_select(last_hidden_states, 0, last_token_indices)
+        draft_token_ids = self._draft_tokens(sample_hidden_states)
+        if k == 1:
+            return draft_token_ids.view(-1, 1)
+
+        positions = torch.index_select(target_positions.view(-1), 0, last_token_indices)
+        hidden_states = next_step_hidden(hidden_states, last_token_indices)
+        draft_token_ids_list = [draft_token_ids]
+        for token_index in range(k - 1):
+            # argmax ids are int64: narrowed here for the next pass (an in-graph consumer, card rule 9)
+            input_ids = draft_token_ids_list[-1].int()
+            positions = positions + 1
+            clamped_positions = torch.where(positions >= self.max_model_len, 0, positions)
+            ret = self._pass_forward(input_ids=input_ids.view(-1, 1), positions=clamped_positions.view(-1, 1),
+                                     hidden_states=hidden_states.view(-1, 1, hidden_states.shape[-1]),
+                                     inputs_embeds=None, attn_metadata=step_metadata[token_index],
+                                     spec_step_idx=token_index + 1)
+            last_hidden_states, hidden_states = split_draft_output(ret)
+            last_hidden_states = last_hidden_states.view(-1, last_hidden_states.shape[-1])
+            hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
+            hidden_states = hidden_states[:batch_size]
+            draft_token_ids_list.append(self._draft_tokens(last_hidden_states[:batch_size]))
+        return torch.stack(draft_token_ids_list, dim=1)
+
+
 def draft_argmax(logits: torch.Tensor) -> torch.Tensor:
     """The draft's token ids ``[rows]`` from its logits ``[rows, vocab]``.
 

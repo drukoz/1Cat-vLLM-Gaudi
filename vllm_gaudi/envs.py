@@ -543,6 +543,7 @@ if TYPE_CHECKING:
     VLLM_HPU_SPEC_SAMPLED_VERIFY: int = 0  # 0 greedy requests only (default), 1 also sampled, 2 sampled over candidates
     VLLM_HPU_MTP_DRAFT_LOOP: int = 0  # 0 draft positions read back from the device (default), 1 host books
     VLLM_HPU_MTP_DRAFT_IDS: int = 0  # 0 draft ids by argmax, int64 narrowed in the graph (default), 1 int32 ids
+    VLLM_HPU_MTP_DRAFT_GRAPH: int = 0  # 0 one HPU graph per MTP draft pass (default), 1 the k passes in one graph
     VLLM_HPU_MTP_TIMING: int = 0  # 0 off (default), 1 time the verification part and the draft of every step,
     # 2 also one record per step (mtp_step_record_r*.jsonl)
     VLLM_HPU_MTP_CHUNK_KV: int = 0  # 1 the MTP draft also runs over prefill chunks that complete no prompt
@@ -2050,6 +2051,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # same is not measured yet (with it, draft positions 2 to k of every row but the first would be wrong).
     "VLLM_HPU_MTP_DRAFT_IDS":
     lambda: int(os.environ.get("VLLM_HPU_MTP_DRAFT_IDS", "0")),
+
+    # The Flash-Next MTP draft passes of a decode step. 0 (default) = each pass is its own HPU-graph replay, the LM
+    # head and the arg max run lazily between the replays and the host builds each later pass's attention metadata
+    # between them. 1 = the metadata of every later pass is built first (the host knows their positions: use it with
+    # VLLM_HPU_MTP_DRAFT_LOOP=1, which takes them from the runner's books), then one HPU graph runs pass 0, the LM
+    # head, the arg max and the passes 1 .. k-1 (spec_decode/flash_next_mtp_steps.py MtpDraftLoop): one replay per
+    # decode draft. Prefill drafts and the draft-rank log (VLLM_FLASH_NEXT_DRAFT_RANK_LOG=1) keep the per-pass path.
+    "VLLM_HPU_MTP_DRAFT_GRAPH":
+    lambda: int(os.environ.get("VLLM_HPU_MTP_DRAFT_GRAPH", "0")),
 
     # What a speculative step is made of. 1 = the runner times every step of a speculative server: the verification
     # part (to the drafter call) and the draft, with the proposer's laps per draft pass and one device wait after
