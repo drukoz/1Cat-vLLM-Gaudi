@@ -1924,6 +1924,19 @@ def _mark_unbacked_dim0(tensor: torch.Tensor):
     torch._dynamo.decorators.mark_unbacked(tensor, 0)
 
 
+def _prompt_hidden_states_per_request(hidden_states: torch.Tensor, token_ids: torch.Tensor) -> torch.Tensor:
+    """The prefill hidden states with one row per request of the prompt batch: ``[batch, seq, hidden]``.
+
+    ``token_ids`` is the prompt batch ``[batch, seq]``. A model that returns its hidden states flattened,
+    ``[batch * seq, hidden]`` (Flash-Next), is viewed by that shape: indexing the flat tensor by request took one
+    token's vector, and a request with prompt logprobs then ended the engine in the LM head (engine-step job 00130,
+    ``1x6 and 128x248320``). Any other shape is returned as it is.
+    """
+    if hidden_states.dim() == 2 and token_ids.dim() == 2 and hidden_states.shape[0] == token_ids.numel():
+        return hidden_states.view(token_ids.shape[0], token_ids.shape[1], hidden_states.shape[-1])
+    return hidden_states
+
+
 def _maybe_wrap_in_hpu_graph(*args, **kwargs):
     return htorch.hpu.wrap_in_hpu_graph(HpuModelAdapter(
         *args, **kwargs), disable_tensor_cache=True) if htorch.utils.internal.is_lazy() else HpuModelAdapter(
@@ -6865,10 +6878,11 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                 non_flattened_hidden_states_prefills.append(non_flattened_hidden_states)
                 # Collect prefill hidden states for prompt logprobs.
                 # req_id is a list of request IDs in this prefill batch.
-                for i, rid in enumerate(req_id):
-                    if rid in self.input_batch.num_prompt_logprobs:
-                        prefill_hidden_states_for_logprobs[rid] = \
-                            non_flattened_hidden_states[i]
+                if any(rid in self.input_batch.num_prompt_logprobs for rid in req_id):
+                    per_request = _prompt_hidden_states_per_request(non_flattened_hidden_states, token_ids)
+                    for i, rid in enumerate(req_id):
+                        if rid in self.input_batch.num_prompt_logprobs:
+                            prefill_hidden_states_for_logprobs[rid] = per_request[i]
                 if self.use_aux_hidden_state_outputs:
                     aux_hidden_states_prefills.append(aux_hidden_states)
                 sample_hidden_states_prefills.append(sample_hidden_states)
