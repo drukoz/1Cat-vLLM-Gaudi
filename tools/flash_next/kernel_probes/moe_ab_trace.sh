@@ -7,13 +7,15 @@
 # kernel-fixes 11bc2f6d (VLLM_HPU_MOE_DENSE: 17-token minimum, folded routing weight) + a5786c55 (a 0 in
 # VLLM_MOE_CHUNK). One all-card farm job:
 #
-#   farm job kernel-fixes moe-ab-trace all 45m -- bash tools/flash_next/kernel_probes/moe_ab_trace.sh base dense
+#   farm job kernel-fixes moe-ab-trace all 45m -- bash tools/flash_next/kernel_probes/moe_ab_trace.sh dense base
 #
 # ARMs, one MTP k = 3 server each (the kit's headline_job.sh arm mtp3: levels 32,1, two rounds each, greedy), both
 # with VLLM_MOE_CHUNK=0,64,8192 VLLM_MOE_TOKEN_BOUNDARY=16,512,1000000:
 #   base   the vendor op (chunk_size 64 from 17 to 512 tokens, the op's default up to 16, 8192 above)
 #   dense  + VLLM_HPU_MOE_DENSE=1 (17 to 512 tokens as two batched FP8 GEMMs; the vendor op outside that range)
-# The only difference between the arms is 17 to 512 tokens: chunk 64 against dense.
+# The only difference between the arms is 17 to 512 tokens: chunk 64 against dense. The dense arm first, and it
+# fails fast: right after its server is healthy, 32 short requests run, and the server log must then hold
+# "runs the dense MoE form" (the plugin's one-time line), or the job stops with exit code 9.
 # The capture (step-anatomy's recipe, jobs 00113 / 00143): the server gets the torch profiler (--profiler-config,
 # HABANA_PROFILE=profile_api_light; no measurable cost while not capturing) and the step timer
 # (VLLM_HPU_STEP_TIMING=1); after the kit's rounds, anatomy_probe.py runs one 32-stream round on the same live
@@ -45,9 +47,12 @@ import os
 import subprocess
 import sys
 
+import json
+import threading
+import urllib.request
+
 here = os.path.dirname(os.path.abspath(__file__))
 args = sys.argv[1:]
-rc = subprocess.call([sys.executable, os.path.join(here, "decode_scaling_kit.py"), *args])
 
 
 def value(flag):
@@ -60,6 +65,33 @@ def value(flag):
 
 
 port, out, probe = value("--port"), value("--out"), os.environ.get("MOE_AB_ANATOMY_PROBE")
+require = os.environ.get("MOE_AB_REQUIRE_LOG")
+if require and port and out:
+    # Fail fast: one burst of 32 short requests (a prefill of about 32 x 10 tokens and MTP verification steps of
+    # 128 rows, both inside the dense range), then the server log must hold the line; a silent fallback to the
+    # vendor op must not produce a verdict (jobs 00177 and 00190 did).
+    def one(i):
+        body = json.dumps({"model": "fn", "prompt": f"Count to ten, number {i}:", "max_tokens": 8,
+                           "temperature": 0}).encode()
+        req = urllib.request.Request(f"http://127.0.0.1:{port}/v1/completions", data=body,
+                                     headers={"Content-Type": "application/json"})
+        try:
+            urllib.request.urlopen(req, timeout=900).read()
+        except Exception as error:  # noqa: BLE001
+            print(f"moe_ab_trace: burst request {i} failed: {error!r}", flush=True)
+
+    threads = [threading.Thread(target=one, args=(i, )) for i in range(32)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    log = os.path.join(os.path.dirname(out), "server0.log")
+    text = open(log, errors="replace").read() if os.path.exists(log) else ""
+    if require not in text:
+        print(f"moe_ab_trace: FAIL: {require!r} is not in {log} after a 32-request burst", flush=True)
+        sys.exit(9)
+    print(f"moe_ab_trace: {require!r} found in the server log", flush=True)
+rc = subprocess.call([sys.executable, os.path.join(here, "decode_scaling_kit.py"), *args])
 if probe and port and out:
     target = os.path.join(os.path.dirname(out), "trace_probe.json")
     print(f"moe_ab_trace: capture round on port {port} -> {target}", flush=True)
@@ -109,7 +141,7 @@ for arm in "$@"; do
     extra=()
     case "$arm" in
         base) ;;
-        dense) extra=(VLLM_HPU_MOE_DENSE=1) ;;
+        dense) extra=(VLLM_HPU_MOE_DENSE=1 "MOE_AB_REQUIRE_LOG=runs the dense MoE form") ;;
         *) echo "moe_ab_trace: unknown arm $arm" >&2; failed=$((failed + 1)); continue ;;
     esac
     mkdir -p "$OUT/$arm/mtp3"
@@ -121,6 +153,11 @@ for arm in "$@"; do
     rc=$?
     echo "moe_ab_trace: arm $arm ended with exit code $rc $(date -u +%T)"
     [ "$rc" -eq 0 ] || failed=$((failed + 1))
+    if [ "$arm" = dense ] && ! grep -q "runs the dense MoE form" "$OUT/$arm/mtp3/server0.log" 2>/dev/null; then
+        echo "moe_ab_trace: FAIL: the dense arm never ran the dense MoE form (no log line); the job stops here"
+        clear_cards
+        exit 9
+    fi
     ls "$OUT/$arm/mtp3/trace" 2>/dev/null | head -n 10 | sed "s/^/moe_ab_trace: $arm trace file /"
     clear_cards
 done
