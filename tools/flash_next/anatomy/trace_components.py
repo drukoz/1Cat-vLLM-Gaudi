@@ -40,16 +40,26 @@ from collections import Counter, defaultdict
 QSA_PROJ = ("qkv_proj", "o_proj", "index_qk_proj", "bmm", "rotary_emb", "q_norm", "k_norm", "index_k_norm", "q_proj",
             "k_proj", "v_proj", "kv_proj", "index_weights", "weights_proj", "q_a_proj", "q_b_proj")
 ORDER = ("hc", "gdn", "qsa_indexer", "qsa_attention", "qsa_proj", "moe_router", "moe_prep", "moe_experts", "moe_shared",
-         "ple", "embed", "logits", "layer_other", "unattributed", "collective")
+         "ple", "embed", "logits", "sampler", "draft_hc", "draft_gdn", "draft_qsa_indexer", "draft_qsa_attention",
+         "draft_qsa_proj", "draft_moe_router", "draft_moe_prep", "draft_moe_experts", "draft_moe_shared", "draft_ple",
+         "draft_layer_other", "draft_other", "layer_other", "unattributed", "collective")
 SMALL_GAP_US = 200.0
 NODE_JOIN_US = 1.0  # events of one node name closer than this are one execution on several engines
 
 
 def component(path: str) -> str | None:
-    """The model component of a device event's module path (None: no path)."""
+    """The model component of a device event's module path (None: no path). The MTP draft head's modules have
+    paths that start with its layer number (``48/self_attn/...``): they get the component of the same path under the
+    target with a ``draft_`` prefix."""
     p = path
     if not p:
         return None
+    m = re.match(r"(\d+)/(.*)$", p)
+    if m:
+        sub = component("model/0/" + m.group(2))
+        return "draft_" + (sub or "other")
+    if p.startswith("sampler") or "/sampler" in p:
+        return "sampler"
     if "logits_processor" in p or "lm_head" in p:
         return "logits"
     if "embed_tokens" in p:
@@ -58,7 +68,10 @@ def component(path: str) -> str | None:
         return "ple"
     if "linear_attn" in p:
         return "gdn"
-    if p.startswith("MOE/") or "hpu__mixture_of_experts" in p:
+    if p.startswith("MOE/"):
+        # the vendor op's chunk events name the module path after "id_<n>_": a draft layer's starts with its number
+        return "draft_moe_experts" if re.search(r"/id_\d+_\d+/", p) else "moe_experts"
+    if "hpu__mixture_of_experts" in p:
         return "moe_experts"
     if "moe_op" in p:
         return "moe_prep"

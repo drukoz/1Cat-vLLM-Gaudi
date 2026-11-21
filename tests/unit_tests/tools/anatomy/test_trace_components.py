@@ -68,6 +68,12 @@ def test_component_paths():
     assert tc.component("model/3/input_mix_weight_up/aten__linear") == "hc"
     assert tc.component("logits_processor/aten__matmul") == "logits"
     assert tc.component("") is None
+    assert tc.component("48/self_attn/hpu__topk") == "draft_qsa_indexer"
+    assert tc.component("48/mlp/experts/moe_op/hpu__mixture_of_experts") == "draft_moe_experts"
+    assert tc.component("48/flashinfer_gaudi__hc_gate_mix") == "draft_hc"
+    assert tc.component("sampler/aten__argmax") == "sampler"
+    assert tc.component("MOE/layer_0/chunk_3/id_77_0/mlp/experts/moe_op") == "draft_moe_experts"
+    assert tc.component("MOE/layer_0/chunk_3/id_77_model/5/mlp/experts/moe_op") == "moe_experts"
 
 
 def test_main_reads_gzip(tmp_path, capsys):
