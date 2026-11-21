@@ -98,6 +98,13 @@ each row's own request before vLLM's sampler. Pull request: the gate runs on `re
    stable.
 4. The brief's later items, none started: device tensors kept in place, async scheduling with speculation (the PLE
    layer needs the sampled tokens on the device), the worker round trip. CPU pinning belongs to native-replay.
+   MEASURED on the Mac (01:30 UTC, the engine harness forcing `async_scheduling=True` past the platform's refusal,
+   tiny model, four reference prompts): every prompt's tokens leave the reference at token 2, with the PLE n-gram
+   ids on the host and on the device alike: under async scheduling the step's n-gram context (built from the host's
+   token table) lacks the previous step's token, which is still on the device. Async scheduling for Flash-Next
+   needs that context on the device first (the last n - 1 tokens of each request kept and shifted in the graph);
+   it would hide the host time outside the replay call (about 5 ms per step at 32 streams on TP8, step-anatomy),
+   but not under speculation, which the HPU runner refuses with async scheduling.
 5. **Done on the CPU at `299856cd`** (`VLLM_HPU_SAMPLER_REQUEST_PARAMS=1`, default 0): the general sampler path's
    ignored `min_tokens`, `logit_bias` and `min_p`. A card check is a 1-card tiny job (a `logit_bias` of +100 must
    make a greedy request write only that token; a stop token before `min_tokens` must not appear; `min_p` must not
