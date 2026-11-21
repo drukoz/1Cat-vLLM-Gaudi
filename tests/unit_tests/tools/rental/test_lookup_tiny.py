@@ -5,6 +5,7 @@ stream comparison, the server command, and a whole run against stand-ins for the
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import pytest
 
@@ -80,7 +81,7 @@ class _FakeServer:
     dead: set = set()
 
     def __init__(self, name, ckpt, out_dir, port, tp, spec, env, health_timeout_s):
-        self.name, self.spec, self.env = name, spec, env
+        self.name, self.spec, self.env, self.out_dir = name, spec, env, out_dir / name
         self.startup_seconds, self.reason, self.popen = 1.0, None, None
         type(self).started.append((name, spec, dict(env)))
 
@@ -190,3 +191,81 @@ def test_a_server_that_does_not_start_fails_only_its_configuration(monkeypatch, 
 def test_unknown_configuration_is_refused(tmp_path):
     with pytest.raises(SystemExit):
         lt.main(["--configs", "ngram3,bogus", "--out", str(tmp_path)])
+
+
+def test_the_lookup_off_gate(monkeypatch, tmp_path, capsys):
+    ckpt, calls = _fake_world(monkeypatch, tmp_path)
+    reads = {}
+
+    def counters(base_url):
+        # the n-gram server verifies no draft in the lookup-off pass (its first two reads), then oracle drafts
+        n = reads[base_url] = reads.get(base_url, 0) + 1
+        m = max(0, n - 2)
+        return {"drafts": 10 * m, "draft_tokens": 50 * m, "accepted": 12 * m,
+                "accepted_per_pos": [6 * m, 4 * m, 2 * m, 0, 0]}
+
+    monkeypatch.setattr(lt, "counters", counters)
+    off_server = {"verify": 0, "rows1": 1}
+
+    def step_records(folder, t0=None, t1=None):
+        name = Path(folder).name
+        rows1 = off_server["rows1"] if name == "ngram5-off" else 1
+        recs = [{"kind": "prefill", "rows": 1, "steps": 3}, {"kind": "decode", "rows": 1, "bucket_rows": rows1,
+                                                             "steps": 40},
+                {"kind": "decode", "rows": 4, "bucket_rows": 4, "steps": 20}]
+        if name == "ngram5-off" and off_server["verify"]:
+            recs.append({"kind": "verify", "rows": 1, "bucket_rows": 6, "steps": off_server["verify"]})
+        return recs
+
+    monkeypatch.setattr(lt, "step_records", step_records)
+    rc = lt.main(["--ckpt", str(ckpt), "--out", str(tmp_path / "out"), "--configs", "ngram5-off"])
+    printed = capsys.readouterr().out
+    assert rc == 0, printed
+    record = json.loads((tmp_path / "out" / "lookup_tiny.json").read_text())
+    entry = record["configs"][0]
+    assert entry["status"] == "passed" and [p["pass"] for p in entry["passes"]] == ["off", "ngram5"]
+    off = entry["passes"][0]
+    assert off["steps"]["kinds"] == {"prefill": 3, "decode": 60} and off["compare"]["identical"] == 11
+    assert record["baseline"]["decode_shapes"] == {"1": [1], "4": [4]}
+    # the baseline and the n-gram server run with the step timer, the n-gram server with plain steps
+    by_name = {name: env for name, _spec, env in _FakeServer.started}
+    assert by_name["baseline"] == lt.STEP_TIMER_ENV
+    assert by_name["ngram5-off"]["VLLM_HPU_FLASH_NEXT_NGRAM_PLAIN_STEPS"] == "1"
+    assert by_name["ngram5-off"]["VLLM_HPU_STEP_TIMING"] == "1" and lt.ORACLE_ENV in by_name["ngram5-off"]
+    modes = [body.get("vllm_xargs") for url, body in calls if url.endswith("/ngram5-off")]
+    assert modes[:11] == [{"spec_lookup": 0}] * 11 and modes[11:] == [None] * 11
+    assert "[ngram5-off/off]: PASSED" in printed and "steps decode 60, prefill 3" in printed
+
+    # a verification step in the lookup-off pass fails the gate
+    reads.clear()
+    off_server["verify"] = 2
+    assert lt.main(["--ckpt", str(ckpt), "--out", str(tmp_path / "out2"), "--configs", "ngram5-off"]) == 1
+    entry = json.loads((tmp_path / "out2" / "lookup_tiny.json").read_text())["configs"][0]
+    assert entry["status"] == "failed" and "2 verification step(s)" in entry["reason"]
+    # so do decode steps whose input rows are not the baseline's (a verification-shaped graph without drafts)
+    reads.clear()
+    off_server.update(verify=0, rows1=6)
+    assert lt.main(["--ckpt", str(ckpt), "--out", str(tmp_path / "out3"), "--configs", "ngram5-off"]) == 1
+    entry = json.loads((tmp_path / "out3" / "lookup_tiny.json").read_text())["configs"][0]
+    assert "decode input rows" in entry["reason"] and "'1': [[6], [1]]" in entry["reason"]
+    # and a drafted step: the counters moved during the lookup-off pass
+    reads.clear()
+    reads["http://fake/ngram5-off"] = 5
+    off_server.update(rows1=1)
+    assert lt.main(["--ckpt", str(ckpt), "--out", str(tmp_path / "out4"), "--configs", "ngram5-off"]) == 1
+    entry = json.loads((tmp_path / "out4" / "lookup_tiny.json").read_text())["configs"][0]
+    assert "draft(s) verified" in entry["reason"]
+    capsys.readouterr()
+
+
+def test_step_records_and_their_summary(tmp_path):
+    folder = tmp_path / "srv"
+    folder.mkdir()
+    lines = [{"kind": "decode", "rows": 2, "bucket_rows": 2, "steps": 1, "t_first": 100.0, "t_last": 100.1},
+             {"kind": "verify", "rows": 2, "bucket_rows": 12, "steps": 1, "t_first": 200.0, "t_last": 200.1}]
+    (folder / "step_timing_worker_r0_11.jsonl").write_text("\n".join(json.dumps(x) for x in lines) + "\nnot json\n")
+    (folder / "step_timing_worker_r1_12.jsonl").write_text(json.dumps(lines[1]) + "\n")  # another rank: not read
+    assert len(lt.step_records(folder)) == 2
+    assert lt.step_records(folder, 150.0, 250.0) == [lines[1]]
+    assert lt.step_summary(lt.step_records(folder)) == {"kinds": {"decode": 1, "verify": 1},
+                                                        "decode_shapes": {"2": [2]}}

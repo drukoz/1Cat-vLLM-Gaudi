@@ -38,7 +38,7 @@ Usage:
   lookup_probe.py --port P --out OUT.json --label L --rounds edit:32:384:0,edit:32:384:1,prose:32:256:-
       round = KIND:STREAMS:TOKENS:MODE[:FIRST] (MODE '-' sends no vllm_xargs; stream i gets prompt FIRST + i
       of its kind, default 0: two rounds of one server should not share a prompt, see WARM_FIRST). Before the first
-      round of each (KIND, STREAMS) a warm round runs on other prompts of the kind (FIRST + 1000 + i): as long as
+      round of each (KIND, STREAMS, MODE) a warm round runs on other prompts of the kind (FIRST + 1000 + i): as long as
       the round for edit, prose and mix, 48 tokens for editl and editf (--warm-tokens N sets one length for all,
       0 skips it).
   lookup_probe.py --compare A.json B.json ...   compare the texts of several probe files
@@ -436,7 +436,9 @@ def main(argv: list[str] | None = None) -> int:
 
     failed = 0
     for kind, n, ntok, mode, first in rounds:
-        if args.warm_tokens != 0 and (kind, n) not in warmed:
+        # one warm round per (KIND, STREAMS, MODE): a mode can run other graphs at the same batch size (requests
+        # with their lookup off on an n-gram server run plain decode steps, the drafting ones verification steps)
+        if args.warm_tokens != 0 and (kind, n, mode) not in warmed:
             if args.warm_tokens >= 0:
                 warm_tokens = args.warm_tokens
             else:
@@ -445,7 +447,7 @@ def main(argv: list[str] | None = None) -> int:
             # prompt would decode through recurrent blocks the warm request has cached, which no measured round
             # needs (and which crashed the real model's speculative servers in job 00133)
             w = run_round(args, kind, n, warm_tokens, mode, files, first + WARM_FIRST)
-            warmed.add((kind, n))
+            warmed.add((kind, n, mode))
             print(round_line(args.label, "warm", w), flush=True)
             results["prompts"].update(w.pop("prompt_token_ids", {}))
             w.pop("texts", None)

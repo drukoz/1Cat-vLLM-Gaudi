@@ -18,6 +18,12 @@ def test_arm_names():
     assert ls.arm_name(mtp, "1", 2) == "lookup only k=3"
     assert ls.arm_name(mtp, "1", None) == "hybrid k=3"  # the server's default mode
     assert ls.arm_name(mtp, None, 1) == "MTP k=3" and ls.arm_name(mtp, "0", 2) == "MTP k=3"  # no hook installed
+    # an n-gram server's request with its lookup off drafts nothing: the same-server no-speculation reference
+    ngram = {"method": "ngram", "num_speculative_tokens": 5}
+    assert ls.arm_name(ngram, None, 0) == "no speculation (n-gram server, lookup off)"
+    assert ls.arm_name(ngram, None, 1) == "n-gram k=5" and ls.arm_name(ngram, "1", None) == "n-gram k=5"
+    assert ls.is_reference("no speculation") and ls.is_reference("no speculation (n-gram server, lookup off)")
+    assert not ls.is_reference("MTP k=3") and not ls.is_reference("n-gram k=5")
 
 
 def _line(worker, lookup, mtp, none, steps):
@@ -106,3 +112,31 @@ def test_sources_are_left_out_when_the_log_does_not_line_up(tmp_path):
     three = "\n".join([one, _line(0, (2, 2, 2), (0, 0, 0), (0, 0, 0), 9), _line(0, (3, 3, 3), (0, 0, 0), (0, 0, 0), 12)])
     assert ls.source_deltas(probe, three) == {}  # more lines than rounds: not this probe's server log
     assert ls.source_deltas(probe, "") == {}
+
+
+def test_the_ngram_servers_lookup_off_rounds_are_the_reference(tmp_path):
+    answer, shas = list(range(50, 58)), ["s0", "s1"]
+    other = answer[:3] + [99, 98, 97, 96, 95]
+    # the folded n-gram arm: n-gram rounds on other prompts, then the same rounds with the lookup off (mode 0)
+    ngram = {"label": "ngram5-nospec", "warm": [], "rounds": [
+        _round("edit", 2, None, 4.0, 90.0, [answer, answer], ["s2", "s3"]),
+        _round("edit", 2, 0, None, 60.0, [answer, answer], shas)]}
+    hybrid = {"label": "hybrid3", "warm": [], "rounds": [_round("edit", 2, 1, 3.0, 75.0, [answer, other], shas)]}
+    _write(tmp_path / "n", ngram, {"method": "ngram", "num_speculative_tokens": 5})
+    _write(tmp_path / "h", hybrid, {"method": "mtp", "num_speculative_tokens": 3}, lookup="1")
+    rows = ls.rows_of([ls.load_run(str(tmp_path / d)) for d in ("n", "h")])
+    by_arm = {r["arm"]: r for r in rows}
+    off = by_arm["no speculation (n-gram server, lookup off)"]
+    assert rows[0] is off and off["lossless"] is None and off["speedup_vs_no_speculation"] == pytest.approx(1.0)
+    assert by_arm["n-gram k=5"]["speedup_vs_no_speculation"] == pytest.approx(60.0 / (90.0 / 4.0))
+    assert by_arm["n-gram k=5"]["lossless"] is None  # its prompts have no reference stream
+    assert by_arm["hybrid k=3"]["speedup_vs_no_speculation"] == pytest.approx(60.0 / 25.0)
+    assert by_arm["hybrid k=3"]["lossless"]["identical"] == 1
+    assert by_arm["hybrid k=3"]["lossless"]["first_difference_min"] == 3
+    # a server without speculation, when there is one, is the reference of the speedups
+    real = {"label": "nospec", "warm": [], "rounds": [_round("edit", 2, None, None, 50.0, [answer, answer], shas)]}
+    _write(tmp_path / "r", real, None)
+    rows = ls.rows_of([ls.load_run(str(tmp_path / d)) for d in ("n", "h", "r")])
+    by_arm = {r["arm"]: r for r in rows}
+    assert by_arm["hybrid k=3"]["speedup_vs_no_speculation"] == pytest.approx(50.0 / 25.0)
+    assert by_arm["no speculation (n-gram server, lookup off)"]["speedup_vs_no_speculation"] == pytest.approx(50 / 60)

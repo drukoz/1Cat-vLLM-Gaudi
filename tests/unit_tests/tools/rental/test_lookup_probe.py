@@ -250,9 +250,12 @@ def test_probe_end_to_end_against_a_fake_server(tmp_path, capsys):
     assert len(warm_shas) == 4 and not warm_shas & measured_shas
     assert [r["first"] for r in record["rounds"]] == [0, 0, 0, 0]
     assert record["prompts"][first["prompt_sha"][0]] == list(range(9))
-    assert len(record["warm"]) == 3 and "texts" not in record["warm"][0]  # one warm round per (kind, streams)
+    # one warm round per (kind, streams, mode): the two edit rounds (modes 0 and 1) warm on the same other prompts
+    assert len(record["warm"]) == 4 and "texts" not in record["warm"][0]
+    assert [(w["kind"], w["mode"]) for w in record["warm"]] == [("edit", 0), ("edit", 1), ("prose", None),
+                                                                ("editf", None)]
     # the warm round is as long as the round for edit and prose, 48 tokens for the whole-answer round
-    assert [w["tokens"] for w in record["warm"]] == [8, 6, 48]
+    assert [w["tokens"] for w in record["warm"]] == [8, 8, 6, 48]
     whole = [b for b in _FakeServer.bodies if b["max_tokens"] == 120]
     assert len(whole) == 2 and all(b["ignore_eos"] is False for b in whole)
     # the request after the last round (a server with the lookup hook then logs the last round's counters)
@@ -304,11 +307,16 @@ def test_serve_script_refuses_bad_arguments():
 ARMS = SERVE.parent / "lookup_arms.sh"
 
 
-def test_arms_script_dry_run():
-    done = subprocess.run(["bash", str(ARMS), "--dry-run", "nospec", "ngram5", "hybrid3"], capture_output=True,
-                          text=True, check=False, env={"PATH": "/usr/bin:/bin", "FARM_OUT": "/results/x"})
+def _arms(*args, **env):
+    done = subprocess.run(["bash", str(ARMS), "--dry-run", *args], capture_output=True, text=True, check=False,
+                          env=dict({"PATH": "/usr/bin:/bin", "FARM_OUT": "/results/x"}, **env))
     assert done.returncode == 0, done.stderr
-    lines = done.stdout.splitlines()
+    return [line for line in done.stdout.splitlines() if line.startswith("arm ")], done.stdout
+
+
+def test_arms_script_dry_run():
+    lines, out = _arms("nospec", "ngram5", "hybrid3")
+    assert "lookup_arms: placement off" in out  # no switch file
     assert len(lines) == 3 and [line.split(":")[0] for line in lines] == ["arm nospec", "arm ngram5", "arm hybrid3"]
     assert "--label nospec" in lines[0] and "--speculative" not in lines[0] and "--out /results/x/nospec" in lines[0]
     assert "--ngram 5" in lines[1] and "edit:1:384:-:100\\,edit:32:384:-:0\\,mix:32:384:-:400" in lines[1]
@@ -318,3 +326,44 @@ def test_arms_script_dry_run():
     assert "mix:32:384:1:400\\,mix:32:384:0:700" in lines[2] and "VLLM_HPU_MTP_DRAFT_LOOP=1" in lines[2]
     bad = subprocess.run(["bash", str(ARMS), "--dry-run", "ngram"], capture_output=True, text=True, check=False)
     assert bad.returncode == 2 and "unknown arm" in bad.stderr
+
+
+def test_arms_script_folds_the_reference_into_the_ngram_server():
+    lines, _ = _arms("tiny-off", "hybrid3", "ngram5-nospec")
+    assert [line.split(":")[0] for line in lines] == ["arm tiny-off", "arm hybrid3", "arm ngram5-nospec"]
+    assert "lookup_tiny.py --configs ngram5-off --out /results/x/tiny-off" in lines[0]
+    # n-gram on the prompts 300 on, then the lookup off on the round's own prompts (the hybrid's mode 1 prompts)
+    assert "--ngram 5" in lines[2] and "VLLM_HPU_FLASH_NEXT_NGRAM_PLAIN_STEPS=1" in lines[2]
+    assert "edit:1:384:-:400\\,edit:1:384:0:100\\,edit:32:384:-:300\\,edit:32:384:0:0" in lines[2]
+    assert "mix:32:384:-:700\\,mix:32:384:0:400" in lines[2] and "--out /results/x/ngram5-nospec" in lines[2]
+    assert "edit:1:384:1:100" in lines[1]
+    # the job's own setting wins
+    lines, _ = _arms("ngram5-nospec", VLLM_HPU_FLASH_NEXT_NGRAM_PLAIN_STEPS="0")
+    assert "NGRAM_PLAIN_STEPS" not in lines[0]
+    # LOOKUP_ARMS_SPLIT=1 (as after a failed tiny gate): two servers, the reference first
+    lines, out = _arms("hybrid3", "ngram5-nospec", LOOKUP_ARMS_SPLIT="1")
+    assert [line.split(":")[0] for line in lines] == ["arm hybrid3", "arm nospec", "arm ngram5"]
+    assert "ngram5-nospec runs as nospec and ngram5" in out and "edit:1:384:-:100" in lines[2]
+
+
+def test_arms_script_placement_switch(tmp_path):
+    switch, wrap, place = tmp_path / "place", tmp_path / "place_wrap.sh", tmp_path / "place.sh"
+    wrap.write_text("#!/bin/bash\n")
+    place.write_text("#!/bin/bash\n")
+    env = {"LOOKUP_ARMS_PLACE_SWITCH": str(switch), "LOOKUP_ARMS_PLACE_WRAP": str(wrap),
+           "LOOKUP_ARMS_PLACE_SCRIPT": str(place)}
+    switch.write_text("on\n")
+    lines, out = _arms("tiny-off", "nospec", **env)
+    assert "lookup_arms: placement ON (rule a^1" in out
+    assert "place_wrap" not in lines[0] and "WORKER_CPU_PIN" not in lines[0]  # the tiny gate is never placed
+    assert "VLLM_HPU_WORKER_CPU_PIN=1" in lines[1] and "PLACE_SIBLING_RULE=a\\^1" in lines[1]
+    assert ("PLACE_ARGS=--log\\ /results/x/nospec/server0.log" in lines[1]
+            and "PLACE_LOG=/results/x/nospec/placement.log" in lines[1])
+    assert "bash %s %s -- bash " % (wrap, place) in lines[1] and lines[1].endswith("--out /results/x/nospec")
+    switch.write_text("off\n")
+    lines, out = _arms("nospec", **env)
+    assert "lookup_arms: placement off" in out and "place_wrap" not in lines[0]
+    switch.write_text("a+N/2\n")
+    wrap.unlink()  # switched on, but the wrapper is missing: off
+    lines, out = _arms("nospec", **env)
+    assert "placement switch on but" in out and "place_wrap" not in lines[0]
