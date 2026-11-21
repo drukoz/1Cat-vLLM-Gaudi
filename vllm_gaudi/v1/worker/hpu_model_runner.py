@@ -4893,8 +4893,17 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                 self._log_verify_advance(bad)
         if context is not None and context.device.type != torch.device(self.device).type:
             context = async_h2d_copy(context.to(torch.int32), device=self.device)
+        kept_ids, kept_positions, kept_context = token_ids, positions, context
+        if made is None or mode != 2:
+            # The host-made inputs (and the host's PLE context) can live in buffers that the next step's uploads
+            # rewrite before it advances from them (VLLM_HPU_PERSISTENT_INPUTS: one buffer per input in a
+            # synchronous engine): the next step advances from copies of what it reads.
+            kept_ids, kept_positions = token_ids.clone(), positions.clone()
+            kept_context = None if context is None else context.clone()
+        elif context is not None and context is not made.ngram_context:
+            kept_context = context.clone()
         self._verify_advance.record(self._verify_step, self.input_batch.req_ids, num_decodes, padded, num_tokens - 1,
-                                    VerifyInputs(token_ids, positions, slot_mapping, num_accepted, context))
+                                    VerifyInputs(kept_ids, kept_positions, slot_mapping, num_accepted, kept_context))
         return ple_inputs
 
     def _set_verify_chain(self, num_decodes, sampled_token_ids, defer_books: bool = False):
