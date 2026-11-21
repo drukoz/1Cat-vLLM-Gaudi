@@ -371,19 +371,32 @@ leaves the choice open. With `0` nothing is loaded, registered or logged. The
 kernels pass the Gaudi2 instruction simulator and have not run on a card; see
 `docs/design/flash-next/hc-fused.md` ("MoE glue kernels").
 
+`VLLM_MOE_CHUNK` and `VLLM_MOE_TOKEN_BOUNDARY` (lists of integers of equal
+length, default empty) pass `chunk_size` and `total_experts` to
+`torch.ops.hpu.mixture_of_experts`: a step of at most `VLLM_MOE_TOKEN_BOUNDARY[i]`
+tokens (the first that fits) gets `VLLM_MOE_CHUNK[i]`, a longer one the last
+value. A value of `0` keeps the op's own default for that range (no
+arguments). On Flash-Next at TP8 (MTP k = 3, 32 streams) `chunk_size` 64 made
+the step about 12 ms shorter (job 00161); `VLLM_MOE_CHUNK=0,64,8192
+VLLM_MOE_TOKEN_BOUNDARY=16,512,1000000` applies it from 17 to 512 tokens only.
+
 `VLLM_HPU_MOE_DENSE` (integer, default `0`) applies to the routed experts of a
 per-channel FP8 MoE (`VllmMixtureOfExpertsOpFP8PerChannel`, Flash-Next's experts
 with `VLLM_HPU_FORCE_CHANNEL_FP8`). `1` keeps the layer's stacked FP8 experts
 when its weights are prepared and runs a step of at most
-`VLLM_HPU_MOE_DENSE_MAX_TOKENS` tokens (integer, default `512`) as two batched
+`VLLM_HPU_MOE_DENSE_MAX_TOKENS` tokens (integer, default `512`) and at least
+`VLLM_HPU_MOE_DENSE_MIN_TOKENS` tokens (integer, default `17`) as two batched
 FP8 GEMMs over all local experts (every expert on every row, the routing
 weight of a pair that is not routed is 0) instead of
-`torch.ops.hpu.mixture_of_experts`; longer steps keep the vendor op. On one
+`torch.ops.hpu.mixture_of_experts`; longer and shorter steps keep the vendor op
+(below the minimum the vendor op reads only the experts the rows hit). On one
 card the vendor op costs several times what reading the local experts once
 costs at 32 to 512 rows (`tools/flash_next/kernel_probes/probe_moe_layers.py`,
 `probe_moe_dense.py`). `0` (or any other value) keeps the vendor op. The two
 forms agree to FP8 rounding (the dense form quantizes the intermediate per
-expert and row). Not yet run on a card.
+expert and row). On the real model (TP8, MTP k = 3, job 00177) the first form of
+this path, without the minimum and with an fp32 weighted sum, was slower than
+the vendor op; keep it off until a later A/B shows otherwise.
 
 `VLLM_HPU_MOE_GLUE_MERGE_GATE_UP` (integer, default `0`) applies only with
 `VLLM_HPU_MOE_GLUE=1`. `1` appends the shared expert's gate_up rows of this
@@ -680,6 +693,7 @@ prepared-model entrypoint and disabled in the generic entrypoint.
 | `VLLM_HPU_PLE_TABLE_RIDER` | Flash-Next only: `1` looks the PLE n-gram table rows up before the token embedding and sums both over the ranks in one all-reduce (the table rows as extra columns), so the table's own all-reduce is gone from every target step; the result is the same bit for bit. Needs the vocabulary-sharded embedding: with `VLLM_HPU_REPLICATED_EMBEDDING=1` nothing changes. Not yet run on a card. | `0` |
 | `VLLM_HPU_ALL_REDUCE_AS_GATHER_ROWS` | `N > 0`: an HPU tensor-parallel all-reduce whose input has at most `N` rows (first dimension) runs as an all-gather of every rank's partial and a local fp32 sum, the same bits on every rank; larger ones stay all-reduces (`docs/design/flash-next/collectives.md`, C4 without the fused kernel). The gather moves 7 times the payload at 8 ranks; it can pay only where one gather phase costs less than an all-reduce. `0` never. Not yet run on a card. | `0` |
 | `VLLM_HPU_MTP_REPLICATED_FC` | Flash-Next MTP only, read when the draft is built: `1` builds the draft's two hidden-by-hidden entry linears (`fc_embedding`, `fc_hidden`) unsharded, which removes their two all-gathers from every draft step (a 2560 x 2560 bf16 matrix each: about 11 MiB more per card each). Not yet run on a card. | `0` |
+| `VLLM_HPU_FLASH_NEXT_ASYNC_SCHED` | Flash-Next only: vLLM's async scheduling (the engine schedules step N+1 while step N runs; the worker prepares and issues step N+1 before step N's sampled tokens reach the host, so the host's per-step work hides behind the device). `0` keeps it off for Flash-Next, as before. `1` keeps vLLM's decision (on unless `--no-async-scheduling`) when there is no speculative config; with one it stays off. `2` is `1` and also keeps it with the Flash-Next MTP draft: the runner keeps its synchronous speculative step (one host read of the verification result), the drafts stay on the device for the next step (no read-back of the drafts, no wait for the draft passes) and the scheduler's optimistic `num_computed_tokens` is corrected with the accepted counts. The runner then carries the PLE n-gram context of the decode rows on the device (the host-built context lacks the previous step's token), keeps a placeholder per in-flight token in each request's output tokens (settled before penalties or bad words read them), and the async scheduler ends prompt chunks on the recurrent block grid as the synchronous engine does (prefix-cache hits of the recurrent state). `VLLM_HPU_PLE_HOST_NGRAM_IDS=1` has no effect under it (the ids need the device's tokens). A seeded request whose prompt spans several chunks samples a different (still valid) stream than without async scheduling. Design and card results: `docs/design/flash-next/async-sched.md`. | `0` |
 
 The Gaudi2 backend routes supported contiguous BF16 residual RMSNorm calls with
 hidden sizes up to 8192 to one Triton-generated TPC kernel. It returns both the
