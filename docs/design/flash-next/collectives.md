@@ -511,33 +511,43 @@ Rollback: `mv ~/farm/q/cpu_layout ~/farm/q/cpu_layout.off`. The plugin's `VLLM_H
 
 ## Handoff (if this agent stops)
 
-State at 09:20 UTC on 2026-11-21 (fourth agent of this track, Opus 5.5). **The node stays until about 00:00 UTC
+State at 10:05 UTC on 2026-11-21 (fourth agent of this track, Opus 5.5). **The node stays until about 00:00 UTC
 on 2026-11-22** (BRIEF 00:50 UTC).
 
-**Now (09:20 UTC), in order:**
+**Now (10:05 UTC), in order:**
 1. 00219 (place-only proof) done and reported (section 7): place-only works.
-2. **00210** (starts by 12:57 UTC at the latest, 120 min) is bound: `~/farm/collectives/bridge/late/00210.env` =
-   `SPIN=on`, `REF_PAIR=1`, `PLACE=/results/bench/place.sh`, `LEAN4=0`, `LEAN5=lean6m-43fdd6850644` (published 09:01:25
-   UTC, wheel sha256s checked), `VERIFY_KV=PT_HPU_HPUGRAPH_STATIC_PLAN_MISS_LOG=200`; no pin. This agent's waiters fetch
-   every arm (`card/00210-real8-bridge-reuse2-*`, verdicts) and, as soon as real-lean5-verify ends, its `server0.log`
-   with the miss table (`card/00210-early/real-lean5-verify/miss_table.txt`). Report: the verdicts, the spinner pair
-   (real-ref against real-ref-alt), the per-rank per-level coverage (`bridge_verdict.py`) to the coordinator,
-   native-replay and engine-step (`a8a87f4c2008bde9c`); the miss table to engine-step and native-replay at once.
+2. **00234 `real8-bridge-reuse3`** (120 min, in 00210's queue place, starts by 16:25 UTC at the latest; coordinator
+   09:50 UTC: kernel-fixes' 00213 measured the dense MoE from 1 token, 100 launches per 1-stream step instead of 148,
+   27.9 against 37.7 ms, so the qualification moved onto build 5's tree): build 5's image
+   `farm-integration:eb21ac75a7c8` (second tag `farm-collectives-int:eb21ac75a7c8`; its first 16 layers are build 4's,
+   only the plugin layer differs), build 5's no-speculation env + `VLLM_HPU_MOE_DENSE=1 VLLM_HPU_MOE_DENSE_MIN_TOKENS=1
+   VLLM_MOE_CHUNK=0,64,8192 VLLM_MOE_TOKEN_BOUNDARY=16,512,1000000`, build 5's probe pair in
+   `/results/bench/intprobe5r` (serve_probe.sh d5e601c1, decode_scaling.py 39057ade as `decode_scaling_real.py`, the
+   text-check wrapper ea28fc0c, text_check.py daca88b9) with integration's dense log checks (`BRIDGE_PROBE_EXTRA`:
+   `--require-log`, `--forbid-log`, `--probe-require-log runs.the.dense.MoE.form`) and `BRIDGE_REQUIRE_LOG="runs the
+   dense MoE form"` (bridge_reuse_job.sh c9680081, node md5 c323c61b); the job script is `~/farm/q/jobs/00234/cmd.sh`.
+   Late file `~/farm/collectives/bridge/late/00234.env` = `SPIN=on`, `REF_PAIR=1`, `PLACE=/results/bench/place.sh`
+   (place_wrap.sh there is now 363bcf9d), `LEAN4=0`, `LEAN5=lean6m-43fdd6850644`,
+   `VERIFY_KV=PT_HPU_HPUGRAPH_STATIC_PLAN_MISS_LOG=200`; no pin. This agent's waiters fetch every arm
+   (`card/00234-real8-bridge-reuse3-*`, verdicts) and, as soon as real-lean5-verify ends, its `server0.log` with the miss
+   table (`card/00234-early/real-lean5-verify/miss_table.txt`). Report: the verdicts, the spinner pair (real-ref against
+   real-ref-alt), the per-rank per-level coverage (`bridge_verdict.py`) to the coordinator, native-replay and
+   engine-step (`a8a87f4c2008bde9c`); the miss table to engine-step and native-replay at once.
 3. **The stale test (coordinator 08:47 UTC)**: branch `fix/flash-next-gaudi-draft-rank-topk-test` (worktree
    `wt/collectives-fix`, 0f85066a on the program head adbcff30): `test_proposer_only_reaches_topk_under_the_gate` now
    checks PR 13's one guarded `.topk(` in `_draft_tokens`; the file passes (15). Gate it (`bin/gate wt/collectives-fix`),
    open the PR to `feat/flash-next-gaudi`, merge when green (test-only). Not ours: `test_flash_next_host_ngram.py`
    fails 4 on the head (`HPUModelRunner` stub without `_block_table_max_blocks`, from 121c88b0); 9 worker files need
    `habana_frameworks` (not on the Mac).
-4. **00210 qualifies lean6m (coordinator 08:57 UTC)**: native-replay's `lean6m-43fdd6850644` (lean5 +
+4. **lean6m (coordinator 08:57 UTC)**: native-replay's `lean6m-43fdd6850644` (lean5 +
    `PT_HPU_HPUGRAPH_STATIC_PLAN_MISS_LOG=N`: per missing launcher one stderr line per N launches with the misses by
-   reason and the first moved input), the log only in real-lean5-verify (`VERIFY_KV`, bridge_reuse_job.sh f65e0226,
-   node md5 13a1a439). When `~/farm/native-replay/bridge-build/out/lean6m-43fdd6850644/manifest.json` exists, add
-   `LEAN5=lean6m-43fdd6850644` and `VERIFY_KV=PT_HPU_HPUGRAPH_STATIC_PLAN_MISS_LOG=200` to the late file (not before:
-   an absent wheel fails every lean arm). When real-lean5-verify ends (`ab_bridge: arm real-lean5-verify ended` in
-   `~/farm/q/jobs/00210/log`): `python3 -I reports/collectives/probes/plan_miss_table.py <its server0.log or folder>`
-   to engine-step and native-replay at once (this agent's waiter puts it in `card/00210-early/real-lean5-verify/`).
-   engine-step's `VLLM_HPU_PERSISTENT_INPUTS` goes into build 6's job (coordinator), not ours. Branch `feat/flash-next-gaudi-collectives` (and `-dev`, the same head), worktree
+   reason and the first moved input; published 09:01:25 UTC, wheel sha256s checked; the line format is frozen), the log
+   only in real-lean5-verify (`VERIFY_KV`). When real-lean5-verify ends (`ab_bridge: arm real-lean5-verify ended` in
+   `~/farm/q/jobs/00234/log`): `python3 -I reports/collectives/probes/plan_miss_table.py <its server0.log or folder>`
+   to engine-step and native-replay at once. engine-step's `VLLM_HPU_PERSISTENT_INPUTS` goes into build 6's job
+   (coordinator), not ours.
+
+Branch `feat/flash-next-gaudi-collectives` (and `-dev`, the same head), worktree
 `/Volumes/Storage/Claude/gaudi-work/wt/collectives`; card results and logs in
 `/Volumes/Storage/Claude/gaudi-work/reports/collectives/` (`card/<id>-<name>/`, `logs/`, `probes/`). This section is
 the track's report: the harness refuses a REPORT.md.
