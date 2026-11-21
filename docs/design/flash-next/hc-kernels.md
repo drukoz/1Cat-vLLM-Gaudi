@@ -342,3 +342,48 @@ INFERRED only: whether the compiler accepts fractional `a` and overlapping outpu
 Next candidates (not built): the conv blocks and the gated RMSNorm per (node, value head), now a larger share; two
 nodes' norms in one block instead of four clamped ones. The value-head split of kernel-fixes' option (c) list is not
 needed while the variants above work.
+
+## 7. QSA indexer top-k as one selection kernel (coordinator 13:15 UTC, task 1)
+
+The indexer keeps the top 512 of `N = 32,768` compressed blocks per row with the vendor sort (`torch.topk` of the
+masked row): 158 us per layer at 16 rows per rank in 00190's trace (12 QSA layers), 0.405 / 0.524 / 0.647 /
+1.536 ms at 4 / 16 / 32 / 128 rows as standalone graphs (00211). qsa-fused measured that no torch form helps and that
+its two-kernel K3a + K3b was slower than the sort (0.45 against 0.30 ms at 4-8 rows: 31 passes over the row in global
+memory, latency-bound loops). Interface and file split agreed with qsa-fused (13:2x UTC): an additive kernel in its
+library, the hook `VLLM_HPU_QSA_TOPK_FORM=4` in its `qsa_sparse_ops.topk_by_form` (on its branch, `32faf44d`), it
+reviews the diff before any card job.
+
+**Kernel** `qsa_fused_topk_f32_gaudi2` (`csrc/qsa_fused/kernels/qsa_fused_topk_gaudi2.c`), op
+`flashinfer_gaudi::qsa_index_topk(Tensor masked, int topk) -> Tensor` (ids `[T, topk]` int32; the kernel's second
+output, a workspace `[T, 4 + N / 16]`, is dropped by the op). Input: `select_blocks`' masked scores (`-inf` where a
+block is not visible). One index-space point per row; `N` a multiple of 512, at most 32,768.
+- key = the fp32 bits of a score >= +0 (NaN with a clear sign bit above +inf, as `torch.topk` puts NaN first), 0 for
+  -0, none for -inf. theta = the k-th largest key. The set: every key above theta, then the lowest columns equal to
+  it up to k (qsa-fused's `threshold_pick` rule); a row with fewer than k keys takes them all and pads with -1.
+- Per row: one read of the row puts the top 16 bits of every key into vector local memory (two per 32-bit lane:
+  64 KiB at N = 32,768; no lookup-table function is called, so the 64 KiB are available); 16 bit-passes over local
+  memory (128-lane 16-bit compares, four count chains, 16 vectors per loop step) find theta16; a second read puts
+  the bucket's (prefix == theta16) low 15 bits + 1 there; 16 more passes find the low part. Three reads of the row
+  in global memory instead of 31.
+- theta and an "overflow" flag (more columns equal theta than the k - G still free) go to the workspace; after an
+  `aso` fence (TPC-C: "global memory is not coherent; call aso for read-after-write"; the pattern of
+  `deepseek_v41_nucleus_mass`) the flag is read back as a scalar. Without overflow one bitmap, key >= theta: every
+  such column is taken; with it, key > theta and key == theta. The bitmaps' words are OR-folded two predicates at
+  once (the fold of the GDN kernel, for OR).
+- After a second fence scalar code walks the bitmap words (four per load batch, empty batches skipped) and stores
+  the ids one by one; then -1 up to k. Output order: ascending (one bitmap), or ascending above-theta columns then
+  ascending tied columns. The caller orders the k picks by value as forms 1-3 do (`torch.topk` of k values).
+
+VERIFIED (simulator): ids bit-exact against `qsa_index_topk_masked_ref` on every row of `topk_tiny`,
+`topk_tiny_width1024`, `topk_real32` (32 rows with short, long and padding rows, every third row on a coarse grid:
+ties beyond the cut) through the real library, its glue and the index-space mapping test with shuffled partitions
+(`tests/standalone/qsa_fused/test_qsa_simulation.py`, 22 passed); a scratch suite of distinct, zero-tie, grid-tie,
+NaN / +inf / denormal and N = 1,024 rows equal to a numpy reference. About 60K instructions per row at N = 32,768
+(INFERRED about 35 us per row at 1.7 GHz: 16 rows on 16 engines about 35 us per call against the sort's 158). CPU:
+`tests/unit_tests/qsa_fused/test_qsa_topk.py` (11 passed: the reference against `torch.topk`'s set on distinct
+scores, ties, zeros, NaN, padding, the op on CPU, fake shapes, GUID / glue / build agreement); every
+`tests/unit_tests/qsa_fused` file green.
+
+Card job: `tools/flash_next/hc_kernels/card_qsa_topk.sh`: the op card tests of the top-k cases (stop on failure),
+`bench_qsa_topk.py` at 4 / 16 / 32 / 128 rows (sorted, kernel, kernel + order by value; chained calls; sets compared
+on the card) and the vendor sort's tie probe, traces at 16 rows. Then the hook (form 4) on qsa-fused's form code.

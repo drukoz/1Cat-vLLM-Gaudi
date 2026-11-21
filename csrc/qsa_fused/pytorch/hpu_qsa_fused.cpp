@@ -20,6 +20,9 @@ constexpr auto kPrepareSchema = "flashinfer_gaudi::qsa_index_prepare";
 constexpr auto kEmitSchema = "flashinfer_gaudi::qsa_index_emit";
 constexpr auto kThresholdSchema = "flashinfer_gaudi::qsa_index_threshold";
 constexpr auto kSelectSchema = "flashinfer_gaudi::qsa_index_select";
+//   qsa_index_topk(Tensor masked, int topk) -> Tensor: the one-node top-k (VLLM_HPU_QSA_TOPK_FORM=4); the kernel's
+//   second output, its workspace, is dropped here.
+constexpr auto kTopkSchema = "flashinfer_gaudi::qsa_index_topk";
 
 bool power_of_two(int64_t value) { return value > 0 && (value & (value - 1)) == 0; }
 
@@ -84,6 +87,13 @@ void validate_threshold(const at::Tensor& scores, const at::Tensor& positions, i
     TORCH_CHECK(scores.size(1) % 128 == 0, "QSA fused scores must have a multiple of 128 columns");
     TORCH_CHECK(power_of_two(ratio) && ratio >= 2 && ratio <= kQsaFusedMaxRatio, "QSA fused ratio must be 2, 4 or 8");
     TORCH_CHECK(topk >= 1, "QSA fused topk must be >= 1");
+}
+
+void validate_topk(const at::Tensor& masked, int64_t topk) {
+    check_tensor(masked, at::kFloat, 2, "masked scores");
+    TORCH_CHECK(masked.size(1) % kQsaFusedTopkColumnStep == 0 && masked.size(1) <= kQsaFusedTopkMaxColumns,
+                "QSA fused top-k needs a multiple of 512 columns, at most 32768");
+    TORCH_CHECK(topk >= 1 && topk <= (1 << 20), "QSA fused topk must be >= 1");
 }
 
 void validate_select(const at::Tensor& meta, int64_t topk) {
@@ -168,6 +178,23 @@ const bool select_registered = [] {
     return true;
 }();
 
+const bool topk_registered = [] {
+    habana::custom_op::registerUserCustomOp(
+        kTopkSchema, kQsaFusedTopkGuid,
+        [](const at::Stack& stack) {
+            const auto& masked = stack.at(0).toTensor();
+            const int64_t topk = stack.at(1).toInt();
+            validate_topk(masked, topk);
+            return habana::PartialOutputMetaDataVector{
+                habana::PartialOutputMetaData{at::kInt, {masked.size(0), topk}},
+                habana::PartialOutputMetaData{at::kInt, {masked.size(0), 4 + masked.size(1) / 16}}};
+        },
+        [](const at::Stack& stack, size_t& size) -> std::shared_ptr<void> {
+            return node_params(size, 0.0, 0, 0, 0, 0, 0, stack.at(1).toInt());
+        });
+    return true;
+}();
+
 std::vector<at::Tensor> execute(const char* schema, const at::Tensor& first, std::vector<c10::IValue> inputs,
                                 size_t outputs) {
     TORCH_CHECK(first.device().type() == c10::DeviceType::HPU, "QSA fused ops require HPU inputs");
@@ -203,6 +230,12 @@ at::Tensor run_threshold(const at::Tensor& scores, const at::Tensor& positions, 
     return execute(kThresholdSchema, scores, {scores, positions, ratio, topk}, 1).at(0);
 }
 
+at::Tensor run_topk(const at::Tensor& masked, int64_t topk) {
+    validate_topk(masked, topk);
+    TORCH_CHECK(topk_registered);
+    return execute(kTopkSchema, masked, {masked, topk}, 2).at(0);
+}
+
 at::Tensor run_select(const at::Tensor& meta, int64_t topk) {
     validate_select(meta, topk);
     TORCH_CHECK(select_registered);
@@ -215,4 +248,5 @@ TORCH_LIBRARY_IMPL(flashinfer_gaudi, HPU, m) {
     m.impl("qsa_index_emit", run_emit);
     m.impl("qsa_index_threshold", run_threshold);
     m.impl("qsa_index_select", run_select);
+    m.impl("qsa_index_topk", run_topk);
 }

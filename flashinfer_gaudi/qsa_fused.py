@@ -11,7 +11,11 @@ kernel database ``libqsa_fused_gaudi2.so`` is registered. Nothing imports this m
 
 Schemas (torch shapes; every integer tensor int32). ``qsa_index_threshold`` and ``qsa_index_select`` (mode 3) take
 the place of ``select_blocks``: scores ``[T, N]`` fp32 (``N`` a multiple of 128) -> meta ``[T, 4 + N / 16]`` ->
-blocks ``[T, topk]`` (ascending, ties at the cut to the lowest block).
+blocks ``[T, topk]`` (ascending, ties at the cut to the lowest block). ``qsa_index_topk`` (``VLLM_HPU_QSA_TOPK_FORM=4``)
+is the same selection in one node, from the masked scores of ``select_blocks`` (``-inf`` where a block is not
+visible): ``[T, N]`` fp32 (``N`` a multiple of 512, at most 32,768) -> ids ``[T, topk]`` int32 (every column above
+the k-th largest key, then the lowest columns equal to it; ascending within each of the two; -1 where a row has
+fewer than ``topk`` unmasked columns). Its library is optional for the other ops: ``qsa_topk_missing_op``.
 
     qsa_index_prepare(Tensor(a!) key_ring, Tensor(b!) key_cache, Tensor qk, Tensor rows, Tensor q_norm_weight,
                       Tensor k_norm_weight, Tensor cos_sin, float eps, int heads, int ring_rows, int ratio) -> Tensor
@@ -33,7 +37,12 @@ import torch
 NAMESPACE = "flashinfer_gaudi"
 OP_NAMES = ("qsa_index_prepare", "qsa_index_emit", "qsa_index_threshold", "qsa_index_select")
 GUIDS = {"qsa_index_prepare": "qsa_fused_prepare_bf16_gaudi2", "qsa_index_emit": "qsa_fused_emit_i32_gaudi2",
-         "qsa_index_threshold": "qsa_fused_threshold_f32_gaudi2", "qsa_index_select": "qsa_fused_select_i32_gaudi2"}
+         "qsa_index_threshold": "qsa_fused_threshold_f32_gaudi2", "qsa_index_select": "qsa_fused_select_i32_gaudi2",
+         "qsa_index_topk": "qsa_fused_topk_f32_gaudi2"}
+TOPK_OP_NAME = "qsa_index_topk"
+# What qsa_index_topk accepts (qsa_fused_params.h: kQsaFusedTopkMaxColumns, kQsaFusedTopkColumnStep).
+TOPK_MAX_COLUMNS = 32768
+TOPK_COLUMN_STEP = 512
 SCHEMAS = {
     "qsa_index_prepare": ("qsa_index_prepare(Tensor(a!) key_ring, Tensor(b!) key_cache, Tensor qk, Tensor rows, "
                           "Tensor q_norm_weight, Tensor k_norm_weight, Tensor cos_sin, float eps, int heads, "
@@ -42,6 +51,7 @@ SCHEMAS = {
                        "int block_size) -> (Tensor, Tensor)"),
     "qsa_index_threshold": "qsa_index_threshold(Tensor scores, Tensor positions, int ratio, int topk) -> Tensor",
     "qsa_index_select": "qsa_index_select(Tensor meta, int topk) -> Tensor",
+    "qsa_index_topk": "qsa_index_topk(Tensor masked, int topk) -> Tensor",
 }
 
 # What the HPU kernels accept (csrc/qsa_fused/qsa_fused_params.h, checked by the op's validation callback and the
@@ -78,6 +88,36 @@ def _qsa_index_threshold_fake(scores, positions, ratio, topk):
 @torch.library.register_fake(f"{NAMESPACE}::qsa_index_select", lib=_LIBRARY)
 def _qsa_index_select_fake(meta, topk):
     return meta.new_empty((meta.shape[0], topk), dtype=torch.int32)
+
+
+@torch.library.register_fake(f"{NAMESPACE}::qsa_index_topk", lib=_LIBRARY)
+def _qsa_index_topk_fake(masked, topk):
+    return masked.new_empty((masked.shape[0], topk), dtype=torch.int32)
+
+
+def qsa_index_topk(masked: torch.Tensor, topk: int) -> torch.Tensor:
+    """The one-node top-k as ``torch.ops.flashinfer_gaudi.qsa_index_topk``: int32 ids ``[T, topk]``, -1 padded."""
+    return torch.ops.flashinfer_gaudi.qsa_index_topk(masked, int(topk))
+
+
+def qsa_topk_shape_reason(masked: torch.Tensor, topk: int) -> str | None:
+    """Why ``qsa_index_topk`` cannot take this input, or None."""
+    if masked.dim() != 2 or masked.dtype != torch.float32:
+        return "the masked scores are not a 2-D fp32 tensor"
+    if masked.shape[1] % TOPK_COLUMN_STEP != 0 or masked.shape[1] > TOPK_MAX_COLUMNS:
+        return f"{masked.shape[1]} columns (a multiple of {TOPK_COLUMN_STEP}, at most {TOPK_MAX_COLUMNS})"
+    if topk < 1:
+        return f"topk {topk}"
+    return None
+
+
+def qsa_topk_missing_op(device_type: str = "hpu") -> bool:
+    """True when ``qsa_index_topk`` has no kernel for ``device_type`` in this process."""
+    key = {"hpu": "HPU", "cpu": "CPU"}[device_type]
+    try:
+        return not torch._C._dispatch_has_kernel_for_dispatch_key(f"{NAMESPACE}::{TOPK_OP_NAME}", key)
+    except RuntimeError:
+        return True
 
 
 def qsa_index_threshold(scores: torch.Tensor, positions: torch.Tensor, ratio: int, topk: int) -> torch.Tensor:
@@ -118,5 +158,6 @@ def qsa_fused_missing_ops(device_type: str = "hpu") -> tuple[str, ...]:
     return tuple(missing)
 
 
-__all__ = ["GUIDS", "OP_NAMES", "SCHEMAS", "qsa_fused_missing_ops", "qsa_index_emit", "qsa_index_prepare",
-           "qsa_index_select", "qsa_index_threshold"]
+__all__ = ["GUIDS", "OP_NAMES", "SCHEMAS", "TOPK_OP_NAME", "qsa_fused_missing_ops", "qsa_index_emit",
+           "qsa_index_prepare", "qsa_index_select", "qsa_index_threshold", "qsa_index_topk", "qsa_topk_missing_op",
+           "qsa_topk_shape_reason"]

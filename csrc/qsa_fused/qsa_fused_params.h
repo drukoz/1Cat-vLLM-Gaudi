@@ -10,7 +10,13 @@ inline constexpr const char* kQsaFusedPrepareGuid = "qsa_fused_prepare_bf16_gaud
 inline constexpr const char* kQsaFusedEmitGuid = "qsa_fused_emit_i32_gaudi2";
 inline constexpr const char* kQsaFusedThresholdGuid = "qsa_fused_threshold_f32_gaudi2";
 inline constexpr const char* kQsaFusedSelectGuid = "qsa_fused_select_i32_gaudi2";
-inline constexpr unsigned kQsaFusedGuidCount = 4;
+// The one-node top-k of the masked block scores (VLLM_HPU_QSA_TOPK_FORM=4; kernels/qsa_fused_topk_gaudi2.c).
+inline constexpr const char* kQsaFusedTopkGuid = "qsa_fused_topk_f32_gaudi2";
+inline constexpr unsigned kQsaFusedGuidCount = 5;
+// The top-k kernel keeps two 16-bit values per column of a row in 64 KiB of vector local memory: at most 32,768
+// columns, a multiple of 512 (the count loop reads four 128-column vectors per step).
+inline constexpr int64_t kQsaFusedTopkMaxColumns = 32768;
+inline constexpr int64_t kQsaFusedTopkColumnStep = 512;
 
 // Gates: one indexer head is one 128-lane bf16 vector; at most 8 heads; ratio and block_size are powers of
 // two with ratio <= 8 and ratio <= block_size; the ring keeps at least one block of rows per slot.
@@ -62,3 +68,9 @@ struct QsaFusedSelectArgs {
     int32_t topk;
 };
 static_assert(sizeof(QsaFusedSelectArgs) == 8, "the selection kernels' scalar ABI is two I32 values");
+
+// Scalar argument of qsa_fused_topk's main().
+struct QsaFusedTopkArgs {
+    int32_t topk;
+};
+static_assert(sizeof(QsaFusedTopkArgs) == 4, "the top-k kernel scalar ABI is one I32 value");

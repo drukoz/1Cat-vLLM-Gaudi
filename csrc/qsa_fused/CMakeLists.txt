@@ -15,12 +15,14 @@ set(TPC_INCLUDE_DIR "/usr/lib/habanatools/include" CACHE PATH "TPC compiler incl
 set(HABANA_INCLUDE_DIR "/usr/include/habanalabs" CACHE PATH "Gaudi host API include directory")
 
 # One .c per GUID, compiled with the flags of the proven GDN decode kernel and no -vlm (the prepare kernel
-# calls a lookup-table special function, which leaves 16 KiB of vector local memory; it keeps none).
+# calls a lookup-table special function, which leaves 16 KiB of vector local memory; it keeps none). The top-k
+# kernel calls none and keeps 64 KiB there.
 set(QSA_FUSED_KERNELS
     qsa_fused_prepare_gaudi2
     qsa_fused_emit_gaudi2
     qsa_fused_threshold_gaudi2
-    qsa_fused_select_gaudi2)
+    qsa_fused_select_gaudi2
+    qsa_fused_topk_gaudi2)
 set(QSA_FUSED_KERNEL_HEADERS "${CMAKE_CURRENT_SOURCE_DIR}/kernels/qsa_fused_common.h")
 
 set(QSA_FUSED_EMBEDDED_OBJECTS "")

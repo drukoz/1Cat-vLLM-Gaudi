@@ -14,13 +14,18 @@ from tests.unit_tests.hc_fused.sim_build import TOOLS_INCLUDE, host_include, mis
 REPO_ROOT = Path(__file__).resolve().parents[3]
 CSRC = REPO_ROOT / "csrc" / "qsa_fused"
 STANDALONE = REPO_ROOT / "tests" / "standalone" / "qsa_fused"
-KERNELS = ("qsa_fused_prepare_gaudi2", "qsa_fused_emit_gaudi2", "qsa_fused_threshold_gaudi2", "qsa_fused_select_gaudi2")
+KERNELS = ("qsa_fused_prepare_gaudi2", "qsa_fused_emit_gaudi2", "qsa_fused_threshold_gaudi2", "qsa_fused_select_gaudi2",
+           "qsa_fused_topk_gaudi2")
+# The kernels that keep vector local memory, with the bytes they may use (the top-k kernel's 16-bit key values of a
+# row: 64 KiB; it calls no lookup-table function, which would cut vector local memory to 16 KiB).
+LOCAL_MEMORY_KERNELS = {"qsa_fused_topk_gaudi2": 65536}
 TPC_FLAGS = ("-Wall", "-Werror", "-O2", "-march=gaudi2")
 LIBRARY = "libqsa_fused_gaudi2.so"
 
 _BUILD: Path | None = None
 
-__all__ = ["CSRC", "KERNELS", "LIBRARY", "TPC_FLAGS", "TOOLS_INCLUDE", "build", "missing_sdk_parts", "run"]
+__all__ = ["CSRC", "KERNELS", "LIBRARY", "LOCAL_MEMORY_KERNELS", "TPC_FLAGS", "TOOLS_INCLUDE", "build",
+           "missing_sdk_parts", "run"]
 
 
 def build(tmp_path_factory) -> Path:

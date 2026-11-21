@@ -12,6 +12,8 @@
 //            outputs slots {topk*ratio + ratio - 1, T} i32, valid {same} i32
 //   threshold inputs scores {N, T} f32 (N a multiple of 128), positions {T} i32; output meta {4 + N / 16, T} i32
 //   select   input   meta {4 + 2 NW, T} i32; output blocks {topk, T} i32
+//   topk     input   masked {N, T} f32 (N a multiple of 512, at most 32768); outputs ids {topk, T} i32 and the
+//                    kernel's workspace {4 + N / 16, T} i32
 
 #include <cstdint>
 #include <cstring>
@@ -26,6 +28,8 @@ extern unsigned char _binary_qsa_fused_threshold_gaudi2_o_start;
 extern unsigned char _binary_qsa_fused_threshold_gaudi2_o_end;
 extern unsigned char _binary_qsa_fused_select_gaudi2_o_start;
 extern unsigned char _binary_qsa_fused_select_gaudi2_o_end;
+extern unsigned char _binary_qsa_fused_topk_gaudi2_o_start;
+extern unsigned char _binary_qsa_fused_topk_gaudi2_o_end;
 
 namespace qsa_fused {
 namespace {
@@ -40,6 +44,7 @@ const KernelInfo kKernels[] = {
     {Kind::Emit, kQsaFusedEmitGuid, 3, 2},
     {Kind::Threshold, kQsaFusedThresholdGuid, 2, 1},
     {Kind::Select, kQsaFusedSelectGuid, 1, 1},
+    {Kind::Topk, kQsaFusedTopkGuid, 1, 2},
 };
 
 struct Elf {
@@ -58,6 +63,8 @@ Elf KernelElf(Kind kind)
             return {&_binary_qsa_fused_threshold_gaudi2_o_start, &_binary_qsa_fused_threshold_gaudi2_o_end};
         case Kind::Select:
             return {&_binary_qsa_fused_select_gaudi2_o_start, &_binary_qsa_fused_select_gaudi2_o_end};
+        case Kind::Topk:
+            return {&_binary_qsa_fused_topk_gaudi2_o_start, &_binary_qsa_fused_topk_gaudi2_o_end};
     }
     return {nullptr, nullptr};
 }
@@ -153,6 +160,24 @@ GlueCodeReturn Resolve(const KernelInfo& kernel, const TensorGeometry* const* in
         r.tableColumns = columns;
         r.outputColumns[0] = 4 + columns / 16;  // two bitmaps of columns / 32 words
         r.outputType[0] = DATA_I32;
+        return GLUE_SUCCESS;
+    }
+    if (kernel.kind == Kind::Topk) {
+        const TensorGeometry& masked = *in[0];
+        if (!Is(masked, DATA_F32, 2)) return GLUE_INCOMPATIBLE_DATA_TYPE;
+        if (s.topk < 1 || s.topk > (1 << 20)) return GLUE_KERNEL_INVALID_SCALAR_ARGUMENT;
+        const uint64_t columns = masked.maxSizes[0];
+        if (columns % static_cast<uint64_t>(kQsaFusedTopkColumnStep) != 0 ||
+            columns > static_cast<uint64_t>(kQsaFusedTopkMaxColumns)) {
+            return GLUE_INCOMPATIBLE_INPUT_SIZE;
+        }
+        r.rows = masked.maxSizes[1];
+        r.topk = static_cast<uint64_t>(s.topk);
+        r.tableColumns = columns;
+        r.outputColumns[0] = r.topk;
+        r.outputColumns[1] = 4 + columns / 16;  // the workspace: two bitmaps of columns / 32 words
+        r.outputType[0] = DATA_I32;
+        r.outputType[1] = DATA_I32;
         return GLUE_SUCCESS;
     }
     if (kernel.kind == Kind::Select) {
@@ -300,6 +325,14 @@ GlueCodeReturn Instantiate(const KernelInfo& kernel, HabanaKernelParams* params,
         args.ring_rows = scalar.ring_rows;
         args.ratio = scalar.ratio;
         args.rotary_half = scalar.rotary_half;
+        instance->kernel.paramsNr = sizeof(args) / sizeof(uint32_t);
+        std::memcpy(instance->kernel.scalarParams, &args, sizeof(args));
+    } else if (kernel.kind == Kind::Topk) {
+        MapRow(inputPattern[0], r.tableColumns);  // the row's masked scores
+        MapRow(outputPattern[0], r.outputColumns[0]);
+        MapRow(outputPattern[1], r.outputColumns[1]);
+        QsaFusedTopkArgs args{};
+        args.topk = scalar.topk;
         instance->kernel.paramsNr = sizeof(args) / sizeof(uint32_t);
         std::memcpy(instance->kernel.scalarParams, &args, sizeof(args));
     } else if (kernel.kind == Kind::Threshold || kernel.kind == Kind::Select) {

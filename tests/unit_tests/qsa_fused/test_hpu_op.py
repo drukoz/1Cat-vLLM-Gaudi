@@ -20,7 +20,7 @@ if not load_qsa_fused_extension():
                 allow_module_level=True)
 
 from flashinfer_gaudi.qsa_fused import (qsa_fused_missing_ops, qsa_index_emit, qsa_index_prepare,  # noqa: E402
-                                        qsa_index_select, qsa_index_threshold)
+                                        qsa_index_select, qsa_index_threshold, qsa_index_topk, qsa_topk_missing_op)
 from tests.unit_tests.qsa_fused.qsa_case import EPS, HPU_CASES, case_by_name, compare, make_inputs, summary  # noqa: E402
 
 
@@ -34,12 +34,15 @@ def _run(case, inputs: dict) -> dict:
         return {"meta": qsa_index_threshold(hpu["scores"], hpu["positions"], case.ratio, case.topk).cpu()}
     if case.kernel == "select":
         return {"blocks": qsa_index_select(hpu["meta"], case.topk).cpu()}
+    if case.kernel == "topk":
+        return {"ids": qsa_index_topk(hpu["masked"], case.topk).cpu()}
     slots, valid = qsa_index_emit(hpu["blocks"], hpu["positions"], hpu["block_table"], case.ratio, case.block_size)
     return {"slots": slots.cpu(), "valid": valid.cpu()}
 
 
 def test_every_op_has_an_hpu_kernel():
     assert qsa_fused_missing_ops("hpu") == ()
+    assert not qsa_topk_missing_op("hpu")
 
 
 @pytest.mark.parametrize("case", HPU_CASES, ids=[case.name for case in HPU_CASES])
@@ -55,7 +58,7 @@ def test_hpu_op_matches_reference(case):
 
 def test_hpu_ops_run_twice_with_the_same_result():
     """A second call (recipe already compiled) returns the same bits; the prepare op from the same inputs."""
-    for name in ("prepare_real_verify32x4", "emit_real_verify128"):
+    for name in ("prepare_real_verify32x4", "emit_real_verify128", "topk_real32"):
         case = case_by_name(name)
         inputs = make_inputs(case)
         first, second = _run(case, inputs), _run(case, inputs)

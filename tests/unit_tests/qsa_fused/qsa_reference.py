@@ -153,6 +153,40 @@ def qsa_index_topk_ref(scores: torch.Tensor, positions: torch.Tensor, ratio: int
     return qsa_index_select_ref(qsa_index_threshold_ref(scores, positions, ratio, topk), topk)
 
 
+def masked_score_keys(masked: torch.Tensor) -> torch.Tensor:
+    """int64 order keys of the masked scores of ``qsa_index_topk``: the fp32 bits of a value >= +0 (a NaN with the
+    sign bit clear above +inf), 0 for -0, negative (no key: never selected) for -inf or any other negative value."""
+    bits = masked.contiguous().view(torch.int32).to(torch.int64)
+    return torch.where(bits == -(2**31), torch.zeros_like(bits), bits)
+
+
+def qsa_index_topk_masked_ref(masked: torch.Tensor, topk: int) -> torch.Tensor:
+    """``qsa_index_topk`` (the one-node kernel): int32 ``[T, topk]``, -1 padded.
+
+    theta = the topk-th largest key of the row. Without ties beyond the cut (#{key >= theta} == topk), or when the row
+    has fewer than topk keys, every column with a key >= theta (every key) in ascending order; with them, every column
+    with key > theta in ascending order, then the lowest columns with key == theta up to topk, ascending.
+    """
+    T = masked.shape[0]
+    keys = masked_score_keys(masked)
+    out = torch.full((T, topk), -1, dtype=torch.int32)
+    for t in range(T):
+        k = keys[t]
+        valid = (k >= 0).nonzero().reshape(-1)
+        if valid.numel() <= topk:
+            out[t, :valid.numel()] = valid.to(torch.int32)
+            continue
+        theta = int(torch.sort(k[valid], descending=True).values[topk - 1])
+        above = (k > theta).nonzero().reshape(-1)
+        equal = (k == theta).nonzero().reshape(-1)
+        if above.numel() + equal.numel() == topk:
+            ids = (k >= theta).nonzero().reshape(-1)
+        else:
+            ids = torch.cat((above, equal[:topk - above.numel()]))
+        out[t] = ids.to(torch.int32)
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Verbatim copies (qsa_sparse_ops.py, qsa_hpu_attention.py)
 # ---------------------------------------------------------------------------
@@ -300,4 +334,4 @@ COPIED = ("gemma_rms_norm", "rope_neox_partial", "index_queries", "compress_bloc
           "select_blocks", "expand_selection", "rows_without_selection", "decode_selected_slots")
 
 __all__ = ["COPIED", "qsa_index_emit_ref", "qsa_index_prepare_ref", "qsa_index_select_ref", "qsa_index_threshold_ref",
-           "qsa_index_topk_ref", "rows_table", "score_keys", *COPIED]
+           "qsa_index_topk_ref", "qsa_index_topk_masked_ref", "masked_score_keys", "rows_table", "score_keys", *COPIED]

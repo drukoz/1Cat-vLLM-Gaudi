@@ -33,13 +33,20 @@ def test_kernel_compiles_with_default_flags(kernel: str, tmp_path: Path) -> None
     obj = tmp_path / f"{kernel}.o"
     proc = sim_build.run(["tpc-clang", *sim_build.TPC_FLAGS, "-reg-mem-count", f"-I{sim_build.TOOLS_INCLUDE}",
                           sim_build.CSRC / "kernels" / f"{kernel}.c", "-c", "-o", obj], timeout=1800)
-    assert "Total VLM used: 0 bytes" in proc.stdout + proc.stderr
+    local = sim_build.LOCAL_MEMORY_KERNELS.get(kernel, 0)
+    assert f"Total VLM used: {local} bytes" in proc.stdout + proc.stderr
     listing = sim_build.run(["tpc-llvm-objdump", "--triple=tpc", "--mcpu=gaudi2", "-d", obj]).stdout
     assert "TPC architecture: gaudi2" in listing
+    if local:
+        # no lookup-table special function: those leave only 16 KiB of vector local memory
+        assert "lookup" not in listing
 
 
 def test_kernels_keep_no_vector_arrays_in_local_memory() -> None:
+    """Only the kernels listed in LOCAL_MEMORY_KERNELS declare __local__ arrays."""
     for path in sorted((sim_build.CSRC / "kernels").iterdir()):
+        if path.stem in sim_build.LOCAL_MEMORY_KERNELS:
+            continue
         assert "__local__" not in path.read_text(), path.name
 
 
