@@ -6,10 +6,13 @@
 # every 15 s. Each arm writes to $OUT/<arm>/ (lookup_serve.sh's files); an arm that fails does not stop the next.
 #
 #   bash tools/flash_next/rental/lookup_arms.sh [--dry-run] ARM...
-#     nospec          no speculation, rounds LOOKUP_ARMS_ROUNDS (default edit:1:384:-,edit:32:384:-,mix:32:384:-)
+#     nospec          no speculation, rounds LOOKUP_ARMS_ROUNDS (default
+#                     edit:1:384:-:100,edit:32:384:-:0,mix:32:384:-:400: no two rounds share a prompt)
 #     ngram<K>        n-gram k = K, the same rounds
 #     hybrid<K>       MTP k = K with VLLM_HPU_FLASH_NEXT_SPEC_LOOKUP=1; every round twice, the request's mode 1
-#                     (hybrid) then 0 (MTP alone), on the same server
+#                     (hybrid, the rounds' own prompts) then 0 (MTP alone, prompts FIRST + 300 on), on the same
+#                     server. A second request on a prompt crashed the real model's n-gram server in job 00133
+#                     (fused and torch verification alike) once it decoded past the first recurrent block.
 # Verification: VLLM_HPU_GDN_CORE_VERIFY as the job sets it (lookup_serve.sh's preset: 0, the torch path). The MTP
 # arms also get VLLM_HPU_MTP_DRAFT_LOOP=1 VLLM_HPU_MTP_CHUNK_KV=1 VLLM_HPU_MTP_TIMING=1 unless the job set them
 # (the integration build's MTP server). Every other flag comes from the job's environment (farm --env).
@@ -18,7 +21,7 @@
 set -u
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 OUT="${FARM_OUT:-/results/lookup-arms}"
-ROUNDS="${LOOKUP_ARMS_ROUNDS:-edit:1:384:-,edit:32:384:-,mix:32:384:-}"
+ROUNDS="${LOOKUP_ARMS_ROUNDS:-edit:1:384:-:100,edit:32:384:-:0,mix:32:384:-:400}"
 DRY=0
 if [ "${1:-}" = "--dry-run" ]; then DRY=1; shift; fi
 if [ $# -eq 0 ]; then
@@ -29,13 +32,15 @@ for arm in "$@"; do
     case "$arm" in nospec | ngram[1-9] | hybrid[1-5]) ;; *) echo "lookup_arms: unknown arm $arm" >&2; exit 2 ;; esac
 done
 
-# a round list with every round twice: the request's mode 1, then 0 (hybrid, then MTP alone)
+# a round list with every round twice: the request's mode 1 on the round's prompts, then 0 (MTP alone) on the
+# prompts 300 on (KIND:STREAMS:TOKENS:MODE[:FIRST])
 modes10() {
-    local out="" r base
+    local out="" r kind n ntok mode first
     IFS=',' read -r -a parts <<<"$1"
     for r in "${parts[@]}"; do
-        base="${r%:*}"
-        out="$out,$base:1,$base:0"
+        IFS=':' read -r kind n ntok mode first <<<"$r"
+        first="${first:-0}"
+        out="$out,$kind:$n:$ntok:1:$first,$kind:$n:$ntok:0:$((first + 300))"
     done
     echo "${out#,}"
 }

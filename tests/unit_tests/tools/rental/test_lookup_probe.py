@@ -19,9 +19,11 @@ SERVE = REPO_ROOT / "tools" / "flash_next" / "rental" / "lookup_serve.sh"
 
 
 def test_rounds_parse():
-    assert lp.parse_rounds("edit:32:384:0,prose:1:256:-, editl:8:512:2,editf:8:1400:-") == [
-        ("edit", 32, 384, 0), ("prose", 1, 256, None), ("editl", 8, 512, 2), ("editf", 8, 1400, None)]
-    for bad in ("edit:32:384", "poem:1:8:-", "edit:0:8:-", "edit:1:1:-", "edit:1:8:3", "edit:x:8:-"):
+    assert lp.parse_rounds("edit:32:384:0,prose:1:256:-, editl:8:512:2,editf:8:1400:-,edit:1:384:-:100") == [
+        ("edit", 32, 384, 0, 0), ("prose", 1, 256, None, 0), ("editl", 8, 512, 2, 0), ("editf", 8, 1400, None, 0),
+        ("edit", 1, 384, None, 100)]
+    for bad in ("edit:32:384", "poem:1:8:-", "edit:0:8:-", "edit:1:1:-", "edit:1:8:3", "edit:x:8:-", "edit:1:8:-:x",
+                "edit:1:8:-:1:2"):
         with pytest.raises(ValueError):
             lp.parse_rounds(bad)
 
@@ -147,7 +149,7 @@ def test_round_summary_arithmetic():
 
 def test_mixed_round_halves():
     small = lp.load_files(str(REPO_ROOT), lp.SMALL_FILES)
-    assert lp.parse_rounds("mix:32:384:1") == [("mix", 32, 384, 1)]
+    assert lp.parse_rounds("mix:32:384:1") == [("mix", 32, 384, 1, 0)]
     # stream 2j is edit prompt j, stream 2j + 1 prose prompt j: the same prompts as the edit and prose rounds
     for j in range(16):
         assert lp.prompt_for("mix", 2 * j, small) == lp.prompt_for("edit", j, small)
@@ -240,7 +242,13 @@ def test_probe_end_to_end_against_a_fake_server(tmp_path, capsys):
     assert first["spec"]["drafts"] == 12 and first["spec"]["acceptance_length"] == pytest.approx(2.0)
     assert first["spec"]["position_rates"] == [1.0, 0.0] and first["step_sizes"] == {"2": 12}
     assert first["token_ids"][0] == list(range(700, 708)) and "prompt_token_ids" not in first
-    assert set(first["prompt_sha"]) <= set(record["prompts"]) and len(record["prompts"]) == 4  # 3 edit + 1 prose
+    # measured: 3 edit + 1 prose (editf's two are edit prompts 0 and 1); the warm rounds ran on other prompts of
+    # their kind (WARM_FIRST on: 3 edit, of which editf's warm round reuses two, + 1 prose)
+    assert set(first["prompt_sha"]) <= set(record["prompts"]) and len(record["prompts"]) == 8
+    warm_shas = {sha for w in record["warm"] for sha in w["prompt_sha"]}
+    measured_shas = {sha for r in record["rounds"] for sha in r["prompt_sha"]}
+    assert len(warm_shas) == 4 and not warm_shas & measured_shas
+    assert [r["first"] for r in record["rounds"]] == [0, 0, 0, 0]
     assert record["prompts"][first["prompt_sha"][0]] == list(range(9))
     assert len(record["warm"]) == 3 and "texts" not in record["warm"][0]  # one warm round per (kind, streams)
     # the warm round is as long as the round for edit and prose, 48 tokens for the whole-answer round
@@ -303,9 +311,10 @@ def test_arms_script_dry_run():
     lines = done.stdout.splitlines()
     assert len(lines) == 3 and [line.split(":")[0] for line in lines] == ["arm nospec", "arm ngram5", "arm hybrid3"]
     assert "--label nospec" in lines[0] and "--speculative" not in lines[0] and "--out /results/x/nospec" in lines[0]
-    assert "--ngram 5" in lines[1] and "mix:32:384:-" in lines[1]
-    # the hybrid arm: every round twice, mode 1 then 0, with the integration build's MTP flags
-    assert "--mtp 3 --lookup 1" in lines[2] and "edit:1:384:1\\,edit:1:384:0" in lines[2]
-    assert "mix:32:384:1\\,mix:32:384:0" in lines[2] and "VLLM_HPU_MTP_DRAFT_LOOP=1" in lines[2]
+    assert "--ngram 5" in lines[1] and "edit:1:384:-:100\\,edit:32:384:-:0\\,mix:32:384:-:400" in lines[1]
+    # the hybrid arm: every round twice, mode 1 on the round's prompts, then 0 on other prompts, with the
+    # integration build's MTP flags
+    assert "--mtp 3 --lookup 1" in lines[2] and "edit:1:384:1:100\\,edit:1:384:0:400" in lines[2]
+    assert "mix:32:384:1:400\\,mix:32:384:0:700" in lines[2] and "VLLM_HPU_MTP_DRAFT_LOOP=1" in lines[2]
     bad = subprocess.run(["bash", str(ARMS), "--dry-run", "ngram"], capture_output=True, text=True, check=False)
     assert bad.returncode == 2 and "unknown arm" in bad.stderr
