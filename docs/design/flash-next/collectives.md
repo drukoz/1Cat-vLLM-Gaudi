@@ -422,4 +422,6 @@ section 6's last row and below) can run on this node now that it stays:
 `bin/farm job collectives real4-ab3-region any:4 25m --env VLLM_HPU_FUSED_GREEDY_LOGITS=1 --env VLLM_GRAPH_RESERVED_MEM=0.5 -- bash tools/flash_next/collectives/ab_job.sh --levels 1,32 --tokens 256 --warm-tokens 320 --repeat-top 2`
 and the same with `real4-ab3-cuts` and `--env VLLM_HPU_VOCAB_PARALLEL_LOGITS=1 --env VLLM_HPU_PLE_TABLE_RIDER=1`
 instead of the first `--env` (submit the second after the first prints its job id). Pull requests are allowed
-again (BRIEF 00:50 UTC): the note and the bridge tools can go into the program branch through `bin/gate`.
+again (BRIEF 00:50 UTC): the note and the bridge tools (no runtime code; CPU test green, card check 00160 passed)
+go into the program branch through `bin/gate` when its queue clears (02:12 UTC: engine-step's gate running for 90
+minutes, four tracks waiting): merge `origin/feat/flash-next-gaudi` (about 20 commits ahead) first.
