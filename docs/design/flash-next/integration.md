@@ -9,25 +9,33 @@ Labels: MEASURED (card, with its file), VERIFIED (CPU test or code line), INFERR
 
 ## Handoff (if this agent stops)
 
-Updated 2026-11-21 00:05 UTC (fourth agent of the track, Opus 5.5, started 23:12 UTC).
+Updated 2026-11-21 00:40 UTC (fourth agent of the track, Opus 5.5, started 23:12 UTC).
 
-**Now (00:05 UTC):** build 1 is measured (job **00128**, the headline table below; job **00121** tiny gate passed).
-**Build 2** is on the branch, not yet on a card: code `a39d1f48` (build 1 + engine-step `ddc6bbbf` with the
-candidate-path log line, native-replay `9b0e7655` with `VLLM_HPU_WORKER_CPU_PIN`, prefill `2abf636a` with
-`VLLM_HPU_PREFIX_ALIGN_SPLIT` / `VLLM_HPU_PREFIX_KEEP_PROMPT_END` / prompt graphs, mtp-card-ready `6f5004f6` with the
-sampled-verification fix and `VLLM_HPU_SPEC_SAMPLED_VERIFY=2`; every new flag off), job kit `4681ee37`. Its CPU run:
-`reports/integration/cpu/out-b6/summary.txt` (list `list_b6.txt`). Plan agreed with the coordinator (00:05 UTC): submit
-when the CPU run is green, the coordinator places it after mtp-card-ready's 00136 (about 02:30 to 03:20 UTC), hold at
-most 45 min (it must end by 03:25; harvest 03:30):
-`bin/farm job integration real8-build2 all 45m --env HEADLINE_TINY_SPEC=1 -- bash -c 'f=/results/late/run.sh; if
-[ -s "$f" ]; then echo "headline: late-bound $f:"; cat "$f"; exec bash "$f"; fi; exec bash
-tools/flash_next/integration/headline_job.sh tiny nospec mtp3'` = the tiny gate with `--spec 3`, then the no-spec
-server (32, 8, 1 streams, two greedy and two sampled rounds per level, 32 first), then MTP k = 3 (32, 8, 1, two rounds).
-Before it starts, write `~/farm/integration/results/late/run.sh` on the node (via `bin/node-scp`) only to switch on
-what other jobs proved: `VLLM_HPU_PREFIX_ALIGN_SPLIT=1 VLLM_HPU_PREFIX_KEEP_PROMPT_END=1` if prefill's 00080 confirms;
-native-replay's 00134 winners (`VLLM_HPU_WORKER_CPU_PIN`, ...); `HEADLINE_MTP_SAMPLED=1` (sampled MTP level last,
-`VLLM_HPU_SPEC_SAMPLED_VERIFY=1`) only if the coordinator confirms mtp-card-ready's 00126 sampled rounds are clean. Form:
-`export K=V ...; exec bash /bundle/plugin/tools/flash_next/integration/headline_job.sh tiny nospec mtp3`.
+**Now (00:40 UTC):** build 1 is measured (job **00128**, tables below; job **00121** tiny gate passed). **Build 2 is
+job 00142** (all cards, hold 60 min, commit `2de56804`, plugin code = `a39d1f48`), at the head of the 8-card queue
+(starts by 01:14 UTC). Its waiting `farm job` command copies the results to `reports/integration/card/00142-real8-build2/`
+(if the agent is gone: `bin/farm fetch integration 00142 00142-real8-build2`). Build 2 = build 1 + engine-step `ddc6bbbf`
+(candidate-path log lines), native-replay `9b0e7655` (`VLLM_HPU_WORKER_CPU_PIN`), prefill `2abf636a` (prefix flags,
+prompt graphs), mtp-card-ready `6f5004f6` (sampled-verification fix 0d1be6fc, candidate verification `=2`); CPU run
+`reports/integration/cpu/out-b6/summary.txt`: 152 files, 148 green, 3 card-only skips, the known flaky
+`test_gdn_core_decode_batch[negative]` passes alone. Late-bound: the job runs `~/farm/integration/results/late/run.sh`
+(source `reports/integration/late/run.sh`, written by `reports/integration/late/make_run.sh`), which exports
+`HEADLINE_MTP_CTX=8:16000 VLLM_HPU_PREFIX_ALIGN_SPLIT=1 VLLM_HPU_PREFIX_KEEP_PROMPT_END=1` (prefix flags: coordinator GO
+00:37 from prefill's 00080) on top of the job's `--env HEADLINE_TINY_SPEC=2 HEADLINE_MTP_SAMPLED=1
+HEADLINE_MTP_SAMPLED_LEVELS=32,1 VLLM_HPU_SPEC_SAMPLED_VERIFY=2 HEADLINE_HOLD_S=3600` and runs the kit of commit
+`61b32ec6` from `~/farm/integration/results/late/kit/` with the arms `tiny nospec nospec-pin mtp2`:
+- tiny: the tiny model at TP8 with every flag, `--spec 2`; a failure ends the job (exit 7).
+- A `nospec`: 32, 8, 1 streams; per level 2 greedy rounds, then 2 sampled rounds (after a warm round each).
+- B `nospec-pin`: A's env + `VLLM_HPU_WORKER_CPU_PIN=1 PT_HPU_DISABLE_HPUGRAPH_REPLAY_HASHCHECK=1`, greedy 1 and 32
+  streams, 2 rounds: compare its 1-stream text with A's (a difference or an error: drop B's flags and say so);
+  server0.log must hold 8 lines `VLLM_HPU_WORKER_CPU_PIN=1: rank r module m: share r of 8, CPUs a-b`.
+- C `mtp2`: MTP k = 2 (coordinator: k = 3 greedy is measured; TP4 favoured fewer rows), greedy 32, 8, 1 (2 rounds),
+  then 8 x 16K-token greedy (acceptance at long prompts), then sampled 32 and 1 LAST with
+  `VLLM_HPU_SPEC_SAMPLED_VERIFY=2` (candidate verification, first run on a real-model server: check texts and that
+  acceptance is near =1's 0.64 / 0.38 at TP4). A crash reruns C without the request shard if 15 min are left.
+Send the coordinator each arm's table as soon as it is read. Left out on purpose: prompt graphs (device memory),
+mtp-card-ready `409c83e5` (a log line) and engine-step `e9032e68` (prompt_logprobs fix, not exercised by the probe):
+both would have needed a new image.
 
 **Build commit `fbb685ac`** (pushed; the headline job runs it). The plugin code is final since `b691faa8`; the later commits only add the
 job kit `tools/flash_next/integration/` and this file. What is in it (first-parent merges on top of the qsa-fused
