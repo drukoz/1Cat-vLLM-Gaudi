@@ -100,6 +100,21 @@ def score_blocks(q: torch.Tensor, keys: torch.Tensor) -> torch.Tensor:
     return scores.sum(dim=1) / math.sqrt(q.shape[-1])
 
 
+def topk_ids_int32(idx: torch.Tensor, n: int) -> torch.Tensor:
+    """The int64 ids ``torch.topk`` returned over ``n`` columns, as int32 of the same shape, without a cast.
+
+    Card rule 9 (kernel-fixes job 00038, 2026-11-20): on a Gaudi card ``topk(...).indices.to(torch.int32)``
+    in the same lazy graph came back as every second id, the second half out of range, for a ``[16, 512]``
+    input with ``k = 10`` (the cast read 8-byte elements from ids the bridge holds as 4 bytes). At this
+    function's shapes (``[rows, 32768]``, ``k = 512``) the cast was right on the card (jobs 00062 and 00063,
+    ``tests/unit_tests/qsa_select/test_hpu_select_ids.py``), and so is this form, which does not depend on
+    what triggers the defect: the ids are only ever an index, the result is a gather from an int32
+    ``arange(n)``, and no node converts the ids' type.
+    """
+    cols = torch.arange(n, dtype=torch.int32, device=idx.device)
+    return cols.index_select(0, idx.reshape(-1)).view(idx.shape)
+
+
 def select_blocks(scores: torch.Tensor, visible: torch.Tensor, block_topk: int) -> torch.Tensor:
     """Top-k blocks: ``scores`` ``[T, N]`` fp32, ``visible`` ``[T]`` int64 ->
     int32 ``[T, block_topk]`` block indices, -1 padded.
@@ -107,14 +122,15 @@ def select_blocks(scores: torch.Tensor, visible: torch.Tensor, block_topk: int) 
     Columns ``n >= visible[t]`` are masked to -inf, ``k = min(block_topk, N)``
     and ``topk(k, dim=-1)``; entries whose value is -inf become -1, and the
     width is padded to ``block_topk`` with -1. The set per row equals HF's
-    ``topk(min(block_topk, nc))``.
+    ``topk(min(block_topk, nc))``. The ids become int32 through ``topk_ids_int32``,
+    never through a cast (card rule 9).
     """
     t, n = scores.shape
     k = min(block_topk, n)
     cols = torch.arange(n, device=scores.device)
     masked = scores.masked_fill(cols[None, :] >= visible[:, None], float("-inf"))
     vals, idx = torch.topk(masked, k, dim=-1)
-    picked = idx.to(torch.int32).masked_fill(vals == float("-inf"), -1)
+    picked = topk_ids_int32(idx, n).masked_fill(vals == float("-inf"), -1)
     if k < block_topk:
         pad = torch.full((t, block_topk - k), -1, dtype=torch.int32, device=scores.device)
         picked = torch.cat((picked, pad), dim=1)
