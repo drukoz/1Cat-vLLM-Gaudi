@@ -6,7 +6,7 @@ This file is the track's report. The harness of the track's agents does not writ
 
 ## Handoff (if this agent stops)
 
-Last update: 2026-11-21 00:41 UTC (fourth agent of the track, Opus 5.5, started 23:15 UTC). Coordinator's rule
+Last update: 2026-11-21 01:00 UTC (fourth agent of the track, Opus 5.5, started 23:15 UTC). The node is extended to about
 for tonight (BRIEF 23:21): card evidence first, no pull request before 04:00 UTC; push the branch after each green
 step and tell the coordinator the commit and the flags (the integration track builds from this branch).
 
@@ -21,12 +21,38 @@ streams on TP4 k = 1 is the best k** (00126 arm k1: 55.2 ms per token greedy, 65
 without speculation and 61.9 / 82.4 at k = 3); at 1 and 8 streams k = 3. On TP8 (Ft grows about 0.24 ms per row)
 k = 2 to 4 are all about 40-41 ms per token at 32 streams by arithmetic.
 
+**The node runs until about 00:00 UTC on 2026-11-22 (BRIEF 00:50); merges allowed again.** Coordinator's plan for
+this track (00:42 UTC): (1) the verify-op crash of 00133, cause and fix, CPU first; (2) the pull request of the
+card-proven MTP fixes (gate, merge); (3) with engine-step (agent a8a87f4c2008bde9c): sampled MTP verification
+through its candidate region (`VLLM_HPU_CANDIDATE_SAMPLING=2`, admission stays on `VLLM_HPU_SPEC_SAMPLED_VERIFY`
+1 or 2); (4) the k choice at TP8 from integration's build 2 (00142) and MTP acceptance at long prompts.
+
+**00133 crash (spec-lookup, TP4, n-gram k = 5, fused verify, prefix caching): cause and fix, `5c770d96`.** The
+request after one whose decode completed a recurrent block died with `ValidateSyncInputTensors tensor_data is
+empty` at `gdn_core_verify`'s first input (the GDN conv pool), in a graph captured after the block commit. The
+align-mode copies (`recurrent_commit.commit_conv`, boundary commit and pre-step copy) wrote the conv window through
+a slice of the pool (`state[dst].narrow(...).copy_`, `hpu::slice_insert`); `commit_ssm` (whole rows,
+`index_copy_`) was fine and its pool was not the failing input (INFERRED from code and log). Fix: whole new rows
+built from `index_select` copies, one `index_copy_` on the pool. CPU: `test_align_commit_slice_writes.py` 10 passed
+(8 failed before), `test_mtp_align_continuity.py` 76 passed, the 3-turn CPU engine test
+(`test_requests_after_a_block_committed_during_speculative_decode`: decode across the block, the same prompt
+again, the next turn) tokens equal to k = 0, copies ran, no slice write (`hpu_cpu_engine --slice-write-probe`).
+Turn 3 gets no prefix-cache hit on this build, with or without MTP. Card check proposed: spec-lookup reruns 00133's
+case with `5c770d96` (or a TP4 MTP arm decoding across 896 tokens, then new batch sizes). The prefix flags of
+prefill (`VLLM_HPU_PREFIX_ALIGN_SPLIT` and the two KEEP flags) on and off: scratch tree
+`reports/mtp-card-ready/scratch-prefill` (prefill merged, qsa.py ours), `reports/mtp-card-ready/turns_prefix_check.py`,
+output `reports/mtp-card-ready/cpu4/turns_prefix/summary.json`.
+
 **Owner's directive (BRIEF 00:28): 8 cards first.** Every TP4 job waits behind the TP8 jobs and probably will
 not run tonight. Sampled MTP at TP8 runs in the integration track's build 2 (MTP k = 2, sampled rounds last with
 `VLLM_HPU_SPEC_SAMPLED_VERIFY=2`; its build 4681ee37 has this branch up to 6f5004f6, which contains `=2`; the
 optional log line is `409c83e5`).
 
-**Branch** (pushed: `origin/feat/flash-next-gaudi-mtp-card-ready` = `409c83e5` and this handoff):
+**Branch** (pushed: `origin/feat/flash-next-gaudi-mtp-card-ready` = `5c770d96` and this handoff):
+- `5c770d96` the 00133 fix (above) with its tests; `hpu_cpu_engine.py --slice-write-probe` and `num_cached_tokens`.
+- 00139 (ended 00:38 UTC, ok): the bench with id checks by value passes on the card at 1 / 8 / 32
+  requests (every candidate id holds its value, greedy holds the max); candidate path 3.3 / 10.3 / 19.1 ms against
+  5.0 / 18.5 / 33.3 ms exact (a busier node than 00135).
 - `409c83e5` one log line at the first candidate step (`VLLM_HPU_SPEC_SAMPLED_VERIFY=2: sampled verification over
   the top 64 candidates of every row (first step: N requests, k = K)`); a refused step logs once per reason.
 - `b66e1131` candidate_verify_bench.py: id checks by value (bf16 ties made 00135's set check fail).
