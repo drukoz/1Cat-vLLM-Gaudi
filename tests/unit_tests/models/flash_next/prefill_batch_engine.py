@@ -29,21 +29,43 @@ from tests.unit_tests import hpu_cpu_engine
 REPO_ROOT = hpu_cpu_engine.REPO_ROOT
 
 
+def _row_slots(indices, row: int):
+    """The recurrent state slots of one row of a prompt batch's load or store indices ([groups, rows] or
+    [groups, rows, width]; [rows] without groups), as a list; None when the batch has none."""
+    if indices is None:
+        return None
+    t = indices.detach().cpu()
+    if t.dim() == 1:
+        return [int(t[row])]
+    return t.select(1, row).reshape(-1).tolist()
+
+
 def _record_prompt_forwards(runner, clock: dict) -> list[dict]:
-    """Every prompt batch ``_form_prefill_batch`` builds: the step, its requests, query and context lengths."""
+    """Every prompt batch ``_form_prefill_batch`` builds: the step, its requests, query and context lengths, and
+    each row's recurrent state slots (load and store, per cache group)."""
     records: list[dict] = []
     real = runner._form_prefill_batch
 
     def recording(contents):
-        if len(contents.req_ids) > 0:
-            records.append({
+        rows = len(contents.req_ids)
+        record = None
+        if rows > 0:
+            record = {
                 "step": clock["step"],
                 "req_ids": list(contents.req_ids),
                 "query_lens": [len(t) for t in contents.token_ids],
                 "context_lens": [int(c) for c in contents.context_lens],
                 "logits": [len(p) for p in contents.logits_positions],
-            })
-        return real(contents)
+            }
+        result = real(contents)
+        if record is not None:
+            md = result.attn_metadata[0] if result.attn_metadata else None
+            load = getattr(md, "load_indices_tensor", None)
+            store = getattr(md, "store_indices_tensor", None)
+            record["load_slots"] = [_row_slots(load, i) for i in range(rows)]
+            record["store_slots"] = [_row_slots(store, i) for i in range(rows)]
+            records.append(record)
+        return result
 
     runner._form_prefill_batch = recording
     return records

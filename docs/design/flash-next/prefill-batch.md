@@ -5,10 +5,33 @@ Track `prefill-batch`, worktree `/Volumes/Storage/Claude/gaudi-work/wt/prefill-b
 forward for Flash-Next's hybrid stack, behind a default-off flag. The track's report lives here (the harness refuses
 report files under `reports/`); scratch tools are in `/Volumes/Storage/Claude/gaudi-work/reports/prefill-batch/tools/`.
 
-## Handoff (if this agent stops) - updated 12:45 UTC 2026-11-21
+## Handoff (if this agent stops) - updated 13:13 UTC 2026-11-21
 
-- **Branch** based on `8ead88c7` (prefill's head = program head 4d66755e + prefill's work; the prefill agent chose
-  this base; its PR into the program branch follows its gate). Commits of this track: this document only so far.
+- **v1 is built and CPU-proven; two card jobs are queued.** Flag `VLLM_HPU_PREFILL_BATCH=N` (default 0), switchable
+  at run time through `VLLM_HPU_RUNTIME_SWITCH_FILE` (a server started at N; the switch file caps it, 0 = off).
+- **Branches.** `feat/flash-next-gaudi-prefill-batch` (base `8ead88c7` = program head 4d66755e + prefill's work):
+  `ad91fa5e` design note, `41dae6de` v1, `0c482379` chunk KV fill shape, `3a8b710c` runtime switch + merge counter +
+  refusal under `VLLM_HPU_PREFILL_CHECKPOINT`, `f3286aaf` card tools, then the engine test (section "CPU proof").
+  Card branch `feat/flash-next-gaudi-prefill-batch-b5` = build 5 (`eb21ac75`) + the same four code/tool commits
+  cherry-picked (`b51c25c5`, `cbe419f5`, `d4285cce` with the switch-list conflict resolved to build 5's list +
+  this flag, `e79272b6`); its worktree is `reports/prefill-batch/b5-tree`. Image `farm-prefill-batch:e79272b6dab4`.
+- **Card jobs (submitted 13:05 UTC, both `all`, placed by the coordinator):**
+  - `00257 tiny8-gate-b5` (25 min): `python3 tools/flash_next/prefill_batch/tiny_gate.py --mtp 0,2`. Pass = every
+    merged reference copy reproduces the HF reference, on equals off, merged forwards in on and none in off.
+    Fetch: `bin/farm fetch prefill-batch 00257 00257-tiny8-gate-b5`; read `summary.json`, `<server>/streams.json`.
+  - `00258 real8-b5-pb-ab` (70 min hold): `ab_job.sh b5_ab.plan` under the placement wrap, 00243's settings
+    (`reports/prefill/slot2/b5_common.env` + `b5_i01off.env`, MTP k = 2, graphs 64,000), `PB_ROWS=8`. Lines: burst
+    probes `b2k` (context 2,048, K = 1, 2, 4, 8) and `b10k` (context 10,240, K = 1, 2, 4, graph knob 70,000), then
+    agent loops `a32-off`, `a32-on`, `a16-on`, `a16-off`. Read: `<line>/burst_probe.json` (saved per removed
+    forward), `<line>/prefill_sweep.md` (TTFT p50/p90/p99, ITL max, uncached tokens per turn, tok/s per stream),
+    `merged.log`, rank-0 `server_events_*.json` (`reports/prefill-batch/tools/bucket_cost.py`, `fwd_table.py`).
+    Fetch: `bin/farm fetch prefill-batch 00258 00258-real8-b5-pb-ab`.
+  - Submit waiters (my pids, in `reports/prefill-batch/logs/submit_*.pid`) copy the results when the jobs end.
+- **To submit again from the card branch:** `farm sync` takes the committed HEAD of `wt/prefill-batch`; detach it at
+  the b5 commit (`git -C wt/prefill-batch checkout --detach <b5 sha>`), submit, wait for the `farm: job` line, then
+  `git checkout feat/flash-next-gaudi-prefill-batch` again (never two syncs of this track at once).
+- **Condition (prefill):** the flag is refused while `VLLM_HPU_PREFILL_CHECKPOINT` is on, until prefill's per-row
+  checkpoint maps ([groups, target_bs, nphysical_chunks]) land; then drop `prefill_checkpoint_on()` from the refusal.
 - **Split agreed with prefill (a9a36e0116ed6cb7d), sent to the coordinator at about 12:25 UTC.** prefill (a, one
   forward per turn, `VLLM_HPU_PREFILL_CHECKPOINT`): `vllm_gaudi/v1/core/*`, `compute_prefix_caching_block_indices`
   and the mamba / prefix-caching branch of `_form_prefill_batch` (made per row, [target_bs, K]),
@@ -19,9 +42,11 @@ report files under `reports/`); scratch tools are in `/Volumes/Storage/Claude/ga
   `_save_ssm_state` in `models/qwen3_5.py`, the QSA prompt path for several rows (qsa-fused asked first),
   `ple_layer.py` per request, the flag, new test files only. Seam: the 2D prompt bucket [bs, T_bucket] of padded
   rows (the form every model path already has); (a)'s checkpoint metadata is per row with row-local offsets.
-- **Design note**: below (sent to the coordinator).
-- **Next**: CPU tests first (grouping rule, per-row state bookkeeping, fixed-shape state save, engine rehearsal with
-  mixed bursts), then the flag, then the tiny TP8 gate and the real-model A/B on build 5 (coordinator places it).
+- **Design note**: below (sent to the coordinator 12:31 UTC; v1 approved 12:36 UTC).
+- **Next**: read 00257 / 00258 when they end; report the per-forward or per-row answer (burst probe) and the agent-loop
+  A/B to the coordinator; if merges are rare at 16K to 56K under the 64,000 graph bound, say what bound v1 needs and
+  what it costs in KV capacity (the owner's trade). Then the PR of v1 (default off; gate: models/flash_next,
+  platform, worker/test_prefill_batch_rules.py, test_qwen3_next.py with its two pre-existing red gated-FP8 tests).
 
 ## Design note (12:45 UTC 2026-11-21)
 
@@ -161,3 +186,42 @@ forward at 10K context would say where it goes).
    plan (16 and 32 agents, 1,024 new tokens per turn, contexts 16K to 56K), placement on: TTFT p50 / p90, the longest
    decode stall, uncached tokens per turn, decode ms per token, and the merged forwards' paced periods against the sum
    of the one-row ones (this answers the per-forward or per-row question of section 4).
+
+## v1 as built (13:13 UTC 2026-11-21)
+
+- `vllm_gaudi/v1/worker/prefill_batch.py`: the pure rules (flag, refusal, `group_sizes`, the read-after-write
+  guard, the graph limit). `hpu_model_runner.py`: `_resolve_prefill_batch` (at init; the prompt bs buckets go up to
+  N), `_prefill_batch_rows_now` (per step: the switch file can cap it), `_prefill_chunk_shape`,
+  `_prefill_batch_sizes`, `_group_prefill_contents` (called from `_extract_prefill_batch_contents` for runs of
+  consecutive one-request chunks), `_count_prefill_batch` (log line at the first merged forward and every 32nd:
+  `VLLM_HPU_PREFILL_BATCH: N merged prompt forwards so far, ...`); the Mamba2 checkpoint maps only for one-row batches
+  (`one_row_prefix_maps`); `propose_eagle_prefill` shifts the target tokens per row; `_fill_draft_kv_for_chunk` takes
+  every row of a no-logits batch. `qwen3_5._save_ssm_state`: several rows in one fixed-shape `index_copy_` (padding
+  rows to the padding row, as the PLE layer does; the test of the old `nonzero` behaviour is updated).
+  `hpu_flash_next_mtp.fill_prefill_chunk`: one last index and next token per row, ids in the batch's [rows, T] shape.
+  `runtime_switches.SWITCHABLE` gains the flag.
+- What v1 does NOT change: the model's prompt path (GDN chunk rule rows, conv rows, QSA rows, PLE rows were already
+  there), the scheduler, one-row forwards (bit-identical path), any flag-off behaviour.
+
+## CPU proof (VERIFIED, tiny checkpoint, CPU engine; 13:10 UTC)
+
+Driver `tests/unit_tests/models/flash_next/prefill_batch_engine.py` (step-driven arrivals, records every prompt forward
+with its rows' state slots). Scratch runs in `reports/prefill-batch/runs/` (`tools/exp1.py`, `exp2.py`, `exp3.py`,
+`cmp.py`), on this branch and on the build-5 card tree:
+
+| plan | flag off -> on prompt forwards | streams equal | logprob drift |
+|---|---|---|---|
+| exp1: 4 x 300 + 2 x 700 at once, then 4 next turns (prefix hits) | 16 -> 5 (all merged) | 10 / 10 | 0.0 |
+| exp2: + chunked 1,200-token prompts, 2 arrivals while decoding, a shared 600 prefix, 6 next turns | 26 -> 18 | 16 / 16 | 0.0 |
+| exp2 with MTP k = 2 + async 2 + draft loop + chunk KV + align split / keep prompt end | 26 -> 23 | 16 / 16 | 0.0 |
+| exp2 with async mode 1 (partial chunks carry one logit) | 26 -> 18 | 16 / 16 | 0.0 |
+| exp3: 4 requests with one shared 600 prefix + 4 with one 512 system prompt | 10 -> 4 | 8 / 8 | 0.0 |
+
+The graph limit is what cut most groups on CPU (vLLM's capture size = the 1,024-token step budget of these plans):
+e.g. the four 44-token tails at context 256 ran as 2 + 2. The hybrid scheduler never gave a request a prefix hit on
+blocks another request computes in the same step (exp3: s1 to s3 waited one step for s0's first chunk), so the
+read-after-write guard did not fire on CPU; it is pinned by `test_prefill_batch_rules.py`.
+Tests: `tests/unit_tests/worker/test_prefill_batch_rules.py` (rules), `tests/unit_tests/models/flash_next/
+test_engine_prefill_batch.py` (the engine plan off / on, without and with MTP; state slots per chunk equal; the
+runtime switch at 0 and 2), `test_runtime_switches.py`, `tests/unit_tests/test_qwen3_next.py` (state save; its two
+gated-FP8 tests are red on the base `8ead88c7` too, not this track's).
