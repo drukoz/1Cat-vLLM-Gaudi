@@ -52,7 +52,7 @@ from vllm_gaudi.v1.sample.candidate_sampling import PARAM_COLUMNS as CANDIDATE_P
 from vllm_gaudi.v1.sample.candidate_sampling import NOISE_SEED as CANDIDATE_NOISE_SEED
 from vllm_gaudi.v1.sample.topk_ids import topk_with_ids
 from vllm_gaudi.v1.sample.request_params import RowParams, apply_request_adjustments, request_adjustments
-from vllm_gaudi.v1.worker.runtime_switches import RuntimeSwitchFile
+from vllm_gaudi.v1.worker.runtime_switches import GRAPH_SWITCHABLE, RuntimeSwitchFile
 from vllm_gaudi.v1.worker.recurrent_commit import (apply_align_precopy, boundary_commits, commit_conv, commit_ssm,
                                                    self_commit_requests)
 from vllm_gaudi.v1.worker.recurrent_lattice import align_lattices
@@ -6820,6 +6820,23 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         self._candidate_path_logged = self._candidate_fallback_logged = False  # the candidate path logs again
         logger.info("Runtime switches from %s: %s", switches.path,
                     ", ".join(f"{name}={value}" for name, value in sorted(values.items())) or "none")
+        if any(name in GRAPH_SWITCHABLE for name in values):
+            logger.info("Runtime switches: flags read inside the forward changed; captured HPU graphs dropped: %s",
+                        ", ".join(self._drop_hpu_graphs()) or "none")
+
+    def _drop_hpu_graphs(self) -> list[str]:
+        """Drop the captured HPU graphs of the model and of the drafter (``wrap_in_hpu_graph``'s ``clear_cache``).
+
+        A flag read inside the forward (``runtime_switches.GRAPH_SWITCHABLE``) is fixed in a graph when the graph is
+        captured; after the drop the next steps capture again with the flags in force. Returns the names dropped."""
+        dropped = []
+        for name, module in (("model", getattr(self, "model", None)),
+                             ("drafter", getattr(getattr(self, "drafter", None), "model", None))):
+            clear = getattr(module, "clear_cache", None)
+            if callable(clear):
+                clear()
+                dropped.append(name)
+        return dropped
 
     def execute_model(
         self,

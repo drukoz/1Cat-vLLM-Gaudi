@@ -153,7 +153,11 @@ own bias and masks (vLLM's raw logprobs come before them). Any other value is `0
 When set, every worker looks at that file before each step (one `stat`) and, when the file changed, takes
 the flags it lists, one `NAME=VALUE` per line. Only flags the runner reads at every step can be switched:
 `VLLM_HPU_FLASH_NEXT_DECODE_METADATA`, `VLLM_HPU_FUSED_GREEDY_LOGITS`, `VLLM_HPU_CANDIDATE_SAMPLING` and
-`VLLM_HPU_VOCAB_PARALLEL_LOGITS` (read at every call of the logits region, which runs after the replayed graph);
+`VLLM_HPU_VOCAB_PARALLEL_LOGITS` (read at every call of the logits region, which runs after the replayed graph),
+and the MoE dense range `VLLM_HPU_MOE_DENSE_MIN_TOKENS` / `VLLM_HPU_MOE_DENSE_MAX_TOKENS` (read inside the forward:
+when the file names one of them the runner drops the captured HPU graphs of the model and of the drafter, and the
+next steps capture again; the server must start with `VLLM_HPU_MOE_DENSE=1`, a minimum above the maximum is the
+vendor op at every size; `tools/flash_next/kernel_probes/moe_rt_ab.sh`);
 any other name is reported and the file is ignored. Replace the file with a rename while no request runs, so every worker sees the change
 at the same step. `tools/flash_next/engine_step/long_context_probe.py` measures two arms of one server
 this way.
