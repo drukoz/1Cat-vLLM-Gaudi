@@ -1,0 +1,15 @@
+# prefill-batch A/B on build 5 (ab_job.sh: one TP8 server with MTP k = 2 and prefill's 00243 settings, started with
+# VLLM_HPU_PREFILL_BATCH=8; the switch file selects the arm). 1) The burst probe: K turns of one shape at once, the
+# arms alternating per round: what a merged forward saves per removed forward at 2 / 4 / 8 rows (per forward or per
+# row?), at a 2,048 and a 10,240-token context (the latter with the graph bound at 70,000 so 4 rows stay graphed).
+# 2) 00243's agent loop (32 agents at 16K / 32K / 45K / 56K, 1,024 new + 256 output, graphs 64,000) in both arms,
+# then 16 agents, in the order off, on, on, off.
+b2k burst --levels 1,2,4,8 --context 2048 --new 512 --rounds 3 --nonce pb-b2k --label "context 2048, 512 new"
+b10k burst --levels 1,2,4 --context 10240 --new 512 --rounds 3 --nonce pb-b10k --label "context 10240, 512 new" --knobs-file /tmp/prefill_knobs.json --knobs '{"prompt_graph_max_tokens": 70000}'
+s1 switch 0
+a32-off sweep --knobs-file /tmp/prefill_knobs.json --knobs '{"prompt_graph_max_tokens": 64000}' --label "batch off" --plan agents --agents 32 --agent-contexts 16384,32768,45056,56000 --agent-new-tokens 1024 --agent-output 256 --agent-warmup-seconds 90 --agent-seconds 150 --canaries 0 --nonce b5-mix
+s2 switch 8
+a32-on sweep --knobs-file /tmp/prefill_knobs.json --knobs '{"prompt_graph_max_tokens": 64000}' --label "batch 8" --plan agents --agents 32 --agent-contexts 16384,32768,45056,56000 --agent-new-tokens 1024 --agent-output 256 --agent-warmup-seconds 90 --agent-seconds 150 --canaries 0 --nonce b5-mix
+a16-on sweep --knobs-file /tmp/prefill_knobs.json --knobs '{"prompt_graph_max_tokens": 64000}' --label "batch 8" --plan agents --agents 16 --agent-contexts 16384,32768,45056,56000 --agent-new-tokens 1024 --agent-output 256 --agent-warmup-seconds 90 --agent-seconds 150 --canaries 0 --nonce b5-mix16
+s3 switch 0
+a16-off sweep --knobs-file /tmp/prefill_knobs.json --knobs '{"prompt_graph_max_tokens": 64000}' --label "batch off" --plan agents --agents 16 --agent-contexts 16384,32768,45056,56000 --agent-new-tokens 1024 --agent-output 256 --agent-warmup-seconds 90 --agent-seconds 150 --canaries 0 --nonce b5-mix16
