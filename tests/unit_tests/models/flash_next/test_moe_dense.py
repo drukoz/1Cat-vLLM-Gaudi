@@ -181,3 +181,17 @@ def test_route_stats_record_the_pairs_per_local_expert(monkeypatch, tmp_path):
         expected = [int(((ids - EXPERTS_MIN) == e).sum()) for e in range(LOCAL)] + [rows]
         assert plugin_ops.moe_route_stats_rows() == [expected]
     assert len(moe_block.VENDOR_CALLS) == 1
+
+
+@pytest.mark.parametrize("rows", [1, 7, 32])
+def test_flat_gate_up_is_the_batched_form(rows, monkeypatch, _dense_from_one_row):
+    """VLLM_HPU_MOE_DENSE_FLAT_GATE_UP=1: gate / up as one 2-D GEMM gives the batched form's output (the same products
+    and scales; on the card bit-identical, job 00248)."""
+    op, dense = _op()
+    op.set_dense_weights(*dense)
+    x, ids, weights = _batch(rows)
+    batched = op(x, ids, weights).float()
+    monkeypatch.setenv("VLLM_HPU_MOE_DENSE_FLAT_GATE_UP", "1")
+    flat = op(x, ids, weights).float()
+    assert len(moe_block.VENDOR_CALLS) == 0
+    torch.testing.assert_close(flat, batched, rtol=1e-2, atol=1e-3)

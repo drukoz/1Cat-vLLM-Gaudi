@@ -559,6 +559,7 @@ if TYPE_CHECKING:
     VLLM_HPU_MOE_DENSE: int = 0  # 0 vendor MoE op (default), 1 dense batched FP8 experts up to MAX_TOKENS rows
     VLLM_HPU_MOE_DENSE_MAX_TOKENS: int = 512  # with VLLM_HPU_MOE_DENSE=1: the most tokens a step runs dense
     VLLM_HPU_MOE_DENSE_MIN_TOKENS: int = 17  # with VLLM_HPU_MOE_DENSE=1: the fewest tokens a step runs dense
+    VLLM_HPU_MOE_DENSE_FLAT_GATE_UP: int = 0  # with VLLM_HPU_MOE_DENSE=1: gate / up as one 2-D GEMM (bit-identical)
     VLLM_HPU_MOE_TENSOR_SCALE_MAX_TOKENS: int = 0  # vendor MoE op: steps of at most N tokens quantize with one scale
     VLLM_HPU_MOE_ROUTE_STATS: str = ""  # a folder: per-step per-expert pair counts of every MoE op (stats jobs)
     VLLM_HPU_COLLECTIVE_MARK_STEP: int = 1  # 1 (default) mark_step() before every HPU collective, 0 none
@@ -2162,6 +2163,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # hit (the dense form reads every local expert: job 00177 lost at 1 stream).
     "VLLM_HPU_MOE_DENSE_MIN_TOKENS":
     lambda: int(os.environ.get("VLLM_HPU_MOE_DENSE_MIN_TOKENS", "17")),
+    # With VLLM_HPU_MOE_DENSE=1: 1 runs the dense form's gate / up as ONE 2-D FP8 GEMM over all local experts
+    # (x [T, H] times w13 viewed [E * 2I, H], the row and the column scales inside the GEMM) instead of a batched GEMM
+    # over an [E, T, H] copy of x: the same products and scales, bit-identical on the card (job 00248), 12 % less
+    # device time per layer at 96 rows. Read inside the forward (switchable at run time). 0 (default) or any other
+    # value: the batched form.
+    "VLLM_HPU_MOE_DENSE_FLAT_GATE_UP":
+    lambda: int(os.environ.get("VLLM_HPU_MOE_DENSE_FLAT_GATE_UP", "0")) == 1,
     # The per-channel FP8 MoE op's vendor path (torch.ops.hpu.mixture_of_experts): a step of at most this many
     # tokens quantizes its input with ONE per-tensor scale instead of one per row. The vendor op validates a per-row
     # activation scale on the host (isfinite, nonzero, then abs / ceil / min / max / ne, gt and lt, each read back:

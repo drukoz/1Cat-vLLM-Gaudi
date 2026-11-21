@@ -29,7 +29,7 @@ from typing import Optional
 # (GRAPH_SWITCHABLE), the runner drops the captured graphs of the model and of the drafter and the next steps capture
 # again. The server must start with VLLM_HPU_MOE_DENSE=1 (the stacked experts are kept only then); a minimum above
 # the maximum is the vendor op at every size.
-GRAPH_SWITCHABLE = ("VLLM_HPU_MOE_DENSE_MIN_TOKENS", "VLLM_HPU_MOE_DENSE_MAX_TOKENS")
+GRAPH_SWITCHABLE = ("VLLM_HPU_MOE_DENSE_MIN_TOKENS", "VLLM_HPU_MOE_DENSE_MAX_TOKENS", "VLLM_HPU_MOE_DENSE_FLAT_GATE_UP")
 SWITCHABLE = ("VLLM_HPU_FLASH_NEXT_DECODE_METADATA", "VLLM_HPU_FUSED_GREEDY_LOGITS", "VLLM_HPU_CANDIDATE_SAMPLING",
               "VLLM_HPU_VOCAB_PARALLEL_LOGITS", "VLLM_HPU_MTP_DRAFT_GRAPH", "VLLM_HPU_MTP_DRAFT_CHAIN",
               "VLLM_HPU_FLASH_NEXT_SPEC_DEVICE_INPUTS") + GRAPH_SWITCHABLE

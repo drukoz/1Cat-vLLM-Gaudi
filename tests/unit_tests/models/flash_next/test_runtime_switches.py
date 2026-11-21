@@ -38,8 +38,10 @@ def test_switch_file_format():
                                "VLLM_HPU_CANDIDATE_SAMPLING", "VLLM_HPU_VOCAB_PARALLEL_LOGITS",
                                "VLLM_HPU_MTP_DRAFT_GRAPH", "VLLM_HPU_MTP_DRAFT_CHAIN",
                                "VLLM_HPU_FLASH_NEXT_SPEC_DEVICE_INPUTS",
-                               "VLLM_HPU_MOE_DENSE_MIN_TOKENS", "VLLM_HPU_MOE_DENSE_MAX_TOKENS"}
-    assert set(GRAPH_SWITCHABLE) == {"VLLM_HPU_MOE_DENSE_MIN_TOKENS", "VLLM_HPU_MOE_DENSE_MAX_TOKENS"}
+                               "VLLM_HPU_MOE_DENSE_MIN_TOKENS", "VLLM_HPU_MOE_DENSE_MAX_TOKENS",
+                               "VLLM_HPU_MOE_DENSE_FLAT_GATE_UP"}
+    assert set(GRAPH_SWITCHABLE) == {"VLLM_HPU_MOE_DENSE_MIN_TOKENS", "VLLM_HPU_MOE_DENSE_MAX_TOKENS",
+                                     "VLLM_HPU_MOE_DENSE_FLAT_GATE_UP"}
     assert parse_switches("VLLM_HPU_MOE_DENSE_MIN_TOKENS=1\nVLLM_HPU_MOE_DENSE_MAX_TOKENS=512\n") == {
         "VLLM_HPU_MOE_DENSE_MIN_TOKENS": "1", "VLLM_HPU_MOE_DENSE_MAX_TOKENS": "512"
     }

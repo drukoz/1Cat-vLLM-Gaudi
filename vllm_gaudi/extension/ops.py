@@ -1486,11 +1486,22 @@ def moe_dense_fp8(x, topk_ids, topk_weights, w13, w2, s13, s2, experts_min):
     routed = (local.unsqueeze(-1) == expert_range).to(torch.float32)  # [T, K, E]
     pair_weight = (routed * topk_weights.to(torch.float32).unsqueeze(-1)).sum(dim=1)  # [T, E]
     x_fp8, x_scale = dynamic_quant(x)
-    a = x_fp8.unsqueeze(0).expand(experts, rows, hidden).contiguous()  # [E, T, H]
-    a_scale = x_scale.reshape(1, rows, 1).to(torch.float32).expand(experts, rows, 1).contiguous()
-    gate_up = torch.ops.hpu.fp8_gemm_v2(a, False, w13, True, None, torch.bfloat16, a_scale, s13.unsqueeze(1), None,
-                                        False)  # [E, T, 2I]
-    mid = (F.silu(gate_up[..., :inter].float()) * gate_up[..., inter:].float()).to(x.dtype)  # [E, T, I]
+    if envs.VLLM_HPU_MOE_DENSE_FLAT_GATE_UP:
+        # Gate and up of every local expert as ONE 2-D GEMM: x [T, H] times w13 viewed [E * 2I, H], the row scale
+        # [T, 1] and the column scales [1, E * 2I] inside it. No [E, T, H] copy of x and one long N for the MME;
+        # each output is the same dot product with the same scales (job 00248: bit-identical to the batched form,
+        # 12 % less device time per layer at 96 rows).
+        gate_up = torch.ops.hpu.fp8_gemm_v2(x_fp8, False, w13.reshape(experts * two_i, hidden), True, None,
+                                            torch.bfloat16, x_scale.reshape(rows, 1).to(torch.float32),
+                                            s13.reshape(1, experts * two_i), None, False).reshape(rows, experts, two_i)
+        mid = (F.silu(gate_up[..., :inter].float()) * gate_up[..., inter:].float()).to(x.dtype)  # [T, E, I]
+        mid = mid.transpose(0, 1).contiguous()  # [E, T, I]
+    else:
+        a = x_fp8.unsqueeze(0).expand(experts, rows, hidden).contiguous()  # [E, T, H]
+        a_scale = x_scale.reshape(1, rows, 1).to(torch.float32).expand(experts, rows, 1).contiguous()
+        gate_up = torch.ops.hpu.fp8_gemm_v2(a, False, w13, True, None, torch.bfloat16, a_scale, s13.unsqueeze(1),
+                                            None, False)  # [E, T, 2I]
+        mid = (F.silu(gate_up[..., :inter].float()) * gate_up[..., inter:].float()).to(x.dtype)  # [E, T, I]
     m_fp8, m_scale = dynamic_quant(mid.reshape(experts * rows, inter))
     # The routing weight of each (expert, row) pair rides on the down GEMM's row scale (0 for a pair that is not
     # routed), and the bf16 GEMM output is summed over the experts with fp32 accumulation: no [E, T, H] fp32 tensor.
