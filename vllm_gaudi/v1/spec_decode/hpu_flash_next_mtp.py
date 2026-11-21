@@ -250,8 +250,10 @@ class HpuFlashNextMtpProposer(HpuEagleProposer):
         value = torch.tensor(nxt, dtype=shifted.dtype, device=shifted.device)
         shifted.index_copy_(0, index, value)
         hidden = target_hidden_states.unsqueeze(0) if target_hidden_states.dim() == 2 else target_hidden_states
+        # [rows, T] as the chunk's batch has them: the draft's metadata processing takes the batch shape from the ids
+        rows_shape = tuple(token_ids.shape) if token_ids.dim() == 2 else (1, -1)
         self.model(
-            input_ids=shifted.unsqueeze(0),
+            input_ids=shifted.view(rows_shape),
             positions=position_ids,
             hidden_states=flat_token_rows(hidden),
             inputs_embeds=None,
