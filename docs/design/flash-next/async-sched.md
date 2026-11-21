@@ -6,7 +6,7 @@ results are under `/Volumes/Storage/Claude/gaudi-work/reports/async-sched/card/`
 
 ## Handoff (if this agent stops)
 
-Updated 2026-11-21 08:58 UTC.
+Updated 2026-11-21 09:25 UTC.
 
 - **Two branches.**
   - `feat/flash-next-gaudi-async-sched`: modes 1 and 2 of `VLLM_HPU_FLASH_NEXT_ASYNC_SCHED` (default 0). Commits:
@@ -61,16 +61,11 @@ Updated 2026-11-21 08:58 UTC.
     platform 60, moe_glue 3 files.
   - M1's card A/B is told to the coordinator a day ahead: tiny check at =1 and =2 with the chain, then TP8 =2
     against =0, 40 min.
-  - **Next: M2**, issuing N+1 before N's read under `VLLM_HPU_FLASH_NEXT_ASYNC_SCHED=3`, which requires the chain,
-    `SPEC_DEVICE_INPUTS=2` and `DECODE_METADATA=1`. What it involves:
-    - in a chained step, skip `_mtp_chain_settle` and the post-processing;
-    - return an async output: `sampled` [B, 1+k] D2H on a side stream; `get_output` trims each row at the first -1;
-    - queue the books (token_ids_cpu, num_tokens / num_tokens_no_spec, output_token_ids, `_gdn_num_accepted_by_req`,
-      mode 2's count correction, mtp-draft-graph's settle);
-    - apply them at a later step's start, in order, without waiting when the step continues the batch;
-    - wait for all of them first when the batch changes (new, finished or resumed requests) or a request needs
-      output values or lengths (`min_tokens`, penalties, bad words): those steps keep the synchronous order;
-    - then M3 (align-mode commits exact) and sampled.
+  - M2 is CPU-green at `cef6fd98` (`VLLM_HPU_FLASH_NEXT_ASYNC_SCHED=3`, section 2.6). M1 rides in mtp-draft-graph's
+    build-5 chain job (branch `feat/flash-next-gaudi-async-sched-m1-b5`). M2's card A/B was asked of the
+    coordinator: tiny gate at mode 3, then TP8 mode 3 against 2 at 32/8/1 with prefix caching off, 50 min.
+  - **Next: M3**, the align-mode pre-step copy and boundary commits from the device acceptance, so mode 3 serves
+    with prefix caching on. Then sampled, with mtp-draft-graph's D2.
 - The 1-token prompt note: spec-lookup's `005e1ff9` is not on the program branch yet. When it is, put prompt 0 back
   into `_serve_staggered`.
 
@@ -335,6 +330,31 @@ difference in any of the five tensors; `=2` gives the model the device-made inpu
 engine's without the flag). The branch is stacked on mtp-draft-graph's (its MTP fixes and the rehearsal engine are
 not on the program head yet). Not covered by M1: the align-mode lattice rows (host-made; M3), M-RoPE positions and
 the dense decode metadata (refused, logged once).
+
+M2 (VERIFIED on CPU, `VLLM_HPU_FLASH_NEXT_ASYNC_SCHED=3`, cef6fd98): mode 3 is mode 2 for the engine; in a chained
+verification step (`_mtp_chain_step`) the runner returns `AsyncSpecModelRunnerOutput` right after the chain is issued:
+the step's tokens `[B, 1 + k]` (-1 after the bonus) are copied on a side stream and read by the worker's output
+thread; `_mtp_chain_settle`, the post-processing and the drafter call are skipped (the chain drafted on the device,
+M1 makes the next step's inputs from its output). The books (the batch's token rows and `num_tokens(_no_spec)`, the
+requests' `output_token_ids`, `_gdn_num_accepted_by_req`) are queued (`SpecEarlyBooks`) and applied at the start of a
+later `execute_model`, in step order, without waiting when the step continues the batch (no request new, resumed or
+finished; every request with its 1 + k tokens; at most two books stay pending). A step whose batch changes waits for
+every pending book first and its `num_computed_tokens` become the true ones (each request's count seeded at the
+first early step and advanced by every applied book; the scheduler's still count the early steps' drafts as
+accepted). A chained step that needs its tokens (logprobs, penalties, bad words, `min_tokens`, structured output, a
+KV transfer, a prefill in the batch) reads them as before, after every pending book. Mode 3 needs the chain,
+`SPEC_DEVICE_INPUTS=2`, the sparse decode metadata and prefix caching off (the align-mode pre-step copy and
+boundary commits read the host's counts: M3); otherwise it acts as 2 and logs why. Tests:
+`tests/unit_tests/models/flash_next/test_engine_async_spec_early.py` (3: the streams equal mode 2's, prompts one at a
+time and all at once, 128 steps issued before the previous step's tokens reached the host, 122 books applied late
+and 5 after a wait; with prefix caching mode 3 acts as 2), the books in `test_flash_next_async_spec.py`. On CPU every
+copy is done when it is issued, so this proves the books, not the overlap; the rehearsal's oracle cannot force
+acceptance under async (it hooks `take_draft_token_ids`, which an async engine never calls), so M2's runs mostly
+accept 0 (M1's oracle runs cover every count).
+
+M1 for mtp-draft-graph's chain card job on build 5: `feat/flash-next-gaudi-async-sched-m1-b5` (28b113fa, 12b7d8c6,
+ad21795c on build 5's 57ca7c31; the M1 flag is read every step, so one server started at `=2` runs the `=0` and
+`=2` arms through the runtime switch file).
 
 ## 3. What is on the branch
 
