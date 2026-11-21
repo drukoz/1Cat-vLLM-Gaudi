@@ -16,6 +16,9 @@
 * ``probe_hc_copies.py`` (the owned copies in front of the fused hyper-connection ops): every copy mode returns
   the bits of mode 0.
 * ``decode_ab_client.py --compare``: the 1-stream rounds are the test of two arms' texts.
+* ``probe_moe_grouped.py`` (only the routed pairs, at most C per expert, against the dense form and the vendor op
+  with chunk 64): with no pair beyond C the grouped result is the dense form's; the overflow counts and the op
+  counts are printed.
 * ``moe_rt_driver.py`` (moe_rt_ab.sh's probe: the MoE dense range switched at run time on one server): against a
   stand-in server it switches every setting, measures every level and prompt set, compares the prompt logprobs of
   the settings, and stops (exit 9) when a switch reaches no worker's graphs.
@@ -94,6 +97,23 @@ def test_moe_dense_probe_matches_the_vendor_stand_in_and_times_every_form(tmp_pa
     parity = [line for line in out.splitlines() if " parity dense" in line and " vs vendor: " in line]
     assert len(parity) == 3 and all(float(line.split("relative ")[1].split()[0]) < 0.05 for line in parity), parity
     assert "VERDICT moe-dense: local8_rows32:" in out
+
+
+def test_moe_grouped_probe_matches_the_dense_form_and_counts_overflow(tmp_path):
+    proc, out = _run([PROBES / "probe_moe_grouped.py", "--out", tmp_path / "mg", "--layers", "1", "--iters", "1",
+                      "--rows", "16", "--caps", "2,16", "--local", "8"], tmp_path)
+    assert proc.returncode == 0, out[-3000:]
+    forms = [line for line in out.splitlines() if line.startswith("PROBE moe-grouped rows") and " form " in line]
+    assert len(forms) == 4 and not any("ERROR" in line for line in forms), forms  # chunk 64, dense, C = 2, C = 16
+    parity = {line.split(" parity ")[1].split(" vs ")[0]: float(line.split("relative ")[1].split(",")[0].split()[0])
+              for line in out.splitlines() if " parity " in line and " vs vendor: " in line}
+    assert set(parity) == {"dense", "grouped C=2", "grouped C=16"} and max(parity.values()) < 0.05, parity
+    assert parity["grouped C=16"] == pytest.approx(parity["dense"], rel=1e-3)  # no pair beyond C: the dense result
+    assert " overflow pairs 0" in out and "layers with a pair beyond C: C=2" in out
+    ops = {line.split(" form ")[1].split(":")[0]: int(line.split(": ")[1].split()[0])
+           for line in out.splitlines() if " aten ops per layer" in line}
+    assert set(ops) == {"dense", "grouped"}, ops
+    assert "VERDICT moe-grouped: rows 16: vendor-chunk64" in out
 
 
 def test_view_probe_selftest(tmp_path):
