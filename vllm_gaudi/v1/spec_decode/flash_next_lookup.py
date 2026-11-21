@@ -72,6 +72,14 @@ def lookup_mode() -> SpecLookupMode:
         return SpecLookupMode.OFF
 
 
+def drafts_off_rows(extra_args: Sequence[dict | None]) -> list[int]:
+    """The rows whose request turned its lookup off (``vllm_xargs {"spec_lookup": 0}``). On the ``ngram`` method the
+    n-gram search is the only drafter, so such a request drafts nothing: the runner leaves it out of the search, and
+    with ``VLLM_HPU_FLASH_NEXT_NGRAM_PLAIN_STEPS=1`` a step in which no request drafts runs as a plain decode step
+    (the spec-lookup card jobs' no-speculation reference on the n-gram server itself)."""
+    return [i for i, args in enumerate(extra_args) if request_mode(args, SpecLookupMode.HYBRID) == SpecLookupMode.OFF]
+
+
 def find_lookup_draft(tokens: np.ndarray, min_ngram: int, max_ngram: int, k: int, max_model_len: int) -> list[int]:
     """The n-gram continuation of ``tokens`` (1-D int32: prompt + output so far): vLLM's prompt-lookup search
     (the longest suffix n-gram of ``min_ngram..max_ngram`` tokens that occurs earlier, at its earliest occurrence),

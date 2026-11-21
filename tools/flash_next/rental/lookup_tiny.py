@@ -31,9 +31,17 @@ Configurations (``--configs``, default ngram3,ngram8,mtp3-lookup,ngram3-search),
   ngram3-fused   ngram3 with the fused GDN verification op (rows of 2 to 4 tokens)
   ngram3-search  n-gram k = 3 with vLLM's own search and prompt_lookup_min 1 (drafts on most steps, hardly any
                  accepted): the numba search in the workers, ragged widths without an oracle
+  ngram5-off     the n-gram server's own no-speculation reference (the spec-lookup TP8 job's ngram5-nospec arm):
+                 n-gram k = 5 with VLLM_HPU_FLASH_NEXT_NGRAM_PLAIN_STEPS=1 and the step timer
+                 (VLLM_HPU_STEP_TIMING=1, one record per step; the baseline server gets it too). Pass "off": every
+                 request with its lookup off (spec_lookup 0) must verify no draft, run no verification step (the
+                 timer's step kinds) and give its decode steps the baseline's decode input rows per request
+                 count; its streams leave the baseline's only at near-ties, and its line says how many are
+                 identical. Pass "ngram5": oracle drafts, as ngram3.
 
 A configuration passes when its server starts, every request of every pass is answered, no stream leaves the
-baseline away from a near-tie, and (passes with oracle drafts) drafts were accepted. Writes ``lookup_tiny.json``,
+baseline away from a near-tie, (passes with oracle drafts) drafts were accepted, and (the plain passes) the checks
+above. Writes ``lookup_tiny.json``,
 one folder with ``server0.log`` per server, and one summary line per pass. Exit code: 0 all passed, 1 otherwise.
 Standard library and the rental helpers only.
 """
@@ -67,6 +75,9 @@ PRESET = {"PT_HPU_LAZY_MODE": "1", "PT_HPU_LAZY_ACC_PAR_MODE": "0", "VLLM_HPU_FL
 NGRAM = {"method": "ngram", "prompt_lookup_max": 8, "prompt_lookup_min": 3}
 MTP3 = {"method": "mtp", "num_speculative_tokens": 3}
 RAGGED = {"schedule": [3, 1, 0, 2, 3, 3, 3], "tamper_every": 4}
+# The step timer (vllm_gaudi/extension/step_timing.py): one JSON line per worker step (EVERY=1) with its kind
+# (prefill, mixed, decode: no draft scheduled, verify) and its decode input rows (bucket_rows).
+STEP_TIMER_ENV = {"VLLM_HPU_STEP_TIMING": "1", "VLLM_HPU_STEP_TIMING_EVERY": "1"}
 # name -> the server's speculative config and environment, its oracle, and its passes over the scenarios:
 # (pass name, the request's spec_lookup mode or None, drafts must be accepted)
 CONFIGS = {
@@ -80,6 +91,9 @@ CONFIGS = {
                      "oracle": RAGGED, "passes": [("ngram3-fused", None, True)]},
     "ngram3-search": {"spec": dict(NGRAM, num_speculative_tokens=3, prompt_lookup_min=1), "oracle": None,
                       "passes": [("ngram3-search", None, False)]},
+    "ngram5-off": {"spec": dict(NGRAM, num_speculative_tokens=5), "env": {"VLLM_HPU_FLASH_NEXT_NGRAM_PLAIN_STEPS": "1"},
+                   "oracle": {"schedule": [5, 2, 0, 4, 5, 1, 3], "tamper_every": 4}, "step_timer": True,
+                   "plain_passes": ("off", ), "passes": [("off", 0, False), ("ngram5", None, True)]},
 }
 
 
@@ -219,6 +233,8 @@ class Server:
         self.name, self.out_dir, self.port, self.health_timeout_s = name, out_dir / name, port, health_timeout_s
         self.command = serve_command(ckpt, port, tp, spec)
         self.env = serve.server_environment(dict(PRESET, **env))
+        if "VLLM_HPU_STEP_TIMING" in env:
+            self.env["VLLM_HPU_STEP_TIMING_DIR"] = str(self.out_dir)
         self.popen = None
         self.startup_seconds = None
         self.reason = None
@@ -250,6 +266,57 @@ class Server:
             return ""
 
 
+def step_records(folder: Path, t0: float | None = None, t1: float | None = None) -> list[dict]:
+    """The step timer's records of the rank-0 worker in ``folder`` (``step_timing_worker_r0_<pid>.jsonl``), those
+    within the wall-clock window ``[t0, t1]`` when given."""
+    out = []
+    for path in sorted(Path(folder).glob("step_timing_worker_r0_*.jsonl")):
+        for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+            try:
+                rec = json.loads(line)
+            except ValueError:
+                continue
+            if t0 is not None and float(rec.get("t_first", 0)) < t0 - 0.5:
+                continue
+            if t1 is not None and float(rec.get("t_last", 0)) > t1 + 0.5:
+                continue
+            out.append(rec)
+    return out
+
+
+def step_summary(records: list[dict]) -> dict:
+    """``{"kinds": {kind: steps}, "decode_shapes": {request count: [decode input rows]}}`` of step records."""
+    kinds: dict[str, int] = {}
+    shapes: dict[str, set] = {}
+    for rec in records:
+        kinds[rec.get("kind")] = kinds.get(rec.get("kind"), 0) + int(rec.get("steps") or 0)
+        if rec.get("kind") == "decode" and rec.get("bucket_rows") is not None:
+            shapes.setdefault(str(rec.get("rows")), set()).add(int(rec["bucket_rows"]))
+    return {"kinds": kinds, "decode_shapes": {k: sorted(v) for k, v in sorted(shapes.items())}}
+
+
+def plain_pass_problem(one: dict, base_shapes: dict | None) -> str | None:
+    """Why a pass with the lookup off is not the no-speculation reference, or None: it verified no draft, its steps
+    are decode steps (never ``verify``), and each request count's decode input rows are the baseline's. Its streams
+    are compared as every pass's (a difference only at a near-tie of the baseline); how many are identical to the
+    server without speculation is in its line (on CPU some leave it at an exact tie: test_lookup_engine.py)."""
+    drafts = (one.get("acceptance") or {}).get("drafts") or 0
+    if drafts:
+        return "%d draft(s) verified" % drafts
+    steps = one.get("steps")
+    if not steps or not steps["kinds"]:
+        return "no step timer record in the pass's time"
+    if steps["kinds"].get("verify"):
+        return "%d verification step(s)" % steps["kinds"]["verify"]
+    if not steps["kinds"].get("decode"):
+        return "no decode step in the step timer's records"
+    differ = {rows: [shapes, base_shapes[rows]] for rows, shapes in steps["decode_shapes"].items()
+              if base_shapes and rows in base_shapes and shapes != base_shapes[rows]}
+    if differ:
+        return "decode input rows (request count: [this pass, the baseline]) differ: %s" % differ
+    return None
+
+
 def counters(base_url: str) -> dict | None:
     try:
         return spec_probe.read_spec_counters(base_url)
@@ -258,10 +325,13 @@ def counters(base_url: str) -> dict | None:
 
 
 def run_config(name: str, config: dict, ckpt: Path, out_dir: Path, port: int, tp: int, plan: list[dict],
-               baseline: dict, tops: dict, args) -> dict:
+               baseline: dict, tops: dict, args, base_shapes: dict | None = None) -> dict:
     """One server of ``config`` and its passes over the scenarios; the configuration's entry."""
     entry = {"config": name, "status": "failed", "reason": None, "spec": config["spec"], "passes": []}
     env = dict(config.get("env") or {})
+    if config.get("step_timer"):
+        env.update(STEP_TIMER_ENV)
+    plain = set(config.get("plain_passes") or ())
     if config.get("oracle"):
         oracle_path = out_dir / ("oracle-%s.json" % name)
         oracle_path.write_text(json.dumps({
@@ -276,13 +346,15 @@ def run_config(name: str, config: dict, ckpt: Path, out_dir: Path, port: int, tp
             entry["reason"] = "the server did not start: %s" % server.reason
         for pass_name, mode, wants_accepted in (config["passes"] if base_url is not None else []):
             before = counters(base_url)
-            started = time.monotonic()
+            started, wall0 = time.monotonic(), time.time()
             streams = run_scenarios(base_url, plan, baseline, False, args.timeout, mode=mode)
             one = {"pass": pass_name, "mode": mode, "status": "failed", "reason": None,
                    "seconds": round(time.monotonic() - started, 1),
                    "acceptance": spec_probe.spec_summary(spec_probe.counters_delta(before, counters(base_url))),
                    "compare": compare(baseline, tops, streams),
                    "streams": {k: v["tokens"] for k, v in streams.items()}}
+            if config.get("step_timer"):
+                one["steps"] = step_summary(step_records(server.out_dir, wall0, time.time()))
             result, accepted = one["compare"], (one["acceptance"] or {}).get("accepted") or 0
             if result["errors"]:
                 one["reason"] = "%d request(s) failed: %s" % (len(result["errors"]), result["errors"][0])
@@ -290,6 +362,8 @@ def run_config(name: str, config: dict, ckpt: Path, out_dir: Path, port: int, tp
                 one["reason"] = "stream(s) leave the baseline away from a near-tie: %s" % result["breaks"][:3]
             elif wants_accepted and accepted <= 0:
                 one["reason"] = "no draft was accepted (the oracle's drafts are the baseline's own tokens)"
+            elif pass_name in plain and plain_pass_problem(one, base_shapes):
+                one["reason"] = plain_pass_problem(one, base_shapes)
             else:
                 one["status"] = "passed"
             entry["passes"].append(one)
@@ -318,12 +392,15 @@ def pass_line(config: str, one: dict) -> str:
     acceptance, result = one.get("acceptance") or {}, one.get("compare") or {}
     rates = ",".join("%.2f" % r for r in acceptance.get("position_rates") or [] if r is not None)
     length = acceptance.get("acceptance_length")
+    kinds = (one.get("steps") or {}).get("kinds")
+    steps = ("; steps %s" % ", ".join("%s %d" % kv for kv in sorted(kinds.items(), key=str))) if kinds else ""
     return ("lookup tiny [%s/%s]: %s%s; %s s; tokens/step %s (pos %s), drafts %s, accepted %s; streams identical "
-            "%s/%s, %s tokens matched, ties %d, unclassified %d, breaks %d" % (
+            "%s/%s, %s tokens matched, ties %d, unclassified %d, breaks %d%s" % (
                 config, one["pass"], one["status"].upper(), (" (%s)" % one["reason"]) if one["reason"] else "",
                 one.get("seconds"), ("%.2f" % length) if length else "-", rates or "-", acceptance.get("drafts"),
                 acceptance.get("accepted"), result.get("identical"), result.get("requests"), result.get("matched"),
-                len(result.get("ties") or []), len(result.get("unclassified") or []), len(result.get("breaks") or [])))
+                len(result.get("ties") or []), len(result.get("unclassified") or []), len(result.get("breaks") or []),
+                steps))
 
 
 def summary_line(entry: dict) -> str:
@@ -364,7 +441,9 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     plan = scenarios(json.loads((ckpt / "reference.json").read_text(encoding="utf-8")), args.tokens)
 
-    base = Server("baseline", ckpt, out_dir, args.port, args.tp, None, {}, args.health_timeout)
+    timed = any(CONFIGS[n].get("step_timer") for n in names)
+    base = Server("baseline", ckpt, out_dir, args.port, args.tp, None, dict(STEP_TIMER_ENV) if timed else {},
+                  args.health_timeout)
     baseline, tops = {}, {}
     with base as base_url:
         if base_url is not None:
@@ -374,7 +453,8 @@ def main(argv: list[str] | None = None) -> int:
                 tops = run_scenarios(base_url, plan, baseline, True, args.timeout)
     failed = [[k, v["error"]] for k, v in baseline.items() if v["error"]]
     drift = [k for k, v in tops.items() if not v["error"] and v["tokens"] != baseline[k]["tokens"]]
-    record["baseline"] = {"status": "passed" if baseline and not failed else "failed",
+    base_shapes = step_summary(step_records(out_dir / "baseline"))["decode_shapes"] if timed else None
+    record["baseline"] = {"status": "passed" if baseline and not failed else "failed", "decode_shapes": base_shapes,
                           "reason": base.reason or (("request(s) failed: %s" % failed[:2]) if failed else None),
                           "startup_seconds": base.startup_seconds, "errors": serve.error_lines(base.log_text()),
                           "streams": {k: v["tokens"] for k, v in baseline.items()},
@@ -394,7 +474,8 @@ def main(argv: list[str] | None = None) -> int:
     tops = {k: v for k, v in tops.items() if not v["error"] and k not in drift}
 
     for name in names:
-        entry = run_config(name, CONFIGS[name], ckpt, out_dir, args.port, args.tp, plan, baseline, tops, args)
+        entry = run_config(name, CONFIGS[name], ckpt, out_dir, args.port, args.tp, plan, baseline, tops, args,
+                           base_shapes)
         record["configs"].append(entry)
         save()
         print(summary_line(entry), flush=True)

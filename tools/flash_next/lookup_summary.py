@@ -8,6 +8,10 @@ Each RUN_DIR is a job's results folder: ``probe.json`` (``lookup_probe.py``), ``
 speculative config and environment) and ``server0.log``. Every measured round becomes one row, named by its arm:
 
   no speculation            a server without ``--speculative-config``
+  no speculation (n-gram server, lookup off)
+                            the ``ngram`` method, the request's lookup mode 0 (``vllm_xargs {"spec_lookup": 0}``): it
+                            drafts nothing, and with ``VLLM_HPU_FLASH_NEXT_NGRAM_PLAIN_STEPS=1`` its steps are plain
+                            decode steps (the same-server reference; a real no-speculation server is preferred)
   n-gram k=K                the ``ngram`` method (ragged rows: a step is as wide as its longest draft)
   MTP k=K                   the ``mtp`` method, the request's lookup mode 0 (or a server without the lookup hook)
   hybrid k=K                mode 1: the lookup continuation where the last tokens match, else the MTP drafts
@@ -32,6 +36,8 @@ import statistics
 import sys
 
 MODES = {0: "MTP", 1: "hybrid", 2: "lookup only"}
+NO_SPEC = "no speculation"
+NO_SPEC_NGRAM = "no speculation (n-gram server, lookup off)"
 _SOURCE = re.compile(r"(lookup|mtp|none) rows (\d+), accepted (\d+) over (\d+) verified rows")
 _BOUNDARY = re.compile(r"Flash-Next lookup hybrid: (.*) \(after (\d+) steps, a new set of requests\)")
 
@@ -39,10 +45,10 @@ _BOUNDARY = re.compile(r"Flash-Next lookup hybrid: (.*) \(after (\d+) steps, a n
 def arm_name(spec: dict | None, lookup_env: str | None, mode: int | None) -> str:
     """The arm of a round from the server's speculative config, its lookup flag and the request's mode."""
     if not spec:
-        return "no speculation"
+        return NO_SPEC
     k = spec.get("num_speculative_tokens")
     if spec.get("method") == "ngram":
-        return "n-gram k=%s" % k
+        return NO_SPEC_NGRAM if mode == 0 else "n-gram k=%s" % k
     if mode is None:
         try:
             mode = int(lookup_env or 0)
@@ -51,6 +57,11 @@ def arm_name(spec: dict | None, lookup_env: str | None, mode: int | None) -> str
     if lookup_env in (None, "", "0"):
         mode = 0  # no hook installed: the request's mode is ignored
     return "%s k=%s" % (MODES.get(mode, "MTP"), k)
+
+
+def is_reference(arm: str) -> bool:
+    """A round without speculation: a server without it, or an n-gram server's request with its lookup off."""
+    return arm in (NO_SPEC, NO_SPEC_NGRAM)
 
 
 def boundary_counters(log_text: str) -> list[dict]:
@@ -139,12 +150,12 @@ def load_run(run_dir: str) -> dict | None:
 
 
 def reference_streams(runs: list[dict]) -> dict[str, list[int]]:
-    """``{prompt hash: the longest stream of token ids}`` over the rounds of the servers without speculation."""
+    """``{prompt hash: the longest stream of token ids}`` over the rounds without speculation (``is_reference``)."""
     best: dict[str, list[int]] = {}
     for run in runs:
-        if run["spec"]:
-            continue
         for rnd in run["probe"].get("rounds", []):
+            if not is_reference(arm_name(run["spec"], run["lookup_env"], rnd.get("mode"))):
+                continue
             for sha, ids in zip(rnd.get("prompt_sha") or [], rnd.get("token_ids") or []):
                 if ids and len(ids) > len(best.get(sha, [])):
                     best[sha] = ids
@@ -183,9 +194,10 @@ def rows_of(runs: list[dict]) -> list[dict]:
                 continue
             spec = rnd.get("spec") or {}
             k = (run["spec"] or {}).get("num_speculative_tokens") or 0
+            arm = arm_name(run["spec"], run["lookup_env"], rnd.get("mode"))
             rows.append({
                 "kind": rnd["kind"], "streams": rnd["streams"], "tokens": rnd["tokens"], "failed": False,
-                "arm": arm_name(run["spec"], run["lookup_env"], rnd.get("mode")), "label": run["probe"].get("label"),
+                "arm": arm, "label": run["probe"].get("label"),
                 "tp": run["tp"], "k": k,
                 "tokens_per_step": spec.get("acceptance_length") or 1.0,
                 "position_rates": spec.get("position_rates") or [],
@@ -197,14 +209,17 @@ def rows_of(runs: list[dict]) -> list[dict]:
                 "rows_per_step_mtp_shapes": rnd["streams"] * (1 + k),
                 "step_sizes": rnd.get("step_sizes"),
                 "sources": run["sources"].get(index),
-                "lossless": lossless(rnd, reference) if run["spec"] else None})
-    base = {(r["kind"], r["streams"]): r for r in rows if not r["failed"] and r["arm"] == "no speculation"}
+                "lossless": None if is_reference(arm) else lossless(rnd, reference)})
+    # the reference of a (kind, streams): a server without speculation when there is one, else the n-gram server's
+    # rounds with the lookup off (the last such round of each)
+    base = {(r["kind"], r["streams"]): r for r in rows if not r["failed"] and r["arm"] == NO_SPEC_NGRAM}
+    base.update({(r["kind"], r["streams"]): r for r in rows if not r["failed"] and r["arm"] == NO_SPEC})
     for r in rows:
         ref = base.get((r["kind"], r["streams"]))
         r["speedup_vs_no_speculation"] = (ref["steady_ms_per_token"] / r["steady_ms_per_token"]
                                           if ref and not r["failed"] and r.get("steady_ms_per_token") else None)
     order = {"edit": 0, "editf": 1, "editl": 2, "prose": 3, "mix": 4}
-    rows.sort(key=lambda r: (order.get(r["kind"], 9), -(r["streams"] or 0), r["arm"] != "no speculation", r["arm"]))
+    rows.sort(key=lambda r: (order.get(r["kind"], 9), -(r["streams"] or 0), not is_reference(r["arm"]), r["arm"]))
     return rows
 
 

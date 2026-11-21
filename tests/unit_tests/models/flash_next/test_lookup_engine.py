@@ -169,6 +169,66 @@ def test_plain_steps_when_no_request_drafts(plain_run):
     _compare(plain_run, "plain-pc")
 
 
+OFF = {"spec_lookup": 0}
+
+
+@pytest.fixture(scope="module")
+def off_run(tiny_checkpoint, tmp_path_factory) -> dict:
+    """Requests that turn their lookup off (vllm_xargs {"spec_lookup": 0}) on the n-gram server with
+    VLLM_HPU_FLASH_NEXT_NGRAM_PLAIN_STEPS=1, the card jobs' no-speculation reference on the n-gram server itself.
+    ``off-pc``: every request off (single prompts across the 256- and 512-token blocks, a batch of four, a second
+    turn on a prefix-cache hit), against an oracle that would draft k tokens on every step. ``mixed-pc``: two
+    requests off and two drafting in one batch. Measured on CPU (2026-11-21): the lookup-off streams are lossless but
+    not bit-identical to the engine without speculation: of the 9 streams 6 are identical and 3 leave it at a near-tie
+    (two of them at an exact tie, a top-2 gap of 0.0), like every speculative engine here."""
+    plan = _plan(Path(tiny_checkpoint))
+    by_name = {s["name"]: s for s in plan["scenarios"]}
+
+    def copy(name: str, new: str, off_every: int = 1) -> dict:
+        requests = []
+        for i, r in enumerate(by_name[name]["requests"]):
+            r = dict(r, id="%s-%s" % (new, r["id"]))
+            if "turn_of" in r:
+                r["turn_of"] = "off-near-256-near-256"
+            if i % off_every == 0:
+                r["extra_args"] = OFF
+            requests.append(r)
+        return {"name": new, "requests": requests}
+
+    plan["scenarios"] = [copy("solo-solo-7", "off-solo-7"), copy("solo-solo-100", "off-solo-100"),
+                         copy("near-256", "off-near-256"), copy("near-512", "off-near-512"),
+                         copy("batch", "off-batch"), copy("turn-2", "off-turn-2"), copy("batch", "mixed", 2)]
+    full = {"schedule": [K]}
+    plan["configs"] = [
+        {"name": "off-pc", "speculative_config": NGRAM, "prefix_caching": True,
+         "env": {"VLLM_HPU_FLASH_NEXT_NGRAM_PLAIN_STEPS": "1"}, "oracle": full,
+         "scenarios": ["off-solo-7", "off-solo-100", "off-near-256", "off-near-512", "off-batch", "off-turn-2"]},
+        {"name": "mixed-pc", "speculative_config": NGRAM, "prefix_caching": True,
+         "env": {"VLLM_HPU_FLASH_NEXT_NGRAM_PLAIN_STEPS": "1"}, "oracle": full, "scenarios": ["mixed"]},
+    ]
+    return _run_child(plan, tmp_path_factory.mktemp("lookup_engine_off"))
+
+
+def test_drafts_off_requests_run_plain_steps_losslessly(off_run):
+    config = off_run["configs"]["off-pc"]
+    assert "error" not in config, config.get("error")
+    # the drafter never saw a request (the oracle drafts k tokens for every request it is asked about)
+    assert config["steps"] == [], config["steps"][:3]
+    widths = sorted({w["width"] for w in config["widths"]})
+    assert widths == [1], widths  # plain decode steps only: one row per request
+    _compare(off_run, "off-pc")
+
+
+def test_drafts_off_requests_beside_drafting_requests(off_run):
+    config = off_run["configs"]["mixed-pc"]
+    assert "error" not in config, config.get("error")
+    # the drafting requests drafted (the oracle has nothing left to draft at the end of a stream)
+    assert config["steps"] and any(s["draft"] for s in config["steps"]), config["steps"][:3]
+    # the batch verifies the drafting requests' k tokens; the requests that are off ride along with the placeholder
+    assert max(w["width"] for w in config["widths"]) == K + 1, config["widths"][:3]
+    _compare(off_run, "mixed-pc", min_matched=60)
+
+
 @pytest.fixture(scope="module")
 def join_run(tiny_checkpoint, tmp_path_factory) -> dict:
     """A 1-token prompt joining a batch that verifies drafts (async-sched's finding, 2026-11-21): the 100-token prompt

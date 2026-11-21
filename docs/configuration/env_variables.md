@@ -395,7 +395,11 @@ verification step at least 2 rows wide per request. `1` keeps the placeholder
 only when another request of the step drafts; a step in which no request
 drafts runs as a plain decode step (1 row per request), which spares one row
 per request on fresh text (at one stream on TP4 an extra row cost about 8 ms,
-card job 00133). Any other value is `0`.
+card job 00133). Any other value is `0`. On the `ngram` method a request sent
+with `vllm_xargs` `{"spec_lookup": 0}` (its lookup off) drafts nothing: the
+n-gram search leaves it out. With `1`, a step of such requests only is a plain
+decode step, so one n-gram server also serves requests without speculation
+(the spec-lookup card jobs' same-server reference).
 
 `VLLM_HPU_MOE_GLUE_MERGE_GATE_UP` (integer, default `0`) applies only with
 `VLLM_HPU_MOE_GLUE=1`. `1` appends the shared expert's gate_up rows of this
