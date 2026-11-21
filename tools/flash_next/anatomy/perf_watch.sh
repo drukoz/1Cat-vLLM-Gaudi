@@ -12,7 +12,7 @@
 # perf is not installed on the node: unpack it once into ~/farm/<track>/perf/root with
 #   cd ~/farm/<track>/perf && apt-get download linux-tools-$(uname -r) linux-tools-$(uname -r | sed 's/-generic//') \
 #       && for d in *.deb; do dpkg -x "$d" root; done
-# Output: ~/farm/<track>/results/perf-<JOB_ID>/<server>-N<n>.{data,dso.txt,sym.txt,tid.txt,calls.txt},
+# Output: ~/farm/<track>/results/perf-<JOB_ID>/<server>-N<n>.{data,dso.txt,sym.txt,tid.txt},
 # <server>-N<n>-strace.{count.txt,calls.txt}, load.log (the node's load at the start and the end of every round) and
 # loadavg.log; fetch with `farm fetch <track> <JOB_ID> perf-<JOB_ID>`. Run a copy of this script, not the file a
 # later update overwrites: `cp watch.sh run-<id>.sh && nohup bash run-<id>.sh <id> &`.
