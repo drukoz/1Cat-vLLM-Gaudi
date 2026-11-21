@@ -145,6 +145,32 @@ def test_round_summary_arithmetic():
     assert failed["ok"] == 0 and "FAILED" in lp.round_line("job", "MEAS", failed)
 
 
+def test_mixed_round_halves():
+    small = lp.load_files(str(REPO_ROOT), lp.SMALL_FILES)
+    assert lp.parse_rounds("mix:32:384:1") == [("mix", 32, 384, 1)]
+    # stream 2j is edit prompt j, stream 2j + 1 prose prompt j: the same prompts as the edit and prose rounds
+    for j in range(16):
+        assert lp.prompt_for("mix", 2 * j, small) == lp.prompt_for("edit", j, small)
+        assert lp.prompt_for("mix", 2 * j + 1, small) == lp.prompt_for("prose", j, small)
+    assert lp.stream_kinds("mix", 4) == ["edit", "prose", "edit", "prose"]
+    assert lp.stream_kinds("edit", 2) == ["edit", "edit"]
+    assert "mix" in lp.FULL_WARM
+
+    def stream(tokens):  # 5 chunks 100 ms apart
+        return {"status": 200, "err": None, "t0": 0.0, "times": [1.0, 1.1, 1.2, 1.3, 1.4], "tokens": tokens,
+                "text": list("abcde"), "usage": {"prompt_tokens": 800, "completion_tokens": tokens[-1]}}
+
+    out = [stream([1, 5, 9, 13, 17]), stream([1, 2, 3, 4, 5]), stream([1, 5, 9, 13, 17]), stream([1, 2, 3, 4, 5])]
+    m = lp.summarize_round("mix", 4, 17, 1, out, 2.0, {"acceptance_length": 2.5})
+    assert m["by_kind"]["edit"]["streams"] == 2 and m["by_kind"]["prose"]["streams"] == 2
+    assert m["by_kind"]["edit"]["tokens_per_chunk_p50"] == pytest.approx(3.4)
+    assert m["by_kind"]["prose"]["tokens_per_chunk_p50"] == pytest.approx(1.0)
+    assert m["by_kind"]["prose"]["ms_per_token_p50"] == pytest.approx(100.0)
+    line = lp.round_line("job", "MEAS", m)
+    assert "edit: tok/chunk 3.40" in line and "prose: tok/chunk 1.00" in line
+    assert "by_kind" not in lp.summarize_round("edit", 2, 17, 1, out[:2], 2.0, None)
+
+
 def test_text_comparison():
     a = {"label": "mtp", "rounds": [{"kind": "edit", "streams": 2, "mode": 0, "ok": 2, "texts": ["hello you", "abc"]},
                                     {"kind": "edit", "streams": 2, "mode": 1, "ok": 2, "texts": ["hello you", "abd"]},
@@ -265,3 +291,21 @@ def test_serve_script_refuses_bad_arguments():
     assert _dry_run("--label", "x").returncode == 2  # no rounds
     assert _dry_run("--label", "x", "--rounds", "edit:1:8:-", "--mtp", "3", "--ngram", "3").returncode == 2
     assert _dry_run("--label", "x", "--rounds", "edit:1:8:-", "--bogus").returncode == 2
+
+
+ARMS = SERVE.parent / "lookup_arms.sh"
+
+
+def test_arms_script_dry_run():
+    done = subprocess.run(["bash", str(ARMS), "--dry-run", "nospec", "ngram5", "hybrid3"], capture_output=True,
+                          text=True, check=False, env={"PATH": "/usr/bin:/bin", "FARM_OUT": "/results/x"})
+    assert done.returncode == 0, done.stderr
+    lines = done.stdout.splitlines()
+    assert len(lines) == 3 and [line.split(":")[0] for line in lines] == ["arm nospec", "arm ngram5", "arm hybrid3"]
+    assert "--label nospec" in lines[0] and "--speculative" not in lines[0] and "--out /results/x/nospec" in lines[0]
+    assert "--ngram 5" in lines[1] and "mix:32:384:-" in lines[1]
+    # the hybrid arm: every round twice, mode 1 then 0, with the integration build's MTP flags
+    assert "--mtp 3 --lookup 1" in lines[2] and "edit:1:384:1\\,edit:1:384:0" in lines[2]
+    assert "mix:32:384:1\\,mix:32:384:0" in lines[2] and "VLLM_HPU_MTP_DRAFT_LOOP=1" in lines[2]
+    bad = subprocess.run(["bash", str(ARMS), "--dry-run", "ngram"], capture_output=True, text=True, check=False)
+    assert bad.returncode == 2 and "unknown arm" in bad.stderr
