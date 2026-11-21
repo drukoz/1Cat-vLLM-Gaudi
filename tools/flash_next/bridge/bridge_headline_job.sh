@@ -21,6 +21,9 @@
 #   EXTRA=<build id>  one more prepared-replay build, its tiny arm (tokens against tiny-stock) and real arm right
 #                     after the main comparison, named after the build id's first word (lean3a-... -> tiny-lean3a,
 #                     real-lean3a); BRIDGE_EXTRA=<build id> in the job's environment does the same
+# BRIDGE_ARMS="name:BUILD[:K=V,...] ..." in the job's environment replaces all of the above: a tiny arm per entry
+# (tokens against the first entry's), then a real arm per entry whose tiny arm passed, in the given order (BUILD "-"
+# = the image's bridge), e.g. "stock:- rebuild:stock-5176b1b2 lean3a:lean3a-8f6f7faf88dc:PT_HPU_HPUGRAPH_PREPARED_REPLAY=1"
 set -u
 L="${1:?LEAN build id}"
 INLINE="${BRIDGE_INLINE:-0}"
@@ -46,6 +49,23 @@ ENV=(--env VLLM_HPU_QSA_FUSED=1 --env VLLM_HPU_QSA_INDEXER_SHARD=1 --env VLLM_HP
     --env VLLM_HPU_GDN_GLUE_CACHE=1 --env VLLM_HPU_HC_FUSED_COPY_MODE=2 --env VLLM_HPU_DECODE_CUT_INTERVAL=1000
     --env VLLM_HPU_CANDIDATE_SAMPLING=1 --env VLLM_GRAPH_RESERVED_MEM=0.4 --env VLLM_HPU_PREFIX_ALIGN_SPLIT=1
     --env VLLM_HPU_PREFIX_KEEP_PROMPT_END=1 --env PT_HPU_SYNCHRONOUS_ACC_QUEUE_FLUSHING=1)
+if [ -n "${BRIDGE_ARMS:-}" ]; then
+    read -r -a SPEC <<<"$BRIDGE_ARMS"
+    TINY=()
+    for a in "${SPEC[@]}"; do TINY+=("tiny-$a"); done
+    bash "$J" --sha "$S" --image "$IMG" "${ENV[@]}" --cmd 'python /farm/farm_tiny.py --gdn hc' "${TINY[@]}"
+    REAL=()
+    for a in "${SPEC[@]}"; do
+        if grep -q "^tiny-${a%%:*} ok" "$V"; then REAL+=("real-$a"); fi
+    done
+    if [ ${#REAL[@]} -gt 0 ]; then
+        bash "$J" --sha "$S" --image "$IMG" "${ENV[@]}" --cmd "bash $P/serve_probe.sh --levels 32,8,1 --tokens 128 --warm-tokens 48 --repeat-top 2 --no-mintok-check --probe-arg --sampled-levels=32,8,1 --probe-arg --interleave-sampled --probe-arg --rounds=2" "${REAL[@]}"
+    fi
+    echo "bridge_headline: verdicts:"
+    cat "$V"
+    ! grep -q ' fail' "$V"
+    exit
+fi
 PROBE="bash $P/serve_probe.sh --levels 32,8,1 --tokens 128 --warm-tokens 48 --repeat-top 2 --no-mintok-check --probe-arg --sampled-levels=32,8,1 --probe-arg --interleave-sampled --probe-arg --rounds=2"
 # 1. the tiny gate of the main comparison
 bash "$J" --sha "$S" --image "$IMG" "${ENV[@]}" --cmd 'python /farm/farm_tiny.py --gdn hc' \
