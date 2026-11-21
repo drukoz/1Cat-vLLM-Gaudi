@@ -6,94 +6,63 @@ results are under `/Volumes/Storage/Claude/gaudi-work/reports/async-sched/card/`
 
 ## Handoff (if this agent stops)
 
-Updated 2026-11-21 10:20 UTC.
+Updated 2026-11-21 10:55 UTC.
 
-- **Card 00220 (mode 1 with `d3fb1b11`, placement on, MEASURED)**: ms/token sync → async: 1 stream greedy 27.9 →
-  29.4, sampled 32.0 → 31.6; 8 streams greedy 43.7 → 50.1, sampled 53.0 → 48.8 (00186: +16 to +21 ms/step). tiny-async
-  passed. Worker spans at 8 rows: sync forward (host) 29-34 ms + device wait 5-10; async forward 36-41 + post 2-8; the
-  census arm counts per decode step 29 `.item()`, 7.7 `.tolist()`, 5.6 scalar reads of device tensors from torch's
-  `_tensor_str` (something formats device tensors every step; source not found yet, likely HPU-only), 14 H2D, 4
-  mark_step, 98 all_reduce. Reported to the coordinator (step-anatomy's census could name the first non-torch frame).
-- **PR #25 merged** (`4f070c75`): modes 1 and 2 on the program head (gate 72 files, 0 red).
-- **M3 CPU-green** on s2 (`VLLM_HPU_FLASH_NEXT_SPEC_DEVICE_ALIGN`): mode 3 serves with prefix caching on. Card
-  need sent: tiny-m3 with prefix caching + TP8 mode 3 / M3=2 against mode 2 with prefix caching, a multi-turn round.
-- M2's card job is now **00233** (`--replaces 00229 --no-sync`, + `VLLM_HPU_MOE_DENSE_MIN_TOKENS=1`, the new serve
-  baseline); mtp-draft-graph's chain job is **00230** (replaced 00228). Waiters: `logs/wait_00233.out`.
-- **Two branches.**
-  - `feat/flash-next-gaudi-async-sched`: modes 1 and 2 of `VLLM_HPU_FLASH_NEXT_ASYNC_SCHED` (default 0). Commits:
-    `7a818007` mode 1; `fb5cefca` mode 2; `0cc8cf09` env order; `d3fb1b11` no wait in a steady decode step
-    (section 2.5); `8a171ea5` merge of the program head `2e9f9196`; docs after. It waits for its gate, then the PR.
-  - `feat/flash-next-gaudi-async-sched-s2`: stage 2 (section 2.6). It is stacked on mtp-draft-graph's branch: their
-    MTP fixes, the rehearsal engine `tests/unit_tests/hpu_cpu_engine.py`, the one-graph draft and the chain
-    `73e9fbf8` are not on the program head yet. It merges the program head `adbcff30`. M1 is at `97a3a08a` and
-    `54c9f552`.
-- **Gate of the PR.** `bin/gate reports/async-sched/trees/gate-8a171ea5` runs in the background with a 4 h alarm
-  (pid of `bin/gate` was 69830 at 08:54 UTC), still waiting for a slot. Log:
-  `reports/async-sched/logs/gate_8a171ea5.out`; the first run, cut by its own alarm, is
-  `gate_8a171ea5_cut.out`. If green:
-  - `gh pr create --base feat/flash-next-gaudi --head feat/flash-next-gaudi-async-sched` (title "Flash-Next under
-    async scheduling: VLLM_HPU_FLASH_NEXT_ASYNC_SCHED (default 0), modes 1 and 2"; body
-    `reports/async-sched/pr_body.md`, fill in the gate line);
-  - then `gh pr merge --merge` (owner's rule: default-off and the gate green). The program head has moved since
-    (`adbcff30`): if GitHub reports a conflict, merge it into the branch and gate again.
-- **Card jobs 00220 and 00221** (all, 40 min each). Job branch `feat/flash-next-gaudi-async-sched-int3` at
-  `ca760021` (integration `8cdc5999` + `d3fb1b11` + job arms + the placement switch; never merge it). They replaced
-  00196→00202 and 00197→00203. Env: build 4's (`VLLM_HPU_PREFIX_ALIGN_SPLIT=1 VLLM_HPU_PREFIX_KEEP_PROMPT_END=1
-  VLLM_MOE_CHUNK=64,8192 VLLM_MOE_TOKEN_BOUNDARY=512,1000000 PT_HPU_SYNCHRONOUS_ACC_QUEUE_FLUSHING=1`; the coordinator
-  keeps `=1`), `HEADLINE_LEVELS=8,1`, the step timer `VLLM_HPU_STEP_TIMING=1` with `_EVERY=50` (records in
-  `<arm>/timing/`).
-  - 00220 `real8-async-m1d`: `tiny-async nospec-async nospec nospec-async-census`. `-census` runs the step timer in
-    mode 2: host sync points with their source lines.
-  - 00221 `real8-async-m2u`: `mtp2-async mtp2 mtp2-async-census`, MTP k = 2, `HEADLINE_MTP_SAMPLED=1
-    HEADLINE_MTP_SAMPLED_LEVELS=8,1 VLLM_HPU_SPEC_SAMPLED_VERIFY=2 VLLM_HPU_MTP_TIMING=0 HEADLINE_ASYNC_MTP_TIMING=0
-    HEADLINE_MTP_FALLBACK=0`.
-  - Waiters that fetch the results: `reports/async-sched/logs/wait_00220.out`, `wait_00221.out`. If the session is
-    gone: `bin/farm fetch async-sched 00220 00220-real8-async-m1d` (same for 00221).
-  - How to read them:
-    - `python3 -I reports/async-sched/tools/ab_table.py <dir> --pairs nospec-async:nospec` (00220) and
-      `--pairs mtp2-async:mtp2` (00221);
-    - `tiny-async/summary.json`: both modes must pass;
-    - `python3 -I reports/async-sched/tools/timer_spans.py <dir> [--sites]`: spans `wait`, `async_wait`, `gap`,
-      `rpc_gap`, the engine's `update_from_output`; `--sites` gives the census. Greedy and sampled rounds are told
-      apart by time: `t` is in epoch seconds and `raw` holds every step.
-    - Compare arms within a job only: since 06:58 UTC jobs get whole-core cpusets.
-  - Placement switch: `~/farm/async-sched/results/switches/place` on the node, read once at each job's start, now
-    `off`.
-    - `on`: `VLLM_HPU_WORKER_CPU_PIN=1` + `place_wrap.sh` + `place.sh` (rule a^1).
-    - `place`: the placement without the pin flag. 00189 measured the pinned server loading in 14.9 min against
-      7.5.
-    - Scripts: copies in `~/farm/async-sched/results/bench`, md5 5f7ca629 and 7e54f2de. spec-lookup's 00208
-      hard-links them.
-    - The coordinator sets the switch itself from collectives' 00219 place-only result, about 09:45 UTC.
-- **Stage 2** (section 2.6). The plan was approved; ownership is agreed with mtp-draft-graph and engine-step.
-  - M1 is CPU-green: `VLLM_HPU_FLASH_NEXT_SPEC_DEVICE_INPUTS`; `vllm_gaudi/v1/worker/flash_next_async_spec.py`;
-    tests `tests/unit_tests/worker/test_flash_next_async_spec.py` (39) and
-    `tests/unit_tests/models/flash_next/test_engine_spec_device_inputs.py` (8). Neighbours pass on s2: mode 1/2 files,
-    platform 60, moe_glue 3 files.
-  - M1's card A/B is told to the coordinator a day ahead: tiny check at =1 and =2 with the chain, then TP8 =2
-    against =0, 40 min.
-  - M2 is CPU-green at `cef6fd98` (`VLLM_HPU_FLASH_NEXT_ASYNC_SCHED=3`, section 2.6). `959890bf` puts the M1 flag in
-    `SWITCHABLE`, without which the runtime switch file rejects it and is ignored as a whole (found by mtp-draft-graph).
-  - Card jobs for stage 2 (the coordinator places both after build 5's 00222):
-    - **00228** is mtp-draft-graph's chain job on their `feat/flash-next-gaudi-mtp-draft-graph-b5` at `ea1715fa`. That
-      is build 5 `eb21ac75` + their chain + my M1 as `249647f7`, `c1906d33` and `70d41eb9`, the cherry-picks of
-      `feat/flash-next-gaudi-async-sched-m1-b5`. It carries M1's A/B: the `tiny-m1` gate at `=1`, and `m1sw`, one
-      server started at `=2` with arms `=0` and `=2` and the chain on.
-    - **00229** `real8-async-m3` is mine, on `feat/flash-next-gaudi-async-sched-m2-b5` at `44a51fcd`: `ea1715fa` + M2
-      + a fix so mode 3 also follows stage B's chain + harness changes (`tiny-m3` gate, words `async3` and `nopc`,
-      the tiny server's prefix-caching opt-out `FARM_SERVE_NO_PREFIX_CACHING=1` in `rental/serve.py`).
-      - Arms: `tiny-m3 mtp2-async3-cuts-nopc-greedy mtp2-async-cuts-nopc-greedy`.
-      - Env: build 5's dense env (`VLLM_HPU_MOE_DENSE=1 VLLM_MOE_CHUNK=0,64,8192 VLLM_MOE_TOKEN_BOUNDARY=16,512,1000000
-        HEADLINE_REQUIRE_DENSE=1`, prefix flags, `PT_HPU_SYNCHRONOUS_ACC_QUEUE_FLUSHING=1`,
-        `VLLM_HPU_QSA_SLOT_SHIFT=0`), chain + draft graph + I01 + `SPEC_DEVICE_INPUTS=2`, levels 32/8/1, greedy, 2
-        rounds, step timer mode 1, MTP timers 0, `HEADLINE_PLACE_SWITCH=/results/switches/place`.
-      - Waiter: `reports/async-sched/logs/wait_00229.out`; else `bin/farm fetch async-sched 00229 00229-real8-async-m3`.
-      - Read: the `tiny-m3` line in the job log; `ab_table.py <dir> --pairs mtp2-async3-cuts-nopc-greedy:mtp2-async-cuts-nopc-greedy`;
-        the spans with `timer_spans.py`. The gain shows as prepare and forward issue under the device's busy time.
-  - M3 is CPU-green (`VLLM_HPU_FLASH_NEXT_SPEC_DEVICE_ALIGN`, section 2.6): mode 3 now serves with prefix caching on.
-    PR #25 (modes 1 and 2) is merged into the program head as `4f070c75` (gate 72 files, 0 red).
-  - **Next**: M3's card A/B (with a multi-turn workload, prefix hits on committed blocks), then sampled with
-    mtp-draft-graph's D2.
+- **Card results so far** (placement on, MTP timers 0, compare arms within a job only):
+  - 00220, mode 1 with `d3fb1b11` (MEASURED). ms/token sync → async: 1 stream greedy 27.9 → 29.4, sampled
+    32.0 → 31.6; 8 streams greedy 43.7 → 50.1, sampled 53.0 → 48.8 (00186 had +16 to +21 ms/step). tiny-async
+    passed. The census's `_tensor_str` reads (29 `.item()` per step) are capture-only (engine-step, VERIFIED in the
+    records): all of them are in record 0 of a 50-step window, the step that captured that bucket's graph, and
+    `per_step` is total/50. Steady steps wait in the D2H of `get_output` and 14 H2D per step (`utils.py:60`,
+    `async_h2d_copy`).
+  - 00221, mode 2 against synchronous MTP k = 2 (MEASURED; `reports/async-sched/card/00221-real8-async-m2u`).
+    ms/step sync → mode 2: 8 streams greedy 61.9/61.9 → 62.2/65.3, sampled 67.5/67.1 → 67.5/69.5; 1 stream greedy
+    53.4/53.7 → 55.0/57.6, sampled 57.9/56.9 → 53.3/56.2. Mode 2 is even with sync per step. At 1 stream greedy it
+    gets 2.00 tokens/step against 2.42: its text leaves sync's after 13 equal tokens (sync opens a `<think>` block
+    the drafter predicts well), INFERRED content, not a defect. Spans: mode 2 hides the engine gap (sync 2.2-4.6 ms
+    → 0.26) but the host's forward + wait (blocked on the device) grows by as much (1 row: sync 38-40 ms, mode 2
+    41-44). INFERRED: the per-step pageable H2D copies (about 20 per step) wait behind the step in flight.
+    engine-step's `VLLM_HPU_PERSISTENT_INPUTS` (pinned host buffers, non-blocking copies, two alternating slots under
+    async scheduling) is the matching fix: an async arm with it when it is on the program head.
+- **Branches.**
+  - `feat/flash-next-gaudi-async-sched`: done, merged as PR #25 (`4f070c75`): modes 1 and 2 on the program head.
+  - `feat/flash-next-gaudi-async-sched-s2`: stage 2 (section 2.6), all default-off, CPU-green. M1 `97a3a08a`
+    `54c9f552` `959890bf`; M2 `cef6fd98`; M3 `a0f29355` `f7bb35ce`; `f616e3e1` (M1 with prefix caching keeps the
+    align mode's load count). mtp-draft-graph's chain is on the program head now (PR #23), so s2 only needs the
+    program head merged in (two conflicts, `SWITCHABLE` in `runtime_switches.py` and its test: the union), then its
+    gate, then a PR (owner's rule: default-off and the gate green).
+  - engine-step's persistent-inputs branch (`e4c442ef`) conflicts with the program head in the same two files plus
+    `_ple_forward_kwargs`; they have the resolution (keep the device-context passthrough, else `upload`). s2 merges
+    it with that one conflict only.
+- **Card job 00237** `real8-async-m3c` (all, 85 min; replaced 00233, which had replaced 00229; starts after
+  mtp-draft-graph's 00230, by 14:21 UTC at the latest).
+  - Job branch `feat/flash-next-gaudi-async-sched-m3-b5` at `107dcf9a` (never merge it): the M2 job branch
+    `44a51fcd` (build 5 + their chain + M1 + M2) + M3 + the M1 fix + harness: gates `tiny-m3pc1` (prefix caching on,
+    mode 2, M3 = 1; passes only with M3's check line at 0 differences) and `tiny-m3pc2` (mode 3 + M3 = 2; passes only
+    if steps were issued early and nothing acted as 2), word `m3a` (M3 = 2; the arm is left out when a `tiny-m3pc`
+    gate failed), word `turns` (`tools/flash_next/rental/commit_turns_probe.py` after the probe, block
+    `HEADLINE_TURNS_BLOCK=512`). CPU on the branch: align 50, spec 41, engine align 3, engine device inputs 8, early 3.
+  - Arms in order: `tiny-m3 mtp2-async3-cuts-nopc-greedy mtp2-async-cuts-nopc-greedy` (M2 isolated, prefix caching
+    off), `tiny-m3pc1 tiny-m3pc2`, `mtp2-async3-cuts-greedy-m3a-turns mtp2-async-cuts-greedy-turns` (prefix caching on).
+  - Env: build 5's dense env (`VLLM_HPU_MOE_DENSE=1 VLLM_HPU_MOE_DENSE_MIN_TOKENS=1 VLLM_MOE_CHUNK=0,64,8192
+    VLLM_MOE_TOKEN_BOUNDARY=16,512,1000000 HEADLINE_REQUIRE_DENSE=1`), prefix flags,
+    `PT_HPU_SYNCHRONOUS_ACC_QUEUE_FLUSHING=1`, `VLLM_HPU_QSA_SLOT_SHIFT=0`, chain + draft graph + I01 +
+    `SPEC_DEVICE_INPUTS=2`, levels 32/8/1, greedy, 2 rounds, step timer mode 1, MTP timers 0,
+    `HEADLINE_PLACE_SWITCH=/results/switches/place`, `HEADLINE_HOLD_S=5040`. The waiter writes
+    `reports/async-sched/logs/wait_00237.out`; else `bin/farm fetch async-sched 00237 00237-real8-async-m3c`.
+  - Read: the `tiny-m3`, `tiny-m3pc1`, `tiny-m3pc2` lines in the job log; `python3 -I
+    reports/async-sched/tools/ab_table.py <dir> --pairs mtp2-async3-cuts-nopc-greedy:mtp2-async-cuts-nopc-greedy,
+    mtp2-async3-cuts-greedy-m3a-turns:mtp2-async-cuts-greedy-turns`; `timer_spans.py <dir>` (mode 3's gain shows as
+    prepare and forward issue under the device's busy time); `turns.json` in both turns arms: `again` equals `first`,
+    `eight_again` equals `eight`, `next_turn` has `cached_tokens` > 0.
+- **00230** is mtp-draft-graph's chain job (build 5 + chain + my M1 as cherry-picks): it carries M1's A/B, the
+  `tiny-m1` gate at `=1` and `m1sw` (one server, arms `=0` and `=2`). Their results folder, read when it lands.
+- **Placement switch**: `~/farm/async-sched/results/switches/place` on the node, read once at each job's start, now
+  `place` (the coordinator sets it). `on` = `VLLM_HPU_WORKER_CPU_PIN=1` + `place_wrap.sh` + `place.sh` (rule a^1);
+  `place` = the placement without the pin flag. Scripts in `~/farm/async-sched/results/bench` (md5 363bcf9d and
+  7e54f2de); spec-lookup hard-links them.
+- **Next**: read 00237; merge the program head into s2, gate, PR; an async arm with persistent inputs; sampled with
+  mtp-draft-graph's D2.
 - The 1-token prompt note: spec-lookup's `005e1ff9` is not on the program branch yet. When it is, put prompt 0 back
   into `_serve_staggered`.
 
