@@ -8,7 +8,7 @@ file), VERIFIED (CPU test or code line), INFERRED.
 
 ## Handoff (if this agent stopped)
 
-Last update: 2026-11-21 05:40 UTC (`date -u`), first agent of the track (Opus 5.5), started 04:35 UTC.
+Last update: 2026-11-21 05:57 UTC (`date -u`), first agent of the track (Opus 5.5), started 04:35 UTC.
 
 **Goal (coordinator, 04:45 UTC).** Run the k draft passes of an MTP decode draft in ONE HPU graph behind a default-off
 flag. Basis: build 3's timer (00178, TP8, k = 3) at 32 streams: the draft costs 16.3 to 18.2 ms of a 104 ms step
@@ -33,8 +33,21 @@ flag. Basis: build 3's timer (00178, TP8, k = 3) at 32 streams: the draft costs 
 - `e3dbc22a` merge of the program head `2e9f9196` (PR #20 engine-step: its sparse-QSA draft metadata, which the
   one-graph path calls too); `d3bbf2a6` the flag as a runtime switch (`runtime_switches.SWITCHABLE`) and the MTP
   timer's kind `verify+graph`; CPU engine `--switch-after` and a test that switches the flag mid-run (8 passed).
-- Gate of `d3bbf2a6`: running on the snapshot `reports/mtp-draft-graph/gate-d3bbf2a6`, output
-  `reports/mtp-draft-graph/gate/gate-d3bbf2a6.txt`. Then the pull request (default off).
+- `bf7cf32c` an engine test of the one-graph draft with engine-step's I01 (`VLLM_HPU_FLASH_NEXT_DECODE_METADATA=1`,
+  in force in both runs): same drafts and streams as the per-pass drafter with I01 (1 passed).
+- Worker tests on the merged branch: `test_mtp_draft_graph.py`, `test_draft_rank_stats.py`, `test_mtp_draft_ids.py`,
+  `test_mtp_step_timer.py` 51 passed.
+- Gate of `bf7cf32c` (the merge protocol's common gate): `bin/gate reports/mtp-draft-graph/gate-bf7cf32c` (a snapshot
+  worktree), output `reports/mtp-draft-graph/gate/gate-bf7cf32c.txt`; it waits for a gate slot (two other tracks'
+  gates hold both). When green: `gh pr create --base feat/flash-next-gaudi --head feat/flash-next-gaudi-mtp-draft-graph`
+  and `gh pr merge --merge` (default off), then tell the coordinator the PR number.
+- Test branch `feat/flash-next-gaudi-mtp-draft-graph-b4` also has, for a follow-up job (not in 00194's image):
+  `0a72517d` arm `mtp<K>-async-switch` (the A/B on the async MTP server, `VLLM_HPU_FLASH_NEXT_ASYNC_SCHED=2`; set
+  `HEADLINE_ASYNC_MTP_TIMING=0`) and `43b5431c` `HEADLINE_SWITCH_SET=graph-md` (the 2 x 2 with I01). Analysis
+  scripts: `reports/mtp-draft-graph/tools/ab_summary.py <arm folder>` (rounds per arm, means, on - off, text
+  identity per stream) and `tools/timer_ab.py <arm folder>` (the timer's records per kind and rows, first record of a
+  key dropped). Build 3's per-pass draft by that script (00178 mtp3): 19.0 ms per step at 32 streams (pass0 4.9,
+  pass1_meta 1.1, pass1 3.8, pass2_meta 1.0, pass2 3.7, final_wait 4.4), 15.3 ms at 1 stream.
 - Card: job 00194 below (00191, the two-server design, was replaced).
 
 **Card job 00194 `real8-draft-graph-switch`** (all, 55 min; replaced 00191 at 05:37 UTC and kept its place: after
