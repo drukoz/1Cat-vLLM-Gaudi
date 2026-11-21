@@ -658,6 +658,20 @@ the reserved vCPUs, re-applied every 2 s. Also a rule for every placement here: 
 2k+1; `VLLM_HPU_WORKER_CPU_PIN=2` puts the main thread on its share's first CPU (19r) and lets other threads use its
 sibling (19r xor 1), so mode 2 needs the sibling kept free (a fix for the flag, after 00189 says it pays).
 
+### 7.13 The sibling-aware placement at TP8: job 00189 (real model, integration build 4)
+
+MEASURED (the collectives track's job 00189, ended 08:40 UTC; one server start per arm; the arms ran on lean3a with
+the prepared replay, so the timers give per-rank costs): real-pin (`VLLM_HPU_WORKER_CPU_PIN=1` plus this track's
+`place.sh`, rule a^1, after health) against real-lean (same build and flags, no pin), greedy steady ms per step:
+1 stream 27.9 / 28.1 against 42.1 / 37.7; 8 streams 44.8 / 45.0 against 67.0 / 66.4; 32 streams 45.8 / 46.7 against
+48.8 / 51.4. Per-rank us per launch with the pin: 1 stream 122 102 120 130 156 128 119 131 (median 125, no slow rank,
+slowest 1.25x the median); 8 streams median 119, none slow; 32 streams median 133. Unpinned: real-lean median 145 at 1
+stream (one rank 1.54x), the rebuild arm median 175. place.sh's first pass moved 2058 threads, none failed. **The
+slow-rank pairs are gone, and the 1- and 8-stream steps drop by 10-14 and 22 ms: the largest single gain so far.**
+Cost: the pinned server took 14.9 min to its first throughput line against 7.5-8.1 min unpinned (INFERRED: mode 1
+holds every rank to its 18 CPUs through weight load, compile and warmup). So `VLLM_HPU_WORKER_CPU_PIN=3` now pins
+nothing before warmup and places after it (0e055831); job 00219 tests place-only (no pin flag) the same way.
+
 ## 8. Build steps
 
 | Step | What | Proof off the card | Card | State |
