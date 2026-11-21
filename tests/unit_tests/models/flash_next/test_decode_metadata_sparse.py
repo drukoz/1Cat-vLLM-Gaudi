@@ -31,7 +31,7 @@ import vllm_gaudi.v1.worker.hpu_model_runner as runner_module  # noqa: E402
 from vllm_gaudi.v1.spec_decode.hpu_flash_next_mtp import HpuFlashNextMtpProposer  # noqa: E402
 from vllm_gaudi.v1.worker.flash_next_decode_metadata import (  # noqa: E402
     draft_step_block_table_and_slots, fill_pad_slots, request_block_table, sparse_decode_metadata_refusal)
-from vllm_gaudi.v1.worker.flash_next_inputs import build_block_table  # noqa: E402
+from vllm_gaudi.v1.worker.flash_next_inputs import build_block_table, decode_block_table_width  # noqa: E402
 
 pytestmark = pytest.mark.skipif(not eh.hpu_cpu_stubs.STUBBED, reason="CPU-only: needs the stubbed Gaudi runtime")
 
@@ -64,6 +64,21 @@ def test_request_block_table_repeats_a_request_over_its_verification_rows():
     got = request_block_table(table, num_blocks, 4, 20, 64, PAD)
     want_rows = [table[i, :n].tolist() for i, n in enumerate(num_blocks) for _ in range(4)]
     assert torch.equal(got, build_block_table(want_rows, 20, 64, PAD))
+
+
+@pytest.mark.parametrize("mode", [0, 1])
+def test_request_block_table_at_the_qsa_table_width(mode):
+    """The runner hands VLLM_HPU_QSA_TABLE_WIDTH's width (decode_block_table_width) to both builders, the dense
+    decode metadata's and the sparse one's, so the two tables stay equal at the batch's width."""
+    rng = np.random.default_rng(5)
+    engine_width = 1024
+    table = _random_table(rng, 4, engine_width)
+    num_blocks = [5, 70, 1, 129]
+    width = decode_block_table_width(num_blocks, engine_width, mode)
+    assert width == (256 if mode == 1 else engine_width)
+    got = request_block_table(table, num_blocks, 3, 12, width, PAD)
+    want_rows = [table[i, :n].tolist() for i, n in enumerate(num_blocks) for _ in range(3)]
+    assert got.shape == (12, width) and torch.equal(got, build_block_table(want_rows, 12, width, PAD))
 
 
 def test_request_block_table_refuses_what_build_block_table_refuses():
