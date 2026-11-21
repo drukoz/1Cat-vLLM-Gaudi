@@ -29,13 +29,14 @@ saw the same token stream; INFERRED until job 00130 shows it with I05 alone). Ne
 the host reads (logprobs, prompt logprobs, the sampled region) now come out of an fp32 id table
 (`v1/sample/topk_ids.py`): the `logprobs=5` crash of spec-lookup's 00086 (OverflowError in the detokenizer, the
 server died) is fixed on the CPU model of the card rule; the sampled region now takes `vocab_parallel.top_k`, so
-with `VLLM_HPU_VOCAB_PARALLEL_LOGITS=2` it gathers each rank's top 64 instead of the logits (job 00137 measures it).
+with `VLLM_HPU_VOCAB_PARALLEL_LOGITS=2` it gathers each rank's top 64 instead of the logits (job 00144 measures it).
 Job 00130 (tiny model, one card): **I01 alone passes** 16 of 16 on every prompt (I01 is token-correct on a card);
 **I05 alone takes the 700-token near tie** (token 4): the near tie is the in-graph greedy region's, no defect.
 **`logprobs=5` is fixed on the card** (every id valid, the sampled token first, the top 5 equal the CPU's).
 **A request with `prompt_logprobs` ended the engine** (an older defect: the prefill hidden states of Flash-Next are
 flattened, the runner indexed them per request): fixed at `e9032e68` with a CPU test that reproduced the crash;
-integration's build 2 carries it (told at 00:32 UTC).
+it is not in integration's build 2 (synced earlier at `ddc6bbbf`), so it reaches the program branch with the pull
+request after 04:00 UTC.
 No pull request tonight (BRIEF.md 23:45): push and tell the coordinator the commit and the proven flags.
 `21d9eace` (asked by the coordinator for the integration build): TP rank 0 logs once "Candidate sampling
 (VLLM_HPU_CANDIDATE_SAMPLING=1): a sampled decode step drew in the logits region ..." and once "... took vLLM's
@@ -61,7 +62,7 @@ sampler instead: <reason>" (integration was told at 23:55 UTC).
 | 00093 `hpu-ids-sampler-tiny-flags` (1 card) | id verdicts, sampler-stage times, tiny model with I01 + I05 | ended 20:29 UTC, exit 1 (the tiny 700-token prompt, a near tie) | done: section 9 |
 | 00110 `real4-ab3-greedy-sampled-long` (TP4) | greedy base / I01 / I05 / both, sampled base / cand, long prefix | ended 22:29 UTC, exit 5 (probe counting artifact; no prefix-cache hit) | done: section 9 |
 | 00130 `tiny-i01-i05-logprobs` (1 card, commit `0cb55ebb`) | `tiny_checks.py --arms i01,i05` | ended 00:25 UTC, exit 1 (the I05 arm's near tie, and both servers died on the `prompt_logprobs` request) | done: section 9; the prompt-logprobs defect fixed at `e9032e68` |
-| **00137** `real4-ab5-short-candvp` (any:4, 28m, commit `ddc6bbbf`, `VLLM_GRAPH_RESERVED_MEM=0.5`; replaced 00131 at 23:55 UTC to carry the candidate path's log lines, kept its place) | `serve_long_probe.sh --arms both --no-long --candvp --logprobs-check`: 32 greedy streams base / both (twice, in turn), text1 compared at 1 stream, 32 sampled streams base / cand / candvp (`VLLM_HPU_VOCAB_PARALLEL_LOGITS=2`), seeded requests, min_tokens round, the logprobs check last; hl-smi memory in `hlsmi.log` | queued 23:39 UTC; placed after step-anatomy's 00119, about 02:00 to 02:30 UTC | `probe.log`: `SUMMARY` (sampled cand and candvp against base, candvp against cand), `TASK` for candvp (must be 32 of 32), `TEXTS text1`, `LOGPROBS ok`; the job log's `Candidate sampling` lines ("drew in the logits region ... from the gathered logits" for cand, "... from each rank's vocabulary shard" for candvp); then tell the coordinator whether `VLLM_HPU_VOCAB_PARALLEL_LOGITS=2` with candidates is proven |
+| **00144** `real4-ab6-short-candvp` (any:4, 28m, commit `e9032e68`, `VLLM_GRAPH_RESERVED_MEM=0.5`; replaced 00131 (23:55 UTC) and 00137 (00:36 UTC) to carry the log lines and the prompt-logprobs fix, kept the place) | `serve_long_probe.sh --arms both --no-long --candvp --logprobs-check`: 32 greedy streams base / both (twice, in turn), text1 compared at 1 stream, 32 sampled streams base / cand / candvp (`VLLM_HPU_VOCAB_PARALLEL_LOGITS=2`), seeded requests, min_tokens round, the logprobs check last; hl-smi memory in `hlsmi.log` | waiting; the owner's 8-card runs go first (coordinator, 00:28 UTC): probably not tonight, then it is the next rental's first TP4 job | `probe.log`: `SUMMARY` (sampled cand and candvp against base, candvp against cand), `TASK` for candvp (must be 32 of 32), `TEXTS text1`, `LOGPROBS ok`; the job log's `Candidate sampling` lines ("drew in the logits region ... from the gathered logits" for cand, "... from each rank's vocabulary shard" for candvp); then tell the coordinator whether `VLLM_HPU_VOCAB_PARALLEL_LOGITS=2` with candidates is proven |
 
 ### Pending subtasks after those steps, in order
 
@@ -84,8 +85,25 @@ sampler instead: <reason>" (integration was told at 23:55 UTC).
    one such chunk on the card would split it; not run.
 2. **The replay call grows from 23 ms at 1 stream to 35 ms at 32** (step-anatomy's split): what in the runner makes
    the host wait inside it; split with native-replay. Not started.
-3. Sampled verification with MTP is mtp-card-ready's (`VLLM_HPU_SPEC_SAMPLED_VERIFY`, rows of
-   `candidate_probs`); keep `candidate_probs`' signature stable.
+3. **Next week: sampled MTP verification through the candidate region** (design from mtp-card-ready, 00:40 UTC).
+   With MTP's arg-max drafts no separate rejection sampler is needed: draw every verification row and the bonus row
+   from the target distribution (temperature, top-k, top-p), each row with its own noise, then run the greedy
+   rejection on those tokens (`greedy_rejection_sample_from_tokens`, on the program branch since PR 13): accept while
+   a row's draw equals the draft, output the first unequal draw, or the bonus row's draw when every draft is
+   accepted. Exact: the draft distribution is one-hot at d, so speculative sampling accepts with probability p(d)
+   and on rejection draws from p without d, renormalized; a draw y from p accepted when y = d gives P(accept) = p(d)
+   and P(y = x | y != d) = p(x) / (1 - p(d)); the rows are independent. Work: `_candidate_sampling_inputs` accepts a
+   speculative step and expands each request's parameters to its 1 + k rows in the HPU's padded layout (row r
+   belongs to request r // (1 + k)), one noise row per row (a seeded request draws its 1 + k rows from its own
+   generator in a fixed order), greedy rows keep the arg max; the region returns per-row tokens as
+   `fused_sampled_token_ids`, which the runner's speculative branch already hands to the greedy rejection. Cost of a
+   sampled verification step then about that of a greedy one (no `[128, 248320]` logits all-gather with
+   `VLLM_HPU_VOCAB_PARALLEL_LOGITS=2`, no sort, no second pass). Estimate: one day for the code and CPU tests (a
+   distribution test: first-draft acceptance equals p(d) within sampling error; tokens equal the greedy rejection's
+   for greedy rows), then one card job: first-draft acceptance against p(d) as in mtp-card-ready's 00135, and the
+   32-stream sampled MTP step time against `VLLM_HPU_SPEC_SAMPLED_VERIFY=2`. Until then sampled verification is
+   mtp-card-ready's (`VLLM_HPU_SPEC_SAMPLED_VERIFY`, rows of `candidate_probs`); keep `candidate_probs`' signature
+   stable.
 4. The brief's later items, none started: device tensors kept in place, async scheduling with speculation (the PLE
    layer needs the sampled tokens on the device), the worker round trip. CPU pinning belongs to native-replay.
 5. **Functional fix, after the speed work**: the general sampler path on HPU ignores `min_tokens`, `logit_bias` and
@@ -306,7 +324,7 @@ reaches past 64 candidates is cut at 64. The design:
   rows of a mixed batch; a step with a row below its `min_tokens` masks the gathered logits and takes
   `topk_ids.topk_with_ids`. The drawn ids are int32 out of an fp32 id table: no top-k index is cast or read back
   as data (the card evidence is in `v1/sample/topk_ids.py`). `VLLM_HPU_VOCAB_PARALLEL_LOGITS=2` turns the logits
-  all-gather of a sampled step into one `[rows, 128]` fp32 all-gather per rank (job 00137 measures it).
+  all-gather of a sampled step into one `[rows, 128]` fp32 all-gather per rank (job 00144 measures it).
 - mtp-card-ready (sampled verification, idea I07): one function `candidate_probs(values, temperature, top_k,
   top_p) -> probs [rows, C]` (zero outside the kept set) serves both the pick (`argmax(probs / noise)`) and the
   rejection sampler (`p(draft token)` = the probability at the column whose id equals the draft id, zero when
