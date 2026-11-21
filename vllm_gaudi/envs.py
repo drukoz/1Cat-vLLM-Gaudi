@@ -529,6 +529,10 @@ if TYPE_CHECKING:
     VLLM_HPU_FUSED_GREEDY_LOGITS: bool = False
     VLLM_HPU_FLASH_NEXT_QSA_MODE: int = 0
     VLLM_HPU_FLASH_NEXT_QSA_PREFILL_TILE: int = 2048
+    VLLM_HPU_FLASH_NEXT_DECODE_METADATA: int = 0  # 0 dense paged-attention buffers (default), 1 sparse-QSA only
+    VLLM_HPU_RUNTIME_SWITCH_FILE: str = ""  # a file of per-step flags a running server rereads (an A/B on one server)
+    VLLM_HPU_CANDIDATE_SAMPLING: int = 0  # 0 vLLM's sampler (default), 1 sampling over candidates, 2 also speculative steps
+    VLLM_HPU_SAMPLER_REQUEST_PARAMS: int = 0  # 0 as before (ignored on HPU), 1 min_tokens/logit_bias/min_p per row
     VLLM_HPU_QSA_FUSED: int = 0  # QsaFusedMode: 0 torch (default), 1 torch data flow, 2 TPC kernels, 3 + top-k kernels
     VLLM_HPU_QSA_INDEXER_SHARD: int = 0  # QsaShardMode: 0 replicated (default), 1 by request (int32), 2 by request (fp32)
     VLLM_HPU_QSA_TABLE_WIDTH: int = 0  # decode block-table columns: 0 the engine's longest context (default), 1 the batch's
@@ -1885,6 +1889,46 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # 262K bf16 bias plane at 1 GiB, under FusedSDPA's 2^31-byte stride limit.
     "VLLM_HPU_FLASH_NEXT_QSA_PREFILL_TILE":
     lambda: int(os.environ.get("VLLM_HPU_FLASH_NEXT_QSA_PREFILL_TILE", "2048")),
+
+    # Flash-Next decode metadata under sparse QSA (VLLM_HPU_FLASH_NEXT_QSA_MODE=1). 0 (default) = a decode or
+    # verification step builds the dense paged-attention buffers (block_list, block_groups, block_usage and,
+    # in the graph, block_mapping and attn_bias) like any model. 1 = it does not build them, since sparse QSA
+    # decode reads only block_table and slot_mapping: one block-table row per request built with numpy, no
+    # identity block resolve, the decode bucket chosen by batch size only, and the same for the MTP drafter's
+    # per-step metadata (v1/worker/flash_next_decode_metadata.py). A runner that cannot use it (another model,
+    # dense QSA, defragmenter on, ...) logs the reason once and keeps the dense buffers. Any other value is 0.
+    "VLLM_HPU_FLASH_NEXT_DECODE_METADATA":
+    lambda: int(os.environ.get("VLLM_HPU_FLASH_NEXT_DECODE_METADATA", "0")),
+
+    # An operator's A/B on one server (v1/worker/runtime_switches.py). Unset (default): nothing. A path: every
+    # worker looks at that file before each step and, when it changed, takes the flags it lists (NAME=VALUE lines).
+    # Only flags the runner reads at every step can be switched: VLLM_HPU_FLASH_NEXT_DECODE_METADATA,
+    # VLLM_HPU_FUSED_GREEDY_LOGITS, VLLM_HPU_CANDIDATE_SAMPLING and VLLM_HPU_VOCAB_PARALLEL_LOGITS. Replace the
+    # file with a rename while no request runs.
+    "VLLM_HPU_RUNTIME_SWITCH_FILE":
+    lambda: os.environ.get("VLLM_HPU_RUNTIME_SWITCH_FILE", "").strip(),
+
+    # The sampled decode step (requests with a temperature above zero: the checkpoint's default sampling is
+    # temperature 1.0, top_k 20, top_p 0.95). 0 (default) = vLLM's sampler: a full sort of [rows, vocabulary],
+    # a scatter back and noise over the vocabulary on every step. 1 = sampling over candidates
+    # (v1/sample/candidate_sampling.py): the 64 largest logits per row are taken in the LM-head region and
+    # temperature, top-k, top-p and the draw run on [rows, 64] with noise made on the host; no sampler graph. A
+    # step whose requests are outside its conditions (top_k unset or above 64, min_p, penalties, logit_bias,
+    # logprobs, a custom logits processor, speculation unless 2, structured output) keeps vLLM's sampler. Same
+    # distribution as vLLM's; the random stream differs. 2 = 1, and the decode steps of a speculative server with
+    # deterministic drafts (MTP, n-gram) sample every verification row and the bonus row in the region, then the
+    # runner verifies the drafts against those draws (greedy_rejection_sample_from_tokens): speculative sampling
+    # exactly for one-hot drafts. Needs mtp-card-ready's VLLM_HPU_SPEC_SAMPLED_VERIFY at 1 or 2, which admits
+    # sampled requests and serves the steps the region refuses; without it 2 acts as 1. Any other value is 0.
+    "VLLM_HPU_CANDIDATE_SAMPLING":
+    lambda: int(os.environ.get("VLLM_HPU_CANDIDATE_SAMPLING", "0")),
+
+    # min_tokens, logit_bias and min_p on the general sampler path (v1/sample/request_params.py). 0 (default) = as
+    # before: on HPU vLLM's processors for them never receive the batch's state, so all three are ignored. 1 = the
+    # runner applies each row's own request's min_tokens mask, logit_bias and min_p cut to the logits before vLLM's
+    # sampler (fixed shapes, host-made int64 indices). Any other value is 0.
+    "VLLM_HPU_SAMPLER_REQUEST_PARAMS":
+    lambda: int(os.environ.get("VLLM_HPU_SAMPLER_REQUEST_PARAMS", "0")),
 
     # Flash-Next sparse QSA decode (QsaFusedMode, vllm_gaudi/models/qwen4_exp/qsa_fused_path.py).
     # 0 (default) = the torch path. 1 = the restructured torch data flow: the indexer scores each
