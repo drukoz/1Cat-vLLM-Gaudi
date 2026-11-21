@@ -8,7 +8,7 @@ file), VERIFIED (CPU test or code line), INFERRED.
 
 ## Handoff (if this agent stopped)
 
-Last update: 2026-11-21 06:42 UTC (`date -u`), first agent of the track (Opus 5.5), started 04:35 UTC.
+Last update: 2026-11-21 06:50 UTC (`date -u`), first agent of the track (Opus 5.5), started 04:35 UTC.
 
 **Goal (coordinator, 04:45 UTC).** Run the k draft passes of an MTP decode draft in ONE HPU graph behind a default-off
 flag. Basis: build 3's timer (00178, TP8, k = 3) at 32 streams: the draft costs 16.3 to 18.2 ms of a 104 ms step
@@ -53,7 +53,10 @@ flag. Basis: build 3's timer (00178, TP8, k = 3) at 32 streams: the draft costs 
 - `344acd9c` engine test: the draft graph and I01 switched together at run time (the 2 x 2, k = 2): same drafts and
   streams as the per-pass drafter (1 passed; on build 4's code too, 2 passed with the switch test).
 - **Next job, approved by the coordinator (06:35 UTC: fewer collectives per draft pass first, then I01; k = 2):
-  00199 `real8-draft-levers`** (all, 60 min; queued 06:37 UTC, place asked). Test branch at `4b296df9` (adds
+  00201 `real8-draft-levers2`** (all, 60 min; replaced 00199 at 06:44 UTC and kept its place, near the end of the
+  queue: the coordinator expects it about 20:00 to 21:00 UTC; it moves up if jobs ahead end early). Test branch at
+  `100f4bf0` (image `farm-mtp-draft-graph:100f4bf032fe`; `d64734c5` cherry-picked: the timer's kind takes `+md` while
+  I01 is in force, so the four arms have records of their own). Earlier test-branch head `4b296df9` (adds
   `0e1abfb9`: arms `mtp<K>-rfc` / `mtp<K>-rfc-switch` = `VLLM_HPU_MTP_REPLICATED_FC=1`, the tiny gate's
   `HEADLINE_TINY_MTP_REPLICATED_FC` / `HEADLINE_TINY_DECODE_METADATA`), image `farm-mtp-draft-graph:4b296df99177`,
   00194's env with `HEADLINE_TINY_SPEC=2 HEADLINE_TINY_DRAFT_GRAPH=1 HEADLINE_TINY_MTP_REPLICATED_FC=1
@@ -61,9 +64,11 @@ flag. Basis: build 3's timer (00178, TP8, k = 3) at 32 streams: the draft costs 
   `tiny mtp2-rfc-switch mtp2-switch`: the tiny gate with all three levers on (REPLICATED_FC was never on a card), then
   two MTP k = 2 servers (REPLICATED_FC 1, then 0), each alternating the 2 x 2 of draft graph and I01 per round (arms
   `off`, `on`, `md`, `on-md`). Read: `tools/ab_summary.py <job>/mtp2-rfc-switch` and `.../mtp2-switch` (rounds per
-  arm, means), `tools/timer_ab.py` (kinds `verify` / `verify+graph`; I01 is not in the timer's kind: the md rounds'
-  records mix with the others of their kind, so read the draft laps per arm from rounds, or extend the kind),
-  acceptance per arm, the 1-stream text identity across arms within a server.
+  arm, means), `tools/timer_ab.py` (kinds `verify`, `verify+graph`, `verify+md`, `verify+graph+md`), acceptance per arm,
+  the 1-stream text identity across arms within a server. Fetch if no waiter copied it: `bin/farm fetch
+  mtp-draft-graph 00201 00201-real8-draft-levers2`.
+- `d64734c5` the timer's `+md` kind (CPU engine with the timer and the four arms switched: all four kinds, no error).
+  Gate of `d64734c5`: `reports/mtp-draft-graph/gate/gate-d64734c5.txt` (snapshot `reports/mtp-draft-graph/gate-d64734c5`).
 
 **Card job 00194 `real8-draft-graph-switch`** (all, 55 min; replaced 00191 at 05:37 UTC and kept its place: after
 integration's 00187, start by 06:46 UTC at the latest). Test branch `feat/flash-next-gaudi-mtp-draft-graph-b4` at
