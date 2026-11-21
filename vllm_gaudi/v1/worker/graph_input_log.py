@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import collections
 import dataclasses
+import importlib
 
 _installed = False
 
@@ -48,7 +49,9 @@ def install(log) -> bool:
     if _installed:
         return True
     try:
-        import habana_frameworks.torch.hpu.graphs as graphs
+        # The module object the wrapper's recursion calls through (``sys.modules``' entry), not an attribute of a
+        # parent package: a stubbed parent may hold another ``graphs``.
+        graphs = importlib.import_module("habana_frameworks.torch.hpu.graphs")
     except Exception:  # noqa: BLE001 - no bridge (a CPU run): nothing to log
         return False
     original = getattr(graphs, "copy_to", None)
