@@ -6,7 +6,7 @@ results are under `/Volumes/Storage/Claude/gaudi-work/reports/async-sched/card/`
 
 ## Handoff (if this agent stops)
 
-Updated 2026-11-21 12:05 UTC.
+Updated 2026-11-21 12:06 UTC.
 
 - **Card results so far** (placement on, MTP timers 0, compare arms within a job only):
   - 00220, mode 1 with `d3fb1b11` (MEASURED). ms/token sync → async: 1 stream greedy 27.9 → 29.4, sampled
@@ -76,12 +76,13 @@ Updated 2026-11-21 12:05 UTC.
   `tiny-m1` gate at `=1` and `m1sw` (one server, arms `=0` and `=2`). Their results folder, read when it lands.
 - **Placement switch**: `~/farm/async-sched/results/switches/place` on the node, read once at each job's start, now
   `place` (the coordinator sets it). `on` = `VLLM_HPU_WORKER_CPU_PIN=1` + `place_wrap.sh` + `place.sh` (rule a^1);
-  `place` = the placement without the pin flag. Scripts in `~/farm/async-sched/results/bench`: `place_wrap.sh`
-  md5 7b159d11 since 12:05 UTC (collectives' `98213f8c`: each server starts from the container's whole cpuset;
-  before it, every later server of a job had 16 CPUs fewer: 00220 and 00221 ran their arms at 144, 128 and 112
-  CPUs of 152, first to third, so their sync baselines had 16 fewer than the async arms; the old file is
-  `reports/async-sched/bench/place_wrap_363bcf9d.sh`), `place.sh` 7e54f2de. spec-lookup's hard link keeps the old
-  wrapper.
+  `place` = the placement without the pin flag. Since 12:05 UTC (coordinator, via integration) the fixed pair is in
+  `~/farm/async-sched/results/late/place/` and `bench/`: `place.sh` 816292de (native-replay `3a733c26`: moves only
+  the server's own process tree) and `place_wrap.sh` 7b159d11 (collectives `98213f8c`: each server starts from the
+  container's whole cpuset). The build 5 kit (00240's branch) reads `late/place/` first. Before the fix every later
+  server of a job had 16 CPUs fewer: 00220 and 00221 ran their arms at 144, 128 and 112 CPUs of 152 (first to
+  third), so their sync baselines had 16 fewer than the async arms (collectives and integration saw no decode loss
+  from it in 00222, only longer loads). The old wrapper: `reports/async-sched/bench/place_wrap_363bcf9d.sh`.
 - **Next**: read 00240; s3's PR when its gate is green; the persistent-inputs
   job (mode 2 and mode 3, PI off/on, prefix caching on, 32/8/1; needs PI on the program head and s3); sampled with
   mtp-draft-graph's D2 (they have no D2 yet: the chain refuses sampled requests).
