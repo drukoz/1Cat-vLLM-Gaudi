@@ -339,7 +339,7 @@ while [ "$i_arm" -lt "${#ARMS[@]}" ]; do
     first=0
     echo "=== headline_job: arm $arm start $(date -u +%T)"
     case "$arm" in
-        tiny | tiny-chain | tiny-chain-vlg | tiny-chain-vp | tiny-m1 | tiny-m3)
+        tiny | tiny-chain | tiny-chain-vlg | tiny-chain-vp | tiny-m1 | tiny-m3 | tiny-m3pc1 | tiny-m3pc2)
             spec=()
             case "${HEADLINE_TINY_SPEC:-0}" in [1-9]) spec=(--spec "$HEADLINE_TINY_SPEC") ;; esac
             tiny_graph="${HEADLINE_TINY_DRAFT_GRAPH:-${VLLM_HPU_MTP_DRAFT_GRAPH:-0}}"
@@ -351,6 +351,7 @@ while [ "$i_arm" -lt "${#ARMS[@]}" ]; do
             tiny_m1="${VLLM_HPU_FLASH_NEXT_SPEC_DEVICE_INPUTS:-0}"
             tiny_async="${VLLM_HPU_FLASH_NEXT_ASYNC_SCHED:-0}"
             tiny_nopc="${FARM_SERVE_NO_PREFIX_CACHING:-0}"
+            tiny_align="${VLLM_HPU_FLASH_NEXT_SPEC_DEVICE_ALIGN:-0}"
             # the chain's gates: the chained draft (stage A; -vlg and -vp: stage B) on the draft graph and I01, with
             # the chain graph's copied inputs logged (a tiny gate is never a measured arm)
             case "$arm" in
@@ -363,6 +364,12 @@ while [ "$i_arm" -lt "${#ARMS[@]}" ]; do
                 # host) with the device-made inputs, prefix caching off (rental/serve.py's opt-out)
                 tiny-m3) tiny_graph=1; tiny_md=1; tiny_chain=1; tiny_vp=0; tiny_vlg=0; tiny_m1=2; tiny_async=3
                     tiny_nopc=1 ;;
+                # async-sched's M3 gates, prefix caching on: the align mode on the device checked against the host's
+                # (mode 2, =1), then used by mode 3 (=2)
+                tiny-m3pc1) tiny_graph=1; tiny_md=1; tiny_chain=1; tiny_vp=0; tiny_vlg=0; tiny_m1=2; tiny_async=2
+                    tiny_nopc=0; tiny_align=1 ;;
+                tiny-m3pc2) tiny_graph=1; tiny_md=1; tiny_chain=1; tiny_vp=0; tiny_vlg=0; tiny_m1=2; tiny_async=3
+                    tiny_nopc=0; tiny_align=2 ;;
             esac
             # the MTP server's own flags too (they act only on the speculative mode)
             tiny_sv="${VLLM_HPU_SPEC_SAMPLED_VERIFY:-0}"
@@ -376,6 +383,7 @@ while [ "$i_arm" -lt "${#ARMS[@]}" ]; do
                 VLLM_HPU_VOCAB_PARALLEL_LOGITS="$tiny_vp" VLLM_HPU_VERIFY_LOGITS_IN_GRAPH="$tiny_vlg" \
                 VLLM_HPU_LOG_UNMATCHED_GRAPH_INPUTS="$tiny_log" VLLM_HPU_FLASH_NEXT_SPEC_DEVICE_INPUTS="$tiny_m1" \
                 VLLM_HPU_FLASH_NEXT_ASYNC_SCHED="$tiny_async" FARM_SERVE_NO_PREFIX_CACHING="$tiny_nopc" \
+                VLLM_HPU_FLASH_NEXT_SPEC_DEVICE_ALIGN="$tiny_align" \
                 "$PYTHON" /farm/farm_tiny.py --gdn hc ${spec[@]+"${spec[@]}"} --out "$OUT/$arm"
             rc=$?
             if [ "$arm" != tiny ]; then
@@ -388,6 +396,7 @@ while [ "$i_arm" -lt "${#ARMS[@]}" ]; do
                         tiny-chain-vp) chain_vp_ok=0 ;;
                         tiny-m1) m1_ok=0 ;;
                         tiny-m3) m3_ok=0 ;;
+                        tiny-m3pc1 | tiny-m3pc2) m3_align_ok=0 ;;
                     esac
                 fi
                 if [ "$arm" = tiny-m3 ] && [ "$rc" -eq 0 ]; then
@@ -397,6 +406,23 @@ while [ "$i_arm" -lt "${#ARMS[@]}" ]; do
                     if [ -z "$last" ] || grep -rqE "ASYNC_SCHED=3 acts as 2|device-made inputs differ" "$OUT/$arm" 2>/dev/null; then
                         echo "headline_job: tiny-m3: mode 3 did not serve the tiny gate"
                         m3_ok=0
+                    fi
+                fi
+                if [ "$arm" = tiny-m3pc1 ] && [ "$rc" -eq 0 ]; then
+                    last="$(grep -rhoE "VLLM_HPU_FLASH_NEXT_SPEC_DEVICE_ALIGN=1: [0-9]+ verification steps made.*" "$OUT/$arm" 2>/dev/null | tail -n 1)"
+                    echo "headline_job: tiny-m3pc1: ${last:-no M3 summary line}"
+                    if [ -z "$last" ] || ! printf '%s' "$last" | grep -q " 0 with differences" ||
+                        grep -rqE "align mode differs|device-made inputs differ" "$OUT/$arm" 2>/dev/null; then
+                        echo "headline_job: tiny-m3pc1: M3's check did not pass: the m3a arms are left out"
+                        m3_align_ok=0
+                    fi
+                fi
+                if [ "$arm" = tiny-m3pc2 ] && [ "$rc" -eq 0 ]; then
+                    last="$(grep -rhoE "VLLM_HPU_FLASH_NEXT_ASYNC_SCHED=3: [0-9]+ steps issued.*" "$OUT/$arm" 2>/dev/null | tail -n 1)"
+                    echo "headline_job: tiny-m3pc2: ${last:-no mode-3 summary line}"
+                    if [ -z "$last" ] || grep -rqE "ASYNC_SCHED=3 acts as 2|align mode differs" "$OUT/$arm" 2>/dev/null; then
+                        echo "headline_job: tiny-m3pc2: mode 3 with M3 did not serve the tiny gate: the m3a arms are left out"
+                        m3_align_ok=0
                     fi
                 fi
                 if [ "$arm" = tiny-m1 ] && [ "$rc" -eq 0 ]; then
@@ -413,7 +439,7 @@ while [ "$i_arm" -lt "${#ARMS[@]}" ]; do
                 grep -rhoE "chained behind its verification, stage [AB]|keeps the draft after the host read: .*|HPU graph replay copies .*" \
                     "$OUT/$arm" 2>/dev/null | cut -c1-400 | sort | uniq -c | head -20
                 want_stage=B
-                case "$arm" in tiny-chain | tiny-m1 | tiny-m3) want_stage=A ;; esac
+                case "$arm" in tiny-chain | tiny-m1 | tiny-m3 | tiny-m3pc1 | tiny-m3pc2) want_stage=A ;; esac
                 if [ "$rc" -eq 0 ] && ! grep -rqE "chained behind its verification, stage $want_stage" "$OUT/$arm" 2>/dev/null; then
                     echo "headline_job: WARNING: $arm passed but no step was chained in stage $want_stage (the gate did not test it)"
                 fi
@@ -510,6 +536,7 @@ while [ "$i_arm" -lt "${#ARMS[@]}" ]; do
             fp8kv=0
             irlog=0
             bad_word=""
+            needs_m3=0
             words="${arm:4}"
             words="${words#-}"
             arm_words=()
@@ -522,6 +549,9 @@ while [ "$i_arm" -lt "${#ARMS[@]}" ]; do
                     async3) async_env=(VLLM_HPU_FLASH_NEXT_ASYNC_SCHED=3); timing="${HEADLINE_ASYNC_MTP_TIMING:-2}" ;;
                     # async-sched job branch: nopc = prefix caching off (after serve_probe.sh's --enable-prefix-caching)
                     nopc) serve_extra+=(--no-enable-prefix-caching) ;;
+                    # async-sched job branch: m3a = stage 2's M3 in use (VLLM_HPU_FLASH_NEXT_SPEC_DEVICE_ALIGN=2; the
+                    # arm is left out when a tiny-m3pc gate failed); turns = commit_turns_probe.py after the probe
+                    m3a) arm_env+=(VLLM_HPU_FLASH_NEXT_SPEC_DEVICE_ALIGN=2); needs_m3=1 ;;
                     graph) draft_graph=1 ;;
                     rfc) replicated_fc=1 ;;
                     noshard) shard=0; greedy_only=1 ;;
@@ -543,13 +573,17 @@ while [ "$i_arm" -lt "${#ARMS[@]}" ]; do
                         ;;
                     hpulog) arm_env+=(HPU_GRAPH_INPUT_LOG=1 "PYTHONPATH=$HERE/hpulog${PYTHONPATH:+:$PYTHONPATH}") ;;
                     greedy) greedy_only=1 ;;
-                    sw | dg32 | cap | kvlp | kvlpfb | long) post_words+=("$w") ;;
+                    sw | dg32 | cap | kvlp | kvlpfb | long | turns) post_words+=("$w") ;;
                     *) bad_word="$w" ;;
                 esac
             done
             if [ -n "$bad_word" ]; then
                 echo "headline_job: arm $arm: unknown word '$bad_word' (see the comment of the MTP arms)"
                 failed=$((failed + 1))
+                continue
+            fi
+            if [ "$needs_m3" = 1 ] && [ "${m3_align_ok:-1}" != 1 ]; then
+                echo "headline_job: arm $arm left out: a tiny-m3pc gate failed (async-sched's M3)"
                 continue
             fi
             ARM_DIR="${OUT:?}/${arm:?}"
@@ -622,7 +656,7 @@ while [ "$i_arm" -lt "${#ARMS[@]}" ]; do
             fi
             # The post steps (serve_probe.sh --post-cmd), in the order sw, cap, kvlp / kvlpfb, long. Each command is
             # one bash -c string; serve_probe.sh runs it in the arm's folder with SERVE_PORT set.
-            for w in sw dg32 cap kvlp kvlpfb long; do
+            for w in sw dg32 cap kvlp kvlpfb long turns; do
                 [[ " ${post_words[*]:-} " == *" $w "* ]] || continue
                 case "$w" in
                     sw | dg32)
@@ -653,6 +687,13 @@ while [ "$i_arm" -lt "${#ARMS[@]}" ]; do
                             --trace "${HEADLINE_CAPTURE_LEVELS:-32,1}" --trace-tokens 64 --trace-after 12 --trace-seconds 0.6
                             --measured-timeout 600 --out "$ARM_DIR/trace_probe.json")
                         post_args+=(--post-cmd "$(printf '%q ' "${cap_cmd[@]}") --port \"\$SERVE_PORT\" 2>&1 | tee trace_probe.log; rc=\${PIPESTATUS[0]}; ls -la trace 2>/dev/null | tail -n 12; du -sh trace 2>/dev/null; exit \$rc")
+                        ;;
+                    turns)
+                        # async-sched job branch: requests across the recurrent block, new batch shapes after the
+                        # commits, the same prompts again (exact tokens), the agent's next turn on the committed blocks
+                        turns_cmd=("$PYTHON" "$TREE/tools/flash_next/rental/commit_turns_probe.py" --model fn
+                            --block "${HEADLINE_TURNS_BLOCK:-896}" --out "$ARM_DIR/turns.json")
+                        post_args+=(--post-cmd "$(printf '%q ' "${turns_cmd[@]}") --port \"\$SERVE_PORT\" 2>&1 | tee turns.log; exit \${PIPESTATUS[0]}")
                         ;;
                     kvlp | kvlpfb)
                         label=bf16
