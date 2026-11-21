@@ -6,7 +6,7 @@ results are under `/Volumes/Storage/Claude/gaudi-work/reports/async-sched/card/`
 
 ## Handoff (if this agent stops)
 
-Updated 2026-11-21 12:09 UTC.
+Updated 2026-11-21 12:31 UTC.
 
 - **Card results so far** (placement on, MTP timers 0, compare arms within a job only):
   - 00220, mode 1 with `d3fb1b11` (MEASURED). ms/token sync → async: 1 stream greedy 27.9 → 29.4, sampled
@@ -43,15 +43,22 @@ Updated 2026-11-21 12:09 UTC.
     step's host-made inputs and the next step's uploads rewrite those buffers first (one buffer per input in a
     synchronous engine). engine-step also found that an input uploaded twice in a step shared a pair; they fixed it
     (a pair per upload of a step).
-  - `feat/flash-next-gaudi-async-sched-s3` (follow-ups): `59b54a77` no draft scatter when M1 made the step's ids
-    (two H2D copies and two device ops less per step); `a4f1e896` M1 keeps copies of host-made inputs (the fix
-    above); `3e98b623` its unit tests (`tests/unit_tests/worker/test_flash_next_async_spec_keep.py`, 3); `57339426`
-    merges the head `4d66755e`. CPU: without PI green (`reports/async-sched/logs/tests_s3.log`); with PI on s3 +
-    `887266b1`: M1 8, M3 3, early 4 (`tests_s3_pi.log`); on s3 + `8a5bc621` (engine-step's per-upload pairs):
-    `tests_s3_pi2.log`. **Gate**: `bin/gate reports/async-sched/trees/gate-57339426`, log
-    `reports/async-sched/logs/gate_57339426.out`; if green: `gh pr create --base feat/flash-next-gaudi --head
-    feat/flash-next-gaudi-async-sched-s3` (title "Stage 2 follow-ups: M1 keeps copies of host-made inputs (for
-    persistent inputs), no draft scatter under M1"), then `gh pr merge --merge` (default-off code paths).
+  - `feat/flash-next-gaudi-async-sched-s3` (follow-ups) at `412a568d`: `59b54a77` no draft scatter when M1 made
+    the step's ids (two H2D copies and two device ops less per step); `a4f1e896` M1 keeps copies of host-made inputs
+    (the fix above); `3e98b623` its unit tests (`tests/unit_tests/worker/test_flash_next_async_spec_keep.py`, 3);
+    `412a568d` class defaults for the async-scheduling state: PR #27 broke
+    `tests/unit_tests/worker/test_flash_next_host_ngram.py` on the head (15 of 22, AttributeError `_verify_advance`
+    in stub runners built without `__init__`; found by engine-step; bin/gate does not run `tests/unit_tests/worker/`).
+    It merges the head `2c84deea` (`2b063e35`). CPU: every worker file that imports on CPU passes
+    (`reports/async-sched/logs/tests_s3_worker.log`; `test_step_timing_wiring` fails 1 on the clean head too, since
+    the chain's `73e9fbf8`; ten files need habana_frameworks); with PI on s3 + engine-step's `8a5bc621`: M1 8, M3
+    3, early 4, loop_async 7 (`tests_s3_pi2.log`). **Gate**: a gate on the older s3 (`57339426`) runs and was not
+    stopped (the kill was denied); `reports/async-sched/logs/gate_412a568d.out` starts the gate of the frozen
+    `412a568d` when it ends. If green: `gh pr create --base feat/flash-next-gaudi --head
+    feat/flash-next-gaudi-async-sched-s3` (title "Stage 2 follow-ups: class defaults for the async state (fixes
+    test_flash_next_host_ngram), M1 keeps copies of host-made inputs, no draft scatter under M1"), then
+    `gh pr merge --merge`. Integration takes the four commits for build 6 (they cherry-pick cleanly onto
+    `2c84deea`).
 - **Card job 00240** `real8-async-m3d` (all, 85 min; replaced 00237, which replaced 00233 and 00229; starts after
   mtp-draft-graph's 00230, by 14:21 UTC at the latest).
   - Job branch `feat/flash-next-gaudi-async-sched-m3-b5` at `1a70d353` (never merge it; `1a70d353` makes a failed
