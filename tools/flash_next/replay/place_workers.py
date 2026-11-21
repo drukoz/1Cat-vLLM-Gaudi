@@ -204,6 +204,14 @@ def apply(the_plan: dict, workers: dict[int, int], *, setaffinity=None, getaffin
     return {"moved": moved, "failed": failed}
 
 
+def _say(text: str) -> None:
+    """One log line; a closed stdout (the caller's pipe gone) must not stop the placement."""
+    try:
+        print(text, flush=True)
+    except OSError:
+        pass
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--log", default=os.path.join(os.environ.get("FARM_OUT", "."), "server0.log"))
@@ -223,14 +231,14 @@ def main() -> int:
         workers = find_workers(args.log)
     the_plan = plan(workers.keys(), cpus, args.rule, n_machine)
     if not the_plan:
-        print("place_workers: no plan (workers %s, %d CPUs): nothing placed" % (workers, len(cpus)), flush=True)
+        _say("place_workers: no plan (workers %s, %d CPUs): nothing placed" % (workers, len(cpus)))
         return 0
-    print("place_workers: rule %r, %d CPUs of %d, workers %s" % (args.rule, len(cpus), n_machine, workers), flush=True)
+    _say("place_workers: rule %r, %d CPUs of %d, workers %s" % (args.rule, len(cpus), n_machine, workers))
     for rank in sorted(the_plan["main"]):
         sib = sibling(the_plan["main"][rank], args.rule, n_machine)
-        print("place_workers: rank %d pid %d main thread on CPU %d (sibling %s kept free), %d helper CPUs" % (
-            rank, workers[rank], the_plan["main"][rank], sib, len(the_plan["helpers"][rank])), flush=True)
-    print("place_workers: first pass %s" % apply(the_plan, workers, allowed=cpus), flush=True)
+        _say("place_workers: rank %d pid %d main thread on CPU %d (sibling %s kept free), %d helper CPUs" % (
+            rank, workers[rank], the_plan["main"][rank], sib, len(the_plan["helpers"][rank])))
+    _say("place_workers: first pass %s" % apply(the_plan, workers, allowed=cpus))
     if not args.foreground and os.fork() > 0:
         return 0  # the caller goes on; the child keeps the placement
     if not args.foreground:
@@ -242,8 +250,8 @@ def main() -> int:
         counts = apply(the_plan, workers, allowed=cpus)
         passes += 1
         if counts["moved"]:
-            print("place_workers: pass %d %s" % (passes, counts), flush=True)
-    print("place_workers: done after %d passes" % passes, flush=True)
+            _say("place_workers: pass %d %s" % (passes, counts))
+    _say("place_workers: done after %d passes" % passes)
     return 0
 
 
