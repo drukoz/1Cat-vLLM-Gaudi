@@ -14,7 +14,8 @@
 # Each real arm runs PROBE_DIR's serve_probe.sh, whose decode_scaling.py (decode_scaling_textcheck.py) runs the build's
 # probe and then text_check.py at 1 stream (6 prompts) and 32 streams, 600 tokens each (texts_1.json, texts_32.json).
 # Afterwards: texts_1 of real-lean4-nan and real-lean4 must equal real-ref's (text_check.py --compare), and no
-# texts_32 may show NaN garbage (replacement characters above 0.5 %, or a run of 40 or more of one character).
+# texts_32 may show NaN garbage (replacement characters above 0.5 %; a run of 40 or more of one character without
+# them is reported as "inspect" with the snippet: it can be a markdown rule or indentation).
 # Settings (the job's environment; ~/farm/collectives/bridge/late/<job id>.env with KEY=VALUE lines wins, read when
 # the job starts): SPIN=on|off (BRIDGE_SPIN, default off: PT_HPU_SYNCHRONOUS_ACC_QUEUE_FLUSHING=1 in every arm),
 # PIN_KV (BRIDGE_PIN_KV, ';'-separated env of every lean real arm, e.g. VLLM_HPU_WORKER_CPU_PIN=1), PLACE
@@ -94,18 +95,24 @@ for arm in arms:
     path = os.path.join(root, "%s-%s" % (prefix, arm), "texts_32.json")
     if not os.path.exists(path):
         continue
-    worst_run, worst_rep = 0, 0.0
+    worst_run, worst_rep, where = 0, 0.0, ""
     for r in json.load(open(path))["results"]:
-        text, run, best, prev = r["text"], 0, 0, None
-        for ch in text:
+        text, run, prev = r["text"], 0, None
+        for i, ch in enumerate(text):
             run = run + 1 if ch == prev else 1
             prev = ch
-            best = max(best, run)
-        worst_run = max(worst_run, best)
-        worst_rep = max(worst_rep, text.count("�") / max(1, len(text)))
-    bad = worst_rep > 0.005 or worst_run >= 40
-    print("texts32-%s %s longest run %d, replacement share %.4f" % (arm, "fail garbage:" if bad else "ok",
-                                                                    worst_run, worst_rep))
+            if run > worst_run:
+                worst_run, where = run, text[max(0, i - run - 20):i + 20]
+        worst_rep = max(worst_rep, text.count("\ufffd") / max(1, len(text)))
+    # NaN garbage shows replacement characters (with one token repeated); a long run alone can be a markdown rule
+    # or indentation (native-replay): then "inspect" with the snippet, not a failure
+    if worst_rep > 0.005:
+        verdict = "fail garbage:"
+    elif worst_run >= 40:
+        verdict = "inspect (a long run, no replacement characters) %r:" % where
+    else:
+        verdict = "ok"
+    print("texts32-%s %s longest run %d, replacement share %.4f" % (arm, verdict, worst_run, worst_rep))
 PY
 echo "bridge_reuse: verdicts:"
 cat "$V"
