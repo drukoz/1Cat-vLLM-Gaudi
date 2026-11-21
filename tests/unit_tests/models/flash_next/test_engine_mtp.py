@@ -223,6 +223,33 @@ def test_the_one_graph_draft_switched_at_run_time(engine_runs):
     assert 0 < run["runner"]["draft_graph_calls"] < len([c for c in run["draft_calls"] if c.get("decode")])
 
 
+def test_the_draft_graph_and_the_sparse_metadata_switched_together(engine_runs):
+    # The 2 x 2 of an operator's A/B on one server (the probe's switch set graph-md): VLLM_HPU_MTP_DRAFT_GRAPH and
+    # VLLM_HPU_FLASH_NEXT_DECODE_METADATA (engine-step's I01: the target's verification steps and the drafter's later
+    # passes without paged-attention buffers) switched between prompts at k = 2. Every draft and every stream equal
+    # the per-pass drafter's; the one-graph path ran exactly where the switch file put it.
+    loop = {"VLLM_HPU_MTP_DRAFT_LOOP": "1"}
+    accept = [2, 0, 1]
+    per_pass = _oracle_run(engine_runs, accept, k=2, env=loop, tag="_loop")
+    switch_file = engine_runs["dir"] / "graph_md.switches"
+    arms = {1: ("1", "0"), 2: ("0", "1"), 3: ("1", "1"), 4: ("0", "0")}
+    options = []
+    for after, (graph, md) in arms.items():
+        options += ["--switch-after", str(after),
+                    f"VLLM_HPU_MTP_DRAFT_GRAPH={graph};VLLM_HPU_FLASH_NEXT_DECODE_METADATA={md}"]
+    run = _oracle_run(engine_runs, accept, *options, k=2,
+                      env={**loop, "VLLM_HPU_RUNTIME_SWITCH_FILE": str(switch_file)}, tag="_graph_md")
+    assert [e["drafter"] for e in run["oracle"]] == [e["drafter"] for e in per_pass["oracle"]]
+    assert [p["generated_ids"] for p in run["prompts"]] == [p["generated_ids"] for p in per_pass["prompts"]]
+    start = 0
+    for number, prompt in enumerate(run["prompts"], 1):
+        calls = [c for c in run["draft_calls"][start:prompt["draft_calls_end"]] if c.get("decode")]
+        start = prompt["draft_calls_end"]
+        graph = arms.get(number - 1, ("0", "0"))[0] == "1"  # the switch after prompt n acts from prompt n + 1
+        assert calls and all(c["graph"] == graph for c in calls), (number, calls)
+    _check_oracle(engine_runs, run, accept, 2)
+
+
 @pytest.mark.parametrize("k", [4, 5], ids=["k4", "k5"])
 def test_oracle_drafts_at_the_sizes_above_the_recipe(engine_runs, k):
     # k + 1 lattice entries exceed the kernel blocks of a request's first block (two per 256-token block here, four
