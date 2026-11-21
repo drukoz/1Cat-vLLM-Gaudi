@@ -11,7 +11,7 @@ This track's harness refuses report files outside the repository, so the handoff
 
 ## Handoff (if this agent stops)
 
-Last update: **2026-11-21 12:40 UTC** (fourth agent, Opus 5.5; the node was extended to about 00:00 UTC on
+Last update: **2026-11-21 13:35 UTC (Mac clock, about 15 min ahead of the coordinator's)** (fourth agent, Opus 5.5; the node was extended to about 00:00 UTC on
 2026-11-22). Branch `feat/flash-next-gaudi-engine-step`, pushed; merged into the program branch up to `bcef8aa5` (PR
 #20); since then, not yet in a PR, all default-off: `ff160409` (`VLLM_HPU_WORKER_GC_FREEZE`), `ca52fa33`
 (`VLLM_HPU_LOG_UNMATCHED_GRAPH_INPUTS`), `844a37f2` (`VLLM_HPU_VERIFY_LOGITS_IN_GRAPH`), `8efc6969`
@@ -689,6 +689,21 @@ step while the host works.
   hits, repeats; card rules 10 / 11: the copy_ might have ordered the in-place cache writes), then a real-model A/B.
   Rank skew in build 5 (per-step records, placement on): `replay_first_ms` p50 6.2-6.5 ms on all 8 workers at 96 rows;
   the placement removed 00205's skew.
+- **`VLLM_HPU_VOCAB_PARALLEL_LOGITS` was not exact on the card (coordinator 12:55 UTC, from mtp-draft-graph's 00230;
+  MEASURED):** the card's `argmax` takes the lowest index on ties (00252), so the tie rule is the same everywhere.
+  `linear -> .to(fp32) -> argmax` in one lazy graph is fused (the GEMM hands out its fp32 accumulator: 00254 / 00255
+  / 00259, 99.997 % of logits off bf16, the arg max on 2-3 % of random rows); the old VP reduction (`_shard_logits`
+  cast the whole shard to fp32, then amax / where / amin) did not fuse in the standalone probes, but did in the real
+  greedy region: at TP2 with VP=1 the old code fails the tiny model's 700-token prompt at token 4 in [hc] (00260),
+  the fix passes (00261; its hc+mtp3 `verify` rung still flips that prompt: the fused-verify near-tie mtp-card-ready
+  owns). Fix: the shard's reductions in the head's own dtype, only reduced values to fp32 (`408d62b8` on
+  `fix/flash-next-gaudi-vp-bf16-compare`, off the program head; CPU test that no whole-shard fp32 cast precedes a
+  reduction). Kit: `tools/flash_next/rental/argmax_precision_check.py` (every in-graph arg max against the gathered
+  path's materialized bf16 arg max on the card, planted near-ties; tiny_smoke runs it report-only on a card,
+  `2d2ac89b`; card run 00265). At TP > 1 every gathered consumer sees bf16 (the head's all-gather materializes
+  first); at TP1 the casts right after the head fuse (sampler, gathered `top_tokens`, min_tokens mask, rejection
+  softmax), a card-vs-CPU drift at near-ties only. Draft and verify never compare the same logits. Gate of the fix
+  branch: `logs/gate_vpfix_2d2ac89b.log`; PR to the program head when green; VP stays off until then.
 - **The tensor-printing reads (coordinator 09:58 UTC, from async-sched's 00220 census): one capture step, not every
   step (MEASURED).** In `nospec-async-census/timing/step_timing_worker_r0_*.jsonl` the item, tolist, scalar and
   all_reduce counters have n = 1 in the first rows=8 window: one step made 1454 `.item()`, 384 `.tolist()`, 500 scalar
