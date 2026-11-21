@@ -1913,8 +1913,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # An operator's A/B on one server (v1/worker/runtime_switches.py). Unset (default): nothing. A path: every
     # worker looks at that file before each step and, when it changed, takes the flags it lists (NAME=VALUE lines).
     # Only flags the runner reads at every step can be switched: VLLM_HPU_FLASH_NEXT_DECODE_METADATA,
-    # VLLM_HPU_FUSED_GREEDY_LOGITS, VLLM_HPU_CANDIDATE_SAMPLING, VLLM_HPU_VOCAB_PARALLEL_LOGITS and
-    # VLLM_HPU_MTP_DRAFT_GRAPH. Replace the file with a rename while no request runs.
+    # VLLM_HPU_FUSED_GREEDY_LOGITS, VLLM_HPU_CANDIDATE_SAMPLING, VLLM_HPU_VOCAB_PARALLEL_LOGITS,
+    # VLLM_HPU_MTP_DRAFT_GRAPH and VLLM_HPU_MTP_DRAFT_CHAIN. Replace the file with a rename while no request runs.
     "VLLM_HPU_RUNTIME_SWITCH_FILE":
     lambda: os.environ.get("VLLM_HPU_RUNTIME_SWITCH_FILE", "").strip(),
 

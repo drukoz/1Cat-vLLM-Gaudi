@@ -245,6 +245,22 @@ and the draft-rank log (`VLLM_FLASH_NEXT_DRAFT_RANK_LOG=1`) keep the per-pass pa
 With `VLLM_HPU_MTP_TIMING=1` the draft's laps are `graph_positions`, `graph_meta`
 (the metadata of the later passes) and `graph` (the replay's issue).
 
+`VLLM_HPU_MTP_DRAFT_CHAIN` chains the Flash-Next MTP draft behind the verification, as
+an integer. `0` (default): the runner reads the verification's result on the host,
+then builds the draft's inputs and issues it. `1`: right after the rejection sampler,
+before any host read, the drafter computes on the device each request's committed
+rows, the draft's inputs and the later passes' block tables and slots, and issues the
+draft in one HPU graph (`MtpDraftChain`); the host then reads the result and keeps its
+books as before. When the verification's per-row greedy ids are on the device (the
+vocabulary-parallel path, or `VLLM_HPU_VERIFY_LOGITS_IN_GRAPH=1`), the greedy rejection
+runs inside the chain's graph too. Needs `VLLM_HPU_MTP_DRAFT_GRAPH=1` and the sparse
+decode metadata (`VLLM_HPU_FLASH_NEXT_DECODE_METADATA=1` in force); a step with a
+prefill, a sampled request (greedy only so far), structured output or the draft-rank
+log keeps today's path (each reason logged once). Switchable at run time
+(`VLLM_HPU_RUNTIME_SWITCH_FILE`). The chained step's device outputs stay in
+`HPUModelRunner._mtp_chain_out` (accepted counts, the next step's ids, the result)
+for async scheduling.
+
 `VLLM_HPU_MTP_TIMING` times the steps of a Flash-Next MTP server, as an integer. `0`
 (default): no timer. `1`: per step the verification part (to the drafter call) and the
 draft, with a lap per draft pass and one device wait after the draft; every 25 steps of
