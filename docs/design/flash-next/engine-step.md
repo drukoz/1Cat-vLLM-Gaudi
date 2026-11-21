@@ -11,9 +11,9 @@ This track's harness refuses report files outside the repository, so the handoff
 
 ## Handoff (if this agent stops)
 
-Last update: **2026-11-21 02:45 UTC** (fourth agent, Opus 5.5; the node was extended to about 00:00 UTC on
-2026-11-22). Branch `feat/flash-next-gaudi-engine-step`, code head `01d66e31` plus documents (program head
-`5c1e8219`, PR 15, merged in at `425fb2ee`), pushed. A second branch of this track,
+Last update: **2026-11-21 02:50 UTC** (fourth agent, Opus 5.5; the node was extended to about 00:00 UTC on
+2026-11-22). Branch `feat/flash-next-gaudi-engine-step`, head `fe4cac24` (the program head with PR 16 merged in; code of
+this track up to `01d66e31`), pushed. A second branch of this track,
 **`feat/flash-next-gaudi-engine-step-mtp-record`** (`2b90707f`, worktree `reports/engine-step/trees/mtp-record`):
 mtp-card-ready's head `7c4d65e3` plus `VLLM_HPU_MTP_TIMING=2` (one record per speculative step, section 14), for
 integration build 4 in place of mtp-card-ready's branch (the timer exists only there). Scratch files, probes and
@@ -36,11 +36,15 @@ question answered on the CPU (section 14).
 
 ### If you take over, in this order
 
-1. The gate: it holds the lock (pid 35066, `reports/engine-step/logs/gate_425fb2ee.log`, outputs in
-   `/tmp/gate.tZJ4wz`) on `merge-wt` (moved to `01d66e31` during the run). Four rental tool test files failed in
-   the parallel pass (`test_rental_scripts`, `test_sh_rent`, `test_sh_run_rental`, `test_sh_tiny_smoke`: "not a git
-   repository", container signals); another track's gate (`/tmp/gate.mSyEA1`) failed three of them in its parallel pass too, so
-   they are not this branch's. When it ends `gate exit 0`, or red on those files only (say so to the coordinator):
+1. The gates. The program head moved (PR 16 qsa-dataflow); it is merged in at **`fe4cac24`** (conflicts in
+   `envs.py`, `env_variables.md` and the decode block table, resolved keeping both sides: the sparse decode
+   metadata's table takes PR 16's `VLLM_HPU_QSA_TABLE_WIDTH` width too). **Gate of `fe4cac24`**: snapshot
+   `reports/engine-step/merge-wt2`, log `reports/engine-step/logs/gate_fe4cac24.log` (wrapper pid 30235, no
+   `--tools`), waiting for a gate slot at 02:50 UTC. The older gate of `01d66e31` (`merge-wt`, log
+   `gate_425fb2ee.log`, outputs `/tmp/gate.mSyEA1`, wrapper pid 35065, with `--tools`) had all flash_next files
+   green in its parallel pass except `test_collective_cuts.py` (killed by the 1,500 s alarm under the load of two
+   gates), plus three rental tool files ("not a git repository", container signals; kernel-fixes' gate
+   `/tmp/gate.tZJ4wz` fails the same three); its alone reruns decide. When the `fe4cac24` gate ends `gate exit 0`:
    from `wt/engine-step`, merge `origin/feat/flash-next-gaudi` again if it moved, push, `gh pr create --base
    feat/flash-next-gaudi`, `gh pr merge --merge`; tell the coordinator.
 2. Read 00164, 00166 and 00169 when they land (table below); section 9 and the coordinator.
