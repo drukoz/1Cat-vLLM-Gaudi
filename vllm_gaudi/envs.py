@@ -552,6 +552,7 @@ if TYPE_CHECKING:
     VLLM_HPU_MOE_GLUE: int = 0  # 0 torch MoE glue (default), 1 the fused MoE glue kernels
     VLLM_HPU_MOE_GLUE_MERGE_GATE_UP: int = 0  # with VLLM_HPU_MOE_GLUE=1: 1 merges the gate_up GEMM into the gate GEMM
     VLLM_HPU_FLASH_NEXT_ASYNC_SCHED: int = 0  # 0 Flash-Next without async scheduling (default), 1 with it, 2 also MTP
+    VLLM_HPU_FLASH_NEXT_SPEC_DEVICE_INPUTS: int = 0  # 0 host-made (default), 1 device-made + check, 2 device-made
     VLLM_HPU_HC_FUSED_COPY_MODE: int = 0  # copies before a fused HC op: 0 all, 1 not its own outputs, 2 block output
     VLLM_HPU_MOE_DENSE: int = 0  # 0 vendor MoE op (default), 1 dense batched FP8 experts up to MAX_TOKENS rows
     VLLM_HPU_MOE_DENSE_MAX_TOKENS: int = 512  # with VLLM_HPU_MOE_DENSE=1: the most tokens a step runs dense
@@ -2107,6 +2108,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Any other value is 0. See docs/design/flash-next/async-sched.md.
     "VLLM_HPU_FLASH_NEXT_ASYNC_SCHED":
     lambda: int(os.environ.get("VLLM_HPU_FLASH_NEXT_ASYNC_SCHED", "0")),
+    # Flash-Next MTP (async-sched stage 2, M1): a verification step's inputs that depend on the previous step's
+    # acceptance (ids, positions, KV slots, GDN accepted counts, PLE context) made on the device. 1 also compares them
+    # with the host-made ones every step (a host read), 2 uses them. Needs VLLM_HPU_FLASH_NEXT_DECODE_METADATA=1.
+    "VLLM_HPU_FLASH_NEXT_SPEC_DEVICE_INPUTS":
+    lambda: int(os.environ.get("VLLM_HPU_FLASH_NEXT_SPEC_DEVICE_INPUTS", "0")),
 
     # (Declared here because tests pin GDN_CORE_VERIFY, HC_FUSED, MOE_GLUE and MOE_GLUE_MERGE_GATE_UP as
     # neighbours.) With VLLM_HPU_HC_FUSED=1 only: which activations get an owned copy before a fused

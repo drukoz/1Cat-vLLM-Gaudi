@@ -62,6 +62,8 @@ from vllm_gaudi.v1.worker.recurrent_spec import (accepted_counts, load_checkpoin
 from vllm_gaudi.v1.spec_decode.flash_next_mtp_steps import is_flash_next_mtp
 from vllm_gaudi.distributed import vocab_parallel
 from vllm_gaudi.platform import is_flash_next_model
+from vllm_gaudi.v1.worker.flash_next_async_spec import (ChainOut, VerifyInputAdvance, VerifyInputs,
+                                                        refresh_stand_in_drafts, stand_in_chain)
 from vllm_gaudi.v1.worker.flash_next_async import (AsyncOutputLedger, PleContextCarry, SpecDraftHandoff,
                                                    needs_output_token_values)
 
@@ -2497,6 +2499,14 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                                     if self.use_async_scheduling and self.speculative_config is not None else None)
         if self._spec_draft_handoff is not None:
             self.use_async_scheduling = False
+        # VLLM_HPU_FLASH_NEXT_SPEC_DEVICE_INPUTS (async-sched stage 2, M1): a verification step's inputs that depend
+        # on the previous verification's acceptance, made on the device (flash_next_async_spec.VerifyInputAdvance).
+        self._verify_advance = (VerifyInputAdvance()
+                                if int(gaudi_envs.VLLM_HPU_FLASH_NEXT_SPEC_DEVICE_INPUTS) in (1, 2)
+                                and self.speculative_config is not None and is_flash_next_model(self.model_config)
+                                else None)
+        self._verify_step = 0
+        self._verify_refusals: set = set()
         self.use_structured_output: bool = False  # Default to false. Set to true when needed during a run
         # Cache token ids on device to avoid h2d copies
         self.input_ids_hpu = torch.zeros(
@@ -4671,6 +4681,8 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                 reason = "async scheduling keeps the sampled token ids on the device"
             elif self._spec_draft_handoff is not None:
                 reason = "async scheduling with speculation keeps the drafts on the device"
+            elif self._verify_advance is not None and int(gaudi_envs.VLLM_HPU_FLASH_NEXT_SPEC_DEVICE_INPUTS) == 2:
+                reason = "VLLM_HPU_FLASH_NEXT_SPEC_DEVICE_INPUTS=2 makes a verification step's ids on the device"
             else:
                 from vllm_gaudi.models.qwen4_exp.ple_ops import collect_ngram_host_tables
                 try:
@@ -4741,6 +4753,104 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
     _async_ledger: Optional[AsyncOutputLedger] = None
     _flash_next_async_checked = False
     _spec_draft_handoff: Optional[SpecDraftHandoff] = None
+
+    def _advance_verify_inputs(self, num_decodes, padded, num_tokens, block_table_cpu_tensor, block_size, sparse_md,
+                               token_ids, positions, slot_mapping, num_accepted, scheduler_output):
+        """VLLM_HPU_FLASH_NEXT_SPEC_DEVICE_INPUTS (stage 2, M1): this verification step's inputs from the previous
+        verification's on the device. Returns (made or None, served, ids, positions, slots, accepted counts): the
+        host's tensors, or with =2 the device-made ones; ``served`` False when this step cannot be advanced at all."""
+        mode = int(gaudi_envs.VLLM_HPU_FLASH_NEXT_SPEC_DEVICE_INPUTS)
+        reason = None
+        if not sparse_md:
+            reason = "the dense decode metadata (it needs VLLM_HPU_FLASH_NEXT_DECODE_METADATA=1)"
+        elif self.uses_mrope:
+            reason = "M-RoPE positions"
+        elif num_accepted is None:
+            reason = "a batch without the GDN acceptance input"
+        if reason is not None:
+            if reason not in self._verify_refusals:
+                self._verify_refusals.add(reason)
+                logger.info("VLLM_HPU_FLASH_NEXT_SPEC_DEVICE_INPUTS=%d: a verification step keeps the host's inputs: %s",
+                            mode, reason)
+            self._verify_advance.reset()
+            return None, False, token_ids, positions, slot_mapping, num_accepted
+        chain = self._verify_advance.pending_chain(self._verify_step)
+        if chain is not None and chain.stand_in:
+            # Without mtp-draft-graph's chain: the drafts this step verifies, as the scheduler has them (a synchronous
+            # engine); under async scheduling the scheduler has placeholders and the device drafts stay.
+            refresh_stand_in_drafts(chain, self.input_batch.req_ids, scheduler_output.scheduled_spec_decode_tokens)
+        with_context = model_requires_raw_input_tokens(self.model)
+        eos_token_id = self._ple_eos_and_ngram()[0] if with_context else 0
+        table_cpu = torch.zeros((padded, block_table_cpu_tensor.shape[1]), dtype=torch.int32)
+        rows = min(num_decodes, padded, block_table_cpu_tensor.shape[0])
+        table_cpu[:rows] = block_table_cpu_tensor[:rows].to(torch.int32)
+        made = self._verify_advance.advance(self._verify_step, self.input_batch.req_ids, num_decodes, padded,
+                                            num_tokens - 1, async_h2d_copy(table_cpu, device=self.device), block_size,
+                                            self._PAD_BLOCK_ID * block_size, eos_token_id, with_context)
+        if made is None:
+            return None, True, token_ids, positions, slot_mapping, num_accepted
+        made.slot_mapping = made.slot_mapping.to(slot_mapping.dtype)
+        made.num_accepted = made.num_accepted.to(num_accepted.dtype)
+        if mode == 2:
+            return made, True, made.token_ids, made.positions, made.slot_mapping, made.num_accepted
+        return made, True, token_ids, positions, slot_mapping, num_accepted
+
+    def _finish_verify_inputs(self, made, num_decodes, padded, num_tokens, token_ids, positions, slot_mapping,
+                              num_accepted, ple_inputs):
+        """The PLE context of a device-made step (=2) or the check against the host's (=1); then this step's inputs
+        are kept for the next one. Returns the PLE inputs the model gets."""
+        mode = int(gaudi_envs.VLLM_HPU_FLASH_NEXT_SPEC_DEVICE_INPUTS)
+        context = ple_inputs[1] if ple_inputs is not None and len(ple_inputs) >= 2 else None
+        if made is not None:
+            if mode == 2:
+                if made.ngram_context is not None and ple_inputs is not None:
+                    ple_inputs = (ple_inputs[0], made.ngram_context) + tuple(ple_inputs[2:])
+                    context = made.ngram_context
+                self._log_verify_advance({})
+            else:
+                bad = self._verify_advance.check(made, VerifyInputs(token_ids, positions, slot_mapping, num_accepted,
+                                                                    context))
+                self._log_verify_advance(bad)
+        if context is not None and context.device.type != torch.device(self.device).type:
+            context = async_h2d_copy(context.to(torch.int32), device=self.device)
+        self._verify_advance.record(self._verify_step, self.input_batch.req_ids, num_decodes, padded, num_tokens - 1,
+                                    VerifyInputs(token_ids, positions, slot_mapping, num_accepted, context))
+        return ple_inputs
+
+    def _set_verify_chain(self, num_decodes, sampled_token_ids) -> None:
+        """The acceptance this step leaves for the next verification step: mtp-draft-graph's chain output
+        (``_mtp_chain_out``) when the step chained, else a stand-in from the host's read and the device drafts."""
+        advance = self._verify_advance
+        recorded = advance._recorded
+        if recorded is None or recorded.step != self._verify_step or num_decodes == 0:
+            advance.set_chain(self._verify_step, None)
+            return
+        chain = getattr(self, "_mtp_chain_out", None)
+        if chain is not None:
+            out = ChainOut(accepted=chain.accepted, next_ids=chain.next_ids, num_decodes=int(chain.num_decodes),
+                           k=int(chain.k), sampled=getattr(chain, "sampled", None),
+                           last_row=getattr(chain, "last_row", None))
+        else:
+            drafts = self._draft_token_ids
+            if drafts is None:
+                advance.set_chain(self._verify_step, None)
+                return
+            if not isinstance(drafts, torch.Tensor):
+                drafts = torch.tensor([list(row) for row in drafts[:num_decodes]], dtype=torch.int32)
+            out = stand_in_chain(sampled_token_ids[:num_decodes], drafts.to(self.device), recorded.padded,
+                                 recorded.k)
+        advance.set_chain(self._verify_step, out)
+
+    def _log_verify_advance(self, bad: dict) -> None:
+        stats = self._verify_advance.stats
+        mode = int(gaudi_envs.VLLM_HPU_FLASH_NEXT_SPEC_DEVICE_INPUTS)
+        if bad and (stats.mismatched_steps <= 8 or stats.mismatched_steps % 100 == 0):
+            logger.warning("VLLM_HPU_FLASH_NEXT_SPEC_DEVICE_INPUTS=%d: step %d's device-made inputs differ from the "
+                           "host's: %s", mode, self._verify_step, bad)
+        if stats.advanced == 1 or stats.advanced % 16 == 0:
+            logger.info("VLLM_HPU_FLASH_NEXT_SPEC_DEVICE_INPUTS=%d: %d verification steps, %d advanced on the "
+                        "device, %d checked, %d with differences %s", mode, stats.verify_steps, stats.advanced,
+                        stats.checked, stats.mismatched_steps, stats.mismatches)
 
     def _flash_next_async_begin_step(self, scheduler_output=None) -> None:
         """Under async scheduling, once per engine step before its batches are built: the last step's decode
@@ -5613,6 +5723,16 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                                                                        self.input_batch.req_ids[:num_decodes],
                                                                        num_tokens,
                                                                        scheduler_output.scheduled_spec_decode_tokens)
+        verify_made, verify_ok = None, False
+        if self._verify_advance is not None and num_tokens > 1 and scheduler_output is not None:
+            # VLLM_HPU_FLASH_NEXT_SPEC_DEVICE_INPUTS: this verification step's acceptance-dependent inputs from the
+            # previous one's, on the device (flash_next_async_spec); =2 uses them from here on.
+            (verify_made, verify_ok, token_ids_device, positions_device, slot_mapping_device,
+             num_accepted_tokens) = self._advance_verify_inputs(num_decodes, padded_batch_size, num_tokens,
+                                                                block_table_cpu_tensor, decode_block_size, sparse_md,
+                                                                token_ids_device, positions_device,
+                                                                slot_mapping_device, num_accepted_tokens,
+                                                                scheduler_output)
         # call prepare_spec_decode_inputs to get the logits indices and
         if scheduler_output is not None:
             logits_indices, spec_decode_metadata = self._prepare_spec_decode_inputs(scheduler_output, logits_indices,
@@ -5686,6 +5806,10 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                                   async_h2d_copy(ple_inputs[1], dtype=torch.int32, device=self.device),
                                   self.input_batch.req_ids[:num_decodes], token_ids_device,
                                   num_tokens_per_req[:num_decodes]))
+        if verify_ok:
+            ple_inputs = self._finish_verify_inputs(verify_made, num_decodes, padded_batch_size, num_tokens,
+                                                    token_ids_device, positions_device, slot_mapping_device,
+                                                    num_accepted_tokens, ple_inputs)
 
         return DecodeInputData(num_decodes=num_decodes,
                                token_ids=token_ids_device,
@@ -7016,6 +7140,8 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         self.warmup_mode = False
         if self.use_async_scheduling or self._spec_draft_handoff is not None:
             self._flash_next_async_begin_step(scheduler_output)
+        if self._verify_advance is not None:
+            self._verify_step += 1
 
         # NOTE(kzawora): Since scheduler doesn't differentiate between prefills
         # and decodes, we must handle mixed batches. In _update_states we make
@@ -7650,6 +7776,8 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                 if step_timer is not None:
                     step_timer.lap("draft")
         ################## Spec Decode end ##################
+        if self._verify_advance is not None:
+            self._set_verify_chain(num_decodes, postprocessed_sampled_token_ids)
 
         if self._spec_draft_handoff is not None:
             # Async scheduling with speculation: the drafts stay on the device for the next step, with the counts

@@ -283,6 +283,56 @@ sampled: prepare 1.98 against 1.41 ms, sample 2.89 against 2.61, gap 0.27 agains
 for sampled requests under mode 2, and the drafter has no sampled path (VERIFIED). So the card's gap is an
 interaction with the device, which only the card's spans and census can show (INFERRED).
 
+### 2.6 Stage 2: step N+1's verification inputs on the device (branch `feat/flash-next-gaudi-async-sched-s2`)
+
+The coordinator's order (08:15 UTC): stage 2 now, the largest item behind the 32-agent target (up to about 30 ms of
+the 84.9 ms synchronous MTP step at 32 streams, section 2.4). Plan approved 08:24 UTC (also in `TASKS.md`); every
+stage behind its own default-off flag, its CPU proof a test file in the tree, then a card A/B, greedy before
+sampled:
+
+| Stage | Owner | What | Removes from the device's idle | Estimate |
+|---|---|---|---|---|
+| D1 | mtp-draft-graph | `VLLM_HPU_MTP_DRAFT_CHAIN=1`: verification, in-graph greedy acceptance and the one-graph draft issued back to back; leaves `runner._mtp_chain_out` | the gap between verification and draft (the host's read, the drafter's input preparation) | theirs |
+| M1 | async-sched | `VLLM_HPU_FLASH_NEXT_SPEC_DEVICE_INPUTS` (1 check, 2 use): step N+1's acceptance-dependent inputs made on the device | nothing (enabler; prices the extra ops) | 1 day (done on CPU) |
+| M2 | async-sched | issue N+1 before reading N: N's tokens copied on a side stream and read on the output thread, the host's books one step late | N+1's preparation and forward issue, as far as N's device work covers them: up to about 20 ms at 32 streams | 1 to 1.5 days |
+| M3 | async-sched | prefix-cache align mode exact under M2 (pre-step copy and boundary commits from the device acceptance); requests joining or leaving through a row map | nothing (production has prefix caching on) | 0.5 to 1 day |
+| D2 + M4 | both | sampled requests: the chain through the in-graph candidate sampler; tests on my side | the same for sampled steps | 0.25 day mine |
+
+Interfaces agreed 08:20 to 08:30 UTC:
+
+- mtp-draft-graph: `VLLM_HPU_MTP_DRAFT_CHAIN` (needs `VLLM_HPU_MTP_DRAFT_GRAPH=1` and
+  `VLLM_HPU_FLASH_NEXT_DECODE_METADATA=1`); the per-step decision `runner._mtp_chain_step` (set before the forward);
+  after a chained step `runner._mtp_chain_out` = (accepted [B], next_ids [B, 1 + k] = bonus + k drafts, sampled
+  [B, 1 + k] with -1 after the bonus, last_row [B], num_decodes, k), int32, the step's padded decode batch,
+  input-batch row order, padded rows accepted 0 and sampled -1, every id rule-9-safe (from an fp32 id table, never a
+  `.to(int32)` of arg max indices); their host read and books in a method of its own (`_mtp_chain_settle`) that M2
+  calls one step late.
+- engine-step (`VLLM_HPU_PACKED_INPUTS`): a per-input switch host-made / device-made; in a verification step that
+  continues a chained one, the device-made inputs (ids, positions, the verification slot mapping, the GDN accepted
+  counts and, with prefix caching, the lattice rows, the PLE context, the draft ids) are read from my tensors and
+  left out of the packed upload; the I01 block table, `query_start_loc`, the logits indices, the target / bonus
+  indices, `cu_num_draft_tokens` and the sampling parameters stay in the packed buffer. Native-replay's bridge facts
+  (through engine-step): a graph input binds without a copy only if it is the tensor the capture saw; any other is
+  copied in by a lazy D2D copy, one launch each; a view handed to a custom op fails at launch.
+
+M1 (VERIFIED on CPU, `vllm_gaudi/v1/worker/flash_next_async_spec.py`, runner hooks in `_create_decode_input_data`
+and `sample_tokens`): after a verification step, its device inputs and its acceptance are kept (mtp-draft-graph's
+`_mtp_chain_out` when the step chained; else a stand-in from the host's read, its draft columns refreshed from the
+drafts the scheduler scheduled, which is what a synchronous engine verifies). In the next verification step, if its
+decode rows are the same requests in the same order with the same padded batch and k, the device makes: ids =
+next_ids; positions = `positions_N[r, 0] + a + 1 + j`; slots = `block_table[r, pos // bs] * bs + pos % bs` (an int32
+`index_select` over the one-row-per-request table of `VLLM_HPU_FLASH_NEXT_DECODE_METADATA=1`; padded rows the pad
+block's slots in row-major order, as `fill_pad_slots`); GDN `num_accepted_tokens` = a + 1 (padded rows 1); the PLE
+context = `advance_ple_context(context_N, ids_N, a + 1)` (padded rows eos). Tests:
+`tests/unit_tests/worker/test_flash_next_async_spec.py` (21: the device-made inputs equal the host-made ones from the
+runner's own helpers over 12 steps of random acceptance, k = 1..3, padded rows; the non-continuation cases; the
+stand-in), `tests/unit_tests/models/flash_next/test_engine_spec_device_inputs.py` (the engine rehearsal with the real
+MTP drafter, k = 2, oracle acceptance 2,0,1,2,1,0, prefix caching on and off: `=1` checks 32 steps with no
+difference in any of the five tensors; `=2` gives the model the device-made inputs and the streams equal the
+engine's without the flag). The branch is stacked on mtp-draft-graph's (its MTP fixes and the rehearsal engine are
+not on the program head yet). Not covered by M1: the align-mode lattice rows (host-made; M3), M-RoPE positions and
+the dense decode metadata (refused, logged once).
+
 ## 3. What is on the branch
 
 See the handoff. Files: `vllm_gaudi/v1/worker/flash_next_async.py` (carry, ledger), `vllm_gaudi/platform.py`
