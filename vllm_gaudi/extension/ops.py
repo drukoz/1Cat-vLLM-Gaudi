@@ -1487,10 +1487,12 @@ def moe_dense_fp8(x, topk_ids, topk_weights, w13, w2, s13, s2, experts_min):
                                         False)  # [E, T, 2I]
     mid = (F.silu(gate_up[..., :inter].float()) * gate_up[..., inter:].float()).to(x.dtype)  # [E, T, I]
     m_fp8, m_scale = dynamic_quant(mid.reshape(experts * rows, inter))
+    # The routing weight of each (expert, row) pair rides on the down GEMM's row scale (0 for a pair that is not
+    # routed), and the bf16 GEMM output is summed over the experts with fp32 accumulation: no [E, T, H] fp32 tensor.
+    m_scale = m_scale.reshape(experts, rows, 1).to(torch.float32) * pair_weight.t().unsqueeze(-1)
     down = torch.ops.hpu.fp8_gemm_v2(m_fp8.reshape(experts, rows, inter), False, w2, True, None, torch.bfloat16,
-                                     m_scale.reshape(experts, rows, 1).to(torch.float32), s2.unsqueeze(1), None,
-                                     False)  # [E, T, H]
-    return (down.float() * pair_weight.t().unsqueeze(-1)).sum(dim=0).to(x.dtype)
+                                     m_scale, s2.unsqueeze(1), None, False)  # [E, T, H], weighted
+    return down.sum(dim=0, dtype=torch.float32).to(x.dtype)
 
 
 def _set_moe_dense_weights(layer):
@@ -1566,7 +1568,8 @@ class VllmMixtureOfExpertsOpFP8PerChannel(VllmMixtureOfExpertsOpBase):
         tokens_num, _ = x.shape
         activation = _as_activation_str(activation)
         if (self.dense_weights is not None and self.w13_input_scale is None and self.is_gated
-                and activation == "silu" and tokens_num <= envs.VLLM_HPU_MOE_DENSE_MAX_TOKENS):
+                and activation == "silu"
+                and envs.VLLM_HPU_MOE_DENSE_MIN_TOKENS <= tokens_num <= envs.VLLM_HPU_MOE_DENSE_MAX_TOKENS):
             return moe_dense_fp8(x, topk_ids, topk_weights, *self.dense_weights, self.experts_min)
         kwargs = self._get_extra_kwargs(tokens_num)
         # Non-gated experts tell the fused kernel to skip the gate split+multiply.

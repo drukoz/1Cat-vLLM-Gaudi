@@ -70,8 +70,13 @@ def _batch(rows, seed=1, local_only=None):
     return x, ids.to(torch.int64), weights
 
 
+@pytest.fixture
+def _dense_from_one_row(monkeypatch):
+    monkeypatch.setenv("VLLM_HPU_MOE_DENSE_MIN_TOKENS", "1")
+
+
 @pytest.mark.parametrize("rows", [1, 7, 32])
-def test_dense_form_matches_the_vendor_op_to_fp8_rounding(rows):
+def test_dense_form_matches_the_vendor_op_to_fp8_rounding(rows, _dense_from_one_row):
     op, dense = _op()
     x, ids, weights = _batch(rows)
     vendor = op(x, ids, weights).float()
@@ -86,20 +91,30 @@ def test_dense_form_matches_the_vendor_op_to_fp8_rounding(rows):
     assert torch.equal(got[no_local], torch.zeros_like(got[no_local]))
 
 
-def test_rows_routed_only_to_other_ranks_give_zeros():
+def test_rows_routed_only_to_other_ranks_give_zeros(_dense_from_one_row):
     op, dense = _op()
     op.set_dense_weights(*dense)
     x, ids, weights = _batch(5, local_only=False)
     assert torch.equal(op(x, ids, weights), torch.zeros(5, H, dtype=torch.bfloat16))
 
 
-def test_more_tokens_than_the_limit_keep_the_vendor_op(monkeypatch):
+def test_more_tokens_than_the_limit_keep_the_vendor_op(monkeypatch, _dense_from_one_row):
     op, dense = _op()
     op.set_dense_weights(*dense)
-    monkeypatch.setattr(envs, "VLLM_HPU_MOE_DENSE_MAX_TOKENS", 16, raising=False)
     monkeypatch.setenv("VLLM_HPU_MOE_DENSE_MAX_TOKENS", "16")
     op(*_batch(16))
     assert len(moe_block.VENDOR_CALLS) == 0
+    op(*_batch(17))
+    assert len(moe_block.VENDOR_CALLS) == 1
+
+
+def test_fewer_tokens_than_the_minimum_keep_the_vendor_op():
+    """Default minimum 17: a step of 1 to 16 rows reads only the hit experts through the vendor op."""
+    op, dense = _op()
+    op.set_dense_weights(*dense)
+    assert envs.VLLM_HPU_MOE_DENSE_MIN_TOKENS == 17
+    op(*_batch(16))
+    assert len(moe_block.VENDOR_CALLS) == 1
     op(*_batch(17))
     assert len(moe_block.VENDOR_CALLS) == 1
 
