@@ -4,37 +4,44 @@ Design note, report and handoff of the `hc-kernels` track (branch `feat/flash-ne
 `/Volumes/Storage/Claude/gaudi-work/wt/hc-kernels`). The harness refuses report files for this agent, so this note is
 the report. Labels: MEASURED (card), VERIFIED (simulator or CPU test named), INFERRED (arithmetic or reading).
 
-## 0. Handoff (if this agent stops) — updated 09:40 UTC 2026-11-21
+## 0. Handoff (if this agent stops) — updated 10:50 UTC 2026-11-21
 
 - **Goal 1:** the two hyper-connection TPC kernels (`hc_fused_gate_mix`, `hc_fused_combine_norm`) at 128
   verification rows (32 streams, MTP k = 3) from about 7 ms per step to about 2 ms. **Goal 2:** the GDN verify kernel
   `gdn_fused_core_verify` (9.45 ms per 128-row step): agreed with kernel-fixes at 09:00 UTC, reviewed by it at 09:25
-  (no objection to the card job; its suggestions are in: variants 4/5, chained bench calls, device traces).
+  (variants 1-5); the fold build (variants 6/7) sent to it for review before its card run.
 - First reading sent to the coordinator 08:25 UTC; plan approved 08:27 UTC (new GUIDs behind a default-off flag, the
   HC contract of `tests/unit_tests/hc_fused/hc_case.py` as the tolerance plus the exact-match fraction against the
   shipped kernels; the 8-card arm goes into build 6).
 - **On the branch, pushed:** HC `3c2ffd72`, `6f5b9300`, `0183f133`, `6c62cc56` (interleaved kernels, ops, flag
-  `VLLM_HPU_HC_FUSED_IL`, tests, bench); GDN `8ed20160` (variants 1-3 of `VLLM_HPU_GDN_VERIFY_VARIANT`). Next commit
-  (09:30, after its simulator run): variants 4/5, chained benches, traces, `kernel_engines.py`: pushed as `b9ff6384`
-  (simulator: variants 1-5 byte-identical, 71 passed).
-- **Card (coordinator 09:33 UTC: split in two):** job A = `tools/flash_next/hc_kernels/card_hc_quick.sh` (HC op card
-  test, the TP1 tiny gate with `VLLM_HPU_HC_FUSED_IL=1`, the HC bench at 4/32/96/128 rows, traces at 128 rows), hold 12
-  min, replaces 00227 (its place: right after build 5, beside engine-step's 2-card job); job B =
-  `tools/flash_next/hc_kernels/card_gdn_verify.sh` (GDN verify variants 0-5: op test, chained bench, bits, traces),
-  placed by the coordinator about 15:00-16:00 UTC beside step-anatomy's 4-card trace. **Job A = 00231 `hc-quick`,
-  job B = 00232 `gdn-variants`** (both image `b9ff6384`, queued 09:39 UTC; waiters' logs
-  `reports/hc-kernels/logs/farm_hc-quick.out`, `farm_gdn-variants.out`). When a job ends: `bin/farm fetch hc-kernels <id> <id>-<name>` if its waiter
-  is gone; read `pytest_il.log`, `tiny.log`, `bench.log` (VERDICT), `gdn_bench_variant*.log` (us per call and
-  "bit-identical" lines); traces with `python3 tools/flash_next/hc_kernels/kernel_engines.py <trace> <kernel name>`;
-  send kernel-fixes the GDN result. The TP1 tiny gate stands in for a TP8 one (coordinator, 09:33).
-- **Gate:** `bin/gate reports/hc-kernels/gate-8ed20160 --tools` running (log `reports/hc-kernels/logs/
-  gate_8ed20160.log`); then a PR of the branch to `feat/flash-next-gaudi` (body draft `reports/hc-kernels/pr/
-  pr_body_step1.md`), merge (default-off, gate green), tell the coordinator the PR number.
-- **Next:** build-6 arm for the coordinator: `VLLM_HPU_HC_FUSED_IL=1` (with `VLLM_HPU_HC_FUSED=1`), and
-  `VLLM_HPU_GDN_VERIFY_VARIANT=<best of the card A/B>` (with `VLLM_HPU_GDN_KERNEL_INTERLEAVE=1`).
+  `VLLM_HPU_HC_FUSED_IL`, tests, bench); GDN `8ed20160` (variants 1-3), `b9ff6384` (variants 4/5, chained benches,
+  traces, split card scripts), `aaf256ea` (merge of the program branch at `e5188341`); then the fold build
+  (variants 6/7: `gdn_core_verify_recurrence_fold.h`, `GDN_VERIFY_BATCHED_GATES`), simulator 0.609-0.630 of the
+  interleaved kernel's instructions, every verify case byte-identical.
+- **PR step 1 (HC + GDN variants 1-5):** gate green on `aaf256ea` (113 files, 10:25 UTC); the program branch moved
+  (PRs #24, #25), so `d07b2155` = `aaf256ea` + `4f070c75` was pushed as `feat/flash-next-gaudi-hc-kernels-pr1` and is
+  gated from `reports/hc-kernels/gate-pr1` (log `reports/hc-kernels/logs/gate_pr1.log`); when green: `gh pr create
+  --base feat/flash-next-gaudi --head feat/flash-next-gaudi-hc-kernels-pr1` (body `reports/hc-kernels/pr/
+  pr_body_step1.md`), `gh pr merge --merge`, PR number to the coordinator. The fold build goes in a later PR.
+- **Card:** job A = **00231** `hc-quick` (image `b9ff6384`, hold 12 min, after build 5 on card 6:
+  `tools/flash_next/hc_kernels/card_hc_quick.sh`: HC op card test, the TP1 tiny gate with `VLLM_HPU_HC_FUSED_IL=1`
+  (stands in for TP8, coordinator 09:33), the HC bench at 4/32/96/128 rows, traces at 128 rows). Job B =
+  `gdn-variants` (`tools/flash_next/hc_kernels/card_gdn_verify.sh`, hold 35 min, placed by the coordinator about
+  15:00-16:00 beside step-anatomy's 4-card trace): op card test with variant 6 first, then the chained bench with
+  on-card bits against variant 0 for 0, 6, 1, 4, 7, the traces of 0, 1, 4, then 2, 3, 5 and the op test with 3. Its
+  id: the latest `reports/hc-kernels/logs/farm_gdn-variants*.out` (00232 was the image without the fold build).
+  When a job ends: `bin/farm fetch hc-kernels <id> <id>-<name>` if its waiter is gone; read `pytest_il.log`,
+  `tiny.log`, `bench.log` (VERDICT), `gdn_bench_variant*.log` (us per call and "bit-identical" lines),
+  `gdn_optest_variant6.log`; traces with `python3 tools/flash_next/hc_kernels/kernel_engines.py <trace> <kernel>`;
+  send kernel-fixes the GDN result.
+- **Next:** build-6 arm for the coordinator: `VLLM_HPU_HC_FUSED_IL=1` (with `VLLM_HPU_HC_FUSED=1`) once job A is
+  green, and `VLLM_HPU_GDN_VERIFY_VARIANT=6` or `7` (with `VLLM_HPU_GDN_KERNEL_INTERLEAVE=1`) once job B is.
 - Tools: `tools/flash_next/hc_kernels/sim_cost.py` (simulator instructions per index-space point, oracle check,
-  bit-equality against another build), `tools/flash_next/hc_kernels/bench_hc.py` (1-card replay bench),
-  `reports/hc-kernels/tools/kernel_engines.py` (per-engine time of a kernel in a profiler trace).
+  bit-equality against another build), `tools/flash_next/hc_kernels/bench_hc.py` and `bench_gdn_verify.py` (1-card
+  chained replay benches), `tools/flash_next/hc_kernels/kernel_engines.py` (per-engine time of a kernel in a
+  profiler trace); scratch GDN driver `.hc_exp/gdn_b1_driver.py <kernels dir> <build dir>` (inside
+  `tools/flash_next/tpcsim.sh`: a candidate tree's interleaved build against the repo's, every verify case, bytes and
+  instruction counts).
 - Untracked scratch in the worktree: `.hc_exp/` (prototype trees), `.hc_sim_base/` (build of the shipped kernels,
   the reference for bit-equality), `.hc_b_il/`. Never `git add -A` here.
 
@@ -162,6 +169,20 @@ against 262 MEASURED: the same model as the HC kernels holds. The hot loop (4 va
 204 VPU operations (90 %): VPU-bound, and three horizontal reductions per row and node (the row's v element, the
 projection, the output) are most of it.
 
+**How it scales with rows, and row parallelism** (INFERRED from the simulator model above, which matched the 00205
+trace within 3 %): one point is one (key head, request) over its T nodes and 3 value heads (TP8); its time does not
+depend on the batch. A call takes ceil(points / engines used) point times: at T = 4, 4 rows = 1 request = 2 points
+(2 engines busy, one point time, about 64 us for the interleaved kernel); 32 rows = 16 points (one point time); 96
+rows = 48 points (2 to 3 point times); 128 rows = 64 points on 16 engines (4 point times = the 262 us MEASURED). Two
+levers, independent of each other: the point time (the fold build, x 0.62 in the simulator) and the points per
+engine (the index-space variants 1, 4, 7: 4 -> 3 at 128 rows if the compiler spreads the points over 22 to 24
+engines, x 0.75). The index space is row-parallel already across requests; within a request the T nodes are a
+recurrence (each node's state is the previous node's), so they cannot run on separate engines without another
+algorithm (the chunked delta rule: not bit-identical, and its intermediate states would still be needed for every
+node's slot). The one finer split left is the value heads of a key head (kernel-fixes' option (c)): 3x the points at
+a third of the work each, which matters most at few requests (1 request: 6 engines instead of 2), at the price of
+q/k conv and norm work repeated per value head and conv-state stores that more than one point would have to own.
+
 **Variants** (`VLLM_HPU_GDN_VERIFY_VARIANT`, only with `VLLM_HPU_GDN_KERNEL_INTERLEAVE=1`; read by the glue like the
 interleave variable; each an optional ELF of the library, weak symbols):
 - 1, request-major (`kernels/gdn_core_verify_interleaved_rmajor_gaudi2.c`): index space `[requests, key heads]`; the
@@ -186,23 +207,58 @@ interleave variable; each an optional ELF of the library, weak symbols):
   output access patterns that are not linear in the point index (a declared superset: overlapping output regions),
   so the documented split hint is the cleaner form.
 - 5, as 4 with the lean ELF.
+- 6, fold (`kernels/gdn_core_verify_interleaved_fold_gaudi2.c`, recurrence `gdn_core_verify_recurrence_fold.h`), and
+  7, the fold ELF with the split of 4. Today's index space. Row group (side, j) carries the four value rows
+  `side * 64 + 16 * d + j`, d = 0..3, whose v and o elements sit at lane `16d + j` of the half's vector, the same
+  place in every dual group. The two sums of each row per node are no longer four separate `v_f32_reduce_add`
+  calls (12 VPU operations each plus a broadcast): `gdn_verify_fold4` folds the four product vectors into one vector
+  whose dual group d holds row d's sum, by the very additions of `v_f32_reduce_add` (VERIFIED in the simulator with a
+  scratch probe: `v_f32_reduce_add` is lane i + lane i ^ 16, then i ^ 32, then i ^ 8, then i ^ 1, i ^ 2, i ^ 4 in
+  that order, every lane ending with the sum; the fold matches it bit for bit in every lane of 4,000 random
+  quadruples with -0.0 elements). Lane bit 4 is folded for two pairs of vectors at once (x1 plus its partners in all
+  lanes, then x0 plus its partners written with a vector predicate over the lanes with the bit clear), bit 5 pairs the
+  two results the same way, and the four in-dual-group stages run once for the four rows: 20 operations for four sums
+  instead of 52. v of the four rows is one shuffle (the shuffle reads lanes 0-7 of a dual group, so rows with j >= 8
+  first move group 1 onto group 0), delta is computed for the four rows in one vector, broadcast per row by one
+  dual-group move, and o lands in the half's vector by one masked move. Every row's arithmetic and its order are the
+  one-row loop's. The code is laid out for tpc-clang's one-block scheduling, which pays a dependent chain's whole
+  latency: node t's output and node t + 1's update depend only on the state after node t, so one block runs both;
+  and the 32 row groups alternate between two register sets, so a group's last output runs in one block with the
+  next group's first update (the first two versions without these overlaps were latency-bound: 0.95 of the
+  interleaved kernel's instructions, 211 words for 107 operations in the node loop). Node t + 1's v and k are read
+  before node t's output is stored (tpc-clang does not tell the `__local__` arrays apart); an output is merged into
+  a fresh read of the v/o vector, since with one node the next group's update reads that vector before this group's
+  output is stored (the stale copy broke 4 of the 14 cases in the simulator before this rule); every move writes all
+  lanes, so its income is a dead register (no copy). The gates (`GDN_VERIFY_BATCHED_GATES`, defined only by the fold
+  wrapper; the other builds compile to the same code as before, checked on their assembly): the inputs of all nodes
+  go into lane t of a vector, the softplus/exp/sigmoid chain runs once instead of once per node; every function is
+  lane-wise, so lane t holds the per-node loop's bits.
+  VERIFIED (scratch driver `.hc_exp/gdn_b1_driver.py`, every verify case): bytes identical to the interleaved kernel
+  on all 14 cases; instructions 0.609 to 0.630 of the interleaved kernel's at T = 1 to 6 (lean: 0.887 to 0.925); hot
+  node loop 121 words for 4 rows x 1 node (89 vector operations) against 193 (lean) and 226 (interleaved); vector local
+  memory 13,312 bytes of 16,384. INFERRED: at the 00205 geometry (TP8, 128 rows, 4 points per engine) 262 us per
+  call x 0.62 = about 163 us, -99 us per call, about -3.6 ms per 128-row step over 36 calls, if the card follows the
+  simulator as the other kernels did (job B measures it). Tried and dropped: packing the four sums after their
+  cross-group stages (0.994: spills and one long serial chain); the q/k normalizations and the gated RMSNorm four
+  nodes at a time (bit-identical, but 0.615 to 0.695: the clamped extra nodes cost more than the chains saved).
 
 VERIFIED (simulator, `tests/standalone/gdn_core_decode/test_simulation.py -k variant`: 43 passed at 09:22 UTC for
-variants 1-3, 71 passed at 09:35 UTC for variants 1-5): out, conv state and SSM state byte-identical to the interleaved
-kernel on all 14 verify cases for each variant (4 and 5 keep today's index space; their split hint is for the graph
-compiler only);
+variants 1-3, 71 passed at 09:35 UTC for variants 1-5, 59 passed at 10:53 UTC for variants 6/7 and the value rules):
+out, conv state and SSM state byte-identical to the interleaved kernel on all 14 verify cases for each variant (4, 5
+and 7 keep today's index space; their split hint is for the graph compiler only; 6 and 7 run 0.609 to 0.630 of the
+instructions); the library build carries the fold ELF (`test_kernel_build.py` 7 passed, `_binary_gdn_core_verify_
+interleaved_fold_gaudi2_o_start` defined);
 variant 1 swaps the index space and runs the same instruction count; variants 2 and 3 run 0.887 to 0.925 of the
-instructions; the glue takes a variant only with the interleave variable at "1" and the value exactly "1", "2" or
-"3". The library builds with the three optional ELFs (`test_kernel_build.py` 7 passed); CPU:
+instructions; the glue takes a variant only with the interleave variable at "1" and the value exactly "1" to "7". The library builds with the three optional ELFs (`test_kernel_build.py` 7 passed); CPU:
 `tests/unit_tests/gdn_core_decode` every file green (`test_verify_variant_flag.py` 5 new).
 
-Card A/B: `tools/flash_next/hc_kernels/card_gdn_verify.sh`: the verify op card test with variant 3; then
-`bench_gdn_verify.py` per variant 0 to 5 at batch 1, 8, 32, T = 4: each call on its own pools and CHAINED (call i + 1's
+Card A/B: `tools/flash_next/hc_kernels/card_gdn_verify.sh`: the verify op card test with variants 6 and 3; then
+`bench_gdn_verify.py` per variant 0 to 7 at batch 1, 8, 32, T = 4: each call on its own pools and CHAINED (call i + 1's
 `a` gets 1e-30 x one element of call i's output, so the compiler cannot overlap independent calls on the 8 idle
-engines, kernel-fixes' point 3), the slope of two K, and the bits of variants 1 to 5 compared with variant 0's on the
+engines, kernel-fixes' point 3), the slope of two K, and the bits of variants 1 to 7 compared with variant 0's on the
 card; then profiler traces (`HABANA_PROFILE=profile_api_light`) of variants 0, 1, 4 at batch 1 and 32 for the engines
 per call (`tools/flash_next/hc_kernels/kernel_engines.py`).
 
-Next candidates (not built): pack the four rows' projection (and output) reductions into one vector after their
-cross-group stages (bit-identical if each lane's operand pairs stay those of `v_f32_reduce_add`; INFERRED about -20 %
-on the hot loop); the value-head split of kernel-fixes' option (c) list is not needed while the variants above work.
+Next candidates (not built): the conv blocks and the gated RMSNorm per (node, value head), now a larger share; two
+nodes' norms in one block instead of four clamped ones. The value-head split of kernel-fixes' option (c) list is not
+needed while the variants above work.

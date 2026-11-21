@@ -301,7 +301,12 @@ recurrence takes a row's element of v with one broadcast and broadcasts the
 output sum with one shuffle, 11 % fewer instructions in the simulator. `3` is
 both. `4` keeps today's index space and kernel and asks the graph compiler to
 split the key-head dimension into partitions of one (`preferredSplitDim`); `5`
-is `4` with the lean build. Outputs and states are bit-identical to the
+is `4` with the lean build. `6` is the fold build
+(`kernels/gdn_core_verify_interleaved_fold_gaudi2.c`): four value rows per
+iteration whose row sums are folded together by the very additions of
+`v_f32_reduce_add`, overlapped nodes and row groups, and the gates of all nodes
+computed at once, 37 to 39 % fewer instructions in the simulator; `7` is `6`
+with the split of `4`. Outputs and states are bit-identical to the
 interleaved kernel's in every variant. Read by the kernel library's host glue like the interleave variable.
 A library built without a variant serves the interleaved kernel. Any other
 value is `0`. See `docs/design/flash-next/hc-kernels.md`. Not yet run on a card.

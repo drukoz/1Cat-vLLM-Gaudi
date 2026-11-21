@@ -19,13 +19,15 @@ extern unsigned char _binary_gdn_core_verify_gaudi2_o_end;
 // The interleaved build (VLLM_HPU_GDN_KERNEL_INTERLEAVE=1): weak, absent when it did not compile.
 extern unsigned char _binary_gdn_core_verify_interleaved_gaudi2_o_start __attribute__((weak));
 extern unsigned char _binary_gdn_core_verify_interleaved_gaudi2_o_end __attribute__((weak));
-// Its variant builds (VLLM_HPU_GDN_VERIFY_VARIANT 1, 2, 3): weak, absent when they did not compile.
+// Its variant builds (VLLM_HPU_GDN_VERIFY_VARIANT 1, 2, 3, 6): weak, absent when they did not compile.
 extern unsigned char _binary_gdn_core_verify_interleaved_rmajor_gaudi2_o_start __attribute__((weak));
 extern unsigned char _binary_gdn_core_verify_interleaved_rmajor_gaudi2_o_end __attribute__((weak));
 extern unsigned char _binary_gdn_core_verify_interleaved_lean_gaudi2_o_start __attribute__((weak));
 extern unsigned char _binary_gdn_core_verify_interleaved_lean_gaudi2_o_end __attribute__((weak));
 extern unsigned char _binary_gdn_core_verify_interleaved_rmajor_lean_gaudi2_o_start __attribute__((weak));
 extern unsigned char _binary_gdn_core_verify_interleaved_rmajor_lean_gaudi2_o_end __attribute__((weak));
+extern unsigned char _binary_gdn_core_verify_interleaved_fold_gaudi2_o_start __attribute__((weak));
+extern unsigned char _binary_gdn_core_verify_interleaved_fold_gaudi2_o_end __attribute__((weak));
 
 namespace {
 
@@ -170,6 +172,7 @@ tpc_lib_api::GlueCodeReturn GdnCoreVerifyGaudi2::GetGcDefinitions(
     // goes through keyHeadDim / requestDim.
     // Variants 4 and 5 keep today's index space and ask the graph compiler for a split of the key-head dimension
     // into partitions of one (preferredSplitDim, which needs every tensor dimension mapped to it allRequired).
+    // Variant 6 is the fold build with today's index space, 7 the fold build with the split of 4 and 5.
     const int asked = GdnKernelInterleaveRequested() ? GdnVerifyVariantRequested() : 0;
     const unsigned char* variantStart = nullptr;
     const unsigned char* variantEnd = nullptr;
@@ -185,10 +188,13 @@ tpc_lib_api::GlueCodeReturn GdnCoreVerifyGaudi2::GetGcDefinitions(
     } else if (asked == 4) {
         variantStart = &_binary_gdn_core_verify_interleaved_gaudi2_o_start;
         variantEnd = &_binary_gdn_core_verify_interleaved_gaudi2_o_end;
+    } else if (asked == 6 || asked == 7) {
+        variantStart = &_binary_gdn_core_verify_interleaved_fold_gaudi2_o_start;
+        variantEnd = &_binary_gdn_core_verify_interleaved_fold_gaudi2_o_end;
     }
     const bool variant = asked != 0 && GdnElfLinked(variantStart, variantEnd);
     const bool requestMajor = variant && (asked == 1 || asked == 3);
-    const bool splitKeyHeads = variant && (asked == 4 || asked == 5);
+    const bool splitKeyHeads = variant && (asked == 4 || asked == 5 || asked == 7);
     const unsigned keyHeadDim = requestMajor ? 1 : 0;
     const unsigned requestDim = requestMajor ? 0 : 1;
     instance->indexSpaceRank = 2;
