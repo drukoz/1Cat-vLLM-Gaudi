@@ -101,6 +101,15 @@ renormalized), at about the cost of a greedy verification step. It needs `VLLM_H
 against vLLM's `apply_top_k_top_p_pytorch`; on the card (TP4, 32 sampled streams) 4.9 ms less per step
 than vLLM's sampler (engine-step job 00110).
 
+`VLLM_HPU_SAMPLER_REQUEST_PARAMS` (integer, default `0`) makes a request's `min_tokens`, `logit_bias` and
+`min_p` take effect on the general sampler path. With `0` they are ignored on HPU: vLLM applies them through logits
+processors whose per-row state the HPU input batch never feeds (and the HPU samples prefills and decodes in calls
+whose rows are not the batch's rows). With `1` the runner applies each row's own request's values to the logits
+before vLLM's sampler (`vllm_gaudi/v1/sample/request_params.py`): the stop ids of a request below its
+`min_tokens` get `-inf`, each `logit_bias` entry is added, and tokens below `min_p` times the row's largest
+probability at its temperature get `-inf`. One difference from vLLM: a request with logprobs gets them after its
+own bias and masks (vLLM's raw logprobs come before them). Any other value is `0`. CPU-checked; not yet on a card.
+
 `VLLM_HPU_RUNTIME_SWITCH_FILE` (a path, default unset) is an operator's tool for an A/B on one server.
 When set, every worker looks at that file before each step (one `stat`) and, when the file changed, takes
 the flags it lists, one `NAME=VALUE` per line. Only flags the runner reads at every step can be switched:

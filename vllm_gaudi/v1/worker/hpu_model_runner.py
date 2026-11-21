@@ -48,6 +48,7 @@ from vllm_gaudi.v1.sample.candidate_sampling import (CANDIDATES, candidate_param
 from vllm_gaudi.v1.sample.candidate_sampling import PARAM_COLUMNS as CANDIDATE_PARAM_COLUMNS
 from vllm_gaudi.v1.sample.candidate_sampling import NOISE_SEED as CANDIDATE_NOISE_SEED
 from vllm_gaudi.v1.sample.topk_ids import topk_with_ids
+from vllm_gaudi.v1.sample.request_params import RowParams, apply_request_adjustments, request_adjustments
 from vllm_gaudi.v1.worker.runtime_switches import RuntimeSwitchFile
 from vllm_gaudi.v1.worker.recurrent_commit import (apply_align_precopy, boundary_commits, commit_conv, commit_ssm,
                                                    self_commit_requests)
@@ -6461,9 +6462,39 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                       logits_requests=None) -> tuple[torch.Tensor, SamplingMetadata]:
         htorch.core.mark_step()
         sampling_metadata = self._prepare_sampling(batch_changed, request_ids, pad_to, logits_requests)
+        if int(gaudi_envs.VLLM_HPU_SAMPLER_REQUEST_PARAMS) == 1:
+            logits_device = self._apply_sampler_request_params(logits_device, request_ids, pad_to, logits_requests)
         sampler_output = self.sampler(logits=logits_device, sampling_metadata=sampling_metadata)
         htorch.core.mark_step()
         return sampler_output, sampling_metadata
+
+    def _apply_sampler_request_params(self, logits_device, request_ids, pad_to, logits_requests):
+        """VLLM_HPU_SAMPLER_REQUEST_PARAMS=1: each row's min_tokens, logit_bias and min_p, from its own request in
+        this call's row order (``v1/sample/request_params.py``): vLLM's processors for them never get the HPU
+        batch's state. The logits are returned unchanged when no row needs anything."""
+        rows = []
+        for req_id, output_token_ids in self._generate_req_id_output_token_ids_lst(request_ids, pad_to,
+                                                                                    logits_requests):
+            params = self.requests[req_id].sampling_params
+            if params is None:
+                rows.append(RowParams())
+                continue
+            greedy = params.sampling_type == SamplingType.GREEDY
+            rows.append(RowParams(min_tokens=params.min_tokens or 0,
+                                  num_output_tokens=len(output_token_ids),
+                                  stop_token_ids=tuple(params.all_stop_token_ids or ()),
+                                  logit_bias=params.logit_bias,
+                                  min_p=params.min_p or 0.0,
+                                  temperature=0.0 if greedy else float(params.temperature)))
+        rows = rows[:int(logits_device.shape[0])]
+        adjust = request_adjustments(rows)
+        if not adjust:
+            return logits_device
+        if not getattr(self, '_request_params_logged', False):
+            self._request_params_logged = True
+            logger.info("VLLM_HPU_SAMPLER_REQUEST_PARAMS=1: min_tokens, logit_bias and min_p applied per row on the "
+                        "general sampler path. Logged once.")
+        return apply_request_adjustments(logits_device, adjust.to(logits_device.device))
 
     def _pool(
         self,
