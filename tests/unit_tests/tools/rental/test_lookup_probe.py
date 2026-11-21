@@ -360,6 +360,13 @@ def test_arms_script_placement_switch(tmp_path):
     assert ("PLACE_ARGS=--log\\ /results/x/nospec/server0.log" in lines[1]
             and "PLACE_LOG=/results/x/nospec/placement.log" in lines[1])
     assert "bash %s %s -- bash " % (wrap, place) in lines[1] and lines[1].endswith("--out /results/x/nospec")
+    assert "pin flag 1" in out
+    # "place": the placement alone, without the pin flag (it doubled the server's load time, job 00189)
+    switch.write_text("place\n")
+    lines, out = _arms("tiny-off", "nospec", **env)
+    assert "lookup_arms: placement ON (rule a^1; pin flag 0" in out
+    assert "bash %s %s -- bash " % (wrap, place) in lines[1] and "PLACE_SIBLING_RULE=a\\^1" in lines[1]
+    assert "WORKER_CPU_PIN" not in lines[1] and "place_wrap" not in lines[0]
     switch.write_text("off\n")
     lines, out = _arms("nospec", **env)
     assert "lookup_arms: placement off" in out and "place_wrap" not in lines[0]

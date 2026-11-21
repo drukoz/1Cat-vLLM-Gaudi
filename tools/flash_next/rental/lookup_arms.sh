@@ -27,12 +27,14 @@
 # arms also get VLLM_HPU_MTP_DRAFT_LOOP=1 VLLM_HPU_MTP_CHUNK_KV=1 VLLM_HPU_MTP_TIMING=1 unless the job set them
 # (the integration build's MTP server). Every other flag comes from the job's environment (farm --env).
 #
-# Worker placement, switched late (async-sched's switch, coordinator 07:02 UTC): the first word of
+# Worker placement, switched late (async-sched's switch, coordinator 07:02 and 08:55 UTC): the first word of
 # LOOKUP_ARMS_PLACE_SWITCH (default /results/switches/place, read once here at the job's start), "on" or "a^1"
-# (rule a^1) or "a+N/2"; anything else or no file: off. On: every real-model server runs with
-# VLLM_HPU_WORKER_CPU_PIN=1 under LOOKUP_ARMS_PLACE_WRAP LOOKUP_ARMS_PLACE_SCRIPT (default
+# (rule a^1) or "a+N/2"; "place": the placement alone (rule a^1, no VLLM_HPU_WORKER_CPU_PIN: the pin flag kept
+# each rank to its CPU share while loading, 14.9 min against 7.5 to 8.1 in job 00189); anything else or no file:
+# off. On: every real-model server runs under LOOKUP_ARMS_PLACE_WRAP LOOKUP_ARMS_PLACE_SCRIPT (default
 # /results/bench/place_wrap.sh /results/bench/place.sh: collectives' wrapper, native-replay's sibling-aware
-# placement), its output in the arm's placement.log. The tiny gate is never placed.
+# placement after health), with VLLM_HPU_WORKER_CPU_PIN=1 unless "place", its output in the arm's
+# placement.log. The tiny gate is never placed. The same case as async-sched's headline_job.sh.
 # Exit code: the number of arms that did not end with 0 (2: a usage error).
 
 set -u
@@ -112,9 +114,11 @@ arm_command() {  # sets CMD to the arm's command and EXTRA_ENV to its extra envi
 }
 
 PLACE_RULE=""
+PLACE_PIN=1
 if [ -r "$PLACE_SWITCH" ]; then
     case "$(awk 'NR == 1 { print $1 }' "$PLACE_SWITCH")" in
         on | "a^1") PLACE_RULE="a^1" ;;
+        place) PLACE_RULE="a^1"; PLACE_PIN=0 ;;
         "a+N/2") PLACE_RULE="a+N/2" ;;
     esac
 fi
@@ -123,7 +127,7 @@ if [ -n "$PLACE_RULE" ] && { [ ! -r "$PLACE_WRAP" ] || [ ! -r "$PLACE_SCRIPT" ];
     PLACE_RULE=""
 fi
 if [ -n "$PLACE_RULE" ]; then
-    echo "lookup_arms: placement ON (rule $PLACE_RULE; switch $PLACE_SWITCH; md5" \
+    echo "lookup_arms: placement ON (rule $PLACE_RULE; pin flag $PLACE_PIN; switch $PLACE_SWITCH; md5" \
         "$(md5sum "$PLACE_WRAP" "$PLACE_SCRIPT" 2>/dev/null | awk '{ printf "%s %s ", $2, substr($1, 1, 8) }'))"
 else
     echo "lookup_arms: placement off (switch $PLACE_SWITCH: $(head -c 40 "$PLACE_SWITCH" 2>/dev/null || echo none))"
@@ -168,8 +172,9 @@ while [ "$i" -lt "${#queue[@]}" ]; do
     arm_command "$arm"
     placed=()
     if [ -n "$PLACE_RULE" ] && [ "$arm" != tiny-off ]; then
-        EXTRA_ENV+=(VLLM_HPU_WORKER_CPU_PIN=1 PLACE_SIBLING_RULE="$PLACE_RULE" PLACE_ARGS="--log $OUT/$arm/server0.log"
+        EXTRA_ENV+=(PLACE_SIBLING_RULE="$PLACE_RULE" PLACE_ARGS="--log $OUT/$arm/server0.log"
             PLACE_LOG="$OUT/$arm/placement.log")
+        if [ "$PLACE_PIN" = 1 ]; then EXTRA_ENV+=(VLLM_HPU_WORKER_CPU_PIN=1); fi
         placed=(bash "$PLACE_WRAP" "$PLACE_SCRIPT" --)
     fi
     if [ "$DRY" -eq 1 ]; then
