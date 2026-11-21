@@ -157,6 +157,15 @@ the flags it lists, one `NAME=VALUE` per line. Only flags the runner reads at ev
 any other name is reported and the file is ignored. Replace the file with a rename while no request runs, so every worker sees the change
 at the same step. `tools/flash_next/engine_step/long_context_probe.py` measures two arms of one server
 this way.
+`VLLM_HPU_QSA_KV_FP8` lets the Flash-Next sparse QSA layers serve an FP8 K/V cache. `0`
+(default): a QSA layer refuses every main KV cache dtype but bf16. `1`: it also serves
+`--kv-cache-dtype fp8_inc`. The backend's `VLLMFP8KVCache` then quantizes K and V to
+E4M3 on write (scale 1.0, Gaudi2 range 240) and dequantizes them when the prefill
+fetches its context, and the sparse decode dequantizes the gathered rows. The attention
+math of the QSA layers stays bf16 (the FP8 matmuls and FP8 fused SDPA that `fp8_inc`
+selects are put back to bf16 for them). It halves the per-token K/V bytes: at TP8,
+13,056 -> 6,912 bytes per token and rank including the indexer's keys, so about 5.4M
+tokens of KV instead of 2.8M at `VLLM_GRAPH_RESERVED_MEM=0.4`. Any other value is `0`.
 
 `VLLM_HPU_GDN_CORE_DECODE` selects the GDN decode core path as an integer.
 `1` (default) is fused: every non-speculative decode step runs through the
