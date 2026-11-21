@@ -258,6 +258,17 @@ def _validate_hpu_dflash2_config(vllm_config: VllmConfig) -> None:
         raise ValueError("HPU DFlash2 requires prefix caching to be disabled")
 
 
+# The largest draft per step a Flash-Next server takes, by method. MTP: 5, the largest lattice (1 + k = 6 nodes) the
+# fused GDN verification op takes (GDN_CORE_VERIFY_MAX_NODES); the CPU tests run the speculative path at k = 3, 4 and
+# 5 (tests/unit_tests/flash_next_spec_sizes.py); at 32 sequences of 131072 tokens a k = 5 server holds slightly fewer
+# full-length sequences, which the engine's own KV sizing reports (docs/design/flash-next/gdn-core-decode.md, "Sizes
+# above the recipe"). n-gram lookup has no draft layer: k = 8 fits that server by the same formulas (55.2 GiB of KV
+# budget without speculation, plus 128 state slots of about 5.2 MB per drafted token: 60.7 GiB of the 61.7
+# available), and a GDN verification of more than 6 rows runs the torch recurrence (the fused verify op takes up to
+# 6); the n-gram tests run at k = 3, 4, 5 and 8.
+FLASH_NEXT_MAX_SPECULATIVE_TOKENS = {"mtp": 5, "ngram": 8}
+
+
 def _validate_flash_next_speculative_config(vllm_config: VllmConfig) -> None:
     """Refuse the Flash-Next speculative configurations M3 cannot run correctly yet."""
     speculative_config = vllm_config.speculative_config
@@ -265,11 +276,11 @@ def _validate_flash_next_speculative_config(vllm_config: VllmConfig) -> None:
         return
     draft_model_config = speculative_config.draft_model_config
     draft_architectures = set(getattr(getattr(draft_model_config, "hf_config", None), "architectures", ()) or ())
-    if speculative_config.method == "ngram":
-        if vllm_config.cache_config.enable_prefix_caching:
-            raise ValueError("Flash-Next n-gram speculation runs with prefix caching disabled for now: add "
-                             "--no-enable-prefix-caching")
-    elif speculative_config.method != "mtp" or "Qwen4ExpMTP" not in draft_architectures:
+    # n-gram prompt lookup runs on the same verification lattices as MTP, with prefix caching on (align mode) or
+    # off (compact GDN): its ragged drafts widen a verification batch to the previous step's accepted count
+    # (vllm_gaudi/v1/worker/verify_width.py), so the recurrent layers always find the committed state.
+    if speculative_config.method != "ngram" and (speculative_config.method != "mtp"
+                                                 or "Qwen4ExpMTP" not in draft_architectures):
         raise ValueError("Flash-Next supports speculative decoding with its own MTP layer or n-gram prompt lookup "
                          "only: use --speculative-config '{\"method\": \"mtp\", \"num_speculative_tokens\": 3}' or "
                          "'{\"method\": \"ngram\", \"num_speculative_tokens\": 3, \"prompt_lookup_max\": 4, "
@@ -279,10 +290,10 @@ def _validate_flash_next_speculative_config(vllm_config: VllmConfig) -> None:
     if not prefix_caching and os.environ.get("VLLM_COMPACT_GDN", "1").strip().lower() not in ("1", "true"):
         raise ValueError("Flash-Next MTP needs compact GDN state for the per-token verification checkpoints: "
                          "unset VLLM_COMPACT_GDN or set it to 1")
-    # 5 is the largest lattice (1 + k = 6 nodes) the fused GDN verification op takes (GDN_CORE_VERIFY_MAX_NODES);
-    # the CPU tests run the speculative path at k = 3, 4 and 5 (tests/unit_tests/flash_next_spec_sizes.py).
-    if not 1 <= speculative_config.num_speculative_tokens <= 5:
-        raise ValueError("Flash-Next MTP on HPU runs 1 to 5 speculative tokens (the recipe is 3)")
+    limit = FLASH_NEXT_MAX_SPECULATIVE_TOKENS["ngram" if speculative_config.method == "ngram" else "mtp"]
+    if not 1 <= speculative_config.num_speculative_tokens <= limit:
+        what = "n-gram lookup" if speculative_config.method == "ngram" else "MTP"
+        raise ValueError(f"Flash-Next {what} on HPU runs 1 to {limit} speculative tokens (the recipe is 3)")
     global _SPEC_GREEDY_ONLY, _SPECULATIVE_SERVER
     _SPEC_GREEDY_ONLY = int(gaudi_envs.VLLM_HPU_SPEC_SAMPLED_VERIFY) not in (1, 2)
     _SPECULATIVE_SERVER = True
