@@ -1583,6 +1583,8 @@ class HpuModelAdapter(torch.nn.Module, HpuKVConnectorModelRunnerMixin):
         #        selected_token_indices = kwargs.pop('selected_token_indices')
         if 'warmup_mode' in kwargs:
             kwargs.pop('warmup_mode')
+        # VLLM_HPU_VERIFY_LOGITS_IN_GRAPH: a greedy verification's logits region in this (captured) forward.
+        verify_logits_indices = kwargs.pop('verify_logits_indices', None)
         input_ids = kwargs['input_ids']
         model_has_chunked_attention = kwargs.pop('model_has_chunked_attention', False)
         framework_attn_metadata = isinstance(kwargs.get('attn_metadata'), Mapping)
@@ -1769,6 +1771,12 @@ class HpuModelAdapter(torch.nn.Module, HpuKVConnectorModelRunnerMixin):
                     raise RuntimeError("Async GDN DMA requires every compiled decoder group to execute")
             if self._rotary_prepare_cos_sin is not None:
                 self._reset_rotary_cos_sin()
+        if verify_logits_indices is not None:
+            # The final mix, the LM head and the arg max in one graph segment; the ids leave the graph as int32 from
+            # an fp32 id table (card rule 9). Returned: (the model's output as before, selected rows, ids [rows]).
+            main = hidden_states[0] if isinstance(hidden_states, tuple) else hidden_states
+            selected = main.view(-1, main.shape[-1])[verify_logits_indices]
+            return hidden_states, selected, vocab_parallel.greedy_ids(self.model, selected)
         return hidden_states
 
     def gdn_dma_pipeline(self):
@@ -5990,7 +5998,8 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                                fuse_greedy_sampling=False,
                                ple_inputs=None,
                                greedy_stop_ids=None,
-                               candidate_sampling=None):
+                               candidate_sampling=None,
+                               verify_in_graph=False):
         # FORWARD.
         batch_size = token_ids.size(0)
         framework_attn_metadata = isinstance(attn_metadata, Mapping)
@@ -6053,6 +6062,8 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             LoraMask.setLoraMask(lora_mask)
             replay_timer = self._mtp_step_timer if not warmup_mode else None
             replay_t0 = time.perf_counter() if replay_timer is not None and replay_timer.per_step else None
+            if verify_in_graph:
+                additional_kwargs["verify_logits_indices"] = logits_indices
             hidden_states = self.model.forward(input_ids=token_ids,
                                                positions=position_ids,
                                                attn_metadata=trimmed_attn_metadata,
@@ -6062,6 +6073,9 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                                                **additional_kwargs)
             if replay_t0 is not None:  # VLLM_HPU_MTP_TIMING=2: the replay call of the target forward, per step
                 replay_timer.replay(time.perf_counter() - replay_t0)
+            verify_selected = verify_ids = None
+            if verify_in_graph:
+                hidden_states, verify_selected, verify_ids = hidden_states
         if step_timer is not None:
             step_timer.lap("forward")
             step_timer.phase = "logits"
@@ -6093,7 +6107,12 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                                                      f'{batch_size}_'
                                                      f'seq{seq_len}_ctx'
                                                      f'{num_blocks}')):
-            if fuse_greedy_sampling:
+            if verify_ids is not None:
+                # VLLM_HPU_VERIFY_LOGITS_IN_GRAPH: the replayed forward already selected the rows and took their
+                # greedy tokens (int32 [rows], logits_indices order); nothing runs here.
+                hidden_states, fused_sampled_token_ids = verify_selected, verify_ids.unsqueeze(-1)
+                logits = None
+            elif fuse_greedy_sampling:
                 stop_kwargs = {}
                 if greedy_stop_ids is not None:  # min_tokens of the rows below it (fused_greedy.py)
                     stop_kwargs = dict(stop_ids=async_h2d_copy(greedy_stop_ids[0], device=self.device),
@@ -6427,18 +6446,32 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
 
         return lora_mask, lora_logits_mask
 
+    def _deterministic_drafts(self) -> bool:
+        """A speculative config whose drafts are one token per position, verified by arg max (Flash-Next MTP, n-gram)."""
+        spec = self.speculative_config
+        return spec is not None and (is_flash_next_mtp(spec) or getattr(spec, "method", None) == "ngram")
+
+    def _verify_logits_in_graph(self, fuse_greedy_sampling: bool, greedy_stop_ids, decode_data) -> bool:
+        """VLLM_HPU_VERIFY_LOGITS_IN_GRAPH for this decode step: a speculative step whose rows the greedy region
+        takes, without a min_tokens mask (the region's stop-id mask has one row per request, not per row)."""
+        return (bool(gaudi_envs.VLLM_HPU_VERIFY_LOGITS_IN_GRAPH) and fuse_greedy_sampling and greedy_stop_ids is None
+                and getattr(decode_data, "spec_decode_metadata", None) is not None and self._deterministic_drafts())
+
     def _can_fuse_plain_greedy_sampling(self, request_ids: list[str]) -> bool:
         """Whether argmax can safely run in the compiled LM-head region."""
         # VLLM_HPU_VOCAB_PARALLEL_LOGITS >= 1 asks for the arg max without the logits all-gather: the same
         # region, for the same plain greedy requests, and also for the greedy verification of a Flash-Next
         # MTP step (the rejection sampler needs the arg max of every verification row and nothing else).
         vocab_parallel_on = vocab_parallel.mode() != vocab_parallel.VocabParallelMode.OFF
-        if not (gaudi_envs.VLLM_HPU_FUSED_GREEDY_LOGITS or vocab_parallel_on):
+        # VLLM_HPU_VERIFY_LOGITS_IN_GRAPH: the greedy verification of a speculative step with deterministic drafts
+        # (Flash-Next MTP, n-gram) takes the arg max of every row inside the replayed forward.
+        in_graph = bool(gaudi_envs.VLLM_HPU_VERIFY_LOGITS_IN_GRAPH) and self._deterministic_drafts()
+        if not (gaudi_envs.VLLM_HPU_FUSED_GREEDY_LOGITS or vocab_parallel_on or in_graph):
             return False
         if not request_ids or self.use_structured_output:
             return False
-        if self.speculative_config is not None and not (vocab_parallel_on
-                                                        and is_flash_next_mtp(self.speculative_config)):
+        if self.speculative_config is not None and not in_graph and not (
+                vocab_parallel_on and is_flash_next_mtp(self.speculative_config)):
             return False
 
         # Built-in min-tokens and logit-bias processors are covered by the
@@ -7335,7 +7368,8 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                 fuse_greedy_sampling=fuse_greedy_sampling,
                 ple_inputs=decode_data.ple_inputs,
                 greedy_stop_ids=greedy_stop_ids,
-                candidate_sampling=candidate_sampling)
+                candidate_sampling=candidate_sampling,
+                verify_in_graph=self._verify_logits_in_graph(fuse_greedy_sampling, greedy_stop_ids, decode_data))
             htorch.core.mark_step()
             if step_timer is not None:
                 step_timer.lap("launch_model")

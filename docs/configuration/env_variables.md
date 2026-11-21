@@ -149,6 +149,16 @@ before vLLM's sampler (`vllm_gaudi/v1/sample/request_params.py`): the stop ids o
 probability at its temperature get `-inf`. One difference from vLLM: a request with logprobs gets them after its
 own bias and masks (vLLM's raw logprobs come before them). Any other value is `0`. CPU-checked; not yet on a card.
 
+`VLLM_HPU_VERIFY_LOGITS_IN_GRAPH` (integer, default `0`) moves a greedy verification step's logits region into the
+captured forward. With `0` the forward returns its hidden states and the runner runs the LM head, the logits
+all-gather and the rejection sampler as separate lazy graphs after the replay. With `1`, for a speculative decode step
+with deterministic drafts (Flash-Next MTP, n-gram) whose requests the greedy region takes (all plainly greedy, no
+`min_tokens` mask), the forward also takes the logits indices and returns `(its output as before, the selected rows,
+every row's greedy token)`: int32 `[rows]` in logits-indices order, taken from an fp32 id table (ties to the lowest id,
+as `argmax`); with `VLLM_HPU_VOCAB_PARALLEL_LOGITS` `1` or `2` each rank's arg max and a `[rows, 2]` all-gather
+instead of the logits. The final hyper-connection mix, the LM head and the arg max are then one graph segment, and
+the runner verifies the drafts from those tokens (`greedy_rejection_sample_from_tokens`). Any other value is `0`.
+
 `VLLM_HPU_RUNTIME_SWITCH_FILE` (a path, default unset) is an operator's tool for an A/B on one server.
 When set, every worker looks at that file before each step (one `stat`) and, when the file changed, takes
 the flags it lists, one `NAME=VALUE` per line. Only flags the runner reads at every step can be switched:

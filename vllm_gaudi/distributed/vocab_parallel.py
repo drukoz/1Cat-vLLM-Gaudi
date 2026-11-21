@@ -238,6 +238,22 @@ def top_tokens(model, hidden_states: torch.Tensor) -> torch.Tensor:
     return _gathered_logits(model, hidden_states).to(torch.float32).argmax(dim=-1).to(torch.int32)
 
 
+def greedy_ids(model, hidden_states: torch.Tensor) -> torch.Tensor:
+    """The greedy token of every row, int32 ``[rows]``, with ids taken from an fp32 id table (card rule 9: ids that
+    leave the graph are never an arg max index cast in it).
+
+    ``VLLM_HPU_VOCAB_PARALLEL_LOGITS`` 1 or 2 and a model :func:`unsupported_reason` accepts: the vocabulary-parallel
+    arg max. Otherwise the gathered logits' maximum and the lowest id that holds it (ties to the lowest id, as
+    ``argmax``), the reduction :func:`vocab_parallel_argmax` makes over the ranks.
+    """
+    if enabled(model):
+        return vocab_parallel_argmax(model, hidden_states)
+    logits = _gathered_logits(model, hidden_states).to(torch.float32)
+    rows, vocab = logits.shape
+    _, token = _lowest_id_of_max(logits, _id_table(0, vocab, rows, logits.device))
+    return token.clamp(min=0.0, max=float(vocab - 1)).to(torch.int32)
+
+
 def top_k(model, hidden_states: torch.Tensor, k: int) -> tuple[torch.Tensor, torch.Tensor]:
     """The ``k`` largest logits of every row: ``(values fp32 [rows, k] largest first, global ids int32 [rows, k])``.
 
