@@ -75,8 +75,8 @@ entry). Run `bin/gate <worktree> --tools` when the merge is due (step 2 below); 
 **Pending, in order**
 
 1. 00208's numbers (above; section 7.6): the tiny gate first, then the hybrid's mode 1 against mode 0 and n-gram
-   against its own lookup-off rounds. If 00208 must be resubmitted before it starts (a CPU failure on `c9740515`:
-   `reports/spec-lookup/logs/b4_cpu/test_lookup_engine_c9740515.log`, `summary.txt`), use `--replaces 00208`.
+   against its own lookup-off rounds. The CPU checks of its build are green (section 7.6); to resubmit before it
+   starts, use `--replaces 00208`.
 2. **Merge after mtp-card-ready's own pull request** (merges are allowed again, BRIEF 00:50 UTC; one gate at a time).
    This branch contains mtp-card-ready through `f1aa2292`; on its merged head `test_engine_mtp.py` fails one test
    alone (`test_sampled_requests_through_the_speculative_engine`, "output with shape [1, 248320] doesn't match the
@@ -487,8 +487,12 @@ indexer, GDN interleave + glue cache, HC copy mode 2, cut interval 1000, candida
   written by replacing the file would not reach this job: then write this track's file too); the two scripts are
   hard links as well (`~/farm/spec-lookup/results/bench/`). Read once at the job's start; never for the tiny gate.
 
-CPU on the merged tree (`reports/spec-lookup/logs/b4_cpu/`): see the commit messages of `e2d673ef` and `14a79fd5`
-and the summary files. The lookup-off engine test (`test_lookup_engine.py::test_drafts_off_requests_*`): plain
+CPU on the merged tree (`reports/spec-lookup/logs/b4_cpu/`, VERIFIED): on `039c7d11` (build 4 + `74d3292f`) the
+fast set 152 passed and 1 failed (`test_lookup_probe.py`'s editl prompt-size guard: a large file of the integration
+tree grew; editl is not used), `test_align_commit_slice_writes.py` 10, `test_lookup_oracle_engine.py` 2,
+`test_ngram_end_to_end.py` 16, `test_lookup_engine.py` 13 and `test_engine_mtp.py` 17 passed (its sampled test
+included: build 4 carries `0d1be6fc`); on `c9740515` the fast set with the tiny and summary tests 167 passed and
+the same 1 failed, `test_lookup_engine.py` 15 passed (the two lookup-off tests included). The lookup-off engine test (`test_lookup_engine.py::test_drafts_off_requests_*`): plain
 1-row steps, the drafter never called; streams lossless but not bit-identical to the engine without speculation
 (6 of 9 identical, 3 at near-ties, two of them exact ties).
 
