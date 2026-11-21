@@ -10381,6 +10381,17 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         # positional arg to NgramProposer.propose(). Pass the statically
         # configured count to match the new signature.
         num_speculative_tokens = self.speculative_config.num_speculative_tokens
+        from vllm_gaudi.v1.spec_decode.flash_next_lookup import drafts_off_rows
+
+        # A request sent with vllm_xargs {"spec_lookup": 0} drafts nothing: the search skips a row without a sampled
+        # token, and with VLLM_HPU_FLASH_NEXT_NGRAM_PLAIN_STEPS=1 a step of such requests is a plain decode step.
+        off = drafts_off_rows([
+            getattr(getattr(self.requests.get(r), "sampling_params", None), "extra_args", None)
+            for r in self.input_batch.req_ids[:len(sampled_token_ids)]
+        ])
+        if off:
+            off_rows = set(off)
+            sampled_token_ids = [[] if i in off_rows else s for i, s in enumerate(sampled_token_ids)]
         draft_token_ids = self.drafter.propose(
             num_speculative_tokens,
             sampled_token_ids,

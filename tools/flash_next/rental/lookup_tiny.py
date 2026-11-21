@@ -34,9 +34,10 @@ Configurations (``--configs``, default ngram3,ngram8,mtp3-lookup,ngram3-search),
   ngram5-off     the n-gram server's own no-speculation reference (the spec-lookup TP8 job's ngram5-nospec arm):
                  n-gram k = 5 with VLLM_HPU_FLASH_NEXT_NGRAM_PLAIN_STEPS=1 and the step timer
                  (VLLM_HPU_STEP_TIMING=1, one record per step; the baseline server gets it too). Pass "off": every
-                 request with its lookup off (spec_lookup 0) must give the baseline's tokens exactly, verify no
-                 draft, run no verification step (the timer's step kinds) and give its decode steps the
-                 baseline's decode input rows per request count. Pass "ngram5": oracle drafts, as ngram3.
+                 request with its lookup off (spec_lookup 0) must verify no draft, run no verification step (the
+                 timer's step kinds) and give its decode steps the baseline's decode input rows per request
+                 count; its streams leave the baseline's only at near-ties, and its line says how many are
+                 identical. Pass "ngram5": oracle drafts, as ngram3.
 
 A configuration passes when its server starts, every request of every pass is answered, no stream leaves the
 baseline away from a near-tie, (passes with oracle drafts) drafts were accepted, and (the plain passes) the checks
@@ -295,13 +296,10 @@ def step_summary(records: list[dict]) -> dict:
 
 
 def plain_pass_problem(one: dict, base_shapes: dict | None) -> str | None:
-    """Why a pass with the lookup off is not the no-speculation reference, or None: its streams equal the server
-    without speculation token for token, it verified no draft, its steps are decode steps (never ``verify``), and
-    each request count's decode input rows are the baseline's."""
-    result = one["compare"]
-    if result["identical"] != result["requests"]:
-        return "%d of %d stream(s) differ from the server without speculation: %s" % (
-            result["requests"] - result["identical"], result["requests"], (result["ties"] + result["unclassified"])[:3])
+    """Why a pass with the lookup off is not the no-speculation reference, or None: it verified no draft, its steps
+    are decode steps (never ``verify``), and each request count's decode input rows are the baseline's. Its streams
+    are compared as every pass's (a difference only at a near-tie of the baseline); how many are identical to the
+    server without speculation is in its line (on CPU some leave it at an exact tie: test_lookup_engine.py)."""
     drafts = (one.get("acceptance") or {}).get("drafts") or 0
     if drafts:
         return "%d draft(s) verified" % drafts

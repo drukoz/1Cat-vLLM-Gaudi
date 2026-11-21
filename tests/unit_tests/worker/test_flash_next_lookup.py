@@ -5,8 +5,8 @@ import numpy as np
 import pytest
 
 from vllm_gaudi.v1.spec_decode.flash_next_lookup import (PAD_DRAFT, REQUEST_KEY, HybridLookup, SpecLookupMode,
-                                                         find_lookup_draft, lookup_mode, merge_drafts, pad_draft,
-                                                         request_mode)
+                                                         drafts_off_rows, find_lookup_draft, lookup_mode,
+                                                         merge_drafts, pad_draft, request_mode)
 
 K = 3
 
@@ -142,6 +142,14 @@ def test_request_mode_overrides_the_default():
     assert request_mode({REQUEST_KEY: "2"}, SpecLookupMode.HYBRID) == SpecLookupMode.LOOKUP_ONLY
     assert request_mode({REQUEST_KEY: 9}, SpecLookupMode.HYBRID) == SpecLookupMode.HYBRID
     assert request_mode({"other": 1}, SpecLookupMode.LOOKUP_ONLY) == SpecLookupMode.LOOKUP_ONLY
+
+
+def test_drafts_off_rows_are_the_requests_that_turned_lookup_off():
+    # the n-gram server's per-request switch: mode 0 drafts nothing; any other mode, a bad value or none drafts
+    args = [None, {REQUEST_KEY: 0}, {REQUEST_KEY: "0"}, {REQUEST_KEY: 1}, {REQUEST_KEY: 2}, {REQUEST_KEY: "x"},
+            {"other": 0}, {}]
+    assert drafts_off_rows(args) == [1, 2]
+    assert drafts_off_rows([]) == []
 
 
 def test_hybrid_merge_honours_per_request_modes():

@@ -24,7 +24,9 @@ What stands in for the Gaudi runtime (the same seams as the other CPU engine reh
 
 Plan (JSON): ``{"ckpt": DIR, "tie": float, "max_model_len": int, "max_num_seqs": int, "baseline_prefix_caching": bool,
 "scenarios": [...], "configs": [...]}``. A scenario is ``{"name", "requests": [{"id", "prompt_ids" | "turn_of",
-"suffix_ids", "max_tokens"}]}``: the requests of a scenario are submitted together (one batch, each request
+"suffix_ids", "max_tokens", "extra_args"}]}`` (``extra_args``, optional: the request's ``SamplingParams.extra_args``
+in the speculative engines, e.g. ``{"spec_lookup": 0}``; the baseline ignores it): the requests of a scenario are
+submitted together (one batch, each request
 finishing at its own length); a request with ``turn_of`` continues the conversation of an earlier scenario's
 request (its prompt is that request's prompt, plus its baseline output, plus ``suffix_ids``), so it starts with a
 prefix-cache hit. A config is ``{"name", "speculative_config", "prefix_caching", "oracle": null | {"schedule": [L,
@@ -517,8 +519,9 @@ def run_config(LLM, SamplingParams, plan: dict, config: dict, base: dict) -> dic
         # max_tokens, its tokens checked for validity, not against the greedy baseline (no per-request seed: the
         # fake HPU device cannot make a generator)
         temperature = float(config.get("temperature", 0))
+        # a request's "extra_args" reach the runner as its SamplingParams.extra_args (vllm_xargs on a server)
         params = [SamplingParams(temperature=temperature, max_tokens=r["max_tokens"], detokenize=False,
-                                 ignore_eos=temperature > 0)
+                                 ignore_eos=temperature > 0, extra_args=r.get("extra_args"))
                   for r in scenario["requests"]]
         if scenario.get("stagger"):
             record["streams"].update(_generate_staggered(llm, scenario, prompts, params, int(scenario["stagger"])))
