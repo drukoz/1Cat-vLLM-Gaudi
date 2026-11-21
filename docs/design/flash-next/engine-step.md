@@ -667,6 +667,28 @@ step while the host works.
   (626), `local scalar` (2). mtp-draft-graph's chain and `VLLM_HPU_VERIFY_LOGITS_IN_GRAPH` take out (3)'s flush,
   the pending-op launches of (5) to (8) and the read (6) (coordinator, 09:19 UTC): check with `window.py` when the
   chain job runs.
+- **The cuts at TP2 (MEASURED, 00235, tiny, 00205's flags):** every cut inside the verify forward (11 segments) and
+  the draft passes (10) is a collective: the token embedding's all-reduce (vocab-parallel, `embedding masked_fill_
+  allreduce_`: the end of 00205's `embed` segment), per layer the attention / GDN `o_proj` and the MoE all-reduces, the
+  PLE n-gram table's all-reduce at layer 1 (the end of 00205's `ple` segment; the real model's table is FP8), and in the
+  drafts the two `fc` all-gathers (`gather_output`; `VLLM_HPU_MTP_REPLICATED_FC=1` removes them). So 00205's two front
+  rows without `coll` are all-reduces issued more than 150 us after their segment. Between the graphs, besides the
+  nine of 00223: the LM head's logits all-gather outside the graphs, 4 per step (verify and 3 drafts); the pre-verify
+  mark_step launches nothing with `PLE_HOST_NGRAM_IDS=1`. No tensor printing in the tiny model, captures included.
+- **The copied inputs of build 5 (MEASURED, integration's 00222, `VLLM_HPU_LOG_UNMATCHED_GRAPH_INPUTS`):** a verify
+  replay copies 54 inputs at every bucket: ids `[rows, 1]` int32, two int32 vectors, positions `[rows]` int64, and 50
+  caches (24 conv `[1154, 5, 1280]` bf16, 24 SSM `[1154, 6, 128, 128]` fp32, 2 FP8 KV `[4774016, 1, 256]`), which
+  reach the wrapped forward only as `kv_caches=` (HpuModelAdapter.forward drops it). The bridge skips each self-copy
+  (`copy_hpu_lazy_D2D`: same tensor id) after the dispatch, the running hash and, while the cache's launch is in
+  flight, `JoinPendingLaunchThread()`; 00205's trace has the 54 `copy_` before its verify replay. The per-pass draft
+  graphs copy 5 to 8 inputs (the CPU prediction: hidden rows, positions, the lattice's views), the one-graph draft
+  loop 12, and prompt forwards (57) the same 50 caches. Lever: **`VLLM_HPU_KV_CACHES_IN_GRAPH_ARGS=0`** (default 1;
+  side branch `8b7cb498`; coordinator GO 12:22 UTC): `_execute_model_generic` leaves `kv_caches` out (every prompt,
+  decode and verify forward; the draft graphs never pass it). CPU: same tokens, no `kv_caches` in any forward. Card:
+  00250 (tiny, one card: the flag 1 then 0, the unmatched log, commit_turns_probe's block crossings, prefix-cache
+  hits, repeats; card rules 10 / 11: the copy_ might have ordered the in-place cache writes), then a real-model A/B.
+  Rank skew in build 5 (per-step records, placement on): `replay_first_ms` p50 6.2-6.5 ms on all 8 workers at 96 rows;
+  the placement removed 00205's skew.
 - **The tensor-printing reads (coordinator 09:58 UTC, from async-sched's 00220 census): one capture step, not every
   step (MEASURED).** In `nospec-async-census/timing/step_timing_worker_r0_*.jsonl` the item, tolist, scalar and
   all_reduce counters have n = 1 in the first rows=8 window: one step made 1454 `.item()`, 384 `.tolist()`, 500 scalar
