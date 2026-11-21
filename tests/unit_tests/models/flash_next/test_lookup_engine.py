@@ -169,6 +169,34 @@ def test_plain_steps_when_no_request_drafts(plain_run):
     _compare(plain_run, "plain-pc")
 
 
+@pytest.fixture(scope="module")
+def join_run(tiny_checkpoint, tmp_path_factory) -> dict:
+    """A 1-token prompt joining a batch that verifies drafts (async-sched's finding, 2026-11-21): the 100-token prompt
+    first, the 1-token prompt two engine steps later. vLLM's scheduler then pads the 1-token request to 1 + k with
+    -1 draft placeholders (uniform speculative shapes); the n-gram server with oracle drafts (prefix caching off and
+    on) and MTP k = 3 (prefix caching on)."""
+    plan = _plan(Path(tiny_checkpoint))
+    reference = json.loads((Path(tiny_checkpoint) / "reference.json").read_text(encoding="utf-8"))["prompts"]
+    by_len = {len(p["prompt_ids"]): p["prompt_ids"] for p in reference}
+    plan["scenarios"] = [{"name": "join-1", "stagger": 2, "requests": [
+        {"id": "join-100", "prompt_ids": by_len[100], "max_tokens": MAX_TOKENS},
+        {"id": "join-1", "prompt_ids": by_len[1], "max_tokens": MAX_TOKENS}]}]
+    oracle = {"schedule": [K], "tamper_every": 0}
+    plan["configs"] = [
+        {"name": "join-ngram-nopc", "speculative_config": NGRAM, "prefix_caching": False, "oracle": oracle},
+        {"name": "join-ngram-pc", "speculative_config": NGRAM, "prefix_caching": True, "oracle": oracle},
+        {"name": "join-mtp-pc", "speculative_config": {"method": "mtp", "num_speculative_tokens": K},
+         "prefix_caching": True, "oracle": None},
+    ]
+    return _run_child(plan, tmp_path_factory.mktemp("lookup_engine_join"))
+
+
+@pytest.mark.parametrize("config", ["join-ngram-nopc", "join-ngram-pc", "join-mtp-pc"])
+def test_one_token_prompt_joining_a_verifying_batch(join_run, config):
+    assert "error" not in join_run["configs"][config], join_run["configs"][config].get("error")
+    _compare(join_run, config, min_matched=60)  # two requests of 48 tokens
+
+
 def _divergences(record: dict, config: str) -> tuple[int, list, list]:
     """``(matched, ties, breaks)`` of ``config`` against the baseline: per request the first token that differs is a
     tie when the speculative token is among the baseline's recorded best tokens there, at most ``TIE`` below the
@@ -190,14 +218,14 @@ def _divergences(record: dict, config: str) -> tuple[int, list, list]:
     return matched, ties, breaks
 
 
-def _compare(record: dict, config: str) -> int:
+def _compare(record: dict, config: str, min_matched: int = MIN_MATCHED) -> int:
     """Every stream of ``config`` equals the baseline up to its first difference, which must be a near-tie of the
     baseline (``_divergences``); returns the tokens that matched."""
     matched, ties, breaks = _divergences(record, config)
     assert not breaks, (f"{config}: streams leave the engine without speculation away from a near-tie "
                         f"(request, token index, speculative token, its baseline log-probability below the best): "
                         f"{breaks}")
-    assert matched >= MIN_MATCHED, f"{config}: only {matched} tokens matched before the first near-tie differences"
+    assert matched >= min_matched, f"{config}: only {matched} tokens matched before the first near-tie differences"
     return matched
 
 

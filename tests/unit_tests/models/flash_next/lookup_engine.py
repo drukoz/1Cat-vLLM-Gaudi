@@ -332,6 +332,26 @@ def run_baseline(LLM, SamplingParams, plan: dict) -> dict:
     return streams
 
 
+def _generate_staggered(llm, scenario: dict, prompts: list, params: list, every: int) -> dict:
+    """The scenario's requests added one at a time, the next one ``every`` engine steps after the last, so a request
+    can join a batch that is verifying drafts; ``{request id: generated token ids}``."""
+    engine = llm.llm_engine
+    pending = [(r["id"], p, sp) for r, p, sp in zip(scenario["requests"], prompts, params)]
+    out: dict[str, list[int]] = {}
+    steps = 0
+    while pending or engine.has_unfinished_requests():
+        if pending and steps % every == 0:
+            request_id, prompt, sampling = pending.pop(0)
+            engine.add_request(request_id, {"prompt_token_ids": list(prompt)}, sampling)
+        for result in engine.step():
+            if result.finished:
+                out[result.request_id] = list(result.outputs[0].token_ids)
+        steps += 1
+        if steps > 100000:
+            raise RuntimeError("the staggered scenario did not finish")
+    return out
+
+
 def run_config(LLM, SamplingParams, plan: dict, config: dict, base: dict) -> dict:
     """One speculative engine over every scenario; each request runs to its baseline's tie-free length."""
     env = dict(config.get("env") or {})
@@ -500,6 +520,9 @@ def run_config(LLM, SamplingParams, plan: dict, config: dict, base: dict) -> dic
         params = [SamplingParams(temperature=temperature, max_tokens=r["max_tokens"], detokenize=False,
                                  ignore_eos=temperature > 0)
                   for r in scenario["requests"]]
+        if scenario.get("stagger"):
+            record["streams"].update(_generate_staggered(llm, scenario, prompts, params, int(scenario["stagger"])))
+            continue
         outs = llm.generate([{"prompt_token_ids": p} for p in prompts], params, use_tqdm=False)
         for request, out in zip(scenario["requests"], outs):
             record["streams"][request["id"]] = list(out.outputs[0].token_ids)
