@@ -6,7 +6,7 @@ results are under `/Volumes/Storage/Claude/gaudi-work/reports/async-sched/card/`
 
 ## Handoff (if this agent stops)
 
-Updated 2026-11-21 12:31 UTC.
+Updated 2026-11-21 13:07 UTC.
 
 - **Card results so far** (placement on, MTP timers 0, compare arms within a job only):
   - 00220, mode 1 with `d3fb1b11` (MEASURED). ms/token sync → async: 1 stream greedy 27.9 → 29.4, sampled
@@ -59,26 +59,34 @@ Updated 2026-11-21 12:31 UTC.
     test_flash_next_host_ngram), M1 keeps copies of host-made inputs, no draft scatter under M1"), then
     `gh pr merge --merge`. Integration takes the four commits for build 6 (they cherry-pick cleanly onto
     `2c84deea`).
-- **Card job 00240** `real8-async-m3d` (all, 85 min; replaced 00237, which replaced 00233 and 00229; starts after
-  mtp-draft-graph's 00230, by 14:21 UTC at the latest).
-  - Job branch `feat/flash-next-gaudi-async-sched-m3-b5` at `1a70d353` (never merge it; `1a70d353` makes a failed
-    `tiny-m3` gate leave out the `async3` arms, which `107dcf9a` of 00237 did not): the M2 job branch
+- **00230** (mtp-draft-graph's chain job, MEASURED, `reports/mtp-draft-graph/card/00230-real8-chain-b5b`): M1's
+  `tiny-m1` gate passed (208 of 223 verification steps advanced on the device, 0 differences); `m1sw` (one server,
+  mode 2, chain stage A, M1 switched at runtime): M1 costs ms/token 24.7 → 26.6 and 25.0 → 25.6 at 32 streams
+  (+1.2, +4.9 %), 12.7 → 13.4 and 12.7 → 13.6 at 1 stream (+0.8); texts identical, acceptance unchanged; 87 % of
+  verification steps advanced. In mode 2 M1 is overhead only: mode 3 has to win more than that.
+- **Card job 00256** `real8-async-m3e` (all, 85 min; replaced 00240, which replaced 00237, 00233 and 00229; starts by
+  13:43 UTC).
+  - Job branch `feat/flash-next-gaudi-async-sched-m3-b5` at `cd49d9f7` (never merge it; `1a70d353` makes a failed
+    `tiny-m3` gate leave out the `async3` arms; `cd49d9f7` adds the word `m1off` and `59b54a77`, the scatter skip):
+    the M2 job branch
     `44a51fcd` (build 5 + their chain + M1 + M2) + M3 + the M1 fix + harness: gates `tiny-m3pc1` (prefix caching on,
     mode 2, M3 = 1; passes only with M3's check line at 0 differences) and `tiny-m3pc2` (mode 3 + M3 = 2; passes only
     if steps were issued early and nothing acted as 2), word `m3a` (M3 = 2; the arm is left out when a `tiny-m3pc`
     gate failed), word `turns` (`tools/flash_next/rental/commit_turns_probe.py` after the probe, block
     `HEADLINE_TURNS_BLOCK=512`). CPU on the branch: align 50, spec 41, engine align 3, engine device inputs 8, early 3.
   - Arms in order: `tiny-m3 mtp2-async3-cuts-nopc-greedy mtp2-async-cuts-nopc-greedy` (M2 isolated, prefix caching
-    off), `tiny-m3pc1 tiny-m3pc2`, `mtp2-async3-cuts-greedy-m3a-turns mtp2-async-cuts-greedy-turns` (prefix caching on).
+    off), `tiny-m3pc1 tiny-m3pc2`, `mtp2-async3-cuts-greedy-m3a-turns mtp2-async-cuts-greedy-turns` (prefix caching on),
+    `mtp2-async-cuts-greedy-m1off` (the best mode 2: M1 off).
   - Env: build 5's dense env (`VLLM_HPU_MOE_DENSE=1 VLLM_HPU_MOE_DENSE_MIN_TOKENS=1 VLLM_MOE_CHUNK=0,64,8192
     VLLM_MOE_TOKEN_BOUNDARY=16,512,1000000 HEADLINE_REQUIRE_DENSE=1`), prefix flags,
     `PT_HPU_SYNCHRONOUS_ACC_QUEUE_FLUSHING=1`, `VLLM_HPU_QSA_SLOT_SHIFT=0`, chain + draft graph + I01 +
     `SPEC_DEVICE_INPUTS=2`, levels 32/8/1, greedy, 2 rounds, step timer mode 1, MTP timers 0,
     `HEADLINE_PLACE_SWITCH=/results/switches/place`, `HEADLINE_HOLD_S=5040`. The waiter writes
-    `reports/async-sched/logs/wait_00240.out`; else `bin/farm fetch async-sched 00240 00240-real8-async-m3d`.
+    `reports/async-sched/logs/wait_00256.out`; else `bin/farm fetch async-sched 00256 00256-real8-async-m3e`.
   - Read: the `tiny-m3`, `tiny-m3pc1`, `tiny-m3pc2` lines in the job log; `python3 -I
     reports/async-sched/tools/ab_table.py <dir> --pairs mtp2-async3-cuts-nopc-greedy:mtp2-async-cuts-nopc-greedy,
-    mtp2-async3-cuts-greedy-m3a-turns:mtp2-async-cuts-greedy-turns`; `timer_spans.py <dir>` (mode 3's gain shows as
+    mtp2-async3-cuts-greedy-m3a-turns:mtp2-async-cuts-greedy-turns,mtp2-async3-cuts-greedy-m3a-turns:mtp2-async-cuts-greedy-m1off`;
+    `turns_table.py <dir> --pair mtp2-async3-cuts-greedy-m3a-turns:mtp2-async-cuts-greedy-turns`; `timer_spans.py <dir>` (mode 3's gain shows as
     prepare and forward issue under the device's busy time); `turns.json` in both turns arms: `again` equals `first`,
     `eight_again` equals `eight`, `next_turn` has `cached_tokens` > 0.
 - **00230** is mtp-draft-graph's chain job (build 5 + chain + my M1 as cherry-picks): it carries M1's A/B, the
@@ -92,7 +100,7 @@ Updated 2026-11-21 12:31 UTC.
   server of a job had 16 CPUs fewer: 00220 and 00221 ran their arms at 144, 128 and 112 CPUs of 152 (first to
   third), so their sync baselines had 16 fewer than the async arms (collectives and integration saw no decode loss
   from it in 00222, only longer loads). The old wrapper: `reports/async-sched/bench/place_wrap_363bcf9d.sh`.
-- **Next**: read 00240; s3's PR when its gate is green; the persistent-inputs
+- **Next**: read 00256; s3's PR when its gate is green; the persistent-inputs
   job (mode 2 and mode 3, PI off/on, prefix caching on, 32/8/1; needs PI on the program head and s3); sampled with
   mtp-draft-graph's D2 (they have no D2 yet: the chain refuses sampled requests).
 - The 1-token prompt note: spec-lookup's `005e1ff9` is not on the program branch yet. When it is, put prompt 0 back
