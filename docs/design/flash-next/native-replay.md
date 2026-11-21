@@ -658,6 +658,29 @@ the reserved vCPUs, re-applied every 2 s. Also a rule for every placement here: 
 2k+1; `VLLM_HPU_WORKER_CPU_PIN=2` puts the main thread on its share's first CPU (19r) and lets other threads use its
 sibling (19r xor 1), so mode 2 needs the sibling kept free (a fix for the flag, after 00189 says it pays).
 
+### 7.13 The sibling-aware placement at TP8: job 00189 (real model, integration build 4)
+
+MEASURED (the collectives track's job 00189, ended 08:40 UTC; one server start per arm; the arms ran on lean3a with
+the prepared replay, so the timers give per-rank costs): real-pin (`VLLM_HPU_WORKER_CPU_PIN=1` plus this track's
+`place.sh`, rule a^1, after health) against real-lean (same build and flags, no pin), greedy steady ms per step:
+1 stream 27.9 / 28.1 against 42.1 / 37.7; 8 streams 44.8 / 45.0 against 67.0 / 66.4; 32 streams 45.8 / 46.7 against
+48.8 / 51.4. Per-rank us per launch with the pin: 1 stream 122 102 120 130 156 128 119 131 (median 125, no slow rank,
+slowest 1.25x the median); 8 streams median 119, none slow; 32 streams median 133. Unpinned: real-lean median 145 at 1
+stream (one rank 1.54x), the rebuild arm median 175. place.sh's first pass moved 2058 threads, none failed. **The
+slow-rank pairs are gone, and the 1- and 8-stream steps drop by 10-14 and 22 ms: the largest single gain so far.**
+Cost: the pinned server took 14.9 min to its first throughput line against 7.5-8.1 min unpinned (INFERRED: mode 1
+holds every rank to its 18 CPUs through weight load, compile and warmup). So `VLLM_HPU_WORKER_CPU_PIN=3` now pins
+nothing before warmup and places after it (0e055831); job 00219 tests place-only (no pin flag) the same way.
+
+**00219, place-only (MEASURED, one server start, ended about 09:15 UTC):** same build and flags, no pin flag,
+`place.sh` after health. Load 7.7 min to the first throughput line (as unpinned). Greedy steady ms per step: 1 stream
+24.0 / 23.6, 8 streams 40.8 / 38.8, 32 streams 42.6 / 42.0 (pin + place: 27.9 / 28.1, 44.8 / 45.0, 45.8 / 46.7;
+unpinned: 42.1 / 37.7, 67.0 / 66.4, 48.8 / 51.4). Per-rank us per launch: 1 stream median 105 (98-124), 8 streams
+median 98, 32 streams median 114; no slow rank. First pass moved 5117 threads, none failed. The NUMA concern (memory
+touched during an unrestricted load) did not show (`numa_balancing=1`). **So: nothing pinned until warmup, then the
+sibling-aware placement**, which is what `VLLM_HPU_WORKER_CPU_PIN=3` now does inside the worker (place.sh also moves
+every other process of the container off the reserved vCPUs; mode 3 only the engine core: to be card-checked).
+
 ## 8. Build steps
 
 | Step | What | Proof off the card | Card | State |
@@ -675,6 +698,106 @@ sibling (19r xor 1), so mode 2 needs the sibling kept free (a fix for the flag, 
 | 11 | lean3: sub-timers, then cuts (a)-(d) of section 7.10 | | | planned |
 
 ## Handoff (if this agent stops)
+
+**10:01 UTC (date -u).** 00219 read (section 7.13: place-only, nothing pinned before warmup, is the fastest: 1 stream
+24.0 / 23.6 ms, load 7.7 min). lean5's qualification is now job **00234** `real8-bridge-reuse3` (collectives, 120 min,
+starts by 16:25 UTC at the latest) on build 5's image (`farm-integration:eb21ac75a7c8`, dense MoE from 1 token: about
+100 launches per 1-stream step instead of 148, kernel-fixes' 00213), lean6m on every lean arm, MISS_LOG=200 in
+real-lean5-verify, place-only placement. The next pull request (mode 3, the CPU tools, the bridge patches, design
+7.10-7.13) waits for its gate on `ac63f272` (the branch merged with program head adbcff30, #22; my 7 test files pass
+on it; body `reports/native-replay/probes/pr_body_3.txt`).
+
+**09:02 UTC (date -u).** 00189 read (section 7.13): pin + `place.sh` removes the slow ranks, 1 stream -10 to -14 ms,
+8 streams -22 ms; the pin during load costs about 7 min of server start, so mode 3 now places only after warmup
+(0e055831). Build `lean6m-43fdd6850644` (published 09:01:25): lean6h2 plus `PT_HPU_HPUGRAPH_STATIC_PLAN_MISS_LOG=N`
+(per launcher that missed, every N prepared launches: recipe, first and last op, misses by reason, the first input
+at another address with its index, dtype and shape), for engine-step's persistent inputs; offered to collectives for
+00210's lean5 arms (same behaviour with lean5's flags) or the next bridge slot. Job 00219 (collectives) tests
+place-only (no pin flag).
+
+**08:30 UTC (date -u).** Builds: `lean6-73203512bf62` (lean5 + `PT_HPU_HPUGRAPH_LEAN_COLLECTIVE`, deferred),
+`lean6h2-15f100baff2e` (lean6 + `PT_HPU_H2D_TIMING=N`: per thread every N host-to-device copies one line
+`HPU_H2D_TIMING ... host_us blocking wait_us pinned bytes multi transfers`; for engine-step's copy census; patches
+`lean6h.patch`, `lean6h2.patch`). Answers sent to engine-step (agent a8a87f4c2008bde9c), from the bridge source:
+(1) with `disable_tensor_cache=True` the wrapper binds a marked input directly only when its own lazy tensor is an input
+of a captured segment ("matched", `habana_lazy/lazy_executor.cpp` `saveInputsAndOutputs`); unmatched inputs are
+copied with a lazy `copy_` before every replay (graphs.py `copy_to`), flushed as their own recipe; replay checks sizes
+and the storage offset (`patch_exact`); views and slices passed in are likely unmatched; (2) any view handed to a custom
+op fails at launch (00043), not the offset or the strides; (3) the bridge uploads Python scalar operands of a lazy graph
+with one `copy_scalars_to_device` multi-transfer per flushed graph, and a random graph's seed on every replay; (4) a
+captured segment ends at every lazy flush: collectives, host reads (`.item()`, D2H), data-dependent ops (`nonzero`,
+`unique`, boolean-mask indexing), which also switch on **stage submission** (default on: then a flush after every
+`PT_HPU_MAX_COMPOUND_OP_SIZE_SS` = 10, 20, 40, ... top-level ops until a host mark_step), an H2D copy into a lazily
+computed tensor, CPU fallbacks, stream and event calls; the reasons are the `PT_IRGRAPH`/`PT_LAZY` debug messages
+"step marker due to ..." in `pytorch_log.txt`; first A/B for the small "embed" and "PLE cast" segments:
+`PT_HPU_MAX_COMPOUND_OP_SIZE_SS=1000000`.
+
+**08:08 UTC (date -u).** lean5's qualification is job **00210** `real8-bridge-reuse2` (collectives track, all cards, 120 min,
+after async-sched's 00202/00203; replaces 00198): tiny-stock, tiny-lean4-nan, tiny-lean5-verify; real-ref, real-lean5,
+real-lean5-verify, real-lean4 (fallback, last); text_check 1/32 (+ churn on the lean5 arms); plan_bad 0 and churn
+texts equal fail the job otherwise. lean6 (`patches/lean6.patch`, PT_HPU_HPUGRAPH_LEAN_COLLECTIVE: the lazy collective
+issued inline without the job thread's copies, about -3 to -4 us per launch) is deferred by the coordinator. Sent to
+engine-step (bridge view of the census's 178 H2D copies and 13 copy-only graphs per 32-stream MTP step): a CPU->HPU
+copy is an immediate DMA on the DMA_H2D sub-stream, never a graph; with `non_blocking=False` (the default) the bridge
+spin-waits on the host until it completes (`backend/helpers/tensor_utils.cpp` `copy_data_to_device`); an HPU->HPU
+copy outside a captured graph is a lazy op flushed as its own recipe at the next replay or mark_step (a full launch);
+batching: one pinned host buffer and one persistent device buffer per dtype, one `non_blocking` copy per step, the
+device views as the graph's static inputs (double-buffered under async scheduling: the bridge's H2D waits only for
+the destination's last writer).
+
+**08:05 UTC (by `date -u`; earlier entries of this session may be off by up to an hour): lean5 built and VLLM_HPU_WORKER_CPU_PIN=3 pushed.**
+- **Mode 3** (773a7f7c, default off): `VLLM_HPU_WORKER_CPU_PIN=3`, `VLLM_HPU_WORKER_CPU_SIBLINGS` (xor1 default, none):
+  after warmup the model thread on share[1], its host sibling share[0] free of the worker's and the engine core's
+  threads, the worker's other threads on the rest, a daemon keeps later threads off both; 7 CPU tests.
+- **lean5** (`lean5-984bf2249087`, `patches/lean5.patch`, published 08:01:58 UTC; bridge clone commit after lean4 on
+  `native-replay-lean`): the static launch plan behind `PT_HPU_HPUGRAPH_STATIC_PLAN` (needs REUSE >= 1). After an
+  unplanned prepared launch the launcher keeps, per ring slot, the launch info as graph::launch left it (physical
+  addresses), the untranslated handles (graph::launch's `addresses`, copied into a thread-local only when the flag
+  is set), the input and output buffers, the intermediates (kept) and the defragmentation generation (new counter,
+  bumped at `device_memory::defragment_memory` entry). A hit (same input buffers, kept outputs and intermediates held
+  by nobody else, same generation) skips update_patching_table, patch_launch_info, allocation, translation and the
+  allocator walks: the tensor infos get the addresses update_patching_table would patch, outputs and in-place outputs
+  are built as there (`create_outdup`), graph::launch only enters the defragmenter's critical section (an empty
+  `lock_addresses`) and launches. A defragmentation between the check and the critical section, or a constant swap
+  by the inference-mode scan (recorded by `update_syn_launch_info` during a planned launch), makes graph::launch
+  translate the handles after all and drops the plan. `=2`: every plan re-translated before use, mismatches counted
+  as `plan_bad`. Not planned (lean4 path): DMA inputs, shape tensors, host-to-device or external tensors,
+  out-duplicates of intermediates or outputs, dynamic shapes. `PT_HPU_HPUGRAPH_STATIC_PLAN_BUMP_EVERY=N` forces
+  invalidations. Timer line: `plan_try plan_hit plan_capture plan_bad defrag_generation`. Estimate (from 00181's
+  split): about 85-95 us per planned launch with inline collectives against 134 (00181 inline arm). The build
+  container `nr-bridge-dev` now runs on the new build cores 18-19, 56-57, 94-95, 132-133 (BRIEF 06:58).
+- **00198** (collectives track, about 12:30-13:00 UTC): arms on the lean5 wheel: tiny-stock, tiny-lean4-nan,
+  tiny-lean5-verify (STATIC_PLAN=2, REUSE=2, BUMP_EVERY=500); real-ref (all off), real-lean4 (REUSE=1),
+  real-lean5-verify (REUSE=2, STATIC_PLAN=2, BUMP_EVERY=5000, inline collectives; text_check 1/32/churn),
+  real-lean5 (REUSE=1, STATIC_PLAN=1, inline; text_check 1/32/churn). `text_check.py --churn` (node md5 daca88b9...):
+  each prompt again alone after a 32-stream burst, a 20K-token prefill and an 8-stream burst; must equal texts_1.
+- Next (coordinator 07:56): lean6, a leaner bridge-side collective issue (inline: no PtTensorInfo copies, no
+  promise/future, cached 2-address translation; about -4 to -6 us per collective, -3 to -4 us per launch).
+  Fewer launches cannot come from the bridge: a launch is a recipe plus the collectives that end it; lazy mode must
+  cut at every collective (HCCL outside Synapse recipes; the next recipe needs its result); no multi-recipe launch.
+
+**06:40 UTC: lean4 built** (`lean4-44fe39c26127`, `patches/lean4.patch`, published 06:28:34, VERIFIED in the wheel; the
+coordinator approved it at 06:25 with a harder qualification). Output-buffer reuse behind
+`PT_HPU_HPUGRAPH_PREPARED_REUSE` (only with `PT_HPU_HPUGRAPH_PREPARED_REPLAY=1`): the bridge allocates every launch's new
+outputs twice over (patch_alloc 14.4 us: `create_empty_tensor` gives a handle; syn_lock 9.9 us: `lock_addresses` backs
+each new handle with device memory under the pool mutex, after a third allocator walk; VERIFIED in
+`backend/synapse_helpers/device_memory.cpp`), about 24 of 144 us per launch. lean4 keeps each prepared launcher's
+outputs of the last two launches (recipe output order, at most `PT_HPU_HPUGRAPH_PREPARED_REUSE_MAX_KB`, default 4096)
+and reuses the set of two launches ago through the bridge's allocated-outputs path when the launcher holds the only
+reference to every tensor and storage (two back, because the graph's lazy outputs keep the last set until they are
+rebound after the next launch; safe in this mode because every device user holds a reference until its work is done:
+the recipe's and the collective's resource holders; stream allocator off, post_record 0). `=2`: also a NaN fill
+(`synMemsetD16/D32Async` on the launch stream) of every reused floating-point buffer right before the launch. Counters
+`reuse_try`, `reuse_hit`, `reuse_poison` per launch in the timer line. Qualification (coordinator): tiny TP8 tokens with
+=2 and =1; real model, `tools/flash_next/replay/text_check.py` (6 prompts x 600 greedy tokens at 1 stream must equal
+the REUSE=0 arm; 32 streams coherent; on the node `~/farm/native-replay/late/text_check.py`, md5 1d8cb0c9...), hit rate
+and sub-timers per rank. Arms sent to the collectives track for the bridge job after 00189 (tiny-lean4-nan, tiny-lean4,
+real-ref = lean4 REUSE=0, real-lean4-nan, real-lean4; place.sh in the real arms if 00189 shows the pin pays).
+
+**06:20 UTC: pull request #21 merged** into `feat/flash-next-gaudi` (merge commit 42d70a7e; gate on 63693b83: 100 files,
+2 red = the two rental tests that also fail on the program head's own snapshot; everything of this branch up to
+f0c36b39 is on the program branch). 00193 found the sibling rule a^1 (section 7.12); `place.sh` (rule a^1) is staged
+in 00189's pin arm by the collectives track.
 
 **State at 2026-11-21 05:35 UTC (newest first).** 00181 is read (section 7.11: run_prep fixed; the collective
 futures are the biggest bridge item; inline collectives -10 us per launch; **two slow ranks per server at 1 and 8
