@@ -640,7 +640,7 @@ while [ "$i_arm" -lt "${#ARMS[@]}" ]; do
                         ;;
                     hpulog) arm_env+=(HPU_GRAPH_INPUT_LOG=1 "PYTHONPATH=$HERE/hpulog${PYTHONPATH:+:$PYTHONPATH}") ;;
                     greedy) greedy_only=1 ;;
-                    sw | dg32 | cap | kvlp | kvlpfb | kvlpc | kvlpfloor | long | turns) post_words+=("$w") ;;
+                    sw | dg32 | cap | kvlp | kvlpfb | kvlpc | kvlpfloor | long | turns | pf) post_words+=("$w") ;;
                     *) bad_word="$w" ;;
                 esac
             done
@@ -741,7 +741,7 @@ while [ "$i_arm" -lt "${#ARMS[@]}" ]; do
             fi
             # The post steps (serve_probe.sh --post-cmd), in the order sw, cap, kvlp / kvlpfb, long. Each command is
             # one bash -c string; serve_probe.sh runs it in the arm's folder with SERVE_PORT set.
-            for w in sw dg32 cap kvlp kvlpfb kvlpfloor kvlpc long turns; do
+            for w in sw dg32 cap pf kvlp kvlpfb kvlpfloor kvlpc long turns; do
                 [[ " ${post_words[*]:-} " == *" $w "* ]] || continue
                 case "$w" in
                     sw | dg32)
@@ -779,6 +779,15 @@ while [ "$i_arm" -lt "${#ARMS[@]}" ]; do
                         turns_cmd=("$PYTHON" "$TREE/tools/flash_next/rental/commit_turns_probe.py" --model fn
                             --block "${HEADLINE_TURNS_BLOCK:-896}" --out "$ARM_DIR/turns.json")
                         post_args+=(--post-cmd "$(printf '%q ' "${turns_cmd[@]}") --port \"\$SERVE_PORT\" 2>&1 | tee turns.log; exit \${PIPESTATUS[0]}")
+                        ;;
+                    pf)
+                        # build 6: long prompts on this server (decode_scaling.py's ctx round: a warm and a measured
+                        # round of N streams with about TOKENS-token prompts, HEADLINE_PF_CTX, default 1:64000), so the
+                        # step timer records prompt chunks (2,048 tokens each) at growing context: scaling_pf.json
+                        pf_cmd=("$PYTHON" "$HERE/decode_scaling.py" --model fn --levels "" --tokens 32 --warm-tokens 8
+                            --no-sampled-check --ctx "${HEADLINE_PF_CTX:-1:64000}" --timeout "${HEADLINE_PROBE_TIMEOUT:-1800}"
+                            --out "$ARM_DIR/scaling_pf.json")
+                        post_args+=(--post-cmd "$(printf '%q ' "${pf_cmd[@]}") --port \"\$SERVE_PORT\" 2>&1 | tee probe_pf.log; exit \${PIPESTATUS[0]}")
                         ;;
                     kvlp | kvlpfb | kvlpfloor | kvlpc)
                         # kvlpfloor (build 6): a second bf16 server's raw run against the job's first good bf16 file,
