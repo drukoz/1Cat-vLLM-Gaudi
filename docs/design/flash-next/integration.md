@@ -9,7 +9,7 @@ Labels: MEASURED (card, with its file), VERIFIED (CPU test or code line), INFERR
 
 ## Handoff (if this agent stops)
 
-Updated 2026-11-21 00:58 UTC (fourth agent of the track, Opus 5.5, started 23:12 UTC).
+Updated 2026-11-21 01:20 UTC (fourth agent of the track, Opus 5.5, started 23:12 UTC).
 
 **Now (00:58 UTC):** build 1 is measured (job **00128**, tables below; job **00121** tiny gate passed). **Build 2 is
 job 00156** `real8-build2b` (all cards, hold 60 min, commit `b2a7f62f` = plugin code `a39d1f48` + mtp-card-ready's
@@ -145,7 +145,18 @@ checkpoint's temperature 1.0, top_k 20, top_p 0.95). Reference (program head, 00
 | 1 (00128) | MTP k = 3 | 1 | 66 | 24.3 (41.1) | not run | | 2.72 |
 | 1 (00128) | MTP k = 3 | 8 | 81 | 29.3 (34.1) | not run | | 2.76 |
 | 1 (00128) | MTP k = 3 | 32 | 106 | **40.7 (24.6)** | not run | | 2.61 |
-| 2 (00156) | (pending) | | | | | | |
+| 2 (00156) | no spec (A) | 1 | 44.0 / 33.0 | 33.0 (30.3) | 43.2 / 31.6 | 31.6 (31.7) | |
+| 2 (00156) | no spec (A) | 8 | 70.0 / 69.9 | 69.9 (14.3) | 58.8 / 69.3 | 58.8 (17.0) | |
+| 2 (00156) | no spec (A) | 32 | 53.7 / 62.6 | 53.7 (18.6) | 58.9 / 52.7 | 52.7 (19.0) | |
+| 2 (00156) | B, C | (pending) | | | | | |
+
+Build 2 readings (arm A, two measured rounds per level, `a / b` = round 1 / round 2; the better round in the
+ms-per-token column): sampled equals greedy now (server0.log: `Candidate sampling (VLLM_HPU_CANDIDATE_SAMPLING=1): a
+sampled decode step drew in the logits region ... from the gathered logits`, no fallback line); a 32-stream step varies
+by about 10 ms between rounds of one server (also in build 1: 67.3 / 51.1); **8 streams is slower than 32 in both
+builds** (70.0 / 69.9 here, 58.7 in build 1, 45.9 on the program head): systematic, unexplained (candidates: the QSA
+request shard at 1 request per rank with its 12 all-gathers, grouped attention from 8 rows). Arm B's eight
+`VLLM_HPU_WORKER_CPU_PIN=1: rank r module m: share r of 8, CPUs 19r-(19r+17)` lines are in its server0.log.
 
 ## Merge log (what the conflicts were)
 
