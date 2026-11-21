@@ -11,50 +11,54 @@ This track's harness refuses report files outside the repository, so the handoff
 
 ## Handoff (if this agent stops)
 
-Last update: **2026-11-21 01:15 UTC** (fourth agent, Opus 5.5; the node was extended to about 00:00 UTC on
-2026-11-22). Branch `feat/flash-next-gaudi-engine-step`, head `d5ad5e67` plus documents (program head `5c1e8219`,
-PR 15, merged in at `425fb2ee`), pushed. Scratch files, probes and card results:
-`/Volumes/Storage/Claude/gaudi-work/reports/engine-step/` (`card_job/` = submit logs, `card/` = fetched results,
-`logs/` = CPU test and gate logs, `probes/` = Mac probes, `merge-wt/` = the gate's snapshot of the branch).
+Last update: **2026-11-21 03:00 UTC** (fourth agent, Opus 5.5; the node was extended to about 00:00 UTC on
+2026-11-22). Branch `feat/flash-next-gaudi-engine-step`, code head `01d66e31` plus documents (program head
+`5c1e8219`, PR 15, merged in at `425fb2ee`), pushed. A second branch of this track,
+**`feat/flash-next-gaudi-engine-step-mtp-record`** (`2b90707f`, worktree `reports/engine-step/trees/mtp-record`):
+mtp-card-ready's head `7c4d65e3` plus `VLLM_HPU_MTP_TIMING=2` (one record per speculative step, section 14), for
+integration build 4 in place of mtp-card-ready's branch (the timer exists only there). Scratch files, probes and
+card results: `/Volumes/Storage/Claude/gaudi-work/reports/engine-step/` (`card_job/` = submit logs, `card/` =
+fetched results, `logs/` = CPU test and gate logs, `probes/` = Mac probes (`mtp_step_ops.py` and `mtp_ops/` for
+section 14), `merge-wt/` = the gate's snapshot of the branch, `trees/b1`, `trees/b2` = builds 1 and 2 detached).
 
 ### State in one paragraph
 
 Card-proven: **`VLLM_HPU_CANDIDATE_SAMPLING=1`** (00110: -4.9 ms per sampled step at 32 streams on TP4; 00144:
--1.2 ms, noisy) and **with `VLLM_HPU_VOCAB_PARALLEL_LOGITS=2`** (`candvp`, 00144: 110.7 against 114.2 ms per step
-at 32 sampled streams on TP4, -3.55 ms, -3.1 %, every stream on task; the log line confirms each rank's shard);
-**I01** token-correct (00130) and neutral at a short context (00110, 00144); **`logprobs=5` and `prompt_logprobs`
-no longer kill the server** (00130 tiny, 00144 real model: HTTP 200, valid ids, `/health` fine). CPU-proven, card
-job queued: **`VLLM_HPU_CANDIDATE_SAMPLING=2`** (`d5ad5e67`): with deterministic drafts (MTP, n-gram) every
-verification row and the bonus row draws in the candidate region with its own noise and the drafts are verified
-against those draws (`greedy_rejection_sample_from_tokens`), which is speculative sampling exactly for one-hot
-drafts (design and interface agreed with mtp-card-ready; it needs their `VLLM_HPU_SPEC_SAMPLED_VERIFY` at 1 or 2).
-Its 8-card check is 00164 (integration build 2 + `d5ad5e67`, MTP k = 2, sampled 32 and 1 streams).
-**`VLLM_HPU_SAMPLER_REQUEST_PARAMS=1`** (`299856cd`, card-proven on the tiny model in 00167): a request's
-`min_tokens`, `logit_bias` and `min_p` take effect on the general sampler path (they were ignored on HPU), applied
-per row from each row's own request before vLLM's sampler. Pull request: the gate runs on `reports/engine-step/merge-wt` at
-`299856cd` (waiting for the lock since 00:40 UTC), then PR and merge.
+-1.2 ms, noisy) and **with `VLLM_HPU_VOCAB_PARALLEL_LOGITS=2`** (`candvp`, 00144: -3.55 ms, -3.1 % at 32 sampled
+streams on TP4); **I01** token-correct (00130) and neutral at a short context (00110, 00144); **`logprobs=5` and
+`prompt_logprobs` no longer kill the server** (00130, 00144); **`VLLM_HPU_SAMPLER_REQUEST_PARAMS=1`** (`299856cd`,
+00167 on the tiny model: `logit_bias`, `min_tokens` and `min_p` take effect on the general sampler path).
+CPU-proven, card job queued: **`VLLM_HPU_CANDIDATE_SAMPLING=2`** (sampled MTP verification in the candidate
+region, 00164). Host time per decode step outside the forward is spread thin (section 13; the copy bench 00173:
+packing the 11 copies saves 0.2 ms at 32 rows, not built; the coordinator leaves the rest to async-sched). The
+candidate region no longer refuses async scheduling (`01d66e31`, async-sched's request). Build 2's 1-stream MTP
+question answered on the CPU (section 14).
 
 ### If you take over, in this order
 
-1. The gate: `tail -3 reports/engine-step/logs/gate_425fb2ee.log` (it tests `merge-wt` at `d5ad5e67`). When it
-   ends `gate exit 0`: from `wt/engine-step`, merge `origin/feat/flash-next-gaudi` again if it moved, push, `gh pr
-   create --base feat/flash-next-gaudi`, `gh pr merge --merge`; tell the coordinator.
-2. Read 00146 and 00164 when they land (table below); section 9 and the coordinator.
-3. Then: the general sampler's ignored `min_tokens` / `logit_bias` / `min_p` (item 5 below), and I01 at a long
-   context once prefill's prefix flags are on the program branch (item 0).
-4. Test branches in `wt/engine-step` (local, not pushed, not for a pull request): `engine-step-mtp-card` (mine +
-   mtp-card-ready's 05d2db66) and `engine-step-int2-card` (integration build 2 + `d5ad5e67`, the tree of 00164).
+1. The gate: it holds the lock (pid 35066, `reports/engine-step/logs/gate_425fb2ee.log`, outputs in
+   `/tmp/gate.tZJ4wz`) on `merge-wt` (moved to `01d66e31` during the run). Four rental tool test files failed in
+   the parallel pass (`test_rental_scripts`, `test_sh_rent`, `test_sh_run_rental`, `test_sh_tiny_smoke`: "not a git
+   repository", container signals); another track's gate (`/tmp/gate.mSyEA1`) has the same three of them red, so
+   they are not this branch's. When it ends `gate exit 0`, or red on those files only (say so to the coordinator):
+   from `wt/engine-step`, merge `origin/feat/flash-next-gaudi` again if it moved, push, `gh pr create --base
+   feat/flash-next-gaudi`, `gh pr merge --merge`; tell the coordinator.
+2. Read 00164, 00166 and 00169 when they land (table below); section 9 and the coordinator.
+3. Build 4 runs the `mtp-record` branch with `VLLM_HPU_MTP_TIMING=2`: read `mtp_step_record_r*.jsonl` (verify ms of
+   the steps whose `prev_committed` is `{"1": n}` against the others).
 
 ### Card jobs
 
 | Job | What | State | To do when it ends |
 |---|---|---|---|
-| 00093 `hpu-ids-sampler-tiny-flags` (1 card) | id verdicts, sampler-stage times, tiny model with I01 + I05 | ended 20:29 UTC, exit 1 (the tiny 700-token prompt, a near tie) | done: section 9 |
-| 00110 `real4-ab3-greedy-sampled-long` (TP4) | greedy base / I01 / I05 / both, sampled base / cand, long prefix | ended 22:29 UTC, exit 5 (probe counting artifact; no prefix-cache hit) | done: section 9 |
-| 00130 `tiny-i01-i05-logprobs` (1 card, commit `0cb55ebb`) | `tiny_checks.py --arms i01,i05` | ended 00:25 UTC, exit 1 (the I05 arm's near tie, and both servers died on the `prompt_logprobs` request) | done: section 9; the prompt-logprobs defect fixed at `e9032e68` |
-| 00144 `real4-ab6-short-candvp` (TP4, `e9032e68`) | the short-context A/B with `candvp` and the logprobs check | ended 00:56 UTC, exit 0 | done: section 9 |
-| **00146** `real8-candvp-short` (all, 35m, `e9032e68`) | the same probe at TP8: greedy base / I01 + I05, sampled vLLM / cand / candvp, logprobs check | queued (8-card sequence) | `SUMMARY`, `TASK`, `LOGPROBS`, the `Candidate sampling` lines; tell the coordinator whether `candvp` holds at TP8 |
-| **00164** `real8-mtp2-cand2-sampled` (all, 40m, `3ed03d13` = integration build 2 + `d5ad5e67`) | `headline_job.sh mtp2` with `HEADLINE_MTP_SAMPLED=1 HEADLINE_MTP_SAMPLED_LEVELS=32,1 VLLM_HPU_SPEC_SAMPLED_VERIFY=2 VLLM_HPU_CANDIDATE_SAMPLING=2` | queued (8-card sequence) | step time and acceptance per draft position, sampled at 32 and 1 streams, against build 2's arm C (the same with `=2` of mtp-card-ready only); the `Candidate sampling` lines must say the region drew; no rejection-sampler error |
+| 00093, 00110, 00130, 00144 | (earlier jobs) | ended | done: section 9 |
+| 00146 `real8-candvp-short` | candvp at TP8 | replaced by 00166 | - |
+| 00158 `real4-mtp3-cand2-sampled` | | cancelled | - |
+| 00167 `tiny-request-params` (1 card, `9a3ed1d1`) | `tiny_checks.py --arms params` | ended 01:46 UTC, exit 0 | done: section 9 (`PARAMS ok`) |
+| 00173 `h2d-copies-1card` (1 card, `01d66e31`) | `h2d_copies_bench.py` at 32 and 1 rows | ended 02:02 UTC, exit 0 | done: section 13 |
+| **00164** `real8-mtp2-cand2-sampled` (all, 40m, `3ed03d13` = integration build 2 + `d5ad5e67`) | `headline_job.sh mtp2` with `HEADLINE_MTP_SAMPLED=1 HEADLINE_MTP_SAMPLED_LEVELS=32,1 VLLM_HPU_SPEC_SAMPLED_VERIFY=2 VLLM_HPU_CANDIDATE_SAMPLING=2` | queued (8-card sequence) | step time and acceptance per draft position, sampled at 32 and 1 streams, against build 2's arm C; the `Candidate sampling` lines must say the region drew; no rejection-sampler error |
+| **00166** `real8-candvp-short2` (all, 35m) | `serve_long_probe.sh --arms both --no-long --candvp --logprobs-check` at TP8 | queued | `SUMMARY`, `TASK`, `LOGPROBS`, the `Candidate sampling` lines: does `candvp` hold at TP8 |
+| **00169** `real8-i01-long120k` (all, 50m) | I01 at 32 x 120K over a shared prefix with prefill's prefix flags, and an MTP k = 2 part (`probe.log`, `mtp2/probe.log`) | queued | `prepare_inputs` and step time base against I01 at a long context |
 
 ### Pending subtasks after those steps, in order
 
