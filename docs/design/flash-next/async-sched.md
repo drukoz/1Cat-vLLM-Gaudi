@@ -33,6 +33,10 @@ Updated 2026-11-21 02:30 UTC.
   against mtp2, async against nospec, at 32 and 1 streams, greedy and sampled), `tiny-async/summary.json` (both
   modes must pass), and grep each arm's `server0.log` for `Async scheduling on for Flash-Next` (the mode took),
   `Traceback`, `PT_DEVMEM`. The old job branch `feat/flash-next-gaudi-async-sched-int` (00171) is superseded.
+- The 1-token prompt left out of `test_engine_async_spec.py`'s staggered schedule: a defect of the speculative
+  prompt path (upstream's scheduler pads a waiting request with 1 token left to 1 + k with -1 placeholders, the
+  HPU prompt path computed and sampled over them), fixed by spec-lookup in `005e1ff9` (its own pull request).
+  When it is on the program branch: merge it here and put prompt 0 back into `_serve_staggered` (3, 1, 2, 0).
 - **Next**: card result to the coordinator and the integration track (flags: mode 1 = `VLLM_HPU_FLASH_NEXT_ASYNC_SCHED=1`,
   MTP = `=2`; engine-step's branch `01d66e31` drops its candidate-sampling refusal under async). Stage 2 of MTP
   (accepted counts on the device) only if 00175 shows a remaining in-step gap worth 2 to 4 days.
