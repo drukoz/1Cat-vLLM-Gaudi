@@ -548,9 +548,9 @@ if TYPE_CHECKING:
     VLLM_HPU_MTP_CHUNK_KV: int = 0  # 1 the MTP draft also runs over prefill chunks that complete no prompt
     VLLM_HPU_GDN_KERNEL_INTERLEAVE: int = 0  # 0 today's GDN decode/verify kernels, 1 four value rows per iteration
     VLLM_HPU_GDN_GLUE_CACHE: int = 0  # 0 per-step glue of the fused GDN ops (default), 1 constants and indices cached
+    VLLM_HPU_FLASH_NEXT_ASYNC_SCHED: int = 0  # 0 Flash-Next without async scheduling (default), 1 with it, 2 also MTP
     VLLM_HPU_PLE_HOST_NGRAM_IDS: int = 0  # 0 PLE n-gram ids computed in the graph (default), 1 on the host
     VLLM_HPU_HC_FUSED: int = 0  # 0 torch hyper-connections (default), 1 the fused hyper-connection kernels
-    VLLM_HPU_FLASH_NEXT_ASYNC_SCHED: int = 0  # 0 Flash-Next without async scheduling (default), 1 with it, 2 also MTP
     VLLM_HPU_MOE_GLUE: int = 0  # 0 torch MoE glue (default), 1 the fused MoE glue kernels
     VLLM_HPU_MOE_GLUE_MERGE_GATE_UP: int = 0  # with VLLM_HPU_MOE_GLUE=1: 1 merges the gate_up GEMM into the gate GEMM
     VLLM_HPU_HC_FUSED_COPY_MODE: int = 0  # copies before a fused HC op: 0 all, 1 not its own outputs, 2 block output
@@ -2076,14 +2076,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_HPU_PLE_HOST_NGRAM_IDS":
     lambda: int(os.environ.get("VLLM_HPU_PLE_HOST_NGRAM_IDS", "0")),
 
-    # Flash-Next hyper-connections through the fused TPC kernels (flashinfer_gaudi.hc_fused: hc_norm,
-    # hc_silu, hc_silu_split, hc_gate_mix, hc_combine, hc_combine_norm). 0 (default) = the torch path,
-    # 1 = fused; any other value is the torch path. Read once per layer at construction. A layer whose
-    # kernels are not loaded, or whose input the kernels do not take, logs one line and runs the torch
-    # path. Not yet proven in a served model; see docs/design/flash-next/hc-fused.md.
-    "VLLM_HPU_HC_FUSED":
-    lambda: int(os.environ.get("VLLM_HPU_HC_FUSED", "0")),
-
     # Flash-Next and vLLM's async scheduling (the engine schedules step N+1 while step N runs; the worker
     # prepares and issues step N+1 before step N's sampled tokens reach the host). 0 (default) = the
     # platform turns async scheduling off for Flash-Next, as before. 1 = Flash-Next keeps vLLM's decision
@@ -2095,6 +2087,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Any other value is 0. See docs/design/flash-next/async-sched.md.
     "VLLM_HPU_FLASH_NEXT_ASYNC_SCHED":
     lambda: int(os.environ.get("VLLM_HPU_FLASH_NEXT_ASYNC_SCHED", "0")),
+
+    # Flash-Next hyper-connections through the fused TPC kernels (flashinfer_gaudi.hc_fused: hc_norm,
+    # hc_silu, hc_silu_split, hc_gate_mix, hc_combine, hc_combine_norm). 0 (default) = the torch path,
+    # 1 = fused; any other value is the torch path. Read once per layer at construction. A layer whose
+    # kernels are not loaded, or whose input the kernels do not take, logs one line and runs the torch
+    # path. Not yet proven in a served model; see docs/design/flash-next/hc-fused.md.
+    "VLLM_HPU_HC_FUSED":
+    lambda: int(os.environ.get("VLLM_HPU_HC_FUSED", "0")),
 
     # Element-wise glue of the Flash-Next MoE block (routing softmax/top-k/renormalization, the shared
     # expert's SiLU-multiply, the per-row FP8 quantization of the routed experts' input, the shared-gate
