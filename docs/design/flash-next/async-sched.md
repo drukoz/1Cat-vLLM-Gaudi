@@ -6,40 +6,52 @@ results are under `/Volumes/Storage/Claude/gaudi-work/reports/async-sched/card/`
 
 ## Handoff (if this agent stops)
 
-Updated 2026-11-21 02:30 UTC.
+Updated 2026-11-21 06:45 UTC.
 
-- **On the branch** (pushed): `8f4816f8` engine-step's `engine_harness.py`, unchanged (same blob as engine-step and
-  the integration build); `7a818007` mode 1 of `VLLM_HPU_FLASH_NEXT_ASYNC_SCHED` (no speculation: the PLE context
-  carry, the output-token ledger, the async scheduler's split fix); `fb5cefca` mode 2 (MTP stage 1: the drafts
-  stay on the device, the scheduler's optimistic counts corrected, section 2.4); `fd010f8c` merge of the program
-  head `d9791183` (PR 16, clean). Default 0 everywhere.
-- **CPU**: `tests/unit_tests/worker/test_flash_next_async.py` 38, `tests/unit_tests/models/flash_next/`
-  `test_engine_loop_async.py` 7, `test_engine_async_sampling.py` 4, `test_engine_async_spec.py` 3 (all pass, each
-  file in its own process); neighbours pass (host n-gram ids 22, platform 51, inputs 10). On the integration tree +
-  this branch, mtp-card-ready's rehearsal engine with the real MTP drafter: `test_engine_mtp_async.py` 2 passed (MTP
-  k = 3 under mode 2 = the synchronous MTP streams; the file is on the job branch only, it needs
-  `tests/unit_tests/hpu_cpu_engine.py`). `bin/gate wt/async-sched` started 02:25 UTC on `fd010f8c` (log
-  `reports/async-sched/logs/gate_fd010f8c.out`); if it is green: `gh pr create --base feat/flash-next-gaudi`
-  (title "Flash-Next under async scheduling: VLLM_HPU_FLASH_NEXT_ASYNC_SCHED (default 0), modes 1 and 2"),
-  `gh pr merge --merge`.
-- **Card job 00179** `real8-async-mtp2b` (all, 60 min hold; replaced 00171, 00175, 00176 in their place, expected
-  start about 04:45 UTC; `HEADLINE_TINY_ABORT=0`: a tiny-gate mismatch is read by hand, near ties exist). Job branch `feat/flash-next-gaudi-async-sched-int2` (`a0273b7c` = integration `d00c0a9a` +
-  `fb5cefca` + job arms; never merge it): `headline_job.sh tiny-async mtp2-async mtp2 async nospec`, env
-  `HEADLINE_LEVELS=32,1 VLLM_HPU_MTP_TIMING=0 HEADLINE_MTP_SAMPLED=1 HEADLINE_MTP_FALLBACK=0 HEADLINE_TINY_SPEC=2
-  HEADLINE_TINY_ABORT=0`
-  (k = 2 as integration build 2's 00156). A background `bin/farm job` (log
-  `reports/async-sched/logs/farm_real8_async_mtp2b.out`) fetches into `reports/async-sched/card/00179-real8-async-mtp2b/`;
-  if the session is gone: `bin/farm fetch async-sched 00179 00179-real8-async-mtp2b`. Read `headline.md` (mtp2-async
-  against mtp2, async against nospec, at 32 and 1 streams, greedy and sampled), `tiny-async/summary.json` (both
-  modes must pass), and grep each arm's `server0.log` for `Async scheduling on for Flash-Next` (the mode took),
-  `Traceback`, `PT_DEVMEM`. The old job branch `feat/flash-next-gaudi-async-sched-int` (00171) is superseded.
+- **On the branch** (pushed): `8f4816f8` engine-step's `engine_harness.py`, unchanged; `7a818007` mode 1 of
+  `VLLM_HPU_FLASH_NEXT_ASYNC_SCHED` (no speculation: the PLE context carry, the output-token ledger, the async
+  scheduler's split fix); `fb5cefca` mode 2 (MTP stage 1, section 2.4); `fd010f8c` merge of the program head
+  `d9791183` (PR 16); `0cc8cf09` the flag's place in the env table (after `VLLM_HPU_MOE_GLUE_MERGE_GATE_UP`:
+  `test_moe_glue_layer` pins the order); `d3fb1b11` no wait for the device in a steady decode step (section 2.5);
+  `8a171ea5` merge of the program head `2e9f9196` (PRs 19 and 20, clean). Default 0 everywhere.
+- **CPU** on `8a171ea5`: `tests/unit_tests/worker/test_flash_next_async.py` 39, `tests/unit_tests/models/flash_next/`
+  `test_engine_loop_async.py` 7, `test_engine_async_sampling.py` 4, `test_engine_async_spec.py` 5, each file in its
+  own process (log `reports/async-sched/logs/tests_after_merge_8a171ea5.log`). On the integration tree + this
+  branch, mtp-card-ready's rehearsal engine with the real MTP drafter: `test_engine_mtp_async.py` 2 passed (job
+  branch int2 only; it needs `tests/unit_tests/hpu_cpu_engine.py`).
+- **Gate**: `bin/gate reports/async-sched/trees/gate-8a171ea5` (a `git archive` of `8a171ea5`, so the worktree
+  stays free while it waits for a slot), log `reports/async-sched/logs/gate_8a171ea5.out`. If green:
+  `gh pr create --base feat/flash-next-gaudi --head feat/flash-next-gaudi-async-sched` (title "Flash-Next under
+  async scheduling: VLLM_HPU_FLASH_NEXT_ASYNC_SCHED (default 0), modes 1 and 2", body
+  `reports/async-sched/pr_body.md` with the gate line), then `gh pr merge --merge` (owner's rule: default-off and
+  the gate green).
+- **Card 00186** (the coordinator's integration build 4, `reports/integration/card/00186-real8-build4/`): mode 2
+  greedy is the best MTP server (33.7 ms/token at 32 streams); at 1 and 8 streams mode 1 (greedy and sampled) and
+  mode 2 sampled are 15 to 21 ms per step slower than synchronous (section 2.5).
+- **Card jobs 00196 and 00197** (all, 40 min each), job branch `feat/flash-next-gaudi-async-sched-int3` at
+  `5ccf0604` (integration `8cdc5999` + `d3fb1b11` as `aeff141f` + job arms; never merge it), build 4's env
+  (`VLLM_HPU_PREFIX_ALIGN_SPLIT=1 VLLM_HPU_PREFIX_KEEP_PROMPT_END=1 VLLM_MOE_CHUNK=64,8192
+  VLLM_MOE_TOKEN_BOUNDARY=512,1000000 PT_HPU_SYNCHRONOUS_ACC_QUEUE_FLUSHING=1`), `HEADLINE_LEVELS=8,1`, the step
+  timer `VLLM_HPU_STEP_TIMING=1` (`VLLM_HPU_STEP_TIMING_EVERY=50`, records in `<arm>/timing/`):
+  - 00196 `real8-async-m1b` (took 00195's place): `tiny-async nospec-async nospec nospec-async-census` (`-census`:
+    the step timer in mode 2, host synchronisation points with their source lines). Waiter log
+    `reports/async-sched/logs/farm_real8_async_m1b.out`.
+  - 00197 `real8-async-m2s`: `mtp2-async mtp2 mtp2-async-census`, MTP k = 2, `HEADLINE_MTP_SAMPLED=1
+    HEADLINE_MTP_SAMPLED_LEVELS=8,1 VLLM_HPU_SPEC_SAMPLED_VERIFY=2 VLLM_HPU_MTP_TIMING=0 HEADLINE_ASYNC_MTP_TIMING=0
+    HEADLINE_MTP_FALLBACK=0`. Waiter log `reports/async-sched/logs/farm_real8_async_m2s.out`.
+  - If the session is gone: `bin/farm fetch async-sched 00196 00196-real8-async-m1b` (same for 00197). Read
+    `python3 -I reports/async-sched/tools/ab_table.py <dir> --pairs nospec-async:nospec` (00196) and
+    `--pairs mtp2-async:mtp2` (00197); `tiny-async/summary.json` (both modes must pass); the timer records of each
+    arm (spans `wait`, `async_wait`, `gap`, `rpc_gap`, the engine's `update_from_output`; the census counters with
+    their source lines), greedy and sampled rounds told apart by time.
+  - 00179 cancelled (00186 answered it); 00195 replaced by 00196.
 - The 1-token prompt left out of `test_engine_async_spec.py`'s staggered schedule: a defect of the speculative
-  prompt path (upstream's scheduler pads a waiting request with 1 token left to 1 + k with -1 placeholders, the
-  HPU prompt path computed and sampled over them), fixed by spec-lookup in `005e1ff9` (its own pull request).
-  When it is on the program branch: merge it here and put prompt 0 back into `_serve_staggered` (3, 1, 2, 0).
-- **Next**: card result to the coordinator and the integration track (flags: mode 1 = `VLLM_HPU_FLASH_NEXT_ASYNC_SCHED=1`,
-  MTP = `=2`; engine-step's branch `01d66e31` drops its candidate-sampling refusal under async). Stage 2 of MTP
-  (accepted counts on the device) only if 00175 shows a remaining in-step gap worth 2 to 4 days.
+  prompt path, fixed by spec-lookup in `005e1ff9` (its own pull request, not on the program branch at `2e9f9196`).
+  When it is there: merge it here and put prompt 0 back into `_serve_staggered` (3, 1, 2, 0).
+- **Next**: the pull request on a green gate. 00196 and 00197 to the coordinator and the integration track: does
+  mode 1 with `d3fb1b11` close the 1- and 8-stream gap, and where does mode 2 lose time on sampled requests.
+  Integration build 5 should take `d3fb1b11` (the flag's env-table place: after `VLLM_HPU_MOE_GLUE_MERGE_GATE_UP`
+  here, before `VLLM_HPU_HC_FUSED` in their `bcaa3ed6`; both pass the order tests).
 
 Labels: **MEASURED** (card, with the file), **VERIFIED** (code or CPU test, with the line or test), **INFERRED**.
 
@@ -185,6 +197,41 @@ without the correction the tokens go wrong; without the scatter they stay right 
 MTP drafter under async runs in mtp-card-ready's rehearsal engine (`tests/unit_tests/hpu_cpu_engine.py`, on the
 integration tree only), checked on the job branch before the card.
 
+### 2.5 Mode 1 slower than synchronous at 1 and 8 streams (00186) and the fix `d3fb1b11`
+
+MEASURED (00186, integration build 4 at TP8, mean of two rounds, ms per step, async minus synchronous):
+
+| server | streams | greedy | sampled |
+|---|---|---|---|
+| mode 1 (`nospec-async` vs `nospec`) | 32 | 63.4 vs 63.2 (+0.2) | 51.9 vs 58.0 (-6.1) |
+| mode 1 | 8 | 66.7 vs 50.5 (+16.2) | 66.9 vs 51.4 (+15.5) |
+| mode 1 | 1 | 54.6 vs 33.7 (+20.9) | 53.2 vs 36.4 (+16.8) |
+| mode 2 (`mtp2-async` vs `mtp2`) | 32 | 77.2 vs 83.4 (-6.2) | 89.6 vs 94.3 (-4.7) |
+| mode 2 | 8 | 66.0 vs 71.4 (-5.4) | 92.1 vs 70.6 (+21.5) |
+| mode 2 | 1 | 56.0 vs 63.5 (-7.5) | 78.5 vs 63.3 (+15.2) |
+
+The sampled rounds use the checkpoint's defaults (temperature 1.0, top_k 20, top_p 0.95, no penalties). The two
+MTP arms also differ in `VLLM_HPU_MTP_TIMING` (2 synchronous, 0 async). mtp2-async's lower 1-stream greedy
+acceptance (2.05 against 2.44) follows its text (INFERRED): greedy text differs between arms on the card.
+
+VERIFIED in the bridge source at the node's version (`reports/native-replay/bridge-src`):
+`HPUEvent::synchronize` waits for its event and then calls `device::flush_host_events()`
+(`backend/habana_device/HPUEvent.cpp:131`). That takes a snapshot of every pending host event and waits for each
+(`backend/synapse_helpers/device.cpp:1107-1118`). Every device-to-host copy into pageable memory registers one,
+completed by a callback after the staging copy (`device.cpp:1520-1590`). And `register_host_event` first waits for
+a pending event on the same host address (`device.cpp:1166-1176`).
+
+Build 4's ledger called `settle(keep=1)` at the start of every `sample_tokens`, on the main thread: an
+`event.synchronize()` of the step before last, which through the flush waited for the copy of the step in flight
+too. Mode 2 never makes that call (its runner step is synchronous), and mode 2 greedy is not slower. `d3fb1b11`:
+no wait in a steady decode step. Placeholders keep `output_token_ids` at their synchronous length (`min_tokens`),
+the values are settled only before a sampler pass that reads them (penalties, bad words) from a window of the last
+64 steps, and older placeholders become the penalty pad (CPU: `test_output_token_ids_have_the_synchronous_length_and_no_wait`
+and the penalty tests). INFERRED: mode 1's async step is nearly flat in the stream count (54 to 67 ms) while the
+synchronous step grows (34 to 51 ms), which a wait for the step in flight alone may not explain; 00196 times the
+spans of every step (and counts the host synchronisation points) with the fix. Mode 2 sampled has a gap of the same
+size without any ledger: cause unknown, 00197.
+
 ## 3. What is on the branch
 
 See the handoff. Files: `vllm_gaudi/v1/worker/flash_next_async.py` (carry, ledger), `vllm_gaudi/platform.py`
@@ -200,4 +247,8 @@ after `_with_host_ngram_ids`; after `AsyncHPUModelRunnerOutput(...)`; the top of
 | 00171 `real8-async-ab` | TP8, integration build + mode 1: tiny gate, async / nospec / nospec-devids at 32 and 1 streams | replaced by 00175 (02:20 UTC) |
 | 00175 `real8-async-mtp` | as 00176 with k = 3 | replaced by 00176 (02:35 UTC) |
 | 00176 `real8-async-mtp2` | as 00179 with the tiny gate aborting the job | replaced by 00179 (02:50 UTC) |
-| 00179 `real8-async-mtp2b` | TP8, integration `d00c0a9a` + modes 1 and 2: tiny gate (no speculation and MTP k = 2), mtp2-async, mtp2, async, nospec at 32 and 1 streams, greedy and sampled | queued, about 04:45 UTC |
+| 00179 `real8-async-mtp2b` | TP8, integration `d00c0a9a` + modes 1 and 2: tiny gate (no speculation and MTP k = 2), mtp2-async, mtp2, async, nospec at 32 and 1 streams, greedy and sampled | cancelled (05:45 UTC): 00186 answered it |
+| 00186 `real8-build4` (integration) | the coordinator's build 4 with modes 1 and 2: mtp2-async, nospec-async, mtp2, nospec at 32, 8 and 1 streams, greedy and sampled | done; section 2.5 |
+| 00195 `real8-async-m1` | mode 1 with `d3fb1b11`: nospec-async, nospec, nospec-devids, nospec-async-spin at 8 and 1 streams, step timer | replaced by 00196 (06:21 UTC) |
+| 00196 `real8-async-m1b` | TP8, int3 `5ccf0604`: tiny-async, nospec-async, nospec, nospec-async-census at 8 and 1 streams, greedy and sampled, step timer | queued |
+| 00197 `real8-async-m2s` | TP8, int3 `5ccf0604`: mtp2-async, mtp2, mtp2-async-census (MTP k = 2, sampled verification 2, MTP timers 0) at 8 and 1 streams, greedy and sampled, step timer | queued |
