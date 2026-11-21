@@ -14,7 +14,7 @@
 #           --no-sampled-check (sampled verification is off in this build: a sampled request gets HTTP 400);
 #           acceptance per draft position per level from /metrics (SPEC lines).
 #   mtp3-32 server 2 with the 32-stream level only (a short hold).
-#   tiny    the tiny model at TP8 with the job's flags (farm_tiny.py --gdn hc; --spec 3 with HEADLINE_TINY_SPEC=1):
+#   tiny    the tiny model at TP8 with the job's flags (farm_tiny.py --gdn hc; --spec K with HEADLINE_TINY_SPEC=K):
 #           tokens against the CPU reference. A failure ends the job (exit 7) unless HEADLINE_TINY_ABORT=0.
 #   mtp3-noshard  server 2 with VLLM_HPU_QSA_INDEXER_SHARD=0 (isolates the request-sharded indexer, never run in a
 #           served speculative step before this build). Run by itself after mtp3 when mtp3 ended with the server
@@ -42,7 +42,8 @@
 # HEADLINE_ROUNDS (measured rounds per level, greedy and sampled, after the warm round; default 2; 0 = one per level
 # and two at the top level, as in job 00128), HEADLINE_LEVELS (default 32,8,1: the 32-stream numbers first),
 # HEADLINE_MTP_SAMPLED=1 (the MTP server with VLLM_HPU_SPEC_SAMPLED_VERIFY=1 and a SAMPLED 32-stream level last;
-# HEADLINE_MTP_SAMPLED_LEVELS), HEADLINE_TINY_SPEC=1 (the tiny gate with --spec 3).
+# HEADLINE_MTP_SAMPLED_LEVELS), HEADLINE_TINY_SPEC=K (the tiny gate with --spec K). MTP arms are mtp<K>
+# (k = K drafted tokens), mtp<K>-32 (32 streams only) and mtp<K>-noshard.
 # Results: $FARM_OUT/<arm>/ (versions.txt, server0.log, scaling.json, probe.log, summary.json) and
 # $FARM_OUT/headline.md + headline.json (headline_table.py), written after every arm.
 # Exit code: the number of arms whose serve_probe.sh did not end with 0.
@@ -149,7 +150,7 @@ while [ "$i_arm" -lt "${#ARMS[@]}" ]; do
     case "$arm" in
         tiny)
             spec=()
-            if [ "${HEADLINE_TINY_SPEC:-0}" = 1 ]; then spec=(--spec 3); fi
+            case "${HEADLINE_TINY_SPEC:-0}" in [1-9]) spec=(--spec "$HEADLINE_TINY_SPEC") ;; esac
             # the MTP server's own flags too (they act only on the speculative mode)
             tiny_sv="${VLLM_HPU_SPEC_SAMPLED_VERIFY:-0}"
             if [ "${HEADLINE_MTP_SAMPLED:-0}" = 1 ]; then tiny_sv="${VLLM_HPU_SPEC_SAMPLED_VERIFY:-1}"; fi
@@ -171,23 +172,24 @@ while [ "$i_arm" -lt "${#ARMS[@]}" ]; do
                 --warm-tokens "$WARM" --repeat-top 2 --no-mintok-check --probe-arg "--sampled-levels=$LEVELS" \
                 --probe-arg --interleave-sampled --probe-arg "--rounds=$ROUNDS"
             ;;
-        mtp3 | mtp3-32 | mtp3-noshard)
+        mtp[1-9] | mtp[1-9]-32 | mtp[1-9]-noshard)
+            k="${arm:3:1}"
             levels="$LEVELS"
-            if [ "$arm" = mtp3-32 ]; then levels=32; fi
+            case "$arm" in *-32) levels=32 ;; esac
             shard="$VLLM_HPU_QSA_INDEXER_SHARD"
-            if [ "$arm" = mtp3-noshard ]; then shard=0; fi
+            case "$arm" in *-noshard) shard=0 ;; esac
             # HEADLINE_MTP_SAMPLED=1: the server also verifies sampled requests (VLLM_HPU_SPEC_SAMPLED_VERIFY=1, the
             # exact path) and one SAMPLED level (32 streams) runs LAST, after every greedy level.
             sampled_args=(--probe-arg --no-sampled-check)
             sampled_verify="${VLLM_HPU_SPEC_SAMPLED_VERIFY:-0}"
-            if [ "${HEADLINE_MTP_SAMPLED:-0}" = 1 ] && [ "$arm" != mtp3-noshard ]; then
+            if [ "${HEADLINE_MTP_SAMPLED:-0}" = 1 ] && [ "${arm%-noshard}" = "$arm" ]; then
                 sampled_args=(--probe-arg "--sampled-levels=${HEADLINE_MTP_SAMPLED_LEVELS:-32}")
                 sampled_verify="${VLLM_HPU_SPEC_SAMPLED_VERIFY:-1}"
             fi
             VLLM_HPU_QSA_INDEXER_SHARD="$shard" VLLM_HPU_SPEC_SAMPLED_VERIFY="$sampled_verify" \
             VLLM_HPU_GDN_CORE_VERIFY="${VLLM_HPU_GDN_CORE_VERIFY:-1}" VLLM_HPU_MTP_TIMING="${VLLM_HPU_MTP_TIMING:-1}" \
                 VLLM_HPU_MTP_DRAFT_LOOP="${VLLM_HPU_MTP_DRAFT_LOOP:-1}" VLLM_HPU_MTP_CHUNK_KV="${VLLM_HPU_MTP_CHUNK_KV:-1}" \
-                bash "$HERE/serve_probe.sh" --out "$OUT/$arm" --mtp 3 --levels "$levels" --tokens "$TOKENS" \
+                bash "$HERE/serve_probe.sh" --out "$OUT/$arm" --mtp "$k" --levels "$levels" --tokens "$TOKENS" \
                 --warm-tokens "$WARM" --repeat-top 1 --no-mintok-check "${sampled_args[@]}" \
                 --probe-arg "--rounds=$ROUNDS"
             ;;
@@ -217,12 +219,13 @@ PY2
     if [ "$rc" -ne 0 ]; then failed=$((failed + 1)); fi
     "$PYTHON" "$HERE/headline_table.py" "$OUT" --md "$OUT/headline.md" --json "$OUT/headline.json" || true
     left=$((HOLD_S - ($(date -u +%s) - T0)))
-    if [ "$arm" = mtp3 ] && [ "$FALLBACK" = 1 ] && { [ "$rc" -eq 3 ] || [ "$rc" -eq 5 ]; }; then
+    case "$arm" in mtp[1-9]) is_mtp=1 ;; *) is_mtp=0 ;; esac
+    if [ "$is_mtp" = 1 ] && [ "$FALLBACK" = 1 ] && { [ "$rc" -eq 3 ] || [ "$rc" -eq 5 ]; }; then
         if [ "$left" -ge 900 ]; then
-            echo "headline_job: mtp3 ended with $rc: the same server with VLLM_HPU_QSA_INDEXER_SHARD=0 next ($left s left)"
-            ARMS+=(mtp3-noshard)
+            echo "headline_job: $arm ended with $rc: the same server with VLLM_HPU_QSA_INDEXER_SHARD=0 next ($left s left)"
+            ARMS+=("$arm-noshard")
         else
-            echo "headline_job: mtp3 ended with $rc; only $left s left: no run without the request shard"
+            echo "headline_job: $arm ended with $rc; only $left s left: no run without the request shard"
         fi
     fi
 done

@@ -92,8 +92,7 @@ def main(argv=None) -> int:
     ap.add_argument("--json", default=None)
     args = ap.parse_args(argv)
     arms = sorted(d for d in os.listdir(args.out) if os.path.isfile(os.path.join(args.out, d, "scaling.json")))
-    order = {"nospec": 0, "mtp3": 1, "mtp3-32": 2, "mtp3-noshard": 3}
-    arms.sort(key=lambda a: (order.get(a, 9), a))
+    arms.sort(key=lambda a: (0 if a == "nospec" else 1, a))
     rows, timing = [], {}
     for arm in arms:
         try:
