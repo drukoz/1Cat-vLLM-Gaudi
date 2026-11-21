@@ -18,13 +18,9 @@ the report. Labels: MEASURED (card), VERIFIED (simulator or CPU test named), INF
   traces, split card scripts), `aaf256ea` (merge of the program branch at `e5188341`); then the fold build
   (variants 6/7: `gdn_core_verify_recurrence_fold.h`, `GDN_VERIFY_BATCHED_GATES`), simulator 0.609-0.630 of the
   interleaved kernel's instructions, every verify case byte-identical.
-- **PR:** the gate on `aaf256ea` was green (10:25 UTC) but the program branch moved twice; the pr1 gate was
-  stopped. Now: the whole branch (HC + GDN variants 1-7) merged with the program head `4d66755e` = `a1f36d80`,
-  CPU tests green on it (39 files, 5 card-only skips), gate `bin/gate reports/hc-kernels/gate-a1f36d80 --tools`
-  waiting for a slot (log `reports/hc-kernels/logs/gate_a1f36d80.log`). When green: push `a1f36d80` as
-  `feat/flash-next-gaudi-hc-kernels-pr2`, `gh pr create --base feat/flash-next-gaudi --head
-  feat/flash-next-gaudi-hc-kernels-pr2` with body `reports/hc-kernels/pr/pr_body_merge1.md` (add a line that PR #28,
-  merged since, touches only `hpu_model_runner.py`), `gh pr merge --merge`, PR number to the coordinator.
+- **PR #29 merged 13:13 UTC** (merge `80a57565` into `feat/flash-next-gaudi`): the branch up to `a1f36d80` (HC IL
+  kernels, GDN verify variants 1-7, benches, card scripts) after the gate on the merge with the program head at #27
+  (119 files, 0 red). The later commits on the branch are design-note updates (card results) for a next PR.
 - **Build 6a (00249, coordinator 12:25 UTC)** runs HC IL and the GDN verify variant late-bound. **00239 ended green
   at 13:09 UTC; verdict `--gv 7` sent 13:05 UTC** (section 6, "Card results"): variant 7 bit-identical on the card,
   125.5 us device time per call at 128 rows against 259.3 (22 engines instead of 16).
