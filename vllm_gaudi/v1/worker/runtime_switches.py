@@ -22,8 +22,11 @@ from typing import Optional
 # VLLM_HPU_MTP_DRAFT_GRAPH is read at every decode draft (HpuFlashNextMtpProposer._draft_graph_enabled): 1 runs the
 # k draft passes in the one-graph loop (built at its first draft), 0 the per-pass graphs; both keep their graphs.
 # VLLM_HPU_MTP_DRAFT_CHAIN is decided before every verification (HPUModelRunner._mtp_chain_decision).
+# VLLM_HPU_FLASH_NEXT_SPEC_DEVICE_INPUTS (async-sched's stage 2, M1) is read at every verification step by a server
+# started at 1 or 2 (the device-made inputs' object exists only then); 0 turns it off while serving.
 SWITCHABLE = ("VLLM_HPU_FLASH_NEXT_DECODE_METADATA", "VLLM_HPU_FUSED_GREEDY_LOGITS", "VLLM_HPU_CANDIDATE_SAMPLING",
-              "VLLM_HPU_VOCAB_PARALLEL_LOGITS", "VLLM_HPU_MTP_DRAFT_GRAPH", "VLLM_HPU_MTP_DRAFT_CHAIN")
+              "VLLM_HPU_VOCAB_PARALLEL_LOGITS", "VLLM_HPU_MTP_DRAFT_GRAPH", "VLLM_HPU_MTP_DRAFT_CHAIN",
+              "VLLM_HPU_FLASH_NEXT_SPEC_DEVICE_INPUTS")
 
 
 def parse_switches(text: str) -> dict[str, str]:

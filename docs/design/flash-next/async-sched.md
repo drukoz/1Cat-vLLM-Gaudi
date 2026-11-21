@@ -6,70 +6,74 @@ results are under `/Volumes/Storage/Claude/gaudi-work/reports/async-sched/card/`
 
 ## Handoff (if this agent stops)
 
-Updated 2026-11-21 07:50 UTC.
+Updated 2026-11-21 11:40 UTC.
 
-- **On the branch** (pushed): `8f4816f8` engine-step's `engine_harness.py`, unchanged; `7a818007` mode 1 of
-  `VLLM_HPU_FLASH_NEXT_ASYNC_SCHED` (no speculation: the PLE context carry, the output-token ledger, the async
-  scheduler's split fix); `fb5cefca` mode 2 (MTP stage 1, section 2.4); `fd010f8c` merge of the program head
-  `d9791183` (PR 16); `0cc8cf09` the flag's place in the env table (after `VLLM_HPU_MOE_GLUE_MERGE_GATE_UP`:
-  `test_moe_glue_layer` pins the order); `d3fb1b11` no wait for the device in a steady decode step (section 2.5);
-  `8a171ea5` merge of the program head `2e9f9196` (PRs 19 and 20, clean). Default 0 everywhere.
-- **CPU** on `8a171ea5`: `tests/unit_tests/worker/test_flash_next_async.py` 39, `tests/unit_tests/models/flash_next/`
-  `test_engine_loop_async.py` 7, `test_engine_async_sampling.py` 4, `test_engine_async_spec.py` 5, each file in its
-  own process (log `reports/async-sched/logs/tests_after_merge_8a171ea5.log`). On the integration tree + this
-  branch, mtp-card-ready's rehearsal engine with the real MTP drafter: `test_engine_mtp_async.py` 2 passed (job
-  branch int2 only; it needs `tests/unit_tests/hpu_cpu_engine.py`).
-- **Gate**: `bin/gate reports/async-sched/trees/gate-8a171ea5` (a `git archive` of `8a171ea5`, so the worktree
-  stays free while it waits for a slot), log `reports/async-sched/logs/gate_8a171ea5.out`. The first run was cut
-  at 07:45 UTC by its own 90 min alarm (45 min waiting for a slot; 38 files ok, 5 at the per-file alarm under a
-  load near 40, 17 not run: `gate_8a171ea5_cut.out`); rerun from 07:48 UTC with a 4 h alarm. If green:
-  `gh pr create --base feat/flash-next-gaudi --head feat/flash-next-gaudi-async-sched` (title "Flash-Next under
-  async scheduling: VLLM_HPU_FLASH_NEXT_ASYNC_SCHED (default 0), modes 1 and 2", body
-  `reports/async-sched/pr_body.md` with the gate line), then `gh pr merge --merge` (owner's rule: default-off and
-  the gate green).
-- **Card 00186** (the coordinator's integration build 4, `reports/integration/card/00186-real8-build4/`): mode 2
-  greedy is the best MTP server (33.7 ms/token at 32 streams); at 1 and 8 streams mode 1 (greedy and sampled) and
-  mode 2 sampled are 15 to 21 ms per step slower than synchronous (section 2.5).
-- **Card jobs 00202 and 00203** (all, 40 min each, right after collectives' 00189; they replaced 00196 and 00197
-  in their places), job branch `feat/flash-next-gaudi-async-sched-int3` at `f2a5ff0b` (integration `8cdc5999` +
-  `d3fb1b11` as `aeff141f` + job arms + the placement switch; never merge it), build 4's env
-  (`VLLM_HPU_PREFIX_ALIGN_SPLIT=1 VLLM_HPU_PREFIX_KEEP_PROMPT_END=1 VLLM_MOE_CHUNK=64,8192
-  VLLM_MOE_TOKEN_BOUNDARY=512,1000000 PT_HPU_SYNCHRONOUS_ACC_QUEUE_FLUSHING=1`), `HEADLINE_LEVELS=8,1`, the step
-  timer `VLLM_HPU_STEP_TIMING=1` (`VLLM_HPU_STEP_TIMING_EVERY=50`, records in `<arm>/timing/`):
-  - 00202 `real8-async-m1c`: `tiny-async nospec-async nospec nospec-async-census` (`-census`: the step timer in
-    mode 2, host synchronisation points with their source lines). Waiter log
-    `reports/async-sched/logs/farm_real8_async_m1c.out`.
-  - 00203 `real8-async-m2t`: `mtp2-async mtp2 mtp2-async-census`, MTP k = 2, `HEADLINE_MTP_SAMPLED=1
-    HEADLINE_MTP_SAMPLED_LEVELS=8,1 VLLM_HPU_SPEC_SAMPLED_VERIFY=2 VLLM_HPU_MTP_TIMING=0 HEADLINE_ASYNC_MTP_TIMING=0
-    HEADLINE_MTP_FALLBACK=0`. Waiter log `reports/async-sched/logs/farm_real8_async_m2t.out`.
-  - Placement switch (the coordinator's request, 06:40 UTC): `~/farm/async-sched/results/switches/place` on the node
-    (`/results/switches/place` in the job), read once at each job's start, now `off`. `on` runs every server arm
-    with `VLLM_HPU_WORKER_CPU_PIN=1` under collectives' `place_wrap.sh` with native-replay's `place.sh` (rule a^1;
-    copies in `~/farm/async-sched/results/bench`, md5 5f7ca629 and 7e54f2de; local copy of `place.sh` in
-    `reports/async-sched/bench/`), the placement's output in each arm's `placement.log`; the job log says
-    `placement ON` or `placement off`. The coordinator sets it itself (06:50 UTC) from collectives' verdict on
-    00189's pin arm (about 08:20 UTC: "on" if at 1 and 8 streams no rank is above 1.4x the rank median and the
-    steady step is not slower than without placement): `echo on > ~/farm/async-sched/results/switches/place`.
-    Queue order then: 00184, 00189, 00170 + 00150 (4 cards each, about 50 min), 00202, 00203.
-  - Since 06:58 UTC every job that starts gets whole-core cpusets (the coordinator's queue change; image builds
-    on whole cores of their own): 00202 and 00203 run on another CPU layout than 00186, so compare their arms with
-    each other, not with 00186 (collectives, 07:00 UTC).
-  - Waiters with fetch: `reports/async-sched/logs/wait_00202.out` and `wait_00203.out` (`bin/farm wait` then
-    `bin/farm fetch`); the submit logs' own waiters end at their 3 h alarm, before the jobs do.
-  - If the session is gone: `bin/farm fetch async-sched 00202 00202-real8-async-m1c` (same for 00203). Read
-    `python3 -I reports/async-sched/tools/ab_table.py <dir> --pairs nospec-async:nospec` (00202) and
-    `--pairs mtp2-async:mtp2` (00203); `tiny-async/summary.json` (both modes must pass); the timer records of each
-    arm with `python3 -I reports/async-sched/tools/timer_spans.py <dir> [--sites]` (spans `wait`, `async_wait`,
-    `gap`, `rpc_gap`, the engine's `update_from_output`; `--sites`: the census with source lines; `t` is epoch
-    seconds and `raw` in each record has every step, so greedy and sampled rounds can be told apart by time).
-  - 00179 cancelled (00186 answered it); 00195 replaced by 00196, 00196 by 00202, 00197 by 00203.
-- The 1-token prompt left out of `test_engine_async_spec.py`'s staggered schedule: a defect of the speculative
-  prompt path, fixed by spec-lookup in `005e1ff9` (its own pull request, not on the program branch at `2e9f9196`).
-  When it is there: merge it here and put prompt 0 back into `_serve_staggered` (3, 1, 2, 0).
-- **Next**: the pull request on a green gate. 00202 and 00203 to the coordinator and the integration track: does
-  mode 1 with `d3fb1b11` close the 1- and 8-stream gap, and where does mode 2 lose time on sampled requests.
-  Integration build 5 should take `d3fb1b11` (the flag's env-table place: after `VLLM_HPU_MOE_GLUE_MERGE_GATE_UP`
-  here, before `VLLM_HPU_HC_FUSED` in their `bcaa3ed6`; both pass the order tests).
+- **Card results so far** (placement on, MTP timers 0, compare arms within a job only):
+  - 00220, mode 1 with `d3fb1b11` (MEASURED). ms/token sync → async: 1 stream greedy 27.9 → 29.4, sampled
+    32.0 → 31.6; 8 streams greedy 43.7 → 50.1, sampled 53.0 → 48.8 (00186 had +16 to +21 ms/step). tiny-async
+    passed. The census's `_tensor_str` reads (29 `.item()` per step) are capture-only (engine-step, VERIFIED in the
+    records): all of them are in record 0 of a 50-step window, the step that captured that bucket's graph, and
+    `per_step` is total/50. Steady steps wait in the D2H of `get_output` and 14 H2D per step (`utils.py:60`,
+    `async_h2d_copy`).
+  - 00221, mode 2 against synchronous MTP k = 2 (MEASURED; `reports/async-sched/card/00221-real8-async-m2u`).
+    ms/step sync → mode 2: 8 streams greedy 61.9/61.9 → 62.2/65.3, sampled 67.5/67.1 → 67.5/69.5; 1 stream greedy
+    53.4/53.7 → 55.0/57.6, sampled 57.9/56.9 → 53.3/56.2. Mode 2 is even with sync per step. At 1 stream greedy it
+    gets 2.00 tokens/step against 2.42: its text leaves sync's after 13 equal tokens (sync opens a `<think>` block
+    the drafter predicts well), INFERRED content, not a defect. Spans: mode 2 hides the engine gap (sync 2.2-4.6 ms
+    → 0.26) but the host's forward + wait (blocked on the device) grows by as much (1 row: sync 38-40 ms, mode 2
+    41-44). INFERRED: the per-step pageable H2D copies (about 20 per step) wait behind the step in flight.
+    engine-step's `VLLM_HPU_PERSISTENT_INPUTS` (pinned host buffers, non-blocking copies, two alternating slots under
+    async scheduling) is the matching fix: an async arm with it when it is on the program head.
+- **Branches.**
+  - `feat/flash-next-gaudi-async-sched`: done, merged as PR #25 (`4f070c75`): modes 1 and 2 on the program head.
+  - `feat/flash-next-gaudi-async-sched-s2`: stage 2 (section 2.6), all default-off, CPU-green. M1 `97a3a08a`
+    `54c9f552` `959890bf`; M2 `cef6fd98`; M3 `a0f29355` `f7bb35ce`; `f616e3e1` (M1 with prefix caching keeps the
+    align mode's load count). `78478ead` merges the program head `4f070c75` (PRs #23 chain, #24, #25; conflicts only
+    in `SWITCHABLE` and its test: the union); `915638c2` (= `35d9d4d4` of the job branches) makes mode 3 issue early
+    after the chain's stage B too; `9d2ee2e3` tests it on the engine (`VLLM_HPU_VOCAB_PARALLEL_LOGITS=1`).
+  - **Gate of stage 2**: `bin/gate reports/async-sched/trees/gate-9d2ee2e3` (frozen copy of `9d2ee2e3`), started
+    11:13 UTC with a 6 h alarm (pid 18115), waiting for a slot. Log `reports/async-sched/logs/gate_9d2ee2e3.out`.
+    If green: `gh pr create --base feat/flash-next-gaudi --head feat/flash-next-gaudi-async-sched-s2` with the title
+    "Flash-Next MTP under async scheduling, stage 2 (default off): device-made verification inputs, early issue
+    (mode 3), device align mode" and the body `reports/async-sched/pr_body_s2.md` (fill in GATE_LINE), then
+    `gh pr merge --merge` (owner's rule: default-off and the gate green). If the program head moved, merge it in
+    and gate again.
+  - engine-step's persistent-inputs branch merged the program head as `887266b1` (the device-context passthrough
+    kept, as asked). s2 merges it with the `SWITCHABLE` union only: scratch branch `s2-pi` in
+    `scratchpad/m1clone`, where the stage 2 engine files run with `VLLM_HPU_PERSISTENT_INPUTS=1`
+    (`reports/async-sched/logs/tests_s2_pi.log`).
+- **Card job 00240** `real8-async-m3d` (all, 85 min; replaced 00237, which replaced 00233 and 00229; starts after
+  mtp-draft-graph's 00230, by 14:21 UTC at the latest).
+  - Job branch `feat/flash-next-gaudi-async-sched-m3-b5` at `1a70d353` (never merge it; `1a70d353` makes a failed
+    `tiny-m3` gate leave out the `async3` arms, which `107dcf9a` of 00237 did not): the M2 job branch
+    `44a51fcd` (build 5 + their chain + M1 + M2) + M3 + the M1 fix + harness: gates `tiny-m3pc1` (prefix caching on,
+    mode 2, M3 = 1; passes only with M3's check line at 0 differences) and `tiny-m3pc2` (mode 3 + M3 = 2; passes only
+    if steps were issued early and nothing acted as 2), word `m3a` (M3 = 2; the arm is left out when a `tiny-m3pc`
+    gate failed), word `turns` (`tools/flash_next/rental/commit_turns_probe.py` after the probe, block
+    `HEADLINE_TURNS_BLOCK=512`). CPU on the branch: align 50, spec 41, engine align 3, engine device inputs 8, early 3.
+  - Arms in order: `tiny-m3 mtp2-async3-cuts-nopc-greedy mtp2-async-cuts-nopc-greedy` (M2 isolated, prefix caching
+    off), `tiny-m3pc1 tiny-m3pc2`, `mtp2-async3-cuts-greedy-m3a-turns mtp2-async-cuts-greedy-turns` (prefix caching on).
+  - Env: build 5's dense env (`VLLM_HPU_MOE_DENSE=1 VLLM_HPU_MOE_DENSE_MIN_TOKENS=1 VLLM_MOE_CHUNK=0,64,8192
+    VLLM_MOE_TOKEN_BOUNDARY=16,512,1000000 HEADLINE_REQUIRE_DENSE=1`), prefix flags,
+    `PT_HPU_SYNCHRONOUS_ACC_QUEUE_FLUSHING=1`, `VLLM_HPU_QSA_SLOT_SHIFT=0`, chain + draft graph + I01 +
+    `SPEC_DEVICE_INPUTS=2`, levels 32/8/1, greedy, 2 rounds, step timer mode 1, MTP timers 0,
+    `HEADLINE_PLACE_SWITCH=/results/switches/place`, `HEADLINE_HOLD_S=5040`. The waiter writes
+    `reports/async-sched/logs/wait_00240.out`; else `bin/farm fetch async-sched 00240 00240-real8-async-m3d`.
+  - Read: the `tiny-m3`, `tiny-m3pc1`, `tiny-m3pc2` lines in the job log; `python3 -I
+    reports/async-sched/tools/ab_table.py <dir> --pairs mtp2-async3-cuts-nopc-greedy:mtp2-async-cuts-nopc-greedy,
+    mtp2-async3-cuts-greedy-m3a-turns:mtp2-async-cuts-greedy-turns`; `timer_spans.py <dir>` (mode 3's gain shows as
+    prepare and forward issue under the device's busy time); `turns.json` in both turns arms: `again` equals `first`,
+    `eight_again` equals `eight`, `next_turn` has `cached_tokens` > 0.
+- **00230** is mtp-draft-graph's chain job (build 5 + chain + my M1 as cherry-picks): it carries M1's A/B, the
+  `tiny-m1` gate at `=1` and `m1sw` (one server, arms `=0` and `=2`). Their results folder, read when it lands.
+- **Placement switch**: `~/farm/async-sched/results/switches/place` on the node, read once at each job's start, now
+  `place` (the coordinator sets it). `on` = `VLLM_HPU_WORKER_CPU_PIN=1` + `place_wrap.sh` + `place.sh` (rule a^1);
+  `place` = the placement without the pin flag. Scripts in `~/farm/async-sched/results/bench` (md5 363bcf9d and
+  7e54f2de); spec-lookup hard-links them.
+- **Next**: read 00240; merge the program head into s2, gate, PR; an async arm with persistent inputs; sampled with
+  mtp-draft-graph's D2.
+- The 1-token prompt note: spec-lookup's `005e1ff9` is not on the program branch yet. When it is, put prompt 0 back
+  into `_serve_staggered`.
 
 Labels: **MEASURED** (card, with the file), **VERIFIED** (code or CPU test, with the line or test), **INFERRED**.
 
@@ -204,6 +208,25 @@ TP8 against about 55 ms of host work), so once stage 1 lets the host run ahead, 
 in-step gap at the verification-to-draft boundary, 2 to 4 ms of about 100 ms; at 1 stream the step is host-bound
 and stage 2 changes nothing the host must do. Not recommended unless 00176 shows a larger gap.
 
+**Revised 08:15 UTC: stage 2 is worth up to about 30 ms per step at 32 streams, not 2 to 4.** Step-anatomy split
+the dense build's synchronous MTP k = 3 step at 32 streams (84.9 ms; the coordinator's message): prepare 6.2,
+forward issue 27.2, wait for the device 31.3, draft 14.6, sample and post 2.6, gap 2.8; the device is busy 54.1 ms
+and idle 30.8 ms while the host works serially. The assumption above (a device-bound step) was wrong. From the code
+(int3, `hpu_model_runner.py`; 00203's census checks it on the card): mode 2 overlaps the step boundary (the engine
+schedules during the step) and the draft read-back (no `take_draft_token_ids`, so nothing waits for the draft
+passes), so step N+1's prepare and the start of its forward issue overlap step N's draft passes on the device,
+about 6 ms (00186: 77.2 against 83.4 ms per step at 32 streams, greedy). Everything else waits for the host's
+read of the verification result (`parse_output`, :7440): the accepted counts per request (:7455), the align
+commits (:7461), the drafter's inputs (`propose_draft_token_ids`, :7664, takes the host token lists), and every
+input of step N+1. Overlapping the rest takes, in order: (1) the draft chained behind the verification on the
+device (mtp-draft-graph's task), so verification and draft are issued back to back without the read; (2) stage 2,
+step N+1's inputs from step N's accepted counts on the device (positions, sequence and context lengths, KV slot
+mapping and block-table offsets, the recurrent lattice offsets and align commits, the PLE context of the k + 1
+verification rows, input ids), as upstream's GPU runner does for async speculation, 2 to 4 days; (3) mode 1's
+asynchronous output for the verification result, so no read of a step's tokens stays on the main thread. Fully
+overlapped, a step becomes max(device about 54 ms, host issue about 50 ms); below that the host issue itself must
+shrink (engine-step's batched input upload, native-replay's graph replay for the 27 ms forward issue).
+
 For the integration build (02:45 UTC): take commit `fb5cefca` (merges cleanly into integration `8df22e1e`), not the
 branch head (which merges the program head with PR 16, carried there as qsa-fused). Flags `=1` / `=2`; with `=2`
 also `VLLM_HPU_MTP_TIMING=0`; engine-step's `01d66e31` keeps candidate sampling under async scheduling.
@@ -263,6 +286,101 @@ gap) are within noise of each other in synchronous MTP and mode 2, greedy and sa
 sampled: prepare 1.98 against 1.41 ms, sample 2.89 against 2.61, gap 0.27 against 0.23). No host work runs only
 for sampled requests under mode 2, and the drafter has no sampled path (VERIFIED). So the card's gap is an
 interaction with the device, which only the card's spans and census can show (INFERRED).
+
+### 2.6 Stage 2: step N+1's verification inputs on the device (branch `feat/flash-next-gaudi-async-sched-s2`)
+
+The coordinator's order (08:15 UTC): stage 2 now, the largest item behind the 32-agent target (up to about 30 ms of
+the 84.9 ms synchronous MTP step at 32 streams, section 2.4). Plan approved 08:24 UTC (also in `TASKS.md`); every
+stage behind its own default-off flag, its CPU proof a test file in the tree, then a card A/B, greedy before
+sampled:
+
+| Stage | Owner | What | Removes from the device's idle | Estimate |
+|---|---|---|---|---|
+| D1 | mtp-draft-graph | `VLLM_HPU_MTP_DRAFT_CHAIN=1`: verification, in-graph greedy acceptance and the one-graph draft issued back to back; leaves `runner._mtp_chain_out` | the gap between verification and draft (the host's read, the drafter's input preparation) | theirs |
+| M1 | async-sched | `VLLM_HPU_FLASH_NEXT_SPEC_DEVICE_INPUTS` (1 check, 2 use): step N+1's acceptance-dependent inputs made on the device | nothing (enabler; prices the extra ops) | 1 day (done on CPU) |
+| M2 | async-sched | issue N+1 before reading N: N's tokens copied on a side stream and read on the output thread, the host's books one step late | N+1's preparation and forward issue, as far as N's device work covers them: up to about 20 ms at 32 streams | 1 to 1.5 days |
+| M3 | async-sched | prefix-cache align mode exact under M2 (pre-step copy and boundary commits from the device acceptance); requests joining or leaving through a row map | nothing (production has prefix caching on) | 0.5 to 1 day |
+| D2 + M4 | both | sampled requests: the chain through the in-graph candidate sampler; tests on my side | the same for sampled steps | 0.25 day mine |
+
+Interfaces agreed 08:20 to 08:30 UTC:
+
+- mtp-draft-graph: `VLLM_HPU_MTP_DRAFT_CHAIN` (needs `VLLM_HPU_MTP_DRAFT_GRAPH=1` and
+  `VLLM_HPU_FLASH_NEXT_DECODE_METADATA=1`); the per-step decision `runner._mtp_chain_step` (set before the forward);
+  after a chained step `runner._mtp_chain_out` = (accepted [B], next_ids [B, 1 + k] = bonus + k drafts, sampled
+  [B, 1 + k] with -1 after the bonus, last_row [B], num_decodes, k), int32, the step's padded decode batch,
+  input-batch row order, padded rows accepted 0 and sampled -1, every id rule-9-safe (from an fp32 id table, never a
+  `.to(int32)` of arg max indices); their host read and books in a method of its own (`_mtp_chain_settle`) that M2
+  calls one step late.
+- engine-step (`VLLM_HPU_PACKED_INPUTS`): a per-input switch host-made / device-made; in a verification step that
+  continues a chained one, the device-made inputs (ids, positions, the verification slot mapping, the GDN accepted
+  counts and, with prefix caching, the lattice rows, the PLE context, the draft ids) are read from my tensors and
+  left out of the packed upload; the I01 block table, `query_start_loc`, the logits indices, the target / bonus
+  indices, `cu_num_draft_tokens` and the sampling parameters stay in the packed buffer. Native-replay's bridge facts
+  (through engine-step): a graph input binds without a copy only if it is the tensor the capture saw; any other is
+  copied in by a lazy D2D copy, one launch each; a view handed to a custom op fails at launch.
+
+M1 (VERIFIED on CPU, `vllm_gaudi/v1/worker/flash_next_async_spec.py`, runner hooks in `_create_decode_input_data`
+and `sample_tokens`): after a verification step, its device inputs and its acceptance are kept (mtp-draft-graph's
+`_mtp_chain_out` when the step chained; else a stand-in from the host's read, its draft columns refreshed from the
+drafts the scheduler scheduled, which is what a synchronous engine verifies). In the next verification step, if its
+decode rows are the same requests in the same order with the same padded batch and k, the device makes: ids =
+next_ids; positions = `positions_N[r, 0] + a + 1 + j`; slots = `block_table[r, pos // bs] * bs + pos % bs` (an int32
+`index_select` over the one-row-per-request table of `VLLM_HPU_FLASH_NEXT_DECODE_METADATA=1`; padded rows the pad
+block's slots in row-major order, as `fill_pad_slots`); GDN `num_accepted_tokens` = a + 1 (padded rows 1); the PLE
+context = `advance_ple_context(context_N, ids_N, a + 1)` (padded rows eos). Tests:
+`tests/unit_tests/worker/test_flash_next_async_spec.py` (21: the device-made inputs equal the host-made ones from the
+runner's own helpers over 12 steps of random acceptance, k = 1..3, padded rows; the non-continuation cases; the
+stand-in), `tests/unit_tests/models/flash_next/test_engine_spec_device_inputs.py` (the engine rehearsal with the real
+MTP drafter, k = 2, oracle acceptance 2,0,1,2,1,0, prefix caching on and off: `=1` checks 32 steps with no
+difference in any of the five tensors; `=2` gives the model the device-made inputs and the streams equal the
+engine's without the flag). The branch is stacked on mtp-draft-graph's (its MTP fixes and the rehearsal engine are
+not on the program head yet). Not covered by M1: the align-mode lattice rows (host-made; M3), M-RoPE positions and
+the dense decode metadata (refused, logged once).
+
+M2 (VERIFIED on CPU, `VLLM_HPU_FLASH_NEXT_ASYNC_SCHED=3`, cef6fd98): mode 3 is mode 2 for the engine; in a chained
+verification step (`_mtp_chain_step`) the runner returns `AsyncSpecModelRunnerOutput` right after the chain is issued
+(stage A behind the verification, or stage B with the greedy rejection inside the chain's graph; `35d9d4d4`): the
+step's tokens `[B, 1 + k]` (-1 after the bonus) are copied on a side stream and read by the worker's output
+thread; `_mtp_chain_settle`, the post-processing and the drafter call are skipped (the chain drafted on the device,
+M1 makes the next step's inputs from its output). The books (the batch's token rows and `num_tokens(_no_spec)`, the
+requests' `output_token_ids`, `_gdn_num_accepted_by_req`) are queued (`SpecEarlyBooks`) and applied at the start of a
+later `execute_model`, in step order, without waiting when the step continues the batch (no request new, resumed or
+finished; every request with its 1 + k tokens; at most two books stay pending). A step whose batch changes waits for
+every pending book first and its `num_computed_tokens` become the true ones (each request's count seeded at the
+first early step and advanced by every applied book; the scheduler's still count the early steps' drafts as
+accepted). A chained step that needs its tokens (logprobs, penalties, bad words, `min_tokens`, structured output, a
+KV transfer, a prefill in the batch) reads them as before, after every pending book. Mode 3 needs the chain,
+`SPEC_DEVICE_INPUTS=2`, the sparse decode metadata and prefix caching off or `VLLM_HPU_FLASH_NEXT_SPEC_DEVICE_ALIGN=2`
+(the align-mode pre-step copy and boundary commits from the device: M3); otherwise it acts as 2 and logs why. Tests:
+`tests/unit_tests/models/flash_next/test_engine_async_spec_early.py` (4: the streams equal mode 2's, prompts one at a
+time and all at once, 128 steps issued before the previous step's tokens reached the host, 122 books applied late
+and 5 after a wait; the same with the chain's stage B, `VLLM_HPU_VOCAB_PARALLEL_LOGITS=1`; with prefix caching and
+no M3 mode 3 acts as 2), the books in `test_flash_next_async_spec.py`. On CPU every
+copy is done when it is issued, so this proves the books, not the overlap; the rehearsal's oracle cannot force
+acceptance under async (it hooks `take_draft_token_ids`, which an async engine never calls), so M2's runs mostly
+accept 0 (M1's oracle runs cover every count).
+
+M3 (VERIFIED on CPU, `VLLM_HPU_FLASH_NEXT_SPEC_DEVICE_ALIGN`, a0f29355): with prefix caching (align mode) a
+verification step's running block is `cdiv(ctx + 1 + k, bs) - 1` of its TRUE context, so under mode 3 the host (one
+step behind) cannot make the align mode. On the device, from the step's device positions and the carried state (the
+last step's running block and next load count; seeded from the host's books when the step does not continue the
+last one): the pre-step plan (`align_precopy_plan`'s rule: a copy when the window moved), the copies (conv from
+row[prev] at row offset n - 1, ssm from row[prev + n - 1], into row[curr]; masked rows copy the pad slot onto itself;
+whole rows with one `index_copy_`, never a write through a slice), the recurrent groups' lattices row[curr : curr + 1
++ k] (other groups keep the host's rows) and the load counts; after the step's acceptance (the chain's or the
+stand-in's) the boundary commits of the committed token whose position completes a block (ssm from store[t], conv
+window from store[0] at row offset t) and the self commits (next load count 1). The host's books follow: now on a
+synchronous step, with the async copy (`AsyncSpecModelRunnerOutput`'s extra rows) under mode 3. Tests:
+`tests/unit_tests/worker/test_flash_next_async_align.py` (50: plan, lattices, commits, self commits and both conv
+layouts equal `recurrent_lattice` / `recurrent_commit`), `tests/unit_tests/models/flash_next/test_engine_spec_device_align.py`
+(prefix caching on, 160-token generations crossing 256-token blocks; oracle acceptance: `=1` without a difference,
+`=2` the host's streams; mode 3 with `=2` serves with prefix caching and gives the synchronous streams, the agent's
+next turn included; no copy through a slice). On this build the CPU engine's next turn gets no prefix-cache hit, so the
+committed slots are checked by the unit tests and the check mode, not by a hit (the card's multi-turn probe should).
+
+M1 for mtp-draft-graph's chain card job on build 5: `feat/flash-next-gaudi-async-sched-m1-b5` (28b113fa, 12b7d8c6,
+ad21795c on build 5's 57ca7c31; the M1 flag is read every step, so one server started at `=2` runs the `=0` and
+`=2` arms through the runtime switch file).
 
 ## 3. What is on the branch
 
