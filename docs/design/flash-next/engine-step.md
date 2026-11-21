@@ -500,3 +500,31 @@ median wall ms per engine step over 60 steps, flags as noted.
   consumer ops); one packed int32 copy with device slices costs 409 + 638 us (with clones of the slices 650 + 573);
   at 1 row 345 + 571 against 362 + 587. So packing saves about 0.2 ms per step at 32 rows and nothing at 1 row: the
   host-side packing and the slice ops eat most of what one copy saves. Not built (about 0.3 % of a step).
+
+## 14. Build 2's 1-stream MTP step (coordinator's question, 2026-11-21 02:30 UTC)
+
+00156 (build 2, MTP k = 2, `VLLM_HPU_SPEC_SAMPLED_VERIFY=2`) ran 1 stream at 84 ms per step with first-position
+acceptance 0.60, against 00128 (build 1, k = 3) at 66 ms and 0.83. Integration's 00161 (build 2, k = 3, `=2` unset)
+ran like build 1. CPU checks with `reports/engine-step/probes/mtp_step_ops.py` (the CPU engine: vLLM's engine, the
+HPU runner, the MTP proposer, the tiny checkpoint; one request, 240-token prompt, 600 greedy tokens, oracle drafts
+accepting 1,0,2,1,1, the prefix flags on; runs in `probes/mtp_ops/`):
+
+- **`=2` changes nothing for greedy rows (MEASURED):** with `VLLM_HPU_SPEC_SAMPLED_VERIFY` 0, 1 and 2 all 300 steps
+  take `_prepare_sampling`, vLLM's rejection sampler and its greedy `rejection_sample`; `_candidate_verify` is
+  never called; `all_greedy` is True on every step; 433 host ops per step outside the two forwards, equal op by op;
+  the same 600 tokens, equal to the stream without speculation. A sampled request on `=2` calls
+  `_candidate_verify` every step.
+- **The align-mode copies run once per recurrent block (MEASURED):** a boundary commit after sampling and a pre-step
+  copy when the running block moves, at contexts 252/253, 508 and 763 on the CPU's 256-token block (once per 512
+  tokens at TP8). The headline's short rounds (23-token prompts, 128 tokens) never leave the first block: no copy
+  ran in 00156's 1-, 8- or 32-stream rounds. `5c770d96` adds 24 ops per copy event (66 against 42).
+- Host ops per step outside the forwards: k = 2 433, k = 3 493 (one more draft pass).
+- **The 1-stream acceptance compares two texts (MEASURED on the card's records):** stream 0's greedy text changes
+  with the batch and with k (00128 nospec N=1 against N=8; 00156 mtp2 N=8 rep 0 against rep 1; k = 3 against k = 2
+  from about token 13). At 8 and 32 streams the first-position rate is equal: k = 3 0.77 / 0.74, k = 2 0.76 / 0.76.
+- **Where the time went (MEASURED, the card's MTP timer files):** the verify span (step start to the drafter call),
+  54.4 ms at k = 3 against 67-71 ms in k = 2's greedy rounds; the draft is 14.5 against 13.2-14.2 ms. On the same
+  k = 2 server the sampled 1-stream rounds verified at 51.5 ms (rep 0) and 64-66 ms (rep 1): not a fixed cost of k
+  or of a path. INFERRED from four rounds: the span tracks the share of steps whose first draft was rejected (0.25:
+  51.5 ms, 0.37: 64-66, 0.40: 67-71; k = 3 0.17: 54). The timer keeps 25-step means; a per-step record keyed by
+  the previous step's accepted count would show it directly.
