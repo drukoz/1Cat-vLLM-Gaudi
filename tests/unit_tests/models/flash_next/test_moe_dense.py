@@ -140,3 +140,13 @@ def test_weights_are_kept_only_with_the_flag(monkeypatch):
     assert torch.equal(s13, dense[2].float()) and torch.equal(s2, dense[3].float())
     op._apply(lambda t: t)  # a device move leaves the references behind: the vendor op serves again
     assert op.dense_weights is None
+
+
+@pytest.mark.parametrize("tokens,expected", [(1, {}), (16, {}), (17, {"chunk_size": 64, "total_experts": GLOBAL}),
+                                             (512, {"chunk_size": 64, "total_experts": GLOBAL}),
+                                             (513, {"chunk_size": 8192, "total_experts": GLOBAL})])
+def test_a_zero_chunk_size_leaves_the_vendor_op_its_default(tokens, expected):
+    """VLLM_MOE_CHUNK=0,64,8192 VLLM_MOE_TOKEN_BOUNDARY=16,512,1000000: no chunk_size up to 16 tokens."""
+    op, _ = _op()
+    op.chunk_size_list, op.token_boundary_list = [0, 64, 8192], [16, 512, 1000000]
+    assert op._get_extra_kwargs(tokens) == expected

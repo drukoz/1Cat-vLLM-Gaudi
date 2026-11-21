@@ -767,6 +767,11 @@ class VllmMixtureOfExpertsOpBase(torch.nn.Module):
                 if tokens_num <= threshold:
                     chunk_size = self.chunk_size_list[idx]
                     break
+            # A chunk size of 0 (or less) in VLLM_MOE_CHUNK means the op's own default for that token range (no
+            # chunk_size and total_experts arguments), e.g. VLLM_MOE_CHUNK=0,64,8192 with
+            # VLLM_MOE_TOKEN_BOUNDARY=16,512,1000000: chunk_size 64 only for steps of 17 to 512 tokens.
+            if chunk_size <= 0:
+                return {}
             kwargs = {
                 "chunk_size": chunk_size,
                 "total_experts": self.global_num_experts,

@@ -346,6 +346,15 @@ leaves the choice open. With `0` nothing is loaded, registered or logged. The
 kernels pass the Gaudi2 instruction simulator and have not run on a card; see
 `docs/design/flash-next/hc-fused.md` ("MoE glue kernels").
 
+`VLLM_MOE_CHUNK` and `VLLM_MOE_TOKEN_BOUNDARY` (lists of integers of equal
+length, default empty) pass `chunk_size` and `total_experts` to
+`torch.ops.hpu.mixture_of_experts`: a step of at most `VLLM_MOE_TOKEN_BOUNDARY[i]`
+tokens (the first that fits) gets `VLLM_MOE_CHUNK[i]`, a longer one the last
+value. A value of `0` keeps the op's own default for that range (no
+arguments). On Flash-Next at TP8 (MTP k = 3, 32 streams) `chunk_size` 64 made
+the step about 12 ms shorter (job 00161); `VLLM_MOE_CHUNK=0,64,8192
+VLLM_MOE_TOKEN_BOUNDARY=16,512,1000000` applies it from 17 to 512 tokens only.
+
 `VLLM_HPU_MOE_DENSE` (integer, default `0`) applies to the routed experts of a
 per-channel FP8 MoE (`VllmMixtureOfExpertsOpFP8PerChannel`, Flash-Next's experts
 with `VLLM_HPU_FORCE_CHANNEL_FP8`). `1` keeps the layer's stacked FP8 experts
