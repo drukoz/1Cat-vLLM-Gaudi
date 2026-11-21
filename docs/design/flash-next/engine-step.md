@@ -11,13 +11,17 @@ This track's harness refuses report files outside the repository, so the handoff
 
 ## Handoff (if this agent stops)
 
-Last update: **2026-11-21 09:20 UTC** (fourth agent, Opus 5.5; the node was extended to about 00:00 UTC on
+Last update: **2026-11-21 09:22 UTC** (fourth agent, Opus 5.5; the node was extended to about 00:00 UTC on
 2026-11-22). Branch `feat/flash-next-gaudi-engine-step`, pushed; merged into the program branch up to `bcef8aa5` (PR
 #20); since then, not yet in a PR, all default-off: `ff160409` (`VLLM_HPU_WORKER_GC_FREEZE`), `ca52fa33`
 (`VLLM_HPU_LOG_UNMATCHED_GRAPH_INPUTS`), `844a37f2` (`VLLM_HPU_VERIFY_LOGITS_IN_GRAPH`), `8efc6969`
-(`VLLM_HPU_PERSISTENT_INPUTS` and the block-table width guard), the probe's `--spec-arms` (`6d5b8eef`) and docs. A
-fix branch, `fix/flash-next-gaudi-block-table-width-guard` (`33eb7cb1`), waits for its gate (section 15). A second
-branch of this track,
+(`VLLM_HPU_PERSISTENT_INPUTS` and the block-table width guard), the probe's `--spec-arms` (`6d5b8eef`), docs; the
+program head `adbcff30` (PRs #18, #21, #22) merged in at `a0bd1753` (two conflicts in `hpu_model_runner.py`, both
+sides kept), and `83a3fa35` (the logger wraps the `sys.modules` graphs module; its test failed after the host
+n-gram test in one session). Next PR: gate of `83a3fa35` in `reports/engine-step/merge-wt`
+(`logs/gate_83a3fa35.log`), the worker tests by hand (`logs/worker_tests_83a3fa35.log`); open and merge the PR when
+green. A fix branch, `fix/flash-next-gaudi-block-table-width-guard` (`33eb7cb1`, on `adbcff30`), waits for its gate
+(section 15). A second branch of this track,
 **`feat/flash-next-gaudi-engine-step-mtp-record`** (`2b90707f`, worktree `reports/engine-step/trees/mtp-record`):
 mtp-card-ready's head `7c4d65e3` plus `VLLM_HPU_MTP_TIMING=2` (one record per speculative step, section 14), for
 integration build 4 in place of mtp-card-ready's branch (the timer exists only there). Scratch files, probes and
