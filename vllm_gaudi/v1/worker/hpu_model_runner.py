@@ -4883,6 +4883,18 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
     # (unit tests) have neither.
     _ple_carry: Optional[PleContextCarry] = None
     _async_ledger: Optional[AsyncOutputLedger] = None
+    # The rest of the async-scheduling state off by default too (__init__ sets it): runners built without __init__,
+    # as the unit tests' stubs are, reach these through the PLE and decode-input paths.
+    _spec_draft_handoff: Optional[SpecDraftHandoff] = None
+    _verify_advance: Optional[VerifyInputAdvance] = None
+    _verify_step = 0
+    _align_flag = 0
+    _align_dev = None
+    _align_step = None
+    _align_pre_books = None
+    _spec_early: Optional[SpecEarlyBooks] = None
+    _spec_early_stream = None
+    _spec_early_waited = False
     _flash_next_async_checked = False
     _spec_draft_handoff: Optional[SpecDraftHandoff] = None
 
