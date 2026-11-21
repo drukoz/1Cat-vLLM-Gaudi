@@ -103,6 +103,14 @@ def main(argv=None) -> int:
                 rows += rows_of(arm, json.load(f))
         except (OSError, ValueError) as error:
             print("headline_table: %s: %r" % (arm, error), file=sys.stderr)
+        # the rounds of a post step on the same server (headline_job.sh: scaling_sw.json of the sw step)
+        for extra in sorted(f for f in os.listdir(os.path.join(args.out, arm))
+                            if f.startswith("scaling_") and f.endswith(".json")):
+            try:
+                with open(os.path.join(args.out, arm, extra)) as f:
+                    rows += rows_of(arm + ":" + extra[len("scaling_"):-len(".json")], json.load(f))
+            except (OSError, ValueError) as error:
+                print("headline_table: %s/%s: %r" % (arm, extra, error), file=sys.stderr)
         timing[arm] = mtp_timing(os.path.join(args.out, arm, "server0.log"))
     md = [table(rows), ""]
     for r in rows:

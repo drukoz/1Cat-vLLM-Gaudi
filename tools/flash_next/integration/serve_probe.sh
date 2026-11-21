@@ -29,6 +29,18 @@
 #     --port N            (default: the job's port base FARM_PORT_BASE, else 8000)
 #     --model DIR         (default /models/Qwen3.8-Flash-Next-FP8); --out DIR (default FARM_OUT)
 #     --probe-arg ARG     one more argument for decode_scaling.py (repeatable)
+#     --require-log RE    (repeatable) a line of server0.log must match the extended regular expression RE once
+#                         the server is healthy, else the server is stopped and the exit code is 8 (a silent
+#                         fallback of a flag the build depends on: build 5's dense MoE)
+#     --forbid-log RE     (repeatable) no line of server0.log may match RE, checked when healthy and after the
+#                         probe; a match ends the run with 8
+#     --probe-require-log RE  (repeatable) decode_scaling.py checks RE in server0.log after its first warm round
+#                         (a form that runs only with traffic: "runs the dense MoE form"); missing: probe exit 8
+#     --post-cmd CMD      (repeatable) after the probe, while the server still runs, `bash -c CMD` in OUT with
+#                         SERVE_PORT, SERVE_OUT, SERVE_LOG, SERVE_KIT (this folder) and SERVE_MODEL_NAME=fn in its
+#                         environment; each one's exit code is printed (POST-RC) and kept in summary.json
+#                         ("post_rc"); a failed post command does not change the exit code; none runs after the
+#                         server died
 #
 # Preset environment, each value only when the job did not set it (farm --env KEY=VALUE wins): the
 # program head's best decode setup of 2026-11-20: PT_HPU_LAZY_MODE=1 PT_HPU_LAZY_ACC_PAR_MODE=0
@@ -43,7 +55,8 @@
 #
 # Writes to OUT: versions.txt, server0.log, scaling.json (decode_scaling.py), probe.log, summary.json.
 # Exit code: 0 the probe ran, 3 the server died, 4 it did not get healthy in time, 5 the probe failed,
-# 2 a usage error, 130/143 interrupted (the server is stopped first).
+# 8 a required server log line is missing or a forbidden one is there, 2 a usage error, 130/143 interrupted
+# (the server is stopped first).
 
 set -u
 
@@ -60,6 +73,10 @@ REPEAT_TOP=2
 CTX=""
 MINTOK_ARGS=()
 PROBE_EXTRA=()
+REQUIRE_LOG=()
+FORBID_LOG=()
+POST_CMDS=()
+POST_RCS=()
 PROBE=1
 MAX_MODEL_LEN=131072
 MAX_NUM_SEQS=32
@@ -107,8 +124,16 @@ while [ $# -gt 0 ]; do
         --model) [ $# -ge 2 ] || die "--model needs a folder"; MODEL="$2"; shift 2 ;;
         --out) [ $# -ge 2 ] || die "--out needs a folder"; OUT="$2"; shift 2 ;;
         --probe-arg) [ $# -ge 2 ] || die "--probe-arg needs a value"; PROBE_EXTRA+=("$2"); shift 2 ;;
+        --require-log) [ -n "${2:-}" ] || die "--require-log needs a pattern"; REQUIRE_LOG+=("$2"); shift 2 ;;
+        --forbid-log) [ -n "${2:-}" ] || die "--forbid-log needs a pattern"; FORBID_LOG+=("$2"); shift 2 ;;
+        --probe-require-log)
+            [ -n "${2:-}" ] || die "--probe-require-log needs a pattern"
+            PROBE_EXTRA+=("--require-log=$2")
+            shift 2
+            ;;
+        --post-cmd) [ -n "${2:-}" ] || die "--post-cmd needs a command"; POST_CMDS+=("$2"); shift 2 ;;
         --) shift; break ;;
-        -h | --help) sed -n '3,47p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        -h | --help) sed -n '3,59p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) die "unknown option: $1 (extra vllm serve arguments follow --)" ;;
     esac
 done
@@ -141,7 +166,7 @@ SERVE+=("$@")
     printf 'serve:'
     printf ' %q' "${SERVE[@]}"
     printf '\n'
-    env | grep -E '^(VLLM_|PT_HPU|HABANA_VISIBLE|FLASHINFER|HCCL_|GC_)' | sort
+    env | grep -E '^(VLLM_|PT_HPU|HABANA_VISIBLE|HABANA_PROFILE|HABANA_LOGS|LOG_LEVEL_|HPU_GRAPH|PYTHONPATH|FLASHINFER|HCCL_|GC_)' | sort
 } >versions.txt
 
 STARTED="$(date -u +%s)"
@@ -151,17 +176,43 @@ HEALTHY_S=""
 PROBE_RC=""
 
 json_summary() {
-    "$PYTHON" - "$OUT/summary.json" "$RESULT" "$TP" "$EP" "$PORT" "${HEALTHY_S:-}" "${PROBE_RC:-}" "$SPEC" "$STARTED" <<'PY'
+    "$PYTHON" - "$OUT/summary.json" "$RESULT" "$TP" "$EP" "$PORT" "${HEALTHY_S:-}" "${PROBE_RC:-}" "$SPEC" "$STARTED" \
+        "${POST_RCS[*]:-}" <<'PY'
 import json, os, sys, time
-out, result, tp, ep, port, healthy, probe_rc, spec, started = sys.argv[1:10]
+out, result, tp, ep, port, healthy, probe_rc, spec, started, post_rcs = sys.argv[1:11]
 env = {k: v for k, v in sorted(os.environ.items())
-       if k.startswith(("VLLM_", "PT_HPU", "HABANA_VISIBLE", "FLASHINFER", "HCCL_", "GC_", "FARM_"))}
+       if k.startswith(("VLLM_", "PT_HPU", "HABANA_VISIBLE", "HABANA_PROFILE", "HABANA_LOGS", "LOG_LEVEL_", "HPU_GRAPH",
+                        "PYTHONPATH", "FLASHINFER", "HCCL_", "GC_", "FARM_"))}
 json.dump({"result": result, "tp": int(tp), "ep": ep == "1", "port": int(port),
            "healthy_after_s": float(healthy) if healthy else None,
            "probe_rc": int(probe_rc) if probe_rc else None, "speculative_config": spec or None,
+           "post_rc": [int(x) for x in post_rcs.split()],
            "seconds": round(time.time() - float(started), 1), "env": env},
           open(out, "w"), indent=1)
 PY
+}
+
+# log_check WHEN: the --require-log patterns (WHEN=healthy) and the --forbid-log patterns in server0.log; prints
+# what it finds and returns 1 when the run must end with 8.
+log_check() {
+    local re bad=0
+    if [ "$1" = healthy ]; then
+        for re in ${REQUIRE_LOG[@]+"${REQUIRE_LOG[@]}"}; do
+            if grep -qE -- "$re" "$OUT/server0.log"; then
+                echo "serve_probe: REQUIRED-LOG ok ($re): $(grep -m1 -E -- "$re" "$OUT/server0.log" | cut -c1-300)"
+            else
+                echo "serve_probe: REQUIRED-LOG MISSING after $1: no line of server0.log matches '$re'"
+                bad=1
+            fi
+        done
+    fi
+    for re in ${FORBID_LOG[@]+"${FORBID_LOG[@]}"}; do
+        if grep -qE -- "$re" "$OUT/server0.log"; then
+            echo "serve_probe: FORBIDDEN-LOG after $1 ($re): $(grep -m1 -E -- "$re" "$OUT/server0.log" | cut -c1-300)"
+            bad=1
+        fi
+    done
+    return "$bad"
 }
 
 # stop_server: SIGTERM to the server's process group, SIGKILL 90 s later. Not SIGINT: a command a
@@ -232,11 +283,18 @@ done
 HEALTHY_S=$(($(date -u +%s) - STARTED))
 echo "serve_probe: SERVER-HEALTHY after $HEALTHY_S s"
 grep -E "Maximum concurrency|num_blocks|KV cache|speculative|Speculative" server0.log | tail -n 12 | cut -c1-300
+if ! log_check healthy; then
+    stop_server
+    RESULT="required-log-missing"
+    json_summary
+    echo "serve_probe: DONE ($RESULT)"
+    exit 8
+fi
 
 RC=0
 if [ "$PROBE" -eq 1 ]; then
     PROBE_ARGS=(--port "$PORT" --model fn --out "$OUT/scaling.json" --levels "$LEVELS" --tokens "$TOKENS"
-        --warm-tokens "$WARM_TOKENS" --repeat-top "$REPEAT_TOP")
+        --warm-tokens "$WARM_TOKENS" --repeat-top "$REPEAT_TOP" --server-log "$OUT/server0.log")
     if [ -n "$CTX" ]; then PROBE_ARGS+=(--ctx "$CTX"); fi
     PROBE_ARGS+=(${MINTOK_ARGS[@]+"${MINTOK_ARGS[@]}"} ${PROBE_EXTRA[@]+"${PROBE_EXTRA[@]}"})
     probe() {
@@ -251,11 +309,46 @@ if [ "$PROBE" -eq 1 ]; then
     echo "serve_probe: PROBE-RC $PROBE_RC"
     grep -E "generation throughput|acceptance|SpecDecoding" server0.log | tail -n 16 | cut -c1-300
     grep -E "MTP step timing" server0.log | tail -n 12 | cut -c1-400
-    if [ "$PROBE_RC" -ne 0 ]; then RC=5; fi
+    if [ "$PROBE_RC" -eq 8 ]; then
+        RC=8
+    elif [ "$PROBE_RC" -ne 0 ]; then
+        RC=5
+    fi
 fi
+if ! log_check after-probe; then RC=8; fi
 echo "serve_probe: fallback/off lines: $(grep -ciE "fallback|is off for|has no HPU kernel" server0.log)"
+# The post commands: while the server still runs, one after the other (each in the background, so a TERM reaches
+# it through on_signal); none after a required-log failure or once the server has died.
+i_post=0
+for cmd in ${POST_CMDS[@]+"${POST_CMDS[@]}"}; do
+    i_post=$((i_post + 1))
+    if [ "$RC" -eq 8 ]; then
+        echo "serve_probe: POST $i_post skipped (a required server log line is missing)"
+        POST_RCS+=(-8)
+        continue
+    fi
+    if ! kill -0 "$SP" 2>/dev/null; then
+        echo "serve_probe: POST $i_post skipped: the server is gone"
+        POST_RCS+=(-3)
+        continue
+    fi
+    echo "serve_probe: POST $i_post start $(date -u +%T): $cmd"
+    (cd "$OUT" && SERVE_PORT="$PORT" SERVE_OUT="$OUT" SERVE_LOG="$OUT/server0.log" SERVE_KIT="$HERE" \
+        SERVE_MODEL_NAME=fn bash -c "$cmd") &
+    CHILD=$!
+    wait "$CHILD"
+    post_rc=$?
+    CHILD=""
+    POST_RCS+=("$post_rc")
+    echo "serve_probe: POST-RC $i_post $post_rc $(date -u +%T)"
+    json_summary
+done
+if [ -n "$SP" ] && ! kill -0 "$SP" 2>/dev/null; then
+    echo "serve_probe: the server died during the post commands"
+    grep -nE "Error|Traceback|error:" server0.log | tail -n 15 | cut -c1-400
+fi
 stop_server
-if [ "$RC" -eq 0 ]; then RESULT="ok"; else RESULT="probe-failed"; fi
+if [ "$RC" -eq 0 ]; then RESULT="ok"; elif [ "$RC" -eq 8 ]; then RESULT="required-log-missing"; else RESULT="probe-failed"; fi
 json_summary
 echo "serve_probe: DONE ($RESULT)"
 exit "$RC"

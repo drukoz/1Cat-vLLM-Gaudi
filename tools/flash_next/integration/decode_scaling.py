@@ -273,6 +273,10 @@ def main():
                     help="an arm of the A/B on one server: NAME=FLAG=VALUE[;FLAG=VALUE...] (repeatable, in order)")
     ap.add_argument("--server-log", default="", help="the server's log, to check that the workers took each switch")
     ap.add_argument("--switch-settle", type=float, default=2.0, help="seconds without requests around a switch")
+    ap.add_argument("--require-log", action="append", default=[], metavar="RE",
+                    help="(repeatable, with --server-log) a line of the server's log must match the regular expression "
+                         "RE after the first warm round, else the probe stops with exit code 8 (a flag that silently "
+                         "fell back, e.g. the dense MoE form)")
     args = ap.parse_args()
     arms = []
     for spec in args.switch_arm:
@@ -289,6 +293,33 @@ def main():
     def save():
         with open(args.out, "w") as f:
             json.dump(results, f, indent=1)
+
+    required = {"checked": not args.require_log, "missing": []}
+
+    def require_logs():
+        """After the first warm round: every --require-log pattern must match a line of --server-log. False: stop."""
+        if required["checked"]:
+            return True
+        required["checked"] = True
+        import re
+        try:
+            with open(args.server_log, errors="replace") as f:
+                text = f.read()
+        except OSError as e:
+            text = ""
+            print("REQUIRE-LOG: cannot read the server log %r: %r" % (args.server_log, e), flush=True)
+        for pattern in args.require_log:
+            m = re.search(pattern, text)
+            if m:
+                line = text[text.rfind("\n", 0, m.start()) + 1:text.find("\n", m.end()) if text.find("\n", m.end()) >= 0 else None]
+                print("REQUIRE-LOG ok (%s): %s" % (pattern, line.strip()[:300]), flush=True)
+            else:
+                required["missing"].append(pattern)
+                print("REQUIRE-LOG MISSING: no line of %s matches %r after the first warm round: stopping (exit 8)" % (
+                    args.server_log, pattern), flush=True)
+        results["require_log"] = {"patterns": args.require_log, "missing": required["missing"]}
+        save()
+        return not required["missing"]
 
     def sampled_level(n):
         # What a client that sets no temperature gets: the server's default sampling on every step.
@@ -365,6 +396,8 @@ def main():
                 print("stopping: the warm round at N=%d arm %s failed: %s" % (n, name, w.get("error_samples")),
                       flush=True)
                 return False
+            if not require_logs():
+                return False
         for rep in range(reps):
             for name, lines in arms:
                 before = switch_to(name, lines)
@@ -397,6 +430,8 @@ def main():
         print("warm  N=%-3d ok=%d err=%d wall=%.1fs ms/tok p50=%s" % (
             n, w["ok"], w["errors"], w["wall_s"], ("%.1f" % w["ms_per_token_p50"]) if w.get("ok") else "-"),
               flush=True)
+        if w.get("ok") and not require_logs():
+            break
         reps = args.rounds if args.rounds > 0 else (args.repeat_top if n == levels[-1] else 1)
         for rep in range(reps):
             m = measured_round(args, n, args.tokens)
@@ -424,6 +459,9 @@ def main():
                 print("TEXT  N=%-3d stream %-2s: %r" % (n, k, t[:110]), flush=True)
         if args.interleave_sampled and not args.no_sampled_check and n in sampled_levels:
             sampled_level(n)
+    if required["missing"]:
+        save()
+        return 8
     if levels and args.mintok_check and not args.min_tokens:
         n = levels[-1]
         w = run_round(args, n, args.warm_tokens, mintok=True)  # compiles whatever the mask adds
@@ -458,7 +496,7 @@ def main():
         else:
             print("CTX FAILED: %s" % m.get("error_samples"), flush=True)
     save()
-    return 0
+    return 8 if required["missing"] else 0
 
 
 if __name__ == "__main__":

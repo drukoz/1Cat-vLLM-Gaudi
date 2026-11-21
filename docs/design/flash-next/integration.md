@@ -9,7 +9,37 @@ Labels: MEASURED (card, with its file), VERIFIED (CPU test or code line), INFERR
 
 ## Handoff (if this agent stops)
 
-Updated 2026-11-21 06:30 UTC (fourth agent of the track, Opus 5.5, started 23:12 UTC).
+**Build 5 (fifth agent of the track, Opus 5.5, started 08:04 UTC on 2026-11-21; updated 08:40 UTC).**
+
+- **Tree.** Base = build 4 (`8cdc5999`) with the program head `adbcff30` (PRs #18 to #22) merged in, so the tree is the
+  program head plus what build 4 carried that the head lacks (qsa-fused's branch, mtp-card-ready + the per-step record,
+  prefill `92e65144`, async-sched `fb5cefca`, this kit). Then, in order: `f6aba529` merge mtp-draft-graph-b4 `100f4bf0`
+  (`VLLM_HPU_MTP_DRAFT_GRAPH` + runtime switch + the kit's switch arms); kernel-fixes `11bc2f6d`, `a5786c55`, `b92402ef`
+  (dense MoE that survives `model.to("hpu")`, chunk size 0); native-replay `773a7f7c` (`VLLM_HPU_WORKER_CPU_PIN=3`, default
+  off); qsa-fused `f3b63114` (`VLLM_HPU_QSA_KV_FP8`, default off); `125429d3` merge engine-step-mtp-record `07932956`;
+  qsa-fused `a09aad30` (kv_logprob_probe.py), `03156364` (`VLLM_HPU_QSA_SLOT_SHIFT`, default 0, OFF in every arm),
+  `703b3cf7` + `9b4faf7c` (qsa_ab_probe.py long rounds); async-sched `d3fb1b11` (mode 1 only: no device wait in a steady
+  step; mode 2 returns before that code, VERIFIED by reading `_flash_next_async_begin_step`); then the kit commit.
+  Merge log below. Image of the code commit `125429d3`: `farm-integration:125429d31188` (built 08:18 UTC, 278 s).
+- **CPU.** dense + FP8 K/V + pin tests 63 passed; slot shift + FP8 K/V 24 passed; async worker test 39 passed; 54
+  non-gate files on a snapshot of `125429d3` (`reports/integration/cpu/out-b10x/summary.txt`): 51 green, 3 card-only
+  skips. `bin/gate` on the final tree: see the job plan line below.
+- **Kit (this commit's tools/flash_next/integration).** An MTP arm is `mtp<K>` plus words: server `async graph rfc noshard
+  spin inline fp8kv pin3 hpulog ss0 irlog`, probe `32 lv<N>_<N> greedy switch`, and steps on the same server after the
+  probe `sw dg32 cap kvlp kvlpfb long` (serve_probe.sh `--post-cmd`). `HEADLINE_TRACE_ENV=1` starts every MTP server
+  with step-anatomy's capture setup; `HEADLINE_REQUIRE_DENSE=1` stops the job with exit 8 when the server log lacks
+  "keep their stacked experts" at load or "runs the dense MoE form" after the first warm round (a silent fallback voided
+  00177 and 00190). Late switches read at the job's start: `~/farm/integration/results/switches/pin` ("on" = every
+  server with pin mode 3) and `.../switches/ss0` ("on" = the stage-submission arms run and the inline arm does not).
+  Dry runs against a fake server on the Mac: `scratchpad/integration/dry-*` (all arms, post steps, the dense stop,
+  the switches).
+- **The job (planned):** `real8-build5`, all cards, hold 110 min, after 00202 / 00203 (coordinator, about 11:30 UTC).
+  Arms: `tiny mtp2-async-sw-cap-kvlp mtp2-async-spin mtp3-async mtp2-kvlpfb ifnot-ss0:mtp2-async-inline-greedy
+  if-ss0:mtp2-async-ss0-greedy if-ss0:mtp2-async-irlog-lv1-greedy mtp2-async-fp8kv-hpulog-32-greedy-dg32-kvlp-long`.
+  Late-bound: `reports/integration/late/make_run5.sh` (run5.sh; `--pin on|off`). Results:
+  `reports/integration/card/<id>-real8-build5/` (or `bin/farm fetch integration <id> <id>-real8-build5`).
+
+Earlier (fourth agent, updated 2026-11-21 06:30 UTC; started 23:12 UTC):
 
 **Now (02:25 UTC), for whoever takes the track next.** Builds 1 and 2 are measured (tables below: 00128, 00156).
 Three jobs of this track wait or run on the node; the `farm job` commands that submitted them ran in the fourth
@@ -258,6 +288,13 @@ worse at 1 and 8 streams (1 stream 54 against 33 ms per step): under async `VLLM
   `hpu_flash_next_mtp.py`: a comment). `a39d1f48` adjusts two of prefill's tests to the merged tree (a stub of
   engine-step's `_poll_runtime_switches`; the rule-9 cast guard skipped because qsa-fused's `select_blocks` no longer
   casts): for prefill's own merge after engine-step and qsa-fused.
+- Build 5: `9b971279` program head `adbcff30` (`envs.py`: the step timer's four variables had moved on the head; both
+  copies identical, the head's placement kept); `f6aba529` mtp-draft-graph-b4 `100f4bf0` (clean); kernel-fixes
+  `11bc2f6d` / `a5786c55` / `b92402ef` and native-replay `773a7f7c` cherry-picked (clean); `ecee792f` = qsa-fused
+  `f3b63114` (`qsa.py`, `envs.py`, `env_variables.md`: both sides had added code at the same place, both kept);
+  `125429d3` engine-step-mtp-record `07932956` (`hpu_model_runner.py` after the target forward: the record's replay
+  timer inside the profiler block, then the step timer's forward lap, both kept); `a09aad30`, `03156364`, `703b3cf7`,
+  `9b4faf7c`, `d3fb1b11` cherry-picked (clean).
 
 ## Card results
 
