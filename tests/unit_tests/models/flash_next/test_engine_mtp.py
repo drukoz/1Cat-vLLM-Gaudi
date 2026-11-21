@@ -281,6 +281,9 @@ def test_the_chained_draft_gives_the_drafts_of_the_per_pass_drafter(engine_runs,
     assert [p["generated_ids"] for p in chain["prompts"]] == [p["generated_ids"] for p in per_pass["prompts"]]
     assert chain["runner"]["draft_chain_calls"] > 0 and per_pass["runner"]["draft_chain_calls"] == 0
     assert not [c for c in chain["draft_calls"] if c.get("decode")]
+    # a step without decodes (the next prompt's prefill after chained steps) is never taken as chained
+    prefill_drafts = [c for c in chain["draft_calls"] if not c.get("fill") and not c.get("decode")]
+    assert prefill_drafts and not [c for c in prefill_drafts if c.get("chain_step")]
     _check_oracle(engine_runs, chain, accept, k)
 
 
@@ -308,6 +311,39 @@ def test_the_chain_runs_the_greedy_rejection_in_its_graph(engine_runs):
     assert chain["runner"]["draft_chain_calls"] > 0
     assert not [c for c in chain["draft_calls"] if c.get("decode")]
     _check_oracle(engine_runs, chain, accept, K)
+
+
+def test_the_chain_switched_at_run_time(engine_runs):
+    # The card's chain set on one server (headline_job.sh mtp<K>-chain-switch): VLLM_HPU_MTP_DRAFT_CHAIN and
+    # VLLM_HPU_VOCAB_PARALLEL_LOGITS switched between prompts at k = 2 on the draft graph and I01 (stage A with VP 0,
+    # stage B with VP 1). Every draft and every stream equal the per-pass drafter's with I01; the decode drafts were
+    # chained exactly where the switch file put it, and no prefill draft's step was taken as chained.
+    accept = [2, 0, 1]
+    per_pass = _oracle_run(engine_runs, accept, k=2, env=CHAIN_BASE, tag="_loop_md")
+    switch_file = engine_runs["dir"] / "chain.switches"
+    arms = {1: ("1", "0"), 2: ("0", "1"), 3: ("1", "1"), 4: ("0", "0")}  # (chain, vp) from the next prompt on
+    options = []
+    for after, (chain, vp) in arms.items():
+        options += ["--switch-after", str(after),
+                    f"VLLM_HPU_MTP_DRAFT_CHAIN={chain};VLLM_HPU_VOCAB_PARALLEL_LOGITS={vp}"]
+    env = {**CHAIN_BASE, "VLLM_HPU_MTP_DRAFT_GRAPH": "1", "VLLM_HPU_RUNTIME_SWITCH_FILE": str(switch_file)}
+    run = _oracle_run(engine_runs, accept, *options, k=2, env=env, tag="_chain_switch")
+    assert [e["drafter"] for e in run["oracle"]] == [e["drafter"] for e in per_pass["oracle"]]
+    assert [p["generated_ids"] for p in run["prompts"]] == [p["generated_ids"] for p in per_pass["prompts"]]
+    start = 0
+    for number, prompt in enumerate(run["prompts"], 1):
+        calls = [c for c in run["draft_calls"][start:prompt["draft_calls_end"]] if not c.get("fill")]
+        start = prompt["draft_calls_end"]
+        chained = arms.get(number - 1, ("0", "0"))[0] == "1"  # the switch after prompt n acts from prompt n + 1
+        decode = [c for c in calls if c.get("decode")]
+        assert bool(decode) != chained, (number, decode)
+        assert all(c["graph"] for c in decode), (number, decode)
+        assert not [c for c in calls if not c.get("decode") and c.get("chain_step")], number
+    assert run["runner"]["draft_chain_calls"] > 0
+    log = engine_runs["dir"].joinpath("k2_accept_201" + "".join(o.strip("-")[:3] for o in options)
+                                      + "_chain_switch.json.log").read_text(encoding="utf-8", errors="replace")
+    assert "stage A" in log and "stage B" in log
+    _check_oracle(engine_runs, run, accept, 2)
 
 
 def test_a_sampled_request_keeps_the_draft_after_the_host_read(engine_runs):

@@ -7090,6 +7090,10 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             logits_prompt = []
             logits_decode = []
             self.use_structured_output = True
+        # VLLM_HPU_MTP_DRAFT_CHAIN: no step is chained until the decode section decides (a step without decodes
+        # never is; the previous step's chain outputs are dropped here, after the next inputs were built)
+        self._mtp_chain_step = False
+        self._mtp_chain_out = None
 
         ######################### PREFILLS #########################
         if num_prefills > 0:
