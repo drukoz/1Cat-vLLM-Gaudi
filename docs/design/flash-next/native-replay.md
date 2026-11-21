@@ -526,6 +526,47 @@ directly. This harness keeps the handoff here (earlier harnesses refused report 
   one-at-a-time gate has five tracks queued for hours, and the coordinator said to leave the queue unless one's gate
   already runs.
 
+### Lean replay work on this node (from 00:40 UTC: the owner extended the node to about 00:00 UTC on 2026-11-22)
+
+The coordinator started next-week item 1 (the bridge-only prepared replay, Pending item 3) on this node, as a
+default-off bridge setting `PT_HPU_HPUGRAPH_PREPARED_REPLAY`, qualified by the tiny model's tokens and
+`bench_replay.py` at TP8, then a real-model A/B at 1 and 32 streams; card jobs 8-card where possible (owner's rule).
+State at 00:57 UTC:
+- **Our own bridge build.** The UNPATCHED gaudi-pytorch-bridge at 5176b1b2 (head of `v1.24.1`) built in `farm-base` in
+  container `nr-bridge-build` (CPUs 18,37,56,75, nice 19, no card; `late/bridge-build/build_bridge.sh`; 840 build steps,
+  23:43 to about 00:58 UTC). `keep_tree.sh` snapshots the container when the log says `build end` as image
+  `farm-bridge-build:5176b1b2` (the build tree in `/tmp/builds`, sources in `/tmp/gaudi-pytorch-bridge`), log
+  `~/farm/native-replay/bridge-build/commit.log`. Next builds: a long-lived dev container `nr-bridge-dev` from that image
+  (same CPUs, `-v ~/farm/native-replay/bridge-build:/out`, `sleep infinity`) and `late/bridge-build/dev_build.sh BUILD_ID
+  PATCH` (reset to 5176b1b2, apply `patches/PATCH`, incremental `build.py -r -l -j 4`, `package_out.py`).
+- **Deployment interface, agreed with the collectives track (agent a3344386b2bc11c38), live on the node:** builds in
+  `~/farm/native-replay/bridge-build/out/<build-id>/` (`wheels/*.whl`, `build.log`, `manifest.json` written last, the
+  folder renamed into place); ids `stock-5176b1b2` and `<name>-<12 hex of the patch's sha256>`; `bin/farm job|tiny|serve
+  ... --bridge <build-id>` installs a build's wheels in the job's container, checks the sha256 and that the loaded .so
+  files are the wheel's, and keeps a per-build recipe cache (exit 7: install failed, 8: wrong bridge loaded).
+- **Incident 00148 (00:46 UTC):** `perf record --call-graph dwarf` on the benchmark's replay loop, card 0 (module 3):
+  `PCIE_ADDR_DEC_ERR ... read from unmapped reg, addr 0x1000007ffd9200a8` = Gaudi2 CFG_BASE (0x1000007FF8000000) +
+  0x59200A8, inside `NIC10_UMR1_0_UNSECURE_DOORBELL1` (a write-only NIC doorbell page mapped into the process); the
+  driver reset the card (done 00:47:00), the peers' links flapped (19 down, 19 up by 00:47:12). Likely cause
+  (INFERRED): perf's DWARF user-stack copy (8 KB above the stack pointer, clamped to the address-space end, not to the
+  stack mapping) read the mapped doorbell page. **BRIEF rule 12: no perf call graphs (dwarf or -g) on processes that
+  have a card open; IP-only perf and gdb are fine.**
+- **Profile of a replayed launch (00148's samples before the fault, 1 card, small recipes, about 22 us per launch):**
+  ExecuteSynapseCache -> RecipeLauncher::Launch about 2/3 (the bridge's per-address event bookkeeping plus Synapse's
+  launch), UpdatePatchingInformation about 1/4 (half of it allocating outputs and intermediates), per-launch object churn
+  about 1/6 (HlExec's constructor builds two empty JIT graphs; lazy tensors; hashes; the launcher), the spec and the
+  LRU lookup under 1/20. The AccThreadPool thread spins at 100 % of a CPU. Reports:
+  `reports/native-replay/card/perf1/perf_bench.{self,dso}.txt`, inclusive `~/farm/native-replay/results/perf1/
+  perf_bench.incl.txt`.
+- **First patch: phase timers** (`late/bridge-build/timers.patch`, the bridge tree with it in
+  `reports/native-replay/bridge-src/`): `PT_HPU_HPUGRAPH_REPLAY_TIMING=N` prints every N replayed launches per thread a line
+  `HPUGRAPH_REPLAY_TIMING ... total_us ... graph_prep ... syn_launch ... | per launch inputs ... externals ...` (16
+  phases of SingleHPUGraph::replayGraph, ExecuteCachedGraph, HlExec::Launch, HabanaLaunchOpPT::run,
+  ExecuteSynapseCache, RecipeLauncher::Launch; only synchronously replayed launches; about 20 ns per stamp). Plan
+  (coordinator, approved): build it as `timers-<hash>`, then one all-card job with `--bridge`: the tiny model at TP8 and
+  the real model at TP8 with the timers, giving the real per-phase split per launch; then the lean path aims at what
+  dominates.
+
 ### Where the two host levers are tested now (coordinator, 00:28 UTC)
 
 The owner put 8-card runs first (BRIEF.md 00:28 UTC): the TP4 job 00134 below waits behind the TP8 jobs and will
