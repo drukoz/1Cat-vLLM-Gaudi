@@ -674,10 +674,20 @@ step while the host works.
 - **Stage 1 of the upload, done on CPU: `VLLM_HPU_PERSISTENT_INPUTS=1`** (`8efc6969`, default 0; coordinator GO
   08:38 UTC): every per-step input of the decode builder, the speculative indices and the PLE inputs through
   `HPUModelRunner._upload`, a persistent pinned host tensor and a persistent device tensor per (name, shape, dtype),
-  copied non-blocking (two pairs alternating per input under async scheduling). Same tokens off and on (greedy, n-gram
+  copied non-blocking (each upload of a step its own pair; two step parities under async scheduling, `begin_step` at
+  every `execute_model`). Same tokens off and on (greedy, n-gram
   k = 3 with oracle drafts); one device address per input shape, which lean5's static launch plan needs (asked
   collectives for the plan_hit per rank, now from 00234). async-sched's device-made inputs replace five of them in chained
   verification steps (its own tensors; agreed 08:46 UTC).
+- **The persistent inputs' contract (async-sched, 11:05 UTC; VERIFIED in its code):** the inputs are no longer fresh
+  tensors: the same input's upload in the next step (two steps later under async scheduling) rewrites them. async-sched's
+  M1 kept a step's host-made positions, ids and PLE context for the next step's device advance and read them after the
+  next upload (`test_engine_spec_device_align` 2 of 3 red with the flag, synchronous, M1 = 2); its fix keeps copies
+  (`feat/flash-next-gaudi-async-sched-s3` `a4f1e896`). Other code that keeps a step's inputs across steps (the PLE
+  carry, the draft chain, spec-lookup) needs the same care. This track's side: an input uploaded twice in one step
+  (two prefill chunks of one bucket) shared one pair, so the second upload could rewrite the first one's pinned buffer
+  while its non-blocking copy, or its device tensor while its forward, still read them; each upload of a step now gets
+  its own pair (`begin_step`, unit test `test_a_second_upload_in_one_step_gets_its_own_pair`).
 - **The lean5 A/B of the persistent inputs:** collectives runs `VLLM_HPU_PERSISTENT_INPUTS=1` against `=0` on one
   image with lean5 on (its ab_bridge template), build 6 preferred, this track's image only if the coordinator or
   collectives says so (do not sync it for this unasked). Best on native-replay's `lean6m-43fdd6850644` with

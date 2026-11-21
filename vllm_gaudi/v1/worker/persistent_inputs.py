@@ -8,10 +8,17 @@ replay re-patches them; native-replay's static launch plan (lean5) only hits whe
 address it had two launches before.
 
 Here every input (by name, shape and dtype) gets a pinned host tensor and a device tensor once. Each step the host
-fills its tensor with CPU ops and issues one ``copy_(non_blocking=True)`` into the device tensor. With synchronous
-stepping one pair per input is enough (step N's inputs are read before step N + 1 prepares them); under async
-scheduling two pairs alternate per input, so a copy never rewrites what the step before may still read, and the
+fills its tensor with CPU ops and issues one ``copy_(non_blocking=True)`` into the device tensor. The runner calls
+``begin_step`` once per engine step. Within a step every upload of an input gets its own pair (the second upload of
+the same name and shape in one step, e.g. two prefill chunks of one bucket, does not rewrite the first one's host
+buffer or device tensor while the first copy or forward may still read them). With synchronous stepping the next
+step reuses the pairs (step N's device work has finished when the runner reads its sampled tokens); under async
+scheduling two step parities alternate, so a copy never rewrites what the step before may still read, and the
 address seen two launches back is the same one (lean5's ring of two hits either way).
+
+Contract (async-sched, 11:05 UTC): an uploaded tensor is rewritten by the same input's upload in the next step
+(synchronous) or two steps later (async scheduling). Code that keeps a step's input tensor and reads it in a later
+step (a device-side advance of positions or ids, a carried PLE context, a chained draft) must keep its own copy.
 
 Nothing else changes: the same values, dtypes and shapes as ``async_h2d_copy``.
 """
@@ -21,7 +28,7 @@ from __future__ import annotations
 import numpy as np
 import torch
 
-MAX_KEYS = 4096  # (name, shape, dtype, slot) pairs kept; beyond it everything is dropped and made again
+MAX_KEYS = 4096  # (name, shape, dtype, parity, call) pairs kept; beyond it everything is dropped and made again
 
 
 class PersistentInputs:
@@ -33,9 +40,16 @@ class PersistentInputs:
         self.device = device
         self.pin_memory = bool(pin_memory)
         self.buffers = buffers
-        self._turn: dict = {}
+        self._parity = 0
+        self._calls: dict = {}
         self._host: dict = {}
         self._dev: dict = {}
+
+    def begin_step(self) -> None:
+        """A new engine step: its uploads take their pairs from the start again (the other parity under async
+        scheduling)."""
+        self._calls.clear()
+        self._parity = (self._parity + 1) % self.buffers
 
     @staticmethod
     def _as_host(source, dtype) -> torch.Tensor:
@@ -53,9 +67,9 @@ class PersistentInputs:
     def upload(self, name: str, source, dtype=None) -> torch.Tensor:
         host = self._as_host(source, dtype)
         key = (name, tuple(host.shape), host.dtype)
-        slot = self._turn.get(key, 0)
-        self._turn[key] = (slot + 1) % self.buffers
-        pair = key + (slot, )
+        call = self._calls.get(key, 0)
+        self._calls[key] = call + 1
+        pair = key + (self._parity, call)
         staging = self._host.get(pair)
         if staging is None:
             if len(self._host) >= MAX_KEYS:

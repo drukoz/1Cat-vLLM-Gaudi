@@ -4731,8 +4731,10 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
 
     def _upload(self, name: str, source, dtype=None):
         """One per-step input to the device. ``VLLM_HPU_PERSISTENT_INPUTS=1``: into a persistent device tensor per
-        (name, shape, dtype), from a persistent pinned host tensor, non-blocking (persistent_inputs.py; two
-        alternating pairs under async scheduling). Otherwise ``async_h2d_copy`` as before (a tensor keeps its dtype)."""
+        (name, shape, dtype) and upload of the step, from a persistent pinned host tensor, non-blocking
+        (persistent_inputs.py; two step parities under async scheduling; ``execute_model`` starts each step). The
+        tensor is rewritten by a later step's upload: keep a copy to read it in a later step. Otherwise
+        ``async_h2d_copy`` as before (a tensor keeps its dtype)."""
         if isinstance(source, torch.Tensor):
             dtype = None  # as async_h2d_copy: a tensor is copied as it is
         if not gaudi_envs.VLLM_HPU_PERSISTENT_INPUTS:
@@ -6900,6 +6902,8 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             return self.kv_connector_no_forward(scheduler_output, self.vllm_config)
         if not warmup_mode:
             self._gc_step_begin()
+        if self._persistent_inputs is not None:
+            self._persistent_inputs.begin_step()  # VLLM_HPU_PERSISTENT_INPUTS: this step's uploads, own pairs
 
         if self.is_pooling_model:
             # 1. padding input_ids and positions 2. fill attn_metadata

@@ -145,10 +145,13 @@ verify graph is captured again for the extra argument).
 every input of every step is a fresh device tensor copied from an unpinned host tensor (`async_h2d_copy`: a device
 allocation per input, and the bridge stages each copy through its pinned pool). With `1` each input (by name, shape
 and dtype) has a persistent pinned host tensor and a persistent device tensor: the host fills its tensor and copies it
-non-blocking into the same device tensor every step (two pairs alternating per input under async scheduling). The
-values are the same; the forward's inputs keep their addresses from step to step, which a static launch plan of the
-HPU graph replay needs. Covered: the decode builder's inputs (ids, positions, slots, block tables, lengths, state
-indices, accepted counts, logits indices), the speculative indices and the PLE inputs. Any other value is `0`.
+non-blocking into the same device tensor every step (an input uploaded twice in one step gets a pair per upload; two
+step parities alternate under async scheduling). The values are the same; the forward's inputs keep their addresses
+from step to step, which a static launch plan of the HPU graph replay needs. Covered: the decode builder's inputs
+(ids, positions, slots, block tables, lengths, state indices, accepted counts, logits indices), the speculative
+indices and the PLE inputs. The inputs are no longer fresh tensors: the same input's upload in the next step (two
+steps later under async scheduling) rewrites them, so code that reads a step's input in a later step must keep its
+own copy. Any other value is `0`.
 
 `VLLM_HPU_RUNTIME_SWITCH_FILE` (a path, default unset) is an operator's tool for an A/B on one server.
 When set, every worker looks at that file before each step (one `stat`) and, when the file changed, takes
