@@ -285,7 +285,9 @@ def test_sample_tokens_calls_the_timer_at_every_boundary_of_a_step():
         'step_timer.lap("launch_inputs")',  # the decode batch
         'step_timer.lap("launch_model")',
         'step_timer.device_wait("device_forward", (logits_device, fused_sampled_token_ids, sample_hidden_states))',
-        'step_timer.lap("wait")',  # a verification step reads the accepted tokens here
+        # a verification step reads the accepted tokens in _mtp_chain_settle (its own method since the MTP draft
+        # chain, so async scheduling's mode 3 can run it one step late): the timer goes with it
+        'self._mtp_chain_settle(sampled_token_ids, decode_data, num_decodes, step_timer)',
         'step_timer.lap("wait")',  # every other step reads the sampled tokens here
         'step_timer.lap("draft")',
     ]
@@ -295,6 +297,8 @@ def test_sample_tokens_calls_the_timer_at_every_boundary_of_a_step():
         assert found >= 0, text
         position = found + len(text)
     assert source.count("if step_timer is not None:") >= 10
+    settle = inspect.getsource(HPUModelRunner._mtp_chain_settle)
+    assert 'step_timer.lap("wait")' in settle
 
 
 def test_the_async_output_wait_is_credited_to_the_timer(timer, clock, monkeypatch):
