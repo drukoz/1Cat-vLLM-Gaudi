@@ -699,6 +699,12 @@ every other process of the container off the reserved vCPUs; mode 3 only the eng
 
 ## Handoff (if this agent stops)
 
+**12:09 UTC (date -u).** place.sh revised again (collectives' point: the server-tree-only rule left the probe clients
+loose, unlike 00219): every process keeps off the reserved vCPUs except shells and the server's ancestors (ba96f64b).
+New file md5 44273de4d8f40d37905ebf4c422b3e00, built by `tools/flash_next/replay/make_place_sh.sh`; sent to
+collectives (00234) and integration. Follow-up pull request (the place_workers fix, the generator) waits for its gate
+on `ba96f64b` (the branch merged with program head 4d66755e).
+
 **12:06 UTC (date -u).** place.sh fixed (integration's job 00222: the first version moved every non-worker process
 off the reserved vCPUs, the job's shells included, so each later server of a multi-server container inherited fewer
 CPUs, 144 down to 64). `place_workers.py` (b60f2ee8, 3a733c26) now moves only the server's own process tree (the
