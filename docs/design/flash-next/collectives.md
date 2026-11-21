@@ -529,10 +529,11 @@ on 2026-11-22** (BRIEF 00:50 UTC).
    Late file `~/farm/collectives/bridge/late/00234.env` = `SPIN=on`, `REF_PAIR=1`, `PLACE=/results/bench/place.sh`
    (place_wrap.sh there is now 98213f8c, md5 7b159d11: it also resets its mask to the container's cpuset before each
    server, after integration found in 00222 that place.sh shrinks the CPU set of every later server of one container
-   by 16; one server per container here, so 00234 is not hit; place.sh there is native-replay's 816292de =
-   3a733c26 since 12:05 UTC, deployed by integration at the coordinator's request: only the server's own process tree
-   is kept off the reserved vCPUs, so the probe clients, children of serve_probe.sh's shell, are no longer confined
-   as in 00219 (7e54f2de); raised with native-replay, INFERRED to be jitter at most), `LEAN4=0`,
+   by 16; one server per container here, so 00234 is not hit; place.sh there is native-replay's 44273de4 =
+   place_workers.py at ba96f64b since 12:20 UTC (reviewed, the embedded source byte-identical): every process but
+   shells and the server's ancestors is kept off the reserved vCPUs, so the probe clients are confined as in 00219
+   (7e54f2de) and the next server of a container still gets the whole set; 816292de of 12:05 left the clients loose),
+   `LEAN4=0`,
    `LEAN5=lean6m-43fdd6850644`,
    `VERIFY_KV=PT_HPU_HPUGRAPH_STATIC_PLAN_MISS_LOG=200`; no pin. This agent's waiters fetch every arm
    (`card/00234-real8-bridge-reuse3-*`, verdicts) and, as soon as real-lean5-verify ends, its `server0.log` with the miss
