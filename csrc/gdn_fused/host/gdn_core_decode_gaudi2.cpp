@@ -12,9 +12,13 @@ license are met.
 #include <cstring>
 
 #include "gdn_core_decode_gaudi2.hpp"
+#include "gdn_kernel_variant.hpp"
 
 extern unsigned char _binary_gdn_core_decode_gaudi2_o_start;
 extern unsigned char _binary_gdn_core_decode_gaudi2_o_end;
+// The interleaved build (VLLM_HPU_GDN_KERNEL_INTERLEAVE=1): weak, absent when it did not compile.
+extern unsigned char _binary_gdn_core_decode_interleaved_gaudi2_o_start __attribute__((weak));
+extern unsigned char _binary_gdn_core_decode_interleaved_gaudi2_o_end __attribute__((weak));
 
 namespace {
 
@@ -212,8 +216,10 @@ tpc_lib_api::GlueCodeReturn GdnCoreDecodeGaudi2::GetGcDefinitions(
     instance->kernel.paramsNr = sizeof(GdnCoreDecodeParams) / sizeof(uint32_t);
     std::memcpy(instance->kernel.scalarParams, &scalar, sizeof(scalar));
 
-    const unsigned isaSize =
-        &_binary_gdn_core_decode_gaudi2_o_end - &_binary_gdn_core_decode_gaudi2_o_start;
+    const GdnKernelElf elf = GdnSelectKernelElf(&_binary_gdn_core_decode_gaudi2_o_start, &_binary_gdn_core_decode_gaudi2_o_end,
+                                                &_binary_gdn_core_decode_interleaved_gaudi2_o_start,
+                                                &_binary_gdn_core_decode_interleaved_gaudi2_o_end);
+    const unsigned isaSize = elf.size;
     const unsigned providedSize = instance->kernel.elfSize;
     instance->kernel.elfSize = isaSize;
     if (providedSize < isaSize) {
@@ -222,6 +228,6 @@ tpc_lib_api::GlueCodeReturn GdnCoreDecodeGaudi2::GetGcDefinitions(
     if (!instance->kernel.kernelElf) {
         return tpc_lib_api::GLUE_FAILED;
     }
-    std::memcpy(instance->kernel.kernelElf, &_binary_gdn_core_decode_gaudi2_o_start, isaSize);
+    std::memcpy(instance->kernel.kernelElf, elf.start, isaSize);
     return tpc_lib_api::GLUE_SUCCESS;
 }

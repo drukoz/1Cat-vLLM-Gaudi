@@ -15,7 +15,7 @@ extension implements both families, so its loader defines both sets of schemas f
 Schemas (activations are bf16 ``[tokens, columns]``):
 
     moe_route(Tensor gates, int experts, int top_k) -> (Tensor, Tensor)
-    moe_silu_mul(Tensor gate_up) -> Tensor
+    moe_silu_mul(Tensor gate_up, int first_column=0) -> Tensor
     moe_combine(Tensor shared, Tensor gates, Tensor routed, int gate_column) -> Tensor
     moe_row_quant(Tensor x, float fp8_max) -> (Tensor, Tensor)
 
@@ -30,7 +30,7 @@ NAMESPACE = "flashinfer_gaudi"
 OP_NAMES = ("moe_route", "moe_silu_mul", "moe_combine", "moe_row_quant")
 SCHEMAS = {
     "moe_route": "moe_route(Tensor gates, int experts, int top_k) -> (Tensor, Tensor)",
-    "moe_silu_mul": "moe_silu_mul(Tensor gate_up) -> Tensor",
+    "moe_silu_mul": "moe_silu_mul(Tensor gate_up, int first_column=0) -> Tensor",
     "moe_combine": "moe_combine(Tensor shared, Tensor gates, Tensor routed, int gate_column) -> Tensor",
     "moe_row_quant": "moe_row_quant(Tensor x, float fp8_max) -> (Tensor, Tensor)",
 }
@@ -64,8 +64,8 @@ def _moe_route_fake(gates, experts, top_k):
 
 
 @torch.library.register_fake(f"{NAMESPACE}::moe_silu_mul", lib=_LIBRARY)
-def _moe_silu_mul_fake(gate_up):
-    return gate_up.new_empty(tuple(gate_up.shape[:-1]) + (gate_up.shape[-1] // 2, ))
+def _moe_silu_mul_fake(gate_up, first_column=0):
+    return gate_up.new_empty(tuple(gate_up.shape[:-1]) + ((gate_up.shape[-1] - first_column) // 2, ))
 
 
 @torch.library.register_fake(f"{NAMESPACE}::moe_combine", lib=_LIBRARY)
@@ -88,9 +88,14 @@ def moe_route(gates: torch.Tensor, experts: int, top_k: int) -> tuple[torch.Tens
     return torch.ops.flashinfer_gaudi.moe_route(gates, int(experts), int(top_k))
 
 
-def moe_silu_mul(gate_up: torch.Tensor) -> torch.Tensor:
-    """``silu(gate_up[:, :D]) * gate_up[:, D:]`` of the shared expert's gate_up GEMM output ``[T, 2 * D]``."""
-    return torch.ops.flashinfer_gaudi.moe_silu_mul(gate_up)
+def moe_silu_mul(gate_up: torch.Tensor, first_column: int = 0) -> torch.Tensor:
+    """``silu(block[:, :D]) * block[:, D:]`` of the shared expert's gate_up columns ``block = gate_up[:, first_column:]``.
+
+    ``first_column`` is 0 for the gate_up GEMM output ``[T, 2 * D]`` itself.  When that GEMM is merged into the
+    block's gate GEMM (``VLLM_HPU_MOE_GLUE_MERGE_GATE_UP=1``) the input is the merged output ``[T, E + 1 + 2 * D]``
+    and ``first_column`` is ``E + 1``: the kernel reads the block where it is, so no slice has to be copied.
+    """
+    return torch.ops.flashinfer_gaudi.moe_silu_mul(gate_up, int(first_column))
 
 
 def moe_combine(shared: torch.Tensor, gates: torch.Tensor, routed: torch.Tensor, gate_column: int) -> torch.Tensor:
