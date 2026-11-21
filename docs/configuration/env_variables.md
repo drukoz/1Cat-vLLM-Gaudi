@@ -504,6 +504,17 @@ expert and row). On the real model (TP8, MTP k = 3, job 00177) the first form of
 this path, without the minimum and with an fp32 weighted sum, was slower than
 the vendor op; keep it off until a later A/B shows otherwise.
 
+`VLLM_HPU_MOE_DENSE_FLAT_GATE_UP` (integer, default `0`) applies with
+`VLLM_HPU_MOE_DENSE=1`. `1` runs the dense form's gate and up projections of
+all local experts as one 2-D FP8 GEMM (x `[T, H]` times the stacked `w13`
+viewed `[E * 2I, H]`, with the row scale `[T, 1]` and the experts' column
+scales `[1, E * 2I]` inside the GEMM) instead of a batched GEMM over an
+`[E, T, H]` copy of x. Each output is the same dot product with the same
+scales: on one card the two forms are bit-identical, and the 2-D form takes
+about 12 % less device time per layer at 96 rows
+(`tools/flash_next/kernel_probes/probe_moe_forms.py`). It is read inside the
+forward, so `VLLM_HPU_RUNTIME_SWITCH_FILE` can switch it.
+
 `VLLM_HPU_MOE_GLUE_MERGE_GATE_UP` (integer, default `0`) applies only with
 `VLLM_HPU_MOE_GLUE=1`. `1` appends the shared expert's gate_up rows of this
 rank to the block's merged gate weight (built once at load, a second
