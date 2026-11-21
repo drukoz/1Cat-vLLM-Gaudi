@@ -339,6 +339,21 @@ Qualification, in order (each decides the next):
 | b | native-replay's `bench_replay.py` at TP8 (`replay`, `replay_seg`), lean build, flag 0 against 1 | the host cost per launch the patch removes |
 | c | the real model at TP8, 1 and 32 streams (`serve_probe.sh` + `decode_scaling.py`): stock bridge, lean flag 0, lean flag 1 | the step time; texts equal at 1 stream |
 
+**Job 00160 `tiny8-bridge-check` (MEASURED, all 8 cards, 02:03-02:08 UTC on 2026-11-21; a1 and a2 merged into one
+job at the coordinator's word): PASS.** The tiny model at TP8 (`--gdn hc`) with the image's bridge, then with
+native-replay's unpatched rebuild `stock-5176b1b2` installed by `--bridge`: `BRIDGE stock-5176b1b2 ok:
+habana_frameworks.torch 1.24.1+git5176b1b ...; 23 .so from the wheels, 14 mapped, 18 differ from the image's; torch
+2.11.0a0+git009...` (every bridge library the process maps is the wheel's; the `.upstream` twins the build does
+not make were not needed); both smokes passed (prompts of 7, 33, 700 and 2,600 tokens 16/16, the usual near ties
+at token 0 for 1 and 100 tokens) and **the tokens are equal prompt by prompt, near-tie lists included**. The install
+and check took under 3 minutes of the arm (stock arm 84 s, bridge arm 167 s). So a rebuilt bridge reaches the
+card through `--bridge` and is what runs. Results: `reports/collectives/card/00160-tiny8-bridge-check-{stock,build}/`.
+
+**Job 00174 `real8-bridge-phase`** (all, 65 min, queued 02:09 UTC behind integration's 00161): native-replay's
+`timers-c281d8b53d08` (phase timers) and `lean-e1dbb4942fb8` (prepared replay step 1), with the accsync pair
+(`PT_HPU_SYNCHRONOUS_ACC_QUEUE_FLUSHING=1`); `bridge_phase_job.sh`, arms tiny-timers, tiny-accsync, tiny-lean, then
+real-timers, real-accsync and real-lean where their tiny arm passed. Pending.
+
 ## Handoff (if this agent stops)
 
 State at 00:55 UTC on 2026-11-21 (fourth agent of this track, Opus 5.5). **The node stays until about 00:00 UTC
@@ -373,15 +388,17 @@ bench8-bridge all 30m` (each arm pairs the flag off and on in one bench run; sum
 `python3 reports/native-replay/probes/knob_table.py bench_r8.json`).
 
 Next, in order (section 7's table):
-1. Read 00160 (above; bumped to the head of the queue at 00:59 UTC, starts by 02:00 UTC at the latest) and send
-   the verdict to the coordinator and native-replay (on exit 8: name the file it reports; native-replay's build
-   has no `.upstream` variants).
+1. 00160 PASSED (section 7), sent to the coordinator and native-replay at 02:10 UTC. Next: 00174 (section 7;
+   this agent's waiter fetches its six arms and `00174-real8-bridge-phase-verdicts.txt` into
+   `reports/collectives/card/`; else `bin/farm fetch collectives 00174 00174-real8-bridge-phase-<arm>...` and
+   `bin/node-scp :farm/collectives/results/00174-real8-bridge-phase-verdicts.txt <dir>/`). Its numbers go to
+   native-replay (it parses the `HPUGRAPH_REPLAY_TIMING` lines) and the coordinator.
 1b. native-replay's next builds: `timers-c281d8b53d08` (phase timers: `PT_HPU_HPUGRAPH_REPLAY_TIMING=N` prints one
    `HPUGRAPH_REPLAY_TIMING` line per N replayed launches per thread; about 01:47 UTC) and, about 20 minutes later,
    `lean-e1dbb4942fb8` (the timers plus the first prepared-replay step behind `PT_HPU_HPUGRAPH_PREPARED_REPLAY=1`;
    patch `tools/flash_next/bridge/patches/lean1.patch` on native-replay's branch, d9a1f8f1). One all-card job of
    six arms, `bridge_phase_job.sh TIMERS LEAN SHA` (deployed to `~/farm/collectives/bridge/`; approved by the
-   coordinator through native-replay, hold 65 min): tiny-timers (reference), tiny-lean, tiny-accsync
+   coordinator, hold 65 min; **submitted as 00174 at 02:09 UTC**): tiny-timers (reference), tiny-accsync, tiny-lean
    (`PT_HPU_SYNCHRONOUS_ACC_QUEUE_FLUSHING=1`: no accumulation thread, no spinning CPU per worker), then
    real-timers, and real-lean / real-accsync only where their tiny arm passed with the reference's tokens
    (verdicts in `<id>-real8-bridge-phase-verdicts.txt`). A background task of this agent
