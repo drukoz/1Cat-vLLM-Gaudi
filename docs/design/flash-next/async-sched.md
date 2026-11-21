@@ -6,12 +6,29 @@ results are under `/Volumes/Storage/Claude/gaudi-work/reports/async-sched/card/`
 
 ## Handoff (if this agent stops)
 
-Updated 2026-11-21 00:58 UTC.
+Updated 2026-11-21 01:45 UTC.
 
-- State: step 1 (measure) done from existing card data (section 1). Steps 2 (design) and 3 (code) in progress.
-- Nothing committed yet beyond the program head. No card job submitted yet.
-- Next: implement the default-off flag `VLLM_HPU_FLASH_NEXT_ASYNC_SCHED` (section 2), CPU tests in an engine-loop
-  harness (async against sync, token equality), then card jobs (section 4).
+- **On the branch** (pushed): `8f4816f8` engine-step's `engine_harness.py`, unchanged (same blob as engine-step and
+  the integration build); `7a818007` the flag `VLLM_HPU_FLASH_NEXT_ASYNC_SCHED` (default 0) with the PLE context
+  carry, the output-token ledger and the async scheduler's split fix (section 2.2). CPU: 27 + 7 + 4 tests of this
+  track pass (`tests/unit_tests/worker/test_flash_next_async.py`,
+  `tests/unit_tests/models/flash_next/test_engine_loop_async.py`, `test_engine_async_sampling.py`); the
+  neighbours (host n-gram ids, platform, inputs, engine-step's sync loop) pass. No `bin/gate` run yet.
+- **Card job 00171** `real8-async-ab` (all, 45 min hold), queued 01:37 UTC, waiting for a place from the
+  coordinator. It runs job branch `feat/flash-next-gaudi-async-sched-int` (`0dcc7ddb` = integration `2af8a8fe` +
+  `7a818007` + job arms; never merge it): `headline_job.sh tiny-async async nospec nospec-devids` with
+  `HEADLINE_LEVELS=32,1`. A background `bin/farm job` (pid 72620 on this Mac, log
+  `reports/async-sched/logs/farm_real8_async_ab.out`) waits and fetches into
+  `reports/async-sched/card/00171-real8-async-ab/`. If the session is gone: `bin/farm fetch async-sched 00171
+  00171-real8-async-ab`, then read `headline.md` (arms async against nospec at 32 and 1 streams, greedy and
+  sampled), `tiny-async/summary.json` (must be PASSED), and grep `async/server0.log` for
+  `Async scheduling on for Flash-Next` (the flag took) and `Traceback|Error`.
+- **Next** (coordinator 01:40 UTC: MTP first): MTP under async scheduling, stage 1 (section 2.4): the drafts stay on
+  the device, the accepted counts keep their one host read per step, the worker corrects the scheduler's optimistic
+  `num_computed_tokens`. Then the pull request of `7a818007` (after `bin/gate`), and tell the coordinator the flag
+  and the card result for the integration track.
+- Messages sent: engine-step (runner lines I touch; its candidate sampling refusal under async is not needed on
+  CPU, please drop it), coordinator (status, job 00171, MTP plan).
 
 Labels: **MEASURED** (card, with the file), **VERIFIED** (code or CPU test, with the line or test), **INFERRED**.
 
@@ -119,4 +136,14 @@ step's own cost to fall.
 
 ## 3. What is on the branch
 
+See the handoff. Files: `vllm_gaudi/v1/worker/flash_next_async.py` (carry, ledger), `vllm_gaudi/platform.py`
+(`resolve_flash_next_async_scheduling`), `vllm_gaudi/v1/core/sched/hpu_async_scheduler.py` (split),
+`vllm_gaudi/envs.py`, `docs/configuration/env_variables.md`, seven small hooks in `hpu_model_runner.py` (import;
+`_ple_forward_kwargs`; `_flash_next_async_begin_step`; the start of `sample_tokens`; `_create_decode_input_data`
+after `_with_host_ngram_ids`; after `AsyncHPUModelRunnerOutput(...)`; the top of `_prepare_sampling`).
+
 ## 4. Card jobs
+
+| Job | What | State |
+|---|---|---|
+| 00171 `real8-async-ab` | TP8, integration build + async: tiny gate with the flag, then async / nospec / nospec-devids at 32 and 1 streams | queued 01:37 UTC |
