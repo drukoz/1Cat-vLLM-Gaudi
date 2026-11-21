@@ -554,6 +554,8 @@ while [ "$i_arm" -lt "${#ARMS[@]}" ]; do
                     # async-sched job branch: m3a = stage 2's M3 in use (VLLM_HPU_FLASH_NEXT_SPEC_DEVICE_ALIGN=2; the
                     # arm is left out when a tiny-m3pc gate failed); turns = commit_turns_probe.py after the probe
                     m3a) arm_env+=(VLLM_HPU_FLASH_NEXT_SPEC_DEVICE_ALIGN=2); needs_m3=1 ;;
+                    # m1off = stage 2's M1 off for this arm (the best mode 2: M1 costs about 1 ms per token there, 00230)
+                    m1off) arm_env+=(VLLM_HPU_FLASH_NEXT_SPEC_DEVICE_INPUTS=0) ;;
                     graph) draft_graph=1 ;;
                     rfc) replicated_fc=1 ;;
                     noshard) shard=0; greedy_only=1 ;;
